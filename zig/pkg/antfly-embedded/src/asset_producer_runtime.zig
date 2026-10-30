@@ -623,10 +623,11 @@ pub const Runtime = struct {
     }
 
     fn routeExtractorConfig(self: *const Runtime, alloc: Allocator, cfg: *extracting.Config) !void {
-        if (cfg.provider == .cloudflare) {
-            var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.bearer_token orelse cfg.api_key, "CLOUDFLARE_API_TOKEN");
+        if (cfg.provider == .cloudflare or cfg.provider == .pioneer) {
+            const env_name = if (cfg.provider == .cloudflare) "CLOUDFLARE_API_TOKEN" else extracting.pioneer.credential_env;
+            var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.bearer_token orelse cfg.api_key, env_name);
             defer secret.deinit(alloc);
-            const token = (try secret.resolveOwned(alloc, self.secret_store)) orelse return error.CloudflareCredentialMissing;
+            const token = (try secret.resolveOwned(alloc, self.secret_store)) orelse return if (cfg.provider == .cloudflare) error.CloudflareCredentialMissing else error.PioneerCredentialMissing;
             if (cfg.api_key) |value| alloc.free(value);
             if (cfg.bearer_token) |value| alloc.free(value);
             cfg.api_key = token;
@@ -3857,7 +3858,7 @@ pub const Runtime = struct {
             // plain, schema-version-less wire request to v2 on the provider
             // side (see zig/pkg/inference's extractWithAdmission); a caller
             // that left schema_version unset -- as
-            // examples/dogfood/index_config.go's knowledgeGraphIndexJSON and
+            // examples/antfly-docs-knowledge-base/index_config.go's knowledgeGraphIndexJSON and
             // GRAPH.md's shorthand extractor config both do -- has no basis
             // to reject that upgraded response as a schema_version mismatch.
             // parseExtractionResponse still derives the actual `v2` parsing
@@ -5800,7 +5801,7 @@ test "asset producer runtime single extractor response preserves legacy optional
 // and zig/pkg/inference's extractWithAdmission) auto-upgrades a plain,
 // schema-version-less wire request to a schema_version=2 response. A
 // producer config that never asked for a specific schema_version -- as
-// examples/dogfood/index_config.go's knowledgeGraphIndexJSON and GRAPH.md's
+// examples/antfly-docs-knowledge-base/index_config.go's knowledgeGraphIndexJSON and GRAPH.md's
 // shorthand extractor config both do -- has no basis to reject that upgrade
 // as a mismatch: before Config.schema_version_explicit existed, `extract()`
 // (asset_producer_runtime.zig) pinned `expected.schema_version` to
@@ -5821,7 +5822,7 @@ test "asset producer runtime accepts an unrequested boundary-model schema_versio
     const response = "{\"object\":\"extraction\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema_version\":2,\"data\":[{\"entities\":[{\"label\":\"component\",\"text\":\"VOPR\",\"start\":0,\"end\":4}],\"relations\":[{\"type\":\"depends_on\",\"source\":{\"entity_index\":0},\"target\":{\"text\":\"antfly-core\",\"start\":10,\"end\":21}}]}]}";
 
     // Config JSON with no "schema_version" field, matching dogfood's real
-    // producer config shape exactly (examples/dogfood/index_config.go's
+    // producer config shape exactly (examples/antfly-docs-knowledge-base/index_config.go's
     // knowledgeGraphIndexJSON never sets one).
     var implicit_cfg = try extracting.parseConfigFromSlice(
         a,

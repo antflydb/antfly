@@ -38,7 +38,7 @@ Decision providers are `antfly` (Antfly inference), `jev`, and `openai`
 Use identical built-in names across query languages. Standalone decisions use
 `/decisions` and `/ai/v1/decisions`, text `input`, named question and answer
 arrays, and predicate `probability`. Jev/Laya wire names remain private adapter
-details. See [the current contract](../docs/guides/decisions.md).
+details. See [the current contract](../docs/reference/decisions.md).
 Query users access Boolean probability through `ai_probability`.
 
 ## Shared expressions and binding

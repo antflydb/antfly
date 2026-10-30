@@ -1,7 +1,8 @@
 import {
   Button,
+  Field,
+  FieldLabel,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectGroup,
@@ -141,17 +142,17 @@ const AggregationBuilder: React.FC<AggregationBuilderProps> = ({
   return (
     <div className="space-y-3">
       <div className="grid grid-cols-2 gap-2">
-        <div>
-          <Label className="text-xs mb-1 block">Name</Label>
+        <Field className="gap-1">
+          <FieldLabel className="text-xs">Name</FieldLabel>
           <Input
             placeholder="e.g., by_category"
             value={name}
             onChange={(e) => setName(e.target.value)}
             className="h-8"
           />
-        </div>
-        <div>
-          <Label className="text-xs mb-1 block">Type</Label>
+        </Field>
+        <Field className="gap-1">
+          <FieldLabel className="text-xs">Type</FieldLabel>
           <Select value={type} onValueChange={(v) => setType(v as AggregationType)}>
             <SelectTrigger size="sm">
               <SelectValue />
@@ -175,11 +176,11 @@ const AggregationBuilder: React.FC<AggregationBuilderProps> = ({
               </SelectGroup>
             </SelectContent>
           </Select>
-        </div>
+        </Field>
       </div>
 
-      <div>
-        <Label className="text-xs mb-1 block">Field</Label>
+      <Field className="gap-1">
+        <FieldLabel className="text-xs">Field</FieldLabel>
         <Input
           placeholder="e.g., category"
           value={field}
@@ -190,7 +191,7 @@ const AggregationBuilder: React.FC<AggregationBuilderProps> = ({
           availableFields={isBucketing ? availableBasicFields : availableFields}
           onFieldSelect={setField}
         />
-      </div>
+      </Field>
 
       {/* Size control for bucketing types (except histogram/date_histogram) */}
       {isBucketing &&
@@ -198,8 +199,8 @@ const AggregationBuilder: React.FC<AggregationBuilderProps> = ({
         type !== "date_histogram" &&
         type !== "range" &&
         type !== "date_range" && (
-          <div>
-            <Label className="text-xs mb-1 block">Size</Label>
+          <Field className="gap-1">
+            <FieldLabel className="text-xs">Size</FieldLabel>
             <Input
               type="number"
               value={size}
@@ -207,13 +208,13 @@ const AggregationBuilder: React.FC<AggregationBuilderProps> = ({
               className="h-8 w-24"
               min={1}
             />
-          </div>
+          </Field>
         )}
 
       {/* Range config */}
       {(type === "range" || type === "date_range") && (
-        <div className="space-y-2">
-          <Label className="text-xs">Ranges</Label>
+        <Field className="gap-2">
+          <FieldLabel className="text-xs">Ranges</FieldLabel>
           {ranges.map((range, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: ranges are reorderable form inputs identified by position
             <div key={i} className="flex gap-2 items-center">
@@ -252,13 +253,13 @@ const AggregationBuilder: React.FC<AggregationBuilderProps> = ({
           <Button onClick={addRange} variant="outline" size="sm" className="h-7 text-xs">
             <PlusIcon className="h-3 w-3 mr-1" /> Add Range
           </Button>
-        </div>
+        </Field>
       )}
 
       {/* Histogram interval */}
       {type === "histogram" && (
-        <div>
-          <Label className="text-xs mb-1 block">Interval</Label>
+        <Field className="gap-1">
+          <FieldLabel className="text-xs">Interval</FieldLabel>
           <Input
             type="number"
             value={interval}
@@ -266,13 +267,13 @@ const AggregationBuilder: React.FC<AggregationBuilderProps> = ({
             className="h-8 w-32"
             min={1}
           />
-        </div>
+        </Field>
       )}
 
       {/* Date histogram calendar interval */}
       {type === "date_histogram" && (
-        <div>
-          <Label className="text-xs mb-1 block">Calendar Interval</Label>
+        <Field className="gap-1">
+          <FieldLabel className="text-xs">Calendar Interval</FieldLabel>
           <Select value={calendarInterval} onValueChange={setCalendarInterval}>
             <SelectTrigger size="sm" className="w-40">
               <SelectValue />
@@ -285,7 +286,7 @@ const AggregationBuilder: React.FC<AggregationBuilderProps> = ({
               ))}
             </SelectContent>
           </Select>
-        </div>
+        </Field>
       )}
 
       <Button

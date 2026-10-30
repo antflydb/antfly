@@ -44,8 +44,8 @@ const document = @import("../pipelines/gliner_boundary_long_document.zig");
 
 pub const Options = struct {
     modern_span_extraction: bool = false,
-    /// Qualified CUDA classification rows per physical forward; other routes stay serial.
-    cuda_batch_items: usize = 1,
+    /// Admitted accelerator classification rows per physical forward.
+    classification_batch_items: usize = 1,
     max_response_bytes: usize = 64 * 1024 * 1024,
     /// `max_sequence_tokens` is the hard per-sequence ceiling. It defaults to
     /// DeBERTa-v3's 512 pretraining positions, the same cap the legacy span
@@ -635,6 +635,35 @@ fn canBatchClassifications(request: *const wire.Request, request_plan: *const Pl
     return true;
 }
 
+/// Shared by device admission and execution. Split-task and windowed plans keep
+/// their single-sequence reservation even when ordinary items support batching.
+pub fn classificationBatchItems(request: *const wire.Request, request_plan: *const Plan, options: Options) usize {
+    if (options.classification_batch_items <= 1 or request.items.len <= 1 or !canBatchClassifications(request, request_plan)) return 1;
+    return @min(options.classification_batch_items, request.items.len);
+}
+
+test "gliner span v2 batch admission preserves serial scratch for split tasks" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"classifications":[{"name":"intent","labels":["sales","support"]}]},"inputs":[{"content":"Help"},{"content":"Buy"}]}
+    , .{});
+    defer request.deinit();
+    // Only cardinality is inspected; no token or model buffers are needed for
+    // the admission decision. One item later splits into two encoder rows.
+    var batches: [2]processor.PreparedBatch = undefined;
+    var ranges = [_]TaskRange{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
+    var items = [_]PreparedItem{
+        .{ .batches = batches[0..1], .ranges = ranges[0..1], .prompt_tokens = 16 },
+        .{ .batches = batches[0..1], .ranges = ranges[0..1], .prompt_tokens = 32 },
+    };
+    const prepared = Plan{ .items = &items, .prompt_tokens = 48 };
+    const options = Options{ .classification_batch_items = 8 };
+    try std.testing.expectEqual(@as(usize, 2), classificationBatchItems(&request, &prepared, options));
+    items[0].batches = &batches;
+    items[0].ranges = &ranges;
+    try std.testing.expectEqual(@as(usize, 1), classificationBatchItems(&request, &prepared, options));
+}
+
 fn plannedClassificationBatch(cb: *const compute.ComputeBackend, allocator: Allocator, config: EncoderConfig, request: *const wire.Request, request_plan: *const Plan, options: Options) ![]ItemLogits {
     const result = try allocator.alloc(ItemLogits, request.items.len);
     var built: usize = 0;
@@ -644,7 +673,7 @@ fn plannedClassificationBatch(cb: *const compute.ComputeBackend, allocator: Allo
     }
     while (built < result.len) {
         try progress(options, built, "encoder");
-        const n = @min(options.cuda_batch_items, result.len - built);
+        const n = @min(options.classification_batch_items, result.len - built);
         const samples = try allocator.alloc(processor.Sample, n);
         defer allocator.free(samples);
         const counts = try allocator.alloc([]const usize, n);
@@ -672,11 +701,12 @@ fn plannedClassificationBatch(cb: *const compute.ComputeBackend, allocator: Allo
 pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, config: EncoderConfig, request: *const wire.Request, request_plan: *const Plan, options: Options) ![]u8 {
     if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .cuda and cb.kind() != .wasm) return error.UnsupportedExtractionBackend;
     if (request_plan.items.len != request.items.len) return error.InvalidExtractionInput;
+    if (options.classification_batch_items == 0) return error.InvalidExtractionInput;
     if (options.decide_request != null and request.items.len != 1) return error.InvalidExtractionInput;
     var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);
     defer writer.deinit();
     try writer.begin(request.model);
-    const batched = if (cb.kind() == .cuda and options.cuda_batch_items > 1 and request.items.len > 1 and canBatchClassifications(request, request_plan))
+    const batched = if ((cb.kind() == .cuda or cb.kind() == .metal) and classificationBatchItems(request, request_plan, options) > 1)
         try plannedClassificationBatch(cb, allocator, config, request, request_plan, options)
     else
         null;

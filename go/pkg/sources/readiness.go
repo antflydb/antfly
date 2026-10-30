@@ -21,7 +21,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"io"
 	"sort"
 	"time"
 )
@@ -55,6 +54,16 @@ func projectionDigest(doc Document) ([32]byte, error) {
 // writers. A provider revision alone cannot identify a normalized record: its
 // URI, path, sharing, connection metadata or normalization may have changed.
 func WaitForDocuments(ctx context.Context, query func(context.Context, string, []byte) ([]byte, error), table string, documents map[string]Document) error {
+	return waitForDocuments(ctx, query, table, documents, false)
+}
+
+// Scoped source writers also verify the outer ownership/filtering projection.
+func sourceRowFields() []string { return append(QueryDocumentFields(), "id", "source_id", "doc_type") }
+func sourceRowMatches(hit syncHit, sourceID string) bool {
+	return hit.Source.ID == hit.ID && hit.Source.SourceID == sourceID && hit.Source.DocType == "source_item"
+}
+
+func waitForDocuments(ctx context.Context, query func(context.Context, string, []byte) ([]byte, error), table string, documents map[string]Document, sourceRows bool) error {
 	if len(documents) == 0 {
 		return nil
 	}
@@ -75,7 +84,11 @@ func WaitForDocuments(ctx context.Context, query func(context.Context, string, [
 		keys = append(keys, id)
 	}
 	sort.Strings(keys)
-	request, _ := json.Marshal(map[string]any{"query": map[string]any{"ids": keys}, "fields": QueryDocumentFields(), "limit": len(keys), "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+	fields := QueryDocumentFields()
+	if sourceRows {
+		fields = sourceRowFields()
+	}
+	request, _ := json.Marshal(map[string]any{"query": documentIDsQuery(keys), "fields": fields, "limit": len(keys), "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
 	wait, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
@@ -83,43 +96,23 @@ func WaitForDocuments(ctx context.Context, query func(context.Context, string, [
 		if err != nil {
 			return err
 		}
-		var result struct {
-			Responses []struct {
-				Status   int             `json:"status"`
-				Error    json.RawMessage `json:"error"`
-				Snapshot string          `json:"remote_snapshot"`
-				Hits     struct {
-					Hits []struct {
-						ID     string `json:"_id"`
-						Source struct {
-							Grep Document `json:"grep"`
-						} `json:"_source"`
-					} `json:"hits"`
-				} `json:"hits"`
-			} `json:"responses"`
-		}
-		decoder := json.NewDecoder(bytes.NewReader(raw))
-		decoder.UseNumber()
-		if err = decoder.Decode(&result); err != nil {
-			return fmt.Errorf("invalid canonical readiness response: %w", err)
-		}
-		if err = decoder.Decode(new(any)); err != io.EOF {
-			return fmt.Errorf("invalid canonical readiness response trailer")
-		}
-		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || result.Responses[0].Snapshot == "" || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
-			return fmt.Errorf("runtime did not provide successful snapshot-bound canonical readiness")
+		hits, err := decodeSyncHits(raw)
+		if err != nil {
+			return err
 		}
 		seen := map[string]bool{}
-		for _, hit := range result.Responses[0].Hits.Hits {
+		returned := map[string]bool{}
+		for _, hit := range hits {
 			want, ok := expected[hit.ID]
-			if !ok {
-				continue
+			if !ok || returned[hit.ID] {
+				return fmt.Errorf("unexpected canonical readiness identity")
 			}
+			returned[hit.ID] = true
 			got, err := projectionDigest(hit.Source.Grep)
 			if err != nil {
 				return err
 			}
-			if got == want {
+			if got == want && (!sourceRows || sourceRowMatches(hit, configString(documents[hit.ID].Metadata, "source_id"))) {
 				seen[hit.ID] = true
 			}
 		}

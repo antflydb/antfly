@@ -18,6 +18,15 @@ const onnx_build = @import("onnx_graph").support;
 pub const OnnxModules = onnx_build.Modules;
 const jit_identity = @import("jit_identity.zig");
 
+/// Inline `pdf_standard_fonts` module for the generated write-files directory;
+/// mirrors `inline_source` in zig/build_support/antfly/fonts.zig.
+const pdf_standard_fonts_source =
+    \\pub const regular = @embedFile("lib/pdf/fonts/roboto/Roboto-Regular.ttf");
+    \\pub const bold = @embedFile("lib/pdf/fonts/roboto/Roboto-Bold.ttf");
+    \\pub const glyphCodepoints = @import("lib/pdf/src/agl_lookup.zig").codepoints;
+    \\
+;
+
 pub const BackendOptions = struct {
     allow_downloads: bool = true,
     enable_metal: bool = false,
@@ -201,6 +210,8 @@ pub fn create(config: Config) Graph {
     };
     const scraping_mod = shared.scraping orelse blk: {
         const mod = createSharedModule(config, "lib/scraping/src/mod.zig");
+        mod.addImport("antfly_data_uri", createSharedModule(config, "lib/scraping/src/data_uri.zig"));
+        mod.addImport("antfly_platform", platform_mod);
         mod.addImport("antfly_source_reference", createSharedModule(config, "lib/scraping/src/source_reference.zig"));
         mod.addImport("objectstore", objectstore_mod);
         mod.addImport("httpx", httpx_mod);
@@ -280,6 +291,7 @@ pub fn create(config: Config) Graph {
         });
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
+        mod.addAnonymousImport("fastino_api", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/fastino_api/root.zig")) });
         break :blk mod;
     };
     const reader_config_mod = shared.reader_config orelse createSharedModule(config, "lib/readers/src/config.zig");
@@ -295,6 +307,7 @@ pub fn create(config: Config) Graph {
         const module = createSharedModule(config, "lib/generating/src/mod.zig");
         module.addImport("antfly-json", json_mod);
         module.addImport("antfly_generating_openapi", generating_openapi_mod);
+        module.addAnonymousImport("anthropic_api", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/anthropic_api/root.zig")) });
         break :blk module;
     };
     structured_mod.addImport("antfly_generating", generating_mod);
@@ -452,7 +465,7 @@ pub fn create(config: Config) Graph {
         _ = files.addCopyFile(b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/fonts/roboto/Roboto-Bold.ttf")), "lib/pdf/fonts/roboto/Roboto-Bold.ttf");
         _ = files.addCopyFile(b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/agl_lookup.zig")), "lib/pdf/src/agl_lookup.zig");
         _ = files.addCopyFile(b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/agl_data.zig")), "lib/pdf/src/agl_data.zig");
-        const fonts = b.createModule(.{ .root_source_file = files.addCopyFile(b.path(pathJoin(b, paths.shared_lib_root, "pdf_standard_fonts.zig")), "pdf_standard_fonts.zig"), .target = target, .optimize = optimize });
+        const fonts = b.createModule(.{ .root_source_file = files.add("pdf_standard_fonts.zig", pdf_standard_fonts_source), .target = target, .optimize = optimize });
         const font = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/font/src/mod.zig")), .target = target, .optimize = optimize });
         const pdf = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/mod.zig")), .target = target, .optimize = optimize });
         pdf.addImport("antfly_image", image_mod);

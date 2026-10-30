@@ -66,6 +66,7 @@ pub fn configureBrowserModule(
     mod.addImport("httpx", httpx_mod);
     mod.addImport("antfly_platform", platform_mod);
     mod.addImport("antfly_chunking", chunking_mod);
+    mod.addImport("antfly_chunking_api_openapi", chunking_mod.import_table.get("antfly_chunking_api_openapi").?);
     mod.addImport("bloom", bloom_mod);
     mod.addImport("antfly_vector", vector_mod);
     mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -119,7 +120,6 @@ pub const AddEmbeddedResult = struct {
     run_lite_rs_tests: *std.Build.Step.Run,
     run_lite_ts_tests: *std.Build.Step.Run,
     run_lite_go_example: *std.Build.Step.Run,
-    run_lite_go_retrieval_template: *std.Build.Step.Run,
     run_cabi_packaging_tests: *std.Build.Step.Run,
     run_capi_tests: *std.Build.Step.Run,
 };
@@ -382,7 +382,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_smoke_mod.link_libc = true;
     capi_smoke_mod.addIncludePath(b.path("pkg/antfly-embedded/include"));
     capi_smoke_mod.addCSourceFile(.{
-        .file = b.path("examples/antfly_c_smoke.c"),
+        .file = b.path("pkg/antfly-embedded/tests/capi_smoke.c"),
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     const capi_smoke = b.addExecutable(.{
@@ -498,37 +498,19 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "go",
         "run",
         ".",
-        "--reset",
-        "--db",
-        "../../zig/.zig-cache/antfly-lite-go-example.aflite",
-        "--backup",
-        "../../zig/.zig-cache/antfly-lite-go-example.afb",
+        "smoke",
+        "-reset",
+        "-db",
+        "../../zig/.zig-cache/antfly-docs-knowledge-base-smoke.aflite",
+        "-backup",
+        "../../zig/.zig-cache/antfly-docs-knowledge-base-smoke.afb",
     });
     run_lite_go_example.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
-    run_lite_go_example.setCwd(b.path("../examples/antfly-lite-go"));
+    run_lite_go_example.setCwd(b.path("../examples/antfly-docs-knowledge-base"));
     run_lite_go_example.step.dependOn(install_libantfly);
     run_lite_go_example.step.dependOn(&install_capi_header.step);
-    const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go Antfly Lite example app");
+    const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go knowledge-base example's model-free smoke check");
     lite_go_example_step.dependOn(&run_lite_go_example.step);
-
-    const run_lite_go_retrieval_template = b.addSystemCommand(&.{
-        "env",
-        "GOWORK=off",
-        "go",
-        "run",
-        ".",
-        "--reset",
-        "--db",
-        "../../zig/.zig-cache/antfly-lite-retrieval-go.aflite",
-        "--backup",
-        "../../zig/.zig-cache/antfly-lite-retrieval-go.afb",
-    });
-    run_lite_go_retrieval_template.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
-    run_lite_go_retrieval_template.setCwd(b.path("../examples/antfly-lite-retrieval-go"));
-    run_lite_go_retrieval_template.step.dependOn(install_libantfly);
-    run_lite_go_retrieval_template.step.dependOn(&install_capi_header.step);
-    const lite_go_retrieval_template_step = b.step("lite-go-retrieval-template", "Run the embedded Go Antfly Lite retrieval template");
-    lite_go_retrieval_template_step.dependOn(&run_lite_go_retrieval_template.step);
 
     const run_cabi_packaging_tests = b.addSystemCommand(&.{
         "env",
@@ -591,7 +573,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi native short lived writers",
         "capi native marker sweep",
         "capi native unbounded writer admits reusable pool before a large request",
-        "capi native allocator proof survives close",
+        "capi native allocator proof",
         "capi native close bounds proof work",
         "capi native text queries",
         "capi native replacement wait",
@@ -672,6 +654,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     const capi_test_step = b.step("capi-test", "Run C API tests");
     capi_test_step.dependOn(&run_capi_tests.step);
+    // Share the exact contract executable while allowing focused API
+    // regressions to avoid compiling unrelated resolver replay fixtures.
+    b.step("capi-contract-test", "Run hermetic C API contracts without resolver replay suites")
+        .dependOn(&run_capi_tests.step);
+    // Physical C API regressions can build their existing implementation owner
+    // directly. The ordinary gate still audits and runs both partitions.
+    @import("../antfly/test_partitions.zig").installLocalArtifact(b, capi_tests.executable, "capi-contract-owner-test-build", "Build physical C API contract tests without consumer discovery", "capi-contract-owner-tests");
 
     // Resolver and scorer are owned by embedded storage. Run their pure tests
     // in embedded CI as well as the compatibility lib-* test targets.
@@ -718,7 +707,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .run_lite_rs_tests = run_lite_rs_tests,
         .run_lite_ts_tests = run_lite_ts_tests,
         .run_lite_go_example = run_lite_go_example,
-        .run_lite_go_retrieval_template = run_lite_go_retrieval_template,
         .run_cabi_packaging_tests = run_cabi_packaging_tests,
         .run_capi_tests = run_capi_tests,
     };

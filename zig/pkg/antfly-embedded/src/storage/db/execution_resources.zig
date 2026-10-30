@@ -1779,7 +1779,10 @@ pub const PrecomputedGeneratedBatch = struct {
     generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
     coverage_outcomes: []PrecomputedCoverageOutcome = &.{},
 
-    pub fn deinit(self: *PrecomputedGeneratedBatch, alloc: Allocator) void {
+    // Batch cleanup is shared by many fallible preparation exits. Keep its
+    // allocation walks out of those exits; each batch pays one call while LLVM
+    // optimizes one cleanup body instead of copies throughout the commit CFG.
+    pub noinline fn deinit(self: *PrecomputedGeneratedBatch, alloc: Allocator) void {
         for (self.artifact_writes) |write| {
             alloc.free(@constCast(write.key));
             alloc.free(@constCast(write.value));

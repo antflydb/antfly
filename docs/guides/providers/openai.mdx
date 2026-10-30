@@ -1,0 +1,106 @@
+---
+title: OpenAI
+description: OpenAI embeddings, generation, vision reading, transcription, speech, and decisions in Antfly
+---
+
+The `openai` provider calls the OpenAI API. Its generator adapter also serves
+OpenAI-compatible endpoints; set `url` to point it elsewhere.
+
+## What It Provides
+
+| Component | Inputs | Notes |
+|---|---|---|
+| Embedder | Text | For example `text-embedding-3-small` |
+| Reader | Images | Vision chat; defaults to `gpt-4.1-mini` |
+| Transcriber | Audio | `whisper-1`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` |
+| Speech synthesizer | Text | `tts-1` and its voices |
+| Generator | Text, images | Chat Completions, with streaming and function tools |
+| Decider | Text, images | OpenAI Decisions at `https://api.openai.com/v1/decisions`; a model is required |
+
+The generator sends images as `image_url` parts. Other media, such as audio or
+PDFs, is rejected before the request is sent.
+
+## Credentials
+
+`api_key`, defaulting to `OPENAI_API_KEY`. Store it as a secret reference such
+as `${secret:openai.api_key}`.
+
+## Example
+
+```json
+{
+  "generators": {
+    "answers": {
+      "provider": "openai",
+      "model": "gpt-5.6-luna",
+      "api_key": "${secret:openai.api_key}",
+      "max_completion_tokens": 1024,
+      "reasoning_effort": "none"
+    }
+  }
+}
+```
+
+## Generation Options
+
+For models that require a completion budget, set `max_completion_tokens`
+instead of `max_tokens`. The budget covers visible output and reasoning tokens,
+and provider token quotas reserve it. The two limits are mutually exclusive;
+`max_tokens` defaults to 256 when neither is set. Antfly does not infer which
+limit a model accepts from its name.
+
+`reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or
+`max`, depending on the model) and sampling options such as `temperature` are
+opt-in and forwarded unchanged. Omit any the selected model does not support.
+These options apply to the `openai` provider only. See the
+[OpenAI Chat Completions reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+for parameter support.
+
+Function tools work with any model that supports function calling; the adapter
+does not make a model tool-capable.
+
+## Extraction
+
+Use `openai` as an extraction provider: name the model and the schema, and
+Antfly runs a generated extractor on that model. As an `extractor` producer on an
+enrichment:
+
+```json
+{
+  "type": "extractor",
+  "config": {
+    "provider": "openai",
+    "model": "gpt-4.1-mini",
+    "api_key": "${secret:openai.api_key}",
+    "schema": {
+      "entities": ["person", "company"],
+      "relations": [{"type": "works_for"}]
+    }
+  }
+}
+```
+
+The schema takes `entities` and `relations`. Admitted model families: `gpt-4o`, `gpt-4.1`, and `gpt-5` (including point releases such as `gpt-5.1`), each with optional `mini` or `nano` tiers and dated snapshots, plus `o3` and `o4-mini`.
+Other models, and task variants such as audio, image, search, or embedding
+models, are rejected when the config is saved. Models in the `gpt-4o` and `gpt-4.1` families score extractions with token log-probabilities; other models use verdict-only scores.
+
+To set instructions, output mode, probabilities, or batching, use the
+generated form instead, which takes the same generator config under
+`generator`:
+
+```json
+{
+  "method": "generated",
+  "generator": {"provider": "openai", "model": "gpt-4.1-mini", "api_key": "${secret:openai.api_key}"},
+  "probabilities": "verdict_only",
+  "instructions": "Only extract people named in the signature block.",
+  "schema": {"entities": ["person"]}
+}
+```
+
+The generated form, with `inputs` added, is also what `/ai/v1/extract` accepts.
+
+## Related
+
+- [Provider rate limits](/docs/guides/providers/rate-limits)
+- [Inference Components and Providers](/docs/guides/inference-providers)

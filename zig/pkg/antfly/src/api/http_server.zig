@@ -4033,7 +4033,7 @@ pub const ApiHttpServer = struct {
     mcp_sessions: mcp.InMemorySessionStore = .{},
     memory_mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
-    inference_sessions: @import("antfly_local_sources").common_provider_registry.gateway.Sessions = .{},
+    inference_sessions: @import("antfly_local_sources").common_inference_gateway.Sessions = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
@@ -18180,6 +18180,7 @@ pub const ApiHttpServer = struct {
         const source = self.table_writes orelse return error.NotFound;
         try ensureTableOperationActive(request);
         const handled = source.reprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
+            error.ReadTransientFailure => return error.InferenceUnavailable,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.InvalidArgument, error.NotFound => return error.NotFound,
             else => {

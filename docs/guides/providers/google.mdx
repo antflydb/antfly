@@ -1,0 +1,102 @@
+---
+title: Google Gemini and Vertex AI
+description: Gemini API and Vertex AI embeddings, generation, reranking, reading, transcription, speech, and web search
+---
+
+Google models are reachable two ways. The `gemini` provider calls the Gemini
+API with an API key. The `vertex` provider calls Vertex AI in your Google Cloud
+project with Google credentials, and also reaches Google's ranking, speech, and
+grounding services.
+
+## What It Provides
+
+| Component | `gemini` | `vertex` | Inputs | Notes |
+|---|:-:|:-:|---|---|
+| Embedder | ✓ | ✓ | Text | For example `gemini-embedding-001`; query and document task types are applied automatically |
+| Reranker | | ✓ | Text | Vertex ranking, default `semantic-ranker-default@latest` |
+| Reader | | ✓ | Images | Gemini vision, default `gemini-2.5-flash` |
+| Transcriber | | ✓ | Audio | Speech-to-Text v2, default model `latest_long` |
+| Speech synthesizer | | ✓ | Text | Cloud Text-to-Speech |
+| Generator | ✓ | ✓ | Text, images, audio, video, PDF (model-dependent) | Streaming and function tools |
+| Web search | | ✓ | Text | See [Web search providers](/docs/guides/providers/web-search) |
+
+Generation sends media as inline data with its MIME type, so a Gemini model
+that accepts audio, video, or PDF input receives it unchanged. Function
+definitions, calls, and results are translated to Google's `generateContent`
+protocol, and response parts such as thought signatures are kept for later turns
+and count toward the agent's context limit.
+
+## Credentials
+
+- `gemini`: `api_key`, defaulting to `GEMINI_API_KEY`.
+- `vertex`: set `project_id` and optionally `location` (default `us-central1`).
+  Credentials come from `credentials_path`, or from Application Default
+  Credentials (`GOOGLE_APPLICATION_CREDENTIALS` or the workload identity of the
+  host).
+
+## Example
+
+```json
+{
+  "generators": {
+    "gemini": {
+      "provider": "gemini",
+      "model": "gemini-2.5-flash",
+      "api_key": "${secret:gemini.api_key}"
+    }
+  },
+  "rerankers": {
+    "vertex-rank": {
+      "provider": "vertex",
+      "project_id": "my-project",
+      "model": "semantic-ranker-default@latest"
+    }
+  }
+}
+```
+
+## Extraction
+
+Use `gemini` as an extraction provider: name the model and the schema, and
+Antfly runs a generated extractor on that model. As an `extractor` producer on an
+enrichment:
+
+```json
+{
+  "type": "extractor",
+  "config": {
+    "provider": "gemini",
+    "model": "gemini-2.5-flash",
+    "api_key": "${secret:gemini.api_key}",
+    "schema": {
+      "entities": ["person", "company"],
+      "relations": [{"type": "works_for"}]
+    }
+  }
+}
+```
+
+The schema takes `entities` and `relations`. Admitted model families: Gemini 2.0, 2.5, and 3 in `flash`, `flash-lite`, and `pro`, including `-preview` and numbered releases. With `vertex`, add `project_id` and optionally `location` and `credentials_path`.
+Other models, and task variants such as audio, image, search, or embedding
+models, are rejected when the config is saved. Scores are verdict-only.
+
+To set instructions, output mode, probabilities, or batching, use the
+generated form instead, which takes the same generator config under
+`generator`:
+
+```json
+{
+  "method": "generated",
+  "generator": {"provider": "gemini", "model": "gemini-2.5-flash", "api_key": "${secret:gemini.api_key}"},
+  "probabilities": "verdict_only",
+  "instructions": "Only extract people named in the signature block.",
+  "schema": {"entities": ["person"]}
+}
+```
+
+The generated form, with `inputs` added, is also what `/ai/v1/extract` accepts.
+
+## Related
+
+- [Provider rate limits](/docs/guides/providers/rate-limits)
+- [Inference Components and Providers](/docs/guides/inference-providers)
