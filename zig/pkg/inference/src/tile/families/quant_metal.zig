@@ -22,9 +22,9 @@ const gemv = @import("../quant_metal_gemv.zig");
 const q4_0 = @import("../quant_metal_q4_0.zig");
 const dense = @import("../quant_metal_dense.zig");
 const q4_k = @import("../quant_metal_q4_k.zig");
+const q8_0 = @import("../quant_metal_q8_0.zig");
 
 pub const regions = [_]Region{
-    msl.raw("rows", @import("../quant_metal_rows.zig").region()),
     msl.metal("q4_0_shared", wrap.q4_0Shared()),
     msl.metal("q4_0_mmv_pair", wrap.q4_0PairActivation() ++ .{
         msl.comment(&.{ "A4B shared-FFN candidate: NQ8 gives the 88-block K axis exact", "eight-way striping instead of the NQ16 6/5-iteration tail." }),
@@ -45,12 +45,12 @@ pub const regions = [_]Region{
     msl.metal("q8_0_pair_activation_mm_sg_v2", &wrap.q8_0_pair_activation_mm_sg_v2),
     msl.metal("q8_0_pair_linear_r_ext", wrap.q8_0_pair_linear_r_ext),
     msl.metal("q8_0_pair_activation_multiply_r_ext", wrap.q8_0_pair_activation_multiply_r_ext),
-    msl.metal("q4_0_pair_activation_multiply_r_ext", wrap.q4_0_pair_activation_multiply_r_ext),
+    msl.metal("q8_0_pair_activation", &[_]msl.Item{q8_0.pair_reduce4} ++ q8_0.pair_ext1r),
+    msl.metal("q8_0_activation_rhs_rows", wrap.q4_0_pair_activation_multiply_r_ext ++ .{ q8_0.rhs_ext1r, q8_0.rhs_reduce4 } ++ @import("../quant_metal_rows.zig").items() ++ .{ gemv.scalar("q8_k"), gemv.reduce("q8_k") }),
     msl.metal("q6_k_nbodd", wrap.q6_kNbOdd()),
     msl.metal("gemv_q1_0", &.{ gemv.scalar("q1_0"), gemv.scalar("i8_s"), gemv.scalar("q4_0") }),
     msl.metal("gemv_q8_0", &.{gemv.scalar("q8_0")}),
     msl.metal("gemv_q8_1", &[_]msl.Item{ gemv.scalar("q8_1"), gemv.reduce("q8_1") } ++ gemv.q8_0_mmv),
-    msl.metal("gemv_q8_k", &.{ gemv.scalar("q8_k"), gemv.reduce("q8_k") }),
     msl.metal("gemv_q2_k", &.{ gemv.scalar("q2_k"), gemv.scalar("q3_k"), gemv.scalar("q4_k"), q4_k.linear }),
     msl.metal("q4_k_pair", &[_]msl.Item{q4_k.pair_linear} ++ q4_k.pair_activation ++ .{gemv.scalar("q5_k")}),
     msl.metal("gemv_q6_k", &.{gemv.scalar("q6_k")}),

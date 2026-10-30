@@ -139,15 +139,15 @@ fn quant(comptime f: Format, comptime name: []const u8, comptime index: []const 
     , .{ .index = index, .mask = f.qk - 1, .qk = f.qk, .body = f.quantize });
 }
 
-pub fn region() []const u8 {
+pub fn items() []const msl.Item {
     comptime {
-        var items: []const msl.Item = &.{};
-        for (formats) |f| items = items ++ .{
+        var out: []const msl.Item = &.{};
+        for (formats) |f| out = out ++ .{
             msl.msl(dequant(f, "get_rows", "ids[row]", &.{ "device const uchar *weight", "device const uint *ids", "device float *output", params, "gid" })),
             msl.msl(quant(f, "set_rows", "ids[row]", &.{ "device const float *input", "device const uint *ids", "device uchar *weight", params, "gid" })),
             msl.msl(dequant(f, "cpy_q_to_f32", "p.row_offset + row", &.{ "device const uchar *weight", "device float *output", params, "gid" })),
             msl.msl(quant(f, "cpy_f32_to_q", "p.row_offset + row", &.{ "device const float *input", "device uchar *weight", params, "gid" })),
         };
-        return msl.region(items);
+        return out;
     }
 }

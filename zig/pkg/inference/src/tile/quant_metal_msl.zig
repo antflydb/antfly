@@ -172,8 +172,3 @@ fn escape(comptime s: []const u8) []const u8 {
 pub fn metal(comptime name: []const u8, comptime items: []const Item) r.Region {
     return r.metal("quant_metal." ++ name, region(items));
 }
-
-/// A Metal region of family `quant_metal.<name>` with prerendered text.
-pub fn raw(comptime name: []const u8, comptime data: []const u8) r.Region {
-    return r.metal("quant_metal." ++ name, data);
-}
