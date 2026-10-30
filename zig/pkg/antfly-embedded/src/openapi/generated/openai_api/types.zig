@@ -5320,6 +5320,35 @@ pub const ConversationResource = struct {
     metadata: std.json.Value,
     /// The time at which the conversation was created, measured in seconds since the Unix epoch.
     created_at: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "metadata", "metadata", false },
+        .{ "created_at", "created_at", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("metadata");
+        try jw.write(self.metadata);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.endObject();
+    }
 };
 
 /// An x/y coordinate pair, e.g. `{ x: 100, y: 200 }`.

@@ -648,12 +648,12 @@ pub const Llama3370BInstructFp8FastInput = std.json.Value;
 
 pub const Llama3370BInstructFp8FastInputVariant0ResponseFormat = struct {
     type: ?[]const u8 = null,
-    json_schema: ?std.json.Value = null,
+    json_schema: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "type", "type", true },
-        .{ "json_schema", "json_schema", true },
+        .{ "json_schema", "json_schema", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -670,9 +670,16 @@ pub const Llama3370BInstructFp8FastInputVariant0ResponseFormat = struct {
             try jw.objectField("type");
             try jw.write(value);
         }
-        if (self.json_schema) |value| {
-            try jw.objectField("json_schema");
-            try jw.write(value);
+        switch (self.json_schema) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("json_schema");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("json_schema");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -725,12 +732,12 @@ pub const Llama3370BInstructFp8FastInputVariant1MessagesItemContentVariant1Item 
 
 pub const Llama3370BInstructFp8FastInputVariant1ResponseFormat = struct {
     type: ?[]const u8 = null,
-    json_schema: ?std.json.Value = null,
+    json_schema: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "type", "type", true },
-        .{ "json_schema", "json_schema", true },
+        .{ "json_schema", "json_schema", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -747,9 +754,16 @@ pub const Llama3370BInstructFp8FastInputVariant1ResponseFormat = struct {
             try jw.objectField("type");
             try jw.write(value);
         }
-        if (self.json_schema) |value| {
-            try jw.objectField("json_schema");
-            try jw.write(value);
+        switch (self.json_schema) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("json_schema");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("json_schema");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -964,12 +978,12 @@ pub const Llama3370BInstructFp8FastInputVariant2RequestsItem = struct {
 
 pub const Llama3370BInstructFp8FastInputVariant2RequestsItemResponseFormat = struct {
     type: ?[]const u8 = null,
-    json_schema: ?std.json.Value = null,
+    json_schema: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "type", "type", true },
-        .{ "json_schema", "json_schema", true },
+        .{ "json_schema", "json_schema", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -986,9 +1000,16 @@ pub const Llama3370BInstructFp8FastInputVariant2RequestsItemResponseFormat = str
             try jw.objectField("type");
             try jw.write(value);
         }
-        if (self.json_schema) |value| {
-            try jw.objectField("json_schema");
-            try jw.write(value);
+        switch (self.json_schema) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("json_schema");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("json_schema");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -1650,12 +1671,12 @@ pub const Qwen330BA3BFp8Input = std.json.Value;
 
 pub const Qwen330BA3BFp8InputVariant0ResponseFormat = struct {
     type: ?[]const u8 = null,
-    json_schema: ?std.json.Value = null,
+    json_schema: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "type", "type", true },
-        .{ "json_schema", "json_schema", true },
+        .{ "json_schema", "json_schema", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1672,9 +1693,16 @@ pub const Qwen330BA3BFp8InputVariant0ResponseFormat = struct {
             try jw.objectField("type");
             try jw.write(value);
         }
-        if (self.json_schema) |value| {
-            try jw.objectField("json_schema");
-            try jw.write(value);
+        switch (self.json_schema) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("json_schema");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("json_schema");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -1727,12 +1755,12 @@ pub const Qwen330BA3BFp8InputVariant1MessagesItemContentVariant1Item = struct {
 
 pub const Qwen330BA3BFp8InputVariant1ResponseFormat = struct {
     type: ?[]const u8 = null,
-    json_schema: ?std.json.Value = null,
+    json_schema: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "type", "type", true },
-        .{ "json_schema", "json_schema", true },
+        .{ "json_schema", "json_schema", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1749,9 +1777,16 @@ pub const Qwen330BA3BFp8InputVariant1ResponseFormat = struct {
             try jw.objectField("type");
             try jw.write(value);
         }
-        if (self.json_schema) |value| {
-            try jw.objectField("json_schema");
-            try jw.write(value);
+        switch (self.json_schema) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("json_schema");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("json_schema");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -1848,12 +1883,12 @@ pub const Qwen330BA3BFp8InputVariant2 = struct {
 
 pub const Qwen330BA3BFp8InputVariant2RequestsItemVariant0ResponseFormat = struct {
     type: ?[]const u8 = null,
-    json_schema: ?std.json.Value = null,
+    json_schema: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "type", "type", true },
-        .{ "json_schema", "json_schema", true },
+        .{ "json_schema", "json_schema", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1870,9 +1905,16 @@ pub const Qwen330BA3BFp8InputVariant2RequestsItemVariant0ResponseFormat = struct
             try jw.objectField("type");
             try jw.write(value);
         }
-        if (self.json_schema) |value| {
-            try jw.objectField("json_schema");
-            try jw.write(value);
+        switch (self.json_schema) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("json_schema");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("json_schema");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -1925,12 +1967,12 @@ pub const Qwen330BA3BFp8InputVariant2RequestsItemVariant1MessagesItemContentVari
 
 pub const Qwen330BA3BFp8InputVariant2RequestsItemVariant1ResponseFormat = struct {
     type: ?[]const u8 = null,
-    json_schema: ?std.json.Value = null,
+    json_schema: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "type", "type", true },
-        .{ "json_schema", "json_schema", true },
+        .{ "json_schema", "json_schema", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1947,9 +1989,16 @@ pub const Qwen330BA3BFp8InputVariant2RequestsItemVariant1ResponseFormat = struct
             try jw.objectField("type");
             try jw.write(value);
         }
-        if (self.json_schema) |value| {
-            try jw.objectField("json_schema");
-            try jw.write(value);
+        switch (self.json_schema) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("json_schema");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("json_schema");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
