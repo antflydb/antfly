@@ -123,7 +123,8 @@ def run(args):
             )
         if "large_proof_numbers" not in db.list_tables():
             db.sql("CREATE TABLE large_proof_numbers (n BIGINT)")
-        sql_key = "measured-" + str(time.time_ns())
+        run_nonce = time.time_ns()
+        sql_key = "measured-" + str(run_nonce)
         before = measurement_stats(db)
         emit(
             kind="seeded",
@@ -133,7 +134,12 @@ def run(args):
             stats=db.stats(),
         )
         operations = (
-            ("batch", lambda: db.batch_json({"inserts": {"measured": {"value": 1}}})),
+            (
+                "batch",
+                lambda: db.batch_json(
+                    {"inserts": {"measured": {"value": 1, "nonce": run_nonce}}}
+                ),
+            ),
             (
                 "sql",
                 lambda: db.sql(
@@ -165,6 +171,11 @@ def run(args):
                     hashlib.sha256(value["payload"].encode()).hexdigest()
                     == first_digest
                 )
+            if name == "sql":
+                rows = db.sql(
+                    "SELECT n FROM large_proof_numbers WHERE _id=$1", [sql_key]
+                )["rows"]
+                assert len(rows) == 1 and int(rows[0][0]) == 7
             assert db.lookup("foreign")["sequence"] == sequence
             after = measurement_stats(db)
             if (
@@ -175,6 +186,7 @@ def run(args):
             emit(
                 kind="operation",
                 operation=name,
+                sql_key=sql_key if name == "sql" else None,
                 status="ok",
                 busy_timeout_seconds=5,
                 proof_required=name != "read",
@@ -193,7 +205,13 @@ def run(args):
         emit(kind="integrity", status="ok", result=integrity)
     with af.open(database, busy_timeout=5.0) as db:
         if "batch" in args.operations:
-            assert db.lookup("measured")["value"] == 1
+            measured = db.lookup("measured")
+            assert measured["value"] == 1 and measured["nonce"] == run_nonce
+        if "sql" in args.operations:
+            rows = db.sql("SELECT n FROM large_proof_numbers WHERE _id=$1", [sql_key])[
+                "rows"
+            ]
+            assert len(rows) == 1 and int(rows[0][0]) == 7
         assert (
             hashlib.sha256(db.lookup("seed-0")["payload"].encode()).hexdigest()
             == first_digest

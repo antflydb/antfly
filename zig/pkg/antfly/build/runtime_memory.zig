@@ -258,7 +258,7 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
         const measured = [_]struct { name: []const u8, mib: usize }{
             .{ .name = test_owner_names.root_unit, .mib = 18_816 },
             .{ .name = test_owner_names.api_storage_authority, .mib = 12_672 },
-            // Native SDK 26.6.2 cold contracts reached 19,145,900,032 bytes
+            // Native macOS 26.6.2 / SDK 27.0 cold contracts reached 19,145,900,032 bytes
             // locally and 18,984,730,624 bytes in the consumer. Reserve the
             // larger peak plus 10%, rounded up to 128 MiB. Qualified local
             // SDK profiles retain their independent claims below.
@@ -325,6 +325,21 @@ pub const TestPartitionProfile = struct {
     /// Caller verified SDK, backend, dependency optimization and instrumentation.
     native_darwin_cpu_debug: bool = false,
 };
+
+/// Keep the independently qualified CPU consumer floor while unqualified
+/// Darwin configurations reserve the larger observed Metal/default footprint.
+pub fn testCompileMaxRssWithProfile(name: []const u8, host: std.Target, target: std.Target, optimize: ?std.lang.Optimize, authored: usize, profile: TestPartitionProfile) usize {
+    if (profile.native_darwin_cpu_debug and host.os.tag == .macos and host.cpu.arch == .aarch64 and
+        target.os.tag == .macos and target.cpu.arch == .aarch64 and optimize == .debug)
+    {
+        const baseline = std.Target.Cpu.baseline(target.cpu.arch, target.os);
+        if (target.cpu.model == baseline.model and target.cpu.features.eql(baseline.features) and
+            target.os.version_range.semver.min.order(host.os.version_range.semver.min) == .eq and
+            std.mem.eql(u8, name, test_owner_names.capi_contract))
+            return @max(authored, 16 * 1024 * 1024 * 1024);
+    }
+    return testCompileMaxRss(name, host, target, optimize, authored);
+}
 
 /// A consumer's measured floor is not the local partition's authored claim.
 /// Qualified physical closures have independent measurements; unqualified
@@ -786,4 +801,16 @@ test "native Linux LLVM fast API covers measured peak and preserves overlap" {
     profile.strip = true;
     profile.sanitize_thread = true;
     try std.testing.expect(runtimeCompileMaxRss(.api_kernel, profile) > claim);
+}
+
+test "qualified Darwin CAPI consumers retain safe overlap without lowering authored claims" {
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .cpu_model = .baseline, .os_tag = .macos });
+    const gib = 1024 * 1024 * 1024;
+    const profile = TestPartitionProfile{ .native_darwin_cpu_debug = true };
+    const qualified = testCompileMaxRssWithProfile(test_owner_names.capi_contract, macos, macos, .debug, 14 * gib, profile);
+    const measured_peak: usize = 15_545_119_176;
+    try std.testing.expect(qualified >= measured_peak + measured_peak / 10);
+    try std.testing.expect(qualified + testCompileMaxRss(test_owner_names.api_storage_authority, macos, macos, .debug, 0) <= 36 * gib * 4 / 5);
+    try std.testing.expectEqual(24 * gib, testCompileMaxRssWithProfile(test_owner_names.capi_contract, macos, macos, .debug, 24 * gib, profile));
+    try std.testing.expect(testCompileMaxRssWithProfile(test_owner_names.capi_contract, macos, macos, .debug, 14 * gib, .{}) > qualified);
 }

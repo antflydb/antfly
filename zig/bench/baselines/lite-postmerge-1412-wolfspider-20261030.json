@@ -9,8 +9,11 @@
     "cpu": "Apple M4 Max",
     "logical_cpus": 14,
     "name": "wolfspider",
+    "os_version": "macOS 26.6.2",
     "ram_bytes": 38654705664,
-    "swap_used_before_and_after_measurements_mib": 542.25
+    "sdk_version": "27.0",
+    "swap_used_before_and_after_measurements_mib": 542.25,
+    "zig_version": "0.17.0"
   },
   "large_graph": {
     "completed_observations": [
@@ -32,7 +35,109 @@
         "status": "ok"
       }
     ],
-    "incomplete_reason": "Subsequent foreign setup returned Busy; resumed SQL must be a mutation and read need not trigger a proof on an unbounded owner.",
+    "continuation": {
+      "exit_code": 0,
+      "observations": [
+        {
+          "elapsed_seconds": 7.5123988329432905,
+          "file_bytes": 3492831232,
+          "kind": "seeded",
+          "retained_payload_bytes": 3019898880
+        },
+        {
+          "attempts": [
+            {
+              "elapsed_seconds": 6.099684125278145,
+              "status": "busy"
+            },
+            {
+              "elapsed_seconds": 11.595632833894342,
+              "status": "busy"
+            },
+            {
+              "elapsed_seconds": 10.870063790585846,
+              "status": "ok"
+            }
+          ],
+          "kind": "foreign_setup",
+          "sequence": 1,
+          "status": "ok"
+        },
+        {
+          "busy_timeout_seconds": 5,
+          "elapsed_seconds": 5.525992624927312,
+          "kind": "operation",
+          "operation": "sql",
+          "proof_failures": 0,
+          "proof_max_ns": 7387321583,
+          "proof_ns": 5501911959,
+          "proof_required": true,
+          "proof_walks": 1,
+          "status": "ok"
+        },
+        {
+          "attempts": [
+            {
+              "elapsed_seconds": 5.570201292168349,
+              "status": "busy"
+            },
+            {
+              "elapsed_seconds": 5.327243874780834,
+              "status": "ok"
+            }
+          ],
+          "kind": "foreign_setup",
+          "sequence": 2,
+          "status": "ok"
+        },
+        {
+          "busy_timeout_seconds": 5,
+          "elapsed_seconds": 0.016900542192161083,
+          "kind": "operation",
+          "operation": "read",
+          "proof_failures": 0,
+          "proof_max_ns": 7387321583,
+          "proof_ns": 0,
+          "proof_required": false,
+          "proof_walks": 0,
+          "status": "ok"
+        },
+        {
+          "kind": "integrity",
+          "result": {
+            "compact_size": 3232149504,
+            "file_size": 3523465216,
+            "issue": null,
+            "live_bytes": 3029556364,
+            "live_file_count": 135873,
+            "reclaimable_bytes": 291315712,
+            "record_count": 135882,
+            "tail_bytes": 0,
+            "valid": true,
+            "valid_prefix_size": 3523465216
+          },
+          "status": "ok"
+        },
+        {
+          "elapsed_seconds": 59.15932787489146,
+          "file_bytes": 3523465216,
+          "kind": "complete",
+          "status": "ok"
+        }
+      ],
+      "scope": "functional qualification under concurrent unit-build load; not isolated throughput comparison",
+      "sql_persistence_readonly_reopen": {
+        "rows": [
+          [
+            "measured-1793389515313673000",
+            "7"
+          ]
+        ],
+        "scope": "separate readonly reopen after successful measured SQL insert",
+        "status": "ok"
+      }
+    },
+    "initial_failure": "Foreign setup returned Busy. The first continuation selected read-only SQL and did not require a proof; the corrected continuation uses a unique foreign write and mutating SQL.",
     "original_exit_code": 1
   },
   "library_sha256": "29aa2f90492d3ded5bfda31ee643b35d7b3bbfc9a54506bf9d8490c53c8e701b",
@@ -9262,6 +9367,9 @@
       "exit_code": 0,
       "source_revision": "e8d6fc11a1bef9bfb5fb640e2c1ecfcbf9d5eca9"
     },
+    "build_reservation_checks": {
+      "passed": 22
+    },
     "contracts": {
       "failed": 0,
       "known_unexpected_logs": 2,
@@ -9270,7 +9378,15 @@
       "passed": 267
     },
     "default_gate": "pending",
-    "full_unit": "running; missing antfly_video in train-fused-chunker command-check identified",
+    "full_unit": "original attempt interrupted after missing antfly_video compile failure; repaired full gate running",
+    "maintenance_fix_contracts": {
+      "failed": 0,
+      "known_unexpected_logs": 2,
+      "leaks": 0,
+      "optional_skips": 3,
+      "passed": 268,
+      "runtime_revision": "ced99336b8"
+    },
     "public_c_api_smoke": {
       "exit_code": 0,
       "exports": 134,
