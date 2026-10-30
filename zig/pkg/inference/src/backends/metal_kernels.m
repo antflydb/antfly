@@ -12113,6 +12113,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint total=p.rows*p.dim;if(gid>=total||p.dim==0u)return;float x=product[gid]+bias[gid%p.dim];output[gid]=0.5f*x*(1.0f+termite_erf_approx(x*0.7071067811865476f));\n"
            "}\n"
            "// GLiNER2.5: all metadata pointers below contain physical int32 values.\n"
+           // tile-codegen:begin model.gliner_boundary family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_gliner_boundary_f32(\n"
            "    device const float *a0 [[buffer(0)]], device const float *a1 [[buffer(1)]],\n"
            "    device const float *a2 [[buffer(2)]], device const float *a3 [[buffer(3)]],\n"
@@ -12407,6 +12408,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    }\n"
            "}\n"
+           // tile-codegen:end model.gliner_boundary family
            "kernel void termite_gliner_word_embeddings_f32(device const float *hidden [[buffer(0)]], device const float *words_mask [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_gliner_word_embeddings_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.batch * p.num_words * p.hidden_size; if (gid >= total || p.seq_len == 0u || p.hidden_size == 0u) return;\n"
            "    uint d = gid % p.hidden_size; uint tmp = gid / p.hidden_size; uint word = tmp % p.num_words; uint b = tmp / p.num_words;\n"
