@@ -8171,9 +8171,9 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
-        const materialized = try coordinator.runGraphMetricPlannedWorkerPageStep("graph_idx", "pagerank", "db-publish-race-materializer");
+        const materialized = try coordinator.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "pagerank", "db-publish-race-materializer");
         try std.testing.expect(materialized.completed_page);
-        const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "pagerank");
+        const publish = try coordinator.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "pagerank");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
         try std.testing.expect(publish.advanced_phase);
 
@@ -8194,7 +8194,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer duplicate_coordinator.close();
 
-        const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "pagerank");
+        const duplicate = try duplicate_coordinator.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "pagerank");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, duplicate.phase);
         try std.testing.expect(!duplicate.advanced_phase);
         try std.testing.expect(!duplicate.published);
@@ -8218,7 +8218,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
 
         var cleanup_finished = false;
         for (0..12) |_| {
-            const cleanup = try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "pagerank", "db-publish-race-cleaner");
+            const cleanup = try worker_db.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "pagerank", "db-publish-race-cleaner");
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, cleanup.phase);
             try std.testing.expect(!cleanup.advanced_phase);
             if (cleanup.published) {
@@ -8382,9 +8382,9 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
-        const materialized = try coordinator.runGraphMetricPlannedWorkerPageStep("graph_idx", "eigenvector", "db-eigenvector-publish-race-materializer");
+        const materialized = try coordinator.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "eigenvector", "db-eigenvector-publish-race-materializer");
         try std.testing.expect(materialized.completed_page);
-        const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
+        const publish = try coordinator.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
         try std.testing.expect(publish.advanced_phase);
 
@@ -8405,7 +8405,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer duplicate_coordinator.close();
 
-        const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
+        const duplicate = try duplicate_coordinator.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, duplicate.phase);
         try std.testing.expect(!duplicate.advanced_phase);
         try std.testing.expect(!duplicate.published);
@@ -8429,7 +8429,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
 
         var cleanup_finished = false;
         for (0..12) |_| {
-            const cleanup = try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "eigenvector", "db-eigenvector-publish-race-cleaner");
+            const cleanup = try worker_db.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "eigenvector", "db-eigenvector-publish-race-cleaner");
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, cleanup.phase);
             try std.testing.expect(!cleanup.advanced_phase);
             if (cleanup.published) {
@@ -8592,9 +8592,9 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
-        const materialized = try coordinator.runGraphMetricPlannedWorkerPageStep("graph_idx", "hits_authority", "db-hits-publish-race-materializer");
+        const materialized = try coordinator.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "hits_authority", "db-hits-publish-race-materializer");
         try std.testing.expect(materialized.completed_page);
-        const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
+        const publish = try coordinator.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
         try std.testing.expect(publish.advanced_phase);
 
@@ -8622,7 +8622,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer duplicate_coordinator.close();
 
-        const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
+        const duplicate = try duplicate_coordinator.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, duplicate.phase);
         try std.testing.expect(!duplicate.advanced_phase);
         try std.testing.expect(!duplicate.published);
@@ -8653,7 +8653,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
 
         var cleanup_finished = false;
         for (0..12) |_| {
-            const cleanup = try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "hits_authority", "db-hits-publish-race-cleaner");
+            const cleanup = try worker_db.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "hits_authority", "db-hits-publish-race-cleaner");
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, cleanup.phase);
             try std.testing.expect(!cleanup.advanced_phase);
             if (cleanup.published) {
