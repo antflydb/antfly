@@ -1,8 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
-// Freeze both original shader factories in ANTFLY_METAL_FAMILY_BASELINE_HEADER.
-// Without a baseline header this is an AA qualification. --bench retains all
-// 31 paired AA/AB/BA samples (32 dispatches), median <=1.05 and p95 <=1.10.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include "../src/backends/metal_kernels.m"
 #ifdef ANTFLY_METAL_FAMILY_BASELINE_HEADER
 #include ANTFLY_METAL_FAMILY_BASELINE_HEADER

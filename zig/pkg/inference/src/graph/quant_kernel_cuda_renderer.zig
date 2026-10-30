@@ -2064,8 +2064,7 @@ pub fn renderAttentionKernel(allocator: std.mem.Allocator, plan: AttentionRender
     return out.toOwnedSlice(allocator);
 }
 
-const flash_prefill_f16_sm89_template_name = "cuda_gqa_flash_prefill_f16_sm89.cuh";
-const flash_prefill_f16_sm89_template = @embedFile("templates/" ++ flash_prefill_f16_sm89_template_name);
+const flash_prefill_f16_sm89_template = @embedFile("templates/cuda_gqa_flash_prefill_f16_sm89.cuh");
 
 pub fn flashPrefillPlanId(plan: FlashPrefillRenderPlan, allocator: std.mem.Allocator) ![]u8 {
     try plan.validate();
@@ -2191,8 +2190,7 @@ pub fn renderFlashPrefillKernel(
     return out.toOwnedSlice(allocator);
 }
 
-const splitk_online_decode_sm89_template_name = "cuda_gqa_decode_splitk_online_sm89.cuh";
-const splitk_online_decode_sm89_template = @embedFile("templates/" ++ splitk_online_decode_sm89_template_name);
+const splitk_online_decode_sm89_template = @embedFile("templates/cuda_gqa_decode_splitk_online_sm89.cuh");
 
 /// Store standalone AOT instantiations as includes of the same native owner
 /// embedded by the JIT. Do not serialize a complete template per geometry.

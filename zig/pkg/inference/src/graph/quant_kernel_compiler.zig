@@ -5388,16 +5388,11 @@ pub fn renderMetalRuntimeCompatibilityAttentionRegion(allocator: std.mem.Allocat
 }
 
 fn encodeMetalRuntimeSource(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    var lines = std.mem.splitScalar(u8, body, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        try out.appendSlice(allocator, "           \"");
-        try out.appendSlice(allocator, line);
-        try out.appendSlice(allocator, "\\n\"\n");
-    }
-    return out.toOwnedSlice(allocator);
+    const encoding = @import("../tile/source_boundary.zig");
+    const policy = encoding.MetalLines{ .skip_empty = true, .terminated_only = false };
+    const result = try allocator.alloc(u8, encoding.metalEncodedSize(body, "           ", policy));
+    encoding.encodeMetal(result, body, "           ", policy);
+    return result;
 }
 
 /// Renders the C launch-shape table + lookup for metal_kernels.m from

@@ -1,9 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
-// Original/candidate and independent F64 qualification for segmented block MMA.
-// Usage: check_metal_segment_blocks --dump-source FROZEN_MAIN.metal
-//        check_metal_segment_blocks FROZEN_MAIN.metal [--bench|--require-source-identity]
-// The required source snapshot must be emitted before changing the program.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #define main antfly_existing_model_family_main
 #include "check_metal_model_families.m"
 #undef main

@@ -1,7 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
-// Shared numerical owner for generated and compatibility paged decode.
-// Zero-mass softmax and max-read synchronization apply to every ABI.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 template<typename Params, uint NT>
 __attribute__((always_inline)) inline void antfly_paged_decode_body(device const float *q , device const uchar *encoded_key , device const uchar *v_bytes , device const uint *block_table , device const float *sinks , device float *output , constant Params &p , threadgroup float *shmem , ushort tid , ushort lane , ushort sgitg , uint2 tg) {
     uint qi = tg.x; uint h = tg.y; if (qi >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || p.num_kv_heads == 0u) return;

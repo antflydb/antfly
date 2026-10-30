@@ -142,12 +142,54 @@ outputs. Original failed receipts remain separate from this follow-up.
 - Independent Metal/CUDA enabled-backend cache identity test passes (230.8 s).
 - Candidate runtime/build source hashes match their frozen input snapshot;
   the updated decoder harness is separately hashed and identical on both sides.
-- Shipping native sources, Tile owners, Metal shader source and all CUDA images
-  remain unchanged from `7bbe576fb2`; no additional kernel-throughput improvement
-  or binary-size reduction is claimed here.
+- Numerical native program bodies and all CUDA images remain unchanged from
+  `7bbe576fb2`. The CI follow-up below changes legal notices and generated source
+  encoding; no kernel-throughput improvement or binary-size reduction is claimed.
 
 Raw qualification receipts, failed experiments, source/binary hashes and Nsight
 profiles are retained under `.benchmark-assets/1166/bl-campaign/`. Physical
 L4/A100 testing remains deferred, and the unpinned CUDA tail result remains a
 qualification limitation. The PR stays draft for review of those limits.
 
+
+## CI follow-up: canonical headers and one source boundary
+
+The first pushed revision failed the automatic license-header check. Canonical
+Apache notices are normalized in 180 inference files with the repository tool;
+non-header bodies were verified unchanged before the targeted generator fixes.
+Two computed CUDA template embed paths are replaced with equivalent literal
+paths so the static dependency audit can resolve them. Their unused filename
+constants are removed; embedded template contents are unchanged.
+
+The generated Tile input manifest and Metal scalar ABI header now use one shared
+canonical notice. The manifest includes the new `tile/source_boundary.zig` owner,
+so both backend qualification identities watch it. That owner also unifies the
+Tile comptime and quant runtime Objective-C string encoders. The old quant
+encoder did not escape quotes/backslashes; full license notices exposed invalid
+Objective-C string literals. Both consumers now share exact-size counting and
+encoding while preserving their existing empty-line and unterminated-line
+policies. No native arithmetic, device call or runtime kernel policy is added.
+
+After regeneration, Objective-C compilation passes. The complete emitted shader
+is identical after comment/whitespace normalization, preserving quoted literals;
+26 changed C/CUDA/MSL files have identical non-comment source and no line-sensitive
+compilation macros. All shipped CUDA binary/PTX images remain byte-identical.
+The source snapshots and model binaries above predate this notice/encoder
+follow-up; identity receipts connect their numerical programs to the final tree.
+No model timing measurement is silently replaced by a later run.
+
+Final follow-up checks pass: both generators, 15 Tile tests, 142 selected
+renderer/compiler/native-source tests, the source-boundary regression in Debug
+and ReleaseFast, and the complete local license workflow (35 dependency-boundary,
+11 header, three provenance and seven asset tests). The regenerated shader also
+passes 52 independent-reference Metal correctness cases and 34 native resource
+comparisons against the frozen shader. Its old byte-identity-only harness guard
+is replaced only in a retained temporary qualification copy, after separately
+proving full non-comment shader identity. No performance timing is taken from
+that modified harness.
+
+The enabled-backend cache identity test passes again (223.3 s), with the new
+shared owner included. Model-explorer's 11 tests pass and all 12 generated files
+remain fresh. Hardware performance claims remain limited to the model and
+fixed-core measurements above; legal/source-encoding changes do not earn kernel
+source-reduction credit.

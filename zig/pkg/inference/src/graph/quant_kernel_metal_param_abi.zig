@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Canonical scalar kernel layouts for C, runtime MSL and standalone lowering.
 //! Only declaration text is generated; dispatch and arithmetic stay native.
@@ -44,7 +56,8 @@ pub const header_path = "src/backends/metal_param_abi.h";
 pub fn renderHeader(allocator: std.mem.Allocator) ![]u8 {
     var e = Emitter{ .allocator = allocator };
     errdefer e.bytes.deinit(allocator);
-    try e.raw("// Copyright 2026 Antfly, Inc.\n// SPDX-License-Identifier: Apache-2.0\n#pragma once\n\n// quant-kernel-codegen:begin scalar Metal ABI (do not edit)\n");
+    try e.raw(@import("../tile/source_boundary.zig").apache_header);
+    try e.raw("#pragma once\n\n// quant-kernel-codegen:begin scalar Metal ABI (do not edit)\n");
     for (spellings) |s| try e.add("#define TERMITE_METAL_ABI_C_{s} {s}\n", .{ s.tag, s.c });
     for (spellings) |s| try e.add("#define TERMITE_METAL_ABI_MSL_{s} \"{s}\"\n", .{ s.tag, s.metal });
     try e.raw(factory);

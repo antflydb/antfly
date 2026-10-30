@@ -47,38 +47,10 @@ pub fn cuda(comptime family: []const u8, comptime data: []const u8) Region {
 pub fn metalLines(comptime indent: []const u8, comptime src: []const u8) []const u8 {
     comptime {
         @setEvalBranchQuota(100_000_000);
-        // Preserve the historical contract: only newline-terminated lines emit.
-        const end = if (std.mem.lastIndexOfScalar(u8, src, '\n')) |last| last + 1 else 0;
-        var size: usize = 0;
-        for (src[0..end]) |ch| size += switch (ch) {
-            '\n' => indent.len + 5,
-            '\\', '"' => 2,
-            else => 1,
-        };
+        const encoding = @import("source_boundary.zig");
+        const size = encoding.metalEncodedSize(src, indent, .{});
         var buffer: [size]u8 = undefined;
-        var cursor: usize = 0;
-        var line_start = true;
-        for (src[0..end]) |ch| {
-            if (line_start) {
-                @memcpy(buffer[cursor..][0..indent.len], indent);
-                cursor += indent.len;
-                buffer[cursor] = '"';
-                cursor += 1;
-                line_start = false;
-            }
-            if (ch == '\n') {
-                @memcpy(buffer[cursor..][0..4], "\\n\"\n");
-                cursor += 4;
-                line_start = true;
-            } else {
-                if (ch == '\\' or ch == '"') {
-                    buffer[cursor] = '\\';
-                    cursor += 1;
-                }
-                buffer[cursor] = ch;
-                cursor += 1;
-            }
-        }
+        encoding.encodeMetal(&buffer, src, indent, .{});
         const result = buffer;
         return &result;
     }
