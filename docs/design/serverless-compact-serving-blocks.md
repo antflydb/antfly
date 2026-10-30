@@ -239,7 +239,7 @@ its performance mechanism. No overall twofold or fourfold p95 result is claimed.
 
 Both traced control/candidate cases record zero failed native outcomes and zero
 resource failure codes. Regressions pass: 449 Node tests, 42 actual-workerd tests,
-one mail integration, 55 focused native checks (one additional live case skips),
+one mail integration, 55 focused native checks (the ordinary suite skips its opt-in scale case),
 the native bootstrap check, and 183 shared object-store tests (two live-provider
 cases skip). Mail retains its pre-existing RPC-result-disposal warning. These
 checks do not establish exhaustive production allocator/provider coverage.
@@ -261,3 +261,13 @@ The hosted gate still requires complete compact/window-indexed diagnostics,
 verbose-archive separation, a short paired provider run using fresh probe/cold
 identities as appropriate, then the original three paired hour trials and 100
 physical-cold epochs. Recovered live `SQLITE_NOMEM` is not declared vendor-fixed.
+
+The separate opt-in 50,000-record native collector regression also passes on the
+committed implementation: 25,000 retained records and receipts survive two
+cycles, cleanup deletes 7,397 objects, and peak operations/step remain 99.
+This is the existing **unpacked** native profile; it does not establish the new
+packed/deferred layout's 50,000-record or hosted behavior. Its log, test source,
+compiled native binary and summary are independently sealed as four artifacts
+(7,383,987 bytes) at
+`dist/qualification/compact-serving-scale-1793349006920/evidence.json`, SHA-256
+`8ab6559cb29a3f57c10e18a173ba63f6cf32686a0d7dcd095af130848e3fde5a`.
