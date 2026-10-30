@@ -15,6 +15,15 @@
 
 //! Generated kernel regions of the `quant_cuda` families.
 
-const Region = @import("../region.zig").Region;
+const r = @import("../region.zig");
+const q = @import("../quant_cuda.zig");
 
-pub const regions = [_]Region{};
+pub const regions = [_]r.Region{
+    r.cuda("quant_cuda.linear_f32_tile", q.wrappers(&q.linear_f32_tile)),
+    r.cuda("quant_cuda.q8_0_tile", q.wrappers(&q.q8_0_tile)),
+    r.cuda("quant_cuda.q4_0_tile", q.wrappers(&q.q4_0_tile)),
+    r.cuda("quant_cuda.tc_hmma", q.wrappers(&q.tc_hmma)),
+    r.cuda("quant_cuda.q4_k_tile", q.wrappers(&q.q4_k_tile)),
+    r.cuda("quant_cuda.q4_0_projections", q.wrappers(&q.q4_0_projections)),
+    r.cuda("quant_cuda.embedding", q.embedding),
+};

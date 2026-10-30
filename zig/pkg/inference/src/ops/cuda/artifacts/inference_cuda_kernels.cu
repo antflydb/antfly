@@ -1192,6 +1192,7 @@ __device__ void termite_linear_bias_f32_tile_rows_cols(
     }
 }
 
+// tile-codegen:begin quant_cuda.linear_f32_tile family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_bias_f32_tile4_r2(
     float* dst,
     const float* input,
@@ -1240,6 +1241,7 @@ extern "C" __global__ void termite_linear_bias_add_f32_tile4_r2(
 ) {
     termite_linear_bias_f32_tile_rows_cols<2u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
 }
+// tile-codegen:end quant_cuda.linear_f32_tile family
 
 extern "C" __global__ void termite_linear_pair_bias_f32_tile4_r2(
     float* dst_a,
@@ -8506,151 +8508,6 @@ __device__ void termite_q8_0_tile_rows_cols_fast(
     }
 }
 
-extern "C" __global__ void termite_linear_q8_0_f32_tile4_r2(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q8_0_tile_rows_cols<2u, 4u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
-}
-
-extern "C" __global__ void termite_linear_q8_0_bias_f32_tile4_r2(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    const float* bias,
-    const float* residual,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q8_0_tile_rows_cols<2u, 4u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
-}
-
-extern "C" __global__ void termite_linear_q8_0_bias_gelu_f32_tile4_r2(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    const float* bias,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q8_0_tile_rows_cols<2u, 4u, 2u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
-}
-
-extern "C" __global__ void termite_linear_q8_0_bias_add_f32_tile4_r2(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    const float* bias,
-    const float* residual,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q8_0_tile_rows_cols<2u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
-}
-
-extern "C" __global__ void termite_linear_q8_0_f32_fast_r2c8(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q8_0_tile_rows_cols_fast<2u, 8u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
-}
-
-extern "C" __global__ void termite_linear_q8_0_bias_f32_fast_r2c8(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    const float* bias,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q8_0_tile_rows_cols_fast<2u, 8u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
-}
-
-extern "C" __global__ void termite_linear_q8_0_bias_gelu_f32_fast_r2c8(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    const float* bias,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q8_0_tile_rows_cols_fast<2u, 8u, 2u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
-}
-
-extern "C" __global__ void termite_linear_q8_0_bias_add_f32_fast_r2c8(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    const float* bias,
-    const float* residual,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q8_0_tile_rows_cols_fast<2u, 8u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
-}
-
-extern "C" __global__ void termite_linear_q8_0_f32_fast_r4c4(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q8_0_tile_rows_cols_fast<4u, 4u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
-}
-
-extern "C" __global__ void termite_linear_q8_0_bias_f32_fast_r4c4(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    const float* bias,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q8_0_tile_rows_cols_fast<4u, 4u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
-}
-
-extern "C" __global__ void termite_linear_q8_0_bias_gelu_f32_fast_r4c4(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    const float* bias,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q8_0_tile_rows_cols_fast<4u, 4u, 2u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
-}
-
-extern "C" __global__ void termite_linear_q8_0_bias_add_f32_fast_r4c4(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    const float* bias,
-    const float* residual,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q8_0_tile_rows_cols_fast<4u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
-}
-
 __device__ __forceinline__ float termite_q4_0_value(const unsigned char* bp, unsigned int lane) {
     unsigned short h = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
     float d = termite_half_to_float(h);
@@ -9052,6 +8909,152 @@ __device__ void termite_q8_0_tile_cols(
     }
 }
 
+// tile-codegen:begin quant_cuda.q8_0_tile family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_linear_q8_0_f32_tile4_r2(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols<2u, 4u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_f32_tile4_r2(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols<2u, 4u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_gelu_f32_tile4_r2(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols<2u, 4u, 2u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_add_f32_tile4_r2(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols<2u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_f32_fast_r2c8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<2u, 8u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_f32_fast_r2c8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<2u, 8u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_gelu_f32_fast_r2c8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<2u, 8u, 2u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_add_f32_fast_r2c8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<2u, 8u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_f32_fast_r4c4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<4u, 4u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_f32_fast_r4c4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<4u, 4u, 1u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_gelu_f32_fast_r4c4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<4u, 4u, 2u>(dst, input, weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q8_0_bias_add_f32_fast_r4c4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q8_0_tile_rows_cols_fast<4u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
+}
+
 extern "C" __global__ void termite_linear_q8_0_f32_tile4(
     float* dst,
     const float* input,
@@ -9062,6 +9065,7 @@ extern "C" __global__ void termite_linear_q8_0_f32_tile4(
 ) {
     termite_q8_0_tile_cols<4u>(dst, input, weight, rows, in_dim, out_dim);
 }
+// tile-codegen:end quant_cuda.q8_0_tile family
 
 extern "C" __global__ void termite_linear_q8_0_gated_down_f32_tile4(
     float* dst,
@@ -9179,17 +9183,6 @@ __device__ void termite_q4_0_tile_cols(
     termite_store_q4_0_cols_warp_sum<COLS>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
 
-extern "C" __global__ void termite_linear_q4_0_f32_tile4(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q4_0_tile_cols<4u>(dst, input, weight, rows, in_dim, out_dim);
-}
-
 extern "C" __global__ void termite_linear_q4_0_f32_tile4_w4(
     float* dst,
     const float* input,
@@ -9283,15 +9276,6 @@ __device__ __forceinline__ void termite_linear_q4_0_q8_1_f32_tile4_impl(
     }
     termite_store_q4_0_cols_warp_sum_warps<4u, Warps>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
-extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4(
-    float* dst,
-    const unsigned char* q8_input,
-    const unsigned char* weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) { termite_linear_q4_0_q8_1_f32_tile4_impl<4u>(dst, q8_input, weight, rows, in_dim, out_dim); }
-
 template <unsigned int RowBlocks, unsigned int Warps>
 __device__ __forceinline__ void termite_linear_q4_0_q8_1_f32_tile4_e4b_impl(
     float* dst,
@@ -9346,27 +9330,6 @@ __device__ __forceinline__ void termite_linear_q4_0_q8_1_f32_tile4_e4b_impl(
         }
     }
 }
-extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_e4b_attn_2048(
-    float* dst,
-    const unsigned char* q8_input,
-    const unsigned char* weight
-) { termite_linear_q4_0_q8_1_f32_tile4_e4b_impl<64u, 4u>(dst, q8_input, weight); }
-
-extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_e4b_attn_4096(
-    float* dst,
-    const unsigned char* q8_input,
-    const unsigned char* weight
-) { termite_linear_q4_0_q8_1_f32_tile4_e4b_impl<128u, 4u>(dst, q8_input, weight); }
-
-extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8(
-    float* dst,
-    const unsigned char* q8_input,
-    const unsigned char* weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) { termite_linear_q4_0_q8_1_f32_tile4_impl<8u>(dst, q8_input, weight, rows, in_dim, out_dim); }
-
 extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows2(
     float* dst,
     const unsigned char* q8_input,
@@ -9589,30 +9552,6 @@ __device__ __forceinline__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows_impl(
         }
     }
 }
-extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows4(
-    float* dst,
-    const unsigned char* q8_input,
-    const unsigned char* weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) { termite_linear_q4_0_q8_1_f32_tile4_w8_rows_impl<4u>(dst, q8_input, weight, rows, in_dim, out_dim); }
-
-extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows8_c4(
-    float* dst,
-    const unsigned char* q8_input,
-    const unsigned char* weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) { termite_linear_q4_0_q8_1_f32_tile4_w8_rows_impl<8u>(dst, q8_input, weight, rows, in_dim, out_dim); }
-
-extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down(
-    float* dst,
-    const unsigned char* q8_input,
-    const unsigned char* weight
-) { termite_linear_q4_0_q8_1_f32_tile4_e4b_impl<320u, 8u>(dst, q8_input, weight); }
-
 extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows(
     float* dst,
     const unsigned char* q8_input,
@@ -9669,12 +9608,6 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows(
     }
 }
 
-extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w10_e4b_down(
-    float* dst,
-    const unsigned char* q8_input,
-    const unsigned char* weight
-) { termite_linear_q4_0_q8_1_f32_tile4_e4b_impl<320u, 10u>(dst, q8_input, weight); }
-
 extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile8(
     float* dst,
     const unsigned char* q8_input,
@@ -9729,17 +9662,6 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile8(
         }
     }
     termite_store_q4_0_cols_warp_sum_warps<8u, 4u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
-}
-
-extern "C" __global__ void termite_linear_q4_0_f32_tile8(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q4_0_tile_cols<8u>(dst, input, weight, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_f32_tile4(
@@ -9986,17 +9908,6 @@ __device__ __forceinline__ void termite_linear_q4_0_gated_down_f32_tile_impl(
     }
     termite_store_q4_0_cols_warp_sum<Cols>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
-extern "C" __global__ void termite_linear_q4_0_gated_down_f32_tile4(
-    float* dst,
-    const float* gate,
-    const float* up,
-    const unsigned char* weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int activation
-) { termite_linear_q4_0_gated_down_f32_tile_impl<4u>(dst, gate, up, weight, rows, in_dim, out_dim, activation); }
-
 extern "C" __global__ void termite_linear_q4_0_gated_down_f32_tile4_w4(
     float* dst,
     const float* gate,
@@ -10038,6 +9949,100 @@ extern "C" __global__ void termite_linear_q4_0_gated_down_f32_tile4_w4(
     termite_store_q4_0_cols_warp_sum_warps<4u, 4u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
 
+// tile-codegen:begin quant_cuda.q4_0_tile family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_linear_q4_0_f32_tile4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4_0_tile_cols<4u>(dst, input, weight, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4(
+    float* dst,
+    const unsigned char* q8_input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) { termite_linear_q4_0_q8_1_f32_tile4_impl<4u>(dst, q8_input, weight, rows, in_dim, out_dim); }
+
+extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_e4b_attn_2048(
+    float* dst,
+    const unsigned char* q8_input,
+    const unsigned char* weight
+) { termite_linear_q4_0_q8_1_f32_tile4_e4b_impl<64u, 4u>(dst, q8_input, weight); }
+
+extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_e4b_attn_4096(
+    float* dst,
+    const unsigned char* q8_input,
+    const unsigned char* weight
+) { termite_linear_q4_0_q8_1_f32_tile4_e4b_impl<128u, 4u>(dst, q8_input, weight); }
+
+extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8(
+    float* dst,
+    const unsigned char* q8_input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) { termite_linear_q4_0_q8_1_f32_tile4_impl<8u>(dst, q8_input, weight, rows, in_dim, out_dim); }
+
+extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows4(
+    float* dst,
+    const unsigned char* q8_input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) { termite_linear_q4_0_q8_1_f32_tile4_w8_rows_impl<4u>(dst, q8_input, weight, rows, in_dim, out_dim); }
+
+extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows8_c4(
+    float* dst,
+    const unsigned char* q8_input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) { termite_linear_q4_0_q8_1_f32_tile4_w8_rows_impl<8u>(dst, q8_input, weight, rows, in_dim, out_dim); }
+
+extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down(
+    float* dst,
+    const unsigned char* q8_input,
+    const unsigned char* weight
+) { termite_linear_q4_0_q8_1_f32_tile4_e4b_impl<320u, 8u>(dst, q8_input, weight); }
+
+extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w10_e4b_down(
+    float* dst,
+    const unsigned char* q8_input,
+    const unsigned char* weight
+) { termite_linear_q4_0_q8_1_f32_tile4_e4b_impl<320u, 10u>(dst, q8_input, weight); }
+
+extern "C" __global__ void termite_linear_q4_0_f32_tile8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4_0_tile_cols<8u>(dst, input, weight, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_0_gated_down_f32_tile4(
+    float* dst,
+    const float* gate,
+    const float* up,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int activation
+) { termite_linear_q4_0_gated_down_f32_tile_impl<4u>(dst, gate, up, weight, rows, in_dim, out_dim, activation); }
+
 extern "C" __global__ void termite_linear_q4_0_gated_down_f32_tile8(
     float* dst,
     const float* gate,
@@ -10059,6 +10064,7 @@ extern "C" __global__ void termite_linear_q4_0_gated_down_f32_tile16(
     unsigned int out_dim,
     unsigned int activation
 ) { termite_linear_q4_0_gated_down_f32_tile_impl<16u>(dst, gate, up, weight, rows, in_dim, out_dim, activation); }
+// tile-codegen:end quant_cuda.q4_0_tile family
 
 __device__ unsigned int termite_q4k_scale(const unsigned char* scales, unsigned int sub) {
     if (sub < 4u) return (unsigned int)(scales[sub] & 63u);
@@ -10437,6 +10443,7 @@ __device__ void termite_qtc_hmma_tile(
     }
 }
 
+// tile-codegen:begin quant_cuda.tc_hmma family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q8_0_f32_tc_hmma(
     float* dst,
     const float* input,
@@ -10707,6 +10714,7 @@ extern "C" __global__ void termite_linear_q4_0_bias_add_f32_tc_hmma_bf16(
     termite_qtc_hmma_tile<3u, TERMITE_QTC_FMT_Q4_0, __nv_bfloat16>(dst, input, packed_weight, bias, residual, rows, in_dim, out_dim);
 #endif
 }
+// tile-codegen:end quant_cuda.tc_hmma family
 
 template <unsigned int COLS, unsigned int MODE>
 __device__ void termite_q4k_tile_cols(
@@ -11030,17 +11038,6 @@ __device__ void termite_q4k_pair_tile_rows_cols(
     }
 }
 
-extern "C" __global__ void termite_linear_q4_k_f32_tile4(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_q4k_tile_cols<4u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
-}
-
 extern "C" __global__ void termite_linear_q6_k_f32_tile4(
     float* dst,
     const float* input,
@@ -11193,6 +11190,18 @@ extern "C" __global__ void termite_linear_q6_k_gated_down_f32_tile4(
             if (col < out_dim) dst[row * out_dim + col] = partial[c][0];
         }
     }
+}
+
+// tile-codegen:begin quant_cuda.q4_k_tile family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_linear_q4_k_f32_tile4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_cols<4u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_k_f32_tile8(
@@ -11471,6 +11480,7 @@ extern "C" __global__ void termite_linear_q4_k_bias_add_f32_tile4(
 ) {
     termite_q4k_tile_cols<4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
 }
+// tile-codegen:end quant_cuda.q4_k_tile family
 
 extern "C" __global__ void termite_linear_q4_k_f32(
     float* dst,
@@ -11852,17 +11862,6 @@ __device__ __forceinline__ void termite_linear_q4_0_pair_nobias_f32_tile_impl(
     }
     termite_store_q4_0_cols_warp_sum<Cols>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
-extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile4(
-    float* dst_a,
-    float* dst_b,
-    const float* input,
-    const unsigned char* weight_a,
-    const unsigned char* weight_b,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) { termite_linear_q4_0_pair_nobias_f32_tile_impl<4u>(dst_a, dst_b, input, weight_a, weight_b, rows, in_dim, out_dim); }
-
 extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile4_w4(
     float* dst_a,
     float* dst_b,
@@ -11976,28 +11975,6 @@ __device__ __forceinline__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile4_i
     }
     termite_store_q4_0_cols_warp_sum_warps<4u, Warps>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
-extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile4(
-    float* dst_a,
-    float* dst_b,
-    const unsigned char* q8_input,
-    const unsigned char* weight_a,
-    const unsigned char* weight_b,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) { termite_linear_q4_0_pair_nobias_q8_1_f32_tile4_impl<4u>(dst_a, dst_b, q8_input, weight_a, weight_b, rows, in_dim, out_dim); }
-
-extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile4_w8(
-    float* dst_a,
-    float* dst_b,
-    const unsigned char* q8_input,
-    const unsigned char* weight_a,
-    const unsigned char* weight_b,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) { termite_linear_q4_0_pair_nobias_q8_1_f32_tile4_impl<8u>(dst_a, dst_b, q8_input, weight_a, weight_b, rows, in_dim, out_dim); }
-
 extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile8(
     float* dst_a,
     float* dst_b,
@@ -12695,22 +12672,6 @@ __device__ __forceinline__ void termite_linear_q4_0_pair_activation_q8_1_f32_til
         }
     }
 }
-extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn(
-    float* dst,
-    const unsigned char* q8_input,
-    const unsigned char* weight_gate,
-    const unsigned char* weight_up,
-    unsigned int activation
-) { termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w_impl<8u>(dst, q8_input, weight_gate, weight_up, activation); }
-
-extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn(
-    float* dst,
-    const unsigned char* q8_input,
-    const unsigned char* weight_gate,
-    const unsigned char* weight_up,
-    unsigned int activation
-) { termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w_impl<5u>(dst, q8_input, weight_gate, weight_up, activation); }
-
 extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn(
     unsigned char* dst_q8,
     const unsigned char* q8_input,
@@ -13451,17 +13412,6 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile8(
     }
 }
 
-extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile8(
-    float* dst_a,
-    float* dst_b,
-    const float* input,
-    const unsigned char* weight_a,
-    const unsigned char* weight_b,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) { termite_linear_q4_0_pair_nobias_f32_tile_impl<8u>(dst_a, dst_b, input, weight_a, weight_b, rows, in_dim, out_dim); }
-
 extern "C" __global__ void termite_linear_q4_k_pair_nobias_f32_tile4(
     float* dst_a,
     float* dst_b,
@@ -13818,30 +13768,6 @@ __device__ __forceinline__ void termite_linear_q4_0_argmax_rows_stage1_tile_impl
         partial_indices[global_tile] = best_index;
     }
 }
-extern "C" __global__ void termite_linear_q4_0_argmax_rows_stage1_tile4(
-    float* partial_values,
-    unsigned int* partial_indices,
-    const float* input,
-    const unsigned char* weight,
-    const int* suppress_token_ids,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int suppress_count
-) { termite_linear_q4_0_argmax_rows_stage1_tile_impl<4u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count); }
-
-extern "C" __global__ void termite_linear_q4_0_argmax_rows_stage1_tile16(
-    float* partial_values,
-    unsigned int* partial_indices,
-    const float* input,
-    const unsigned char* weight,
-    const int* suppress_token_ids,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int suppress_count
-) { termite_linear_q4_0_argmax_rows_stage1_tile_impl<16u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count); }
-
 extern "C" __global__ void termite_linear_q4_k_argmax_rows_stage1_tile4(
     float* partial_values,
     unsigned int* partial_indices,
@@ -13990,42 +13916,6 @@ __device__ __forceinline__ void termite_linear_q6_k_argmax_rows_stage1_tile_impl
         partial_indices[global_tile] = best_index;
     }
 }
-extern "C" __global__ void termite_linear_q6_k_argmax_rows_stage1_tile4(
-    float* partial_values,
-    unsigned int* partial_indices,
-    const float* input,
-    const unsigned char* weight,
-    const int* suppress_token_ids,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int suppress_count
-) { termite_linear_q6_k_argmax_rows_stage1_tile_impl<4u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count); }
-
-extern "C" __global__ void termite_linear_q6_k_argmax_rows_stage1_tile8(
-    float* partial_values,
-    unsigned int* partial_indices,
-    const float* input,
-    const unsigned char* weight,
-    const int* suppress_token_ids,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int suppress_count
-) { termite_linear_q6_k_argmax_rows_stage1_tile_impl<8u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count); }
-
-extern "C" __global__ void termite_linear_q6_k_argmax_rows_stage1_tile16(
-    float* partial_values,
-    unsigned int* partial_indices,
-    const float* input,
-    const unsigned char* weight,
-    const int* suppress_token_ids,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int suppress_count
-) { termite_linear_q6_k_argmax_rows_stage1_tile_impl<16u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count); }
-
 extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8(
     float* partial_values,
     unsigned int* partial_indices,
@@ -14703,20 +14593,6 @@ __device__ __forceinline__ void termite_linear_q4_0_qkv_nobias_f32_tile_impl(
     }
     termite_store_q4_0_cols_warp_sum<Cols>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
-extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile4(
-    float* dst_q,
-    float* dst_k,
-    float* dst_v,
-    const float* input,
-    const unsigned char* weight_q,
-    const unsigned char* weight_k,
-    const unsigned char* weight_v,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int q_out_dim,
-    unsigned int kv_out_dim
-) { termite_linear_q4_0_qkv_nobias_f32_tile_impl<4u>(dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim); }
-
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile4_w4(
     float* dst_q,
     float* dst_k,
@@ -15174,6 +15050,141 @@ extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8(
     termite_store_q4_0_cols_warp_sum_warps<8u, 8u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
 
+// tile-codegen:begin quant_cuda.q4_0_projections family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile4(
+    float* dst_a,
+    float* dst_b,
+    const float* input,
+    const unsigned char* weight_a,
+    const unsigned char* weight_b,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) { termite_linear_q4_0_pair_nobias_f32_tile_impl<4u>(dst_a, dst_b, input, weight_a, weight_b, rows, in_dim, out_dim); }
+
+extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile4(
+    float* dst_a,
+    float* dst_b,
+    const unsigned char* q8_input,
+    const unsigned char* weight_a,
+    const unsigned char* weight_b,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) { termite_linear_q4_0_pair_nobias_q8_1_f32_tile4_impl<4u>(dst_a, dst_b, q8_input, weight_a, weight_b, rows, in_dim, out_dim); }
+
+extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile4_w8(
+    float* dst_a,
+    float* dst_b,
+    const unsigned char* q8_input,
+    const unsigned char* weight_a,
+    const unsigned char* weight_b,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) { termite_linear_q4_0_pair_nobias_q8_1_f32_tile4_impl<8u>(dst_a, dst_b, q8_input, weight_a, weight_b, rows, in_dim, out_dim); }
+
+extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn(
+    float* dst,
+    const unsigned char* q8_input,
+    const unsigned char* weight_gate,
+    const unsigned char* weight_up,
+    unsigned int activation
+) { termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w_impl<8u>(dst, q8_input, weight_gate, weight_up, activation); }
+
+extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn(
+    float* dst,
+    const unsigned char* q8_input,
+    const unsigned char* weight_gate,
+    const unsigned char* weight_up,
+    unsigned int activation
+) { termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w_impl<5u>(dst, q8_input, weight_gate, weight_up, activation); }
+
+extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile8(
+    float* dst_a,
+    float* dst_b,
+    const float* input,
+    const unsigned char* weight_a,
+    const unsigned char* weight_b,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) { termite_linear_q4_0_pair_nobias_f32_tile_impl<8u>(dst_a, dst_b, input, weight_a, weight_b, rows, in_dim, out_dim); }
+
+extern "C" __global__ void termite_linear_q4_0_argmax_rows_stage1_tile4(
+    float* partial_values,
+    unsigned int* partial_indices,
+    const float* input,
+    const unsigned char* weight,
+    const int* suppress_token_ids,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int suppress_count
+) { termite_linear_q4_0_argmax_rows_stage1_tile_impl<4u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count); }
+
+extern "C" __global__ void termite_linear_q4_0_argmax_rows_stage1_tile16(
+    float* partial_values,
+    unsigned int* partial_indices,
+    const float* input,
+    const unsigned char* weight,
+    const int* suppress_token_ids,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int suppress_count
+) { termite_linear_q4_0_argmax_rows_stage1_tile_impl<16u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count); }
+
+extern "C" __global__ void termite_linear_q6_k_argmax_rows_stage1_tile4(
+    float* partial_values,
+    unsigned int* partial_indices,
+    const float* input,
+    const unsigned char* weight,
+    const int* suppress_token_ids,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int suppress_count
+) { termite_linear_q6_k_argmax_rows_stage1_tile_impl<4u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count); }
+
+extern "C" __global__ void termite_linear_q6_k_argmax_rows_stage1_tile8(
+    float* partial_values,
+    unsigned int* partial_indices,
+    const float* input,
+    const unsigned char* weight,
+    const int* suppress_token_ids,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int suppress_count
+) { termite_linear_q6_k_argmax_rows_stage1_tile_impl<8u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count); }
+
+extern "C" __global__ void termite_linear_q6_k_argmax_rows_stage1_tile16(
+    float* partial_values,
+    unsigned int* partial_indices,
+    const float* input,
+    const unsigned char* weight,
+    const int* suppress_token_ids,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int suppress_count
+) { termite_linear_q6_k_argmax_rows_stage1_tile_impl<16u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count); }
+
+extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile4(
+    float* dst_q,
+    float* dst_k,
+    float* dst_v,
+    const float* input,
+    const unsigned char* weight_q,
+    const unsigned char* weight_k,
+    const unsigned char* weight_v,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int q_out_dim,
+    unsigned int kv_out_dim
+) { termite_linear_q4_0_qkv_nobias_f32_tile_impl<4u>(dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim); }
+
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile8(
     float* dst_q,
     float* dst_k,
@@ -15187,6 +15198,7 @@ extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile8(
     unsigned int q_out_dim,
     unsigned int kv_out_dim
 ) { termite_linear_q4_0_qkv_nobias_f32_tile_impl<8u>(dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim); }
+// tile-codegen:end quant_cuda.q4_0_projections family
 
 extern "C" __global__ void termite_linear_q4_k_qkv_nobias_f32_tiled(
     float* dst_q,
@@ -15318,6 +15330,7 @@ extern "C" __global__ void termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled(
     if (tid == 0u) dst[local] = partial[0];
 }
 
+// tile-codegen:begin quant_cuda.embedding family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_embedding_lookup_q4_k_f32(
     float* dst,
     const unsigned char* weight,
@@ -15469,6 +15482,51 @@ extern "C" __global__ void termite_embedding_add_weighted_i32_q6_k_f32(
     dst[idx] = termite_q6k_value(bp, value_index) * lhs_scale + rhs[idx] * rhs_scale;
 }
 
+extern "C" __global__ void termite_embedding_lookup_i32_q8_0_f32(
+    float* dst,
+    const unsigned char* weight,
+    const int* ids,
+    unsigned int total,
+    unsigned int dim,
+    float scale
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int out_row = idx / dim;
+    unsigned int col = idx - out_row * dim;
+    unsigned long long src_row = (unsigned long long)((unsigned int)ids[out_row]);
+    unsigned int row_blocks = dim / 32u;
+    unsigned int block = col / 32u;
+    unsigned int lane = col - block * 32u;
+    const unsigned char* bp = weight + (src_row * row_blocks + block) * 34ull;
+    dst[idx] = termite_q8_0_value(bp, lane) * scale;
+}
+
+extern "C" __global__ void termite_embedding_lookup_i32_q4_0_f32(
+    float* dst,
+    const unsigned char* weight,
+    const int* ids,
+    unsigned int total,
+    unsigned int dim,
+    float scale
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int out_row = idx / dim;
+    unsigned int col = idx - out_row * dim;
+    unsigned long long src_row = (unsigned long long)((unsigned int)ids[out_row]);
+    unsigned int row_blocks = dim / 32u;
+    unsigned int block = col / 32u;
+    unsigned int lane = col - block * 32u;
+    unsigned int q_offset = 2u + (lane & 15u);
+    unsigned int high_nibble = lane >> 4u;
+    const unsigned char* bp = weight + (src_row * row_blocks + block) * 18ull;
+    dst[idx] = termite_q4_0_value_nibble(bp, q_offset, high_nibble) * scale;
+}
+// tile-codegen:end quant_cuda.embedding family
+
 extern "C" __global__ void termite_rms_norm_add_weighted_embedding_i32_q6_k_f32(
     float* dst,
     const float* input,
@@ -15515,50 +15573,6 @@ extern "C" __global__ void termite_rms_norm_add_weighted_embedding_i32_q6_k_f32(
         float normed_value = input[idx] * norm_scale * norm_weight[i];
         dst[idx] = token_value * lhs_scale + normed_value * rhs_scale;
     }
-}
-
-extern "C" __global__ void termite_embedding_lookup_i32_q8_0_f32(
-    float* dst,
-    const unsigned char* weight,
-    const int* ids,
-    unsigned int total,
-    unsigned int dim,
-    float scale
-) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int out_row = idx / dim;
-    unsigned int col = idx - out_row * dim;
-    unsigned long long src_row = (unsigned long long)((unsigned int)ids[out_row]);
-    unsigned int row_blocks = dim / 32u;
-    unsigned int block = col / 32u;
-    unsigned int lane = col - block * 32u;
-    const unsigned char* bp = weight + (src_row * row_blocks + block) * 34ull;
-    dst[idx] = termite_q8_0_value(bp, lane) * scale;
-}
-
-extern "C" __global__ void termite_embedding_lookup_i32_q4_0_f32(
-    float* dst,
-    const unsigned char* weight,
-    const int* ids,
-    unsigned int total,
-    unsigned int dim,
-    float scale
-) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int out_row = idx / dim;
-    unsigned int col = idx - out_row * dim;
-    unsigned long long src_row = (unsigned long long)((unsigned int)ids[out_row]);
-    unsigned int row_blocks = dim / 32u;
-    unsigned int block = col / 32u;
-    unsigned int lane = col - block * 32u;
-    unsigned int q_offset = 2u + (lane & 15u);
-    unsigned int high_nibble = lane >> 4u;
-    const unsigned char* bp = weight + (src_row * row_blocks + block) * 18ull;
-    dst[idx] = termite_q4_0_value_nibble(bp, q_offset, high_nibble) * scale;
 }
 
 __device__ __forceinline__ bool termite_deberta_attention_key_valid(
