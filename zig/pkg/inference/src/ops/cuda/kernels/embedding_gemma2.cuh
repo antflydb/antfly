@@ -1023,6 +1023,7 @@ extern "C" __global__ void termite_embedding_gemma2_training_unpack_bhsd_bf16(
     else ((__nv_bfloat16*)out)[i] = rounded;
 }
 
+// tile-codegen:begin quant_cuda.bshd family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_embedding_gemma2_pack_bshd_bf16_f32(
     float* out, const __nv_bfloat16* input, unsigned int batch,
     unsigned int sequence, unsigned int heads, unsigned int dim) {
@@ -1086,6 +1087,7 @@ extern "C" __global__ void termite_embedding_gemma2_unpack_bhsd_f32_bf16(
     size_t destination = (((size_t)b * sequence + position) * heads + head) * dim + d;
     out[destination] = __float2bfloat16_rn(input[i]);
 }
+// tile-codegen:end quant_cuda.bshd family
 
 // ATen's contiguous vector_norm/SumOps reduction uses four accumulators
 // per lane, then combines lanes in a width-dependent block tree. Squared

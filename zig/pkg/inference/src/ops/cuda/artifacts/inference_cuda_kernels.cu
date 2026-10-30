@@ -1243,7 +1243,6 @@ extern "C" __global__ void termite_linear_bias_add_f32_tile4_r2(
 ) {
     termite_linear_bias_f32_tile_rows_cols<2u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
 }
-// tile-codegen:end quant_cuda.linear_f32_tile family
 
 extern "C" __global__ void termite_linear_pair_bias_f32_tile4_r2(
     float* dst_a,
@@ -1433,6 +1432,7 @@ extern "C" __global__ void termite_linear_triple_bias_f32_tile4_r2(
         }
     }
 }
+// tile-codegen:end quant_cuda.linear_f32_tile family
 
 // tile-codegen:begin rms_norm family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_rms_norm_f32(float* dst, const float* input, const float* weight, unsigned int rows, unsigned int dim, float eps) {

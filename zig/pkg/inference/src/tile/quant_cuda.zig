@@ -145,6 +145,116 @@ pub const linear_f32_tile = [_]Wrapper{
     linear("termite_linear_bias_add_f32_tile4_r2", "termite_linear_bias_f32_tile_rows_cols<2u, 4u, 3u>", "const float* weight", .bias_residual),
 };
 
+/// Two or three f32 projections with bias of the same input, 4 columns x 2
+/// rows per 256-thread block.
+const multi_bias_f32_src =
+    \\extern "C" __global__ void $(name)(
+    \\    float* dst_a,
+    \\    float* dst_b,
+    \\?triple     float* dst_c,
+    \\    const float* input,
+    \\    const float* weight_a,
+    \\    const float* bias_a,
+    \\    const float* weight_b,
+    \\    const float* bias_b,
+    \\?triple     const float* weight_c,
+    \\?triple     const float* bias_c,
+    \\    unsigned int rows,
+    \\    unsigned int in_dim,
+    \\    unsigned int out_dim
+    \\) {
+    \\    unsigned int col_tile = blockIdx.x * 4u;
+    \\    unsigned int row_base = blockIdx.y * 2u;
+    \\    unsigned int tid = threadIdx.x;
+    \\    __shared__ float partial_a[2][4][256];
+    \\    __shared__ float partial_b[2][4][256];
+    \\?triple     __shared__ float partial_c[2][4][256];
+    \\    float acc_a[2][4];
+    \\    float acc_b[2][4];
+    \\?triple     float acc_c[2][4];
+    \\    #pragma unroll
+    \\    for (unsigned int r = 0; r < 2u; ++r) {
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0; c < 4u; ++c) {
+    \\            acc_a[r][c] = 0.0f;
+    \\            acc_b[r][c] = 0.0f;
+    \\?triple             acc_c[r][c] = 0.0f;
+    \\        }
+    \\    }
+    \\
+    \\    for (unsigned int k = tid; k < in_dim; k += 256u) {
+    \\        float x[2];
+    \\        #pragma unroll
+    \\        for (unsigned int r = 0; r < 2u; ++r) {
+    \\            unsigned int row = row_base + r;
+    \\            x[r] = row < rows ? input[row * in_dim + k] : 0.0f;
+    \\        }
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0; c < 4u; ++c) {
+    \\            unsigned int col = col_tile + c;
+    \\            if (col < out_dim) {
+    \\                float wa = weight_a[col * in_dim + k];
+    \\                float wb = weight_b[col * in_dim + k];
+    \\?triple                 float wc = weight_c[col * in_dim + k];
+    \\                #pragma unroll
+    \\                for (unsigned int r = 0; r < 2u; ++r) {
+    \\                    acc_a[r][c] += x[r] * wa;
+    \\                    acc_b[r][c] += x[r] * wb;
+    \\?triple                     acc_c[r][c] += x[r] * wc;
+    \\                }
+    \\            }
+    \\        }
+    \\    }
+    \\
+    \\    #pragma unroll
+    \\    for (unsigned int r = 0; r < 2u; ++r) {
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0; c < 4u; ++c) {
+    \\            partial_a[r][c][tid] = acc_a[r][c];
+    \\            partial_b[r][c][tid] = acc_b[r][c];
+    \\?triple             partial_c[r][c][tid] = acc_c[r][c];
+    \\        }
+    \\    }
+    \\    __syncthreads();
+    \\    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+    \\        if (tid < stride) {
+    \\            #pragma unroll
+    \\            for (unsigned int r = 0; r < 2u; ++r) {
+    \\                #pragma unroll
+    \\                for (unsigned int c = 0; c < 4u; ++c) {
+    \\                    partial_a[r][c][tid] += partial_a[r][c][tid + stride];
+    \\                    partial_b[r][c][tid] += partial_b[r][c][tid + stride];
+    \\?triple                     partial_c[r][c][tid] += partial_c[r][c][tid + stride];
+    \\                }
+    \\            }
+    \\        }
+    \\        __syncthreads();
+    \\    }
+    \\    if (tid == 0u) {
+    \\        #pragma unroll
+    \\        for (unsigned int r = 0; r < 2u; ++r) {
+    \\            unsigned int row = row_base + r;
+    \\            if (row >= rows) continue;
+    \\            #pragma unroll
+    \\            for (unsigned int c = 0; c < 4u; ++c) {
+    \\                unsigned int col = col_tile + c;
+    \\                if (col >= out_dim) continue;
+    \\                unsigned int out_idx = row * out_dim + col;
+    \\                dst_a[out_idx] = partial_a[r][c][0] + bias_a[col];
+    \\                dst_b[out_idx] = partial_b[r][c][0] + bias_b[col];
+    \\?triple                 dst_c[out_idx] = partial_c[r][c][0] + bias_c[col];
+    \\            }
+    \\        }
+    \\    }
+    \\}
+    \\
+;
+
+pub const multi_bias_f32 = fillAll(multi_bias_f32_src, .{
+    .{ .name = "termite_linear_pair_bias_f32_tile4_r2", .triple = false },
+    .{ .name = "termite_linear_triple_bias_f32_tile4_r2", .triple = true },
+});
+
 // ---------------------------------------------------------------- Q8_0
 
 pub const q8_0_tile = [_]Wrapper{
@@ -1179,4 +1289,35 @@ const qkv_q8_1_sig = [_][]const u8{ "float* dst_q", "float* dst_k", "float* dst_
 pub const qkv_q8_1 = fillAll(qkv_q8_1_src, .{
     .{ .name = "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile4", .sig = sigText(&qkv_q8_1_sig), .cols = "4", .bound = "4u" },
     .{ .name = "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8", .sig = sigText(&qkv_q8_1_sig), .cols = "8", .bound = "cols" },
+});
+
+// ---------------------------------------------------------------- BSHD <-> BHSD
+
+/// EmbeddingGemma attention layout moves between [batch, seq, heads, dim]
+/// and [batch, heads, seq, dim] (embedding_gemma2.cuh), one element per
+/// thread: `pack` gathers from BSHD, `unpack` scatters to it.
+const bshd_src =
+    \\extern "C" __global__ void $(name)(
+    \\    $(out)* out, const $(in)* input, unsigned int batch,
+    \\    unsigned int sequence, unsigned int heads, unsigned int dim) {
+    \\    size_t count = (size_t)batch * sequence * heads * dim;
+    \\    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    \\    if (i >= count) return;
+    \\    unsigned int d = i % dim;
+    \\    size_t t = i / dim;
+    \\    unsigned int position = t % sequence;
+    \\    t /= sequence;
+    \\    unsigned int head = t % heads;
+    \\    unsigned int b = t / heads;
+    \\    size_t $(index) = (((size_t)b * sequence + position) * heads + head) * dim + d;
+    \\    $(store);
+    \\}
+    \\
+;
+
+pub const bshd = fillAll(bshd_src, .{
+    .{ .name = "termite_embedding_gemma2_pack_bshd_bf16_f32", .out = "float", .in = "__nv_bfloat16", .index = "source", .store = "out[i] = __bfloat162float(input[source])" },
+    .{ .name = "termite_embedding_gemma2_pack_bshd_f32", .out = "float", .in = "float", .index = "source", .store = "out[i] = input[source]" },
+    .{ .name = "termite_embedding_gemma2_unpack_bhsd_f32", .out = "float", .in = "float", .index = "destination", .store = "out[destination] = input[i]" },
+    .{ .name = "termite_embedding_gemma2_unpack_bhsd_f32_bf16", .out = "__nv_bfloat16", .in = "float", .index = "destination", .store = "out[destination] = __float2bfloat16_rn(input[i])" },
 });

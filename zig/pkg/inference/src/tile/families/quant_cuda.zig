@@ -20,7 +20,7 @@ const q = @import("../quant_cuda.zig");
 
 pub const regions = [_]r.Region{
     r.cuda("quant_cuda.dense_f32", q.dense_f32),
-    r.cuda("quant_cuda.linear_f32_tile", q.wrappers(&q.linear_f32_tile)),
+    r.cuda("quant_cuda.linear_f32_tile", q.wrappers(&q.linear_f32_tile) ++ "\n" ++ q.multi_bias_f32),
     r.cuda("quant_cuda.q8_0_tile", q.wrappers(&q.q8_0_tile)),
     r.cuda("quant_cuda.quantize_q8_1", q.quantize_q8_1),
     r.cuda("quant_cuda.q4_0_tile", q.wrappers(&q.q4_0_tile) ++ "\n" ++ q.q4_0_cols4),
@@ -31,4 +31,5 @@ pub const regions = [_]r.Region{
     r.cuda("quant_cuda.qkv_q8_1", q.qkv_q8_1),
     r.cuda("quant_cuda.q4_0_projections", q.wrappers(&q.q4_0_projections)),
     r.cuda("quant_cuda.embedding", q.embedding),
+    r.region("src/ops/cuda/kernels/embedding_gemma2.cuh", "", "quant_cuda.bshd", q.bshd),
 };
