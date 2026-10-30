@@ -1532,7 +1532,9 @@ const local_catalog_categories = .{ "chunkers", "rerankers", "embedders", "gener
 /// Mark a local catalog listed while public execution is disabled. Entries keep
 /// their compatibility and error; `invocable: false` says public calls will 403.
 fn markLocalCatalogNotInvocable(a: std.mem.Allocator, root: *Json) !void {
-    inline for (local_catalog_categories) |category| {
+    // Local predictors come from this node's ML directory, not connection
+    // transports, and are equally not invocable while disabled.
+    inline for (local_catalog_categories ++ .{"predictors"}) |category| {
         if (root.object.getPtr(category)) |group| if (group.* == .object) {
             for (group.object.values()) |*entry| if (entry.* == .object) {
                 try entry.object.put(a, "invocable", .{ .bool = false });
@@ -1772,6 +1774,7 @@ test "httpx inference gateway lists local models without public execution" {
             return alloc.dupe(u8,
                 \\{"generators":{"acme/demo":{"compatibility":"compatible"}},
                 \\ "extractors":{"acme/broken":{"compatibility":"incompatible","error":{"code":"MissingGlinerSpanEncoderConfig","message":"unreadable"}}},
+                \\ "predictors":{"risk":{"task":"predict","num_features":2,"num_outputs":1}},
                 \\ "object":"list","data":[{"id":"acme/demo","object":"model"}]}
             );
         }
@@ -1794,6 +1797,7 @@ test "httpx inference gateway lists local models without public execution" {
     try std.testing.expectEqualStrings("MissingGlinerSpanEncoderConfig", broken.get("error").?.object.get("code").?.string);
     try std.testing.expect(!broken.get("invocable").?.bool);
     try std.testing.expect(!disabled.object.get("data").?.array.items[0].object.get("invocable").?.bool);
+    try std.testing.expect(!disabled.object.get("predictors").?.object.get("risk").?.object.get("invocable").?.bool);
 
     server.enabled = true;
     const enabled = try localModelCatalog(a, &server);
