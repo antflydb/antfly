@@ -149,7 +149,8 @@ outputs. Original failed receipts remain separate from this follow-up.
 Raw qualification receipts, failed experiments, source/binary hashes and Nsight
 profiles are retained under `.benchmark-assets/1166/bl-campaign/`. Physical
 L4/A100 testing remains deferred, and the unpinned CUDA tail result remains a
-qualification limitation. The PR stays draft for review of those limits.
+qualification limitation. The PR stayed draft at this checkpoint; the BM follow-up
+marks it ready, isolates the Metal defect and records the human CI approval gate.
 
 
 ## CI follow-up: canonical headers and one source boundary

@@ -10217,6 +10217,10 @@ fn copyToPinnedScalarDownloadAndSync(self: *CudaCompute, device: buffer_mod.Devi
 }
 
 fn copyToHostTrackedAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
+    if (bytes.len > device.len) return error.InvalidCudaState;
+    if (bytes.len == 0) return;
+    // Admission precedes every optional staging allocation and driver call.
+    try @import("../../execution/transfer_audit.zig").checkDeviceHostAccess();
     if (self.execution_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
     const tried_pinned_scalar_download = pinnedScalarDownloadEligible(self, bytes);
     if (try copyToPinnedScalarDownloadAndSync(self, device, bytes)) return;
@@ -10231,14 +10235,28 @@ fn copyToHostTrackedAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer,
 // bandwidth (~180MB/s observed for the per-token 1MB logits row). Stage
 // through a reusable pinned buffer instead: pinned DMA + host memcpy is
 // ~10-20x faster for the sampled-decode logits path.
-const pinned_bulk_download_min_bytes: usize = 64 * 1024;
+const pinned_bulk_download_min_bytes: usize = 32 * 1024;
 const pinned_bulk_download_max_bytes: usize = 4 * 1024 * 1024;
 
+fn pinnedBulkDownloadCapacity(bytes: usize) ?usize {
+    if (bytes < pinned_bulk_download_min_bytes or bytes > pinned_bulk_download_max_bytes) return null;
+    return std.math.ceilPowerOfTwoAssert(usize, bytes);
+}
+
 fn copyToPinnedBulkDownloadAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !bool {
-    if (bytes.len < pinned_bulk_download_min_bytes or bytes.len > pinned_bulk_download_max_bytes) return false;
-    if (self.debug_cuda_graph_capture_active) return false;
-    if (self.pinned_bulk_download_buffer.ptr == null) {
-        self.pinned_bulk_download_buffer = buffer_mod.HostBuffer.alloc(&self.ctx, pinned_bulk_download_max_bytes) catch return false;
+    const capacity = pinnedBulkDownloadCapacity(bytes.len) orelse return false;
+    if (self.debug_cuda_graph_capture_active or self.ctx.driver.fns.cuMemFreeHost == null) return false;
+    if (self.pinned_bulk_download_buffer.len < bytes.len) {
+        if (self.pinned_bulk_download_buffer.ptr != null) {
+            // Growth is cold. Complete prior stream users before releasing
+            // staging, including recovery after a failed earlier download.
+            try synchronizeAndDrainDeferredDeviceFrees(self);
+            self.pinned_bulk_download_buffer.freeChecked(&self.ctx) catch return false;
+        }
+        // Retain only the largest required size class, never a fixed 4 MiB
+        // allocation for a modest output. Allocation denial keeps the ordinary
+        // pageable transfer fallback available.
+        self.pinned_bulk_download_buffer = buffer_mod.HostBuffer.alloc(&self.ctx, capacity) catch return false;
     }
     const staging = self.pinned_bulk_download_buffer.bytes()[0..bytes.len];
     const logical = buffer_mod.DeviceBuffer{ .ptr = device.ptr, .len = bytes.len };
@@ -36325,4 +36343,116 @@ test "CUDA grouped projection outputs preserve QKV values and release unavailabl
     const retained = try toFloat32Op(&compute, input, std.testing.allocator);
     defer std.testing.allocator.free(retained);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, retained);
+}
+
+test "CUDA pinned bulk readback capacity is bounded and follows demand" {
+    const Case = struct { bytes: usize, capacity: ?usize };
+    for ([_]Case{
+        .{ .bytes = 0, .capacity = null },
+        .{ .bytes = 32767, .capacity = null },
+        .{ .bytes = 32768, .capacity = 32768 },
+        .{ .bytes = 49152, .capacity = 65536 },
+        .{ .bytes = 65536, .capacity = 65536 },
+        .{ .bytes = 65540, .capacity = 131072 },
+        .{ .bytes = 196608, .capacity = 262144 },
+        .{ .bytes = 4194304, .capacity = 4194304 },
+        .{ .bytes = 4194305, .capacity = null },
+        .{ .bytes = std.math.maxInt(usize), .capacity = null },
+    }) |case| try std.testing.expectEqual(case.capacity, pinnedBulkDownloadCapacity(case.bytes));
+}
+
+test "CUDA pinned bulk readback audit denies before staging or driver access" {
+    const audit = @import("../../execution/transfer_audit.zig");
+    var scope = audit.Audit{ .forbid_device_host_access = true };
+    try audit.begin(&scope);
+    defer audit.end();
+    var bytes: [49152]u8 = undefined;
+    try std.testing.expectError(error.DeviceReadbackForbidden, copyToHostTrackedAndSync(undefined, .{ .ptr = 4096, .len = bytes.len }, &bytes));
+    try std.testing.expectError(error.InvalidCudaState, copyToHostTrackedAndSync(undefined, .{ .ptr = 4096, .len = 1 }, &bytes));
+    try copyToHostTrackedAndSync(undefined, .{ .ptr = 0, .len = 0 }, &.{});
+    try std.testing.expectEqual(@as(u64, 0), scope.download_calls);
+}
+
+test "CUDA pinned bulk readback grows reuses and preserves fallback bytes and guards" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const count = pinned_bulk_download_max_bytes + 4;
+    const source = try a.alloc(u8, count);
+    defer a.free(source);
+    for (source, 0..) |*byte, i| byte.* = @truncate(i *% 37 +% 11);
+    var device = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, count);
+    defer device.free(&compute.ctx);
+    try device.copyFromHost(&compute.ctx, source);
+    const output = try a.alloc(u8, count + 32);
+    defer a.free(output);
+    var previous: ?*anyopaque = null;
+    var previous_capacity: usize = 0;
+    for ([_]usize{ 32768, 49152, 65536, 65540, 196608, 1048576, 4194304, 4194308, 0, 49152 }) |bytes| {
+        @memset(output, 0xa7);
+        const syncs = compute.stats.download_syncs;
+        const pinned = compute.stats.pinned_bulk_downloads;
+        try copyToHostTrackedAndSync(&compute, device, output[0..bytes]);
+        try std.testing.expectEqualSlices(u8, source[0..bytes], output[0..bytes]);
+        for (output[bytes..]) |byte| try std.testing.expectEqual(@as(u8, 0xa7), byte);
+        try std.testing.expectEqual(syncs + @intFromBool(bytes != 0), compute.stats.download_syncs);
+        const eligible = pinnedBulkDownloadCapacity(bytes) != null;
+        try std.testing.expectEqual(pinned + @intFromBool(eligible), compute.stats.pinned_bulk_downloads);
+        const capacity = compute.pinned_bulk_download_buffer.len;
+        if (previous_capacity >= bytes or !eligible) {
+            try std.testing.expectEqual(previous_capacity, capacity);
+            try std.testing.expectEqual(previous, compute.pinned_bulk_download_buffer.ptr);
+        } else try std.testing.expectEqual(pinnedBulkDownloadCapacity(bytes).?, capacity);
+        previous = compute.pinned_bulk_download_buffer.ptr;
+        previous_capacity = capacity;
+    }
+}
+
+test "CUDA pinned bulk readback retains failed frees and falls back on allocation denial" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const source = try a.alloc(u8, 49152);
+    defer a.free(source);
+    for (source, 0..) |*byte, i| byte.* = @truncate(i *% 13 +% 7);
+    var device = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, source.len);
+    defer device.free(&compute.ctx);
+    try device.copyFromHost(&compute.ctx, source);
+    const output = try a.alloc(u8, source.len);
+    defer a.free(output);
+    try copyToHostTrackedAndSync(&compute, device, output[0..32768]);
+    const prior = compute.pinned_bulk_download_buffer;
+    const Fail = struct {
+        fn free(_: ?*anyopaque) callconv(.c) driver_mod.CUresult {
+            return 1;
+        }
+        fn alloc(_: *?*anyopaque, _: usize) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_ERROR_OUT_OF_MEMORY;
+        }
+    };
+    const saved_free = compute.ctx.driver.fns.cuMemFreeHost;
+    const saved_alloc = compute.ctx.driver.fns.cuMemAllocHost;
+    defer compute.ctx.driver.fns.cuMemFreeHost = saved_free;
+    defer compute.ctx.driver.fns.cuMemAllocHost = saved_alloc;
+    compute.ctx.driver.fns.cuMemFreeHost = Fail.free;
+    try copyToHostTrackedAndSync(&compute, device, output);
+    try std.testing.expectEqualSlices(u8, source, output);
+    try std.testing.expectEqual(prior.ptr, compute.pinned_bulk_download_buffer.ptr);
+    try std.testing.expectEqual(prior.len, compute.pinned_bulk_download_buffer.len);
+    compute.ctx.driver.fns.cuMemFreeHost = saved_free;
+    compute.ctx.driver.fns.cuMemAllocHost = Fail.alloc;
+    try copyToHostTrackedAndSync(&compute, device, output);
+    try std.testing.expectEqualSlices(u8, source, output);
+    try std.testing.expectEqual(@as(?*anyopaque, null), compute.pinned_bulk_download_buffer.ptr);
+    compute.ctx.driver.fns.cuMemAllocHost = saved_alloc;
+    compute.ctx.driver.fns.cuMemFreeHost = null;
+    try copyToHostTrackedAndSync(&compute, device, output);
+    try std.testing.expectEqualSlices(u8, source, output);
+    try std.testing.expectEqual(@as(?*anyopaque, null), compute.pinned_bulk_download_buffer.ptr);
+    compute.ctx.driver.fns.cuMemFreeHost = saved_free;
+    try copyToHostTrackedAndSync(&compute, device, output);
+    try std.testing.expectEqualSlices(u8, source, output);
+    try std.testing.expectEqual(@as(usize, 65536), compute.pinned_bulk_download_buffer.len);
 }

@@ -44890,6 +44890,79 @@ test "metal native explicit F32 MPS preference prevents Q8 staging and replaces 
     try std.testing.expectEqual(@as(u64, 0), released.quant_linear_bytes);
 }
 
+test "metal native dense paired projections preserve every prefill row" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const width = 16;
+    const max_rows = 17;
+    const prefix = 7;
+    var inputs: [prefix + max_rows * width]f32 = undefined;
+    for (&inputs, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) / 16;
+    var storage = try testDeviceTensorFromSlice(runtime, &inputs, &.{inputs.len});
+    defer storage.deinit();
+    var stats: ops.NativeQuantTimingStats = .{};
+    for ([_]usize{ 63, 64, 65 }) |columns| {
+        var weights: [2][65 * width]f32 = undefined;
+        var biases: [2][65]f32 = undefined;
+        for (0..2) |slot| {
+            for (weights[slot][0 .. columns * width], 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + slot * 3) % 23)) - 11)) / 32;
+            for (biases[slot][0..columns], 0..) |*value, i| value.* = @as(f32, @floatFromInt(i + slot)) / 64;
+            var weight = try MetalTensor.ownedCloneFrom(weights[slot][0 .. columns * width], &.{ @intCast(columns), width });
+            defer weight.deinit();
+            var bias = try MetalTensor.ownedCloneFrom(biases[slot][0..columns], &.{@intCast(columns)});
+            defer bias.deinit();
+            try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+                .slot = slot,
+                .weight = weight,
+                .bias = bias,
+                .quantized_storage = null,
+                .in_dim = width,
+                .out_dim = columns,
+                .retain_dense_fallback = false,
+            }, &stats));
+            try std.testing.expectEqual(.dense, provider.raw_linear_slot_kinds[slot]);
+        }
+        for ([_]usize{ 1, 2, 8, max_rows }) |rows| {
+            var input = try storage.retainedView(prefix * @sizeOf(f32), rows * width * @sizeOf(f32), &.{ @intCast(rows), width });
+            defer input.deinit();
+            for ([_]bool{ false, true }) |planned| {
+                if (planned) {
+                    try beginFrame(runtime);
+                    try beginPlannedComputeScope(runtime, @backingInt(ComputeSource.dense_linear), .ffn);
+                }
+                defer if (planned and hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+                var pair = (try decoderRuntimeApplyLinearPair(&provider, .{
+                    .slot_a = @as(usize, 0),
+                    .slot_b = @as(usize, 1),
+                    .input = input,
+                    .in_dim = @as(usize, width),
+                    .out_dim = columns,
+                })) orelse return error.UnexpectedNull;
+                defer pair.first.deinit();
+                defer pair.second.deinit();
+                if (planned) {
+                    try endPlannedComputeScope(runtime);
+                    try submitFrame(runtime);
+                    try waitFrame(runtime);
+                }
+                for ([_]*MetalTensor{ &pair.first, &pair.second }, 0..) |output, slot| {
+                    try std.testing.expect(output.isDevice());
+                    const actual = try tensorHostSlice(output);
+                    try std.testing.expectEqual(rows * columns, actual.len);
+                    for (0..rows) |row| for (0..columns) |col| {
+                        var expected: f64 = biases[slot][col];
+                        for (0..width) |k| expected += @as(f64, inputs[prefix + row * width + k]) * weights[slot][col * width + k];
+                        try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), actual[row * columns + col], 1e-5);
+                    };
+                }
+            }
+        }
+    }
+}
+
 test "metal native decoder runtime dense linear and rms-linear preserve device tensors" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
