@@ -63,7 +63,9 @@ if not archive.exists():
         write_batch_size=1,
     )
 assert pq.read_table(archive).to_pydict() == columns
-fixture = bench.import_fixture(shared / "fixture-bounded-pages", [archive], "typed-navigation-v1")
+fixture = bench.import_fixture(
+    shared / "fixture-bounded-pages", [archive], "typed-navigation-v1"
+)
 properties = {
     name: {"type": "string", "x-antfly-field": {"type": "text"}}
     if name == "body"
