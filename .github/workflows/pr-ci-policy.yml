@@ -65,3 +65,7 @@ jobs:
       - name: Test proposed CI policy when present
         if: ${{ hashFiles('.github/scripts/pr-ci.test.cjs') != '' }}
         run: node --test .github/scripts/*.test.cjs
+
+      - name: Test automatic Colony gitlink publisher
+        if: ${{ hashFiles('.github/scripts/test_publish_colony_pin.py') != '' }}
+        run: python3 -B -m unittest discover -s .github/scripts -p 'test_publish_colony_pin.py'
