@@ -52,8 +52,8 @@ ones.
 | `ANTFLY_ENRICHMENT_PDF_SHARED_WINDOW_MAX_PAGES` | 32 | Clamped to 1..128; widens shared render windows only, never a model batch |
 | `ANTFLY_INFERENCE_READ_BATCH_SIZE` (inference) | 8 | Clamped to 1..64; `1` publishes `serial_compatibility`. Shared by the Florence executor and the capability resolver |
 | `ANTFLY_INFERENCE_READ_PROFILE` (inference) | off | Per-page render and OCR batch profile events |
-| OCR `render_dpi` / `render_resolution` | 150 / `"requested_dpi"` | `"model_input"` is an explicit opt-in |
-| OCR `max_rendered_pixels` / `max_rendered_dimension` | 40,000,000 / 4096 | Per-page spatial caps |
+| OCR `render.dpi` / `render.resolution` | 150 / `"requested_dpi"` | `"model_input"` is an explicit opt-in |
+| OCR `render.max_pixels` / `render.max_dimension` | 40,000,000 / 4096 | Per-page spatial caps |
 | Read endpoint images per request (inference) | 64 | Aggregate downloaded input is capped by `ANTFLY_INFERENCE_READ_BATCH_BYTES` (default 256 MiB); decoded-pixel admission also applies. See [`pkg/inference/BATCHING.md`](pkg/inference/BATCHING.md#readerocr-batching) |
 | PDF render lane (`threaded_io_limits.zig`) | 4 workers, queue 8 | 512 MiB window scratch, 2 MiB retained scratch per worker |
 | Lazy PNG representation encode (`encodeParallel`) | 8 jobs | Also capped by the PDF render lane's concurrent capacity; each job holds an admitted scratch grant |
@@ -70,7 +70,7 @@ ones.
 
 ## Quality-preserving rendering and scratch admission
 
-`ocr.render_resolution` defaults to `"requested_dpi"`: render at `render_dpi`
+`ocr.render.resolution` defaults to `"requested_dpi"`: render at `render.dpi`
 subject to the declared spatial caps, then apply the model's preprocessing.
 The explicit `"model_input"` policy permits direct rendering near the model's
 preferred input dimensions. It is an opt-in quality/performance tradeoff, not
@@ -1133,8 +1133,9 @@ caches between threads; changing page or chunk artifact keys.
 ## Current implementation
 
 - Document extraction marks PDF pages with missing or low-quality embedded text
-  `pending_ocr`; born-digital pages that pass quality checks never enter the
-  render scheduler.
+  `pending_ocr` when the `ocr` block names a reader or generator, and
+  `ocr_not_configured` otherwise; born-digital pages that pass quality checks
+  never enter the render scheduler.
 - One heap-owned PDF OCR coordinator lives for the whole document operation.
   Its `PdfRenderSession` discovers the page tree once and refreshes an
   immutable `RenderForkTemplate`; each render worker instantiates a private
@@ -1373,8 +1374,7 @@ or a foreground failure.
 The public `execution` policy carries `batch_items`, `batch_bytes`, and
 `max_document_pages`; per-index embedding policy lives under
 `execution.embedding`. OCR render geometry is part of the document-extraction
-`ocr` config (`render_dpi`, `render_resolution`, `max_rendered_pixels`,
-`max_rendered_dimension`). Render concurrency, in-flight pixels and bytes,
+`ocr.render` config (`dpi`, `resolution`, `max_pixels`, `max_dimension`). Render concurrency, in-flight pixels and bytes,
 prefetch, and shared-window width are operator-only environment settings; they
 are not part of the public API. Every value and its clamp is listed under
 [Limits and defaults](#limits-and-defaults).

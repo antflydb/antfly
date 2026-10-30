@@ -29,12 +29,15 @@ pub fn probeModelDir(allocator: std.mem.Allocator, model_dir: []const u8) !bool 
     return pipeline_mod.probeModelDir(allocator, model_dir);
 }
 
-/// The `/read` prompt is a natural-language question. Absent or blank
-/// prompts become upstream's caption question, "Describe this image.".
+/// `/read` reads text, so absent or blank prompts ask Moondream to transcribe
+/// the image, like every other reader's default task. Other prompts are
+/// natural-language questions passed through as-is.
+pub const default_read_question = "Transcribe all text in this image.";
+
 pub fn question(prompt: ?[]const u8) []const u8 {
-    const raw = prompt orelse return pipeline_mod.default_question;
+    const raw = prompt orelse return default_read_question;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    return if (trimmed.len == 0) pipeline_mod.default_question else trimmed;
+    return if (trimmed.len == 0) default_read_question else trimmed;
 }
 
 pub const LoadedMoondreamReader = struct {
@@ -73,8 +76,8 @@ pub const LoadedMoondreamReader = struct {
     }
 };
 
-test "read question defaults to the caption prompt" {
-    try std.testing.expectEqualStrings("Describe this image.", question(null));
-    try std.testing.expectEqualStrings("Describe this image.", question(" \n"));
+test "read question defaults to transcription" {
+    try std.testing.expectEqualStrings(default_read_question, question(null));
+    try std.testing.expectEqualStrings(default_read_question, question(" \n"));
     try std.testing.expectEqualStrings("What color is it?", question(" What color is it? "));
 }

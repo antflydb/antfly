@@ -239,7 +239,11 @@ test "backup preflight reader sources release allocations at every failure point
             defer result.deinit(a);
         }
     };
-    const a = std.testing.allocator;
+    // JSON arenas can grow/remap in place depending on neighboring heap
+    // allocations. Enumerate the allocate/copy fallback consistently so every
+    // owned image/prompt allocation is faulted, independent of heap placement.
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    const a = backing.allocator();
     for ([_][]const u8{
         "https://example.org/image",
         "\"https://example.org/image\"",

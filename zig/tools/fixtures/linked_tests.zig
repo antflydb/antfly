@@ -19,6 +19,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const native_link = b.option(bool, "native-link", "Use the native archive test linker") orelse false;
+    const early_provider = b.option(bool, "early-provider", "Attach provider metadata before consumer splitting") orelse false;
+    const strip = b.option(bool, "strip", "Qualify the stripped native link profile") orelse false;
     const filters = @import("build_test_filters.zig").select(b.allocator, buildArguments(b) orelse &.{}, &.{"fixture"});
     const error_logs = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/test_error_logs.zig"),
@@ -41,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     consumer_module.addImport("antfly_test_error_logs", error_logs);
+    if (early_provider) consumer_module.linkLibrary(provider);
     if (native_link) @import("antfly_platform").addMacosSdkPaths(b, consumer_module, target);
     consumer_module.addCSourceFile(.{ .file = b.path("consumer.c"), .flags = &.{} });
     const consumer = linked.add(b, .{
@@ -94,6 +97,7 @@ pub fn build(b: *std.Build) void {
         concurrent.dependOn(&child.step);
     }
     if (native_link) linked.finalizeNativeLinks(b);
+    if (strip) @import("build_support/embedded/shared_library.zig").stripBuildGraph(b);
 }
 
 fn buildArguments(b: *std.Build) ?[]const []const u8 {

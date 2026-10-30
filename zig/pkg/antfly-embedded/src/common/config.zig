@@ -507,7 +507,7 @@ pub const Config = struct {
     pub const S3AddressingStyle = enum { path, virtual_hosted };
     pub const BucketProvisioning = enum { require_existing, create_if_missing };
     pub const AwsCredentialSource = enum { default, static, profile, web_identity };
-    pub const GcsCredentialSource = enum { default, bearer_token, service_account };
+    pub const GcsCredentialSource = scraping.GcsCredentialSource;
 
     pub const AwsCredentialConfig = struct {
         source: AwsCredentialSource = .default,
@@ -535,21 +535,7 @@ pub const Config = struct {
         }
     };
 
-    pub const GcsCredentialConfig = struct {
-        source: GcsCredentialSource = .default,
-        bearer_token: ?[]u8 = null,
-        service_account_json: ?[]u8 = null,
-        credentials_path: ?[]u8 = null,
-        scope: ?[]u8 = null,
-
-        pub fn deinit(self: *GcsCredentialConfig, alloc: std.mem.Allocator) void {
-            if (self.bearer_token) |value| alloc.free(value);
-            if (self.service_account_json) |value| alloc.free(value);
-            if (self.credentials_path) |value| alloc.free(value);
-            if (self.scope) |value| alloc.free(value);
-            self.* = undefined;
-        }
-    };
+    pub const GcsCredentialConfig = scraping.GcsCredentialConfig;
 
     pub const ConnectionConfig = struct {
         display_name: ?[]u8 = null,
@@ -1000,10 +986,7 @@ pub const Config = struct {
                 .http_max_body_mb = if (inference.http_max_body_mb) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 10,
                 .pool_size = if (inference.pool_size) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 2,
             } else .{},
-            .remote_content = if (raw_root.get("remote_content")) |remote_content|
-                try parseRemoteContentConfig(alloc, remote_content)
-            else
-                null,
+            .remote_content = try remoteContentForConnections(alloc, raw_root.get("remote_content"), &connections),
             .connections = connections,
             .shard_allocation = .{
                 .default_shards_per_table = try optionalU32Field(root, "default_shards_per_table") orelse if (deployment_mode.supportsLite()) default_standalone_shards_per_table else default_config_shards_per_table,
@@ -1728,6 +1711,37 @@ fn rawOptionalStringField(
     };
 }
 
+fn remoteContentForConnections(
+    alloc: std.mem.Allocator,
+    raw: ?std.json.Value,
+    connections: *const Config.ConnectionsConfig,
+) !?Config.RemoteContentConfig {
+    var result: ?Config.RemoteContentConfig = if (raw) |value| try parseRemoteContentConfig(alloc, value) else null;
+    errdefer if (result) |*cfg| cfg.deinit(alloc);
+    var it = connections.iterator();
+    while (it.next()) |entry| {
+        const connection = entry.value_ptr;
+        if (connection.kind != .external_io) continue;
+        const external = connection.external_io orelse continue;
+        if (external.protocol != .gcs) continue;
+        var fetch_allowed = false;
+        for (connection.capabilities) |capability| if (std.mem.eql(u8, capability, "content.fetch")) {
+            fetch_allowed = true;
+            break;
+        };
+        if (!fetch_allowed) continue;
+        if (result == null) result = .{};
+        try result.?.gcs_connections.put(alloc, entry.key_ptr.*, .{
+            .buckets = external.buckets,
+            .prefix = external.prefix,
+            .project_id = external.project_id,
+            .endpoint = external.endpoint,
+            .credentials = external.gcs_credentials,
+        });
+    }
+    return result;
+}
+
 fn parseRemoteContentConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.RemoteContentConfig {
     const parsed = try std.json.parseFromValue(scraping_openapi.RemoteContentConfig, alloc, value, .{
         .allocate = .alloc_always,
@@ -1796,6 +1810,29 @@ pub fn remoteContentSecurityJsonAlloc(
     defer snapshot.deinit();
     const security = snapshot.config.security orelse scraping.ContentSecurityConfig{};
     return try std.json.Stringify.valueAlloc(alloc, security, .{});
+}
+
+/// Preserve scoped GCS content connections as well as destination policy
+/// across the storage-owner boundary. Secret references stay unresolved until
+/// the destination has passed connection selection and scope validation.
+pub fn remoteContentSnapshotJsonAlloc(
+    alloc: std.mem.Allocator,
+    remote_content: *const scraping.RemoteContentConfig,
+) ![]u8 {
+    var snapshot = try remote_content.acquire();
+    defer snapshot.deinit();
+    const config = snapshot.config;
+    const entries = try alloc.alloc(scraping.RemoteContentSnapshotData.NamedGcsConnection, config.gcs_connections.count());
+    defer alloc.free(entries);
+    var it = config.gcs_connections.iterator();
+    var index: usize = 0;
+    while (it.next()) |entry| : (index += 1) {
+        entries[index] = .{ .name = entry.key_ptr.*, .connection = entry.value_ptr.* };
+    }
+    return try std.json.Stringify.valueAlloc(alloc, scraping.RemoteContentSnapshotData{
+        .security = config.security orelse .{},
+        .gcs_connections = entries,
+    }, .{});
 }
 
 fn parseRemoteContentS3Credential(alloc: std.mem.Allocator, value: std.json.Value) !Config.S3CredentialConfig {
@@ -4100,4 +4137,24 @@ test "common config resources share byte and inference request policy" {
     inline for (.{ "{\"admission\":{}}", "{\"graph_execution\":{}}", "{\"inference\":{\"max_concurrent_requests\":1}}" }) |raw| {
         try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, raw));
     }
+}
+
+test "GCS content views require explicit connection capability and borrow scoped configuration" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"connections":{
+        \\ "fetch":{"kind":"external_io","capabilities":["content.fetch"],"external_io":{"protocol":"gcs","buckets":["originals"],"prefix":"objects/sha256","credentials":{"source":"default"}}},
+        \\ "storage":{"kind":"external_io","capabilities":["objects.read"],"external_io":{"protocol":"gcs","buckets":["private-backups"],"credentials":{"source":"default"}}}
+        \\}}
+    ;
+    var config = try Config.parseFromSlice(a, raw);
+    defer config.deinit();
+    const remote = config.remote_content.?;
+    try std.testing.expectEqual(@as(usize, 1), remote.gcs_connections.count());
+    const view = remote.gcs_connections.get("fetch").?;
+    try std.testing.expectEqualStrings("originals", view.buckets[0]);
+    try std.testing.expectEqualStrings("objects/sha256", view.prefix.?);
+    try std.testing.expectEqual(Config.GcsCredentialSource.default, view.credentials.source);
+    try std.testing.expect(remote.gcs_connections.get("storage") == null);
+    try std.testing.expect(view.prefix.?.ptr == config.connections.get("fetch").?.external_io.?.prefix.?.ptr);
 }

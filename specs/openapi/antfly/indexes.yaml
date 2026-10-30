@@ -191,6 +191,317 @@ components:
               additionalProperties: true
             - $ref: '#/components/schemas/VectorLabelsConfig'
             - $ref: '#/components/schemas/MediaOutputConfig'
+            # Appended last so earlier generated branch names stay unchanged.
+            - $ref: '#/components/schemas/DocumentExtractionConfig'
+    DocumentExtractionConfig:
+      type: object
+      description: |-
+        Configuration for the `document_extraction` producer. It downloads the source URL and persists derived units such as PDF pages, sections, images, and audio.
+
+        Native text (PDF text layers, Office documents, HTML, email, plain text) is extracted with no model. Scanned pages and images are read only when `ocr` names a reader or generator, and audio is transcribed only when `transcription` names a transcriber. Units that need a producer that is not configured report `extraction_status` `ocr_not_configured` or `transcription_not_configured`.
+
+        **Example:**
+        ```json
+        {
+          "source": {"filename_field": "filename", "content_type_field": "mime_type"},
+          "ocr": {"reader": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}},
+          "transcription": {"transcriber": {"provider": "antfly", "model": "openai/whisper-small"}}
+        }
+        ```
+      properties:
+        source:
+          $ref: '#/components/schemas/DocumentExtractionSourceConfig'
+        filename:
+          type: string
+          description: Static filename used for content detection when the row has none.
+        content_type:
+          type: string
+          description: Static content type. Overrides the downloaded response's content type.
+        etag:
+          type: string
+          description: Static ETag recorded as source version metadata.
+        checksum:
+          type: string
+          description: Static checksum recorded as source version metadata.
+        version:
+          type: string
+          description: Static source version. Together with the other metadata it lets extraction skip unchanged sources.
+        last_modified:
+          type: string
+          description: Static last-modified timestamp recorded as source version metadata.
+        credentials:
+          type: string
+          description: Credential reference used to download the source URL.
+        html_strip_tags:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: true
+          description: Strip HTML markup from HTML sources before storing their text.
+        ocr:
+          $ref: '#/components/schemas/DocumentExtractionOcrConfig'
+        transcription:
+          $ref: '#/components/schemas/DocumentExtractionTranscriptionConfig'
+        route_preset:
+          type: string
+          enum: [mixed_files, explicit_only]
+          default: mixed_files
+          description: |-
+            How sources that match no explicit route are handled. `mixed_files` (alias `default`) detects PDFs, HTML, email, Office documents, ZIP archives, images, audio, and text. `explicit_only` (alias `none`) records unmatched sources as unsupported. Detection never requests a producer: detected images and audio without a configured producer report `ocr_not_configured` or `transcription_not_configured`.
+        routes:
+          type: array
+          description: Routes evaluated in order before the preset. The first route whose match applies selects the extractor.
+          items:
+            $ref: '#/components/schemas/DocumentExtractionRoute'
+    DocumentExtractionSourceConfig:
+      type: object
+      description: Names of row fields that carry source metadata. Each overrides the matching static field.
+      properties:
+        filename_field:
+          type: string
+          description: Row field holding the source filename.
+        content_type_field:
+          type: string
+          description: Row field holding the source content type.
+        etag_field:
+          type: string
+          description: Row field holding the source ETag.
+        checksum_field:
+          type: string
+          description: Row field holding the source checksum.
+        version_field:
+          type: string
+          description: Row field holding the source version.
+        last_modified_field:
+          type: string
+          description: Row field holding the source last-modified timestamp.
+    DocumentExtractionRoute:
+      type: object
+      required: [extractor]
+      properties:
+        match:
+          $ref: '#/components/schemas/DocumentExtractionRouteMatch'
+        extractor:
+          type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [pdf, html, text, email, docx, pptx, xlsx, archive, ocr, image, audio, transcript, unsupported]
+              description: |-
+                Extractor for matching sources. `image` is an alias of `ocr` and `transcript` of `audio`. An `ocr` route requires an `ocr` block and an `audio` route requires a `transcription` block; otherwise the configuration is rejected with `DocumentExtractionModelRequired`.
+            unit:
+              type: string
+              description: Unit type recorded for the extracted units, such as `page` or `transcript_segment`.
+    DocumentExtractionRouteMatch:
+      type: object
+      description: Conditions a source must meet. Every condition given must match.
+      properties:
+        content_type:
+          type: string
+          description: Exact content type.
+        content_type_prefix:
+          type: string
+          description: Content type prefix, such as `image/`.
+        extension:
+          description: Filename extension or list of extensions.
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        magic_prefix:
+          description: Leading bytes or list of leading-byte prefixes.
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+    DocumentExtractionOcrConfig:
+      type: object
+      description: |-
+        Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers run their own OCR task; generators receive a transcription instruction.
+      x-antfly-exactly-one-of: [reader, generator]
+      properties:
+        reader:
+          $ref: '#/components/schemas/DocumentExtractionReaderConfig'
+        generator:
+          $ref: '../shared/generating.yaml#/components/schemas/GeneratorConfig'
+        mode:
+          type: string
+          enum: [auto, always]
+          default: auto
+          description: "`auto` reads PDF pages whose native text fails the `quality` checks, and images. `always` reads every page."
+        prompt:
+          type: string
+          description: Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts.
+        render:
+          $ref: '#/components/schemas/DocumentExtractionRenderConfig'
+        quality:
+          $ref: '#/components/schemas/DocumentExtractionOcrQualityConfig'
+    DocumentExtractionReaderConfig:
+      type: object
+      required: [provider]
+      description: |-
+        Reader provider for OCR. Every provider except `apple` requires `model`; Apple uses Vision text recognition and accepts no model, credentials, or prompt.
+      properties:
+        provider:
+          type: string
+          enum: [antfly, openai, cloudflare, vertex, apple]
+        model:
+          type: string
+          description: Reader model, such as `lightonai/LightOnOCR-3-0.8B`.
+        prompt:
+          type: string
+          description: Provider-level prompt. Hosted readers send their own read instruction when it is omitted.
+        max_tokens:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Maximum output tokens per page.
+        api_url:
+          type: string
+          description: Reader endpoint URL.
+        url:
+          type: string
+          description: Reader endpoint URL; takes precedence over `api_url`.
+        base_url:
+          type: string
+          description: Provider API base URL.
+        api_key:
+          type: string
+          description: API key, normally a `${secret:...}` reference.
+        bearer_token:
+          type: string
+          description: Bearer token, normally a `${secret:...}` reference.
+        capability_token:
+          type: string
+          description: Capability token for an Antfly inference endpoint.
+        capability_revision:
+          type: string
+          description: Revision of the capability token.
+        account_id:
+          type: string
+          description: Cloudflare account ID. Required for `cloudflare`.
+        gateway_id:
+          type: string
+          description: Cloudflare AI Gateway ID.
+        project_id:
+          type: string
+          description: Google Cloud project for `vertex`.
+        location:
+          type: string
+          description: Google Cloud location for `vertex`.
+        credentials_path:
+          type: string
+          description: Path to Google Cloud credentials for `vertex`.
+        recognition_languages:
+          type: array
+          maxItems: 16
+          items:
+            type: string
+          description: Apple Vision recognition languages. Defaults to `en-US`.
+        recognition_level:
+          type: string
+          enum: [accurate, fast]
+          default: accurate
+          description: Apple Vision recognition level.
+        uses_language_correction:
+          type: boolean
+          default: false
+          description: Apple Vision language correction.
+    DocumentExtractionRenderConfig:
+      type: object
+      description: How PDF pages are rasterized for OCR.
+      properties:
+        dpi:
+          type: integer
+          minimum: 72
+          maximum: 600
+          default: 150
+          description: Render resolution in dots per inch.
+        resolution:
+          type: string
+          enum: [requested_dpi, model_input]
+          default: requested_dpi
+          description: "`requested_dpi` renders at `dpi` within the caps. `model_input` renders near the model's preferred input size."
+        max_pixels:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 100000000
+          default: 40000000
+          description: Maximum pixels per rendered page.
+        max_dimension:
+          type: integer
+          minimum: 512
+          maximum: 16384
+          default: 4096
+          description: Maximum width or height of a rendered page.
+    DocumentExtractionOcrQualityConfig:
+      type: object
+      description: Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode.
+      properties:
+        min_content_chars:
+          type: integer
+          x-go-type-skip-optional-pointer: false
+          minimum: 0
+          default: 50
+          description: Pages with fewer meaningful characters are read with OCR.
+        garbled_min_words:
+          type: integer
+          x-go-type-skip-optional-pointer: false
+          minimum: 0
+          default: 20
+          description: Minimum words before the garbled-text check applies.
+        garbled_sample_words:
+          type: integer
+          minimum: 1
+          default: 50
+          description: Words sampled by the garbled-text check.
+        max_single_char_word_ratio:
+          type: number
+          x-go-type-skip-optional-pointer: false
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0.4
+          description: Maximum ratio of single-character words before text counts as garbled.
+        substantial_line_min_chars:
+          type: integer
+          minimum: 1
+          default: 15
+          description: Minimum characters for a line to count in the corrupted-line check.
+        max_corrupted_line_ratio:
+          type: number
+          x-go-type-skip-optional-pointer: false
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0.2
+          description: Maximum ratio of corrupted lines.
+        font_corruption_score_threshold:
+          type: number
+          x-go-type-skip-optional-pointer: false
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0.5
+          description: Font corruption score at which text is replaced by OCR.
+        max_replacement_char_ratio:
+          type: number
+          x-go-type-skip-optional-pointer: false
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0.05
+          description: Maximum ratio of Unicode replacement characters.
+    DocumentExtractionTranscriptionConfig:
+      type: object
+      required: [transcriber]
+      description: Transcribes audio units.
+      properties:
+        transcriber:
+          $ref: 'audio.yaml#/components/schemas/STTConfig'
     MediaOutputConfig:
       type: object
       required: [output_name]

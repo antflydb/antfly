@@ -247,13 +247,7 @@ pub fn renderJsonToPartsWithConfig(
     return try template_mod.textToParts(alloc, rendered);
 }
 
-pub fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
-    const directives = try template_mod.parseErrorDirectives(alloc, rendered);
-    defer template_mod.freeErrorDirectives(alloc, directives);
-    if (directives.len == 0) return;
-    if (directives[0].isPermanent()) return RenderError.PermanentPromptFailure;
-    return RenderError.TransientPromptFailure;
-}
+pub const validateRenderedTemplate = @import("template_inspection.zig").validateRenderedTemplate;
 
 fn remoteMediaHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     try beginRemoteHelper(ctx);
@@ -501,10 +495,13 @@ fn credentialName(ctx: hbs.HelperContext) !?[]const u8 {
 fn formatRemoteFetchErrorDirective(alloc: Allocator, err: anyerror) ![]const u8 {
     return switch (err) {
         error.StreamTooLong => try template_mod.formatErrorDirective(alloc, 413, @errorName(err)),
+        error.InvalidGcsUrl => try template_mod.formatErrorDirective(alloc, 400, @errorName(err)),
         error.PathNotAllowed => try template_mod.formatErrorDirective(alloc, 403, @errorName(err)),
         error.HttpCredentialNotFoundOrOutOfScope,
         error.UnsupportedRemoteContentCredential,
         error.CredentialDestinationNotAllowed,
+        error.GcsConnectionNotFoundOrOutOfScope,
+        error.AmbiguousGcsConnection,
         error.S3CredentialNotFoundOrOutOfScope,
         error.InvalidCredentialName,
         => try template_mod.formatErrorDirective(alloc, 403, @errorName(err)),
@@ -528,10 +525,13 @@ fn downloadRemoteContentOutcomeAlloc(
         render_ctx.remote_bytes_remaining,
     );
     resolved.security.max_download_size_bytes = fetch_budget;
-    const outcome = (if (try remoteFetchDownloadContext(render_ctx, &resolved.security)) |download_context|
+    const download_context = try remoteFetchDownloadContext(render_ctx, &resolved.security);
+    const outcome = (if (resolved.gcs_connection) |*connection|
+        gcsDownloadOutcome(render_ctx.alloc, download_context, url, &resolved.security, connection)
+    else if (download_context) |context|
         scraping.downloadContentOutcomeAllocWithHeadersAndContext(
             render_ctx.alloc,
-            download_context,
+            context,
             url,
             &resolved.security,
             if (resolved.s3_credentials) |*creds| creds else null,
@@ -781,9 +781,15 @@ const ResolvedRemoteContentFetchOptions = struct {
     security: scraping.ContentSecurityConfig = remote_fetch_security,
     s3_credentials: ?scraping.S3CredentialsConfig = null,
     http_headers: ?[]scraping.HTTPHeader = null,
+    gcs_connection: ?scraping.GcsContentConnection = null,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         if (self.s3_credentials) |*creds| creds.deinit(alloc);
+        if (self.gcs_connection) |*connection| {
+            connection.credentials.deinit(alloc);
+            if (connection.endpoint) |value| alloc.free(value);
+            if (connection.project_id) |value| alloc.free(value);
+        }
         if (self.http_headers) |headers| {
             for (headers) |header| {
                 alloc.free(@constCast(header.name));
@@ -807,12 +813,22 @@ fn resolveRemoteContentFetchOptions(
         return .{ .security = effectiveRemoteContentSecurity(cfg, null) };
     };
     const cfg = remote_content orelse {
+        if (isUriScheme(parsed, "gs")) return error.GcsConnectionNotFoundOrOutOfScope;
         if (credential_name != null and isUriScheme(parsed, "s3")) return error.S3CredentialNotFoundOrOutOfScope;
         if (credential_name != null and (isUriScheme(parsed, "http") or isUriScheme(parsed, "https"))) {
             return error.HttpCredentialNotFoundOrOutOfScope;
         }
         return .{};
     };
+    if (isUriScheme(parsed, "gs")) {
+        var location = try scraping.parseGcsLocationAlloc(alloc, url);
+        defer location.deinit(alloc);
+        const selected = try selectGcsConnection(cfg, &location, credential_name);
+        return .{
+            .security = effectiveRemoteContentSecurity(cfg, null),
+            .gcs_connection = try resolveGcsConnection(alloc, secret_store, selected),
+        };
+    }
     if (isUriScheme(parsed, "s3")) {
         const selected = try selectS3Credential(alloc, cfg, secret_store, parsed, credential_name);
         if (credential_name != null and selected == null) return error.S3CredentialNotFoundOrOutOfScope;
@@ -834,6 +850,53 @@ fn resolveRemoteContentFetchOptions(
         };
     }
     return .{ .security = effectiveRemoteContentSecurity(cfg, null) };
+}
+
+fn gcsDownloadOutcome(alloc: Allocator, context: ?scraping.DownloadContext, url: []const u8, security: *const scraping.ContentSecurityConfig, connection: *const scraping.GcsContentConnection) !scraping.DownloadOutcome {
+    return .{ .ok = try scraping.downloadGcsContentAlloc(alloc, context, url, security, connection) };
+}
+
+fn selectGcsConnection(cfg: *const scraping.RemoteContentConfig, location: *const scraping.GcsLocation, name: ?[]const u8) !*const scraping.GcsContentConnection {
+    if (name) |explicit| {
+        const connection = cfg.gcs_connections.getPtr(explicit) orelse return error.GcsConnectionNotFoundOrOutOfScope;
+        if (!connection.allows(location)) return error.GcsConnectionNotFoundOrOutOfScope;
+        return connection;
+    }
+    var selected: ?*const scraping.GcsContentConnection = null;
+    var longest: usize = 0;
+    var ambiguous = false;
+    var it = cfg.gcs_connections.iterator();
+    while (it.next()) |entry| {
+        const connection = entry.value_ptr;
+        if (!connection.allows(location)) continue;
+        const length = if (connection.prefix) |prefix| std.mem.trimEnd(u8, prefix, "/").len else 0;
+        if (selected == null or length > longest) {
+            selected = connection;
+            longest = length;
+            ambiguous = false;
+        } else if (length == longest) ambiguous = true;
+    }
+    if (ambiguous) return error.AmbiguousGcsConnection;
+    return selected orelse error.GcsConnectionNotFoundOrOutOfScope;
+}
+
+fn resolveGcsConnection(alloc: Allocator, store: ?*common_secrets.FileStore, source: *const scraping.GcsContentConnection) !scraping.GcsContentConnection {
+    var resolved = source.*;
+    resolved.credentials = .{ .source = source.credentials.source };
+    resolved.endpoint = null;
+    resolved.project_id = null;
+    errdefer {
+        resolved.credentials.deinit(alloc);
+        if (resolved.endpoint) |value| alloc.free(value);
+        if (resolved.project_id) |value| alloc.free(value);
+    }
+    inline for (.{ "bearer_token", "service_account_json", "credentials_path", "scope" }) |field| {
+        if (@field(source.credentials, field)) |value|
+            @field(resolved.credentials, field) = try common_secrets.resolveReferenceOwned(alloc, store, value);
+    }
+    if (source.endpoint) |value| resolved.endpoint = try common_secrets.resolveReferenceOwned(alloc, store, value);
+    if (source.project_id) |value| resolved.project_id = try common_secrets.resolveReferenceOwned(alloc, store, value);
+    return resolved;
 }
 
 fn effectiveRemoteContentSecurity(
@@ -2180,4 +2243,35 @@ test "PDF extract mode emits text even when the media-part limit is exhausted" {
     );
     defer alloc.free(rendered);
     try std.testing.expectEqualStrings("extracted text", rendered);
+}
+
+test "GCS fetch connection scopes fail before resolving secrets and never use ambient fallback" {
+    const a = std.testing.allocator;
+    const buckets = [_][]u8{@constCast("originals")};
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.gcs_connections.deinit(a);
+    try cfg.gcs_connections.put(a, "archive", .{
+        .buckets = &buckets,
+        .prefix = @constCast("objects/sha256"),
+        .credentials = .{ .source = .bearer_token, .bearer_token = @constCast("${secret:missing}") },
+    });
+    for ([_][]const u8{ "gs://another/objects/sha256/doc.pdf", "gs://originals/objects/sha256-other/doc.pdf", "gs://originals/elsewhere/doc.pdf" }) |uri|
+        try std.testing.expectError(error.GcsConnectionNotFoundOrOutOfScope, resolveRemoteContentFetchOptions(a, &cfg, null, uri, "archive"));
+    try std.testing.expectError(error.GcsConnectionNotFoundOrOutOfScope, resolveRemoteContentFetchOptions(a, null, null, "gs://originals/objects/sha256/doc.pdf", null));
+    try std.testing.expectError(error.GcsConnectionNotFoundOrOutOfScope, resolveRemoteContentFetchOptions(a, &cfg, null, "gs://originals/objects/sha256/doc.pdf", "missing"));
+}
+
+test "GCS fetch auto-selection is scoped and ambiguous peers require an explicit name" {
+    const a = std.testing.allocator;
+    const buckets = [_][]u8{@constCast("originals")};
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.gcs_connections.deinit(a);
+    try cfg.gcs_connections.put(a, "broad", .{ .buckets = &buckets, .prefix = @constCast("objects") });
+    try cfg.gcs_connections.put(a, "narrow", .{ .buckets = &buckets, .prefix = @constCast("objects/sha256") });
+    var location = try scraping.parseGcsLocationAlloc(a, "gs://originals/objects/sha256/doc.pdf?generation=123");
+    defer location.deinit(a);
+    try std.testing.expect((try selectGcsConnection(&cfg, &location, null)) == cfg.gcs_connections.getPtr("narrow").?);
+    try cfg.gcs_connections.put(a, "peer", .{ .buckets = &buckets, .prefix = @constCast("objects/sha256") });
+    try std.testing.expectError(error.AmbiguousGcsConnection, selectGcsConnection(&cfg, &location, null));
+    try std.testing.expect((try selectGcsConnection(&cfg, &location, "peer")) == cfg.gcs_connections.getPtr("peer").?);
 }

@@ -454,7 +454,8 @@ def audit_modules(
                 target = entry if imported == "root" else edges.get((module, imported))
                 if target is None or target not in modules:
                     raise ValueError(
-                        f"unresolved module import {imported!r} in {path} (owner {module})"
+                        f"unresolved module import {imported!r} in {path} (owner {module}); "
+                        f"via {' -> '.join(next_chain)}"
                     )
                 pending.append((target, modules[target].resolve(), next_chain))
     return len(visited)
