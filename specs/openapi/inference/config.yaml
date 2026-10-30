@@ -689,6 +689,13 @@ components:
             Whether this artifact can run in the current build. `incompatible`
             artifacts are rejected before load; a model whose directory cannot
             be read is listed as `incompatible` with `error` set.
+        invocable:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          description: |
+            False when this deployment rejects public execution
+            (`public_inference_enabled: false`); the model is installed and
+            listed, but public calls return 403. Omitted when it can be invoked.
         error:
           type: object
           description: Why the model is unusable, set when its directory could not be read. Other models still list.

@@ -1270,6 +1270,8 @@ pub const ModelInfo = struct {
     qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Whether this artifact can run in the current build. `incompatible` artifacts are rejected before load; a model whose directory cannot be read is listed as `incompatible` with `error` set.
     compatibility: ?[]const u8 = null,
+    /// False when this deployment rejects public execution (`public_inference_enabled: false`); the model is installed and listed, but public calls return 403. Omitted when it can be invoked.
+    invocable: ?bool = null,
     /// Why the model is unusable, set when its directory could not be read. Other models still list.
     @"error": ?std.json.Value = null,
     /// List of capabilities this model supports (omitted when empty)
@@ -1281,6 +1283,7 @@ pub const ModelInfo = struct {
     pub const openApiFieldMetadata = .{
         .{ "qualified_limits", "qualified_limits", true },
         .{ "compatibility", "compatibility", true },
+        .{ "invocable", "invocable", true },
         .{ "error", "error", true },
         .{ "capabilities", "capabilities", true },
         .{ "inputs", "inputs", true },
@@ -1302,6 +1305,10 @@ pub const ModelInfo = struct {
         }
         if (self.compatibility) |value| {
             try jw.objectField("compatibility");
+            try jw.write(value);
+        }
+        if (self.invocable) |value| {
+            try jw.objectField("invocable");
             try jw.write(value);
         }
         if (self.@"error") |value| {
