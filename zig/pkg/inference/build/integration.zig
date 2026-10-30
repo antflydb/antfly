@@ -69,6 +69,8 @@ pub fn add(ctx: Context, wasm_jinja: *std.Build.Module, wasm_platform: *std.Buil
     registry_module.addImport("antfly_platform", ctx.graph.platform_mod);
     registry_module.addImport("httpx", ctx.graph.httpx_mod);
     registry_module.addImport("protobuf", ctx.graph.protobuf_mod);
+    registry_module.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
+    registry_module.addImport("antfly_document_runs", ctx.graph.document_runs_mod);
     const registry_tests = ctx.b.addTest(.{ .root_module = registry_module });
     ctx.step("registry-test", "Run Hub snapshot, artifact dependency and download tests").dependOn(&ctx.addRunArtifact(registry_tests).step);
     const bge = benches.createBge(ctx);

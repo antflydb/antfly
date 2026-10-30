@@ -320,3 +320,131 @@ test "embedded inference shared owner funds parked capsules and preserves origin
     try std.testing.expectEqual(@as(usize, 1), refs.count);
     try std.testing.expectEqual(@as(usize, 0), node.scheduler.stats().operations);
 }
+
+test "native model registry planning yields queued query work and preserves every original refusal" {
+    const Clock = struct {
+        var instant: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return instant.load(.acquire);
+        }
+    };
+    const Mode = enum { normal, canceled, deadline, lease };
+    const Probe = struct {
+        state: *owner_module.State,
+        owner: runtime.runnable_abi.Owner,
+        parent: *anyopaque = undefined,
+        io: *const runtime.native_abi.IoBorrow,
+        canceled: std.atomic.Value(bool) = .init(false),
+        query_done: std.atomic.Value(bool) = .init(false),
+        checks: usize = 0,
+        reject_at: usize,
+        mode: Mode,
+        fn checked(status: runtime.error_abi.Status) !void {
+            if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+        }
+        fn cancellation(raw: ?*const anyopaque) callconv(.c) u8 {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return @intFromBool(self.canceled.load(.acquire));
+        }
+        fn query(self: *@This()) anyerror!void {
+            var work: ?*anyopaque = null;
+            try checked(self.owner.start(self.owner.context, &.{ .io = self.io, .class = @backingInt(runtime.runnable_abi.Class.query), .out_handle = &work }));
+            defer self.owner.finish(work.?);
+            self.query_done.store(true, .release);
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == 1) {
+                var control: ?*anyopaque = null;
+                try checked(self.owner.start(self.owner.context, &.{ .io = self.io, .class = @backingInt(runtime.runnable_abi.Class.control), .allow_wait = 0, .out_handle = &control }));
+                self.owner.finish(control.?);
+            }
+            if (self.checks == self.reject_at) switch (self.mode) {
+                .normal => unreachable,
+                .canceled => self.canceled.store(true, .release),
+                .deadline => Clock.instant.store(1000, .release),
+                .lease => return error.ExecutionLeaseLost,
+            };
+            try checked(self.owner.checkpoint(self.parent));
+        }
+    };
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    for (std.enums.values(files.RegistryPlanning)) |kind| {
+        for ([_]bool{ true, false }) |large| {
+            const fixture = try files.registryPlanningFixture(alloc, kind, large);
+            defer alloc.free(fixture);
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const directory = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+            defer alloc.free(directory);
+            if (kind == .receipt) {
+                try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "x" });
+                try tmp.dir.writeFile(io, .{ .sub_path = ".antfly-download-complete.json", .data = fixture });
+            }
+            const input = if (kind == .receipt) directory else fixture;
+            var total_checks: usize = 0;
+            for (std.enums.values(Mode)) |mode| {
+                if (large and mode != .normal) continue;
+                var reject_at: usize = if (mode == .normal) 0 else 1;
+                while (reject_at <= total_checks) : (reject_at += 1) {
+                    Clock.instant.store(0, .release);
+                    var state: owner_module.State = .{ .owner_alloc = alloc, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .checkpoint_budget = 1 }), .native_now_ns = Clock.now };
+                    defer state.owner.tryDeinit() catch @panic("registry planning owner leaked");
+                    const owner = state.port();
+                    const borrow = runtime.native_abi.IoBorrow.init(&io);
+                    var probe: Probe = .{ .state = &state, .owner = owner, .io = &borrow, .reject_at = reject_at, .mode = mode };
+                    var parent: ?*anyopaque = null;
+                    try Probe.checked(owner.start(owner.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.background), .slots = 2, .retained_bytes = input.len, .has_deadline = 1, .native_deadline = 1, .deadline_ns = 1000, .cancellation = .{ .context = &probe, .is_cancelled = Probe.cancellation }, .out_handle = &parent }));
+                    defer if (parent) |value| owner.finish(value);
+                    probe.parent = parent.?;
+                    const retained = state.owner.scheduler.stats().retained_bytes;
+                    var query: ?std.Io.Future(anyerror!void) = null;
+                    defer {
+                        if (query) |*task| _ = task.cancel(io) catch {};
+                    }
+                    if (mode == .normal) {
+                        query = try io.concurrent(Probe.query, .{&probe});
+                        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+                        while (state.owner.scheduler.stats().queued == 0) {
+                            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.TestExpectedQueuedQuery;
+                            try io.sleep(.fromMilliseconds(1), .awake);
+                        }
+                    }
+                    const result = files.testRegistryPlanning(alloc, io, kind, input, &probe, Probe.check);
+                    if (mode == .normal) {
+                        try std.testing.expectEqual(@as(usize, switch (kind) {
+                            .metadata => if (large) 256 else 4,
+                            .safetensors, .onnx => if (large) 32 else 4,
+                            .receipt => 1,
+                        }), try result);
+                        try query.?.await(io);
+                        query = null;
+                        try std.testing.expect(probe.query_done.load(.acquire));
+                        try std.testing.expectEqual(@as(usize, 2), state.owner.scheduler.stats().runnable_slots);
+                        total_checks = probe.checks;
+                        try std.testing.expect(total_checks > (if (large) @as(usize, 8) else 0));
+                    } else {
+                        try std.testing.expectError(switch (mode) {
+                            .canceled => error.Canceled,
+                            .deadline => error.DeadlineExceeded,
+                            .lease => error.ExecutionLeaseLost,
+                            .normal => unreachable,
+                        }, result);
+                        // A one-shot caller refusal must not be polled again and
+                        // mistaken for malformed receipt data or a fresh lifetime.
+                        try std.testing.expectEqual(reject_at, probe.checks);
+                    }
+                    try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().operations);
+                    try std.testing.expectEqual(retained, state.owner.scheduler.stats().retained_bytes);
+                    owner.finish(parent.?);
+                    parent = null;
+                    try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
+                    try std.testing.expectEqual(@as(u64, 0), state.owner.scheduler.stats().retained_bytes);
+                    if (mode == .normal) break;
+                }
+            }
+        }
+    }
+}

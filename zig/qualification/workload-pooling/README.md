@@ -1787,3 +1787,36 @@ qualify deployed model execution or throughput. Framework/vendor construction,
 broader registry preparation, mapped-page faults and wider cross-engine/deployment
 evidence remain in the full goal. The full GNU qualification waiver remains in
 effect. The installed CLI has not been rebuilt for this milestone.
+
+### Interruptible registry decoding
+
+The normal Hub metadata, bundle, shard-index and receipt decoders now borrow the
+existing execution owner through the shared SQL/runtime JSON scanner. Scanner
+refills and owned copies check every 4 KiB, tokens every 64 iterations, and ONNX
+scans every 64 protobuf fields. Hub resolution parses its metadata once. Receipt
+fallback preserves the exact original execution refusal without a second poll.
+Existing artifact identities, selection, hidden staging and publication semantics
+remain covered by the normal registry regressions.
+
+From `zig/`, run `zig build antfly-inference-file-owner-test
+antfly-sql-input-owner-test antfly-inference-worker-provider-check -Dcuda=true
+-Doptimize=Debug -j1`, plus `inference-test-inference-unit` with the prefixes in
+`registry-preparation-v4.json`. The unchanged-input receipt records 36/36 steps,
+five real-owner cases, 15 SQL scanner/input cases (cached from the successful v2
+run), 33 selected registry/download/receipt cases and the production provider
+semantic check. Large inputs let an already queued query progress and retain
+the original team; compact inputs refuse every observed checkpoint under
+cancellation, deadline and a one-shot lease fence without leaking retained work.
+The existing SQL cases verify shared-scanner compatibility and allocation faults.
+
+The repaired standalone registry target is `inference-registry-test`; its runtime
+and document imports now include the production checkpoint dependency.
+`registry-preparation-standalone-v1.json` records 115/115 tests and 5/5 steps
+passing with unchanged inputs. Final source snapshots and verification references are recorded in
+`registry-preparation-final.json` in the cumulative integration receipts.
+
+This completes these decoder checkpoint paths. Broader registry selection and
+preparation, framework/vendor construction, mapped-page-fault scope and wider
+cross-engine/deployment evidence remain open. This is local deterministic
+integration; it adds no deployed inference or throughput claim. Full GNU
+qualification remains waived and the installed CLI is unchanged.

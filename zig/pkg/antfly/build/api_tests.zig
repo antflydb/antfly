@@ -941,6 +941,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     model_file_module.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    model_file_module.addImport("httpx", antfly_imports.httpx);
+    model_file_module.addImport("protobuf", b.createModule(.{
+        .root_source_file = b.path("lib/protobuf/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     model_file_module.addImport("antfly_platform", antfly_imports.platform);
     model_file_module.addImport("antfly_document_runs", inference_owner_control.import_table.get("antfly_document_runs").?);
     const file_owner_root = b.createModule(.{
@@ -952,7 +958,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     file_owner_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
     file_owner_root.addImport("antfly_local_sources", resource_forward_sources);
     file_owner_root.addImport("inference_model_file", model_file_module);
-    const file_owner_tests = b.addTest(.{ .name = "model-file-owner-tests", .root_module = file_owner_root, .filters = &.{ "native model files", "native model artifact receipts", "native model directory discovery", "embedded inference shared owner" }, .max_rss = 2 * 1024 * 1024 * 1024 });
+    const file_owner_tests = b.addTest(.{ .name = "model-file-owner-tests", .root_module = file_owner_root, .filters = &.{ "native model files", "native model artifact receipts", "native model directory discovery", "embedded inference shared owner", "native model registry planning" }, .max_rss = 2 * 1024 * 1024 * 1024 });
     b.step("antfly-inference-file-owner-test", "Verify physical native model file I/O through real API-owned grants")
         .dependOn(&b.addRunArtifact(file_owner_tests).step);
     const http_cleanup_root = b.createModule(.{
@@ -4569,6 +4575,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_input_owner_inventory = b.addOptions();
     sql_input_owner_inventory.addOption([]const []const u8, "names", &.{ "common_bounded_admission", "common_request_admission", "sql_memory_budget", "sql_cooperative_json_output", "sql_cooperative_json_source" });
     sql_input_owner_sources.addOptions("antfly_local_test_sources", sql_input_owner_inventory);
+    sql_input_owner_sources.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    sql_input_owner_sources.addImport("antfly_platform", antfly_imports.platform);
     sql_input_owner_sources.addImport("antfly_test_source_root", sql_input_owner_root);
     sql_input_owner_root.addImport("antfly_local_sources", sql_input_owner_sources);
     const sql_input_owner_tests = b.addTest(.{

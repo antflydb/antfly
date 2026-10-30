@@ -23,6 +23,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 const builtin = @import("builtin");
 const execution = @import("../execution_control.zig");
+const admitted_json = @import("../util/admitted_json.zig");
 const admitted_file = @import("../util/admitted_file.zig");
 const managed_receipt = @import("managed_receipt.zig");
 const gliner_catalog = @import("gliner_catalog.zig");
@@ -671,7 +672,7 @@ fn appendDeclaredGlinerBundle(
     bytes: []const u8,
     quant_filter: ?[]const u8,
 ) !?bool {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    const parsed = try admitted_json.parse(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidInferenceBundle;
     const object = parsed.value.object;
@@ -2395,6 +2396,7 @@ fn expandArtifactDependencies(
     var descriptor_bytes: u64 = 0;
     var index: usize = 0;
     while (index < selected.items.len) : (index += 1) {
+        try (execution.InferenceExecutionControl{}).check();
         const file = selected.items[index];
         const is_index = std.mem.endsWith(u8, file.name, ".safetensors.index.json");
         const is_onnx = std.mem.endsWith(u8, file.name, ".onnx");
@@ -2415,6 +2417,7 @@ fn expandArtifactDependencies(
         defer dependencies.deinit();
         var paths = dependencies.items.keyIterator();
         while (paths.next()) |dependency| {
+            try (execution.InferenceExecutionControl{}).check();
             if (!hasFile(files, dependency.*)) {
                 std.debug.print("Missing artifact {s}, referenced by {s}\n", .{ dependency.*, file.name });
                 return error.MissingModelArtifact;
@@ -2616,15 +2619,19 @@ pub fn resolveModelSnapshot(
 
     const body = resp.body orelse return error.EmptyResponse;
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    return parseModelSnapshot(allocator, body, config.revision);
+}
+
+fn parseModelSnapshot(allocator: std.mem.Allocator, body: []const u8, revision: []const u8) !ModelSnapshot {
+    const parsed = try admitted_json.parse(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidResponse;
     const sha = parsed.value.object.get("sha") orelse return error.MissingHubCommit;
     if (sha != .string or !isSha1Hex(sha.string)) return error.InvalidHubRevision;
-    if (isSha1Hex(config.revision) and !std.ascii.eqlIgnoreCase(config.revision, sha.string)) return error.HubRevisionMismatch;
+    if (isSha1Hex(revision) and !std.ascii.eqlIgnoreCase(revision, sha.string)) return error.HubRevisionMismatch;
     const commit = try allocator.dupe(u8, sha.string);
     errdefer allocator.free(commit);
-    return .{ .commit = commit, .files = try parseHubFiles(allocator, body) };
+    return .{ .commit = commit, .files = try parseHubFilesValue(allocator, parsed.value) };
 }
 
 fn modelInfoUrlAlloc(
@@ -2648,11 +2655,14 @@ fn modelInfoUrlAlloc(
 }
 
 fn parseHubFiles(allocator: std.mem.Allocator, body: []const u8) ![]HubFile {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    const parsed = try admitted_json.parse(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
+    return parseHubFilesValue(allocator, parsed.value);
+}
 
-    if (parsed.value != .object) return error.InvalidResponse;
-    const siblings_value = parsed.value.object.get("siblings") orelse return error.InvalidResponse;
+fn parseHubFilesValue(allocator: std.mem.Allocator, value: std.json.Value) ![]HubFile {
+    if (value != .object) return error.InvalidResponse;
+    const siblings_value = value.object.get("siblings") orelse return error.InvalidResponse;
     if (siblings_value != .array) return error.InvalidResponse;
 
     var files = std.ArrayListUnmanaged(HubFile).empty;
@@ -2664,7 +2674,8 @@ fn parseHubFiles(allocator: std.mem.Allocator, body: []const u8) ![]HubFile {
         }
         files.deinit(allocator);
     }
-    for (siblings_value.array.items) |sibling| {
+    for (siblings_value.array.items, 0..) |sibling, index| {
+        if (index % 64 == 0) try (execution.InferenceExecutionControl{}).check();
         if (sibling == .object) {
             if (sibling.object.get("rfilename")) |rf| {
                 if (rf == .string) {
@@ -5782,4 +5793,12 @@ test "Qwen3-VL safetensors generated descriptor preserves legacy and staged re-p
 
 test "Qwen3-VL reranker generated descriptor preserves legacy and staged re-pulls" {
     try testGeneratedBundlePublication(qwen3vl_catalog.reranker_bundle_manifest, "model.safetensors");
+}
+
+/// Test entry for the exact metadata decoder used after a successful Hub GET.
+pub fn testSnapshotPreparation(allocator: std.mem.Allocator, body: []const u8) !usize {
+    if (!builtin.is_test) @compileError("test only");
+    var snapshot = try parseModelSnapshot(allocator, body, "main");
+    defer snapshot.deinit(allocator);
+    return snapshot.files.len;
 }

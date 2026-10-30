@@ -278,7 +278,8 @@ fn loadValidatedSource(
     };
     defer allocator.free(receipt_json);
 
-    var parsed = std.json.parseFromSlice(
+    var decode_refusal: ?anyerror = null;
+    var parsed = @import("../util/admitted_json.zig").parseWithRefusal(
         DownloadReceipt,
         allocator,
         receipt_json,
@@ -288,9 +289,14 @@ fn loadValidatedSource(
             // the parsed arena instead of borrowing unescaped input slices.
             .allocate = .alloc_always,
         },
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return error.InvalidManagedDownload,
+        &decode_refusal,
+    ) catch |err| {
+        // Original owner refusal is not malformed receipt data.
+        if (decode_refusal) |original| return original;
+        return switch (err) {
+            error.OutOfMemory => err,
+            else => error.InvalidManagedDownload,
+        };
     };
     errdefer parsed.deinit();
     if ((parsed.value.version != 1 and parsed.value.version != 2) or

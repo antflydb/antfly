@@ -15,6 +15,8 @@
 
 //! Artifact references are authoritative: never guess shard or external-data names.
 const std = @import("std");
+const execution = @import("../execution_control.zig");
+const admitted_json = @import("../util/admitted_json.zig");
 const wire = @import("protobuf").wire;
 const receipt = @import("managed_receipt.zig");
 
@@ -43,14 +45,16 @@ pub const Paths = struct {
 };
 
 pub fn safetensors(allocator: std.mem.Allocator, filename: []const u8, bytes: []const u8) !Paths {
+    try (execution.InferenceExecutionControl{}).check();
     var paths: Paths = .{ .allocator = allocator };
     errdefer paths.deinit();
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    const parsed = try admitted_json.parse(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidSafetensorsIndex;
     const weights = parsed.value.object.get("weight_map") orelse return error.InvalidSafetensorsIndex;
     if (weights != .object or weights.object.count() == 0) return error.InvalidSafetensorsIndex;
-    for (weights.object.values()) |value| {
+    for (weights.object.values(), 0..) |value, index| {
+        if (index % 64 == 0) try (execution.InferenceExecutionControl{}).check();
         if (value != .string or !std.mem.endsWith(u8, value.string, ".safetensors")) return error.InvalidSafetensorsIndex;
         try paths.add(filename, value.string);
     }
@@ -113,7 +117,9 @@ fn externalLocation(bytes: []const u8) !?[]const u8 {
     var pos: usize = 0;
     var key: []const u8 = "";
     var value: []const u8 = "";
-    while (pos < bytes.len) {
+    var fields: usize = 0;
+    while (pos < bytes.len) : (fields += 1) {
+        if (fields % 64 == 0) try (execution.InferenceExecutionControl{}).check();
         const tag = try wire.readTag(bytes, &pos);
         if (tag.wire_type == .length_delimited) {
             const text = try readBytes(bytes, &pos);
@@ -127,7 +133,9 @@ fn externalLocation(bytes: []const u8) !?[]const u8 {
 fn visit(paths: *Paths, filename: []const u8, bytes: []const u8, kind: Message, depth: usize) anyerror!void {
     if (depth > 64) return error.OnnxGraphNestingTooDeep;
     var pos: usize = 0;
-    while (pos < bytes.len) {
+    var fields: usize = 0;
+    while (pos < bytes.len) : (fields += 1) {
+        if (fields % 64 == 0) try (execution.InferenceExecutionControl{}).check();
         const tag = try wire.readTag(bytes, &pos);
         if (tag.field == 0) return error.InvalidOnnxModel;
         if (tag.wire_type != .length_delimited) {
@@ -144,6 +152,7 @@ fn visit(paths: *Paths, filename: []const u8, bytes: []const u8, kind: Message, 
 }
 
 pub fn onnx(allocator: std.mem.Allocator, filename: []const u8, bytes: []const u8) !Paths {
+    try (execution.InferenceExecutionControl{}).check();
     var paths: Paths = .{ .allocator = allocator };
     errdefer paths.deinit();
     try visit(&paths, filename, bytes, .model, 0);
@@ -194,6 +203,7 @@ test "ONNX dependencies include external Constant attributes as well as initiali
 test "artifact references reject traversal and malformed protobuf lengths" {
     const allocator = std.testing.allocator;
     for ([_][]const u8{ "../weights.bin", "/weights.bin", "C:/weights.bin", "https://example.com/weights.bin", "sub/../weights.bin" }) |path| {
+        try (execution.InferenceExecutionControl{}).check();
         var paths: Paths = .{ .allocator = allocator };
         defer paths.deinit();
         try std.testing.expectError(error.InvalidModelArtifactPath, paths.add("onnx/model.onnx", path));

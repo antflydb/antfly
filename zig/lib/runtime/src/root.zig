@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const cooperative_json = @import("cooperative_json.zig");
 pub const execution_wait = @import("execution_wait.zig");
 pub const callback_abi = @import("runtime_callback_abi.zig");
 pub const error_abi = @import("runtime_error_abi.zig");

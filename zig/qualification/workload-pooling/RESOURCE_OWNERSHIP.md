@@ -5739,3 +5739,45 @@ both receipts. These are local deterministic integrations, not deployed model
 execution, performance or full GNU qualification. Framework construction, broader
 registry preparation, mapped-page faults and wider cross-engine and deployment
 evidence remain open in the full goal.
+
+### Registry decoding checkpoints retain original execution
+
+Hub metadata, GLiNER bundle descriptors, safetensors dependency indexes and
+managed receipts now use the same bounded complete-input JSON scanner as SQL.
+The scanner lives in the Apache runtime library; SQL retains its existing
+control type and parsing entry points. Refills and owned copies check in 4 KiB
+chunks, and token iteration checks every 64 tokens. Decoded values retain input
+and allocator semantics, not execution callbacks. Hub resolution decodes the
+metadata once and materializes files from that same DOM, preserving immutable
+commit validation and exact integer parsing.
+
+ONNX dependency traversal checks every 64 protobuf fields, including nested
+graph/tensor and external-data entries. Safetensors weight-map iteration, Hub
+sibling materialization and dependency-closure expansion also checkpoint the
+synchronous caller. These paths borrow the existing pull/load owner; they do
+not admit another root or create a preparation helper.
+
+Receipt decoding separately records an original execution refusal so the
+existing malformed-receipt fallback cannot turn cancellation, deadline or a
+one-shot lease fence into InvalidManagedDownload. It propagates that exact cause
+without polling again. Partial DOMs, owned Hub strings, dependency sets and
+validated artifact paths are retired before the caller finishes its root.
+
+`registry-preparation-v4.json` records 36/36 build steps with unchanged inputs:
+five API-owned file/preparation tests pass, the existing 15 SQL input/scanner
+cases pass (cached from v2), 33 selected normal registry/download/receipt cases
+pass, and the production worker-provider semantic check passes. A queued query
+runs while large metadata, safetensors, ONNX and receipt inputs are prepared;
+control work also progresses and the original two-slot team returns. Compact
+fixtures inject cancellation, deadline and a one-shot lease refusal at every
+observed checkpoint, retaining operation bytes until final finish. `registry-preparation-standalone-v1.json` also records all 115 standalone
+registry/dependency cases passing with unchanged inputs. Large-input fairness and
+exhaustive compact-input refusal are separate campaigns to avoid quadratic
+verification cost. SQL coverage includes split/escaped strings, exact
+integers, skipped nested fields, NoResize copies and allocation-failure cleanup.
+
+These are deterministic native integrations and local Hub fixtures, not deployed
+model inference, throughput or mapped-page-fault qualification. Registry selection
+and other preparation loops, framework/vendor construction and wider cross-engine
+and deployment evidence remain in the full goal. Full GNU qualification remains
+waived; the installed CLI has not been rebuilt for this milestone.
