@@ -4680,3 +4680,46 @@ diagnosis.
 The SQL staged graph view also forwards `get_many` to its transaction overlay.
 Mixed staged, deleted, missing, duplicate and untouched identities retain input
 alignment while untouched identities share one bounded owner request.
+
+
+The frontier/aggregate follow-up merges main through `0d5de07465` in
+`f0202d494e`. Upstream Pioneer runtime detail IDs remain 833–835 and the
+unmerged Cypher additions follow at 836. Standalone uses upstream's common
+trusted-principal resolver, with paired issuer/secret validation.
+
+Source ranges certify document placement, not relationship placement. Only an
+explicit retained backend certificate licenses source-owned adjacency routing;
+ordinary native and producer-backed indexes conservatively retain all possible
+source-table owners. The regression retains an artifact edge with source `a`
+and producer `z` across disjoint owner ranges, including batched first pages
+and a continuation after a nonempty earlier owner.
+
+Correlated membership prefetch now divides supported population or cache-quota
+declines into bounded left-to-right subwindows. Unknown capabilities still
+fall back directly, and singleton declines keep the scalar executor. A
+127-key/two-matches-per-key regression replaces 127 scalar scans with three
+probes; duplicate input order, eager expression evaluation and discarded work
+accounting remain intact.
+
+Private adjacency batches carry at most 16 identities and one MiB of admitted
+first-page payload. NULL slots mean cache decline, never EOF. Physical scans,
+including discarded payloads, remain charged. Native owners enforce per-page
+record allowances; distributed batches group identities by immutable owner and
+retain original owner encounter order and native continuations. Full-closure
+reductions prefetch only already-required bounded or unbounded frontiers, with
+memory/work/edge headroom and existing eight-MiB cache admission. Row-goal and
+ordinary demand-driven paths retain scalar reads. Oversized relationship data
+remains readable through the scalar path. Frontier regressions preserve exact
+path counts and cut adjacency RPCs by more than half.
+
+Exact owner-side `COUNT(*)` uses the original single-node Cypher predicate,
+parameters and logical label, not SQL admission hints or population estimates.
+The same evaluator performs authorization, TTL and field projection at each
+retained owner. Direct native execution retains its existing evaluator; owner
+partials replace row transport only at coordinators and RPC clients. Only row-local primitive predicates are licensed; optional
+matches, DISTINCT, grouping, projection windows, nested patterns, writes and
+small-memory invocations retain the existing executor. Partial counts carry
+exact examined populations; the coordinator checks and sums them within the
+statement anchor limit. Nested evaluator work forwards to the original owner
+meter even on failures. Wire tests verify NULL parameters, zero row-scan RPCs,
+multiple owners, state/anchor exhaustion and complete callback cleanup.

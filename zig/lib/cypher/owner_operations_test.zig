@@ -1,0 +1,243 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const root = @import("root.zig");
+const b = root.backend;
+const v = root.value;
+const A = std.mem.Allocator;
+const definition: root.catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{.{ .name = "R", .stored_type = "R", .index = "links", .source_label = "D", .target_label = "D" }} };
+const Fixture = struct {
+    nodes: [33]v.Node = undefined,
+    properties: [33][2]v.Entry = undefined,
+    edges: [32]v.Relationship = undefined,
+    work: ?b.Work = null,
+    bulk: usize = 0,
+    counts: usize = 0,
+    rpc_scans: usize = 0,
+    rpc_expands: usize = 0,
+    count_enabled: bool = true,
+    batch_enabled: bool = true,
+    fail_edges: bool = false,
+    range_start: usize = 0,
+    range_end: usize = 33,
+    fn init(self: *@This(), a: A) !void {
+        for (&self.nodes, &self.properties, 0..) |*node, *properties, i| {
+            properties.* = .{ .{ .name = "start", .value = .{ .boolean = i < 16 } }, .{ .name = "value", .value = .{ .integer = @intCast(i) } } };
+            node.* = .{ .identity = .{ .table = "docs", .key = try std.fmt.allocPrint(a, "n{d}", .{i}) }, .labels = &.{"D"}, .properties = properties };
+        }
+        for (&self.edges, 0..) |*edge, i| edge.* = .{ .identity = .{ .table = "docs", .key = try std.fmt.allocPrint(a, "r{d}", .{i}) }, .index = "links", .type = "R", .source = self.nodes[i].identity, .target = self.nodes[if (i < 16) i + 16 else 32].identity };
+    }
+    fn bind(_: *anyopaque, _: A, _: root.catalog.Graph) !void {}
+    fn check(_: *anyopaque) !void {}
+    fn setWork(ptr: *anyopaque, work: ?b.Work) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.work = work;
+    }
+    fn scan(ptr: *anyopaque, a: A, _: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.work) |work| try work.charge(work.ptr, 1);
+        const start = if (after) |text| try std.fmt.parseInt(usize, text, 10) else self.range_start;
+        const end = @min(self.range_end, start + limit);
+        const nodes = try a.alloc(*const v.Node, end - start);
+        for (nodes, start..) |*node, i| node.* = &self.nodes[i];
+        return .{ .items = nodes, .examined = nodes.len, .next = if (end < self.range_end) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+    }
+    fn filtered(ptr: *anyopaque, a: A, table: []const u8, _: []const b.PropertyFilter, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+        return scan(ptr, a, table, after, limit);
+    }
+    fn get(ptr: *anyopaque, _: A, identity: v.Identity) !?*const v.Node {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        for (&self.nodes) |*node| if (node.identity.eql(identity)) return node;
+        return null;
+    }
+    fn expand(ptr: *anyopaque, a: A, _: root.catalog.Relationship, identity: v.Identity, direction: root.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.work) |work| try work.charge(work.ptr, 1);
+        var items: std.ArrayList(*const v.Relationship) = .empty;
+        const start = if (after) |text| try std.fmt.parseInt(usize, text, 10) else 0;
+        var i = start;
+        while (i < self.edges.len) : (i += 1) {
+            const edge = &self.edges[i];
+            if (!((direction != .in and edge.source.eql(identity)) or (direction != .out and edge.target.eql(identity)))) continue;
+            if (items.items.len == limit) return .{ .items = items.items, .examined = items.items.len, .next = try std.fmt.allocPrint(a, "{d}", .{i}) };
+            try items.append(a, edge);
+        }
+        return .{ .items = items.items, .examined = items.items.len };
+    }
+    fn batchOne(ptr: *anyopaque, a: A, mapping: root.catalog.Relationship, identity: v.Identity, direction: root.ast.Direction, limit: usize, _: usize) !b.Page(*const v.Relationship) {
+        return expand(ptr, a, mapping, identity, direction, null, limit);
+    }
+    fn expandMany(ptr: *anyopaque, a: A, mapping: root.catalog.Relationship, identities: []const v.Identity, direction: root.ast.Direction, limit: usize, maximum: usize) !?b.ExpansionBatch {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (!self.batch_enabled) return null;
+        if (self.fail_edges) {
+            if (self.work) |work| try work.charge(work.ptr, 1);
+            return error.CypherEdgeBudgetExceeded;
+        }
+        self.bulk += 1;
+        return @import("expansion_batch.zig").run(a, ptr, mapping, identities, direction, limit, maximum, self.work, batchOne);
+    }
+    fn countNodes(ptr: *anyopaque, a: A, table: []const u8, input: b.CountInput) !?b.CountResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (!self.count_enabled) return null;
+        self.counts += 1;
+        const work = self.work;
+        defer self.work = work;
+        return @import("owner_count.zig").run(a, self.backend(), definition, table, input, work);
+    }
+    fn backend(self: *@This()) b.Backend {
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = check, .scan = scan, .scan_where = filtered, .get = get, .expand = expand, .expand_many = expandMany, .count_nodes = countNodes, .set_work = setWork } };
+    }
+    const Channel = struct {
+        fixture: *Fixture,
+        owner: root.rpc.Owner,
+        fn invoke(ptr: *anyopaque, a: A, body: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const request = try std.json.parseFromSliceLeaky(root.rpc.Request, arena.allocator(), body, .{});
+            if (request.operation == .scan) self.fixture.rpc_scans += 1;
+            if (request.operation == .expand) self.fixture.rpc_expands += 1;
+            return self.owner.execute(a, body);
+        }
+    };
+};
+test "owner COUNT preserves predicates NULL parameters and budgets without row RPCs" {
+    for ([_]bool{ false, true }) |null_parameter| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var fixture: Fixture = .{};
+        try fixture.init(a);
+        var channel: Fixture.Channel = .{ .fixture = &fixture, .owner = .{ .backend = fixture.backend(), .graph = definition, .table = "docs" } };
+        var client: root.rpc.Client = .{ .channel = .{ .ptr = &channel, .call = Fixture.Channel.invoke }, .incarnation = 1, .revision = 1 };
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, "MATCH(n:D {start:true}) WHERE n.value >= $low RETURN count(*) AS total", .{}, &diagnostic);
+        defer compiled.deinit();
+        const parameters = &[_]v.Entry{.{ .name = "low", .value = if (null_parameter) .null else .{ .integer = 8 } }};
+        var result = try root.runtime.execute(a, client.backend(), definition, &compiled, parameters, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, if (null_parameter) 0 else 8), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(usize, 33), result.stats.scanned_anchors);
+        try std.testing.expectEqual(@as(usize, 0), fixture.rpc_scans);
+        try std.testing.expectEqual(@as(usize, 1), fixture.counts);
+        try std.testing.expectError(error.CypherStateBudgetExceeded, root.runtime.execute(a, client.backend(), definition, &compiled, parameters, .{ .intermediate_states = 10 }));
+        try std.testing.expectError(error.CypherAnchorBudgetExceeded, root.runtime.execute(a, client.backend(), definition, &compiled, parameters, .{ .scanned_anchors = 2 }));
+        try std.testing.expect(fixture.work == null);
+    }
+}
+test "frontier batches reduce adjacency RPCs and retain path counts" {
+    var scalar: usize = 0;
+    for ([_][]const u8{ "MATCH(a:D {start:true})-[:R*1..64]->(b:D) RETURN count(*)", "MATCH(a:D {start:true})-[:R*1..]->(b:D) RETURN count(*)" }) |query| for ([_]bool{ false, true }) |batched| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var fixture: Fixture = .{ .batch_enabled = batched };
+        try fixture.init(a);
+        var channel: Fixture.Channel = .{ .fixture = &fixture, .owner = .{ .backend = fixture.backend(), .graph = definition, .table = "docs" } };
+        var client: root.rpc.Client = .{ .channel = .{ .ptr = &channel, .call = Fixture.Channel.invoke }, .incarnation = 1, .revision = 1 };
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try root.runtime.execute(a, client.backend(), definition, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 32), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(usize, 32), result.stats.explored_edges);
+        if (!batched) scalar = fixture.rpc_expands else {
+            try std.testing.expect(fixture.bulk > 0);
+            try std.testing.expect(fixture.rpc_expands + fixture.bulk < scalar / 2);
+        }
+    };
+}
+
+test "distributed COUNT combines exact owner populations at the retained cut" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixtures = [_]Fixture{ .{ .range_end = 16 }, .{ .range_start = 16 } };
+    var channels: [2]Fixture.Channel = undefined;
+    var clients: [2]root.rpc.Client = undefined;
+    var snapshots: [2]root.distributed.Snapshot = undefined;
+    for (&fixtures, &channels, &clients, &snapshots) |*fixture, *channel, *client, *snapshot| {
+        try fixture.init(a);
+        channel.* = .{ .fixture = fixture, .owner = .{ .backend = fixture.backend(), .graph = definition, .table = "docs" } };
+        client.* = .{ .channel = .{ .ptr = channel, .call = Fixture.Channel.invoke }, .incarnation = 1, .revision = 1 };
+        snapshot.* = .{ .backend = client.backend(), .ptr = fixture, .validate = Fixture.check, .close = undefined };
+    }
+    const targets = [_]root.distributed.Target{ .{ .table = "docs", .table_id = 1, .group_id = 1 }, .{ .table = "docs", .table_id = 1, .group_id = 2 } };
+    var set: root.distributed.ReadSet = .{ .a = a, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &fixtures, .checkpoint = Fixture.check, .admit = undefined, .capture = undefined } };
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(a, "MATCH(n:D) WHERE n.value >= $low RETURN count(*)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try root.runtime.execute(a, set.backend(), definition, &compiled, &.{.{ .name = "low", .value = .{ .integer = 8 } }}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 25), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(usize, 33), result.stats.scanned_anchors);
+    for (fixtures) |fixture| {
+        try std.testing.expectEqual(@as(usize, 1), fixture.counts);
+        try std.testing.expectEqual(@as(usize, 0), fixture.rpc_scans);
+    }
+}
+
+test "large adjacency payload declines only cache admission and clones typed replies" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: Fixture = .{};
+    try fixture.init(a);
+    fixture.edges[1].native = .{ .weight = 7, .created_at = 42, .updated_at = 43 };
+    const payload = try a.alloc(u8, 1 << 20);
+    @memset(payload, 'x');
+    fixture.edges[0].properties = &.{.{ .name = "large", .value = .{ .string = payload } }};
+    var channel: Fixture.Channel = .{ .fixture = &fixture, .owner = .{ .backend = fixture.backend(), .graph = definition, .table = "docs" } };
+    var client: root.rpc.Client = .{ .channel = .{ .ptr = &channel, .call = Fixture.Channel.invoke }, .incarnation = 1, .revision = 1 };
+    const batch = (try client.backend().vtable.expand_many.?(client.backend().ptr, a, definition.relationships[0], &.{ fixture.nodes[0].identity, fixture.nodes[1].identity }, .out, 1, 128)).?;
+    try std.testing.expectEqual(@as(usize, 2), batch.examined);
+    try std.testing.expect(batch.pages[0] == null);
+    try std.testing.expectEqual(@as(usize, 1), batch.pages[1].?.items.len);
+    // The declined edge remains available through ordinary pagination.
+    const page = try client.backend().vtable.expand(client.backend().ptr, a, definition.relationships[0], fixture.nodes[0].identity, .out, null, 128);
+    try std.testing.expectEqual(@as(usize, payload.len), page.items[0].properties[0].value.string.len);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const reply = try channel.owner.executeTyped(scratch.allocator(), .{ .operation = .expand_many, .graph_incarnation = 1, .graph_revision = 1, .relationship = "R", .identities = &.{fixture.nodes[1].identity}, .direction = .out, .limit = 1, .max_examined = 128 });
+    const owned = try reply.clone(a);
+    scratch.deinit();
+    scratch = .init(std.testing.allocator);
+    try std.testing.expectEqualStrings("n1", owned.batch.?.pages[0].?.values[0].value.relationship.source.key);
+    try std.testing.expectEqual(@as(f64, 7), owned.batch.?.pages[0].?.values[0].value.relationship.native.weight);
+    try std.testing.expectEqual(@as(u64, 43), owned.batch.?.pages[0].?.values[0].value.relationship.native.updated_at);
+    fixture.fail_edges = true;
+    try std.testing.expectError(error.CypherEdgeBudgetExceeded, client.backend().vtable.expand_many.?(client.backend().ptr, a, definition.relationships[0], &.{fixture.nodes[1].identity}, .out, 128, 128));
+    try std.testing.expect(fixture.work == null);
+}
+
+test "local COUNT retains the direct evaluator when no row transport is saved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: Fixture = .{};
+    try fixture.init(a);
+    var callbacks = fixture.backend().vtable.*;
+    callbacks.prefer_count_nodes = false;
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(a, "MATCH(n:D) RETURN count(*)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try root.runtime.execute(a, .{ .ptr = &fixture, .vtable = &callbacks }, definition, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 33), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(usize, 0), fixture.counts);
+}

@@ -161,6 +161,40 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             incompatible
         )
         assert incompatible["stats"]["scanned_anchors"] <= 2000, incompatible
+        nonunique = table + "_nonunique"
+        call("/sql", {"statement": f"CREATE TABLE {nonunique} (bucket BIGINT)"})
+        call(
+            "/sql",
+            {"statement": f"CREATE INDEX {nonunique}_bucket ON {nonunique}(bucket)"},
+        )
+        call(
+            f"/tables/{nonunique}/batch",
+            {
+                "inserts": {f"n{i}": {"bucket": i // 2} for i in range(254)},
+                "sync_level": "full_index",
+            },
+        )
+        call(
+            f"/graphs/{nonunique}",
+            {"labels": [{"name": "U", "table": nonunique}], "relationships": []},
+        )
+        call(
+            f"/graphs/{nonunique}/query",
+            {
+                "query": "MATCH(n:U {bucket:0}) RETURN n.bucket",
+                "limits": {"scanned_anchors": 2},
+            },
+            wait_for_index=True,
+        )
+        adaptive = call(
+            f"/graphs/{nonunique}/query",
+            {
+                "query": "UNWIND range(0,126) AS k MATCH(n:U) WHERE n.bucket=k RETURN count(*)",
+                "limits": {"scanned_anchors": 254},
+            },
+        )
+        assert adaptive["rows"] == [[{"type": "integer", "value": "254"}]], adaptive
+        assert adaptive["stats"]["scanned_anchors"] == 254, adaptive
         # Only a composite index exists: each complete (tenant,id) prefix
         # must avoid the 1,000-row scan of the two tenant-only prefixes.
         composite = table + "_composite"

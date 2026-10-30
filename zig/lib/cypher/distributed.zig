@@ -220,7 +220,7 @@ pub const ReadSet = struct {
         self.* = undefined;
     }
     pub fn backend(self: *ReadSet) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .count_nodes = countNodes, .expand_many = expandMany, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         for (cast(ptr).snapshots) |snapshot| if (snapshot.backend.vtable.set_read_fields) |configure| configure(snapshot.backend.ptr, fields);
@@ -754,6 +754,29 @@ pub const ReadSet = struct {
             (!result.complete and result.page.items.len != 0)) return error.CypherInvalidBackendPage;
         return used;
     }
+    fn countNodes(ptr: *anyopaque, a: A, table: []const u8, input: b.CountInput) !?b.CountResult {
+        const self = cast(ptr);
+        if (!@import("owner_count.zig").eligible(input)) return null;
+        var total: b.CountResult = .{ .count = 0, .examined = 0 };
+        var found = false;
+        for (self.targets, self.snapshots) |target, snapshot| {
+            if (!std.mem.eql(u8, target.table, table)) continue;
+            found = true;
+            try checkpoint(ptr);
+            var demand = input;
+            demand.max_examined = input.max_examined - total.examined;
+            if (self.work) |work| {
+                if (work.remaining) |left| demand.max_work = @min(demand.max_work, left(work.ptr));
+            }
+            const read = snapshot.backend.vtable.count_nodes orelse return null;
+            const value = (try read(snapshot.backend.ptr, a, table, demand)) orelse return null;
+            if (value.count > value.examined or value.examined > demand.max_examined) return error.CypherInvalidBackendPage;
+            total.count += value.count;
+            total.examined += value.examined;
+        }
+        try checkpoint(ptr);
+        return if (found) total else null;
+    }
     fn probeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?b.Probe {
         const self = cast(ptr);
         if (limit == 0 or limit > 128) return null;
@@ -915,6 +938,78 @@ pub const ReadSet = struct {
             result[index] = (try (v.Value{ .node = value }).clone(a)).node;
         };
     }
+    fn expandMany(ptr: *anyopaque, a: A, mapping: catalog.Relationship, identities: []const v.Identity, direction: ast.Direction, limit: usize, maximum: usize) !?b.ExpansionBatch {
+        const self = cast(ptr);
+        if (identities.len == 0 or identities.len > 16 or limit == 0 or limit > 128) return null;
+        const table = self.mappingSource(mapping) orelse return error.UndefinedGraphTable;
+        var owner_count: usize = 0;
+        for (self.targets, self.snapshots) |target, snapshot| if (std.mem.eql(u8, target.table, table)) {
+            if (snapshot.backend.vtable.expand_many == null) return null;
+            owner_count += 1;
+        };
+        if (owner_count == 0 or maximum / owner_count < identities.len) return null;
+        const allowance = @min(4096, maximum / owner_count);
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const items = try temporary.alloc(std.ArrayList(*const v.Relationship), identities.len);
+        const pages = try a.alloc(?b.Page(*const v.Relationship), identities.len);
+        const finished = try temporary.alloc(bool, identities.len);
+        for (items) |*list| list.* = .empty;
+        for (pages) |*page| page.* = .{ .items = &.{} };
+        @memset(finished, false);
+        var examined: usize = 0;
+        var bytes: usize = 0;
+        // Group by immutable owner, retaining its original encounter position.
+        // First-page batches replace V separate RPCs with one per owner. Each
+        // node stops at its first unfinished owner; cursors retain native tokens.
+        for (self.targets, self.snapshots, 0..) |target, snapshot, owner| {
+            if (!std.mem.eql(u8, target.table, table)) continue;
+            var selected: [16]v.Identity = undefined;
+            var positions: [16]usize = undefined;
+            var count: usize = 0;
+            for (identities, 0..) |identity, index| if (!finished[index] and self.adjacencyOwner(owner, mapping, identity, null, direction)) {
+                selected[count] = identity;
+                positions[count] = index;
+                count += 1;
+            };
+            if (count == 0) continue;
+            try checkpoint(ptr);
+            var owner_arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer owner_arena.deinit();
+            const batch = (try snapshot.backend.vtable.expand_many.?(snapshot.backend.ptr, owner_arena.allocator(), mapping, selected[0..count], direction, limit, allowance)) orelse {
+                for (positions[0..count]) |index| {
+                    pages[index] = null;
+                    finished[index] = true;
+                }
+                continue;
+            };
+            if (batch.pages.len != count or batch.examined > allowance) return error.CypherInvalidBackendPage;
+            examined += batch.examined;
+            for (batch.pages, positions[0..count]) |page, index| {
+                const value = page orelse {
+                    pages[index] = null;
+                    finished[index] = true;
+                    continue;
+                };
+                if (value.items.len > limit or (value.examined orelse value.items.len) < value.items.len) return error.CypherInvalidBackendPage;
+                const needed = try @import("expansion_batch.zig").pageBytes(value);
+                if (needed > @import("expansion_batch.zig").max_bytes - bytes) {
+                    pages[index] = null;
+                    finished[index] = true;
+                    continue;
+                }
+                const copied = try @import("expansion_batch.zig").clone(a, value);
+                bytes += needed;
+                try items[index].appendSlice(a, copied.items);
+                const continuation = try self.adjacencyNext(a, mapping, identities[index], null, direction, .{ .owner = owner }, copied.next);
+                pages[index] = .{ .items = items[index].items, .next = continuation };
+                finished[index] = copied.items.len != 0 or copied.next != null or continuation == null;
+            }
+        }
+        try checkpoint(ptr);
+        return .{ .pages = pages, .examined = examined };
+    }
     fn adjacencyOwner(self: *ReadSet, owner: usize, mapping: catalog.Relationship, identity: v.Identity, peer: ?v.Identity, direction: ast.Direction) bool {
         const graph = self.graph orelse return false;
         const source = graph.label(mapping.source_label).?.table;
@@ -923,6 +1018,10 @@ pub const ReadSet = struct {
         if (!std.mem.eql(u8, shard.table, source)) return false;
         const outgoing = direction != .in and std.mem.eql(u8, identity.table, source) and (peer == null or std.mem.eql(u8, peer.?.table, target));
         const incoming = direction != .out and std.mem.eql(u8, identity.table, target) and (peer == null or std.mem.eql(u8, peer.?.table, source));
+        if (!outgoing and !incoming) return false;
+        // Every source owner must certify placement before any can be pruned.
+        // An artifact producer may be on the very owner pruning would omit.
+        for (self.targets, self.snapshots) |candidate, snapshot| if (std.mem.eql(u8, candidate.table, source) and !snapshot.backend.vtable.source_owned_adjacency) return true;
         return (outgoing and shard.owns(identity)) or (incoming and (peer == null or shard.owns(peer.?)));
     }
     fn adjacencyPosition(self: *ReadSet, a: A, mapping: catalog.Relationship, identity: v.Identity, peer: ?v.Identity, direction: ast.Direction, encoded: ?[]const u8, start: usize) !?Cursor {
@@ -1862,7 +1961,7 @@ test "adjacency routing prunes only catalog certified source owners and preserve
     var fixture: Fixture = .{};
     var owners = [_]Fixture.Owner{ .{ .fixture = &fixture, .index = 0 }, .{ .fixture = &fixture, .index = 1 } };
     var snapshots: [2]Snapshot = undefined;
-    for (&owners, &snapshots) |*owner, *snapshot| snapshot.* = .{ .ptr = owner, .validate = Fixture.Owner.check, .close = undefined, .backend = .{ .ptr = owner, .vtable = &.{ .bind = undefined, .checkpoint = Fixture.Owner.check, .scan = undefined, .get = undefined, .expand = Fixture.Owner.expand, .expand_between = Fixture.Owner.between } } };
+    for (&owners, &snapshots) |*owner, *snapshot| snapshot.* = .{ .ptr = owner, .validate = Fixture.Owner.check, .close = undefined, .backend = .{ .ptr = owner, .vtable = &.{ .source_owned_adjacency = true, .bind = undefined, .checkpoint = Fixture.Owner.check, .scan = undefined, .get = undefined, .expand = Fixture.Owner.expand, .expand_between = Fixture.Owner.between } } };
     var targets = [_]Target{
         .{ .table = "docs", .table_id = 1, .group_id = 1, .ranges = &.{.{ .end = "m" }} },
         .{ .table = "docs", .table_id = 1, .group_id = 2, .ranges = &.{.{ .start = "m" }} },

@@ -69,6 +69,13 @@ pub const SeekWindow = struct { filter: ?usize, offset: usize = 0, primary: bool
 /// bindings: their record/seek work must remain charged through Work, including
 /// quota declines. Only complete, admitted pages consume logical anchors.
 pub const Probe = struct { page: Page(*const v.Node), complete: bool };
+/// Exact scalar COUNT over a licensed single-node match. Owners evaluate the
+/// original Cypher predicate after policy projection, never admission hints.
+pub const CountInput = struct { node: ast.Node, predicate: ?*const ast.Expr = null, parameters: []const v.Entry = &.{}, source: []const u8 = "", max_examined: usize = 1_000_000, max_work: usize = 1_000_000, memory_bytes: usize = 64 << 20 };
+pub const CountResult = struct { count: usize, examined: usize };
+/// First adjacency pages for a bounded frontier. NULL slots decline cache
+/// admission without inventing EOF. Examined includes discarded page reads.
+pub const ExpansionBatch = struct { pages: []const ?Page(*const v.Relationship), examined: usize };
 pub const FilterOp = enum { eq, lt, lte, gt, gte, in, is_null };
 /// Private compiler proof: a distinct, homogeneous, non-null primitive set.
 /// Inexact integers cannot be lowered into rounded DOUBLE equality domains.
@@ -172,6 +179,15 @@ pub const Backend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     pub const VTable = struct {
+        /// Certifies every mapped index in this retained backend stores edges
+        /// under their logical source key. Document ranges alone are no proof:
+        /// producer-owned edges may reside in another owner's immutable root.
+        source_owned_adjacency: bool = false,
+        /// Row transports benefit from partial counts. A direct local adapter
+        /// can expose the owner operation while retaining its existing evaluator.
+        prefer_count_nodes: bool = true,
+        count_nodes: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, CountInput) anyerror!?CountResult = null,
+        expand_many: ?*const fn (*anyopaque, std.mem.Allocator, catalog.Relationship, []const v.Identity, ast.Direction, usize, usize) anyerror!?ExpansionBatch = null,
         /// Borrowed until reset. Null retains complete entities, an empty set
         /// requests identities only. Authorization always sees the full row.
         set_read_fields: ?*const fn (*anyopaque, ?[]const []const u8) void = null,

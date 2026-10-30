@@ -41,6 +41,8 @@ pub const snapshot = @import("snapshot.zig");
 pub const mutations = @import("mutations.zig");
 test {
     _ = @import("fanout_test.zig");
+    _ = @import("access_paths_test.zig");
+    _ = @import("owner_operations_test.zig");
     _ = catalog_guard;
     _ = dependencies;
     _ = runtime;

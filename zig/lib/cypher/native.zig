@@ -126,7 +126,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         read_fields: ?[]const []const u8 = null,
 
         pub fn backend(self: *Self) b.Backend {
-            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .planned_domains = if (@hasDecl(DB, "RelationalReadSession")) @hasDecl(DB.RelationalReadSession, "seekPrefix") else false, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+            return .{ .ptr = self, .vtable = &.{ .prefer_count_nodes = false, .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .count_nodes = countNodes, .expand_many = expandMany, .planned_domains = if (@hasDecl(DB, "RelationalReadSession")) @hasDecl(DB.RelationalReadSession, "seekPrefix") else false, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
         }
         fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
             cast(ptr).read_fields = fields;
@@ -313,6 +313,22 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         }
         fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
             return (try scanWhereImpl(ptr, a, table, filters, encoded, limit, false)).?;
+        }
+        fn expandBatchOne(ptr: *anyopaque, a: A, mapping: root.catalog.Relationship, identity: v.Identity, direction: root.ast.Direction, limit: usize, maximum: usize) !b.Page(*const v.Relationship) {
+            return expandPair(ptr, a, mapping, identity, null, direction, null, limit, maximum);
+        }
+        fn expandMany(ptr: *anyopaque, a: A, mapping: root.catalog.Relationship, identities: []const v.Identity, direction: root.ast.Direction, limit: usize, maximum: usize) !?b.ExpansionBatch {
+            return @import("expansion_batch.zig").run(a, ptr, mapping, identities, direction, limit, maximum, cast(ptr).work, expandBatchOne);
+        }
+        fn countNodes(ptr: *anyopaque, a: A, table: []const u8, input: b.CountInput) !?b.CountResult {
+            const self = cast(ptr);
+            const work = self.work;
+            const fields = self.read_fields;
+            defer {
+                self.work = work;
+                self.read_fields = fields;
+            }
+            return @import("owner_count.zig").run(a, self.backend(), self.graph orelse return null, table, input, work);
         }
         fn probeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?b.Probe {
             if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return null;

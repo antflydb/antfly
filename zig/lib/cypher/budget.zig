@@ -32,6 +32,12 @@ pub fn allocatorExhausted(a: std.mem.Allocator) bool {
     const budget: *Budget = @ptrCast(@alignCast(a.ptr));
     return budget.exhausted;
 }
+pub fn allocatorRemaining(a: std.mem.Allocator) ?usize {
+    var probe: Budget = undefined;
+    if (a.vtable != probe.allocator().vtable) return null;
+    const budget: *Budget = @ptrCast(@alignCast(a.ptr));
+    return budget.limit -| budget.live;
+}
 fn admit(self: *Budget, growth: usize) bool {
     if (growth > self.limit -| self.live) {
         self.exhausted = true;

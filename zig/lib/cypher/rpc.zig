@@ -24,7 +24,7 @@ const catalog = @import("catalog.zig");
 const A = std.mem.Allocator;
 // Named transport types keep the checked callback ABI stable across separately
 // compiled runtimes. Anonymous enum/struct type names contain local IDs.
-pub const Operation = enum { validate, scan, scan_ordered, estimate, population, get, get_many, expand, search, observe, observe_ranges, normalize, project, probe };
+pub const Operation = enum { validate, scan, scan_ordered, estimate, population, get, get_many, expand, search, observe, observe_ranges, normalize, project, probe, count, expand_many };
 pub const Filter = struct { property: []const u8, value: std.json.Value, op: b.FilterOp = .eq, domain: ?b.ScalarDomain = null, plan: ?b.DomainPlan = null };
 // Borrow immutable scalar/string payloads through one owner call. Avoid the
 // stringify/parse round trip (and arena growth) for already typed filter data.
@@ -56,9 +56,43 @@ fn encodeFilters(a: A, filters: []const b.PropertyFilter) ![]Filter {
 }
 pub const OrderAfter = struct { value: std.json.Value };
 pub const Order = struct { property: []const u8, descending: bool = false, exclude_null: bool = false, after: ?OrderAfter = null };
-pub const BudgetFailure = enum { work, anchors };
+pub const BudgetFailure = enum { work, anchors, edges };
+pub const BatchPage = struct { values: []const wire.Value, next: ?[]const u8 = null, examined: usize };
+pub const BatchReply = struct {
+    pages: []const ?BatchPage,
+    examined: usize,
+    fn fromBatch(a: A, batch: b.ExpansionBatch) !BatchReply {
+        const pages = try a.alloc(?BatchPage, batch.pages.len);
+        for (batch.pages, pages) |page, *out| {
+            out.* = null;
+            if (page) |value| {
+                const values = try a.alloc(wire.Value, value.items.len);
+                for (value.items, values) |item, *encoded| encoded.* = .{ .value = .{ .relationship = item }, .include_native = true };
+                out.* = .{ .values = values, .next = value.next, .examined = value.examined orelse value.items.len };
+            }
+        }
+        return .{ .pages = pages, .examined = batch.examined };
+    }
+    fn toBatch(self: BatchReply, a: A) !b.ExpansionBatch {
+        const pages = try a.alloc(?b.Page(*const v.Relationship), self.pages.len);
+        for (self.pages, pages) |page, *out| {
+            out.* = null;
+            if (page) |value| {
+                const items = try a.alloc(*const v.Relationship, value.values.len);
+                for (value.values, items) |encoded, *item| {
+                    if (encoded.value != .relationship) return error.CypherInvalidBackendPage;
+                    item.* = (try encoded.value.clone(a)).relationship;
+                }
+                out.* = .{ .items = items, .next = if (value.next) |next| try a.dupe(u8, next) else null, .examined = value.examined };
+            }
+        }
+        return .{ .pages = pages, .examined = self.examined };
+    }
+};
+pub const CountRequest = struct { node: ast.Node, predicate: ?*const ast.Expr = null, parameters: wire.Value, source: []const u8 = "", memory_bytes: usize = 64 << 20 };
 pub const Request = struct {
     operation: Operation,
+    count: ?CountRequest = null,
     graph_incarnation: u64,
     graph_revision: u64,
     table: []const u8 = "",
@@ -84,6 +118,8 @@ pub const Request = struct {
 };
 pub const Projection = struct { node: ?*const v.Node, relationships: []const *const v.Relationship = &.{} };
 pub const Reply = struct {
+    batch: ?BatchReply = null,
+    count: ?b.CountResult = null,
     read_failure: ?BudgetFailure = null,
     search_failure: ?BudgetFailure = null,
     exact_keys: bool = false,
@@ -109,6 +145,7 @@ pub const Reply = struct {
     /// scratch (including per-document decoding) has been reclaimed.
     pub fn clone(self: Reply, a: A) !Reply {
         var out = self;
+        if (self.batch) |batch| out.batch = try BatchReply.fromBatch(a, try batch.toBatch(a));
         const values = try a.dupe(wire.Value, self.values);
         for (values) |*item| item.value = try item.value.clone(a);
         out.values = values;
@@ -148,7 +185,7 @@ pub const Client = struct {
     work: ?b.Work = null,
     read_fields: ?[]const []const u8 = null,
     pub fn backend(self: *Client) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .count_nodes = countNodes, .expand_many = expandMany, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         cast(ptr).read_fields = fields;
@@ -177,10 +214,11 @@ pub const Client = struct {
         if (reply.work > bounded.max_work) return error.CypherInvalidBackendPage;
         if (self.work) |work| try work.charge(work.ptr, reply.work);
         if (reply.read_failure) |failure| {
-            if ((request.operation != .scan_ordered and request.operation != .get_many and request.operation != .probe) or reply.values.len != 0 or reply.next != null or reply.ordered or reply.cursors != null or reply.cursor_trace != null) return error.CypherInvalidBackendPage;
+            if ((request.operation != .scan_ordered and request.operation != .get_many and request.operation != .probe and request.operation != .count and request.operation != .expand_many) or reply.values.len != 0 or reply.next != null or reply.ordered or reply.cursors != null or reply.cursor_trace != null or reply.count != null or reply.batch != null) return error.CypherInvalidBackendPage;
             return switch (failure) {
                 .work => error.CypherStateBudgetExceeded,
                 .anchors => error.CypherAnchorBudgetExceeded,
+                .edges => error.CypherEdgeBudgetExceeded,
             };
         }
         return reply;
@@ -342,6 +380,37 @@ pub const Client = struct {
         const page: b.Page(*const v.Node) = .{ .items = nodes, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined, .unfiltered = reply.unfiltered, .seek_window = if (self.channel.owner_local) reply.seek_window else null };
         return if (self.channel.owner_local) try @import("sparse_seek.zig").finish(a, page) else page;
     }
+    fn expandMany(ptr: *anyopaque, a: A, mapping: catalog.Relationship, identities: []const v.Identity, direction: ast.Direction, limit: usize, maximum: usize) !?b.ExpansionBatch {
+        const self = cast(ptr);
+        if (identities.len == 0 or identities.len > 16) return null;
+        var arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer arena.deinit();
+        const request: Request = .{ .read_fields = self.read_fields, .operation = .expand_many, .relationship = mapping.name, .identities = identities, .direction = direction, .limit = limit, .max_examined = maximum, .graph_incarnation = self.incarnation, .graph_revision = self.revision };
+        var size = std.Io.Writer.Discarding.init(&.{});
+        try std.json.Stringify.value(request, .{}, &size.writer);
+        if (size.fullCount() > (1 << 20) - 2048) return null;
+        const reply = try self.invoke(arena.allocator(), request);
+        if (reply.values.len != 0 or reply.next != null or reply.count != null) return error.CypherInvalidBackendPage;
+        const batch = reply.batch orelse return null;
+        if (batch.pages.len != identities.len or batch.examined > maximum) return error.CypherInvalidBackendPage;
+        var used: usize = 0;
+        for (batch.pages) |page| if (page) |value| {
+            if (value.values.len > limit or value.examined < value.values.len or value.examined > batch.examined -| used) return error.CypherInvalidBackendPage;
+            used += value.examined;
+        };
+        return try batch.toBatch(a);
+    }
+    fn countNodes(ptr: *anyopaque, a: A, table: []const u8, input: b.CountInput) !?b.CountResult {
+        const self = cast(ptr);
+        const request: Request = .{ .read_fields = self.read_fields, .operation = .count, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .max_examined = input.max_examined, .count = .{ .node = input.node, .predicate = input.predicate, .parameters = .{ .value = .{ .map = input.parameters } }, .source = input.source, .memory_bytes = input.memory_bytes } };
+        var size = std.Io.Writer.Discarding.init(&.{});
+        try std.json.Stringify.value(request, .{}, &size.writer);
+        if (size.fullCount() > (1 << 20) - 2048) return null;
+        const reply = try self.invoke(a, request);
+        if (reply.values.len != 0 or reply.next != null or reply.batch != null) return error.CypherInvalidBackendPage;
+        if (reply.count) |result| if (result.count > result.examined or result.examined > input.max_examined or reply.values.len != 0 or reply.next != null) return error.CypherInvalidBackendPage;
+        return reply.count;
+    }
     fn probeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?b.Probe {
         const self = cast(ptr);
         if (limit == 0 or limit > 128) return null;
@@ -409,6 +478,7 @@ pub const Client = struct {
             return switch (failure) {
                 .work => error.CypherStateBudgetExceeded,
                 .anchors => error.CypherAnchorBudgetExceeded,
+                .edges => error.CypherInvalidBackendPage,
             };
         }
         if (reply.values.len != reply.scores.len or reply.values.len > 1024) return error.CypherInvalidBackendPage;
@@ -454,6 +524,7 @@ pub const Owner = struct {
         const failure: @typeInfo(@FieldType(Reply, "read_failure")).optional.child = switch (err) {
             error.CypherStateBudgetExceeded => .work,
             error.CypherAnchorBudgetExceeded => .anchors,
+            error.CypherEdgeBudgetExceeded => .edges,
             else => return err,
         };
         try self.backend.vtable.checkpoint(self.backend.ptr);
@@ -513,6 +584,24 @@ pub const Owner = struct {
                 const count = if (self.backend.vtable.population_upper_bound) |read| try read(self.backend.ptr, scratch, request.table) else null;
                 try self.backend.vtable.checkpoint(self.backend.ptr);
                 return .{ .work = meter.units, .population = count };
+            },
+            .expand_many => {
+                const mapping = self.graph.relationship(request.relationship) orelse return error.UndefinedGraphRelationship;
+                if (!self.permitsTable(self.graph.label(mapping.source_label).?.table) or request.identities.len == 0 or request.identities.len > 16) return error.Forbidden;
+                const read = self.backend.vtable.expand_many orelse return .{ .work = meter.units };
+                const result = (read(self.backend.ptr, scratch, mapping, request.identities, request.direction, request.limit, request.max_examined) catch |err| return self.readFailure(meter.units, err)) orelse return .{ .work = meter.units };
+                if (result.pages.len != request.identities.len or result.examined > request.max_examined) return error.CypherInvalidBackendPage;
+                try self.backend.vtable.checkpoint(self.backend.ptr);
+                return .{ .batch = try BatchReply.fromBatch(scratch, result), .work = meter.units };
+            },
+            .count => {
+                if (!self.permitsTable(request.table)) return error.Forbidden;
+                const input = request.count orelse return error.CypherInvalidBackendPage;
+                if (input.parameters.value != .map) return error.InvalidCypherParameters;
+                const read = self.backend.vtable.count_nodes orelse return .{ .work = meter.units };
+                const result = read(self.backend.ptr, scratch, request.table, .{ .node = input.node, .predicate = input.predicate, .parameters = input.parameters.value.map, .source = input.source, .max_examined = request.max_examined, .max_work = request.max_work, .memory_bytes = @min(input.memory_bytes, 64 << 20) }) catch |err| return self.readFailure(meter.units, err);
+                try self.backend.vtable.checkpoint(self.backend.ptr);
+                return .{ .count = result, .work = meter.units };
             },
             .probe => {
                 if (!self.permitsTable(request.table) or request.limit > 128) return error.Forbidden;

@@ -112,6 +112,9 @@ pub fn CommitResult(comptime Receipt: type) type {
 }
 
 pub fn execute(backing: A, backend: backend_mod.Backend, graph: catalog.Graph, compiled: *const compiler.Compiled, parameters: []const v.Entry, limits: Limits) !Result {
+    return executeWithWork(backing, backend, graph, compiled, parameters, limits, null);
+}
+pub fn executeWithWork(backing: A, backend: backend_mod.Backend, graph: catalog.Graph, compiled: *const compiler.Compiled, parameters: []const v.Entry, limits: Limits, parent_work: ?backend_mod.Work) !Result {
     try graph.validate();
     try @import("binder.zig").validate(backing, graph, compiled.query);
     // Scratch frees must reach a reclaiming allocator, even when the host
@@ -121,7 +124,7 @@ pub fn execute(backing: A, backend: backend_mod.Backend, graph: catalog.Graph, c
     const budget = try allocator.create(Budget);
     budget.* = .{ .backing = allocator, .limit = limits.memory_bytes };
     errdefer allocator.destroy(budget);
-    return executeBudget(budget, backend, graph, compiled, parameters, limits) catch |err| return if (budget.exhausted) error.CypherMemoryBudgetExceeded else err;
+    return executeBudget(budget, backend, graph, compiled, parameters, limits, parent_work) catch |err| return if (budget.exhausted) error.CypherMemoryBudgetExceeded else err;
 }
 
 /// Pull execution for row-local node scans and all-path traversals. Stateful reductions, path
@@ -1700,10 +1703,10 @@ pub const NodeCursor = struct {
     }
 };
 
-fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.Graph, compiled: *const compiler.Compiled, parameters: []const v.Entry, limits: Limits) !Result {
+fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.Graph, compiled: *const compiler.Compiled, parameters: []const v.Entry, limits: Limits, parent_work: ?backend_mod.Work) !Result {
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     errdefer arena.deinit();
-    var engine: Engine = .{ .a = arena.allocator(), .planning_allocator = arena.allocator(), .scratch_allocator = budget.allocator(), .backend = backend, .graph = graph, .source = compiled.query.source, .parameters = parameters, .limits = limits, .regex = .{ .a = arena.allocator(), .scratch = std.heap.ArenaAllocator.init(budget.allocator()) } };
+    var engine: Engine = .{ .parent_work = parent_work, .a = arena.allocator(), .planning_allocator = arena.allocator(), .scratch_allocator = budget.allocator(), .backend = backend, .graph = graph, .source = compiled.query.source, .parameters = parameters, .limits = limits, .regex = .{ .a = arena.allocator(), .scratch = std.heap.ArenaAllocator.init(budget.allocator()) } };
     engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
     engine.strings = engine.newStringWork(engine.a);
     defer engine.deinitRetiredDomains();
@@ -1973,6 +1976,7 @@ const Engine = struct {
     adjacency_cache: ?*AdjacencyCache = null,
     interior: ?*const Interior = null,
     cache_reads: bool = false,
+    parent_work: ?backend_mod.Work = null,
     read_only: bool = false,
     join: ?*const Join = null,
     lookups: []Lookup = &.{},
@@ -2021,6 +2025,7 @@ const Engine = struct {
         const self: *Engine = @ptrCast(@alignCast(ptr));
         try self.checkpoint();
         if (amount > self.limits.intermediate_states -| self.stats.intermediate_states) return error.CypherStateBudgetExceeded;
+        if (self.parent_work) |work| try work.charge(work.ptr, amount);
         self.stats.intermediate_states += amount;
     }
     const AggregateOverrides = struct {
@@ -2040,6 +2045,7 @@ const Engine = struct {
     }
     fn state(self: *Engine) !void {
         try self.checkpoint();
+        if (self.parent_work) |work| try work.charge(work.ptr, 1);
         self.stats.intermediate_states += 1;
         if (self.stats.intermediate_states > self.limits.intermediate_states) return error.CypherStateBudgetExceeded;
     }
@@ -6785,38 +6791,55 @@ const Engine = struct {
                 var batch_size: usize = 0;
                 while (batch_size < items.len) : (batch_size += 1) items[batch_size] = source.next() orelse break;
                 if (batch_size == 0) break;
-                var batch: Lookup = .{ .alias = pattern.alias, .table = engine.graph.label(pattern.labels[0]).?.table, .budget = .{ .backing = engine.scratch_allocator, .limit = @min(8 << 20, engine.limits.memory_bytes / 8) } };
-                batch.arena = std.heap.ArenaAllocator.init(batch.budget.allocator());
-                defer if (batch.arena) |*arena| arena.deinit();
-                var examined: usize = 0;
-                const prepared = fold.prefetchCorrelated(engine, row, unwind.alias, pattern, operation.predicate, items[0..batch_size], &batch, &examined) catch |err| declined: {
-                    if (err == error.OutOfMemory and batch.budget.exhausted) break :declined false;
-                    return err;
-                };
-                // Charge discarded physical rows from admitted caches and
-                // ordinary fetches. Declined advisory probes leave examined
-                // zero; their owner work has already been charged.
-                const debt = if (prepared) examined - batch.rows.items.len else examined;
-                if (debt > engine.limits.scanned_anchors -| engine.stats.scanned_anchors) return error.CypherAnchorBudgetExceeded;
-                engine.stats.scanned_anchors += debt;
-                if (!prepared) batch.decline();
-                const previous = engine.correlated_lookup;
-                engine.correlated_lookup = if (prepared) &batch else previous;
-                defer engine.correlated_lookup = previous;
-                var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
-                defer arena.deinit();
-                for (items[0..batch_size]) |item| {
-                    _ = arena.reset(.retain_capacity);
-                    const scope = EvalScope.enter(engine, arena.allocator());
-                    defer scope.leave(engine);
-                    try engine.state();
-                    if (fold.record_rows) fold.stage_counts[index + 1] +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
-                    try fold.expand(engine, try engine.replace(row, unwind.alias, item), index + 1);
-                }
+                try fold.correlatedWindow(engine, row, index, unwind, pattern, operation, items[0..batch_size]);
             }
             return true;
         }
-        fn prefetchCorrelated(_: *@This(), engine: *Engine, row: Row, alias: []const u8, pattern: ast.Node, predicate: ?*const ast.Expr, items: []const v.Value, batch: *Lookup, examined: *usize) anyerror!bool {
+        // Split only a supported proof's population/memory decline. Unknown
+        // capabilities retain the ordinary fallback without a binary probe tree.
+        // Left windows finish before right windows, preserving outer encounter
+        // order and duplicate inputs. All discarded owner work remains charged.
+        fn correlatedWindow(fold: *@This(), engine: *Engine, row: Row, index: usize, unwind: @FieldType(@FieldType(ast.Clause, "operation"), "unwind"), pattern: ast.Node, operation: ast.Match, items: []const v.Value) anyerror!void {
+            var batch: Lookup = .{ .alias = pattern.alias, .table = engine.graph.label(pattern.labels[0]).?.table, .budget = .{ .backing = engine.scratch_allocator, .limit = @min(8 << 20, engine.limits.memory_bytes / 8) } };
+            batch.arena = std.heap.ArenaAllocator.init(batch.budget.allocator());
+            defer if (batch.arena) |*arena| arena.deinit();
+            var examined: usize = 0;
+            var split = false;
+            const prepared = fold.prefetchCorrelated(engine, row, unwind.alias, pattern, operation.predicate, items, &batch, &examined, &split) catch |err| declined: {
+                if (err == error.OutOfMemory and batch.budget.exhausted) {
+                    split = true;
+                    break :declined false;
+                }
+                return err;
+            };
+            // Charge discarded physical rows from admitted caches and
+            // ordinary fetches. Declined advisory probes leave examined
+            // zero; their owner work has already been charged.
+            const debt = if (prepared) examined - batch.rows.items.len else examined;
+            if (debt > engine.limits.scanned_anchors -| engine.stats.scanned_anchors) return error.CypherAnchorBudgetExceeded;
+            engine.stats.scanned_anchors += debt;
+            if (!prepared) batch.decline();
+            if (!prepared and split and items.len > 1) {
+                const middle = items.len / 2;
+                try fold.correlatedWindow(engine, row, index, unwind, pattern, operation, items[0..middle]);
+                try fold.correlatedWindow(engine, row, index, unwind, pattern, operation, items[middle..]);
+                return;
+            }
+            const previous = engine.correlated_lookup;
+            engine.correlated_lookup = if (prepared) &batch else previous;
+            defer engine.correlated_lookup = previous;
+            var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer arena.deinit();
+            for (items) |item| {
+                _ = arena.reset(.retain_capacity);
+                const scope = EvalScope.enter(engine, arena.allocator());
+                defer scope.leave(engine);
+                try engine.state();
+                if (fold.record_rows) fold.stage_counts[index + 1] +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
+                try fold.expand(engine, try engine.replace(row, unwind.alias, item), index + 1);
+            }
+        }
+        fn prefetchCorrelated(_: *@This(), engine: *Engine, row: Row, alias: []const u8, pattern: ast.Node, predicate: ?*const ast.Expr, items: []const v.Value, batch: *Lookup, examined: *usize, split: *bool) anyerror!bool {
             const a = batch.arena.?.allocator();
             const scope = EvalScope.enter(engine, a);
             defer scope.leave(engine);
@@ -6876,7 +6899,10 @@ const Engine = struct {
                 if (try probe_where(engine.backend.ptr, probe_scratch.allocator(), batch.table, &.{filter}, maximum)) |result| {
                     // A declined probe is advisory work, not a query binding.
                     // Its owner meter remains charged even on quota decline.
-                    if (!result.complete) return false;
+                    if (!result.complete) {
+                        split.* = true;
+                        return false;
+                    }
                     const page = result.page;
                     const used = page.examined orelse page.items.len;
                     if (page.next != null or page.unfiltered or used < page.items.len or used > maximum) return error.CypherInvalidBackendPage;
@@ -6904,7 +6930,10 @@ const Engine = struct {
                 const upper = proof orelse return false;
                 // Estimates can saturate at their requested limit. Only a strict
                 // bound fits this cache; it never supplies query rows or EOF.
-                if (upper > maximum) return false;
+                if (upper > maximum) {
+                    split.* = true;
+                    return false;
+                }
                 var after: ?[]const u8 = null;
                 while (true) {
                     try engine.state();
@@ -8574,8 +8603,35 @@ const Engine = struct {
         }
         return original;
     }
+    fn ownerCount(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) !?[]const Row {
+        const read = self.backend.vtable.count_nodes orelse return null;
+        if (!self.backend.vtable.prefer_count_nodes) return null;
+        if (self.limits.memory_bytes < 8 << 20) return null;
+        if (!self.read_only or input.len != 1 or input[0].len != 0 or operation.optional or operation.paths.len != 1 or middle.len != 0 or projection.wildcard or projection.distinct or projection.predicate != null or projection.order.len != 0 or projection.skip != null or projection.limit != null or projection.items.len != 1) return null;
+        const path = operation.paths[0];
+        if (path.nodes.len != 1 or path.edges.len != 0 or path.alias != null or path.selector != .all) return null;
+        const item = projection.items[0];
+        if (item.expression.value != .call) return null;
+        const aggregate_call = item.expression.value.call;
+        if (!std.ascii.eqlIgnoreCase(aggregate_call.name, "count") or !aggregate_call.star or aggregate_call.distinct or aggregate_call.args.len != 0) return null;
+        const node = path.nodes[0];
+        const request: backend_mod.CountInput = .{ .node = node, .predicate = operation.predicate, .source = self.source, .parameters = self.parameters, .max_examined = self.limits.scanned_anchors -| self.stats.scanned_anchors, .max_work = remainingWork(self), .memory_bytes = self.limits.memory_bytes };
+        if (!@import("owner_count.zig").eligible(request)) return null;
+        const label = self.graph.label(node.labels[0]) orelse return null;
+        const result = (try read(self.backend.ptr, self.a, label.table, request)) orelse return null;
+        if (result.examined > request.max_examined or result.count > result.examined) return error.CypherInvalidBackendPage;
+        self.stats.scanned_anchors += result.examined;
+        const total_count = std.math.cast(i64, result.count) orelse return error.CypherNumericOverflow;
+        const name = item.alias orelse try self.expressionName(item.expression);
+        self.columns = try self.a.dupe([]const u8, &.{name});
+        const row = try self.a.dupe(v.Entry, &.{.{ .name = name, .value = .{ .integer = total_count } }});
+        try self.stages.append(self.a, .{ .operation = "match", .span = match_span, .input_rows = 1, .output_rows = result.count });
+        try self.stages.append(self.a, .{ .operation = "project", .span = projection_span, .input_rows = result.count, .output_rows = 1 });
+        return try self.a.dupe(Row, &.{row});
+    }
     noinline fn streamMatchProjectionInto(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer) anyerror!?[]const Row {
         if (continuation == null and consumer == null and (input_weights == null or (input_weights.?.len == 1 and input_weights.?[0].isOne()))) {
+            if (try self.ownerCount(input, operation, projection, original_middle, match_span, projection_span)) |rows| return rows;
             if (try self.indexedGroups(input, operation, projection, original_middle, match_span, projection_span)) |rows| return rows;
             if (try self.indexedObservers(input, operation, projection, original_middle, match_span, projection_span)) |rows| return rows;
         }
@@ -13188,6 +13244,7 @@ const Engine = struct {
                 var head: usize = 0;
                 while (head < pending.items.len) : (head += 1) {
                     const index = pending.items[head];
+                    try self.prefetchLowerDomain(&graph, head, domain, std.math.maxInt(usize), pending.items);
                     const range = try self.loadLowerDomain(&graph, index, domain);
                     for (graph.nodes.items[index].arcs.items[range.first..range.last]) |arc| {
                         try self.state();
@@ -13220,6 +13277,7 @@ const Engine = struct {
                 var head: usize = 0;
                 while (head < graph.nodes.items.len) : (head += 1) {
                     if (graph.nodes.items[head].depth >= upper) continue;
+                    try self.prefetchLowerDomain(&graph, head, domain, upper, null);
                     _ = try self.loadLowerDomain(&graph, head, domain);
                 }
                 if (try self.lowerDomainDepth(&graph, domain, edge, &current)) |proof| {
@@ -14569,6 +14627,7 @@ const Engine = struct {
         arena: ?std.heap.ArenaAllocator = null,
         pages: std.HashMapUnmanaged(Key, StoredPage, Context, std.hash_map.default_max_load_percentage) = .empty,
         disabled: bool = false,
+        batch_disabled: bool = false,
         fn put(self: *@This(), key: Key, page: Page) !void {
             if (self.arena == null) self.arena = .init(self.budget.allocator());
             const a = self.arena.?.allocator();
@@ -14585,6 +14644,58 @@ const Engine = struct {
             if (self.arena) |*arena| arena.deinit();
         }
     };
+    fn prefetchLowerDomain(self: *Engine, graph: *LowerGraph, head: usize, domain: usize, upper: usize, frontier: ?[]const usize) !void {
+        const read = self.backend.vtable.expand_many orelse return;
+        const cache = self.adjacency_cache orelse return;
+        if (cache.disabled or cache.batch_disabled or self.limits.memory_bytes < 32 << 20 or remainingWork(self) < 65536) return;
+        if ((Budget.allocatorRemaining(self.scratch_allocator) orelse 0) < 16 << 20) return;
+        const remaining = self.limits.explored_edges -| self.stats.explored_edges;
+        if (remaining < 8192) return;
+        const edge = graph.domains[domain];
+        for (self.graph.relationships, 0..) |mapping, mapping_index| {
+            const selected = edge.types.len == 0 or for (edge.types) |name| {
+                if (std.mem.eql(u8, name, mapping.name)) break true;
+            } else false;
+            if (!selected) continue;
+            var identities: [16]v.Identity = undefined;
+            var batch_size: usize = 0;
+            var ordinal = head;
+            const length = if (frontier) |positions| positions.len else graph.nodes.items.len;
+            while (ordinal < length and batch_size < identities.len) : (ordinal += 1) {
+                const position = if (frontier) |positions| positions[ordinal] else ordinal;
+                const node = graph.nodes.items[position];
+                if (node.depth >= upper or node.domains.contains(domain)) continue;
+                const key: AdjacencyCache.Key = .{ .mapping = mapping_index, .node = node.node.identity, .direction = edge.direction, .cursor = null };
+                if (cache.pages.contains(key)) continue;
+                const outgoing = edge.direction != .in and try self.graph.admits(node.node, mapping.source_label, &self.values);
+                const incoming = edge.direction != .out and try self.graph.admits(node.node, mapping.target_label, &self.values);
+                if (!outgoing and !incoming) continue;
+                identities[batch_size] = node.node.identity;
+                batch_size += 1;
+            }
+            if (batch_size < 2) continue;
+            var arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
+            defer arena.deinit();
+            const maximum = @min(4096, (self.limits.explored_edges -| self.stats.explored_edges) / 2);
+            const batch = (try read(self.backend.ptr, arena.allocator(), mapping, identities[0..batch_size], edge.direction, 128, maximum)) orelse {
+                cache.batch_disabled = true;
+                return;
+            };
+            if (batch.pages.len != batch_size or batch.examined > maximum) return error.CypherInvalidBackendPage;
+            try self.accountEdges(.{ .items = &.{}, .examined = batch.examined });
+            for (batch.pages, identities[0..batch_size]) |page, identity| {
+                const value = page orelse {
+                    cache.batch_disabled = true;
+                    continue;
+                };
+                cache.put(.{ .mapping = mapping_index, .node = identity, .direction = edge.direction, .cursor = null }, value) catch |err| {
+                    if (err != error.OutOfMemory or !cache.budget.exhausted) return err;
+                    cache.disabled = true;
+                    return;
+                };
+            }
+        }
+    }
     fn lowerPage(self: *Engine, mapping: usize, node: v.Identity, direction: ast.Direction, cursor: ?[]const u8) !backend_mod.Page(*const v.Relationship) {
         try self.checkpoint();
         const key: AdjacencyCache.Key = .{ .mapping = mapping, .node = node, .direction = direction, .cursor = cursor };
