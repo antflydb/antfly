@@ -23,6 +23,7 @@ const q4_0 = @import("../quant_metal_q4_0.zig");
 const dense = @import("../quant_metal_dense.zig");
 const q4_k = @import("../quant_metal_q4_k.zig");
 const q8_0 = @import("../quant_metal_q8_0.zig");
+const mm_sg = @import("../quant_metal_mm_sg.zig");
 
 pub const regions = [_]Region{
     msl.metal("q4_0_shared", wrap.q4_0Shared()),
@@ -63,4 +64,6 @@ pub const regions = [_]Region{
     msl.metal("dense_f32_multi_row", &.{ dense.multiRow(dense.f32_), dense.multiRowReduce(dense.f32_) }),
     msl.metal("dense_f16_multi_row", &.{ dense.multiRow(dense.f16_), dense.multiRowReduce(dense.f16_) }),
     msl.metal("dense_bf16_multi_row", &.{ dense.multiRow(dense.bf16_), dense.multiRowReduce(dense.bf16_) }),
+    msl.metal("q4_0_mm_sg", &mm_sg.q4_0_kernels),
+    msl.metal("q8_0_mm_sg", &.{mm_sg.q8_0_kernel}),
 };
