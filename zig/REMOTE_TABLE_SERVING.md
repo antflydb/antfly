@@ -2327,9 +2327,9 @@ mixed content uses vector classification to copy clean runs and visits the
 canonical encoder only for actual escape bytes. Unicode-escape and byte-array
 output options keep the standard encoder's semantics.
 
-These additional in-memory layout changes advance runtime ABI to **74**. Stored
-source recipe **v10**, reader protocol **96**, `AFOV0005` and persisted artifacts
-are unchanged.
+This preceding layout revision used runtime ABI **74** and reader protocol
+**96**. The refinement below supersedes both. Stored-source recipe **v10**,
+`AFOV0005` and persisted artifact layouts remain unchanged.
 
 ### Reader-local failures, shared text payloads and compact writes
 

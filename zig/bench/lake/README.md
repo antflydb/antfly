@@ -2164,3 +2164,114 @@ reads and restart. Existing hidden/projected highlights, unavailable originals,
 exact signed decimals, deletes, native ordering, refresh and deadline cases
 remain covered. The preceding 50-case run also passed before the final fan-out
 correction; only the final executable supplies the timings above.
+
+## Shared text pages and compact metadata writes
+
+The [retained observation](native-page-leases-and-compact-writes-v1-observation.json)
+qualifies runtime `8823bc6952824a913757bc2dae4f1a3c272b5160` against control
+`c631577a9d4ab095ca3738fa0c19c39afbe95ebe`. Both include main
+`c0705f12640e5fc9e52f289a55f7268a54fd1682`. The control is an ancestor of the
+final merge, with the preceding lake runtime and the same main changes. During
+its build, every `zig/pkg` file was verified against that committed control;
+the committed candidate was restored before its separate build.
+
+Frozen Debug executables:
+
+- Control SHA-256: `82d3c9a083b1de43d9accf394d866a6fa795db4a4a6e4b896b069b0925a61976`.
+- Candidate SHA-256: `892e44175aaf28cd2c6b36c80632d085fb20920a05011642dd9d9e678b2dd1a6`.
+
+The latest changes fix reader-local cold-flight quota failures, share native
+source text through decoded-page leases, separate Parquet fetching from CPU
+decoding, reclaim typed codec scratch, and preserve compact keys through writes
+and maintenance. Runtime ABI is **75**, native reader protocol **97**. The
+stored-source recipe and page wire layouts remain unchanged. Protocol 97 fences
+new publications whose encoded pages exceed the older key-expansion policy.
+
+The HTTP comparison records **252 measured requests**, with seven samples per
+case, in both executable orders. Independent Parquet values and complete
+hit/total hashes agree across every sample and both binaries. The helper,
+fixture, executable and complete-report hashes are retained alongside all
+samples. Statistics requests still assert the bounded global frontier plan.
+
+Warm local Debug medians, milliseconds:
+
+| Shape | Control → candidate, primary | Control → candidate, reverse |
+| --- | ---: | ---: |
+| Large native ASCII strings | 28.518 → 20.152 | 35.596 → 27.213 |
+| Large ASCII with explicit source identity | 29.143 → 20.972 | 36.164 → 27.665 |
+| Large escaped/Unicode native strings | 34.233 → 26.258 | 34.311 → 25.860 |
+| Escaped/Unicode with explicit source identity | 34.637 → 26.724 | 34.651 → 26.517 |
+| Native-only wide control | 77.549 → 77.149 | 77.308 → 77.201 |
+| Wide composition control | 83.900 → 83.038 | 83.697 → 82.745 |
+| Physical SQL scan control | 78.299 → 78.480 | 77.676 → 78.833 |
+| Global exact term control | 57.621 → 57.754 | 57.474 → 57.431 |
+| Global prefix control | 47.365 → 47.880 | 47.533 → 47.369 |
+
+Native ASCII delivery improves **23.5–29.3%** and escaped/Unicode delivery
+**23.3–24.6%**. The identity variants improve **23.5–28.0%** and
+**22.8–23.5%**, respectively. Wide and statistics controls do not establish
+material gains. The physical SQL control is **0.2–1.5% slower**; no scan win is
+claimed. These results measure the current refinements, separately from the
+preceding live-admission and compiled-composition comparison above.
+
+A separate **ReleaseSafe production-code stress probe** builds 512 ordered
+131,000-byte keys sharing a long prefix, deletes one key, updates another and
+walks GC records. Both implementations verify every full returned key/value,
+record count, GC row count and allocation refund. Six alternating pairs retain
+all samples, including the first pair. This deliberately wide synthetic input
+qualifies compressed occupancy and work amplification, not archive throughput.
+
+| Kernel | Control median | Candidate median | Speedup |
+| --- | ---: | ---: | ---: |
+| Initial build | 43.769 ms | 19.795 ms | 2.21× |
+| Two-key edit | 3.530 ms | 0.238 ms | 14.86× |
+| GC traversal | 8.600 ms | 0.609 ms | 14.13× |
+
+Initial publication uses **77 → 1 pages**, height **3 → 0**, and
+**10,102,296 → 136,694 encoded bytes**. Cumulative operation allocations fall
+from **132,068,740 → 993,246 bytes** for construction,
+**10,246,390 → 575,391** for edits, and **86,942,492 → 361,933** for GC.
+These are allocated-byte totals, not peak memory measurements.
+
+Reproduce the kernel with the same worktree cache:
+
+```sh
+mkdir -p .benchmark-results/lake/page-leases-v1/before
+git show c631577a9d4ab095ca3738fa0c19c39afbe95ebe:zig/pkg/antfly/src/serverless/graph_segment/page_tree.zig \
+  > .benchmark-results/lake/page-leases-v1/before/page_tree.zig
+~/bin/zig test -lc -O ReleaseSafe --cache-dir zig/.zig-cache \
+  --global-cache-dir zig/.zig-cache/global \
+  --test-filter compact_write_production_comparison --dep before --dep after \
+  -Mroot=zig/bench/lake/compact_write_probe.zig \
+  -Mbefore=.benchmark-results/lake/page-leases-v1/before/page_tree.zig \
+  -Mafter=zig/pkg/antfly/src/serverless/graph_segment/page_tree.zig
+```
+
+For HTTP runs, build and freeze both source revisions first. Run
+`live_delivery.py LABEL IMMUTABLE_BINARY RUNTIME_SOURCE_COMMIT MODE` with
+`ANTFLY_LAKE_DELIVERY_RESULTS` pointing to an isolated absolute output root.
+For each of `wide`, `ascii`, `escaped` and `statistics`, run control/candidate,
+then candidate/control under fresh labels. Timing runs must not overlap this
+task's builds, native tests, E2E or cleanup.
+
+Final qualification passes **438 distinct native checks**, with no failures,
+skips or leaks, and **50 real Parquet/Iceberg E2E cases in 367.42 seconds**
+against the frozen final executable. Native coverage includes reader-local
+cold-flight retries; typed column/dictionary allocation faults; result pins
+surviving cursor teardown and unavailable source bytes; rejected or non-consuming
+callback transfers; UTF-8 page boundaries; delayed fetches leaving CPU admission
+free; cancellation; wide compressed-key updates, retention, differences and GC;
+and legacy explicit expansion limits. Both real-file formats retain cold/warm,
+restart, highlights, exact decimals, deletes, ordering and refresh coverage.
+
+The committed control independently fails the existing 145,186-row, 12-column
+cached cohort with `ParquetPageTooLarge` under 32-MiB raw and 32-MiB structural
+allowances. The candidate passes unchanged limits, checks peak residency at or
+below 64 MiB, and asserts reclaimable cached vectors retaining fewer than 16
+bytes per row per column. Codec staging arrays no longer remain in cache arenas.
+This is a native cursor admission qualification, not a public-query memory claim.
+
+Other work on the shared host is uncontrolled. HTTP observations use warm local
+Debug with process/OS/persistent caches and readiness warming. There is no cloud,
+empty-cache, archive-scale, Release HTTP or full-query-memory qualification.
+Real-provider cloud retention qualification remains deferred.
