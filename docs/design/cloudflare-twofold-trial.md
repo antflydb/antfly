@@ -1,13 +1,16 @@
 # Next disposable latency rehearsal
 
-Status: the original candidate closure below is preserved, pending replacement
-by the conservative warm-read policy in `e8591354d3`. Local traces exposed a
-short-tail prefetch regression in the original candidate. Do not deploy that
-closure; qualify the revised modules locally, re-seal the candidate, and update
-these hashes first. The resource names and disposable-token scope stay the same.
+The re-sealed pair uses the previously approved corrected control `c44896ac8c`
+and candidate production source `e8591354d3`. The revised policy passes local
+correctness checks: 499 Node tests, three guarded workerd checks, 188 shared native
+checks (two live-provider skips), 34 focused journal tests, 18 app cases and all
+108 candidate metadata observations. Its metadata recovery gain does not prove
+an overall app gain or a gate pass. The original eager-prefetch proposal is
+preserved without credential files at
+`dist/qualification/twofold-original-hosted-proposal` under the example.
+Resource names and the pending disposable-token authorization scope are unchanged.
 
-The originally prepared pair uses the previously approved corrected control `c44896ac8c`
-and candidate production source `edd57e464c`. This is a short diagnostic
+This is a short diagnostic
 rehearsal with the original offered workload, exact-body/receipt checks,
 independent whole-window evidence, and unchanged qualification thresholds.
 It cannot substitute for the three hour-long trials and cold samples.
@@ -18,11 +21,11 @@ The locally built and verified configuration/bundle closure is in
 Both stacks pass `verifySealedRun` with no errors. The control full module is
 `563936db3958bdab50c404db4a6ccef15e095e798e49198ab2304d87322dac97`;
 candidate full/compact/observation modules are respectively
-`352c3e98742b5330f47f2fe8f8c47b0fde79e55c45f677609ec44a7702ba68ce`,
-`5d45cfc3292cfc9a13a4dc96b0d506ee14304ae8bb50251a3412522e5d367269`,
-and `1a010d53a7debdcefeb58c45d2167c7491461997a811f1a1544bdbb8dee1a151`.
+`9b86730b4cf0941db1adf22c8876d61c90a0d03643cde2e87fe03d7f2c33d367`,
+`fbeac401afd8dc59bd7eabefc5cf6368306b972bd7af277863b3bbbdb6b31e61`,
+and `fa7e6af392149a884443f1bf27ffad5336d40ff46a7ed9c4ad6f892ef8d35c49`.
 The candidate retains the previous hosted feature configuration; affinity and
-write read-ahead remain disabled pending local evidence.
+write read-ahead remain disabled because local comparisons show no consistent benefit.
 
 The independent observer is prepared and locally sealed at
 `examples/cloudflare-serverless/dist/qualification/antfly-1278-observe-mvvfupn619ef/run.json`.

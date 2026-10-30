@@ -107,7 +107,7 @@ does not establish its allocator-level root cause or satisfy the hosted gate.
 
 ## Initial implementation measurements
 
-The corrected candidate full module is
+The first anchor-corrected prototype full module is
 `352c3e98742b5330f47f2fe8f8c47b0fde79e55c45f677609ec44a7702ba68ce`;
 the frozen previous candidate control is
 `9711adb54900fe7c494fb16a8fa0675b1e83ca2eba9a598bb9a6b0d79759f02c`.
@@ -140,3 +140,98 @@ recovery; its 34-test native suite verifies every warm tail length through seven
 deep cold/warm catch-up, allocation failures, concurrent appends and fencing.
 New WASM and end-to-end measurements are required before selecting that policy
 for a hosted deployment.
+
+## Final local qualification of the conservative warm policy
+
+Production implementation `e8591354d3`, measured from clean source
+`dbe020dc86`, produces full/compact/observation modules:
+
+- `9b86730b4cf0941db1adf22c8876d61c90a0d03643cde2e87fe03d7f2c33d367`
+- `fbeac401afd8dc59bd7eabefc5cf6368306b972bd7af277863b3bbbdb6b31e61`
+- `fa7e6af392149a884443f1bf27ffad5336d40ff46a7ed9c4ad6f892ef8d35c49`
+
+All 499 Node tests pass against these modules. The shared object-store suite
+passes 188/190 tests, with two credential-dependent live-provider cases skipped;
+all 34 focused journal tests pass. Three guarded actual-workerd regressions pass:
+eviction/collection/reindex recovery, SQL/KV-forbidden bounded native plans, and
+write-plan reuse versus semantic dependency rejection. An earlier concurrent
+full workerd run had a Tail response-body failure and a legacy-test timeout;
+both affected files pass in isolation with unchanged assertions/timeouts. The
+frozen previous legacy implementation also passes that long-running test. The
+failed concurrent run remains preserved, not relabeled as a clean full run.
+
+The final metadata matrix verifies all 108 candidate observations across 36
+cases. At 32 commits of lag and 100 ms binding delay:
+
+| Recovery p95 | Previous candidate | Conservative warm policy |
+| --- | ---: | ---: |
+| Cold cursor | 3,540 ms | 1,321 ms |
+| Expired proof | 3,447 ms | 1,221 ms |
+| Advanced checkpoint | 511 ms | 308 ms |
+
+Cold/expired recovery is about 2.7–2.8× faster for this component. The control
+still times out on all six 32-entry cold/expired observations at 200 ms delay;
+the candidate completes them under the unchanged five-second budget. The
+matrix alternates order, clones identical physical fixtures and freezes its
+launch source/arguments. See
+`dist/qualification/twofold-metadata-short-tails/report.json` under the example.
+
+All 18 final actual-workerd cases pass exact-body, count and visibility checks,
+covering 1,728 measured reads and 576 measured writes. The following are complete
+order ranges, not selected best samples:
+
+| App workload | Profile | Read p95 | Write p95 |
+| --- | --- | ---: | ---: |
+| 64 documents/tenant, 50 ms binding delay | Previous candidate | 463–484 ms | 232–254 ms |
+| Same, two orders | Current | 467–476 ms | 241–271 ms |
+| Same, two orders | Affinity | 456–482 ms | 241–380 ms |
+| Same, two orders | Affinity + write read-ahead | 471–478 ms | 237–257 ms |
+| 512 documents/tenant, 100 ms binding delay | Previous candidate, two orders | 1,095–3,090 ms | 862–3,089 ms |
+| Same, two orders | Current | 1,598–1,617 ms | 1,084–1,303 ms |
+| Same, one case | Affinity | 1,856 ms | 883 ms |
+| Same, one case | Affinity + write read-ahead | 2,111 ms | 2,001 ms |
+
+The apparent idle app improvement does not survive reversing order. First-read
+p95 is control 967 → current 536 ms in one order, but current 1,050 → control
+453 ms in the other. Each case has only twelve first-read samples. Treat this
+as an order effect, not a reproducible implementation gain. The large workload
+also varies substantially; no overall twofold app improvement is established.
+Keep affinity and additional write read-ahead disabled in the selected hosted
+diagnostic profile.
+
+The larger slow-read traces have zero warm prefetch and typically three to five
+metadata GETs, so the original short-tail overfetch is fixed. They still show
+substantial shared-pool waiting: one candidate read waits 1,153 ms for its point
+kernel after 433 ms admission, then spends 342 ms in native lookup (340 ms I/O).
+Do not add independently computed stage percentiles to explain request p95.
+
+`dist/qualification/twofold-results.json` summarizes all final app cases. Reports
+retain first/warm timings, native phases, physical counters, source/argument
+hashes, bundles and module copies. Three phase resets start with one existing
+writer I/O operation; counters preserve that activity rather than resetting it
+to zero. Every final counter snapshot has zero active I/O and zero recorded
+resource codes. These snapshots are not independent whole-window evidence and
+cannot rule out later background failures or establish the hosted allocator's
+behavior. The earlier false-positive resource classifier, missing control-shim
+import, eager-prefetch regressions and interrupted attempts remain preserved.
+
+## Remaining architectural boundary and hosted acceptance
+
+The native recovery component improves; the shared read queue is still a limit
+at larger concurrency. If paired hosted traces confirm it, extend the shared
+engine with resumable native metadata observation: a native plan binds the
+source root, scope and original clock anchor; request-owned bounded transport
+performs its I/O outside the WASM execution slot; native resumption validates
+the frames, fresh end probe, owner and expiry before serving. Retain typed
+revisions, cumulative operation/byte budgets and settlement of unused failures.
+A JavaScript prefetch followed by a newly anchored native certificate is not
+correct: the certificate must bind an anchor preceding the I/O. This continuation
+protocol is not implemented or claimed as part of the measured result here.
+
+Next run the frozen candidate on the original paired hosted offered workload,
+measure compute/storage placement separately, and require complete independent
+whole-window diagnostics before proceeding to the three hour-long trials and
+100 physical cold samples. The new disposable scope is described in
+[the hosted proposal](cloudflare-twofold-trial.md); credential/cleanup approval
+is pending. No new cloud resources were deployed for these local experiments.
+The historical live `SQLITE_NOMEM` and the hosted gate remain unresolved.

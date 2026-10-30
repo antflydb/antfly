@@ -500,13 +500,29 @@ source revisions, test logs and independent cleanup inventory. An earlier seal
 had an incorrect top-level source label due to a script variable being reused;
 it remains preserved as invalid and is explicitly superseded by this seal.
 
-The next recovery/preparation implementation is described in
+The implemented recovery/preparation changes and full local comparisons are in
 [Bounded metadata recovery and reusable immutable preparation](serverless-metadata-recovery.md).
 It adds shared native bounded journal catch-up, direct advanced-checkpoint
 rebasing with the original proof anchor, bounded checkpoint repair, metadata
 observation affinity and write-plan reuse after authority refresh. The corrected
-metadata-only matrix verifies all candidate observations and measures about
-2.6× faster 32-entry cold/expired recovery at 100 ms binding delay. This is not
-a new hosted latency result. End-to-end trials and placement qualification
-remain separate from the metadata-stage result and the unreproduced historical
-allocator error.
+final metadata-only matrix verifies all 108 candidate observations and measures
+2.7–2.8× faster 32-entry cold/expired recovery at 100 ms binding delay. Native
+coverage protects warm tails through seven commits from speculative reads.
+All 499 Node tests and the three guarded workerd recovery/write-reuse checks
+pass against the final modules; the shared native suite passes 188 tests with
+two live-provider cases skipped.
+
+All 18 final app cases pass correctness checks, but do not establish another
+overall twofold gain. Warm 64-document cases are essentially unchanged; large
+512-document cases vary substantially between orders. The apparent idle app
+benefit reverses with order. Affinity and extra write read-ahead remain off in
+the proposed hosted profile. Larger slow reads still wait in the shared native
+pool despite having no warm prefetch; resumable native metadata I/O is a
+possible next architectural step, with a pre-I/O authenticated clock anchor.
+It is not implemented or claimed as a measured gain here.
+
+The revised disposable hosted pair is prepared locally, with its original
+undeployed proposal preserved. No new cloud resources were created. Hosted
+latency, independent whole-window diagnostics, placement qualification and the
+historical allocator error remain unresolved; named token/cleanup authorization
+for the new deployment is pending. The original gate remains unpassed.
