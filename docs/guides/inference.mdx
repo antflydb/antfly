@@ -1,13 +1,13 @@
 ---
 title: Antfly Inference
-sidebar: concepts
-order: 3
 description: The model runtime inside Antfly, what it runs, and how to pull and configure models for it
 prerequisites:
   - Antfly installed and running
 difficulty: beginner
 estimatedTime: "10 min"
 tags: [inference, embeddings, reranking, models]
+sidebar: inference
+order: 1
 ---
 
 <Questions>
@@ -60,74 +60,26 @@ Setting `inference.api_url` disables embedded inference. It is not a fallback. S
 
 ## Configuring a Separate Inference Process
 
-`antfly inference run --config inference.json` reads admission settings and the
-model settings `models_dir`, `ml_dir`, `max_loaded_models`, `preload`, `keep_alive`,
-`prompt_cache`, and `kernel_jit`. `keep_alive` is the same duration string standalone
-uses (default `5m`; `"0"` disables idle unloading); the operator's flat integer-millisecond
-`keep_alive_ms` is also accepted, and if both are set, `keep_alive` wins. `prompt_cache`
-takes the same fields as standalone's (`enabled`, `mode`, `max_bytes_mb`, `min_tokens`,
-`ttl_ms`); the prompt KV cache stays on by default when `prompt_cache` is omitted entirely,
-matching prior behavior. `kernel_jit` takes the same fields as standalone's
-(`mode`, `cache_dir`, `max_cache_bytes_mb`, `preload_budget_ms`); the
-`--kernel-jit-*` flags and `ANTFLY_INFERENCE_KERNEL_JIT_MODE` still override it:
+`antfly inference run --config inference.json` reads model settings under `inference`
+and resource policy under `resources`:
 
 ```json
 {
   "inference": {
     "models_dir": "/models",
-    "ml_dir": "/ml",
     "max_loaded_models": 3,
+    "keep_alive": "5m",
     "preload": [
       {"kind": "embedder", "name": "BAAI/bge-small-en-v1.5", "backend": "native"}
     ]
-  }
+  },
+  "resources": {"inference": {"admission": {"max_concurrent_requests": 8}}}
 }
 ```
 
-Pull the referenced models into that directory before starting the process.
-The operator's flat config spelling (those fields at the top level, including
-`keep_alive_ms`) is also accepted. If both spellings exist, the nested
-`inference` value wins for each field, including an explicit empty `preload`
-list. No `api_url` is required to start the server; configure the listener
-with `--host` and `--port`.
-
-Explicit CLI options override config regardless of argument order. Supplying
-one or more `--preload-model` flags replaces the config preload list rather than
-appending to it. For an exact match of kind, model reference (including artifact
-variant), and backend, config-only `residency_mode` and `memory_budget_mb`
-policies are retained; unrelated config models are not loaded. Duplicate config
-entries matching the same CLI selection are rejected as ambiguous.
-A model-count limit of zero disables that limit. When paths are
-absent from both CLI and config, the usual environment/home defaults apply.
-Preload entries retain their backend, artifact format/quantization, and optional
-residency/memory-budget choices.
-An unqualified preload name with `format`/`quantization` is expanded to an
-explicit artifact reference (for example, `owner/model:gguf:Q4_K`) before
-resolution. Conflicts between preferences and already-qualified references are
-rejected rather than silently selecting another installed artifact.
-
-The runtime reads this config directly. The operator additionally emits
-equivalent `--models-dir`, `--ml-dir`, `--max-loaded-models`, and one
-`--preload-model` flag per preload entry, so a pod still running an older
-runtime binary that predates config-file model policies keeps working during
-a rolling upgrade. The operator resolves nested model overrides into the flat
-config spelling before emitting JSON or CLI arguments, writes default model
-kinds (`generator` when omitted in `spec.config.preload`) and normalized
-artifact references into both outputs, and preserves remaining non-model
-nested settings alongside the client URL field required by the legacy schema;
-admission settings and flat per-model policies remain intact.
-
-For operator-generated eager preloads (the default loading strategy), specify a
-recognized task such as `tasks: [embed]` or `tasks: [generate]` on each model.
-The warm CLI needs a model kind; an omitted or unrecognized task hint
-does not imply a generator. The operator reports a configuration validation
-failure before creating or updating the workload when that kind is ambiguous.
-Alternatively, supply `spec.config.preload` with an explicit `kind`, or use
-lazy/bounded loading to discover the model task at request time. Per-model
-eager strategy overrides have the same requirement.
-
-Empty or null optional `backend`, `format`, and `quantization` fields in operator
-preload configuration are treated as unspecified in both JSON and CLI output.
+Pull the referenced models into `models_dir` before starting the process. CLI flags
+override the file; see the [inference runtime reference](../reference/inference-runtime.md)
+for every setting, preload rules, and migrating older flat configs.
 
 ## Pulling Models
 
@@ -159,7 +111,7 @@ Verified starting points, one per job:
 | Reranking | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0` |
 | Generation | `ggml-org/gemma-4-E4B-it-GGUF` |
 | Transcription | `openai/whisper-tiny` |
-| Reading and OCR | `antflydb/Florence-2-base` |
+| Reading and OCR | [`lightonai/LightOnOCR-3-0.8B`](/docs/guides/models/lightonocr3) |
 | Extraction | `antflydb/gliner2-base-v1` |
 
 See what is installed:
@@ -249,10 +201,12 @@ The chunkers `fixed_bert` and `fixed_bpe` are built in and need no download. Chu
 
 ## Capacity, Admission, and Memory
 
-- **Request admission.** `admission.inference.max_concurrent_requests` (default 32; `--max-concurrent-requests` on `antfly inference run`; 0 disables the limit) bounds concurrent inference requests. The same value sizes a weighted work budget, so a few heavy requests can exhaust capacity before the count is reached. Standalone shares one budget across direct enrichment and query calls, `/ai/v1`, and `/ml/v1`. Requests are never queued. When capacity is exhausted, HTTP callers get `503` with `Retry-After: 1` and a JSON body carrying `retryable: true`.
-- **Model residency.** At most `max_loaded_models` models stay loaded (default 10; 0 means unlimited), and the least recently used idle model is evicted to make room. Idle models unload after `inference.keep_alive` (default `5m`; `"0"` disables idle unloading); `antfly inference run` also accepts the operator's flat `keep_alive_ms` spelling (integer milliseconds; `0` disables idle unloading), and `keep_alive` wins if both are set. Concurrent requests for the same unloaded model share one load.
-- **Memory.** Model loads and requests reserve memory before they allocate. The reservation comes from one process envelope shared with storage and caches. Set the envelope with `--process-memory-budget-mb` or `ANTFLY_PROCESS_MEMORY_BUDGET_MB` on `antfly standalone` or `antfly inference run`. Otherwise the cgroup limit is used, and host memory without a cgroup limit. In Kubernetes Burstable pods, set it below the container limit. A request that can never fit returns `MODEL_RESOURCE_LIMIT`. Temporary pressure returns a retryable `MODEL_RESOURCE_BUSY` once idle models have been evicted.
+- **Request admission.** At most 32 concurrent inference requests by default (`resources.inference.admission.max_concurrent_requests`).
+- **Model residency.** Up to 10 models stay loaded (`max_loaded_models`); idle models unload after `keep_alive` (default `5m`).
+- **Memory.** Model loads and requests reserve memory from one process envelope shared with storage and caches. Set it with `--process-memory-budget-mb` or `ANTFLY_PROCESS_MEMORY_BUDGET_MB`; otherwise the cgroup or host limit applies. A request that can never fit returns `MODEL_RESOURCE_LIMIT`; temporary contention returns `MODEL_RESOURCE_BUSY`.
 - **Query priority.** Background enrichment yields to query-time work in the same database process. Embedding backfill pauses (up to 5 s) while a query-time embed is running, and background generation pauses while an interactive generate or chat request is in flight. Backfill that receives `503` retries with backoff.
+
+The [inference runtime reference](../reference/inference-runtime.md) covers weighted work admission, request ceilings, and the model-instance API.
 
 ### Loading models in Antfarm
 
@@ -304,42 +258,9 @@ Then prompt it with the outcome, for example "Set up local embeddings and rerank
 ## Next Steps
 
 - [Local Model Compatibility](/docs/guides/supported-models): which artifacts load, which are rejected, and why
+- [Inference Components and Providers](/docs/guides/inference-providers): every component and the hosted providers that can serve it
 - [Multimodal Embeddings](/docs/guides/multimodal): the ClipClap embedder on an image index
 - [Tune Hybrid Search](/docs/guides/hybrid-search): the reranker in a query pipeline
 - [Inference API reference](/inference/api): the HTTP surface
-
-- [Typed Decisions](decisions.md): named choice, ordinal score, and Boolean questions through HTTP and C, Rust, Go, Python, or TypeScript embedded inference
-
-### Model instances
-
-Antfly inference owns the shared model cache. Antfarm and other clients use the
-same model-instance API:
-
-- `GET /ai/v1/models/instances` lists loading and loaded instances without
-  extending their idle deadlines. Each incarnation appears once, with all its
-  supported tasks.
-- `POST /ai/v1/models/instances` with `{ "model": "owner/model", "task": "embedder" }`
-  prepares the same instance used by that task's inference requests. Existing
-  compatible instances are reused. Normal eviction still applies. Readers that
-  own sessions per request have no persistent instance and return an unsupported
-  instance error; their ordinary inference requests remain available.
-- `DELETE /ai/v1/models/instances/{instance_id}` unloads one exact incarnation.
-  An absent or stale ID succeeds without affecting a replacement. Busy, loading,
-  and startup-managed instances return a conflict.
-
-A model is an artifact; a model instance is one loading or loaded incarnation
-inside a server; a backend is its selected execution implementation. Loaded
-instances may stream weights and do not promise full GPU residency.
-`active_handles` counts internal owners and load waiters, rather than HTTP
-requests. `unloadable` and `unload_blocked_reason` describe eviction eligibility
-at snapshot time; concurrent work can change it before an unload arrives.
-
-Startup backend overrides for split transcription models also select the backend
-for subsequent default requests. The pinned instance is reused across aliases
-and canonical paths; explicit backend policies and newly published artifact
-generations retain separate cache identities.
-
-Relation models may advertise `untyped_entities` in their model capabilities.
-These models emit generic `ENTITY` nodes and accept relation names without typed
-endpoints. Antfarm uses this capability for REBEL artifacts, including renamed
-installations, while preserving typed schemas for other relation models.
+- [Typed Decisions](../reference/decisions.md): named choice, ordinal score, and Boolean questions
+- [Inference runtime reference](../reference/inference-runtime.md): configuration, admission, memory, and model instances

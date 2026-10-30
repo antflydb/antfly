@@ -188,6 +188,13 @@ pub const MmapRegion = struct {
         advise(@constCast(bytes.ptr), bytes.len, .sequential);
     }
 
+    /// Restore sparse inference access after a bounded scan of borrowed mmap
+    /// bytes. Like the sequential hint, this cannot fail the owning operation.
+    pub fn adviseBytesRandom(bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        advise(@constCast(bytes.ptr), bytes.len, .random);
+    }
+
     /// Release clean pages for a consumed file-backed range. The mapping stays
     /// valid: a later access faults the bytes back from the file. This is an
     /// advisory Linux optimization and deliberately cannot fail allocation or

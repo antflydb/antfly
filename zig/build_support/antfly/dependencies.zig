@@ -639,6 +639,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     generating_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     generating_mod.addImport("antfly-json", json_mod);
     generating_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    generating_mod.addAnonymousImport("anthropic_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/anthropic_api/root.zig") });
     const chunking_mod = b.createModule(.{
         .root_source_file = b.path("lib/chunking/src/mod.zig"),
         .target = target,
@@ -665,8 +666,14 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    scraping_mod.addAnonymousImport("antfly_data_uri", .{
+        .root_source_file = b.path("lib/scraping/src/data_uri.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     scraping_mod.addImport("antfly_source_reference", source_reference_mod);
     scraping_mod.addImport("objectstore", objectstore_mod);
+    scraping_mod.addImport("antfly_platform", platform_mod);
     scraping_mod.addImport("httpx", httpx_mod);
     const reranking_mod = b.createModule(.{
         .root_source_file = b.path("lib/reranking/src/mod.zig"),
@@ -683,6 +690,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     extracting_mod.addImport("httpx", httpx_mod);
     extracting_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
+    extracting_mod.addAnonymousImport("fastino_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/fastino_api/root.zig") });
 
     // --- Inference backend detection (must precede module creation) ---
     structured_mod.addImport("antfly_generating", generating_mod);
@@ -809,6 +817,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .structlog = structlog_mod,
             .jinja = inference_jinja_mod,
             .inference_api_source = inference_api_source,
+            .inference_config_openapi = inference_config_openapi_mod,
             .protobuf = protobuf_mod,
             .sentencepiece_proto = sentencepiece_proto_mod,
             .ml = inference_ml_mod,
@@ -1041,6 +1050,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    inference_bedrock_mod.addAnonymousImport("bedrock_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/bedrock_api/root.zig") });
     inference_bedrock_mod.addImport("antfly_cancellation", cancellation_mod);
     inference_bedrock_mod.addImport("httpx", httpx_mod);
     inference_bedrock_mod.addImport("antfly_hash", hash_mod);
@@ -1172,6 +1182,19 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const darwin_shared_storage_sdk27 = darwin_release_profile and shared_inference_core and
         @import("antfly_platform").macosSdkMatchesVersion(b, target, "27.0");
     const darwin_release_memory = darwin_shared_storage_sdk27;
+    // Independently measured on the Linux release runner, not inherited from
+    // native Apple Silicon's SDK 27 profile.
+    const darwin_cross_release_memory = optimize == .fast and inference_optimize == .fast and
+        strip and !sanitize_thread and link_libc and
+        lmdb_backend == .zig and !lmdb_evented_async_io and !with_tla and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .x86_64 and
+        b.graph.host.result.abi == .gnu and
+        target.result.os.tag == .macos and target.result.cpu.arch == .aarch64 and
+        target.result.cpu.model == baseline_cpu.model and target.result.cpu.features.eql(baseline_cpu.features) and
+        shared_inference_core and inference_enable_metal and inference_enable_system_blas and
+        !inference_enable_cuda and !inference_enable_pjrt and
+        @import("antfly_platform").macosSdkMatchesVersion(b, target, "26.1");
     const native_cpu_debug_test_profile = optimize == .debug and !strip and !sanitize_thread and link_libc and
         lmdb_backend == .zig and !lmdb_evented_async_io and !with_tla and
         inference_optimize == .fast and inference_enable_system_blas and
@@ -1243,6 +1266,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .shared_inference_core = shared_inference_core,
         .darwin_release_memory = darwin_release_memory,
         .darwin_shared_storage_sdk27 = darwin_shared_storage_sdk27,
+        .darwin_cross_release_memory = darwin_cross_release_memory,
         .sanitize_thread = sanitize_thread,
         .build_info = build_info,
 

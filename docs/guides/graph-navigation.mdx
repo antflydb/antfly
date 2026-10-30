@@ -1,11 +1,23 @@
 ---
-title: "Explore trees and graphs with the retrieval agent"
-description: "Choose branches or follow a graph path through a retrieval-step navigation policy."
+title: "Tree and Graph Navigation"
+description: "How the retrieval agent explores a hierarchy or follows a graph path from a seed query, and how its budgets, permissions, and instructions apply"
+sidebar: concepts
+order: 4
 ---
 
-Configure `steps.retrieval.navigation` to explore one query's authorized data.
-`strategy: "tree"` lets the model explore branches and return to unvisited
-siblings. `strategy: "graph"` follows a single model-selected path.
+<Questions>
+- How do I let the retrieval agent walk a document hierarchy?
+- How do I make the agent follow a workflow graph step by step?
+- What limits how far navigation goes?
+- Can navigation run without a model?
+- Which permissions does navigation need?
+</Questions>
+
+Navigation lets the retrieval agent move from a search hit through a table's
+structure instead of stopping at the hit. Configure it on
+`steps.retrieval.navigation`. `strategy: "tree"` explores branches of a
+hierarchy and can return to unvisited siblings; `strategy: "graph"` follows one
+path along graph edges. The main decision is which of the two matches your data.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
@@ -14,7 +26,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
     "query": "Compare recovery options across the deployment runbook",
     "stream": false,
     "max_internal_iterations": 12,
-    "generator": {"provider": "antfly", "model": "your-tool-capable-model"},
+    "generator": {"provider": "antfly", "model": "ggml-org/gemma-4-E4B-it-GGUF"},
     "queries": [{
       "table": "runbooks",
       "full_text_search": {"match": "deployment", "field": "title"},
@@ -38,14 +50,21 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
   }'
 ```
 
-Omit `start_key` to start at the first search hit. Explicit starts and subsequent
-reads enforce query filters, authenticated row filters, and fields projection.
-Exploration stays in the configured table. The agent calls `search` once to
-start, then `navigate` to choose an offered, unvisited key. For trees, siblings
-remain in the frontier while another branch is explored. `max_depth` counts
-from the start at depth zero; `beam_width` bounds children per expansion.
+## Tree Exploration
 
-For a workflow path, replace the navigation object with:
+`index` names the graph index whose edges form the hierarchy, such as parent and
+child sections, and `query_index` picks which entry in `queries` seeds the
+walk. With `start_key`, navigation starts at that
+document; without it, at the first search hit.
+
+The agent calls `search` once to start, then `navigate` to choose one of the
+offered, unvisited keys. Siblings stay in the frontier while the agent explores
+another branch, so it can come back to them. `max_depth` counts from the start
+at depth zero, and `beam_width` bounds how many children each expansion offers.
+
+## Graph Paths
+
+For a workflow or any ordered path, use a graph index:
 
 ```json
 {
@@ -60,28 +79,67 @@ For a workflow path, replace the navigation object with:
 }
 ```
 
-Graph direction and edge types apply at every hop. `max_steps` limits moves
-after the start node. Both agentic strategies share the enclosing model,
-conversation, iteration budget, 20-tool-call cap, and accumulated context budget.
-Candidate lists are pruned to fit context; only offered keys remain selectable.
-An exhausted model/context budget returns `status: "incomplete"` with collected
-evidence and steps. Narrow the fields projection for large documents.
+`direction` and `edge_types` apply at every hop. `max_steps` limits moves after
+the start node, and `neighbor_limit` bounds the candidates offered at each step.
 
-Optional `instruction` supplies a workflow rule. `instruction_field` opts into
-a top-level string field on each visited document; include it in your projection.
-Instructions accumulate alongside earlier evidence. Other fields and unvisited
-candidates remain untrusted evidence. Instructions cannot change permissions or
-budgets. Tree navigation requires the `tree_search` tool permission; graph
-navigation requires `graph_search`, alongside the seed query's permissions.
+## Budgets
 
-For deterministic tree retrieval, use `strategy: "tree", selection: "ranked"`.
-No model is required for navigation. Supply a literal `start_key`, omit it to
-use seed results, or use the ranked-only `start_nodes` selector (`$roots`,
-comma-separated keys, or a prior-result selector). Query-level `tree_search`
-and `graph_navigation` are no longer accepted; policy belongs on the step.
+Both agentic strategies share the request's model, conversation, iteration
+budget (`max_internal_iterations`), 20-tool-call cap, and context budget.
+Candidate lists are pruned to fit the context, and only offered keys can be
+selected. When the model or context budget runs out, the response has
+`status: "incomplete"` with the evidence and steps collected so far. Narrow
+`fields` when documents are large, so more candidates fit.
 
-Read visited documents from `hits`, the optional answer from `generation`, and
-agentic steps named `tree_navigation` or `graph_navigation`. Tree steps include
-depth and the actual branch parent. With `stream: true`, execution emits the
-standard retrieval events. Query-builder tree output returns the query and
-`retrieval_navigation` separately; copy the latter into the retrieval step.
+## Permissions and Instructions
+
+The start document and every later read enforce the seed query's filters,
+authenticated row filters, and `fields` projection. Navigation never leaves the
+configured table. Tree navigation needs the `tree_search` tool permission and
+graph navigation needs `graph_search`, in addition to the seed query's
+permissions.
+
+`instruction` adds a workflow rule for the model. `instruction_field` also reads
+a top-level string field from each visited document as an instruction; include
+that field in `fields`. Instructions accumulate alongside earlier evidence and
+cannot change permissions or budgets. Other fields and unvisited candidates are
+treated as untrusted evidence.
+
+## Ranked Trees Without a Model
+
+`strategy: "tree"` with `selection: "ranked"` walks the hierarchy
+deterministically, with no model call for navigation. Start from a literal
+`start_key`, from the seed results by omitting it, or from `start_nodes`: `$roots`,
+comma-separated keys, or a selector over a prior result. `start_nodes` is only
+available for ranked selection.
+
+## Reading the Result
+
+Visited documents are in `hits`, and the answer, when `generation` is set, is in
+`generation`. Agentic runs record steps named `tree_navigation` or
+`graph_navigation`; tree steps include the depth and the actual branch parent.
+With `stream: true`, the run emits the standard retrieval events. The query
+builder returns its query and `retrieval_navigation` separately; copy
+`retrieval_navigation` into this step.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can configure navigation for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "answer questions over my runbooks
+by walking their section hierarchy from the best search hit", and use this page
+to judge the result.
+
+## Next Steps
+
+- [Artifact-Backed Indexes](/docs/guides/artifact-indexes) to build the graph
+  indexes navigation walks.
+- [Write a Cited Research Report](/docs/guides/deep-research) when one question
+  needs several parallel searches rather than one walk.
+- [Document Engine](/docs/guides/document-engine) for the search modes and
+  filters that make a good seed query.

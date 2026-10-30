@@ -378,7 +378,7 @@ pub const PreparedPublication = struct {
 // a stream of short reads from starving queued writers and maintenance.
 const QueuedMutex = struct {
     state: std.Io.Mutex = .init,
-    ready: std.Io.Condition = .init,
+    ready: @import("antfly_platform").sync.BroadcastCondition = .init,
     next: u64 = 0,
     serving: u64 = 0,
 
@@ -461,6 +461,7 @@ pub fn testMaintenanceCaptureAdmission() !void {
 const PathGate = struct {
     path: []u8,
     mutex: QueuedMutex = .{},
+    sql_preparation: @import("sql.zig").PreparationAdmission = .{},
     references: usize = 1,
     owners: std.ArrayList(*Owner) = .empty,
 };
@@ -582,6 +583,9 @@ fn releaseGate(gate: *PathGate) void {
 // Compatible connections borrow one persistent generation and one maintenance
 // worker. SQL sessions, cursor IDs, and child handles remain connection-local.
 pub const Owner = struct {
+    // Only bootstrap small files at close. Large files must finish their
+    // existing worker proof; shutdown never starts another whole-file walk.
+    const close_allocator_proof_max_bytes = 4 * 1024 * 1024;
     const MaintenanceKey = struct { table_id: u64, incarnation: u128 };
     const MaintenanceSchedule = struct {
         shadow_next: bool = true,
@@ -626,6 +630,13 @@ pub const Owner = struct {
     // the worker only try-locks under that gate and yields to an active proof.
     allocator_proof_mutex: std.Io.Mutex = .init,
     verification_cancel: @FieldType(NativeStore, "maintenance_cancel") = .{},
+    allocator_certificate_pending: bool = false,
+    // Historical attempts suppress close-time retries; only active work is
+    // allowed to finish when shutdown cancels the remaining maintenance.
+    allocator_verification_started: bool = false,
+    allocator_verification_active: bool = false,
+    // Directory progress belongs to the path owner, not a serving generation.
+    artifact_marker_sweep: @FieldType(NativeStore, "artifact_marker_sweep") = .{},
     reader_coordinator: *native.ReaderCoordinator = undefined,
     maintenance_pending: bool = false,
     // Replay can move the checkpoint on every turn. Give physical storage a
@@ -647,6 +658,9 @@ pub const Owner = struct {
     // Connection-owner lifetime totals, protected by the path gate. They survive
     // foreground runtime refreshes and distinguish conflicts from a moving tip.
     publication_stats: struct {
+        /// Namespace rounds reaching replay/idle completion (errors below).
+        /// Lets observers distinguish quiescence from a worker that stopped.
+        maintenance_rounds: u64 = 0,
         attempts: u64 = 0,
         refused: u64 = 0,
         rebased: u64 = 0,
@@ -655,6 +669,19 @@ pub const Owner = struct {
         replay_attempts: u64 = 0,
         replay_refused: u64 = 0,
         maintenance_errors: u64 = 0,
+        // Detached graph-walk totals, including foreground and maintenance.
+        // These survive runtime refresh and exclude lease/queue wait time.
+        allocator_proof_walks: u64 = 0,
+        allocator_proof_failures: u64 = 0,
+        allocator_proof_ns: u64 = 0,
+        allocator_proof_max_ns: u64 = 0,
+        // Successful positive-timeout mutation admission, before its body.
+        // Log2 nanosecond buckets give bounded percentile ranges, not exact
+        // sample quantiles. Diagnostics/read admission cannot pollute them.
+        mutation_admission_count: u64 = 0,
+        mutation_admission_ns: u64 = 0,
+        mutation_admission_max_ns: u64 = 0,
+        mutation_admission_log2_ns: [64]u64 = @splat(0),
         last_maintenance_error: ?[]const u8 = null,
     } = .{},
     test_runtime_snapshot_opens: if (h.builtin.is_test) u64 else void = if (h.builtin.is_test) 0 else {},
@@ -662,7 +689,10 @@ pub const Owner = struct {
     embedding_memo_budget: cache_budget.CacheBudget = .init(embedding_memo_bytes),
     test_after_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle) void } else void = if (h.builtin.is_test) null else {},
     test_after_allocator_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *native.NativeFile) void } else void = if (h.builtin.is_test) null else {},
-    test_capacity_wait: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
+    test_before_allocator_reader_close: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *native.NativeFile) void } else void = if (h.builtin.is_test) null else {},
+    test_allocator_wait: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
+    test_after_stop: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
+    test_before_maintenance_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
 
     /// Caller holds the path lease, so the checkpoint and catalog cannot race
     /// a different process's publication. Cursor continuation deliberately
@@ -833,6 +863,7 @@ pub const Owner = struct {
     }
 
     pub fn notifyMutation(self: *Owner) void {
+        self.allocator_certificate_pending = true;
         if (self.worker == null) return;
         self.maintenance_pending = true;
         self.wake.set(h.handleLockIo());
@@ -1102,11 +1133,17 @@ pub const Owner = struct {
         }
         const io = h.handleLockIo();
         if (self.stopping.load(.acquire)) return false;
+        if (comptime h.builtin.is_test) if (self.test_before_maintenance_capture) |hook| hook.notify(hook.ptr);
         // Yield briefly to foreground work, then join the fair queue. Capture
         // stays short; queued traffic must not indefinitely postpone replay/TTL.
         if (!acquireMaintenanceCapture(&self.gate.mutex, &self.maintenance_capture_misses)) return true;
         var gate_locked = true;
         defer if (gate_locked) self.gate.mutex.unlock(io);
+        if (self.stopping.load(.acquire)) return false;
+        // A foreground proof owns the admission lane. Refresh can open index
+        // sources and publish lease metadata, so yield before even capturing
+        // a runtime. The gate protects this flag through the capture boundary.
+        if (self.allocator_verification_active) return true;
         var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
         var lease_held = true;
         defer if (lease_held) lease.close();
@@ -1117,14 +1154,14 @@ pub const Owner = struct {
         // Reap crash/normal-exit leftovers even if this short-lived owner is
         // canceled before its detached graph walk can finish.
         if (self.options.open_mode == .writer)
-            try foreground.owned_lite_backend.?.native_docstore.?.artifact_marker_sweep.run(foreground_file);
+            try self.artifact_marker_sweep.run(foreground_file);
         if (self.options.open_mode == .writer and !foreground_file.free_pages_verified) {
             if (!self.allocator_proof_mutex.tryLock()) return true;
             defer self.allocator_proof_mutex.unlock(io);
             var proof_lease: ?native.PathWriterLock = lease;
             lease_held = false;
             defer if (proof_lease) |*held| held.close();
-            try self.verifyAllocatorAssumeLocked(&proof_lease);
+            try self.verifyAllocatorAssumeLocked(&proof_lease, null);
             return true;
         }
         try @import("sql_commit.zig").recover(foreground);
@@ -1382,6 +1419,7 @@ pub const Owner = struct {
         self.maintenance_round_pending = self.maintenance_round_pending or pending;
         const ttl_pending = self.maintenance_round_ttl_pending;
         if (self.maintenance_table_cursor == 0) {
+            self.publication_stats.maintenance_rounds +|= 1;
             self.maintenance_round_ttl_pending = false;
             // Mutations arriving during the detached turn still wake the owner;
             // replay debt is inspected again under the next capture fence.
@@ -1398,9 +1436,14 @@ pub const Owner = struct {
     fn storageMaintenanceTurn(self: *Owner) !bool {
         const io = h.handleLockIo();
         if (self.stopping.load(.acquire)) return true;
+        if (comptime h.builtin.is_test) if (self.test_before_maintenance_capture) |hook| hook.notify(hook.ptr);
         if (!acquireMaintenanceCapture(&self.gate.mutex, &self.maintenance_capture_misses)) return false;
         var gate_locked = true;
         defer if (gate_locked) self.gate.mutex.unlock(io);
+        if (self.stopping.load(.acquire)) return true;
+        // Keep the scheduled storage turn pending while foreground admission
+        // proves the tip; even its runtime refresh can publish index leases.
+        if (self.allocator_verification_active) return false;
         var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
         var lease_held = true;
         defer if (lease_held) lease.close();
@@ -1488,10 +1531,12 @@ pub const Owner = struct {
     /// the gate held on every path; proof teardown releases the path lease.
     /// Runtime pins keep the reader's borrowed allocator/executor alive while
     /// the graph walk runs with both publication locks released.
-    fn verifyAllocatorAssumeLocked(self: *Owner, lease: *?native.PathWriterLock) !void {
+    fn verifyAllocatorAssumeLocked(self: *Owner, lease: *?native.PathWriterLock, connection: ?*Connection) !void {
         const io = h.handleLockIo();
         const foreground = try self.refresh();
         const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
+        if (needsOutcomeReconciliation(foreground)) return error.OutcomeUnknown;
+        if (file.transaction_header != null or file.durable_header != null) return error.FileBusy;
         if (file.free_pages_verified) return;
         foreground.allocator_verification_references += 1;
         defer {
@@ -1499,6 +1544,10 @@ pub const Owner = struct {
             self.collectRetired();
         }
         const reader = try file.captureAllocatorVerificationSnapshot(&self.verification_cancel);
+        self.allocator_verification_started = true;
+        std.debug.assert(!self.allocator_verification_active);
+        self.allocator_verification_active = true;
+        defer self.allocator_verification_active = false;
         const proof_alloc = reader.allocator;
         defer {
             // Reader/ledger teardown can release substantial cached metadata.
@@ -1507,6 +1556,7 @@ pub const Owner = struct {
             if (lease.*) |*held| held.close();
             lease.* = null;
             self.gate.mutex.unlock(io);
+            if (comptime h.builtin.is_test) if (self.test_before_allocator_reader_close) |hook| hook.notify(hook.ptr, reader);
             reader.close();
             proof_alloc.destroy(reader);
             self.gate.mutex.lockUncancelable(io);
@@ -1515,14 +1565,30 @@ pub const Owner = struct {
         lease.* = null;
         self.gate.mutex.unlock(io);
         if (comptime h.builtin.is_test) if (self.test_after_allocator_capture) |hook| hook.notify(hook.ptr, reader);
+        const proof_started = std.Io.Clock.awake.now(io).nanoseconds;
         const verified = reader.completeAllocatorVerification();
+        const proof_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - proof_started));
         self.gate.mutex.lockUncancelable(io);
+        self.publication_stats.allocator_proof_walks +|= 1;
+        self.publication_stats.allocator_proof_ns +|= proof_ns;
+        self.publication_stats.allocator_proof_max_ns = @max(self.publication_stats.allocator_proof_max_ns, proof_ns);
+        if (verified) |_| {} else |_| {
+            self.publication_stats.allocator_proof_failures +|= 1;
+        }
         try verified;
-        lease.* = try native.lockWriterPathWithIo(alloc, io, self.path);
+        // A foreground operation has not started its mutation yet. Preserve
+        // its connection-local busy policy when another process wins the
+        // writer lease during the detached proof. Background turns stay
+        // nonblocking and yield to that writer instead of consuming its budget.
+        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked() else try native.lockWriterPathWithIo(alloc, io, self.path);
         var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         if (self.current) |current| {
+            // A foreground publication may have failed while the walk ran.
+            // Retrying the same immutable proof cannot reconcile that outcome.
+            if (needsOutcomeReconciliation(current)) return error.OutcomeUnknown;
             const live = &current.owned_lite_backend.?.native_docstore.?.file;
+            if (live.transaction_header != null or live.durable_header != null) return error.FileBusy;
             if (std.meta.eql(live.header, probe.header) and
                 (try live.file.stat(live.runtime())).inode == (try probe.file.stat(probe.runtime())).inode)
                 try live.inheritAllocatorVerification(reader);
@@ -1543,21 +1609,52 @@ pub const Owner = struct {
         const io = h.handleLockIo();
         self.gate.mutex.lockUncancelable(io);
         defer self.gate.mutex.unlock(io);
-        var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
-        defer lease.close();
-        var tip = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
-        defer tip.close();
-        for ([_]?*h.Handle{ self.current, self.maintenance_snapshot }) |candidate| {
-            const root = candidate orelse continue;
-            const store = root.owned_lite_backend.?.native_docstore.?;
-            store.mutex.lock();
-            defer store.mutex.unlock();
-            const file = &store.file;
-            if (!file.free_pages_verified or file.read_only or !std.meta.eql(file.header, tip.header) or
-                (try file.file.stat(file.runtime())).inode != (try tip.file.stat(tip.runtime())).inode) continue;
-            try file.sync();
-            _ = try file.certifyAllocator();
-            return;
+        var lease: ?native.PathWriterLock = try native.lockWriterPathWithIo(alloc, io, self.path);
+        defer if (lease) |*held| held.close();
+        for (0..2) |attempt| {
+            var proof_bytes: u64 = 0;
+            var can_prove_current = false;
+            {
+                var tip = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
+                defer tip.close();
+                // Revision-3 files cannot carry this certificate. Their
+                // conversion belongs to maintenance, never shutdown.
+                if (!tip.header.indexed_reclamation) return;
+                // The walk checks both recovery slots. Bound the physical
+                // file, including a larger inactive slot or unpublished tail.
+                proof_bytes = (try tip.file.stat(tip.runtime())).size;
+                for ([_]?*h.Handle{ self.current, self.maintenance_snapshot }) |candidate| {
+                    const root = candidate orelse continue;
+                    const store = root.owned_lite_backend.?.native_docstore.?;
+                    store.mutex.lock();
+                    defer store.mutex.unlock();
+                    const file = &store.file;
+                    if (file.read_only or !std.meta.eql(file.header, tip.header) or
+                        (try file.file.stat(file.runtime())).inode != (try tip.file.stat(tip.runtime())).inode) continue;
+                    if (!file.free_pages_verified) {
+                        if (self.current == root and !needsOutcomeReconciliation(root) and
+                            file.transaction_header == null and file.durable_header == null) can_prove_current = true;
+                        continue;
+                    }
+                    try file.sync();
+                    _ = try file.certifyAllocator();
+                    return;
+                }
+            }
+            if (attempt != 0 or !can_prove_current or !self.allocator_certificate_pending or self.allocator_verification_started or
+                proof_bytes > close_allocator_proof_max_bytes) return;
+            // Registry close has drained foreground calls and joined the
+            // worker. Bootstrap a small, never-scheduled pool, but never
+            // repeat a failed/canceled walk or start a large one at close.
+            // Never rebuild a runtime for a foreign publication just to seal it.
+            // Reuse the detached proof path, releasing both publication locks
+            // during the walk and reader teardown. A moving external tip may
+            // still refuse certification; never retry indefinitely at close.
+            self.verification_cancel.requested.store(false, .release);
+            self.allocator_proof_mutex.lockUncancelable(io);
+            defer self.allocator_proof_mutex.unlock(io);
+            try self.verifyAllocatorAssumeLocked(&lease, null);
+            if (lease == null) lease = try native.lockWriterPathWithIo(alloc, io, self.path);
         }
     }
 
@@ -1568,6 +1665,7 @@ pub const Owner = struct {
             // remains recoverable and the next owner uses ordinary proof.
             std.log.warn("native Lite allocator certificate deferred: {s}", .{@errorName(err)});
         };
+        self.artifact_marker_sweep.deinit(h.handleLockIo());
         if (self.maintenance_snapshot) |snapshot| closeMaintenanceSnapshot(snapshot);
         if (self.embedding_memo) |*memo| memo.deinit(&self.embedding_memo_budget);
         for (self.retired.items) |retired| h.closeHandle(retired);
@@ -1614,6 +1712,9 @@ pub const Connection = struct {
     gate: *PathGate,
     owner: *Owner,
     mutex: QueuedMutex = .{},
+    // Scoped to C API admission while mutex is held. Reacquisition after a
+    // detached allocator proof consumes the same request budget.
+    admission_deadline_ns: ?i96 = null,
     current: ?*h.Handle = null,
     attached: bool = false,
     sql_sessions: @FieldType(h.Handle, "sql_sessions") = .empty,
@@ -1622,6 +1723,8 @@ pub const Connection = struct {
     next_sql_cursor_id: u64 = 1,
     table_handles: @FieldType(h.Handle, "table_handles") = .empty,
     readable_lease_hook: ?h.ReadableLeaseHook = null,
+    test_admission_sleep: if (h.builtin.is_test) ?struct { ptr: *anyopaque, sleep: *const fn (*anyopaque, std.Io.Duration) std.Io.Cancelable!void } else void = if (h.builtin.is_test) null else {},
+    test_path_lease_busy: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
 
     pub fn acquire(self: *Connection) !native.PathWriterLock {
         const io = h.handleLockIo();
@@ -1632,9 +1735,13 @@ pub const Connection = struct {
 
     fn acquirePathLeaseAssumeLocked(self: *Connection) !native.PathWriterLock {
         const io = h.handleLockIo();
-        const deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, self.options.busy_timeout_ms) * std.time.ns_per_ms;
+        const deadline = self.admission_deadline_ns orelse (std.Io.Clock.awake.now(io).nanoseconds + @as(i96, self.options.busy_timeout_ms) * std.time.ns_per_ms);
         var backoff: i96 = std.time.ns_per_ms;
         while (true) {
+            // A slow detached proof may outlast the retry budget. Always try
+            // the lease once: a stable verified tip must still be admitted if
+            // no contention wait is needed. An expired budget forbids waiting,
+            // not an uncontended acquisition.
             const lease = if (h.liteOpenModeCanWrite(self.options.open_mode))
                 native.lockWriterPathWithIo(alloc, io, self.path)
             else
@@ -1643,29 +1750,36 @@ pub const Connection = struct {
                 if (err != error.WouldBlock and err != error.FileBusy) return err;
                 const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
                 if (remaining <= 0) return error.FileBusy;
+                if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| hook.notify(hook.ptr);
                 try io.sleep(.fromNanoseconds(@min(backoff, remaining)), .awake);
                 backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
             }
         }
     }
 
-    /// Cold bounded writers need a checked pool before any request can open
-    /// index leases or stage an arbitrarily large mutation. Unbounded owners
-    /// retain the append-first fast path. No SQL request has started yet, so
-    /// admission never needs to replay a partially executed operation.
-    pub fn refresh(self: *Connection, lease: *?native.PathWriterLock) !*h.Handle {
+    /// Prepare an existing free pool before a mutating request can open index
+    /// leases or stage an arbitrarily large mutation. Waiting here releases publication
+    /// locks so an active detached proof can finish. Empty unbounded owners
+    /// keep the append-first path, reads do not demand reuse proof, and bounded
+    /// owners still require capacity proof.
+    /// No SQL request has started, so admission never replays partial work.
+    pub fn refresh(self: *Connection, lease: *?native.PathWriterLock, intent: api.StorageIntent) !*h.Handle {
         var root = try self.owner.refresh();
-        if (self.options.profile == .native and self.options.open_mode == .writer and usesCapacityAdmission(root)) {
+        if (self.options.profile == .native and self.options.open_mode == .writer and
+            (usesCapacityAdmission(root) or (intent == .mutation and try self.needsReuseAdmission(root))))
+        {
             const io = h.handleLockIo();
             // Verification can be published just before its reader is closed.
-            // A bounded request must wait for that reader fence too, even when
-            // the flag is already true. Warm owners need only this try-lock.
+            // Mutations must wait for that reader fence too, even when the
+            // pool is already verified. Otherwise a whole transaction can pick
+            // append-only allocation during reader teardown. Idle verified
+            // unbounded owners skip this lane entirely.
             const waited = !self.owner.allocator_proof_mutex.tryLock();
             if (waited) {
                 lease.*.?.close();
                 lease.* = null;
                 self.gate.mutex.unlock(io);
-                if (comptime h.builtin.is_test) if (self.owner.test_capacity_wait) |hook| hook.notify(hook.ptr);
+                if (comptime h.builtin.is_test) if (self.owner.test_allocator_wait) |hook| hook.notify(hook.ptr);
                 self.owner.allocator_proof_mutex.lockUncancelable(io);
                 self.gate.mutex.lockUncancelable(io);
             }
@@ -1674,15 +1788,30 @@ pub const Connection = struct {
                 lease.* = try self.acquirePathLeaseAssumeLocked();
                 root = try self.owner.refresh();
             }
-            while (try needsCapacityProof(root)) {
-                try self.owner.verifyAllocatorAssumeLocked(lease);
+            if (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) {
+                try self.owner.verifyAllocatorAssumeLocked(lease, self);
                 if (lease.* == null) lease.* = try self.acquirePathLeaseAssumeLocked();
                 root = try self.owner.refresh();
+                // Another process may move the tip during the detached walk.
+                // Do not repeat whole-file proofs while holding this
+                // connection's admission queue. No transaction has started:
+                // refuse safely and let a later request prove the new tip.
+                if (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) return error.FileBusy;
             }
         }
         self.current = root;
         self.attach(root);
         return root;
+    }
+
+    fn needsReuseAdmission(self: *Connection, root: *h.Handle) !bool {
+        const store = root.owned_lite_backend.?.native_docstore.?;
+        if (store.file.free_pages_verified) return self.owner.allocator_verification_active;
+        // This reads allocator metadata, not the live graph. Do not trust the
+        // advertised pages for allocation until the detached proof checks them.
+        // Waiting only for a nonempty pool avoids a graph scan on empty imports.
+        const stats = (try store.file.allocatorStats()) orelse return false;
+        return stats.reusable_pages != 0;
     }
 
     fn usesCapacityAdmission(root: *h.Handle) bool {
@@ -1786,7 +1915,13 @@ pub const Connection = struct {
         const last = owner.connections.items.len == 0;
         if (last) {
             owner.stopping.store(true, .release);
-            owner.verification_cancel.request();
+            // Retain progress from a mutating v4 owner's in-flight proof.
+            // Replay/inference still observe stopping and cancel normally.
+            const finish_proof = owner.options.profile == .native and owner.options.open_mode == .writer and
+                owner.allocator_certificate_pending and owner.allocator_verification_active and
+                if (owner.current) |root| root.owned_lite_backend.?.native_docstore.?.file.header.indexed_reclamation else false;
+            if (!finish_proof) owner.verification_cancel.request();
+            if (comptime h.builtin.is_test) if (owner.test_after_stop) |hook| hook.notify(hook.ptr);
             owner.wake.set(io);
             for (self.gate.owners.items, 0..) |candidate, i| {
                 if (candidate == owner) {
@@ -1904,6 +2039,821 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     return wrapper;
 }
 
+test "capi native marker sweep survives foreground replacement while proof is busy" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("foreground-marker-progress");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+    defer h.closeHandle(wrapper);
+    const owner = wrapper.lite_connection.?.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    owner.allocator_proof_mutex.lockUncancelable(io);
+    defer owner.allocator_proof_mutex.unlock(io);
+    var markers: std.ArrayList(std.Io.File) = .empty;
+    var orphan: ?usize = null;
+    defer {
+        for (markers.items, 0..) |marker, i| if (orphan == null or i != orphan.?) marker.close(io);
+        markers.deinit(a);
+    }
+    for (0..130) |i| {
+        const name = try std.fmt.allocPrint(a, "{s}/.aflite-lease-{x:0>32}", .{ tmp.path(), i });
+        defer a.free(name);
+        const marker = try std.Io.Dir.cwd().createFile(io, name, .{ .read = true, .exclusive = true, .lock = .exclusive });
+        errdefer marker.close(io);
+        try markers.append(a, marker);
+    }
+    // Select the last marker in actual directory order, so more than one
+    // bounded batch of live markers precedes it on every supported filesystem.
+    var dir = try std.Io.Dir.cwd().openDir(io, tmp.path(), .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, ".aflite-lease-") and entry.name.len == 46)
+            orphan = try std.fmt.parseInt(usize, entry.name[14..], 16);
+    }
+    try std.testing.expect(orphan != null);
+    markers.items[orphan.?].close(io);
+    for (0..6) |turn| {
+        {
+            owner.gate.mutex.lockUncancelable(io);
+            defer owner.gate.mutex.unlock(io);
+            var lease = try native.lockWriterPathWithIo(a, io, path);
+            defer lease.close();
+            var foreign = try native.NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true });
+            defer foreign.close();
+            foreign.defer_allocator_verification = true;
+            var text: [16]u8 = undefined;
+            try foreign.putCatalogRecord("test/changed-runtime", try std.fmt.bufPrint(&text, "{d}", .{turn}));
+        }
+        _ = try owner.maintenanceTurnForTest();
+    }
+    const name = try std.fmt.allocPrint(a, ".aflite-lease-{x:0>32}", .{orphan.?});
+    defer a.free(name);
+    try std.testing.expectError(error.FileNotFound, dir.openFile(io, name, .{}));
+    // Live leases must survive every sweep.
+    for (0..130) |i| {
+        if (i == orphan.?) continue;
+        const live_name = try std.fmt.allocPrint(a, ".aflite-lease-{x:0>32}", .{i});
+        defer a.free(live_name);
+        const live = try dir.openFile(io, live_name, .{});
+        live.close(io);
+    }
+}
+
+test "capi native unbounded writer admits reusable pool before a large request" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    const Scenario = enum { empty, cold, active, draining, foreign, uncertain, uncertain_during };
+    for ([_]Scenario{ .empty, .cold, .active, .draining, .foreign, .uncertain, .uncertain_during }) |scenario| {
+        const active = scenario == .active or scenario == .draining or scenario == .foreign;
+        var tmp = try api.TestDirectory.init("unbounded-reuse-admission");
+        defer tmp.cleanup();
+        try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+        const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+        defer a.free(path);
+        const value: [32768]u8 = @splat('v');
+        {
+            var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+            defer seed.close();
+            for (0..@as(usize, if (scenario == .empty) 0 else 64)) |i| {
+                var key: [16]u8 = undefined;
+                try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+            }
+            for (0..@as(usize, if (scenario == .empty) 0 else 64)) |i| {
+                var key: [16]u8 = undefined;
+                try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+            }
+            if (scenario != .empty) for (0..4) |_| {
+                _ = try seed.reclaimPages(4096);
+            };
+            if (scenario != .empty) try std.testing.expect((try seed.allocatorStats()).?.reusable_pages > 256);
+        }
+        const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+        defer h.closeHandle(wrapper);
+        const connection = wrapper.lite_connection.?;
+        const owner = connection.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(io);
+        owner.worker.?.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
+        owner.verification_cancel.requested.store(false, .release);
+        owner.allocator_verification_started = false;
+        owner.maintenance_storage_pending = false;
+        {
+            var lease = try connection.acquire();
+            defer {
+                lease.close();
+                connection.gate.mutex.unlock(io);
+            }
+            const store = owner.current.?.owned_lite_backend.?.native_docstore.?;
+            store.file.free_pages_verified = false;
+            store.file.max_file_bytes = null;
+            store.maintenance_policy.options.max_storage_bytes = 0;
+            store.maintenance_policy.options.capacity_probe = null;
+            store.disk_admission_limit = null;
+        }
+        {
+            var lease: ?native.PathWriterLock = try connection.acquire();
+            defer {
+                connection.detach();
+                if (lease) |*held| held.close();
+                connection.gate.mutex.unlock(io);
+            }
+            const root = try connection.refresh(&lease, .read_only);
+            try std.testing.expect(!root.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+            try std.testing.expect(!owner.allocator_verification_started);
+        }
+        const Probe = struct {
+            owner: *Owner,
+            foreign: bool,
+            uncertain: bool,
+            uncertain_during: bool,
+            captures: usize = 0,
+            captured: std.Io.Event = .unset,
+            released: std.Io.Event = .unset,
+            waited: bool = false,
+            failure: ?anyerror = null,
+            fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.captures += 1;
+                if (self.uncertain or self.uncertain_during) {
+                    // Bound a regression: without the publication guards,
+                    // cancel the second attempt instead of hanging the suite.
+                    if (self.captures > 1) {
+                        self.owner.verification_cancel.request();
+                    } else if (self.uncertain_during) {
+                        const lock_io = h.handleLockIo();
+                        self.owner.gate.mutex.lockUncancelable(lock_io);
+                        defer self.owner.gate.mutex.unlock(lock_io);
+                        self.owner.current.?.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = true;
+                    }
+                    return;
+                }
+                self.captured.set(h.handleLockIo());
+                self.released.waitUncancelable(h.handleLockIo());
+            }
+            fn waiting(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.waited = true;
+                defer self.released.set(h.handleLockIo());
+                if (self.foreign) self.publishForeign() catch |err| {
+                    self.failure = err;
+                };
+            }
+            fn publishForeign(self: *@This()) !void {
+                const lock_io = h.handleLockIo();
+                var lease = try native.lockWriterPathWithIo(alloc, lock_io, self.owner.path);
+                defer lease.close();
+                var file = try native.NativeFile.openWithIo(alloc, lock_io, self.owner.path, .{ .externally_locked = true, .no_sync = true });
+                defer file.close();
+                file.defer_allocator_verification = true;
+                try file.putCatalogRecord("foreign", "publication while admission yields");
+            }
+            fn turn(self: *@This()) void {
+                _ = self.owner.maintenanceTurnForTest() catch |err| {
+                    self.failure = err;
+                };
+                self.captured.set(h.handleLockIo());
+            }
+        };
+        var probe: Probe = .{ .owner = owner, .foreign = scenario == .foreign, .uncertain = scenario == .uncertain, .uncertain_during = scenario == .uncertain_during };
+        defer {
+            probe.released.set(io);
+            if (owner.worker) |worker| {
+                worker.join();
+                owner.worker = null;
+            }
+            owner.test_after_allocator_capture = null;
+            owner.test_before_allocator_reader_close = null;
+            owner.test_allocator_wait = null;
+        }
+        if (active) {
+            if (scenario == .draining) {
+                owner.test_before_allocator_reader_close = .{ .ptr = &probe, .notify = Probe.capture };
+            } else {
+                owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+            }
+            owner.test_allocator_wait = .{ .ptr = &probe, .notify = Probe.waiting };
+            owner.worker = try std.Thread.spawn(.{}, Probe.turn, .{&probe});
+            probe.captured.waitUncancelable(io);
+            if (probe.failure) |err| return err;
+            if (scenario == .draining) try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+        }
+        {
+            var lease: ?native.PathWriterLock = try connection.acquire();
+            defer {
+                connection.detach();
+                if (lease) |*held| held.close();
+                connection.gate.mutex.unlock(io);
+            }
+            if (scenario == .empty) {
+                const file = &owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+                try std.testing.expectEqual(@as(u64, 0), (try file.allocatorStats()).?.reusable_pages);
+            }
+            if (scenario == .uncertain or scenario == .uncertain_during) {
+                owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+                if (scenario == .uncertain) {
+                    owner.current.?.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = true;
+                }
+                try std.testing.expectError(error.OutcomeUnknown, connection.refresh(&lease, .mutation));
+                try std.testing.expectEqual(@as(usize, if (scenario == .uncertain) 0 else 1), probe.captures);
+                try std.testing.expect(!owner.allocator_verification_active);
+                try std.testing.expect(!owner.verification_cancel.requested.load(.acquire));
+                continue;
+            }
+            const root = try connection.refresh(&lease, .mutation);
+            const file = &root.owned_lite_backend.?.native_docstore.?.file;
+            if (scenario == .empty) {
+                try std.testing.expect(!owner.allocator_verification_started);
+                try std.testing.expect(!file.free_pages_verified);
+                continue;
+            }
+            if (!file.free_pages_verified) return error.ReusablePoolUnverifiedAtAdmission;
+            try std.testing.expect(owner.allocator_verification_started);
+            try std.testing.expectEqual(active, probe.waited);
+            const before = (try file.file.stat(io)).size;
+            const reused = (try file.allocatorStats()).?.reused_pages;
+            // One admitted request can publish many transactions without ever
+            // releasing the gate. Its complete volume fits in the initial pool.
+            for (0..16) |i| {
+                var key: [16]u8 = undefined;
+                try file.putCatalogRecord(try std.fmt.bufPrint(&key, "new-{d}", .{i}), &value);
+            }
+            const reused_pages = (try file.allocatorStats()).?.reused_pages - reused;
+            const growth = (try file.file.stat(io)).size - before;
+            std.debug.print("LITE_REUSE_ADMISSION scenario={s} write_bytes={d} growth_bytes={d} reused_pages={d}\n", .{ @tagName(scenario), 16 * value.len, growth, reused_pages });
+            try std.testing.expect(reused_pages > 0);
+            try std.testing.expect(growth < 32 * file.header.page_size);
+            try std.testing.expect((try file.check()).valid);
+            connection.notifyMutation();
+        }
+        if (owner.worker) |worker| {
+            worker.join();
+            owner.worker = null;
+        }
+        if (probe.failure) |err| return err;
+        if (active) try std.testing.expectEqual(@as(usize, if (scenario == .foreign) 2 else 1), probe.captures);
+    }
+}
+
+test "capi SQL native read intent avoids allocator proofs with exclusive locking" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("sql-read-storage-intent");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    {
+        const value: [32768]u8 = @splat('v');
+        var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer seed.close();
+        for (0..64) |i| {
+            var key: [16]u8 = undefined;
+            try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+        }
+        for (0..64) |i| {
+            var key: [16]u8 = undefined;
+            try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+        }
+        for (0..4) |_| _ = try seed.reclaimPages(4096);
+    }
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+    const id = api.publishHandle(wrapper) catch |err| {
+        h.closeHandle(wrapper);
+        return err;
+    };
+    defer api.antfly_db_close(id);
+    const owner = wrapper.lite_connection.?.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    owner.verification_cancel.requested.store(false, .release);
+    owner.allocator_verification_started = false;
+    owner.maintenance_storage_pending = false;
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&output);
+    const Check = struct {
+        fn ok(code: h.capi.ErrorCode, buffer: h.capi.Buffer, line: u32) !void {
+            if (code != .ok) std.debug.print("SQL_INTENT failure_line={d} response={s}\n", .{ line, if (buffer.ptr) |ptr| ptr[0..buffer.len] else "<empty>" });
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, code);
+        }
+    };
+    // Streaming cursors require a table-backed SELECT. Provision its source
+    // before modeling the cold unverified owner used by the read assertions.
+    try Check.ok(api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"CREATE TABLE seed_numbers (n BIGINT)\"}"), &output), output, @src().line);
+    api.antfly_buffer_free(&output);
+    try Check.ok(api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"INSERT INTO seed_numbers (_id,n) VALUES ('seed',7)\"}"), &output), output, @src().line);
+    api.antfly_buffer_free(&output);
+    owner.allocator_verification_started = false;
+    const store = owner.current.?.owned_lite_backend.?.native_docstore.?;
+    store.file.free_pages_verified = false;
+    store.file.max_file_bytes = null;
+    store.maintenance_policy.options.max_storage_bytes = 0;
+    store.maintenance_policy.options.capacity_probe = null;
+    store.disk_admission_limit = null;
+    try std.testing.expect((try store.file.allocatorStats()).?.reusable_pages > 256);
+    // Catalog cache locking is exclusive, but listing/opening existing tables
+    // is a read operation. SDK opens must not demand whole-file reuse proofs.
+    const tables = @import("tables.zig");
+    try Check.ok(tables.antfly_db_list_tables_json(id, &output), output, @src().line);
+    api.antfly_buffer_free(&output);
+    try std.testing.expect(!owner.allocator_verification_started);
+    var table: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(id, .fromSlice("seed_numbers"), &table));
+    defer api.antfly_db_close(table);
+    try std.testing.expect(!owner.allocator_verification_started);
+    var timestamp: u64 = 0;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_timestamp(table, .fromSlice("seed"), &timestamp));
+    try Check.ok(api.antfly_db_lookup_json(table, .fromSlice("seed"), &output), output, @src().line);
+    api.antfly_buffer_free(&output);
+    try std.testing.expect(!owner.allocator_verification_started);
+
+    var session: u64 = 0;
+    try Check.ok(@import("sql_session.zig").antfly_db_sql_session_open(id, &session), output, @src().line);
+    for ([_][]const u8{
+        "{\"statement\":\"SELECT 1\"}",
+        "{\"statement\":\"EXPLAIN SELECT 1\"}",
+        "{\"statement\":\"EXPLAIN ANALYZE SELECT 1\"}",
+        "{\"statement\":\"BEGIN\",\"session_id\":1}",
+        "{\"statement\":\"SELECT 1\",\"session_id\":1}",
+    }) |request| {
+        try Check.ok(api.antfly_db_sql_json(id, .fromSlice(request), &output), output, @src().line);
+        api.antfly_buffer_free(&output);
+    }
+    try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"SELECT (\",\"session_id\":1}"), &output));
+    api.antfly_buffer_free(&output);
+    try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"SELECT 1\",\"session_id\":1}"), &output));
+    try std.testing.expect(std.mem.indexOf(u8, output.ptr.?[0..output.len], "25P02") != null);
+    api.antfly_buffer_free(&output);
+    try Check.ok(api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"ROLLBACK\",\"session_id\":1}"), &output), output, @src().line);
+    api.antfly_buffer_free(&output);
+    const select = h.capi.Slice.fromSlice("{\"statement\":\"SELECT 1\"}");
+    try Check.ok(@import("sql_describe.zig").antfly_db_sql_describe_json(id, select, &output), output, @src().line);
+    api.antfly_buffer_free(&output);
+    var cursor: u64 = 0;
+    try Check.ok(@import("sql_cursor.zig").antfly_db_sql_open_cursor_json(id, .fromSlice("{\"statement\":\"SELECT n FROM seed_numbers\"}"), &cursor, &output), output, @src().line);
+    api.antfly_buffer_free(&output);
+    try Check.ok(@import("sql_cursor.zig").antfly_db_sql_fetch_cursor_json(id, cursor, 1, &output), output, @src().line);
+    api.antfly_buffer_free(&output);
+    try Check.ok(@import("sql_cursor.zig").antfly_db_sql_close_cursor(id, cursor), output, @src().line);
+    // Mutating ANALYZE is rejected by the runtime before execution or binding.
+    try std.testing.expectEqual(h.capi.ErrorCode.unsupported, api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"EXPLAIN ANALYZE INSERT INTO missing (_id) VALUES ('x')\"}"), &output));
+    api.antfly_buffer_free(&output);
+    try std.testing.expect(!owner.allocator_verification_started);
+    try std.testing.expect(!owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+    try Check.ok(api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"CREATE TABLE numbers (n BIGINT)\"}"), &output), output, @src().line);
+    api.antfly_buffer_free(&output);
+    try std.testing.expect(owner.allocator_verification_started);
+    try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+    try Check.ok(api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"INSERT INTO numbers (_id,n) VALUES ('row',7)\"}"), &output), output, @src().line);
+    api.antfly_buffer_free(&output);
+    const file = &owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "capi native allocator proof reacquisition honors per-connection busy admission" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    const Scenario = enum { foreground, immediate, background };
+    for ([_]Scenario{ .foreground, .immediate, .background }) |scenario| {
+        var tmp = try api.TestDirectory.init("proof-writer-admission");
+        defer tmp.cleanup();
+        try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+        const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+        defer a.free(path);
+        const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+        defer h.closeHandle(wrapper);
+        const connection = wrapper.lite_connection.?;
+        const owner = connection.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(io);
+        owner.worker.?.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
+        owner.verification_cancel.requested.store(false, .release);
+        // Options belong to a connection, not to the shared storage owner.
+        // The background case must remain nonblocking even with this budget.
+        connection.options.busy_timeout_ms = if (scenario == .immediate) 0 else 5000;
+        owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+        const Probe = struct {
+            path: []const u8,
+            held: ?native.PathWriterLock = null,
+            failure: ?anyerror = null,
+            retries: usize = 0,
+            fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                // Win the actual writer lease while proof runs outside it.
+                self.held = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+            }
+            fn release(self: *@This()) void {
+                if (self.held) |*held| held.close();
+                self.held = null;
+            }
+            fn busy(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.retries += 1;
+                // No sleeps or scheduler races: release only after a real
+                // failed reacquisition reaches the caller's admission policy.
+                self.release();
+            }
+        };
+        var probe: Probe = .{ .path = path };
+        defer probe.release();
+        owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+        connection.test_path_lease_busy = .{ .ptr = &probe, .notify = Probe.busy };
+        defer {
+            owner.test_after_allocator_capture = null;
+            connection.test_path_lease_busy = null;
+        }
+        var lease: ?native.PathWriterLock = try connection.acquire();
+        defer {
+            if (lease) |*held| held.close();
+            connection.gate.mutex.unlock(io);
+        }
+        const result = owner.verifyAllocatorAssumeLocked(&lease, if (scenario == .background) null else connection);
+        if (probe.failure) |err| return err;
+        switch (scenario) {
+            .foreground => {
+                try result;
+                try std.testing.expectEqual(@as(usize, 1), probe.retries);
+                try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+            },
+            .immediate => {
+                try std.testing.expectError(error.FileBusy, result);
+                try std.testing.expectEqual(@as(usize, 0), probe.retries);
+            },
+            .background => {
+                try std.testing.expectError(error.WouldBlock, result);
+                try std.testing.expectEqual(@as(usize, 0), probe.retries);
+            },
+        }
+    }
+}
+
+test "capi native allocator proof survives close and foreground runtime replacement" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    const Scenario = enum { foreground, closing, canceled, queued, queued_storage };
+    for ([_]Scenario{ .foreground, .closing, .canceled, .queued, .queued_storage }) |scenario| {
+        const queued = scenario == .queued or scenario == .queued_storage;
+        var tmp = try api.TestDirectory.init("inflight-proof-lifetime");
+        defer tmp.cleanup();
+        try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+        const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+        defer a.free(path);
+        const value: [32768]u8 = @splat('x');
+        {
+            // Seed the pool before a DB runtime can pin any input generations.
+            var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+            defer seed.close();
+            for (0..16) |i| {
+                var key: [16]u8 = undefined;
+                try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+            }
+            for (0..16) |i| {
+                var key: [16]u8 = undefined;
+                try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+            }
+            _ = try seed.reclaimPages(4096);
+            if ((try seed.allocatorStats()).?.reusable_pages <= 64) return error.ProofFixtureHasNoFreePool;
+        }
+        const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+        var closed = false;
+        defer if (!closed) h.closeHandle(wrapper);
+        const connection = wrapper.lite_connection.?;
+        const owner = connection.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(io);
+        owner.worker.?.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
+        owner.verification_cancel.requested.store(false, .release);
+        owner.allocator_verification_started = false;
+        owner.maintenance_storage_pending = false;
+        {
+            var lease = try connection.acquire();
+            defer {
+                lease.close();
+                connection.gate.mutex.unlock(io);
+            }
+            const store = owner.current.?.owned_lite_backend.?.native_docstore.?;
+            store.file.free_pages_verified = false;
+            store.file.defer_allocator_verification = true;
+            store.file.max_file_bytes = null;
+            store.maintenance_policy.options.max_storage_bytes = 0;
+            store.maintenance_policy.options.capacity_probe = null;
+            store.disk_admission_limit = null;
+            owner.notifyMutation();
+        }
+        if (queued) {
+            // Finish a real earlier proof, then move the tip. A historical
+            // attempt must not be mistaken for a currently running walk.
+            _ = try owner.maintenanceTurnForTest();
+            try std.testing.expect(owner.allocator_verification_started);
+            try std.testing.expect(!owner.allocator_verification_active);
+            var lease = try connection.acquire();
+            defer {
+                lease.close();
+                connection.gate.mutex.unlock(io);
+            }
+            var foreign = try native.NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true });
+            defer foreign.close();
+            foreign.defer_allocator_verification = true;
+            const large = try a.alloc(u8, Owner.close_allocator_proof_max_bytes);
+            defer a.free(large);
+            @memset(large, 'q');
+            try foreign.putCatalogRecord("foreign-large", large);
+            try std.testing.expect((try foreign.file.stat(io)).size > Owner.close_allocator_proof_max_bytes);
+            // Whether the worker runs before or after close drops the gate,
+            // force admission through the fair queue rather than yielding.
+            owner.maintenance_capture_misses = 2;
+            owner.maintenance_storage_pending = scenario == .queued_storage;
+        }
+        const Probe = struct {
+            owner: *Owner,
+            entry_header: native.Header,
+            exit_header: ?native.Header = null,
+            captured: std.Io.Event = .unset,
+            released: std.Io.Event = .unset,
+            calls: usize = 0,
+            failure: ?anyerror = null,
+            canceled_on_stop: bool = false,
+            fn beforeGate(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.captured.set(h.handleLockIo());
+                self.released.waitUncancelable(h.handleLockIo());
+            }
+            fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.calls += 1;
+                self.captured.set(h.handleLockIo());
+                self.released.waitUncancelable(h.handleLockIo());
+            }
+            fn stopped(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.canceled_on_stop = self.owner.verification_cancel.requested.load(.acquire);
+                self.released.set(h.handleLockIo());
+            }
+            fn turn(self: *@This()) void {
+                _ = self.owner.maintenanceTurnForTest() catch |err| {
+                    self.failure = err;
+                    self.captured.set(h.handleLockIo());
+                    return;
+                };
+                self.exit_header = self.owner.current.?.owned_lite_backend.?.native_docstore.?.file.header;
+                self.captured.set(h.handleLockIo());
+            }
+        };
+        var probe: Probe = .{ .owner = owner, .entry_header = owner.current.?.owned_lite_backend.?.native_docstore.?.file.header };
+        defer probe.released.set(io);
+        owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+        if (queued) owner.test_before_maintenance_capture = .{ .ptr = &probe, .notify = Probe.beforeGate };
+        owner.worker = try std.Thread.spawn(.{}, Probe.turn, .{&probe});
+        probe.captured.waitUncancelable(io);
+        if (probe.failure) |err| return err;
+        if (scenario == .closing or queued) {
+            owner.test_after_stop = .{ .ptr = &probe, .notify = Probe.stopped };
+        } else if (scenario == .canceled) {
+            owner.verification_cancel.request();
+            probe.released.set(io);
+            owner.worker.?.join();
+            owner.worker = null;
+            if (probe.failure) |err| {
+                if (err != error.MaintenanceCanceled) return error.CanceledProofUnexpectedOutcome;
+            } else return error.CanceledProofUnexpectedOutcome;
+            probe.failure = null;
+        } else {
+            {
+                var lease: ?native.PathWriterLock = try connection.acquire();
+                defer {
+                    connection.detach();
+                    if (lease) |*held| held.close();
+                    connection.gate.mutex.unlock(io);
+                }
+                const previous = owner.current.?;
+                const replacement = blk: {
+                    // Retire the runtime captured by the proof while retaining
+                    // its allocator/executor until the original walk finishes.
+                    previous.maintenance_references += 1;
+                    defer previous.maintenance_references -= 1;
+                    break :blk try owner.refresh();
+                };
+                try std.testing.expect(replacement != previous);
+                const store = replacement.owned_lite_backend.?.native_docstore.?;
+                store.file.max_file_bytes = null;
+                store.maintenance_policy.options.max_storage_bytes = 0;
+                store.maintenance_policy.options.capacity_probe = null;
+                store.disk_admission_limit = null;
+                // Exercise append-only lineage below request admission, which
+                // now waits for a reusable pool instead of permitting this race.
+                try store.file.putCatalogRecord("during-proof", "foreground progress");
+                if (store.file.free_pages_verified) return error.ReplacementVerifiedBeforeOriginalProof;
+                connection.notifyMutation();
+            }
+            probe.released.set(io);
+            owner.worker.?.join();
+            owner.worker = null;
+            if (probe.failure) |err| return err;
+            {
+                var lease: ?native.PathWriterLock = try connection.acquire();
+                defer {
+                    connection.detach();
+                    if (lease) |*held| held.close();
+                    connection.gate.mutex.unlock(io);
+                }
+                const root = try connection.refresh(&lease, .mutation);
+                const file = &root.owned_lite_backend.?.native_docstore.?.file;
+                if (!file.free_pages_verified) return error.CompletedProofLostAcrossReplacement;
+                const before = (try file.allocatorStats()).?.reused_pages;
+                const before_pages = file.activeCheckpoint().page_count;
+                for (0..8) |_| try file.putCatalogRecord("during-proof", &value);
+                if ((try file.allocatorStats()).?.reused_pages <= before) return error.CompletedProofDidNotEnableReuse;
+                if (file.activeCheckpoint().page_count >= before_pages + 32) return error.CompletedProofKeptAppending;
+                connection.notifyMutation();
+            }
+        }
+        h.closeHandle(wrapper);
+        closed = true;
+        if (probe.failure) |err| return err;
+        if (queued) {
+            if (!probe.canceled_on_stop) return error.CloseDidNotCancelQueuedWork;
+            if (!std.meta.eql(probe.entry_header, probe.exit_header.?)) return error.StoppedMaintenanceRefreshedRuntime;
+        } else if (probe.canceled_on_stop) return error.CloseCanceledExistingProof;
+        try std.testing.expectEqual(@as(usize, if (queued) 0 else 1), probe.calls);
+        var certificate = try native.NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
+        defer certificate.close();
+        if (try certificate.inheritAllocatorCertificate() != (scenario != .canceled and !queued)) return error.CloseCertificateUnexpectedOutcome;
+        try std.testing.expect((try certificate.check()).valid);
+    }
+}
+
+test "capi native close bounds proof work and skips legacy files" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    const Reason = enum { legacy, large, foreign };
+    for ([_]Reason{ .legacy, .large, .foreign }) |reason| {
+        const indexed = reason != .legacy;
+        var tmp = try api.TestDirectory.init("close-proof-budget");
+        defer tmp.cleanup();
+        try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+        const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+        defer a.free(path);
+        {
+            var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = indexed, .no_sync = true });
+            defer seed.close();
+            if (reason == .large) {
+                const large = try a.alloc(u8, Owner.close_allocator_proof_max_bytes);
+                defer a.free(large);
+                @memset(large, 'x');
+                try seed.putDocument("large", large);
+            } else try seed.putDocument("legacy", "revision 3");
+        }
+        const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+        var closed = false;
+        defer if (!closed) h.closeHandle(wrapper);
+        const connection = wrapper.lite_connection.?;
+        const owner = connection.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(io);
+        owner.worker.?.join();
+        owner.worker = null;
+        owner.allocator_verification_started = false;
+        {
+            var lease = try connection.acquire();
+            defer {
+                lease.close();
+                connection.gate.mutex.unlock(io);
+            }
+            const file = &owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+            try std.testing.expectEqual(indexed, file.header.indexed_reclamation);
+            if (reason == .large) try std.testing.expect(file.activeCheckpoint().page_count *| file.header.page_size > Owner.close_allocator_proof_max_bytes);
+            file.free_pages_verified = false;
+            file.defer_allocator_verification = true;
+            file.max_file_bytes = null;
+            try file.putCatalogRecord("changed", "one small publication");
+            owner.notifyMutation();
+            if (reason == .foreign) {
+                var foreign = try native.NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true });
+                defer foreign.close();
+                foreign.defer_allocator_verification = true;
+                try foreign.putCatalogRecord("foreign", "a newer publication");
+            }
+        }
+        const Probe = struct {
+            calls: usize = 0,
+            fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.calls += 1;
+            }
+        };
+        var probe: Probe = .{};
+        owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+        h.closeHandle(wrapper);
+        closed = true;
+        try std.testing.expectEqual(@as(usize, 0), probe.calls);
+        var file = try native.NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
+        defer file.close();
+        try std.testing.expect(!try file.inheritAllocatorCertificate());
+        const value = (try file.getCatalogRecordAlloc(a, "changed")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("one small publication", value);
+    }
+}
+
+test "capi native short lived writers carry reuse across clean closes without a worker turn" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("short-lived-reuse");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const value: [32768]u8 = @splat('x');
+    {
+        // A crash/older writer left a valid free pool without a certificate.
+        var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer seed.close();
+        // Keep enough distinct payloads to cover the entire request. Repeatedly
+        // overwriting one key can reuse the same few pages during seeding and
+        // leave a pool too small for a request that pins its entry generation.
+        for (0..64) |i| {
+            var key: [16]u8 = undefined;
+            try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+        }
+        for (0..64) |i| {
+            var key: [16]u8 = undefined;
+            try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+        }
+        for (0..4) |_| _ = try seed.reclaimPages(4096);
+        try std.testing.expect((try seed.allocatorStats()).?.reusable_pages > 256);
+    }
+    for (0..3) |process| {
+        const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+        var closed = false;
+        defer if (!closed) h.closeHandle(wrapper);
+        const connection = wrapper.lite_connection.?;
+        const owner = connection.owner;
+        // No worker turn is available. The first owner must prove its pool
+        // at admission; subsequent owners inherit its clean-close certificate.
+        owner.stopping.store(true, .release);
+        owner.verification_cancel.request();
+        owner.wake.set(io);
+        owner.worker.?.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
+        owner.verification_cancel.requested.store(false, .release);
+        owner.allocator_verification_started = false;
+        var lease: ?native.PathWriterLock = try connection.acquire();
+        {
+            defer {
+                connection.detach();
+                if (lease) |*held| held.close();
+                connection.gate.mutex.unlock(io);
+            }
+            const root = try connection.refresh(&lease, .mutation);
+            const file = &root.owned_lite_backend.?.native_docstore.?.file;
+            if (!file.free_pages_verified) return error.ShortLivedWriterPoolUnverified;
+            const before = (try file.allocatorStats()).?.reused_pages;
+            const before_pages = file.activeCheckpoint().page_count;
+            for (0..8) |_| try file.putCatalogRecord("next", &value);
+            connection.notifyMutation();
+            const reused_pages = (try file.allocatorStats()).?.reused_pages - before;
+            const growth_pages = file.activeCheckpoint().page_count - before_pages;
+            std.debug.print("LITE_OWNER_REUSE owner={d} growth_pages={d} reused_pages={d}\n", .{ process, growth_pages, reused_pages });
+            if (reused_pages == 0) return error.ShortLivedWriterDidNotReuse;
+            if (growth_pages >= 32) return error.ShortLivedWriterKeptAppending;
+        }
+        h.closeHandle(wrapper);
+        closed = true;
+        var probe = try native.NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
+        defer probe.close();
+        if (!try probe.inheritAllocatorCertificate()) return error.ShortLivedWriterLostCertificate;
+        if (!(try probe.check()).valid) return error.ShortLivedWriterInvalidFile;
+    }
+}
+
 test "capi resolver curation publication proofs skip large catalogs and fence changed records" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1973,4 +2923,705 @@ test "capi resolver curation publication proofs skip large catalogs and fence ch
     }
     try std.testing.expectError(error.EnrichmentSourceChanged, absent.verify(root));
     std.debug.print("PUBLICATION PROOF catalog_bytes=4194304 primary_commits=20 hydrated_catalogs=0 same_content=accepted changed_content=fenced\n", .{});
+}
+
+test "capi native allocator proof refuses admission on a moving tip" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("moving-allocator-admission");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    {
+        var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer seed.close();
+        const value: [32768]u8 = @splat('v');
+        for (0..16) |i| {
+            var key: [16]u8 = undefined;
+            try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+        }
+        for (0..16) |i| {
+            var key: [16]u8 = undefined;
+            try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+        }
+        _ = try seed.reclaimPages(4096);
+        try std.testing.expect((try seed.allocatorStats()).?.reusable_pages > 64);
+    }
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+    defer h.closeHandle(wrapper);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    owner.verification_cancel.requested.store(false, .release);
+    const Probe = struct {
+        owner: *Owner,
+        captures: usize = 0,
+        failure: ?anyerror = null,
+        fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.captures += 1;
+            // Bound the unfixed regression instead of hanging the test suite.
+            if (self.captures > 1) {
+                self.owner.verification_cancel.request();
+                return;
+            }
+            self.publish() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn publish(self: *@This()) !void {
+            var lease = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.owner.path);
+            defer lease.close();
+            var file = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.owner.path, .{ .externally_locked = true, .no_sync = true });
+            defer file.close();
+            file.defer_allocator_verification = true;
+            try file.putCatalogRecord("foreign", "move the tip while the proof is detached");
+        }
+    };
+    var probe: Probe = .{ .owner = owner };
+    owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+    defer owner.test_after_allocator_capture = null;
+    var lease: ?native.PathWriterLock = try connection.acquire();
+    defer {
+        connection.detach();
+        if (lease) |*held| held.close();
+        connection.gate.mutex.unlock(io);
+    }
+    owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+    const proof_walks_before = owner.publication_stats.allocator_proof_walks;
+    const proof_failures_before = owner.publication_stats.allocator_proof_failures;
+    const result = connection.refresh(&lease, .mutation);
+    if (probe.failure) |err| return err;
+    try std.testing.expectError(error.FileBusy, result);
+    try std.testing.expectEqual(@as(usize, 1), probe.captures);
+    try std.testing.expectEqual(@as(u64, 1), owner.publication_stats.allocator_proof_walks - proof_walks_before);
+    try std.testing.expectEqual(@as(u64, 0), owner.publication_stats.allocator_proof_failures - proof_failures_before);
+    try std.testing.expect(owner.publication_stats.allocator_proof_ns >= owner.publication_stats.allocator_proof_max_ns);
+    try std.testing.expect(!owner.verification_cancel.requested.load(.acquire));
+    // The refusal occurs before a transaction starts. A later, stable request
+    // can obtain a new proof and proceed using the same connection.
+    owner.test_after_allocator_capture = null;
+    const root = try connection.refresh(&lease, .mutation);
+    try std.testing.expect(root.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+}
+
+test "capi native allocator proof queue retains eligible wake after spurious competitor" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const io = h.handleLockIo();
+    var gate: QueuedMutex = .{};
+    const Schedule = struct {
+        const Outcome = enum(u8) { none, entered, reblocked };
+        first_parked: std.Io.Event = .unset,
+        second_parked: std.Io.Event = .unset,
+        second_held: std.Io.Event = .unset,
+        release_first: std.Io.Event = .unset,
+        release_second: std.Io.Event = .unset,
+        outcome_ready: std.Io.Event = .unset,
+        first_entered: std.Io.Event = .unset,
+        outcome: std.atomic.Value(Outcome) = .init(.none),
+    };
+    var schedule: Schedule = .{};
+    const Waiter = struct {
+        base: std.Io,
+        gate: *QueuedMutex,
+        schedule: *Schedule,
+        first: bool,
+        calls: usize = 0,
+        fn wait(ptr: ?*anyopaque, word: *const u32, expected: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (word != &self.gate.ready.epoch.raw) return self.base.futexWaitUncancelable(u32, word, expected);
+            self.calls += 1;
+            if (self.calls == 1) {
+                const parked = if (self.first) &self.schedule.first_parked else &self.schedule.second_parked;
+                parked.set(self.base);
+            }
+            if (self.first and self.calls == 2) {
+                self.schedule.outcome.store(.reblocked, .release);
+                self.schedule.outcome_ready.set(self.base);
+            }
+            if (!self.first and self.calls == 2) {
+                // A legal spurious wake lets a competitor recheck before the
+                // eligible waiter resumes. It must not consume that waiter's
+                // remaining broadcast signal and leave its ticket asleep.
+                return;
+            }
+            if (!self.first and self.calls == 3) {
+                self.schedule.second_held.set(self.base);
+                self.schedule.release_second.waitUncancelable(self.base);
+            }
+            self.base.futexWaitUncancelable(u32, word, expected);
+            if (self.first and self.calls == 1) self.schedule.release_first.waitUncancelable(self.base);
+        }
+        fn wake(ptr: ?*anyopaque, word: *const u32, count: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.base.futexWake(u32, word, count);
+        }
+        fn run(self: *@This()) void {
+            // QueuedMutex only uses futex operations on its supplied Io.
+            var vtable = self.base.vtable.*;
+            vtable.futexWaitUncancelable = wait;
+            vtable.futexWake = wake;
+            const controlled: std.Io = .{ .userdata = self, .vtable = &vtable };
+            self.gate.lockUncancelable(controlled);
+            if (self.first) {
+                self.schedule.outcome.store(.entered, .release);
+                self.schedule.outcome_ready.set(self.base);
+                self.schedule.first_entered.set(self.base);
+            }
+            self.gate.unlock(controlled);
+        }
+    };
+    var first: Waiter = .{ .base = io, .gate = &gate, .schedule = &schedule, .first = true };
+    var second: Waiter = .{ .base = io, .gate = &gate, .schedule = &schedule, .first = false };
+    gate.lockUncancelable(io);
+    const first_thread = try std.Thread.spawn(.{}, Waiter.run, .{&first});
+    schedule.first_parked.waitUncancelable(io);
+    const second_thread = try std.Thread.spawn(.{}, Waiter.run, .{&second});
+    schedule.second_parked.waitUncancelable(io);
+    gate.unlock(io);
+    schedule.second_held.waitUncancelable(io);
+    schedule.release_first.set(io);
+    schedule.outcome_ready.waitUncancelable(io);
+    const initial = schedule.outcome.load(.acquire);
+    // Repair the old implementation's lost wake only to join every thread
+    // before reporting the regression. The fixed implementation needs none.
+    if (initial == .reblocked) {
+        gate.state.lockUncancelable(io);
+        gate.ready.broadcast(io);
+        gate.state.unlock(io);
+    }
+    schedule.first_entered.waitUncancelable(io);
+    schedule.release_second.set(io);
+    first_thread.join();
+    second_thread.join();
+    try std.testing.expectEqual(Schedule.Outcome.entered, initial);
+    try std.testing.expectEqual(gate.next, gate.serving);
+}
+
+test "capi native allocator proof mutation preflight honors busy timeout before batch and SQL execution" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    for ([_]enum { batch, sql }{ .batch, .sql }) |operation| {
+        for ([_]u64{ 0, 1000 }) |timeout_ms| {
+            var tmp = try api.TestDirectory.init("batch-proof-admission");
+            defer tmp.cleanup();
+            try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+            const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+            defer a.free(path);
+            {
+                var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+                defer seed.close();
+                const value: [32768]u8 = @splat('v');
+                for (0..16) |i| {
+                    var key: [16]u8 = undefined;
+                    try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+                }
+                for (0..16) |i| {
+                    var key: [16]u8 = undefined;
+                    try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+                }
+                _ = try seed.reclaimPages(4096);
+                try std.testing.expect((try seed.allocatorStats()).?.reusable_pages > 64);
+            }
+            const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = timeout_ms }, false);
+            const id = api.publishHandle(wrapper) catch |err| {
+                h.closeHandle(wrapper);
+                return err;
+            };
+            defer api.antfly_db_close(id);
+            const owner = wrapper.lite_connection.?.owner;
+            owner.stopping.store(true, .release);
+            owner.wake.set(io);
+            owner.worker.?.join();
+            owner.worker = null;
+            owner.stopping.store(false, .release);
+            owner.verification_cancel.requested.store(false, .release);
+            if (operation == .sql) {
+                var output: h.capi.Buffer = .{};
+                defer api.antfly_buffer_free_zero(&output);
+                try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"CREATE TABLE numbers (n BIGINT)\"}"), &output));
+            }
+            const Probe = struct {
+                owner: *Owner,
+                captures: usize = 0,
+                failure: ?anyerror = null,
+                fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.captures += 1;
+                    if (self.captures != 1) return;
+                    self.publish() catch |err| {
+                        self.failure = err;
+                    };
+                }
+                fn publish(self: *@This()) !void {
+                    var lease = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.owner.path);
+                    defer lease.close();
+                    var file = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.owner.path, .{ .externally_locked = true, .no_sync = true });
+                    defer file.close();
+                    file.defer_allocator_verification = true;
+                    try file.putCatalogRecord("foreign", "invalidate the first proof before the requested batch starts");
+                }
+            };
+            var probe: Probe = .{ .owner = owner };
+            owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+            defer owner.test_after_allocator_capture = null;
+            owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+            const key = "accepted";
+            const value = "{\"text\":\"one accepted batch\"}";
+            const writes = [_]h.capi.WriteIntent{.{ .key = .{ .ptr = key.ptr, .len = key.len }, .value = .{ .ptr = value.ptr, .len = value.len }, .is_delete = false }};
+            var output: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&output);
+            const result = if (operation == .batch)
+                api.antfly_db_batch(id, &writes, writes.len, null, 0, 0, 0)
+            else
+                api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"INSERT INTO numbers (_id,n) VALUES ('accepted',7)\"}"), &output);
+            if (probe.failure) |err| return err;
+            try std.testing.expectEqual(if (timeout_ms == 0) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, result);
+            try std.testing.expectEqual(if (timeout_ms == 0) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, h.capi.lastErrorCode());
+            try std.testing.expectEqual(@as(usize, if (timeout_ms == 0) 1 else 2), probe.captures);
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            if (operation == .batch) {
+                const found = api.antfly_db_lookup_json(id, .{ .ptr = key.ptr, .len = key.len }, &out);
+                try std.testing.expectEqual(if (timeout_ms == 0) h.capi.ErrorCode.not_found else h.capi.ErrorCode.ok, found);
+            } else {
+                try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"SELECT n FROM numbers WHERE _id = 'accepted'\"}"), &out));
+                const parsed = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+                defer parsed.deinit();
+                const rows = parsed.value.object.get("rows").?.array.items;
+                try std.testing.expectEqual(@as(usize, if (timeout_ms == 0) 0 else 1), rows.len);
+            }
+        }
+    }
+}
+
+test "capi native allocator proof peer close certificate survives runtime refresh" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("request-allocator-certificate");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .busy_timeout_ms = 1000 }, true);
+    const id = api.publishHandle(wrapper) catch |err| {
+        h.closeHandle(wrapper);
+        return err;
+    };
+    defer api.antfly_db_close(id);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    owner.verification_cancel.requested.store(false, .release);
+    {
+        var lease: ?native.PathWriterLock = try connection.acquire();
+        defer {
+            if (lease) |*held| held.close();
+            connection.gate.mutex.unlock(io);
+        }
+        owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+        try owner.verifyAllocatorAssumeLocked(&lease, connection);
+        try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+    }
+    const key = "certificate-document";
+    const value = "{\"text\":\"durable request publication\"}";
+    const writes = [_]h.capi.WriteIntent{.{ .key = .{ .ptr = key.ptr, .len = key.len }, .value = .{ .ptr = value.ptr, .len = value.len }, .is_delete = false }};
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(id, &writes, writes.len, null, 0, 0, 0));
+    {
+        var lease = try connection.acquire();
+        defer {
+            lease.close();
+            connection.gate.mutex.unlock(io);
+        }
+        var foreign = try native.NativeFile.openWithIo(a, io, path, .{ .externally_locked = true });
+        defer foreign.close();
+        try foreign.completeAllocatorVerification();
+        try foreign.putCatalogRecord("foreign-certificate", "new primary tip with unchanged index inputs");
+        try foreign.sync();
+        try std.testing.expect(try foreign.certifyAllocator());
+        owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+        owner.allocator_verification_started = false;
+    }
+    var timestamp: u64 = 0;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_timestamp(id, .{ .ptr = key.ptr, .len = key.len }, &timestamp));
+    try std.testing.expect(timestamp != 0);
+    try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+    try std.testing.expect(!owner.allocator_verification_started);
+}
+
+test "capi native allocator proof admission shares deadline with lease reacquisition" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("proof-admission-deadline");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    {
+        var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer seed.close();
+        const value: [32768]u8 = @splat('v');
+        for (0..16) |i| {
+            var key: [16]u8 = undefined;
+            try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+        }
+        for (0..16) |i| {
+            var key: [16]u8 = undefined;
+            try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+        }
+        _ = try seed.reclaimPages(4096);
+        try std.testing.expect((try seed.allocatorStats()).?.reusable_pages > 64);
+    }
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 1000 }, false);
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    owner.verification_cancel.requested.store(false, .release);
+    const Probe = struct {
+        connection: *Connection,
+        held: ?native.PathWriterLock = null,
+        failure: ?anyerror = null,
+        captures: usize = 0,
+        retries: usize = 0,
+        fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.captures += 1;
+            self.expireBudget() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn expireBudget(self: *@This()) !void {
+            self.held = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.connection.path);
+            // Expire the actual request deadline while the proof is detached.
+            // Reacquisition must fail without entering a fresh lease retry loop.
+            const deadline = self.connection.admission_deadline_ns orelse return error.MissingAdmissionDeadline;
+            const remaining = deadline - std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
+            if (remaining > 0) try h.handleLockIo().sleep(.fromNanoseconds(remaining + std.time.ns_per_ms), .awake);
+        }
+        fn busy(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.retries += 1;
+        }
+    };
+    var probe: Probe = .{ .connection = connection };
+    defer if (probe.held) |*held| held.close();
+    owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+    connection.test_path_lease_busy = .{ .ptr = &probe, .notify = Probe.busy };
+    defer {
+        owner.test_after_allocator_capture = null;
+        connection.test_path_lease_busy = null;
+    }
+    owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+    const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("rejected"), .value = .fromSlice("{}"), .is_delete = false }};
+    const result = api.antfly_db_batch(id, &writes, writes.len, null, 0, 0, 0);
+    if (probe.failure) |err| return err;
+    try std.testing.expectEqual(h.capi.ErrorCode.busy, result);
+    try std.testing.expectEqual(@as(usize, 1), probe.captures);
+    try std.testing.expectEqual(@as(usize, 0), probe.retries);
+    try std.testing.expectEqual(@as(?i96, null), connection.admission_deadline_ns);
+    probe.held.?.close();
+    probe.held = null;
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.not_found, api.antfly_db_lookup_json(id, .fromSlice("rejected"), &out));
+}
+
+const AdmissionFollowupOperation = enum { batch, sql, read };
+
+const AdmissionFollowupFixture = struct {
+    tmp: api.TestDirectory,
+    path: []u8,
+    id: *anyopaque,
+    connection: *Connection,
+
+    fn init(comptime name: []const u8, timeout_ms: u64, operation: AdmissionFollowupOperation) !@This() {
+        const a = std.testing.allocator;
+        const io = h.handleLockIo();
+        var tmp = try api.TestDirectory.init(name);
+        errdefer tmp.cleanup();
+        try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+        const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+        errdefer a.free(path);
+        {
+            var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+            defer seed.close();
+            const value: [32768]u8 = @splat('v');
+            for (0..16) |i| {
+                var key: [16]u8 = undefined;
+                try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+            }
+            for (0..16) |i| {
+                var key: [16]u8 = undefined;
+                try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+            }
+            _ = try seed.reclaimPages(4096);
+            try std.testing.expect((try seed.allocatorStats()).?.reusable_pages > 64);
+        }
+        const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = timeout_ms }, false);
+        const id = try api.publishHandle(wrapper);
+        errdefer api.antfly_db_close(id);
+        const connection = wrapper.lite_connection.?;
+        const owner = connection.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(io);
+        owner.worker.?.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
+        owner.verification_cancel.requested.store(false, .release);
+        if (operation == .sql) {
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"CREATE TABLE numbers (n BIGINT)\"}"), &out));
+        }
+        if (operation == .read) try boundCapacity(owner.current.?);
+        owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+        return .{ .tmp = tmp, .path = path, .id = id, .connection = connection };
+    }
+
+    fn boundCapacity(root: *h.Handle) !void {
+        const store = root.owned_lite_backend.?.native_docstore.?;
+        store.mutex.lock();
+        defer store.mutex.unlock();
+        store.maintenance_policy.options.max_storage_bytes = 1024 * 1024 * 1024;
+        try store.refreshAdmissionAssumeLocked();
+    }
+
+    fn deinit(self: *@This()) void {
+        self.connection.owner.test_after_allocator_capture = null;
+        self.connection.test_admission_sleep = null;
+        api.antfly_db_close(self.id);
+        std.testing.allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+
+    fn call(self: *@This(), operation: AdmissionFollowupOperation) h.capi.ErrorCode {
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&out);
+        const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("accepted"), .value = .fromSlice("{\"text\":\"one admitted write\"}"), .is_delete = false }};
+        return switch (operation) {
+            .batch => api.antfly_db_batch(self.id, &writes, writes.len, null, 0, 0, 0),
+            .sql => api.antfly_db_sql_json(self.id, .fromSlice("{\"statement\":\"INSERT INTO numbers (_id,n) VALUES ('accepted',7)\"}"), &out),
+            .read => @import("tables.zig").antfly_db_list_tables_json(self.id, &out),
+        };
+    }
+
+    fn expectWritten(self: *@This(), operation: AdmissionFollowupOperation, written: bool) !void {
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&out);
+        switch (operation) {
+            .batch => try std.testing.expectEqual(if (written) h.capi.ErrorCode.ok else h.capi.ErrorCode.not_found, api.antfly_db_lookup_json(self.id, .fromSlice("accepted"), &out)),
+            .sql => {
+                try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(self.id, .fromSlice("{\"statement\":\"SELECT n FROM numbers WHERE _id = 'accepted'\"}"), &out));
+                const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.ptr.?[0..out.len], .{});
+                defer parsed.deinit();
+                try std.testing.expectEqual(@as(usize, if (written) 1 else 0), parsed.value.object.get("rows").?.array.items.len);
+            },
+            .read => {},
+        }
+    }
+};
+
+const AdmissionFollowupProbe = struct {
+    connection: *Connection,
+    slow_stable: bool = false,
+    capacity_bounded: bool = false,
+    captures: usize = 0,
+    sleep_calls: usize = 0,
+    failure: ?anyerror = null,
+
+    fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.captures += 1;
+        self.duringProof() catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn duringProof(self: *@This()) !void {
+        const io = h.handleLockIo();
+        if (self.slow_stable) {
+            const deadline = self.connection.admission_deadline_ns orelse return error.MissingAdmissionDeadline;
+            const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+            // Model a multi-minute graph walk with a short, real timeout:
+            // the tip stays stable while proof work outlasts the budget.
+            if (remaining > 0) try io.sleep(.fromNanoseconds(remaining + std.time.ns_per_ms), .awake);
+            return;
+        }
+        if (self.captures != 1) return;
+        const owner = self.connection.owner;
+        owner.gate.mutex.lockUncancelable(io);
+        defer owner.gate.mutex.unlock(io);
+        var lease = try native.lockWriterPathWithIo(alloc, io, owner.path);
+        defer lease.close();
+        var foreign = try native.NativeFile.openWithIo(alloc, io, owner.path, .{ .externally_locked = true, .no_sync = true });
+        defer foreign.close();
+        foreign.defer_allocator_verification = true;
+        try foreign.putCatalogRecord("foreign", "invalidate the detached proof once");
+        // Keep the read's explicit capacity policy across a foreground refresh.
+        if (self.capacity_bounded) try AdmissionFollowupFixture.boundCapacity(try owner.refresh());
+    }
+
+    fn cancelSleep(ptr: *anyopaque, _: std.Io.Duration) std.Io.Cancelable!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.sleep_calls += 1;
+        return error.Canceled;
+    }
+};
+
+test "capi native allocator proof maintenance yields before refreshing an active proof" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("proof-maintenance-yield", 1000, .batch);
+    defer fixture.deinit();
+    const Probe = struct {
+        connection: *Connection,
+        captures: usize = 0,
+        failure: ?anyerror = null,
+        fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.captures += 1;
+            self.check() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn check(self: *@This()) !void {
+            const owner = self.connection.owner;
+            try std.testing.expect(owner.allocator_verification_active);
+            const captured = owner.current.?;
+            if (self.captures == 1) {
+                // A peer moves the tip while the foreground owns a detached
+                // proof. Background refresh must not reopen index sources and
+                // publish more leases before checking that proof's admission.
+                var change = AdmissionFollowupProbe{ .connection = self.connection, .captures = 1 };
+                try change.duringProof();
+            }
+            defer owner.maintenance_storage_pending = false;
+            for ([_]bool{ false, true }) |storage_pending| {
+                owner.maintenance_storage_pending = storage_pending;
+                try std.testing.expect(try owner.maintenanceTurn());
+                try std.testing.expect(owner.current.? == captured);
+                if (storage_pending) try std.testing.expect(owner.maintenance_storage_pending);
+            }
+        }
+    };
+    var probe = Probe{ .connection = fixture.connection };
+    fixture.connection.owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+    const result = fixture.call(.batch);
+    if (probe.failure) |err| return err;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, result);
+    try std.testing.expectEqual(@as(usize, 2), probe.captures);
+    try fixture.expectWritten(.batch, true);
+}
+
+test "capi native allocator proof admits a slow stable proof after the retry deadline" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    for ([_]AdmissionFollowupOperation{ .batch, .sql, .read }) |operation| {
+        var fixture = try AdmissionFollowupFixture.init("slow-stable-proof", 1000, operation);
+        defer fixture.deinit();
+        var probe: AdmissionFollowupProbe = .{ .connection = fixture.connection, .slow_stable = true };
+        fixture.connection.owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = AdmissionFollowupProbe.capture };
+        const stats = &fixture.connection.owner.publication_stats;
+        const admissions_before = stats.mutation_admission_count;
+        const admission_ns_before = stats.mutation_admission_ns;
+        const result = fixture.call(operation);
+        if (probe.failure) |err| return err;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, result);
+        try std.testing.expectEqual(@as(u64, if (operation == .read) 0 else 1), stats.mutation_admission_count - admissions_before);
+        if (operation != .read) try std.testing.expect(stats.mutation_admission_ns - admission_ns_before >= std.time.ns_per_s);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, h.capi.lastErrorCode());
+        try std.testing.expectEqual(@as(usize, 1), probe.captures);
+        try std.testing.expect(fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+        try fixture.expectWritten(operation, true);
+        // The finished proof remains usable; an immediate next call does not
+        // repeat the expensive scan even though the first call ran past budget.
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.read));
+        try std.testing.expectEqual(@as(usize, 1), probe.captures);
+    }
+}
+
+test "capi native allocator proof capacity reads retry a moving tip before execution" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    for ([_]u64{ 0, 1000 }) |timeout_ms| {
+        var fixture = try AdmissionFollowupFixture.init("moving-read-proof", timeout_ms, .read);
+        defer fixture.deinit();
+        var probe: AdmissionFollowupProbe = .{ .connection = fixture.connection, .capacity_bounded = true };
+        fixture.connection.owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = AdmissionFollowupProbe.capture };
+        const result = fixture.call(.read);
+        if (probe.failure) |err| return err;
+        try std.testing.expectEqual(if (timeout_ms == 0) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, result);
+        try std.testing.expectEqual(@as(usize, if (timeout_ms == 0) 1 else 2), probe.captures);
+    }
+}
+
+test "capi native allocator proof cancelled backoff does not reenter admission" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    for ([_]AdmissionFollowupOperation{ .batch, .sql }) |operation| {
+        var fixture = try AdmissionFollowupFixture.init("cancelled-proof-backoff", 1000, operation);
+        defer fixture.deinit();
+        var probe: AdmissionFollowupProbe = .{ .connection = fixture.connection };
+        fixture.connection.owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = AdmissionFollowupProbe.capture };
+        fixture.connection.test_admission_sleep = .{ .ptr = &probe, .sleep = AdmissionFollowupProbe.cancelSleep };
+        const result = fixture.call(operation);
+        if (probe.failure) |err| return err;
+        try std.testing.expectEqual(h.capi.ErrorCode.cancelled, result);
+        try std.testing.expectEqual(h.capi.ErrorCode.cancelled, h.capi.lastErrorCode());
+        try std.testing.expectEqual(@as(usize, 1), probe.captures);
+        try std.testing.expectEqual(@as(usize, 1), probe.sleep_calls);
+        try std.testing.expect(fixture.connection.mutex.tryLock());
+        fixture.connection.mutex.unlock(h.handleLockIo());
+        try fixture.expectWritten(operation, false);
+    }
+}
+
+test "capi native allocator proof initial admission survives a long local queue wait" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const io = h.handleLockIo();
+    var fixture = try AdmissionFollowupFixture.init("queued-stable-proof", 1000, .batch);
+    defer fixture.deinit();
+    const Writer = struct {
+        fixture: *AdmissionFollowupFixture,
+        result: h.capi.ErrorCode = .busy,
+        fn run(self: *@This()) void {
+            self.result = self.fixture.call(.batch);
+        }
+    };
+    var writer: Writer = .{ .fixture = &fixture };
+    const mutex = &fixture.connection.mutex;
+    mutex.lockUncancelable(io);
+    const thread = std.Thread.spawn(.{}, Writer.run, .{&writer}) catch |err| {
+        mutex.unlock(io);
+        return err;
+    };
+    // Observe an actual queued ticket: the writer has already calculated its
+    // admission deadline before it parks behind this connection's API call.
+    while (true) {
+        mutex.state.lockUncancelable(io);
+        const queued = mutex.next == mutex.serving +% 2;
+        mutex.state.unlock(io);
+        if (queued) break;
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    io.sleep(.fromMilliseconds(1001), .awake) catch {};
+    mutex.unlock(io);
+    thread.join();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, writer.result);
+    try fixture.expectWritten(.batch, true);
 }

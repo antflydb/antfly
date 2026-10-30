@@ -90,7 +90,7 @@ pub const Context = struct {
         const Adapter = struct {
             fn acquire(raw: *anyopaque, out: *abi.OwnedBytes) callconv(.c) abi.Status {
                 const facade: *const @import("antfly_scraping").RemoteContentConfig = @ptrCast(@alignCast(raw));
-                const bytes = @import("antfly_local_sources").common_config.remoteContentSecurityJsonAlloc(std.heap.smp_allocator, facade) catch |err| return switch (err) {
+                const bytes = @import("antfly_local_sources").common_config.remoteContentSnapshotJsonAlloc(std.heap.smp_allocator, facade) catch |err| return switch (err) {
                     error.OutOfMemory => .out_of_memory,
                     error.Timeout => .timeout,
                     error.Canceled => .cancelled,
@@ -104,7 +104,7 @@ pub const Context = struct {
             }
         };
         const services = @import("kernel_runtime_services.zig");
-        const source = services.RemoteContentSource{ .context = @ptrCast(@constCast(remote)), .acquire = Adapter.acquire, .release = Adapter.release };
+        const source = services.RemoteContentSource{ .version = 2, .context = @ptrCast(@constCast(remote)), .acquire = Adapter.acquire, .release = Adapter.release };
         try self.ensure();
         try statusToError(services.antfly_storage_context_configure_remote_content_source(self.handle, &source));
     }

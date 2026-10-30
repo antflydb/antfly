@@ -9,13 +9,15 @@ import {
   CardTitle,
   Checkbox,
   DashboardToolbar,
+  Field,
+  FieldLabel,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
+  Spinner,
   StatCard,
   Tabs,
   TabsList,
@@ -33,7 +35,7 @@ import type {
   GraphResult,
   IndexStatus,
 } from "@antfly/sdk";
-import { GitBranch, Hash, Loader2, Network, RefreshCw, Route, Search } from "lucide-react";
+import { GitBranch, Hash, Network, RefreshCw, Route, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useApi } from "@/hooks/use-api-config";
 import JsonViewer from "./JsonViewer";
@@ -430,7 +432,7 @@ export function GraphIndexExplorer({
       <DashboardToolbar className="items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
           <Network className="size-4 text-muted-foreground" />
-          <h2 className="font-display text-xl tracking-tight">Graph Explorer</h2>
+          <h2 className="text-xl font-semibold tracking-[-0.015em]">Graph Explorer</h2>
           {selectedIndex?.status?.rebuilding && (
             <Badge className="af-status-badge-warning">Rebuilding</Badge>
           )}
@@ -476,8 +478,8 @@ export function GraphIndexExplorer({
             <CardTitle className="text-lg">Query</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <Label>Graph index</Label>
+            <Field className="gap-2">
+              <FieldLabel>Graph index</FieldLabel>
               <Select value={selectedIndexName} onValueChange={setSelectedIndexName}>
                 <SelectTrigger>
                   <SelectValue />
@@ -490,7 +492,7 @@ export function GraphIndexExplorer({
                   ))}
                 </SelectContent>
               </Select>
-            </div>
+            </Field>
 
             <Tabs value={mode} onValueChange={(value) => setMode(value as GraphMode)}>
               <TabsList className="grid w-full grid-cols-3">
@@ -500,9 +502,9 @@ export function GraphIndexExplorer({
               </TabsList>
             </Tabs>
 
-            <div className="space-y-2">
+            <Field className="gap-2">
               <div className="flex items-center justify-between gap-2">
-                <Label htmlFor="graph-start-key">Start key</Label>
+                <FieldLabel htmlFor="graph-start-key">Start key</FieldLabel>
                 <Button
                   variant="ghost"
                   size="xs"
@@ -511,7 +513,7 @@ export function GraphIndexExplorer({
                   className="shrink-0"
                 >
                   {isLoadingKeys ? (
-                    <Loader2 className="size-3.5 animate-spin" />
+                    <Spinner className="size-3.5" />
                   ) : (
                     <Search className="size-3.5" />
                   )}
@@ -539,22 +541,22 @@ export function GraphIndexExplorer({
                   ))}
                 </div>
               )}
-            </div>
+            </Field>
 
             {mode === "shortest_path" && (
-              <div className="space-y-2">
-                <Label htmlFor="graph-target-key">Target key</Label>
+              <Field className="gap-2">
+                <FieldLabel htmlFor="graph-target-key">Target key</FieldLabel>
                 <Input
                   id="graph-target-key"
                   value={targetKey}
                   onChange={(event) => setTargetKey(event.target.value)}
                   placeholder="target-key"
                 />
-              </div>
+              </Field>
             )}
 
-            <div className="space-y-2">
-              <Label htmlFor="graph-max-depth">Outgoing depth</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="graph-max-depth">Outgoing depth</FieldLabel>
               <Input
                 id="graph-max-depth"
                 type="number"
@@ -563,11 +565,11 @@ export function GraphIndexExplorer({
                 value={maxDepth}
                 onChange={(event) => setMaxDepth(coerceInteger(event.target.value, 2, 1, 12))}
               />
-            </div>
+            </Field>
 
             {mode === "shortest_path" ? (
-              <div className="space-y-2">
-                <Label>Path score</Label>
+              <Field className="gap-2">
+                <FieldLabel>Path score</FieldLabel>
                 <Select
                   value={objective}
                   onValueChange={(value) => setObjective(value as GraphPathObjective)}
@@ -581,11 +583,11 @@ export function GraphIndexExplorer({
                     <SelectItem value="max_weight_product">Maximum weight product</SelectItem>
                   </SelectContent>
                 </Select>
-              </div>
+              </Field>
             ) : (
               <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-2">
-                  <Label htmlFor="graph-max-results">Limit</Label>
+                <Field className="gap-2">
+                  <FieldLabel htmlFor="graph-max-results">Limit</FieldLabel>
                   <Input
                     id="graph-max-results"
                     type="number"
@@ -596,9 +598,9 @@ export function GraphIndexExplorer({
                       setMaxResults(coerceInteger(event.target.value, 100, 1, 500))
                     }
                   />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="graph-min-weight">Min weight</Label>
+                </Field>
+                <Field className="gap-2">
+                  <FieldLabel htmlFor="graph-min-weight">Min weight</FieldLabel>
                   <Input
                     id="graph-min-weight"
                     type="number"
@@ -607,53 +609,53 @@ export function GraphIndexExplorer({
                     value={minWeight}
                     onChange={(event) => setMinWeight(coerceNumber(event.target.value, 0, 0))}
                   />
-                </div>
+                </Field>
               </div>
             )}
 
             {availableEdgeTypes.length > 0 && (
-              <div className="space-y-2">
-                <Label>Edge types</Label>
-                <div className="grid gap-2 rounded-none border-(length:--border-width) border-border-strong bg-muted/30 p-2">
+              <Field className="gap-2">
+                <FieldLabel>Edge types</FieldLabel>
+                <div className="grid gap-2 rounded-md border-(length:--border-width) border-border-strong bg-muted/30 p-2">
                   {availableEdgeTypes.map((edgeType) => {
                     const checkboxId = controlId("graph-edge-type", edgeType);
                     return (
-                      <div key={edgeType} className="flex items-center gap-2 text-sm">
+                      <Field
+                        key={edgeType}
+                        orientation="horizontal"
+                        className="gap-2 text-sm w-auto"
+                      >
                         <Checkbox
                           id={checkboxId}
                           checked={selectedEdgeTypes.includes(edgeType)}
                           onCheckedChange={(checked) => toggleEdgeType(edgeType, checked === true)}
                         />
-                        <Label htmlFor={checkboxId} className="font-normal">
+                        <FieldLabel htmlFor={checkboxId} className="font-normal">
                           {edgeType}
-                        </Label>
+                        </FieldLabel>
                         <Badge className="ml-auto">
                           {formatNumber(selectedIndex?.status?.edge_types?.[edgeType], "0")}
                         </Badge>
-                      </div>
+                      </Field>
                     );
                   })}
                 </div>
-              </div>
+              </Field>
             )}
 
-            <div className="flex items-center gap-2 text-sm">
+            <Field orientation="horizontal" className="gap-2 text-sm w-auto">
               <Checkbox
                 id="graph-include-paths"
                 checked={includePaths}
                 onCheckedChange={(checked) => setIncludePaths(checked === true)}
               />
-              <Label htmlFor="graph-include-paths" className="font-normal">
+              <FieldLabel htmlFor="graph-include-paths" className="font-normal">
                 Include paths
-              </Label>
-            </div>
+              </FieldLabel>
+            </Field>
 
             <Button className="w-full" onClick={runGraphQuery} disabled={isLoading}>
-              {isLoading ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <GitBranch className="size-4" />
-              )}
+              {isLoading ? <Spinner className="size-4" /> : <GitBranch className="size-4" />}
               Run graph query
             </Button>
           </CardContent>
@@ -738,7 +740,7 @@ export function GraphIndexExplorer({
                   {graph.edges.slice(0, 40).map((edge) => (
                     <div
                       key={edge.id}
-                      className="rounded-none border-(length:--border-width) border-border-strong bg-muted/30 p-2 text-xs"
+                      className="rounded-md border-(length:--border-width) border-border-strong bg-muted/30 p-2 text-xs"
                     >
                       <div className="flex items-center justify-between gap-2">
                         <Badge variant={edge.pathEdge ? "default" : "default"}>

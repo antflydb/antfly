@@ -1,0 +1,45 @@
+---
+title: Web Search Providers
+description: Exa, Serper, Tavily, Brave, You.com, Linkup, and Vertex AI web search for Antfly agents
+order: 10
+---
+
+Retrieval agents and deep research can search the live web through a
+`web_search` connection. Each connection names one provider.
+
+| Provider | `provider` | Credential environment variable |
+|---|---|---|
+| Exa | `exa` | `EXA_API_KEY` |
+| Serper | `serper` | `SERPER_API_KEY` |
+| Tavily | `tavily` | `TAVILY_API_KEY` |
+| Brave | `brave` | `BRAVE_API_KEY` |
+| You.com | `you` | `YOU_API_KEY` |
+| Linkup | `linkup` | `LINKUP_API_KEY` |
+| Vertex AI | `vertex` | Google credentials; see [Google](/docs/guides/providers/google) |
+
+## Example
+
+```json
+{
+  "connections": {
+    "agent-web": {
+      "display_name": "Agent web",
+      "kind": "web_search",
+      "provider": "exa",
+      "capabilities": ["web.search", "web.fetch", "agents.use"],
+      "web_search": {
+        "max_results": 10,
+        "safe_search": true,
+        "include_domains": ["docs.example.com"],
+        "api_key": "${secret:exa.api_key}"
+      }
+    }
+  }
+}
+```
+
+`include_domains` limits results to the listed sites.
+
+## Related
+
+- [Write a Cited Research Report](/docs/guides/deep-research)

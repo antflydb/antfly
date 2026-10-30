@@ -28,22 +28,7 @@ pub const default_max_distinct_state_bytes: usize = 16 * 1024 * 1024;
 /// Operator-owned ceilings applied to one admitted graph request. These values
 /// are deliberately absent from the public query DSL: callers may shape result
 /// size, but cannot raise server CPU or retained-memory admission.
-pub const Limits = struct {
-    max_explored_nodes: usize = default_max_explored_nodes,
-    max_explored_edges: usize = default_max_explored_edges,
-    max_explored_edge_bytes: usize = default_max_explored_edge_bytes,
-    max_scanned_anchors: usize = default_max_scanned_anchors,
-    max_intermediate_states: usize = default_max_intermediate_states,
-    max_retained_state_bytes: usize = default_max_retained_state_bytes,
-    max_distinct_identities: usize = default_max_distinct_identities,
-    max_distinct_state_bytes: usize = default_max_distinct_state_bytes,
-
-    pub fn validate(self: Limits) !void {
-        inline for (comptime std.meta.fieldNames(Limits)) |reflected_name| {
-            if (@field(self, reflected_name) == 0) return error.InvalidGraphExecutionLimits;
-        }
-    }
-};
+pub const Limits = @import("antfly_platform").resource_policy.GraphLimits;
 
 /// `std.HashMapUnmanaged` uses an eight-slot minimum allocation and power-of-two
 /// capacity at its configured load percentage. These helpers mirror that

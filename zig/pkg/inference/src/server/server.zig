@@ -1234,6 +1234,10 @@ pub fn httpBodyLimitBytesFromMib(mib: usize) error{InvalidHttpBodyLimit}!usize {
     return std.math.mul(usize, mib, 1024 * 1024) catch error.InvalidHttpBodyLimit;
 }
 
+/// Deployment ceilings narrow the manifest's executor contract. They apply to
+/// linked/direct execution as well as HTTP and discovery; zero is invalid.
+pub const RequestLimits = platform.resource_policy.InferenceRequestLimits;
+
 pub const NodeConfig = struct {
     chunking_limits: @import("../pipelines/media_chunk_limits.zig").Limits = .{},
     models_dir: []const u8 = "./models",
@@ -1244,6 +1248,9 @@ pub const NodeConfig = struct {
     keep_alive_ms: u64 = 300_000,
     max_loaded_models: usize = 10,
     max_concurrent_requests: usize = 32,
+    /// Weighted media/work capacity, independent of request-count permits.
+    /// Null preserves the legacy request-count-derived capacity.
+    max_work_units: ?usize = null,
     /// Transport concurrency is bounded independently from inference work.
     /// Keep enough connection headroom for health, discovery, and idle
     /// keep-alive clients without allowing retained Threaded workers to grow
@@ -1267,6 +1274,7 @@ pub const NodeConfig = struct {
     process_memory_limit_provenance: runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
     resource_ownership: model_manager_mod.ResourceOwnership = .local,
     generation_budget_overrides: BudgetOverrides = .{},
+    request_limits: RequestLimits = .{},
     generation_batching: GenerationBatchingConfig = .{},
     /// Maximum queueing delay used only by resolved native executor batches.
     /// Serial compatibility paths bypass the broker and never pay this delay.
@@ -1315,11 +1323,7 @@ test "standalone inference bind is loopback-only unless explicitly overridden" {
     try validateStandaloneBind("0.0.0.0", true);
 }
 
-pub const GenerationBatchingMode = enum {
-    off,
-    auto,
-    on,
-};
+pub const GenerationBatchingMode = @FieldType(platform.inference_settings.GenerationBatching, "mode");
 
 fn cudaDecodeGraphReplayRequested(raw_opt: ?[]const u8) bool {
     const raw = raw_opt orelse return false;
@@ -1339,6 +1343,14 @@ pub const GenerationBatchingConfig = struct {
     max_step_query_tokens: usize = 512,
     max_decode_wait_us: u32 = 1_000,
     max_idle_prefill_chunk_size: usize = 2048,
+
+    pub fn fromSettings(settings: platform.inference_settings.GenerationBatching) @This() {
+        var out: @This() = .{};
+        inline for (comptime std.meta.fieldNames(platform.inference_settings.GenerationBatching)) |field| {
+            @field(out, field) = @field(settings, field);
+        }
+        return out;
+    }
 
     pub fn enabledForBackend(self: @This(), backend: backends_mod.BackendType) bool {
         if (backend != .cuda) return false;
@@ -1604,7 +1616,7 @@ const max_chunk_results = lib_chunker.max_chunk_results;
 const max_chunk_target_tokens = lib_chunker.max_chunk_target_tokens;
 const max_chunk_audio_window_ms = lib_chunker.max_chunk_audio_window_ms;
 const default_read_admission_max_tokens: usize = 256;
-const max_read_tokens: usize = 1024;
+const max_read_tokens: usize = 8192;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 const default_max_request_media_bytes: usize = 100 * 1024 * 1024;
 const read_admission_bytes_per_unit: usize = 16 * 1024 * 1024;
@@ -3865,20 +3877,23 @@ fn requireLegacyClassification(manifest: manifest_mod.ModelManifest) !void {
     if (requiresQualifiedSpanClassification(manifest)) return error.UnsupportedClassificationExtraction;
 }
 
-fn spanV2BackendSupported(config: span_v2_executor.EncoderConfig, backend: backends_mod.BackendType) bool {
+fn spanV2BackendSupported(config: span_v2_executor.EncoderConfig, backend: backends_mod.BackendType, qualified_variant: ?gliner_decide_qualification.QualifiedVariant) bool {
     return switch (backend) {
         .native, .metal => true,
-        .cuda => config == .modern_bert,
+        .cuda => config == .modern_bert or qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8,
         else => false,
     };
 }
 
-test "GLiNER span backend selection preserves the DeBERTa CUDA exclusion" {
-    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .native));
-    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .metal));
-    try std.testing.expect(!spanV2BackendSupported(.{ .deberta = .{} }, .cuda));
-    try std.testing.expect(spanV2BackendSupported(.{ .modern_bert = .{} }, .cuda));
-    try std.testing.expect(!spanV2BackendSupported(.{ .modern_bert = .{} }, .pjrt));
+test "GLiNER span backend selection requires exact DeBERTa CUDA qualification" {
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .native, null));
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .metal, null));
+    try std.testing.expect(!spanV2BackendSupported(.{ .deberta = .{} }, .cuda, null));
+    try std.testing.expect(!spanV2BackendSupported(.{ .deberta = .{} }, .cuda, .decide_1b));
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .cuda, .decide_deberta));
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .cuda, .decide_deberta_q8));
+    try std.testing.expect(spanV2BackendSupported(.{ .modern_bert = .{} }, .cuda, null));
+    try std.testing.expect(!spanV2BackendSupported(.{ .modern_bert = .{} }, .pjrt, null));
 }
 
 test "GLiNER span identity gate preserves ordinary DeBERTa classification" {
@@ -4010,6 +4025,11 @@ pub const Node = struct {
     embed_cache: cache_mod.ResultCache([]const f32),
     media_index_cache: @import("../pipelines/media_index_cache.zig").Cache = .{},
     media_audio_plan_store: @import("../pipelines/media_audio_plan.zig").Store = .{},
+    media_speaker_store: @import("../pipelines/media_speaker_state.zig").Store = .{},
+    speaker_flights: @import("../pipelines/media_speaker_flights.zig").Registry = .{},
+    speaker_revision_cache: @import("../pipelines/speaker_revision_cache.zig").Cache = .{},
+    speaker_analysis_preprocess_runs: std.atomic.Value(u64) = .init(0),
+    speaker_analysis_model_runs: std.atomic.Value(u64) = .init(0),
     metrics: metrics_mod.Metrics,
     inference_admission: inference_admission_mod.InferenceAdmission,
     /// Live streaming transcription sessions (voice API).
@@ -4018,10 +4038,7 @@ pub const Node = struct {
     /// for the node's lifetime; session configs point into this cache.
     silero_weights: std.StringHashMapUnmanaged(*silero_vad_mod.Weights) = .empty,
     silero_weights_lock: std.atomic.Mutex = .unlocked,
-    /// Speaker-embedding models for diarization by resolved ONNX path,
-    /// loaded on first use and kept for the node's lifetime.
-    speaker_embedders: std.StringHashMapUnmanaged(*speaker_embedding_mod.Embedder) = .empty,
-    speaker_embedders_lock: std.atomic.Mutex = .unlocked,
+    speaker_models: @import("../pipelines/speaker_model_cache.zig").Cache = .{},
     /// Lazily allocates only while compatible native executor work is queued.
     /// Ownership is here, rather than the storage BackendRuntime, because Node
     /// owns resolved model generations and concrete fused executor callbacks.
@@ -4119,6 +4136,7 @@ pub const Node = struct {
     pub fn init(allocator: std.mem.Allocator, supplied_config: NodeConfig) !Node {
         var config = supplied_config;
         config.chunking_limits = try config.chunking_limits.environment(allocator);
+        try config.request_limits.validate();
         if (config.http_max_connections == 0 or config.http_max_request_tasks == 0 or config.http_max_body_bytes == 0)
             return error.InvalidHttpTransportCapacity;
         if (config.kernel_jit.profile_capture_only) {
@@ -4167,7 +4185,7 @@ pub const Node = struct {
             .tabular_registry = tabular_mod.registry.Registry.init(allocator),
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
-            .inference_admission = inference_admission_mod.InferenceAdmission.init(config.max_concurrent_requests),
+            .inference_admission = inference_admission_mod.InferenceAdmission.initWithLimits(config.max_concurrent_requests, config.max_work_units orelse config.max_concurrent_requests),
             .transcription_sessions = transcription_sessions.Registry.init(allocator),
             .compatibility_cache = .empty,
             .hard_cancellation_watchdog = hard_cancellation_watchdog,
@@ -4212,8 +4230,8 @@ pub const Node = struct {
         self: *const Node,
         backend: runtime.tier.memory.BackendClass,
     ) runtime.tier.memory.Limits {
-        return runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
-            backend,
+        return backends_mod.defaultMemoryLimits(
+            if (backend == .gpu and backends_mod.cudaDeviceMemoryBytes(.cuda) != 0) .cuda else if (backend == .gpu) .metal else .native,
             self.config.process_memory_limit_bytes,
         );
     }
@@ -4278,6 +4296,8 @@ pub const Node = struct {
         self.document_artifacts.deinit(self.allocator);
         self.model_manager.setHostCacheReclaimer(null);
         self.media_index_cache.deinit();
+        self.speaker_flights.deinit(self.allocator);
+        self.speaker_revision_cache.deinit(self.allocator);
         // Sessions hold only PCM buffers; drop them before any runtime teardown.
         self.transcription_sessions.deinit();
         var silero_it = self.silero_weights.iterator();
@@ -4287,13 +4307,7 @@ pub const Node = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.silero_weights.deinit(self.allocator);
-        var speaker_it = self.speaker_embedders.iterator();
-        while (speaker_it.next()) |entry| {
-            entry.value_ptr.*.deinit();
-            self.allocator.destroy(entry.value_ptr.*);
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.speaker_embedders.deinit(self.allocator);
+        self.speaker_models.deinit(self.allocator);
         // The refresher borrows Node, its allocator, and the models directory.
         // Cancel and join it before releasing any of those dependencies.
         if (self.readiness_refresh_io) |io| {
@@ -7367,7 +7381,7 @@ pub const Node = struct {
             total_bytes = std.math.add(usize, total_bytes, shapes[i].bytes) catch return error.InferenceEncodedBytesExceeded;
             total_pixels = std.math.add(u64, total_pixels, shapes[i].pixels) catch return error.InferenceDecodedPixelsExceeded;
         }
-        try validateInferenceExecutorInvocation(contract, .{ .item_count = count, .encoded_media_bytes = if (raw) 0 else total_bytes, .decoded_pixels = total_pixels, .media_parts_per_item = 1, .has_image = true });
+        try validateInferenceExecutorInvocation(contract, .{ .internal_microbatch = true, .item_count = count, .encoded_media_bytes = if (raw) 0 else total_bytes, .decoded_pixels = total_pixels, .media_parts_per_item = 1, .has_image = true });
         const Probe = struct {
             fn canceled(ptr: *const anyopaque) bool {
                 const c: *const InferenceExecutionControl = @ptrCast(@alignCast(ptr));
@@ -8163,6 +8177,26 @@ pub const Node = struct {
         io: std.Io,
         control: InferenceExecutionControl,
 
+        /// The epoch backend carries no request control, so its per-layer
+        /// vision checks never fire. A page encoding alone checks its own
+        /// deadline at each command-buffer boundary and then frees the gate.
+        fn pageBackend(request: *const @This()) ops.ComputeBackend {
+            var cb = request.ctx.cb.?;
+            cb.execution_control = request.control;
+            return cb;
+        }
+
+        /// Conservative epochs have no vision broker. Encode one page under
+        /// the step lock, exactly as generation does without a hook.
+        fn encodeSerial(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            try request.control.check();
+            try request.ctx.lockStep(request.control);
+            defer request.ctx.unlockStep();
+            var cb = request.pageBackend();
+            return qwen3vl_projector.encodeProjectedImagesResident(&cb, allocator, request.ctx.cfg, images, limits);
+        }
+
         fn encodeCpuPrepared(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, original_limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
             const request: *@This() = @ptrCast(@alignCast(raw));
             try request.control.check();
@@ -8173,7 +8207,8 @@ pub const Node = struct {
             if (images.len != 1) {
                 try ctx.lockStep(request.control);
                 defer ctx.unlockStep();
-                return qwen3vl_projector.encodeProjectedImagesResident(&ctx.cb.?, allocator, ctx.cfg, images, limits);
+                var cb = request.pageBackend();
+                return qwen3vl_projector.encodeProjectedImagesResident(&cb, allocator, ctx.cfg, images, limits);
             }
             const started = platform.time.monotonicNs();
             var prepared = try qwen3vl_projector.prepareProjectedImageResident(allocator, ctx.cfg, images[0], limits, request.control.imageWorkControl());
@@ -8205,12 +8240,13 @@ pub const Node = struct {
             defer ctx.unlockStep();
             ctx.cpu_preprocess_items += 1;
             ctx.cpu_preprocess_ns +|= elapsed;
+            var cb = request.pageBackend();
             if (ctx.features.device_vision_features) {
-                const result = try qwen3vl_projector.encodePreparedProjectedImagesDeviceBatched(&ctx.cb.?, allocator, ctx.cfg, &.{&prepared}, limits);
+                const result = try qwen3vl_projector.encodePreparedProjectedImagesDeviceBatched(&cb, allocator, ctx.cfg, &.{&prepared}, limits);
                 defer allocator.free(result);
                 return result[0];
             }
-            return qwen3vl_projector.encodePreparedProjectedImageResident(&ctx.cb.?, allocator, ctx.cfg, &prepared, limits);
+            return qwen3vl_projector.encodePreparedProjectedImageResident(&cb, allocator, ctx.cfg, &prepared, limits);
         }
 
         fn encode(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
@@ -8227,7 +8263,8 @@ pub const Node = struct {
             if (geometry == 0) {
                 try ctx.lockStep(request.control);
                 defer ctx.unlockStep();
-                return qwen3vl_projector.encodeProjectedImagesResident(&ctx.cb.?, allocator, ctx.cfg, images, limits);
+                var cb = request.pageBackend();
+                return qwen3vl_projector.encodeProjectedImagesResident(&cb, allocator, ctx.cfg, images, limits);
             }
             const Cancel = struct {
                 fn check(ptr: *const anyopaque) bool {
@@ -8466,6 +8503,7 @@ pub const Node = struct {
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend);
         const messages = [_]generation.Message{.{ .role = "user", .content = prompt, .image_bytes = &.{image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = prompt } } }};
         const estimate = try countPromptTokens(a, model_path, model, cfg, &messages, max_tokens, false, false);
+        try validateMeasuredReadPrompt(try resolvedInferenceExecutorContract(self, "read", &model.manifest), estimate.token_count, @intCast(max_tokens));
         const limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(model.session, self.defaultGenerationLimits(.gpu)));
         var local_budget = runtime.tier.memory.RunBudget.init(limits);
         const components = [_]runtime.tier.memory.GptGenerationBudgetComponent{.{ .backend = backend, .kv_dtype = kv_dtype, .config = cfg, .workspace_capacity = model.session.generationWorkspaceCapacity() }};
@@ -8499,6 +8537,20 @@ pub const Node = struct {
         if (image.len > @min(readInlineSourceByteCap(self), contract.batch.max_encoded_media_bytes) or
             (try measureExecutorDecodedImages(&model.manifest, &.{image})) > (contract.batch.max_decoded_pixels orelse std.math.maxInt(u64)))
             return error.MicrobatchResourceLimitExceeded;
+        // Admission below waits for peers to retire, but this page's own
+        // shared peaks stay leased while it waits. Reject a plan that cannot
+        // fit even alone instead of returning retryable capacity errors.
+        const solo = try features.soloPagePlan(
+            amounts,
+            try std.math.add(usize, if (share_vision_peak) shared_vision_bytes else 0, memory.decoder_backend_peak),
+            if (share_vision_peak) shared_vision_host_bytes else 0,
+        );
+        if (!(solo.fitsLimits(limits) catch false)) {
+            std.log.warn("LightOnOCR3 read page exceeds the generation budget even when admitted alone scratch_bytes={d} scratch_limit_bytes={d}; raise --scratch-budget-mb or the other generation budgets", .{
+                solo.host_scratch_bytes +| solo.backend_scratch_bytes, limits.scratch_limit_bytes,
+            });
+            return error.ResourceLimitExceeded;
+        }
         const extended_epoch = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_EXTENDED_EPOCH");
         // Refill completed slots in the same resident epoch. The simultaneous
         // window and every GPU forward retain their existing independent caps.
@@ -8625,7 +8677,7 @@ pub const Node = struct {
         var vision_request = LightOnVisionRequest{ .ctx = ctx, .io = page_io, .control = control };
         var pipeline = generation.NativeGenerationPipeline{
             .qwen_prefill_batch = if (ctx.features.prefill_batch or ctx.features.packed_mixed) .{ .ptr = &vision_request, .run_fn = batchLightOnPreparedPrefill } else null,
-            .qwen_vision_batch = if (ctx.features.cpu_preprocess) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encodeCpuPrepared } else if (vision_batch_enabled) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encode } else null,
+            .qwen_vision_batch = if (ctx.features.cpu_preprocess) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encodeCpuPrepared } else if (vision_batch_enabled) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encode } else .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encodeSerial },
             .allocator = a,
             .io = page_io,
             .cb = ctx.cb.?,
@@ -8934,6 +8986,7 @@ pub const Node = struct {
             const payload = item.payloadAs(LightOnReadPayload);
             const messages = [_]generation.Message{.{ .role = "user", .content = payload.prompt, .image_bytes = &.{payload.image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = payload.prompt } } }};
             const estimate = try countPromptTokens(allocator, payload.model_path, model, cfg, &messages, payload.max_tokens, false, false);
+            try validateMeasuredReadPrompt(try resolvedInferenceExecutorContract(self, "read", &model.manifest), estimate.token_count, @intCast(payload.max_tokens));
             // countPromptTokens owns no retained encode; it only returns shape.
             const components = [_]runtime.tier.memory.GptGenerationBudgetComponent{.{ .backend = backend, .kv_dtype = kv_dtype, .config = cfg, .workspace_capacity = model.session.generationWorkspaceCapacity() }};
             // One execution lock owns CUDA decoder scratch. Choose each
@@ -9026,7 +9079,9 @@ pub const Node = struct {
         allow_incomplete: bool,
     ) ![]Qwen3VlReadResult {
         try control.update(.loading_model, 0, 1);
-        const max_tokens: i32 = @intCast(requested_max_tokens orelse default_read_admission_max_tokens);
+        const contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "read");
+        const max_tokens: i32 = @intCast(boundedReadOutputTokens(requested_max_tokens, default_read_admission_max_tokens, contract.batch.max_output_tokens_per_item));
+        try validateInferenceExecutorInvocation(contract, .{ .item_count = image_datas.len, .output_tokens_per_item = @intCast(max_tokens), .has_image = true });
         // Keep one handle alive across the serial batch so another request
         // cannot evict the resident decoder/projector between page images.
         // generateMessagesDirectPrepared acquires a short-lived execution
@@ -9409,8 +9464,8 @@ pub const Node = struct {
             defer manifest.deinit();
             if (isGenerativeReadModel(&manifest)) {
                 const prompt = try resolveGenerativeReadPrompt(&manifest, request.prompt);
-                const output_tokens = max_tokens orelse default_read_admission_max_tokens;
                 const contract = try resolvedInferenceExecutorContract(self, "read", &manifest);
+                const output_tokens = boundedReadOutputTokens(max_tokens, default_read_admission_max_tokens, contract.batch.max_output_tokens_per_item);
                 const image_datas = try allocator.alloc([]const u8, request.images.len);
                 defer allocator.free(image_datas);
                 for (request.images, 0..) |image, index| {
@@ -9513,6 +9568,20 @@ pub const Node = struct {
         defer broker_fence.deinit();
         const broker_manifest = broker_fence.manifest();
         const broker_contract = try resolvedInferenceExecutorContract(self, "read", broker_manifest);
+        var request_bytes: usize = 0;
+        var request_pixels: u64 = 0;
+        for (request.images) |image| {
+            request_bytes = std.math.add(usize, request_bytes, image.bytes.len) catch return error.InferenceEncodedBytesExceeded;
+            request_pixels = std.math.add(u64, request_pixels, try measureExecutorDecodedImages(broker_manifest, &.{image.bytes})) catch return error.InferenceDecodedPixelsExceeded;
+        }
+        try validateInferenceExecutorInvocation(broker_contract, .{
+            .item_count = request.images.len,
+            .decoded_pixels = request_pixels,
+            .output_tokens_per_item = max_tokens orelse 0,
+            .media_parts_per_item = 1,
+            .has_image = true,
+            .encoded_media_bytes = request_bytes,
+        });
         if (broker_contract.batch.mode != .native or broker_contract.batch.max_items <= 1)
             return null;
 
@@ -9773,6 +9842,15 @@ pub const Node = struct {
         var broker_fence = acquired_fence;
         defer broker_fence.deinit();
         const broker_contract = try resolvedInferenceExecutorContract(self, "read", broker_fence.manifest());
+        var request_pixels: u64 = 0;
+        for (request.images) |image| request_pixels = std.math.add(u64, request_pixels, try image.pixels()) catch return error.InferenceDecodedPixelsExceeded;
+        try validateInferenceExecutorInvocation(broker_contract, .{
+            .item_count = request.images.len,
+            .decoded_pixels = request_pixels,
+            .output_tokens_per_item = max_tokens orelse 0,
+            .media_parts_per_item = 1,
+            .has_image = true,
+        });
         if (!broker_contract.accepts_borrowed_rasters or
             broker_contract.batch.mode != .native or
             broker_contract.batch.max_items <= 1)
@@ -10202,7 +10280,7 @@ pub const Node = struct {
         model_path: []const u8,
         rasters: []const readers_api.RasterImage,
         prompt: ?[]const u8,
-        max_tokens: ?usize,
+        requested_max_tokens: ?usize,
         source_fingerprint: ?[]const u8,
         execution_fence: ?*const readers_mod.ExecutionFence,
         result_allocators: ?[]const std.mem.Allocator,
@@ -10221,6 +10299,7 @@ pub const Node = struct {
             break :blk &owned_admission_manifest.?;
         };
         const executor_contract = try resolvedInferenceExecutorContract(self, "read", admission_manifest);
+        var max_tokens = requested_max_tokens;
         if (!executor_contract.accepts_borrowed_rasters)
             return error.BorrowedRasterUnsupported;
         const normalized_prompt = normalizeReadPrompt(prompt);
@@ -10231,6 +10310,7 @@ pub const Node = struct {
                 return error.InferenceDecodedPixelsExceeded;
         }
         try validateInferenceExecutorInvocation(executor_contract, .{
+            .internal_microbatch = execution_fence != null,
             .item_count = rasters.len,
             .text_bytes_per_item = if (normalized_prompt) |value| value.len else 0,
             .output_tokens_per_item = max_tokens orelse 0,
@@ -10254,12 +10334,14 @@ pub const Node = struct {
             );
         defer reader.deinit();
         try control.check();
+        max_tokens = try reader.resolveMaxTokens(requested_max_tokens, executor_contract.batch.max_output_tokens_per_item);
         const exact_prompt_tokens = try reader.inputTokenCount(.{
             .prompt = normalized_prompt,
             .max_tokens = max_tokens,
             .source_fingerprint = source_fingerprint,
         });
         try validateInferenceExecutorInvocation(executor_contract, .{
+            .internal_microbatch = execution_fence != null,
             .item_count = rasters.len,
             .text_bytes_per_item = if (normalized_prompt) |value| value.len else 0,
             .input_tokens_per_item = exact_prompt_tokens,
@@ -10336,7 +10418,7 @@ pub const Node = struct {
         image_datas: []const []const u8,
         encoded_images: ?[]const readers_api.EncodedImage,
         prompt: ?[]const u8,
-        max_tokens: ?usize,
+        requested_max_tokens: ?usize,
         source_fingerprint: ?[]const u8,
         execution_fence: ?*const readers_mod.ExecutionFence,
         result_allocators: ?[]const std.mem.Allocator,
@@ -10355,6 +10437,7 @@ pub const Node = struct {
             break :blk &owned_admission_manifest.?;
         };
         const executor_contract = try resolvedInferenceExecutorContract(self, "read", admission_manifest);
+        var max_tokens = requested_max_tokens;
         const normalized_prompt = normalizeReadPrompt(prompt);
         var encoded_media_bytes: usize = 0;
         for (image_datas, 0..) |image_data, index| {
@@ -10364,6 +10447,7 @@ pub const Node = struct {
         }
         const decoded_pixels = try measureExecutorDecodedImages(admission_manifest, image_datas);
         try validateInferenceExecutorInvocation(executor_contract, .{
+            .internal_microbatch = execution_fence != null,
             .item_count = image_datas.len,
             .text_bytes_per_item = if (normalized_prompt) |value| value.len else 0,
             .output_tokens_per_item = max_tokens orelse 0,
@@ -10385,12 +10469,14 @@ pub const Node = struct {
             );
         defer reader.deinit();
         try control.check();
+        max_tokens = try reader.resolveMaxTokens(requested_max_tokens, executor_contract.batch.max_output_tokens_per_item);
         const exact_prompt_tokens = try reader.inputTokenCount(.{
             .prompt = normalized_prompt,
             .max_tokens = max_tokens,
             .source_fingerprint = source_fingerprint,
         });
         try validateInferenceExecutorInvocation(executor_contract, .{
+            .internal_microbatch = execution_fence != null,
             .item_count = image_datas.len,
             .text_bytes_per_item = if (normalized_prompt) |value| value.len else 0,
             .input_tokens_per_item = exact_prompt_tokens,
@@ -10621,6 +10707,7 @@ pub const Node = struct {
             model.getTokenizer(),
             .{
                 .max_length = @intCast(whisper_config.max_target_positions),
+                .max_output_tokens = (try resolvedInferenceExecutorContract(self, "transcribe", &model.manifest)).batch.max_output_tokens_per_item,
                 .decoder_start_token_id = whisper_config.decoder_start_token_id,
                 .vocab_size = whisper_config.vocab_size,
                 .eos_token_id = whisper_config.eos_token_id,
@@ -10668,34 +10755,44 @@ pub const Node = struct {
         return error.SpeakerModelUnavailable;
     }
 
-    /// The loaded default speaker model, shared across requests. The graph
-    /// import takes seconds, so it runs outside the map lock; a concurrent
-    /// first request may import twice and the later copy is dropped.
-    fn speakerEmbedder(self: *Node) !*speaker_embedding_mod.Embedder {
-        const model_path = try self.resolveSpeakerModelPath();
-        defer self.allocator.free(model_path);
-        {
-            spinLock(&self.speaker_embedders_lock);
-            defer self.speaker_embedders_lock.unlock();
-            if (self.speaker_embedders.get(model_path)) |embedder| return embedder;
+    fn resolveChunkSpeakerPath(self: *Node, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        const ref = try registry_mod.ModelRef.parse(name);
+        if (!std.mem.endsWith(u8, ref.variant, ".onnx")) return error.UnsupportedSpeakerModel;
+        const dir = try registry_mod.modelInstallDirAlloc(a, self.config.models_dir, ref);
+        defer a.free(dir);
+        const path = try std.fs.path.join(a, &.{ dir, ref.variant });
+        if (dirExists(path)) return path;
+        a.free(path);
+        const fallback = try std.fs.path.join(a, &.{ self.config.models_dir, ref.owner, ref.name, ref.variant });
+        if (dirExists(fallback)) return fallback;
+        a.free(fallback);
+        return error.SpeakerModelUnavailable;
+    }
+    fn chunkSpeakerRevision(self: *Node, path: []const u8, io: std.Io, control: InferenceExecutionControl) ![64]u8 {
+        return self.speaker_revision_cache.get(self.allocator, path, io, control);
+    }
+    fn pinnedSpeakerEmbedder(self: *Node, a: std.mem.Allocator, path: []const u8, revision: [64]u8, io: std.Io, control: InferenceExecutionControl) !@import("../pipelines/speaker_model_cache.zig").Cache.Lease {
+        const key = try std.fmt.allocPrint(a, "{s}:{s}", .{ path, revision });
+        defer a.free(key);
+        if (!std.mem.eql(u8, &revision, &try self.chunkSpeakerRevision(path, io, control))) return error.ModelConfigurationChanged;
+        const lease = try self.speaker_models.acquire(self.allocator, path, key, control);
+        errdefer lease.deinit();
+        const after = self.chunkSpeakerRevision(path, io, control) catch |err| {
+            lease.verificationFailed(err);
+            return err;
+        };
+        if (!std.mem.eql(u8, &revision, &after)) {
+            lease.retire();
+            return error.ModelConfigurationChanged;
         }
-        var loaded = try speaker_embedding_mod.Embedder.load(self.allocator, model_path);
-        errdefer loaded.deinit();
-        const owned = try self.allocator.create(speaker_embedding_mod.Embedder);
-        errdefer self.allocator.destroy(owned);
-        owned.* = loaded;
-        const key = try self.allocator.dupe(u8, model_path);
-        errdefer self.allocator.free(key);
-        spinLock(&self.speaker_embedders_lock);
-        defer self.speaker_embedders_lock.unlock();
-        if (self.speaker_embedders.get(model_path)) |existing| {
-            self.allocator.free(key);
-            owned.deinit();
-            self.allocator.destroy(owned);
-            return existing;
-        }
-        try self.speaker_embedders.put(self.allocator, key, owned);
-        return owned;
+        return lease;
+    }
+    fn speakerEmbedder(self: *Node, control: InferenceExecutionControl) !@import("../pipelines/speaker_model_cache.zig").Cache.Lease {
+        const path = try self.resolveSpeakerModelPath();
+        defer self.allocator.free(path);
+        const io = control.io orelse std.Options.debug_io;
+        const revision = try self.chunkSpeakerRevision(path, io, control);
+        return self.pinnedSpeakerEmbedder(self.allocator, path, revision, io, control);
     }
 
     /// Local diarization: replaces the phrases of `result` with
@@ -10711,7 +10808,9 @@ pub const Node = struct {
         control: ?InferenceExecutionControl,
     ) !void {
         if (result.segments.len == 0) return;
-        const embedder = try self.speakerEmbedder();
+        const speaker_lease = try self.speakerEmbedder(control orelse .{});
+        defer speaker_lease.deinit();
+        const embedder = speaker_lease.model();
         const pcm = try audio_mod.copyOrResample(allocator, samples, sample_rate, speaker_embedding_mod.sample_rate);
         defer allocator.free(pcm);
         const labelled = try speaker_embedding_mod.diarizeSegmentsAlloc(allocator, embedder, pcm, result.segments, .{}, control);
@@ -11286,13 +11385,13 @@ pub const Node = struct {
         } else 0;
         const execution_mutex = loaded.targetInferenceExecutionMutex();
         const effective = control orelse InferenceExecutionControl{};
-        // A waiting CUDA boundary request cannot use the session workspace
+        // A waiting GPU boundary request cannot use the session workspace
         // yet. Admit its device ceiling only when it reaches the front of the
         // model queue; otherwise concurrent waiters reserve duplicate device
         // capacity and fail before the already-serialized execution can drain.
         // This is distinct from the execution/provider lock: admission may
         // evict other models and must remain outside those locks.
-        const admission_mutex = if (backend == .cuda) &loaded.gliner_boundary_admission_lock else null;
+        const admission_mutex = if (backend == .cuda or backend == .metal) &loaded.gliner_boundary_admission_lock else null;
         if (admission_mutex) |mutex| try effective.lock(mutex);
         defer if (admission_mutex) |mutex| mutex.unlock();
         while (true) {
@@ -11414,16 +11513,22 @@ pub const Node = struct {
         // Reject an unmeasured backend or request cardinality before parsing
         // model inputs. Sequence geometry is checked again after exact planning.
         if (qualified_identity) |identity|
-            try gliner_decide_qualification.requireRequestIdentity(identity, qualified_backend, request.items.len, 1, 1);
+            try gliner_decide_qualification.requireRequestIdentity(identity, qualified_backend, request.items.len, request.items.len, 1);
         const session_config = try session_factory.getGlinerSpanConfig(loaded.session);
         const config: span_v2_executor.EncoderConfig = switch (session_config) {
             .deberta => |value| .{ .deberta = value },
             .modern_bert => |value| .{ .modern_bert = value },
         };
-        if (!spanV2BackendSupported(config, backend)) return error.UnsupportedExtractionBackend;
+        if (!spanV2BackendSupported(config, backend, qualified_variant)) return error.UnsupportedExtractionBackend;
         // The executor's generic DeBERTa default is 512. An exact qualified
         // identity supplies its own measured ceiling. FP32 and Q8 evidence
         // independently cover the 1B's 1024-token budget.
+        if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
+            options.classification_batch_items = gliner_decide_qualification.cuda_batch_items;
+            options.max_sequences_per_item = 1;
+        } else if (backend == .metal and qualified_variant == .decide_deberta) {
+            options.classification_batch_items = gliner_decide_qualification.metal_batch_items;
+        }
         const requested_sequence = if (qualified_variant == .decide_1b) (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?.sequence_tokens else options.processor.max_sequence_tokens;
         const max_sequence = span_v2_executor.sequenceTokenCeiling(config, requested_sequence, backend == .cuda);
         options.processor.max_sequence_tokens = max_sequence;
@@ -11465,13 +11570,20 @@ pub const Node = struct {
         failure.* = .{ .stage = "model" };
         observer.emit(.{ .phase = .model });
 
+        // GPU batches reserve their complete physical workspace only at the
+        // front of the model lane. Concurrent waiters retain bounded host state,
+        // without each reserving another batch's otherwise serialized workspace.
+        const admission_mutex = if (backend == .cuda or backend == .metal) &loaded.gliner_boundary_admission_lock else null;
+        if (admission_mutex) |mutex| try (control orelse InferenceExecutionControl{}).lock(mutex);
+        defer if (admission_mutex) |mutex| mutex.unlock();
+
         // Metal work is admitted like the boundary route: a GPU run budget
         // and a process-wide backend-scratch lease, acquired before the
         // execution lock because admission can evict other models.
         var device_lease: ?runtime.tier.memory.AdmissionLease = null;
         defer if (device_lease) |*owned| owned.release();
         if (backend == .metal or backend == .cuda) {
-            const device_bytes = try span_v2_executor.deviceScratchUpperBound(config, longest);
+            const device_bytes = try std.math.mul(usize, try span_v2_executor.deviceScratchUpperBound(config, longest), span_v2_executor.classificationBatchItems(request, &request_plan, options));
             const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                 self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu)),
                 self.config.generation_budget_overrides.scratch_limit_bytes,
@@ -11643,7 +11755,8 @@ pub const Node = struct {
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
             .reader_resolver = &self.extraction_reader_resolver,
-            .reader_admission = .{ .ptr = &reader_admission, .validate = ExtractionReaderAdmission.validate },
+            .reader_admission = .{ .ptr = &reader_admission, .resolve_limits = ExtractionReaderAdmission.resolveLimits },
+            .reader_request_limits = self.config.request_limits,
             .gliner_pipeline_factory = .{ .ptr = self, .create = createGlinerPipeline },
             .execution_control = execution_control,
         };
@@ -13325,14 +13438,14 @@ pub const Node = struct {
         const consumers: *MediaOutputExecution = @ptrCast(@alignCast(request.output_executor.?.context));
         const index = try consumers.boundaryIndex();
         const resolved = consumers.resolved[index];
-        const identity = try std.fmt.allocPrint(a, "antfly-transcriber-boundary-v1:{s}:whisper-30s", .{resolved.identity});
+        const identity = if (consumers.config.targets[index].kind == .diarize) try std.fmt.allocPrint(a, "antfly-speaker-boundary-v1:{s}:30s", .{resolved.identity}) else try std.fmt.allocPrint(a, "antfly-transcriber-boundary-v1:{s}:whisper-30s", .{resolved.identity});
         defer a.free(identity);
         const Planner = struct {
             fn describe(raw: *anyopaque) chunks.EmbeddingContext {
                 const active: *MediaOutputExecution = @ptrCast(@alignCast(raw));
                 const boundary_index = active.boundaryIndex() catch unreachable;
                 const target_config = active.config.targets[boundary_index];
-                return .{ .model = target_config.model, .model_identity = active.resolved[boundary_index].identity, .model_revision = active.resolved[boundary_index].revision, .task_type = "TRANSCRIBE" };
+                return .{ .model = target_config.model, .model_identity = active.resolved[boundary_index].identity, .model_revision = active.resolved[boundary_index].revision, .task_type = if (target_config.kind == .diarize) "DIARIZE" else "TRANSCRIBE" };
             }
             fn count(_: *anyopaque, _: []const u8) anyerror!usize {
                 return error.UnsupportedChunkMediaType;
@@ -13396,7 +13509,7 @@ pub const Node = struct {
 
     fn chunkAndEmbedAdmitted(self: *Node, a: std.mem.Allocator, io: std.Io, supplied: InferenceExecutionControl, supplied_request: @import("../pipelines/media_chunking.zig").Request, target: @import("chunk_response.zig").Target, sink: @import("../pipelines/media_chunking.zig").Sink) anyerror!@import("chunk_response.zig").Execution {
         var request = supplied_request;
-        if (request.native_source != null) self.model_manager.setHostCacheReclaimer(.{ .context = &self.media_index_cache, .reclaim = @import("../pipelines/media_index_cache.zig").Cache.reclaim });
+        self.model_manager.setHostCacheReclaimer(.{ .context = &self.media_index_cache, .reclaim = @import("../pipelines/media_index_cache.zig").Cache.reclaim });
         const IndexAdmission = struct {
             fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
                 const manager: *model_manager_mod.ModelManager = @ptrCast(@alignCast(raw));
@@ -13411,7 +13524,14 @@ pub const Node = struct {
             defer consumers.deinit(a);
             request.output_executor = .{ .context = &consumers, .execute = MediaOutputExecution.execute };
             const boundary = try outputs_config.boundary();
-            request.transcribe_boundary = boundary.kind == .transcribe;
+            request.transcribe_boundary = boundary.kind == .transcribe or boundary.kind == .diarize;
+            if (request.policy.audio_speaker_turns and !boundary.hasDiarization()) return error.InvalidChunkPolicy;
+            for (outputs_config.targets) |output| if (output.kind == .embedding and output.diarization != null and (!request.policy.audio_speaker_turns or !std.mem.eql(u8, output.name, boundary.name))) return error.InvalidChunkOutputs;
+            consumers.speaker_turns = request.policy.audio_speaker_turns;
+            consumers.speaker_outputs = request.execute_outputs;
+            var needs_speakers = request.policy.audio_speaker_turns;
+            for (outputs_config.targets) |output| needs_speakers = needs_speakers or (output.execute and output.hasDiarization());
+            if ((needs_speakers and request.execute_outputs) or request.policy.audio_speaker_turns) request.speaker_analysis = .{ .context = &consumers, .prepare = MediaOutputExecution.prepareSpeakers, .ensure = MediaOutputExecution.ensureSpeakers, .samples = MediaOutputExecution.speakerSamples, .checkpoint = MediaOutputExecution.checkpointSpeakers, .close = MediaOutputExecution.closeSpeakers, .boundary = if (request.policy.audio_speaker_turns) MediaOutputExecution.speakerBoundary else null, .recipe_id = if (request.policy.audio_speaker_turns) &consumers.resolved[try consumers.boundaryIndex()].recipe_id else null };
             request.audio_boundary = request.transcribe_boundary or consumers.resolved[try consumers.boundaryIndex()].uses_audio;
             for (consumers.resolved[0..consumers.initialized]) |value| if (value.uses_audio and value.failure == null) {
                 request.needs_audio = true;
@@ -13419,7 +13539,7 @@ pub const Node = struct {
             };
 
             if (request.transcribe_boundary or !boundary.execute) request.execute = false;
-            return self.chunkAndEmbedAdmitted(a, io, supplied, request, .{ .model = boundary.model, .model_identity = boundary.model_identity, .task_type = if (boundary.kind == .transcribe) "TRANSCRIBE" else boundary.task_type, .dimensions = boundary.dimensions }, sink);
+            return self.chunkAndEmbedAdmitted(a, io, supplied, request, .{ .model = boundary.model, .model_identity = boundary.model_identity, .task_type = if (boundary.kind == .diarize) "DIARIZE" else if (boundary.kind == .transcribe) "TRANSCRIBE" else boundary.task_type, .dimensions = boundary.dimensions }, sink);
         };
         inline for (@typeInfo(@import("../pipelines/media_chunk_limits.zig").Limits).@"struct".field_names) |name| @field(request.limits, name) = @min(@field(request.limits, name), @field(self.config.chunking_limits, name));
         request.max_working_bytes = @min(request.max_working_bytes, request.limits.max_working_bytes);
@@ -13590,7 +13710,7 @@ pub const Node = struct {
             }
             return ctx.status(if (err == error.StaleChunkContinuation or err == error.EmbeddingIdentityMismatch or err == error.SourceVersionChanged) @as(u16, 409) else if (err == error.MemoryBudgetExceeded or err == error.ResourceTemporarilyUnavailable) @as(u16, 503) else @as(u16, 400)).json(.{ .@"error" = @errorName(err), .message = "model-aware chunk request could not be initialized" });
         };
-        return results.finish(ctx, try results.response(request, if (boundary) |value| .{ .model = value.model, .task_type = if (value.kind == .transcribe) "TRANSCRIBE" else value.task_type, .dimensions = value.dimensions, .model_identity = value.model_identity } else target, execution));
+        return results.finish(ctx, try results.response(request, if (boundary) |value| .{ .model = value.model, .task_type = if (value.kind == .diarize) "DIARIZE" else if (value.kind == .transcribe) "TRANSCRIBE" else value.task_type, .dimensions = value.dimensions, .model_identity = value.model_identity } else target, execution));
     }
 
     pub fn chunkText(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -17246,6 +17366,8 @@ pub const Node = struct {
         if (body.requests.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "'requests' must not be empty" });
         }
+        self.config.request_limits.validateItemCount(body.requests.len) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
         if (body.requests.len > max_generate_batch_items) {
             return ctx.status(413).json(.{
                 .@"error" = "BATCH_TOO_LARGE",
@@ -20669,10 +20791,10 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "every framed attachment must be referenced exactly once",
             });
-        const max_tokens = validateReadMaxTokens(body.max_tokens) catch
+        var max_tokens = validateReadMaxTokens(body.max_tokens) catch
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
-                .message = "'max_tokens' must be between 1 and 1024",
+                .message = "'max_tokens' must be between 1 and 8192",
             });
         const inline_source_cap = readInlineSourceByteCap(self);
         var inline_source_bytes: usize = 0;
@@ -20933,6 +21055,8 @@ pub const Node = struct {
         };
         defer reader.deinit();
 
+        max_tokens = reader.resolveMaxTokens(max_tokens, executor_contract.batch.max_output_tokens_per_item) catch |err|
+            return inferenceFailureResponse(ctx, err);
         const exact_prompt_tokens = reader.inputTokenCount(.{
             .prompt = normalizeReadPrompt(body.prompt),
             .max_tokens = max_tokens,
@@ -21202,6 +21326,7 @@ pub const Node = struct {
             error.UnsupportedAudioFormat => return unsupportedAudioResponse(ctx, "unsupported audio input"),
             error.OutOfMemory => return err,
             error.Timeout, error.Cancelled, error.Canceled => return inferenceFailureResponse(ctx, err),
+            error.InferenceOutputTokensExceeded => return inferenceExecutorContractFailureResponse(ctx, err),
             else => if (isTransientInferenceCapacityError(err))
                 return modelResourceBusyResponse(ctx)
             else
@@ -21307,6 +21432,7 @@ pub const Node = struct {
                 self.tokenizer,
                 .{
                     .max_length = self.decoder_config.max_length,
+                    .max_output_tokens = (try resolvedInferenceExecutorContract(self.node, "transcribe", &self.manifest.?)).batch.max_output_tokens_per_item,
                     .decoder_start_token_id = self.decoder_config.decoder_start_token_id,
                     .vocab_size = self.decoder_config.vocab_size,
                     .eos_token_id = self.decoder_config.eos_token_id,
@@ -21717,6 +21843,7 @@ pub const Node = struct {
                 error.UnsupportedAudioFormat => return unsupportedAudioResponse(ctx, "unsupported audio input"),
                 error.OutOfMemory => return err,
                 error.Timeout, error.Cancelled, error.Canceled => return inferenceFailureResponse(ctx, err),
+                error.InferenceOutputTokensExceeded => return inferenceExecutorContractFailureResponse(ctx, err),
                 else => if (isTransientInferenceCapacityError(err))
                     return modelResourceBusyResponse(ctx)
                 else
@@ -22329,6 +22456,7 @@ pub const Node = struct {
         entry.session.process(&pipeline, &events, commit) catch |err| switch (err) {
             error.OutOfMemory => return err,
             error.Timeout, error.Cancelled, error.Canceled => return inferenceFailureResponse(ctx, err),
+            error.InferenceOutputTokensExceeded => return inferenceExecutorContractFailureResponse(ctx, err),
             else => if (isTransientInferenceCapacityError(err))
                 return modelResourceBusyResponse(ctx)
             else
@@ -22657,7 +22785,7 @@ pub const Node = struct {
             };
         } else if (!commit) return true;
         entry.session.process(pipeline, events, commit) catch |err| {
-            writeSessionStreamError(writer, payload, session_id, if (isTransientInferenceCapacityError(err)) "MODEL_RESOURCE_BUSY" else "INFERENCE_FAILED", @errorName(err));
+            writeSessionStreamError(writer, payload, session_id, if (isInferenceExecutorContractError(err)) generateExecutorContractError(err).batch.code else if (isTransientInferenceCapacityError(err)) "MODEL_RESOURCE_BUSY" else "INFERENCE_FAILED", @errorName(err));
             return false;
         };
         if (events.items.len == 0) return !ctx.isCancellationRequested();
@@ -23616,11 +23744,13 @@ pub const Node = struct {
         var retained = ParsedDenseEmbedInputs{};
         defer retained.deinit(a);
         var budget = RequestMediaBudget.init(byte_cap);
+        var request_budget: EmbeddingGroupRequestBudget = .{};
         for (raw_groups, groups) |raw, *group| {
             group.* = try parseEmbeddingGroup(self, a, manifest, raw, &retained, &budget, .{ .io = io, .control = control }, &.{});
             try grouped.validateGroup(group.*, options);
-            try validateEmbeddingGroupContract(self, contract, group.*, groups.len, control);
+            try request_budget.add(try validateEmbeddingGroupContract(self, contract, group.*, groups.len, control));
         }
+        try request_budget.validate(contract, groups.len);
         var handle = try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
         const loaded = handle.get();
@@ -23629,7 +23759,9 @@ pub const Node = struct {
         try loaded.verifyEmbeddingIdentityWithControl(control);
         const active_contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
         const active_options = try groupedEmbeddingOptions(&loaded.manifest, active_contract, options);
-        for (groups) |group| try validateEmbeddingGroupContract(self, active_contract, group, groups.len, control);
+        request_budget = .{};
+        for (groups) |group| try request_budget.add(try validateEmbeddingGroupContract(self, active_contract, group, groups.len, control));
+        try request_budget.validate(active_contract, groups.len);
         const vectors = try out.alloc([]f32, groups.len);
         var count: usize = 0;
         errdefer {
@@ -23687,6 +23819,7 @@ pub const Node = struct {
         defer retained.deinit(a);
         var media_budget = RequestMediaBudget.init(byte_cap);
         var errors = std.ArrayListUnmanaged(EmbedItemError).empty;
+        var request_budget: EmbeddingGroupRequestBudget = .{};
         for (raw_groups, 0..) |raw, index| {
             groups[index] = parseEmbeddingGroup(self, a, manifest, raw, &retained, &media_budget, .{ .io = ctx.io, .control = control }, attachments) catch |err| {
                 if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
@@ -23701,13 +23834,16 @@ pub const Node = struct {
                     groups[index] = null;
                     break :preflight;
                 };
-                validateEmbeddingGroupContract(self, contract, groups[index].?, groups.len, control) catch |err| {
+                const shape = validateEmbeddingGroupContract(self, contract, groups[index].?, groups.len, control) catch |err| {
                     if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err) or err == error.ResourceTemporarilyUnavailable or err == error.MemoryBudgetExceeded) return err;
                     try errors.append(a, embedItemFailure(index, err, "input"));
                     groups[index] = null;
+                    break :preflight;
                 };
+                try request_budget.add(shape);
             }
         }
+        try request_budget.validate(contract, raw_groups.len);
         const vectors = try a.alloc(?[]f32, groups.len);
         @memset(vectors, null);
         var input_tokens: usize = 0;
@@ -23726,7 +23862,18 @@ pub const Node = struct {
             .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT),
             .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768,
         });
-        try validateInferenceExecutorInvocation(active_contract, .{ .item_count = raw_groups.len });
+        request_budget = .{};
+        for (groups, 0..) |maybe, index| {
+            const group = maybe orelse continue;
+            const shape = validateEmbeddingGroupContract(self, active_contract, group, groups.len, control) catch |err| {
+                if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
+                try errors.append(a, embedItemFailure(index, err, "embedding"));
+                groups[index] = null;
+                continue;
+            };
+            try request_budget.add(shape);
+        }
+        try request_budget.validate(active_contract, raw_groups.len);
         const compact = try a.alloc(grouped.Group, groups.len);
         var complete = true;
         for (groups, compact) |maybe, *value| {
@@ -23749,10 +23896,7 @@ pub const Node = struct {
         } else {
             for (groups, 0..) |maybe_group, index| {
                 const group = maybe_group orelse continue;
-                const result = group_result: {
-                    validateEmbeddingGroupContract(self, active_contract, group, groups.len, control) catch |err| break :group_result @as(anyerror!grouped.Result, err);
-                    break :group_result grouped.embedCached(a, loaded.session, loaded.getTokenizer(), group, active_options, loaded.embeddingExecutionLock(), control, &frame_cache);
-                } catch |err| {
+                const result = grouped.embedCached(a, loaded.session, loaded.getTokenizer(), group, active_options, loaded.embeddingExecutionLock(), control, &frame_cache) catch |err| {
                     if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
                     try errors.append(a, embedItemFailure(index, err, "embedding"));
                     continue;
@@ -24352,6 +24496,7 @@ pub const Node = struct {
                         false,
                         "compatible",
                         false,
+                        self.config.request_limits,
                     );
                     try listed_model_names.put(a, name, {});
                     model_count += 1;
@@ -24401,6 +24546,7 @@ pub const Node = struct {
                     chat_template_failed,
                     listing.compatibility_level,
                     std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, entry.path),
+                    self.config.request_limits,
                 );
                 try appendModelMetadata(&body, a, &listing.manifest, task);
                 if (isOpenAiListTask(task)) {
@@ -24459,6 +24605,7 @@ pub const Node = struct {
                     model.chat_template_failed,
                     @tagName(loaded_compatibility.level),
                     std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, listing.canonical_model_dir),
+                    self.config.request_limits,
                 );
                 try appendModelMetadata(&body, a, &model.manifest, task);
                 if (isOpenAiListTask(task)) {
@@ -25771,7 +25918,6 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.UnsupportedClassificationExtraction,
         error.UnsupportedInput,
         error.UnsupportedRelationExtraction,
-        error.UnsupportedGlinerDecisionGeometry,
         error.InvalidMaxTokens,
         => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
         error.GlinerDecisionArtifactMismatch,
@@ -25785,6 +25931,7 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.ConstrainedInputTooLarge,
         error.GeneratedExtractionLimitExceeded,
         error.ReadBatchTooLarge,
+        error.UnsupportedGlinerDecisionGeometry,
         error.InferenceBatchTooLarge,
         error.InferenceMediaPartLimitExceeded,
         error.StreamTooLong,
@@ -25807,6 +25954,7 @@ test {
     _ = @import("gliner_boundary_concurrency_test.zig");
     _ = @import("gliner_boundary_metal_socket_test.zig");
     _ = @import("gliner_family_cuda_socket_test.zig");
+    _ = @import("gliner_family_metal_batch_test.zig");
     _ = @import("gliner_boundary_queued_cancellation_test.zig");
     _ = @import("embed_direct_vs_http_bench_test.zig");
 }
@@ -27212,6 +27360,7 @@ fn appendModelInfo(
     compatibility_level: []const u8,
     /// REBEL emits generic ENTITY nodes and accepts untyped relation names.
     untyped_entities: bool,
+    request_limits: RequestLimits,
 ) !void {
     const inferred_classification = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification") and !model_caps.hasCapability(capabilities, "classification");
     const inferred_zero_shot = zero_shot_classification and !model_caps.hasCapability(capabilities, "zero_shot");
@@ -27350,6 +27499,7 @@ fn appendModelInfo(
         accepts_audio,
         accepts_document,
         accepts_video,
+        request_limits,
     );
     if (chat_template_failed) try buf.appendSlice(allocator, ",\"chat_template\":false");
     if (compatibility_level.len > 0) {
@@ -27494,6 +27644,7 @@ test "REBEL catalog advertises generic entity schema independently of model name
         false,
         "compatible",
         true,
+        .{},
     );
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -27527,6 +27678,7 @@ test "reranker catalog advertises rerank documents" {
         false,
         "compatible",
         false,
+        .{},
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -27557,6 +27709,7 @@ test "fixed chunk catalog advertises its multimodal transport truth" {
         false,
         "compatible",
         false,
+        .{},
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -27588,13 +27741,14 @@ fn appendResolvedInferenceCapabilities(
     accepts_audio: bool,
     accepts_document: bool,
     accepts_video: bool,
+    request_limits: RequestLimits,
 ) !void {
     // Kept in lockstep with antfly inference.work.MimeTypes' bounded native
     // capability representation. The wire catalog may contain any validated
     // essence, but no node may publish more extensions than a peer can retain.
     const resolved_task = normalizedInferenceTask(task) orelse return;
     if (!accepts_text and !accepts_image and !accepts_audio and !accepts_document and !accepts_video) return;
-    const resolved = try resolveInferenceBatchCapabilities(
+    var resolved = request_limits.narrow(try resolveInferenceBatchCapabilities(
         resolved_task,
         manifest_capabilities,
         resolvedExecutorBatchImplementation(resolved_task, executor_kind),
@@ -27603,8 +27757,12 @@ fn appendResolvedInferenceCapabilities(
         accepts_image,
         accepts_audio,
         accepts_document,
-    );
+    ));
 
+    if (request_limits.max_items_per_request) |limit| {
+        resolved.max_items = @min(resolved.max_items, limit);
+        resolved.preferred_items = @min(resolved.preferred_items, resolved.max_items);
+    }
     try buf.appendSlice(allocator, ",\"inference_capabilities\":{\"version\":4,\"task\":");
     try jsonEncodeString(buf, allocator, resolved_task);
     try buf.appendSlice(allocator, ",\"input_modalities\":[");
@@ -28416,6 +28574,7 @@ test "unified multimodal embedding contract admits bounded ordered media parts" 
 /// planner's resource and modality checks.
 const ResolvedInferenceExecutorContract = struct {
     task: []const u8,
+    max_items_per_request: ?usize = null,
     batch: ResolvedInferenceBatchCapabilities,
     accepts_text: bool,
     accepts_image: bool,
@@ -28427,6 +28586,7 @@ const ResolvedInferenceExecutorContract = struct {
 };
 
 const InferenceExecutorInvocationShape = struct {
+    internal_microbatch: bool = false,
     item_count: usize = 1,
     text_bytes_per_item: usize = 0,
     input_tokens_per_item: usize = 0,
@@ -28476,18 +28636,37 @@ fn resolvedInferenceExecutorContract(
         );
     }
     const max_images = if (modalities.image) executorMaxImages(resolved_task) else 0;
+    var implementation = resolvedExecutorBatchImplementation(resolved_task, executor_kind);
+    const cuda_decide_batch = build_options.enable_cuda and node.session_manager.required_backend == .cuda;
+    const metal_decide_batch = build_options.enable_metal and node.session_manager.required_backend == .metal;
+    if ((cuda_decide_batch or metal_decide_batch) and
+        std.mem.eql(u8, resolved_task, "extract") and
+        manifest.gliner_classification_head == .label_marker_mlp and manifest.gliner_span_encoder_family == .deberta)
+    {
+        // Metal preserves the existing public request cardinality and chunks
+        // physical forwards at eight rows. CUDA's qualified request cap is
+        // independently eight. Boundary discovery stays conservative because
+        // its long-document profiles still require one input per request.
+        implementation = .{
+            .mode = .native,
+            .preferred_items = if (metal_decide_batch) gliner_decide_qualification.metal_batch_items else gliner_decide_qualification.cuda_batch_items,
+            .max_items = if (metal_decide_batch) resolvedTaskMaxItems(resolved_task) else gliner_decide_qualification.cuda_batch_items,
+            .per_item_failures = false,
+        };
+    }
     return .{
         .task = resolved_task,
-        .batch = try resolveInferenceBatchCapabilities(
+        .max_items_per_request = node.config.request_limits.max_items_per_request,
+        .batch = node.config.request_limits.narrow(try resolveInferenceBatchCapabilities(
             resolved_task,
             manifest.capabilities,
-            resolvedExecutorBatchImplementation(resolved_task, executor_kind),
+            implementation,
             requestMediaMaxBytes(node),
             if (max_images > 0) requestMediaMaxDecodedPixels(node, max_images) else 0,
             modalities.image,
             modalities.audio,
             false,
-        ),
+        )),
         .accepts_text = modalities.text,
         .accepts_image = modalities.image,
         .accepts_audio = modalities.audio,
@@ -28634,6 +28813,9 @@ fn validateInferenceExecutorInvocation(
     contract: ResolvedInferenceExecutorContract,
     shape: InferenceExecutorInvocationShape,
 ) !void {
+    if (!shape.internal_microbatch) {
+        if (contract.max_items_per_request) |limit| if (shape.item_count > limit) return error.InferenceBatchTooLarge;
+    }
     if (shape.item_count == 0 or shape.item_count > contract.batch.max_items)
         return error.InferenceBatchTooLarge;
     if (shape.has_text and !contract.accepts_text)
@@ -28720,7 +28902,7 @@ const ExtractionReaderAdmission = struct {
     node: *Node,
     allocator: std.mem.Allocator,
 
-    fn validate(ptr: *anyopaque, model_path: []const u8, images: []const []const u8, options: readers_mod.ReadOptions) !void {
+    fn resolveLimits(ptr: *anyopaque, model_path: []const u8, images: []const []const u8, options: readers_mod.ReadOptions) !RequestLimits {
         const self: *ExtractionReaderAdmission = @ptrCast(@alignCast(ptr));
         var manifest = try manifest_mod.loadFromDir(self.allocator, model_path);
         defer manifest.deinit();
@@ -28737,6 +28919,12 @@ const ExtractionReaderAdmission = struct {
             .media_parts_per_item = 1,
             .has_image = true,
         });
+        return .{
+            .max_items_per_request = contract.max_items_per_request,
+            .max_input_tokens_per_item = contract.batch.max_input_tokens_per_item,
+            .max_output_tokens_per_item = contract.batch.max_output_tokens_per_item,
+            .max_decoded_pixels_per_batch = contract.batch.max_decoded_pixels,
+        };
     }
 };
 
@@ -29070,6 +29258,7 @@ test "standalone inference model catalog publishes resolved native reader batchi
         false,
         "compatible",
         false,
+        .{},
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
     defer parsed.deinit();
@@ -29103,7 +29292,6 @@ test "standalone inference model catalog publishes resolved native reader batchi
     try std.testing.expectEqual(@as(i64, 32 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_encoded_media_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, 8 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_decoded_pixels").?.integer);
     const task_limits = resolved.object.get("task_limits").?.object;
-    try std.testing.expectEqual(@as(i64, max_read_tokens), task_limits.get("max_output_tokens_per_item").?.integer);
     try std.testing.expect(task_limits.get("max_candidates_per_request").? == .null);
     const transform = resolved.object.get("image_transform").?.object;
     try std.testing.expectEqual(@as(i64, 768), transform.get("target_width").?.integer);
@@ -29129,6 +29317,7 @@ test "standalone inference catalog validates extensible MIME against executor co
         false,
         false,
         false,
+        .{},
     );
     try body.append(alloc, '}');
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
@@ -29161,6 +29350,7 @@ test "standalone inference catalog validates extensible MIME against executor co
             false,
             false,
             false,
+            .{},
         ),
     );
 
@@ -29319,6 +29509,7 @@ test "normalized inference capabilities cover every model family" {
             false,
             "compatible",
             false,
+            .{},
         );
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
         defer parsed.deinit();
@@ -32965,7 +33156,8 @@ test "read admission units scale with image batch and decode length" {
     try std.testing.expectEqual(@as(usize, 1), estimateReadAdmissionUnits(1, null));
     try std.testing.expectEqual(@as(usize, 4), estimateReadAdmissionUnits(4, null));
     try std.testing.expectEqual(@as(usize, 8), estimateReadAdmissionUnits(4, default_read_admission_max_tokens + 1));
-    try std.testing.expectEqual(@as(usize, 16), estimateReadAdmissionUnits(4, max_read_tokens));
+    try std.testing.expectEqual(@as(usize, 16), estimateReadAdmissionUnits(4, 1024));
+    try std.testing.expectEqual(@as(usize, 128), estimateReadAdmissionUnits(4, 8192));
 }
 
 test "Qwen3-VL read admission includes one serial multimodal generation" {
@@ -33038,16 +33230,16 @@ test "Qwen3-VL direct read rejects insufficient generation capacity before fetch
 }
 
 test "direct extraction validates read max tokens" {
-    var valid = try parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":1024}");
+    var valid = try parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":8192}");
     defer valid.deinit();
-    try std.testing.expectEqual(@as(?usize, max_read_tokens), valid.max_tokens);
+    try std.testing.expectEqual(@as(?usize, 8192), valid.max_tokens);
     try std.testing.expectError(
         error.InvalidMaxTokens,
         parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":-1}"),
     );
     try std.testing.expectError(
         error.InvalidMaxTokens,
-        parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":1025}"),
+        parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":8193}"),
     );
 }
 
@@ -36211,7 +36403,7 @@ test "EmbeddingGemma2 grouped frontend rechecks loaded manifest limits and modal
     const options = try groupedEmbeddingOptions(&manifest, contract, .{});
     try std.testing.expectEqual(@as(usize, 512), options.max_tokens);
     try std.testing.expectEqual(@as(usize, 256), (try groupedEmbeddingOptions(&manifest, contract, .{ .max_tokens = 256 })).max_tokens);
-    try validateEmbeddingGroupContract(&node, contract, .{ .content = &.{.{ .text = "document" }} }, 1, .{});
+    _ = try validateEmbeddingGroupContract(&node, contract, .{ .content = &.{.{ .text = "document" }} }, 1, .{});
     try std.testing.expectError(error.UnsupportedInferenceModality, validateEmbeddingGroupContract(&node, contract, .{ .content = &.{.{ .audio = "audio" }} }, 1, .{}));
     manifest.max_position_embeddings = 128;
     try std.testing.expectEqual(@as(usize, 128), (try groupedEmbeddingOptions(&manifest, contract, .{})).max_tokens);
@@ -37283,7 +37475,24 @@ fn hasGroupedEmbeddingInput(input: std.json.Value) bool {
     return false;
 }
 
-fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecutorContract, group: @import("../pipelines/embedding_gemma2.zig").Group, count: usize, control: InferenceExecutionControl) !void {
+/// Groups share one public request, even when executed serially or split into
+/// multiple native microbatches. Retain aggregate accounting independently of
+/// per-item error handling and the backend's batching decision.
+const EmbeddingGroupRequestBudget = struct {
+    encoded_media_bytes: usize = 0,
+    decoded_pixels: u64 = 0,
+
+    fn add(self: *@This(), shape: InferenceExecutorInvocationShape) !void {
+        self.encoded_media_bytes = std.math.add(usize, self.encoded_media_bytes, shape.encoded_media_bytes) catch return error.InferenceEncodedBytesExceeded;
+        self.decoded_pixels = std.math.add(u64, self.decoded_pixels, shape.decoded_pixels) catch return error.InferenceDecodedPixelsExceeded;
+    }
+
+    fn validate(self: @This(), contract: ResolvedInferenceExecutorContract, count: usize) !void {
+        try validateInferenceExecutorInvocation(contract, .{ .item_count = count, .encoded_media_bytes = self.encoded_media_bytes, .decoded_pixels = self.decoded_pixels });
+    }
+};
+
+fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecutorContract, group: @import("../pipelines/embedding_gemma2.zig").Group, count: usize, control: InferenceExecutionControl) !InferenceExecutorInvocationShape {
     var text_bytes: usize = if (group.title) |title| title.len else 0;
     var media_bytes: usize = 0;
     var pixels: u64 = 0;
@@ -37294,21 +37503,21 @@ fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecut
     var media_parts: usize = 0;
     for (group.content) |part| switch (part) {
         .text => |text| {
-            text_bytes += text.len;
+            text_bytes = std.math.add(usize, text_bytes, text.len) catch return error.InferenceTextBytesExceeded;
             has_text = true;
         },
         .image => |bytes| {
             media_parts += 1;
-            media_bytes += bytes.len;
+            media_bytes = std.math.add(usize, media_bytes, bytes.len) catch return error.InferenceEncodedBytesExceeded;
             has_image = true;
             const info = try image_pipeline.inspectEncodedForInference(bytes, null);
-            pixels += try info.pixels();
+            pixels = std.math.add(u64, pixels, try info.pixels()) catch return error.InferenceDecodedPixelsExceeded;
         },
         .raster => |raster| {
             try raster.validate();
             media_parts += 1;
             has_image = true;
-            pixels += try raster.pixels();
+            pixels = std.math.add(u64, pixels, try raster.pixels()) catch return error.InferenceDecodedPixelsExceeded;
         },
         inline .video, .sampled_video => |payload| {
             try control.check();
@@ -37317,9 +37526,9 @@ fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecut
             const bytes = if (@TypeOf(payload) == @import("../pipelines/embedding_gemma2.zig").SampledVideo) payload.bytes else payload;
             const sampling: @import("../pipelines/embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == @import("../pipelines/embedding_gemma2.zig").SampledVideo) payload.sampling else .reference;
             media_parts += 1;
-            media_bytes += bytes.len;
+            media_bytes = std.math.add(usize, media_bytes, bytes.len) catch return error.InferenceEncodedBytesExceeded;
             has_video = true;
-            pixels += try @import("../pipelines/embedding_gemma2_video.zig").inspectPixelsWithSampling(bytes, control, sampling);
+            pixels = std.math.add(u64, pixels, try @import("../pipelines/embedding_gemma2_video.zig").inspectPixelsWithSampling(bytes, control, sampling)) catch return error.InferenceDecodedPixelsExceeded;
         },
         .pcm => |pcm| {
             media_parts += 1;
@@ -37328,11 +37537,13 @@ fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecut
         },
         .audio => |bytes| {
             media_parts += 1;
-            media_bytes += bytes.len;
+            media_bytes = std.math.add(usize, media_bytes, bytes.len) catch return error.InferenceEncodedBytesExceeded;
             has_audio = true;
         },
     };
-    try validateInferenceExecutorInvocation(contract, .{ .item_count = count, .text_bytes_per_item = text_bytes, .encoded_media_bytes = media_bytes, .decoded_pixels = pixels, .media_parts_per_item = media_parts, .has_text = has_text, .has_image = has_image, .has_audio = has_audio, .has_video = has_video });
+    const shape: InferenceExecutorInvocationShape = .{ .item_count = count, .text_bytes_per_item = text_bytes, .encoded_media_bytes = media_bytes, .decoded_pixels = pixels, .media_parts_per_item = media_parts, .has_text = has_text, .has_image = has_image, .has_audio = has_audio, .has_video = has_video };
+    try validateInferenceExecutorInvocation(contract, shape);
+    return shape;
 }
 
 fn parseVideoSampling(value: std.json.Value) !@import("../pipelines/embedding_gemma2_video.zig").Sampling {
@@ -45352,15 +45563,74 @@ test "model aware media output generation rejects an alias replacement before ex
 }
 
 const MediaOutputExecution = struct {
+    const speakers = lib_chunker.diarization;
+    const speaker_checkpoint = @import("../pipelines/media_speaker_state.zig");
+    const audio_providers = @import("../pipelines/media_chunking_audio.zig");
+    const SpeakerState = struct {
+        registry: speakers.Registry = .{},
+        timeline: speaker_checkpoint.timeline.Timeline = .{},
+        embedder: ?@import("../pipelines/speaker_model_cache.zig").Cache.Lease = null,
+        identity: [32]u8 = undefined,
+        cacheable: bool = false,
+        next_window: u64 = 0,
+        covered_samples: u64 = 0,
+        total_samples: ?u64 = null,
+        complete: bool = false,
+        valid: bool = true,
+        memory_window: u64 = 0,
+        disk_window: u64 = 0,
+        disk_cursor: ?speaker_checkpoint.DiskCursor = null,
+        borrowed: ?*@import("../pipelines/media_index_cache.zig").Cache.Entry = null,
+        fn snapshot(self: *const @This(), rate: u32) speaker_checkpoint.Snapshot {
+            return .{ .registry = &self.registry, .shared = self.timeline.view(), .sample_rate = rate, .next_window = self.next_window, .covered_samples = self.covered_samples, .total_samples = self.total_samples, .complete = self.complete };
+        }
+        fn borrowComplete(self: *@This(), a: std.mem.Allocator, entry: *@import("../pipelines/media_index_cache.zig").Cache.Entry) !void {
+            std.debug.assert(entry.data.speaker_analysis.complete);
+            try self.restore(a, entry.data.speaker_analysis);
+            self.borrowed = entry;
+        }
+        fn restore(self: *@This(), a: std.mem.Allocator, saved: speaker_checkpoint.Snapshot) !void {
+            try saved.validate();
+            std.debug.assert(self.borrowed == null);
+            if (saved.shared) |view| try self.timeline.restore(a, view) else {
+                var fresh = self.timeline;
+                fresh.blocks = .empty;
+                fresh.count = 0;
+                errdefer fresh.deinit(a);
+                // Disk snapshots retain every recorded boundary, including
+                // adjacent identical labels accepted by older checkpoint codecs.
+                for (saved.spans) |span| try fresh.appendRecorded(a, span);
+                self.timeline.deinit(a);
+                self.timeline = fresh;
+            }
+            self.registry.count = saved.registry.count;
+            @memcpy(self.registry.sums[0..saved.registry.count], saved.registry.sums[0..saved.registry.count]);
+            self.next_window = saved.next_window;
+            self.covered_samples = saved.covered_samples;
+            self.total_samples = saved.total_samples;
+            self.complete = saved.complete;
+        }
+    };
     const chunks = @import("../pipelines/media_chunking.zig");
     const outputs = lib_chunker.outputs;
-    const Resolved = struct { path: []const u8, identity: [64]u8, revision: [64]u8, recipe_id: [64]u8, max_audio_ns: i64 = 30 * std.time.ns_per_s, failure: ?anyerror = null, uses_audio: bool = false, uses_video: bool = false, classifier_profile: ?@import("../models/media_classifier_profile.zig").Profile = null };
+    const Resolved = struct { speaker_path: ?[]const u8 = null, speaker_revision: [64]u8 = @splat(0), path: []const u8, identity: [64]u8, revision: [64]u8, recipe_id: [64]u8, max_audio_ns: i64 = 30 * std.time.ns_per_s, failure: ?anyerror = null, uses_audio: bool = false, uses_video: bool = false, classifier_profile: ?@import("../models/media_classifier_profile.zig").Profile = null };
     node: *Node,
     io: std.Io,
     control: InferenceExecutionControl,
     config: outputs.Config,
     resolved: [16]Resolved = undefined,
     initialized: usize = 0,
+    allocator: std.mem.Allocator = undefined,
+    allow_partial: bool = false,
+    speakers_prepared: bool = false,
+    speaker_turns: bool = false,
+    speaker_outputs: bool = true,
+    speaker_states: [16]?*SpeakerState = @splat(null),
+    speaker_lease: ?runtime.tier.memory.AdmissionLease = null,
+    speaker_provider: ?audio_providers.Provider = null,
+    speaker_fork: ?audio_providers.Fork = null,
+    speaker_scratch: std.mem.Allocator = undefined,
+    speaker_cache_admission: ?@import("../pipelines/media_index_cache.zig").Cache.Admission = null,
     frame_arena: ?std.heap.ArenaAllocator = null,
     prepared_frames: [16][32]?[]const f32 = @splat(@splat(null)),
     frame_errors: [16]?anyerror = @splat(null),
@@ -45534,13 +45804,13 @@ const MediaOutputExecution = struct {
     }
     fn init(node: *Node, a: std.mem.Allocator, io: std.Io, supplied: InferenceExecutionControl, config: outputs.Config, allow_partial: bool) !MediaOutputExecution {
         try config.validate();
-        var self = MediaOutputExecution{ .node = node, .io = io, .control = node.bindExecutionControl(io, supplied), .config = config };
+        var self = MediaOutputExecution{ .node = node, .io = io, .control = node.bindExecutionControl(io, supplied), .config = config, .allocator = a, .allow_partial = allow_partial };
         errdefer self.deinit(a);
         for (config.targets, 0..) |target, i| {
             try self.control.check();
             self.resolved[i] = self.resolve(a, target) catch |err| blk: {
                 if (chunks.abort(err) or std.mem.eql(u8, target.name, config.boundary_model) or (target.required and !allow_partial)) return err;
-                break :blk .{ .path = "", .identity = @splat(0), .revision = @splat(0), .recipe_id = try target.recipeIdentity(a, "", ""), .failure = err };
+                break :blk .{ .path = "", .identity = @splat(0), .revision = @splat(0), .recipe_id = if (target.hasDiarization()) try target.speakerRecipeIdentity(a, "", "", "") else try target.recipeIdentity(a, "", ""), .failure = err };
             };
             self.initialized += 1;
         }
@@ -45551,10 +45821,312 @@ const MediaOutputExecution = struct {
         }
         return self;
     }
+    fn wantsSpeakerAnalysis(self: *const MediaOutputExecution, target: outputs.Target) bool {
+        return target.hasDiarization() and ((self.speaker_outputs and target.execute) or (self.speaker_turns and std.mem.eql(u8, target.name, self.config.boundary_model)));
+    }
+    fn speakerState(self: *MediaOutputExecution, name: []const u8) !*SpeakerState {
+        for (self.config.targets, 0..) |target, i| if (std.mem.eql(u8, name, target.name)) return self.speaker_states[i] orelse return error.SpeakerAnalysisUnavailable;
+        return error.InvalidChunkOutputs;
+    }
+    fn speakerBoundary(raw: *anyopaque, start: i64, end: i64) !speakers.Span {
+        const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        const state = self.speaker_states[try self.boundaryIndex()] orelse return error.SpeakerAnalysisUnavailable;
+        const stop = state.timeline.turnEnd(start, end);
+        return .{ .start_ns = start, .end_ns = stop, .speaker_index = state.timeline.label(start, stop) };
+    }
+    fn speakerAdmission(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
+        const node: *Node = @ptrCast(@alignCast(raw));
+        return node.model_manager.admitHostPreflight(bytes);
+    }
+    fn speakerContext(self: *MediaOutputExecution) speaker_checkpoint.Store.Context {
+        return .{ .store = &self.node.media_speaker_store, .io = self.io, .models_dir = self.node.config.models_dir };
+    }
+    /// A source/model/settings key deliberately excludes output names and ASR
+    /// identities. Matching transcription, boundary and voice outputs share state.
+    fn prepareSpeakers(raw: *anyopaque, scratch: std.mem.Allocator, provider: audio_providers.Provider, budget: usize, source: [32]u8, version: []const u8, cacheable: bool) !void {
+        const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        if (self.speakers_prepared) return;
+        if (provider.sample_rate == 0) return error.UnsupportedAudioFormat;
+        self.speaker_scratch = scratch;
+        self.speaker_provider = provider;
+        self.speaker_cache_admission = .{ .context = self.node, .acquire = speakerAdmission };
+        var identities: [16]?[32]u8 = @splat(null);
+        var groups: usize = 0;
+        for (self.config.targets, 0..) |target, i| {
+            if (!self.wantsSpeakerAnalysis(target) or self.resolved[i].failure != null) continue;
+            identities[i] = try speaker_checkpoint.key(scratch, source, version, &self.resolved[i].speaker_revision, target.speakerConfig(), provider.sample_rate);
+            var duplicate = false;
+            for (identities[0..i]) |prior| if (prior) |identity| {
+                if (std.mem.eql(u8, &identity, &identities[i].?)) duplicate = true;
+            };
+            if (!duplicate) groups += 1;
+        }
+        const root_bytes = (speakers.max_spans / speaker_checkpoint.timeline.block_size) * @sizeOf(*speaker_checkpoint.timeline.Block);
+        const bytes = try std.math.mul(usize, groups, @sizeOf(SpeakerState) + root_bytes + @sizeOf(speaker_checkpoint.timeline.Block));
+        if (bytes > budget) return error.ChunkWorkingBudgetExceeded;
+        self.speaker_lease = try self.node.model_manager.admitHostPreflight(bytes);
+        for (identities, 0..) |maybe_identity, i| {
+            const identity = maybe_identity orelse continue;
+            for (identities[0..i], 0..) |prior, j| if (prior) |key| {
+                if (std.mem.eql(u8, &identity, &key)) {
+                    self.speaker_states[i] = self.speaker_states[j];
+                    break;
+                }
+            };
+            if (self.speaker_states[i] != null) continue;
+            const state = try self.allocator.create(SpeakerState);
+            state.* = .{ .identity = identity, .cacheable = cacheable, .total_samples = if (provider.final_samples == null) provider.samples else null };
+            self.speaker_states[i] = state;
+            state.timeline.admission = .{ .context = self.node, .acquire = speakerAdmission };
+            state.timeline.max_blocks = (budget / groups - @sizeOf(SpeakerState) - root_bytes) / @sizeOf(speaker_checkpoint.timeline.Block);
+            if (!cacheable) continue;
+            var memory_hit = false;
+            if (self.node.media_index_cache.get(identity)) |entry| {
+                defer if (state.borrowed != entry) self.node.media_index_cache.release(entry);
+                if (entry.data == .speaker_analysis) {
+                    memory_hit = true;
+                    if (entry.data.speaker_analysis.complete) try state.borrowComplete(self.allocator, entry) else try state.restore(self.allocator, entry.data.speaker_analysis);
+                    state.memory_window = state.next_window;
+                    state.disk_cursor = self.node.media_index_cache.speakerDisk(identity);
+                    state.disk_window = if (state.disk_cursor) |cursor| cursor.window else 0;
+                }
+            }
+            if (!memory_hit) if (speaker_checkpoint.Store.loadWithCursor(self.speakerContext(), scratch, identity)) |saved| {
+                defer saved.snapshot.deinit(scratch);
+                try state.restore(self.allocator, saved.snapshot);
+                state.disk_cursor = saved.cursor;
+                state.disk_window = saved.cursor.window;
+            } else |_| {};
+            if (state.registry.count > self.config.targets[i].speakerConfig().max_speakers) return error.InvalidSpeakerCheckpoint;
+            if (state.next_window > state.memory_window) {
+                self.node.media_index_cache.remember(std.heap.smp_allocator, identity, .{ .speaker_analysis = state.snapshot(provider.sample_rate) }, self.speaker_cache_admission.?);
+                state.memory_window = state.next_window;
+                if (state.disk_cursor) |cursor| self.node.media_index_cache.recordSpeakerDisk(identity, cursor);
+            }
+        }
+        self.speakers_prepared = true;
+    }
+    fn leader(self: *const MediaOutputExecution, i: usize) bool {
+        const state = self.speaker_states[i] orelse return false;
+        for (self.speaker_states[0..i]) |prior| if (prior == state) return false;
+        return true;
+    }
+    fn speakerFailure(self: *MediaOutputExecution, index: usize, err: anyerror) !void {
+        const state = self.speaker_states[index].?;
+        state.valid = false;
+        var fatal = chunks.abort(err);
+        for (self.config.targets, 0..) |target, i| if (self.speaker_states[i] == state) {
+            self.resolved[i].failure = err;
+            fatal = fatal or (self.speaker_turns and std.mem.eql(u8, target.name, self.config.boundary_model)) or (target.required and !self.allow_partial);
+        };
+        if (fatal) return err;
+    }
+    fn enough(self: *MediaOutputExecution, state: *const SpeakerState, start: i64, end: i64, stop_at_turn: bool) bool {
+        if (!state.valid or state.complete) return true;
+        if (state.timeline.len() == 0) return false;
+        const spans = state.timeline;
+        if (spans.at(spans.len() - 1).end_ns >= end) return true;
+        if (stop_at_turn) {
+            const boundary_state = self.speaker_states[self.boundaryIndex() catch return false] orelse return false;
+            const index = boundary_state.timeline.first(start);
+            if (index + 1 < boundary_state.timeline.len()) {
+                const turn_end = boundary_state.timeline.at(index).end_ns;
+                return spans.at(spans.len() - 1).end_ns >= turn_end;
+            }
+        }
+        return false;
+    }
+    /// Analyze only the prefix needed by this chunk. One embedding per model
+    /// and grid window feeds every clustering configuration that needs it.
+    fn ensureSpeakers(raw: *anyopaque, _: std.mem.Allocator, start: i64, end: i64, stop_at_turn: bool) !void {
+        const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        if (self.speaker_provider == null) return;
+        const scratch = self.speaker_scratch;
+        const Flights = @import("../pipelines/media_speaker_flights.zig").Registry;
+        // Keep this set stable while the boundary timeline advances: every
+        // participating configuration can consume the same window embedding.
+        var eligible: [16]bool = @splat(false);
+        var keys: [16][32]u8 = undefined;
+        var keys_count: usize = 0;
+        for (self.speaker_states, 0..) |maybe_state, i| if (maybe_state) |state| {
+            eligible[i] = self.leader(i) and !self.enough(state, start, end, stop_at_turn);
+            if (eligible[i] and state.cacheable) {
+                keys[keys_count] = state.identity;
+                keys_count += 1;
+            }
+        };
+        const Ordering = struct {
+            fn less(_: void, left: [32]u8, right: [32]u8) bool {
+                return std.mem.order(u8, &left, &right) == .lt;
+            }
+        };
+        std.mem.sort([32]u8, keys[0..keys_count], {}, Ordering.less);
+        var held: [16]Flights.Lease = undefined;
+        var held_count: usize = 0;
+        defer {
+            // Waiters must see this accepted model prefix before its gate opens.
+            checkpointSpeakers(raw, false);
+            while (held_count != 0) {
+                held_count -= 1;
+                held[held_count].deinit();
+            }
+        }
+        for (keys[0..keys_count]) |key| {
+            held[held_count] = try self.node.speaker_flights.acquire(self.node.allocator, key, self.control);
+            held_count += 1;
+        }
+        for (self.speaker_states, 0..) |maybe_state, i| if (maybe_state) |state| {
+            if (!self.leader(i) or !state.cacheable or self.enough(state, start, end, stop_at_turn)) continue;
+            if (self.node.media_index_cache.get(state.identity)) |entry| {
+                defer self.node.media_index_cache.release(entry);
+                if (entry.data == .speaker_analysis and entry.data.speaker_analysis.next_window > state.next_window) {
+                    try state.restore(self.allocator, entry.data.speaker_analysis);
+                    state.memory_window = state.next_window;
+                }
+                state.disk_cursor = self.node.media_index_cache.speakerDisk(state.identity);
+                state.disk_window = if (state.disk_cursor) |cursor| cursor.window else state.disk_window;
+            }
+        };
+        while (true) {
+            try self.control.check();
+            var ordinal: ?u64 = null;
+            for (self.speaker_states, 0..) |maybe_state, i| if (maybe_state) |state| {
+                if (eligible[i] and !self.enough(state, start, end, stop_at_turn)) ordinal = @min(ordinal orelse std.math.maxInt(u64), state.next_window);
+            };
+            const next_window = ordinal orelse return;
+            if (self.speaker_fork == null) if (self.speaker_provider.?.fork) |fork| {
+                self.speaker_fork = try fork(self.speaker_provider.?.context, scratch);
+                self.speaker_provider = self.speaker_fork.?.provider;
+            };
+            const provider = self.speaker_provider.?;
+            const first = std.math.cast(usize, @as(u128, next_window) * provider.sample_rate * 3 / 2) orelse return error.TimestampOverflow;
+            const requested = @min(provider.samples, try std.math.add(usize, first, try std.math.mul(usize, provider.sample_rate, 3)));
+            var lease = try provider.read(provider.context, scratch, first, requested);
+            defer lease.deinit(scratch);
+            const next = std.math.cast(usize, @as(u128, next_window + 1) * provider.sample_rate * 3 / 2) orelse return error.TimestampOverflow;
+            const step = @min(lease.pcm.samples.len, next - first);
+            if (step == 0) return error.InvalidSpeakerCheckpoint;
+            const known_total = if (provider.final_samples) |length| length(provider.context) else provider.samples;
+            const total: ?u64 = if (known_total) |samples| samples else if (lease.pcm.samples.len < requested - first) first + lease.pcm.samples.len else null;
+            const final = if (total) |samples| first + step >= samples else step == lease.pcm.samples.len;
+            const start_ns = std.math.cast(i64, @as(u128, first) * std.time.ns_per_s / provider.sample_rate) orelse return error.TimestampOverflow;
+            const end_ns = std.math.cast(i64, (@as(u128, first + step) * std.time.ns_per_s + (if (final) @as(u128, provider.sample_rate - 1) else 0)) / provider.sample_rate) orelse return error.TimestampOverflow;
+            var window: ?[]f32 = null;
+            defer if (window) |owned| scratch.free(owned);
+            var energy: f64 = 0;
+            for (lease.pcm.samples[0..step]) |sample| {
+                if (!std.math.isFinite(sample)) return error.InvalidAudio;
+                energy += @as(f64, sample) * sample;
+            }
+            const rms = @sqrt(energy / @as(f64, @floatFromInt(step)));
+            var vectors: [16]?[]f32 = @splat(null);
+            var vector_revisions: [16][64]u8 = undefined;
+            var vector_count: usize = 0;
+            defer for (vectors[0..vector_count]) |vector| if (vector) |owned| scratch.free(owned);
+            for (self.config.targets, 0..) |target, i| {
+                const state = self.speaker_states[i] orelse continue;
+                if (!self.leader(i) or !state.valid or state.complete or state.next_window != next_window or !eligible[i]) continue;
+                state.valid = false; // Publication excludes a partially applied model result.
+                const config = target.speakerConfig();
+                var label: ?u32 = null;
+                if (rms >= config.min_rms) {
+                    var embedding: ?[]f32 = null;
+                    for (vectors[0..vector_count], vector_revisions[0..vector_count]) |vector, revision| if (std.mem.eql(u8, &revision, &self.resolved[i].speaker_revision)) {
+                        embedding = vector;
+                        break;
+                    };
+                    if (embedding == null) {
+                        if (window == null) {
+                            _ = self.node.speaker_analysis_preprocess_runs.fetchAdd(1, .monotonic);
+                            const pcm = try audio_mod.copyOrResample(scratch, lease.pcm.samples, provider.sample_rate, speaker_embedding_mod.sample_rate);
+                            defer scratch.free(pcm);
+                            if (pcm.len == 0) return error.InvalidSpeakerEmbedding;
+                            const owned = try scratch.alloc(f32, speaker_embedding_mod.window_samples);
+                            for (owned, 0..) |*sample, at| sample.* = pcm[at % pcm.len];
+                            window = owned;
+                        }
+                        if (state.embedder == null) state.embedder = self.node.pinnedSpeakerEmbedder(scratch, self.resolved[i].speaker_path.?, self.resolved[i].speaker_revision, self.io, self.control) catch |err| {
+                            try self.speakerFailure(i, err);
+                            continue;
+                        };
+                        _ = self.node.speaker_analysis_model_runs.fetchAdd(1, .monotonic);
+                        embedding = state.embedder.?.model().embedAlloc(scratch, window.?, self.control) catch |err| {
+                            try self.speakerFailure(i, err);
+                            continue;
+                        };
+                        vectors[vector_count] = embedding;
+                        vector_revisions[vector_count] = self.resolved[i].speaker_revision;
+                        vector_count += 1;
+                    }
+                    label = state.registry.assign(embedding.?, config) catch |err| {
+                        try self.speakerFailure(i, err);
+                        continue;
+                    };
+                }
+                state.timeline.append(self.allocator, .{ .start_ns = start_ns, .end_ns = end_ns, .speaker_index = label }) catch |err| {
+                    try self.speakerFailure(i, err);
+                    continue;
+                };
+                state.next_window += 1;
+                state.covered_samples = first + step;
+                state.total_samples = total orelse state.total_samples;
+                state.complete = final;
+                state.valid = true;
+            }
+            if ((next_window + 1) % 16 == 0) checkpointSpeakers(self, true);
+        }
+    }
+    fn speakerSamples(raw: *anyopaque) ?usize {
+        const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        for (self.speaker_states) |maybe_state| if (maybe_state) |state| {
+            if (state.total_samples) |samples| return std.math.cast(usize, samples);
+        };
+        return null;
+    }
+    fn checkpointSpeakers(raw: *anyopaque, durable: bool) void {
+        const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        const provider = self.speaker_provider orelse return;
+        for (self.speaker_states, 0..) |maybe_state, i| if (maybe_state) |state| {
+            if (!self.leader(i) or !state.valid or !state.cacheable or state.next_window == 0) continue;
+            const snapshot = state.snapshot(provider.sample_rate);
+            if (state.next_window > state.memory_window) {
+                self.node.media_index_cache.remember(std.heap.smp_allocator, state.identity, .{ .speaker_analysis = snapshot }, self.speaker_cache_admission.?);
+                state.memory_window = state.next_window;
+            }
+            if (self.node.media_index_cache.speakerDisk(state.identity)) |cursor| if (cursor.window > state.disk_window) {
+                state.disk_cursor = cursor;
+                state.disk_window = cursor.window;
+            };
+            if (durable and state.next_window > state.disk_window) {
+                const cursor = speaker_checkpoint.Store.saveWithCursor(self.speakerContext(), self.speaker_scratch, state.identity, snapshot, state.disk_cursor) catch continue;
+                state.disk_cursor = cursor;
+                state.disk_window = cursor.window;
+                self.node.media_index_cache.recordSpeakerDisk(state.identity, cursor);
+            }
+        };
+    }
+    fn closeSpeakers(raw: *anyopaque) void {
+        const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        checkpointSpeakers(raw, true);
+        if (self.speaker_fork) |fork| fork.deinit();
+        self.speaker_fork = null;
+        self.speaker_provider = null;
+    }
     fn resolve(self: *MediaOutputExecution, a: std.mem.Allocator, target: outputs.Target) !Resolved {
+        if (target.kind == .diarize) {
+            const path = try self.node.resolveChunkSpeakerPath(a, target.model);
+            errdefer a.free(path);
+            const revision = try self.node.chunkSpeakerRevision(path, self.io, self.control);
+            if (target.speakerConfig().model_identity) |expected| if (!std.mem.eql(u8, expected, &revision)) return error.EmbeddingIdentityMismatch;
+            if (target.model_identity) |expected| if (!std.mem.eql(u8, expected, &revision)) return error.EmbeddingIdentityMismatch;
+            const speaker_path = try a.dupe(u8, path);
+            errdefer a.free(speaker_path);
+            return .{ .path = path, .identity = revision, .revision = revision, .recipe_id = try target.speakerRecipeIdentity(a, &revision, &revision, &revision), .speaker_path = speaker_path, .speaker_revision = revision, .uses_audio = true };
+        }
         const path = try self.node.resolveRequestModelPath(a, self.io, target.model, switch (target.kind) {
             .embedding => "embedders",
             .transcribe => "transcribers",
+            .diarize => unreachable,
             .classify => "classifiers",
         });
         errdefer a.free(path);
@@ -45595,7 +46167,16 @@ const MediaOutputExecution = struct {
             identity = revision;
         }
         if (target.model_identity) |expected| if (!std.mem.eql(u8, expected, &identity)) return error.EmbeddingIdentityMismatch;
-        return .{ .path = path, .identity = identity, .revision = revision, .max_audio_ns = max_audio_ns, .recipe_id = try target.recipeIdentity(a, &identity, &revision), .uses_audio = uses_audio, .uses_video = uses_video, .classifier_profile = classifier_profile };
+        var value = Resolved{ .path = path, .identity = identity, .revision = revision, .max_audio_ns = max_audio_ns, .recipe_id = try target.recipeIdentity(a, &identity, &revision), .uses_audio = uses_audio, .uses_video = uses_video, .classifier_profile = classifier_profile };
+        if (target.hasDiarization()) {
+            const speaker_path = try self.node.resolveChunkSpeakerPath(a, target.speakerModel());
+            errdefer a.free(speaker_path);
+            value.speaker_path = speaker_path;
+            value.speaker_revision = try self.node.chunkSpeakerRevision(speaker_path, self.io, self.control);
+            if (target.speakerConfig().model_identity) |expected| if (!std.mem.eql(u8, expected, &value.speaker_revision)) return error.EmbeddingIdentityMismatch;
+            value.recipe_id = try target.speakerRecipeIdentity(a, &identity, &revision, &value.speaker_revision);
+        }
+        return value;
     }
     fn deinit(self: *MediaOutputExecution, a: std.mem.Allocator) void {
         if (self.frame_cache) |cache| {
@@ -45603,7 +46184,18 @@ const MediaOutputExecution = struct {
             a.destroy(cache);
         }
         if (self.frame_arena) |*arena| arena.deinit();
-        for (self.resolved[0..self.initialized]) |value| if (value.path.len != 0) a.free(value.path);
+        for (self.speaker_states, 0..) |state, i| if (state) |owned| {
+            if (!self.leader(i)) continue;
+            if (owned.embedder) |lease| lease.deinit();
+            owned.timeline.deinit(a);
+            if (owned.borrowed) |entry| self.node.media_index_cache.release(entry);
+            a.destroy(owned);
+        };
+        if (self.speaker_lease) |*lease| lease.release();
+        for (self.resolved[0..self.initialized]) |value| {
+            if (value.path.len != 0) a.free(value.path);
+            if (value.speaker_path) |speaker_path| a.free(speaker_path);
+        }
     }
     fn boundaryIndex(self: *const MediaOutputExecution) !usize {
         for (self.config.targets, 0..) |target, i| if (std.mem.eql(u8, target.name, self.config.boundary_model)) return i;
@@ -45642,7 +46234,7 @@ const MediaOutputExecution = struct {
         for (self.config.targets, 0..) |target, index| {
             try self.control.check();
             const resolved = &self.resolved[index];
-            const base = outputs.Result{ .name = target.name, .kind = target.kind, .required = target.required, .model = target.model, .model_identity = if (resolved.failure == null) &resolved.identity else "", .model_revision = if (resolved.failure == null) &resolved.revision else "", .recipe_id = &resolved.recipe_id, .status = .complete, .start_ns = descriptor.coordinates.start_ns, .end_ns = descriptor.coordinates.end_ns };
+            const base = outputs.Result{ .name = target.name, .kind = target.kind, .required = target.required, .model = target.model, .model_identity = if (resolved.path.len != 0) &resolved.identity else "", .model_revision = if (resolved.path.len != 0) &resolved.revision else "", .recipe_id = &resolved.recipe_id, .speaker_model_revision = if (resolved.speaker_path != null) &resolved.speaker_revision else null, .status = .complete, .start_ns = descriptor.coordinates.start_ns, .end_ns = descriptor.coordinates.end_ns };
             if (!target.execute) {
                 var value = base;
                 value.status = .skipped;
@@ -45741,6 +46333,10 @@ const MediaOutputExecution = struct {
                 var value = base;
                 switch (target.kind) {
                     .transcribe => value.spans = &.{},
+                    .diarize => {
+                        value.speaker_spans = &.{};
+                        value.speaker_scope = .source;
+                    },
                     .classify => value.labels = &.{},
                     .embedding => {
                         value.status = .failed;
@@ -45850,6 +46446,43 @@ const MediaOutputExecution = struct {
         const after = std.fmt.bytesToHex(try self.node.model_manager.modelIdentityForManifest(resolved.path, manifest), .lower);
         if (!std.mem.eql(u8, &after, &resolved.revision)) return error.ModelConfigurationChanged;
     }
+    fn appendSpeakerTranscript(a: std.mem.Allocator, out: *std.ArrayList(outputs.Span), timeline: speaker_checkpoint.timeline.Timeline, segment: transcribing_api.Segment, origin: i64, start: i64, end: i64) !void {
+        const text = segment.text orelse "";
+        const words = segment.words orelse &.{};
+        if (words.len != 0) {
+            const Aligned = struct { char_start: usize, start: i64, label: ?u32 };
+            const aligned = try a.alloc(Aligned, words.len);
+            defer a.free(aligned);
+            var cursor: usize = 0;
+            var count: usize = 0;
+            for (words) |word| {
+                const token = std.mem.trim(u8, word.word orelse break, " \t\r\n");
+                if (token.len == 0) break;
+                const at = std.mem.indexOfPos(u8, text, cursor, token) orelse break;
+                const word_start = try std.math.add(i64, origin, try std.math.mul(i64, word.start_ms orelse break, std.time.ns_per_ms));
+                const word_end = @min(end, try std.math.add(i64, origin, try std.math.mul(i64, word.end_ms orelse break, std.time.ns_per_ms)));
+                if (word_start < start or word_start >= end or word_end < word_start or (count != 0 and word_start < aligned[count - 1].start)) break;
+                aligned[count] = .{ .char_start = at, .start = word_start, .label = timeline.label(word_start, word_end) };
+                count += 1;
+                cursor = at + token.len;
+            }
+            if (count == words.len) {
+                var first: usize = 0;
+                var group_start = start;
+                var label = aligned[0].label;
+                for (aligned[1..]) |word| {
+                    if (word.label == label) continue;
+                    try out.append(a, .{ .text = text[first..word.char_start], .start_ns = group_start, .end_ns = word.start, .speaker_index = label });
+                    first = word.char_start;
+                    group_start = word.start;
+                    label = word.label;
+                }
+                try out.append(a, .{ .text = text[first..], .start_ns = group_start, .end_ns = end, .speaker_index = label });
+                return;
+            }
+        }
+        try out.append(a, .{ .text = text, .start_ns = start, .end_ns = end, .speaker_index = timeline.label(start, end) });
+    }
     fn run(self: *MediaOutputExecution, a: std.mem.Allocator, target: outputs.Target, resolved: *const Resolved, payload: chunks.Payload, value: *outputs.Result) !void {
         switch (target.kind) {
             .embedding => {
@@ -45872,9 +46505,18 @@ const MediaOutputExecution = struct {
                 const output = try self.node.embedMediaOutput(a, self.control, resolved, target, payload, shared_frames);
                 value.embedding = output.vector;
             },
+            .diarize => {
+                if (payload != .pcm) return error.ModelDoesNotSupportAudioInput;
+                const state = try self.speakerState(target.name);
+                value.speaker_spans = try state.timeline.slice(a, value.start_ns orelse return error.InvalidChunkCoordinates, value.end_ns orelse return error.InvalidChunkCoordinates);
+                value.speaker_scope = .source;
+                // Source preparation already verified the immutable timeline
+                // against the pinned speaker bytes; there is no ASR manifest.
+                return;
+            },
             .transcribe => {
                 if (payload != .pcm) return error.ModelDoesNotSupportAudioInput;
-                const response = try self.node.transcribeDecodedPcmFromPathPinned(a, resolved.path, .{ .url = "", .language = target.language, .timestamps = true, .diarization = target.diarize }, payload.pcm, self.control, self.node.config.chunking_limits.max_working_bytes, resolved.revision);
+                const response = try self.node.transcribeDecodedPcmFromPathPinned(a, resolved.path, .{ .url = "", .language = target.language, .timestamps = true, .diarization = false }, payload.pcm, self.control, self.node.config.chunking_limits.max_working_bytes, resolved.revision);
                 var spans = std.ArrayList(outputs.Span).empty;
                 const origin = value.start_ns orelse return error.InvalidChunkCoordinates;
                 const end = value.end_ns orelse return error.InvalidChunkCoordinates;
@@ -45885,11 +46527,13 @@ const MediaOutputExecution = struct {
                     // Whisper timestamps have 20ms granularity and may extend
                     // the last token past a sample-exact window tail.
                     if (start_ns >= end) continue;
-                    const speaker = if (segment.speaker) |name| if (std.mem.startsWith(u8, name, "SPEAKER_")) std.fmt.parseInt(u32, name[8..], 10) catch null else null else null;
-                    try spans.append(a, .{ .text = segment.text orelse "", .start_ns = start_ns, .end_ns = @min(end_ns, end), .speaker_index = speaker });
+                    if (target.hasDiarization()) {
+                        try appendSpeakerTranscript(a, &spans, (try self.speakerState(target.name)).timeline, segment, origin, start_ns, @min(end_ns, end));
+                    } else try spans.append(a, .{ .text = segment.text orelse "", .start_ns = start_ns, .end_ns = @min(end_ns, end) });
                 };
                 if (spans.items.len == 0 and response.text != null and response.text.?.len != 0) try spans.append(a, .{ .text = response.text.?, .start_ns = origin, .end_ns = end });
                 value.spans = try spans.toOwnedSlice(a);
+                if (target.hasDiarization()) value.speaker_scope = .source;
             },
             .classify => {
                 var handle = try self.node.model_manager.acquireFromDirWithControl(resolved.path, self.control);
@@ -46197,4 +46841,464 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try std.testing.expectEqual(@as(i64, 1), shape.object.get("minimum_dimensions").?.integer);
     try std.testing.expectEqual(@as(usize, 64), model.object.get("model_revision").?.string.len);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+}
+
+test "model aware media source diarization emits standalone turns and splits transcript text at word clocks" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const O = lib_chunker.outputs;
+    var state = MediaOutputExecution.SpeakerState{};
+    defer state.timeline.deinit(a);
+    try state.timeline.append(a, .{ .start_ns = 0, .end_ns = std.time.ns_per_s, .speaker_index = 0 });
+    try state.timeline.append(a, .{ .start_ns = std.time.ns_per_s, .end_ns = 2 * std.time.ns_per_s, .speaker_index = 1 });
+    const target = O.Target{ .name = "voices", .kind = .diarize, .model = "speaker" };
+    var execution = MediaOutputExecution{ .node = undefined, .io = std.testing.io, .control = .{}, .config = .{ .boundary_model = "voices", .targets = &.{target} }, .initialized = 1 };
+    execution.speaker_states[0] = &state;
+    const revision: [64]u8 = @splat('a');
+    const resolved = MediaOutputExecution.Resolved{ .path = "speaker", .identity = revision, .revision = revision, .recipe_id = revision };
+    var receipt = O.Result{ .name = "voices", .kind = .diarize, .model = "speaker", .required = true, .model_identity = &revision, .model_revision = &revision, .recipe_id = &revision, .status = .complete, .speaker_model_revision = &revision, .start_ns = 500 * std.time.ns_per_ms, .end_ns = 1500 * std.time.ns_per_ms };
+    try execution.run(alloc, target, &resolved, .{ .pcm = .{ .samples = &.{0}, .sample_rate = 16000 } }, &receipt);
+    try receipt.validate(target);
+    try std.testing.expectEqual(@as(usize, 2), receipt.speaker_spans.?.len);
+    var spans: std.ArrayList(O.Span) = .empty;
+    try MediaOutputExecution.appendSpeakerTranscript(alloc, &spans, state.timeline, .{ .text = "Hello, world!", .start_ms = 0, .end_ms = 2000, .words = &.{ .{ .word = "Hello,", .start_ms = 0, .end_ms = 900 }, .{ .word = "world!", .start_ms = 1000, .end_ms = 2000 } } }, 0, 0, 2 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 2), spans.items.len);
+    try std.testing.expectEqualStrings("Hello, ", spans.items[0].text);
+    try std.testing.expectEqualStrings("world!", spans.items[1].text);
+    try std.testing.expectEqual(@as(?u32, 0), spans.items[0].speaker_index);
+    try std.testing.expectEqual(@as(?u32, 1), spans.items[1].speaker_index);
+    try std.testing.expectEqual(@as(i64, std.time.ns_per_s), spans.items[1].start_ns);
+    spans.clearRetainingCapacity();
+    try MediaOutputExecution.appendSpeakerTranscript(alloc, &spans, state.timeline, .{ .text = "No word clocks.", .start_ms = 0, .end_ms = 2000 }, 0, 0, 2 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(?u32, null), spans.items[0].speaker_index);
+}
+
+test "model aware media speaker checkpoint runs without ASR and replays source scoped identities" {
+    const models = platform.env.getenv("ANTFLY_TEST_SPEAKER_MODELS_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const private_models = try temp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(private_models);
+    const ref = try registry_mod.ModelRef.parse(lib_chunker.diarization.default_model);
+    const installed = try registry_mod.modelInstallDirAlloc(a, models, ref);
+    defer a.free(installed);
+    const variant_path = try std.fs.path.join(a, &.{ installed, ref.variant });
+    defer a.free(variant_path);
+    const fallback = try std.fs.path.join(a, &.{ models, ref.owner, ref.name, ref.variant });
+    defer a.free(fallback);
+    const private_dir = try registry_mod.modelInstallDirAlloc(a, private_models, ref);
+    defer a.free(private_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, private_dir);
+    const private_model = try std.fs.path.join(a, &.{ private_dir, ref.variant });
+    defer a.free(private_model);
+    try std.Io.Dir.cwd().copyFile(if (dirExists(variant_path)) variant_path else fallback, .cwd(), private_model, std.testing.io, .{});
+    var node = try Node.init(a, .{ .models_dir = private_models, .max_concurrent_requests = 4 });
+    defer node.deinit();
+    const receipts = @import("../registry/managed_receipt.zig");
+    const digest = try node.chunkSpeakerRevision(private_model, std.testing.io, .{});
+    const model_stat = try std.Io.Dir.cwd().statFile(std.testing.io, private_model, .{});
+    const receipt = try std.json.Stringify.valueAlloc(a, receipts.DownloadReceipt{
+        .version = 2,
+        .source = .{ .owner = ref.owner, .name = ref.name, .variant = ref.variant, .resolved_revision = "0123456789012345678901234567890123456789" },
+        .artifacts = &.{.{ .path = ref.variant, .size = model_stat.size, .sha256 = &digest }},
+    }, .{});
+    defer a.free(receipt);
+    const receipt_path = try std.fs.path.join(a, &.{ private_dir, receipts.complete_filename });
+    defer a.free(receipt_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = receipt_path, .data = receipt });
+    const fixture_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, platform.env.getenv("ANTFLY_TEST_SPEAKER_AUDIO") orelse "../../e2e/inference/testdata/whisper_quality.wav", a, .limited(16 * 1024 * 1024));
+    defer a.free(fixture_bytes);
+    var fixture = try audio_mod.decodeBounded(a, fixture_bytes, .{}, 16 * 1024 * 1024);
+    defer fixture.deinit();
+    const pcm = try audio_mod.copyOrResample(a, fixture.samples, fixture.sample_rate, 16000);
+    defer a.free(pcm);
+    const samples = try a.alloc(f32, 120000);
+    defer a.free(samples);
+    for (samples[0..48000], 0..) |*sample, i| sample.* = pcm[i % pcm.len];
+    @memset(samples[48000..72000], 0);
+    @memcpy(samples[72000..], samples[0..48000]);
+    const encoded = try audio_mod.wav.encodeInterleaved(a, samples, 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
+    defer a.free(encoded);
+    const Capture = struct {
+        count: usize = 0,
+        node: ?*Node = null,
+        first_runs: u64 = 0,
+        expected_outputs: usize = 1,
+        compare_outputs: bool = true,
+        coordinates: [16]lib_chunker.planning.Coordinates = undefined,
+        labels: [16]?u32 = undefined,
+        fn accept(raw: *anyopaque, item: @import("../pipelines/media_chunking.zig").Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.count < self.coordinates.len);
+            try std.testing.expect(item.embedding == null);
+            try std.testing.expectEqual(self.expected_outputs, item.outputs.len);
+            if (self.count == 0) if (self.node) |node_| {
+                self.first_runs = node_.speaker_analysis_model_runs.load(.monotonic);
+            };
+            for (item.outputs) |output| {
+                try std.testing.expect(output.kind == .diarize and output.status == .complete and output.speaker_scope == .source);
+                if (self.compare_outputs) try std.testing.expectEqualDeep(item.outputs[0].speaker_spans.?, output.speaker_spans.?);
+            }
+            try std.testing.expect(item.outputs[0].kind == .diarize and item.outputs[0].status == .complete);
+            try std.testing.expect(item.outputs[0].speaker_scope == .source);
+            try std.testing.expect(item.outputs[0].spans == null);
+            self.coordinates[self.count] = item.descriptor.coordinates;
+            self.labels[self.count] = item.outputs[0].speaker_spans.?[0].speaker_index;
+            self.count += 1;
+        }
+    };
+    const target = lib_chunker.outputs.Target{ .name = "voices", .kind = .diarize, .model = lib_chunker.diarization.default_model };
+    var request = chunk_response.Request{ .input = .{ .binary = .{ .mime_type = "audio/wav", .data = encoded } }, .outputs = .{ .boundary_model = "voices", .targets = &.{target} }, .policy = .{ .audio_speaker_turns = true, .window_ns = 2 * std.time.ns_per_s } };
+    var full = Capture{ .node = &node };
+    const result = try node.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &full, .accept = Capture.accept });
+    if (result.failure) |err| return err;
+    try std.testing.expect(result.summary.complete);
+    const baseline_runs = node.speaker_analysis_model_runs.load(.monotonic);
+    try std.testing.expect(full.first_runs > 0 and full.first_runs < baseline_runs);
+    try std.testing.expect(full.count >= 4);
+    try std.testing.expectEqual(@as(?u32, 0), full.labels[0]);
+    try std.testing.expectEqual(@as(?u32, 0), full.labels[full.count - 1]);
+    var silence = false;
+    for (full.labels[0..full.count]) |label| silence = silence or label == null;
+    try std.testing.expect(silence);
+    const baseline_hashes = node.speaker_revision_cache.full_hashes.load(.monotonic);
+    try std.testing.expectEqual(@as(u64, 1), node.speaker_models.imports.load(.monotonic));
+    const old_budget = request.max_working_bytes;
+    request.max_working_bytes = 512 * 1024;
+    const baseline_disk_reads = node.media_speaker_store.full_reads.load(.monotonic);
+    request.max_chunks = 1;
+    var ordinal: u64 = 0;
+    var cursor: [85]u8 = undefined;
+    while (ordinal < full.count) {
+        var page = Capture{};
+        request.continuation = if (ordinal == 0) null else result.summary.identity.cursor(ordinal, &cursor);
+        const resumed = try node.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &page, .accept = Capture.accept });
+        if (resumed.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 1), page.count);
+        try std.testing.expectEqualDeep(full.coordinates[@intCast(ordinal)], page.coordinates[0]);
+        try std.testing.expectEqual(full.labels[@intCast(ordinal)], page.labels[0]);
+        ordinal = resumed.summary.next_ordinal;
+    }
+    try std.testing.expectEqual(baseline_runs, node.speaker_analysis_model_runs.load(.monotonic));
+    try std.testing.expectEqual(baseline_hashes, node.speaker_revision_cache.full_hashes.load(.monotonic));
+    try std.testing.expectEqual(baseline_disk_reads, node.media_speaker_store.full_reads.load(.monotonic));
+    request.max_working_bytes = old_budget;
+    var restarted = try Node.init(a, .{ .models_dir = private_models, .max_concurrent_requests = 1 });
+    defer restarted.deinit();
+    request.continuation = result.summary.identity.cursor(2, &cursor);
+    var recovered = Capture{};
+    const recovery = try restarted.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &recovered, .accept = Capture.accept });
+    if (recovery.failure) |err| return err;
+    try std.testing.expectEqualDeep(full.coordinates[2], recovered.coordinates[0]);
+    try std.testing.expectEqual(@as(u64, 0), restarted.speaker_analysis_model_runs.load(.monotonic));
+    // Persist a partial registry, then finish it in another node. Only the
+    // remaining model windows may execute, with the same labels and boundaries.
+    request.source_version = "partial-recovery";
+    request.continuation = null;
+    var partial = Capture{};
+    const partial_result = try node.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &partial, .accept = Capture.accept });
+    if (partial_result.failure) |err| return err;
+    const partial_runs = node.speaker_analysis_model_runs.load(.monotonic) - baseline_runs;
+    try std.testing.expect(partial_runs > 0 and partial_runs < baseline_runs);
+    ordinal = partial_result.summary.next_ordinal;
+    while (ordinal < full.count) {
+        var resumed_capture = Capture{};
+        request.continuation = partial_result.summary.identity.cursor(ordinal, &cursor);
+        const continued = try restarted.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &resumed_capture, .accept = Capture.accept });
+        if (continued.failure) |err| return err;
+        try std.testing.expectEqualDeep(full.coordinates[@intCast(ordinal)], resumed_capture.coordinates[0]);
+        try std.testing.expectEqual(full.labels[@intCast(ordinal)], resumed_capture.labels[0]);
+        ordinal = continued.summary.next_ordinal;
+    }
+    const remaining_runs = restarted.speaker_analysis_model_runs.load(.monotonic);
+    try std.testing.expectEqual(baseline_runs, partial_runs + remaining_runs);
+    const before_shared_runs = node.speaker_analysis_model_runs.load(.monotonic);
+    // Different output names share one cold analysis and one set of centroids.
+    var targets = [_]lib_chunker.outputs.Target{ target, .{ .name = "also-voices", .kind = .diarize, .model = target.model } };
+    request.outputs = .{ .boundary_model = "voices", .targets = &targets };
+    request.continuation = null;
+    request.max_chunks = 0;
+    request.source_version = "shared-analysis";
+    var shared = Capture{ .expected_outputs = 2 };
+    const sharing = try node.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &shared, .accept = Capture.accept });
+    if (sharing.failure) |err| return err;
+    const shared_runs = node.speaker_analysis_model_runs.load(.monotonic) - before_shared_runs;
+    try std.testing.expectEqual(baseline_runs, shared_runs);
+    // Different clustering configurations still share their model embeddings.
+    targets[1].diarization = .{ .min_rms = 0.02 };
+    request.source_version = "shared-embeddings";
+    var configured = Capture{ .expected_outputs = 2, .compare_outputs = false };
+    const variant = try node.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &configured, .accept = Capture.accept });
+    if (variant.failure) |err| return err;
+    const configured_runs = node.speaker_analysis_model_runs.load(.monotonic) - before_shared_runs - shared_runs;
+    try std.testing.expectEqual(baseline_runs, configured_runs);
+    // Four overlapping requests for a new source share each accepted prefix.
+    const Concurrent = struct {
+        node: *Node,
+        request: chunk_response.Request,
+        ready: *std.atomic.Value(usize),
+        go: *std.atomic.Value(bool),
+        failure: ?anyerror = null,
+        capture: Capture = .{},
+        fn run(self: *@This()) void {
+            _ = self.ready.fetchAdd(1, .release);
+            while (!self.go.load(.acquire)) std.atomic.spinLoopHint();
+            const value = self.node.chunkAndEmbedDirect(std.testing.allocator, std.testing.io, .{}, self.request, .{ .model = lib_chunker.diarization.default_model }, .{ .context = &self.capture, .accept = Capture.accept }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.failure = value.failure;
+        }
+    };
+    request.outputs = .{ .boundary_model = "voices", .targets = &.{target} };
+    request.source_version = "concurrent-shared-analysis";
+    var ready: std.atomic.Value(usize) = .init(0);
+    var go: std.atomic.Value(bool) = .init(false);
+    var concurrent: [4]Concurrent = undefined;
+    var threads: [4]std.Thread = undefined;
+    const before_concurrent = node.speaker_analysis_model_runs.load(.monotonic);
+    for (&concurrent, &threads) |*worker, *thread| {
+        worker.* = .{ .node = &node, .request = request, .ready = &ready, .go = &go };
+        thread.* = try std.Thread.spawn(.{}, Concurrent.run, .{worker});
+    }
+    while (ready.load(.acquire) != threads.len) std.atomic.spinLoopHint();
+    go.store(true, .release);
+    for (threads) |thread| thread.join();
+    for (&concurrent) |*worker| {
+        if (worker.failure) |err| return err;
+        try std.testing.expectEqual(full.count, worker.capture.count);
+        try std.testing.expectEqualDeep(full.coordinates[0..full.count], worker.capture.coordinates[0..full.count]);
+        try std.testing.expectEqualDeep(full.labels[0..full.count], worker.capture.labels[0..full.count]);
+    }
+    const concurrent_runs = node.speaker_analysis_model_runs.load(.monotonic) - before_concurrent;
+    try std.testing.expectEqual(baseline_runs, concurrent_runs);
+    try std.testing.expectEqual(baseline_hashes, node.speaker_revision_cache.full_hashes.load(.monotonic));
+    const before_silence = node.speaker_analysis_preprocess_runs.load(.monotonic);
+    var silent_target = target;
+    silent_target.diarization = .{ .min_rms = 1 };
+    request.outputs = .{ .boundary_model = "voices", .targets = &.{silent_target} };
+    request.source_version = "all-silent-preprocessing";
+    var silent_capture = Capture{};
+    const silent_result = try node.chunkAndEmbedDirect(a, std.testing.io, .{}, request, .{ .model = target.model }, .{ .context = &silent_capture, .accept = Capture.accept });
+    if (silent_result.failure) |err| return err;
+    try std.testing.expect(silent_result.summary.complete);
+    try std.testing.expectEqual(before_silence, node.speaker_analysis_preprocess_runs.load(.monotonic));
+    try std.testing.expectEqual(before_concurrent + concurrent_runs, node.speaker_analysis_model_runs.load(.monotonic));
+    std.debug.print("speaker concurrent_requests=4 concurrent_model_runs={d} warm_full_hashes=0\n", .{concurrent_runs});
+    std.debug.print("speaker performance first_chunk_runs={d} full_runs={d} warm_page_runs=0 restart_runs=0 shared_outputs_runs={d} shared_configurations_runs={d} partial_restart_runs={d}\n", .{ full.first_runs, baseline_runs, shared_runs, configured_runs, remaining_runs });
+}
+
+test "model aware media speaker planning skips disabled secondary analysis" {
+    const targets = [_]lib_chunker.outputs.Target{ .{ .name = "boundary", .kind = .diarize, .model = "speaker", .execute = false }, .{ .name = "optional", .kind = .diarize, .model = "another-speaker" } };
+    var execution = MediaOutputExecution{ .node = undefined, .io = std.testing.io, .control = .{}, .config = .{ .boundary_model = "boundary", .targets = &targets }, .speaker_turns = true, .speaker_outputs = false };
+    try std.testing.expect(execution.wantsSpeakerAnalysis(targets[0]));
+    try std.testing.expect(!execution.wantsSpeakerAnalysis(targets[1]));
+    execution.speaker_turns = false;
+    try std.testing.expect(!execution.wantsSpeakerAnalysis(targets[0]));
+    execution.speaker_outputs = true;
+    try std.testing.expect(execution.wantsSpeakerAnalysis(targets[1]));
+}
+
+test "model aware media complete speaker timelines borrow pinned cache storage without copying" {
+    const Cache = @import("../pipelines/media_index_cache.zig").Cache;
+    const a = std.testing.allocator;
+    const Admission = struct {
+        controller: @import("../runtime/tier/memory.zig").AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
+        }
+    };
+    var admission: Admission = .{};
+    var cache: Cache = .{};
+    defer cache.deinit();
+    const registry = try a.create(lib_chunker.diarization.Registry);
+    defer a.destroy(registry);
+    registry.* = .{ .count = 1 };
+    registry.sums[0][0] = 1;
+    const snapshot = MediaOutputExecution.speaker_checkpoint.Snapshot{ .registry = registry, .spans = &.{.{ .start_ns = 0, .end_ns = 1500 * std.time.ns_per_ms, .speaker_index = 0 }}, .sample_rate = 16000, .next_window = 1, .covered_samples = 24000, .total_samples = 24000, .complete = true };
+    var timeline: MediaOutputExecution.speaker_checkpoint.timeline.Timeline = .{};
+    defer timeline.deinit(a);
+    for (snapshot.spans) |span| try timeline.append(a, span);
+    var shared_snapshot = snapshot;
+    shared_snapshot.spans = &.{};
+    shared_snapshot.shared = timeline.view();
+    cache.remember(a, @splat(7), .{ .speaker_analysis = shared_snapshot }, .{ .context = &admission, .acquire = Admission.acquire });
+    const entry = cache.get(@splat(7)).?;
+    const state = try a.create(MediaOutputExecution.SpeakerState);
+    defer a.destroy(state);
+    state.* = .{};
+    try state.borrowComplete(a, entry);
+    defer state.timeline.deinit(a);
+    try std.testing.expect(state.timeline.view().blocks[0] == entry.data.speaker_analysis.shared.?.blocks[0]);
+    try std.testing.expectEqual(@as(usize, 0), Cache.reclaim(&cache, Cache.max_bytes));
+    try std.testing.expectEqualDeep(snapshot.registry.sums[0], state.registry.sums[0]);
+    cache.release(state.borrowed.?);
+    try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
+    try std.testing.expectEqual(@as(usize, 0), admission.controller.snapshot().hostTotalBytes());
+}
+
+test "deployment request limits narrow executor plans without widening manifest bounds" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .request_limits = .{ .max_items_per_request = 1, .max_input_tokens_per_item = 8192, .max_output_tokens_per_item = 1024, .max_decoded_pixels_per_batch = 4_194_304 } });
+    defer node.deinit();
+    var capabilities = [_][]const u8{"inference.limits.max_input_tokens_per_item=4096"};
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .generator, .capabilities = &capabilities };
+    const contract = try resolvedInferenceExecutorContract(&node, "generate", &manifest);
+    try std.testing.expectEqual(@as(?usize, 1), contract.max_items_per_request);
+    try std.testing.expectEqual(@as(?usize, 4096), contract.batch.max_input_tokens_per_item);
+    try std.testing.expectEqual(@as(?usize, 1024), contract.batch.max_output_tokens_per_item);
+    try std.testing.expectError(error.InferenceInputTokensExceeded, validateInferenceExecutorInvocation(contract, .{ .has_text = true, .input_tokens_per_item = 4097 }));
+    try std.testing.expectError(error.InvalidInferenceConfig, (RequestLimits{ .max_output_tokens_per_item = 0 }).validate());
+}
+
+test "reader media budget admits a full scan independently of single request concurrency" {
+    var node = try Node.init(std.testing.allocator, .{
+        .max_concurrent_requests = 1,
+        .max_work_units = 8,
+        .content_security = .{ .max_image_dimension = 2048, .max_download_size_bytes = 12 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    const admission = readRequestAdmission(&node, 1, 0, 1024);
+    try std.testing.expect(admission.decoded_pixel_cap >= 2048 * 2048);
+    try node.inference_admission.acquireRequestSlot();
+    defer node.inference_admission.releaseRequestSlot();
+    try node.inference_admission.reserveUnits(admission.units);
+    defer node.inference_admission.releaseReservedUnits(admission.units);
+    try std.testing.expectError(error.QueueFull, node.inference_admission.acquireRequestSlot());
+}
+
+/// Only omitted output lengths are narrowed automatically; explicit requests
+/// retain their value so invocation validation can report a policy violation.
+fn boundedReadOutputTokens(requested: ?usize, model_default: usize, ceiling: ?usize) usize {
+    return requested orelse if (ceiling) |limit| @min(model_default, limit) else model_default;
+}
+
+test "omitted reader output tokens resolve before execution and explicit excess is rejected" {
+    try std.testing.expectEqual(@as(usize, 64), boundedReadOutputTokens(null, 256, 64));
+    try std.testing.expectEqual(@as(usize, 64), boundedReadOutputTokens(null, 4096, 64));
+    try std.testing.expectEqual(@as(usize, 256), boundedReadOutputTokens(null, 256, 1024));
+    try std.testing.expectEqual(@as(usize, 65), boundedReadOutputTokens(65, 256, 64));
+    const contract: ResolvedInferenceExecutorContract = .{
+        .task = "read",
+        .max_items_per_request = 1,
+        .batch = .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_encoded_media_bytes = 1024, .max_output_tokens_per_item = 64, .max_decoded_pixels = null, .max_media_parts_per_item = 1, .per_item_failures = true },
+        .accepts_text = true,
+        .accepts_image = true,
+        .accepts_audio = false,
+        .accepts_document = false,
+    };
+    try validateInferenceExecutorInvocation(contract, .{ .output_tokens_per_item = boundedReadOutputTokens(null, 4096, 64) });
+    try std.testing.expectError(error.InferenceBatchTooLarge, validateInferenceExecutorInvocation(contract, .{ .item_count = 2 }));
+    try validateInferenceExecutorInvocation(contract, .{ .item_count = 2, .internal_microbatch = true });
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, validateInferenceExecutorInvocation(contract, .{ .output_tokens_per_item = boundedReadOutputTokens(65, 4096, 64) }));
+}
+
+fn validateMeasuredReadPrompt(contract: ResolvedInferenceExecutorContract, actual_input_tokens: usize, output_tokens: usize) !void {
+    try validateInferenceExecutorInvocation(contract, .{
+        .input_tokens_per_item = actual_input_tokens,
+        .output_tokens_per_item = output_tokens,
+        .has_image = true,
+    });
+}
+
+test "LightOn measured prompt policy rejects expanded input before page execution" {
+    const contract: ResolvedInferenceExecutorContract = .{
+        .task = "read",
+        .batch = .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_encoded_media_bytes = 1024, .max_input_tokens_per_item = 32, .max_output_tokens_per_item = 64, .max_decoded_pixels = null, .max_media_parts_per_item = 1, .per_item_failures = true },
+        .accepts_text = true,
+        .accepts_image = true,
+        .accepts_audio = false,
+        .accepts_document = false,
+    };
+    try validateMeasuredReadPrompt(contract, 32, 64);
+    try std.testing.expectError(error.InferenceInputTokensExceeded, validateMeasuredReadPrompt(contract, 33, 64));
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, validateMeasuredReadPrompt(contract, 32, 65));
+}
+
+test "generate batch HTTP enforces public cardinality before dispatch" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .request_limits = .{ .max_items_per_request = 1 } });
+    defer node.deinit();
+    resetRequestWorkTestCounters();
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/generate/batch");
+    defer request.deinit();
+    try request.setJson(
+        \\{"requests":[{"custom_id":"one","body":{"model":"missing","messages":[]}},{"custom_id":"two","body":{"model":"missing","messages":[]}}]}
+    );
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.generateBatchContent(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 413), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "BATCH_TOO_LARGE") != null);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "grouped embedding request rejects aggregate pixels before model loading in direct and HTTP paths" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .request_limits = .{ .max_decoded_pixels_per_batch = 1 } });
+    defer node.deinit();
+    var inputs = [_][]const u8{"image"};
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &inputs };
+    const contract = try resolvedInferenceExecutorContract(&node, "embed", &manifest);
+    // Each valid PNG contains one pixel and fits individually. The two groups
+    // exceed the request ceiling even if the executor would process them serially.
+    var input = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"}}]},{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"}}]}]
+    , .{});
+    defer input.deinit();
+    try std.testing.expectError(error.InferenceDecodedPixelsExceeded, node.embedGroupsFromPath(a, std.testing.io, "missing-model", &manifest, contract, input.value, .{}, .{}, 4096));
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    for ([_]EmbedErrorPolicy{ .fail_fast, .per_item }) |policy| {
+        try std.testing.expectError(error.InferenceDecodedPixelsExceeded, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = input.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &.{}, 4096, .{}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+}
+
+test "grouped embedding request aggregate allows the exact boundary and checks overflow" {
+    var node = try Node.init(std.testing.allocator, .{ .request_limits = .{ .max_decoded_pixels_per_batch = 6 } });
+    defer node.deinit();
+    var inputs = [_][]const u8{"image"};
+    const manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &inputs };
+    const contract = try resolvedInferenceExecutorContract(&node, "embed", &manifest);
+    var budget: EmbeddingGroupRequestBudget = .{};
+    try budget.add(.{ .decoded_pixels = 3 });
+    try budget.add(.{ .decoded_pixels = 3 });
+    try budget.validate(contract, 2);
+    try budget.add(.{ .decoded_pixels = 1 });
+    try std.testing.expectError(error.InferenceDecodedPixelsExceeded, budget.validate(contract, 2));
+    budget.decoded_pixels = std.math.maxInt(u64);
+    try std.testing.expectError(error.InferenceDecodedPixelsExceeded, budget.add(.{ .decoded_pixels = 1 }));
+}
+
+test "Whisper HTTP pipelines inherit narrowed output policy and preserve typed failures" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .request_limits = .{ .max_output_tokens_per_item = 64 } });
+    defer node.deinit();
+    var inputs = [_][]const u8{"audio"};
+    var capabilities = [_][]const u8{"inference.limits.max_output_tokens_per_item=32"};
+    var ids: [0]whisper_prompt_mod.ForcedDecoderId = .{};
+    var languages: [0]whisper_prompt_mod.LanguageToken = .{};
+    const cache = whisper_prompt_mod.PromptCache{ .allocator = a, .automatic_ids = &ids, .language_tokens = &languages, .transcribe_id = 50359, .no_timestamps_id = 50363 };
+    var whisper = Node.WhisperRuntime{ .node = &node, .allocator = a, .prompt_cache = &cache, .manifest = .{ .allocator = a, .model_type = .transcriber, .inputs = &inputs, .capabilities = &capabilities } };
+    var pipeline = try whisper.pipeline(null, 1024, .{}, false, .full);
+    try std.testing.expectEqual(@as(?usize, 32), pipeline.output_token_budget.remaining);
+    pipeline.output_token_budget.remaining = 0;
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, pipeline.transcribePcmConditioned(&.{0.1}, 16000, &.{}));
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/transcribe");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try inferenceExecutorContractFailureResponse(&ctx, error.InferenceOutputTokensExceeded);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 413), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "OUTPUT_TOKEN_LIMIT_EXCEEDED") != null);
 }

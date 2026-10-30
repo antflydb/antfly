@@ -57,6 +57,14 @@ pub const Digest = struct {
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
         return .{ .size_bytes = bytes.len, .sha256 = std.fmt.bytesToHex(digest, .lower) };
     }
+    /// Authenticate a complete existing file mapping with sequential readahead,
+    /// then restore the sparse-access policy used by inference weight reads.
+    pub fn ofMapped(bytes: []const u8) Digest {
+        const file = @import("../util/c_file.zig");
+        file.MmapRegion.adviseBytesSequential(bytes);
+        defer file.MmapRegion.adviseBytesRandom(bytes);
+        return of(bytes);
+    }
     pub fn verify(self: Digest, expected: FilePin) !void {
         if (self.size_bytes != expected.size_bytes or !std.mem.eql(u8, &self.sha256, expected.sha256))
             return error.GlinerBoundaryArtifactMismatch;

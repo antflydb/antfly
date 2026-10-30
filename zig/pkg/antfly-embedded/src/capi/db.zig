@@ -493,7 +493,7 @@ pub fn litePhysicalIndexConfigJson(
 /// dense_vector/sparse_vector: `indexesJsonNeedsAssetProducer`/
 /// `indexesJsonHasGeneratedEnrichment` recursively scan the whole merged
 /// object for a nested `"kind":"asset","producer_json":...}` object (see
-/// examples/dogfood's knowledgeGraphIndexJSON, which declares the graph
+/// examples/antfly-docs-knowledge-base's knowledgeGraphIndexJSON, which declares the graph
 /// index's extractor exactly that way, under an "artifact" key inside the
 /// graph index's own config), so a graph/full_text/algebraic index must not
 /// be filtered out here even though `managed_embedder.zig`'s embedder
@@ -777,6 +777,10 @@ pub const HandleAccess = enum {
     catalog,
 };
 
+/// Persistent storage intent is independent of API locking. SQL reads still
+/// need exclusive access to their session/cursor registries.
+pub const StorageIntent = enum { read_only, mutation };
+
 /// Held for the duration of one export call; see `enterHandle`.
 pub const HandleGuard = struct {
     handle: *Handle,
@@ -784,6 +788,8 @@ pub const HandleGuard = struct {
     parent_slot: ?*HandleRegistry.Slot = null,
     lock_handle: *Handle,
     access: HandleAccess,
+    // Cancellation after backoff can return registry pins without API locks.
+    access_held: bool = true,
     connection: ?*@import("lite_connection.zig").Connection = null,
     path_lease: ?lite_backend.native.PathWriterLock = null,
     connection_gate_held: bool = false,
@@ -833,6 +839,20 @@ pub const HandleGuard = struct {
     }
 
     pub fn leave(self: HandleGuard) void {
+        self.leaveWithRegistry(true);
+    }
+
+    /// The caller retains its HandleEntry pins through independent plan teardown.
+    fn leaveAccess(self: HandleGuard) void {
+        self.leaveWithRegistry(false);
+    }
+
+    fn leaveWithRegistry(self: HandleGuard, comptime release_registry: bool) void {
+        defer if (release_registry) {
+            if (self.parent_slot) |slot| HandleRegistry.leave(slot);
+            HandleRegistry.leave(self.slot);
+        };
+        if (!self.access_held) return;
         const io = handleLockIo();
         if (self.suspended_query_root) |root| {
             const connection = self.connection.?;
@@ -840,8 +860,6 @@ pub const HandleGuard = struct {
             root.query_borrows -= 1;
             connection.collectRetired();
             connection.gate.mutex.unlock(io);
-            if (self.parent_slot) |slot| HandleRegistry.leave(slot);
-            HandleRegistry.leave(self.slot);
             return;
         }
         if (self.connection) |connection| {
@@ -865,8 +883,6 @@ pub const HandleGuard = struct {
             }
             if (self.connection_gate_held) connection.gate.mutex.unlock(io);
             connection.mutex.unlock(io);
-            if (self.parent_slot) |slot| HandleRegistry.leave(slot);
-            HandleRegistry.leave(self.slot);
             return;
         }
         switch (self.access) {
@@ -881,8 +897,6 @@ pub const HandleGuard = struct {
             },
             .exclusive, .catalog => self.lock_handle.api_lock.unlock(io),
         }
-        if (self.parent_slot) |slot| HandleRegistry.leave(slot);
-        HandleRegistry.leave(self.slot);
     }
 };
 
@@ -907,28 +921,130 @@ fn catalogOwnershipError(err: anyerror) capi.ErrorCode {
 /// export, at entry: the lock is not reentrant, so internal helpers must not
 /// call it again.
 pub fn enterHandle(ptr: ?*anyopaque, access: HandleAccess) ?HandleGuard {
-    return enterHandleInternal(ptr, access, false);
+    return enterHandleWithIntent(ptr, access, if (access == .read) .read_only else .mutation);
+}
+
+pub fn enterHandleWithIntent(ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent) ?HandleGuard {
+    const entry = HandleEntry.capture(ptr) orelse return null;
+    return enterWithAdmissionRetry(entry, ptr, access, intent, false);
+}
+
+/// Prepared SQL retains its original registry pins until preparation memory is
+/// freed. These pins keep the connection/preparation budget alive, not its
+/// current foreground runtime. Path/API locks are released during backoff, so
+/// refresh can proceed; close waits until preparation is freed as for any call.
+/// Ordinary exports release and recapture their pins between attempts.
+fn enterWithAdmissionRetry(initial: HandleEntry, ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent, comptime retain_entry: bool) ?HandleGuard {
+    const connection = initial.lock_handle.lite_connection orelse return enterCapturedHandle(initial, access, intent, false);
+    const timeout_ms = connection.options.busy_timeout_ms;
+    if (timeout_ms == 0) return enterCapturedHandle(initial, access, intent, false);
+    const io = handleLockIo();
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    const deadline = started + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    var entry = initial;
+    var guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline);
+    defer if (intent == .mutation and guard.entry_error == null) {
+        // Successful admission still owns the path gate. Count this admission,
+        // including retries and proof work. Resuming a suspended operation is
+        // another admission; these are not counts of unique exported calls.
+        std.debug.assert(guard.connection_gate_held);
+        const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started));
+        const stats = &guard.connection.?.owner.publication_stats;
+        stats.mutation_admission_count +|= 1;
+        stats.mutation_admission_ns +|= elapsed;
+        stats.mutation_admission_max_ns = @max(stats.mutation_admission_max_ns, elapsed);
+        stats.mutation_admission_log2_ns[std.math.log2_int(u64, @max(1, elapsed))] +|= 1;
+    };
+    var backoff: i96 = std.time.ns_per_ms;
+    const test_sleep = if (builtin.is_test) connection.test_admission_sleep else {};
+    // Capacity-limited reads can also need a proof. Only admission is retried:
+    // the exported operation has not executed yet.
+    while (guard.entry_error == .busy) {
+        const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+        if (remaining <= 0) return guard;
+        guard.leaveWithRegistry(!retain_entry);
+        const delay = std.Io.Duration.fromNanoseconds(@min(backoff, remaining));
+        const slept = if (comptime builtin.is_test) blk: {
+            if (test_sleep) |hook| break :blk hook.sleep(hook.ptr, delay);
+            break :blk io.sleep(delay, .awake);
+        } else io.sleep(delay, .awake);
+        if (!retain_entry) entry = HandleEntry.capture(ptr) orelse return null;
+        // Cancellation must not reacquire a path lease or begin another proof.
+        slept catch |err| return entry.failedGuard(access, capi.mapErrorContext(err, @src().fn_name));
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline)
+            return entry.failedGuard(access, capi.mapError(error.FileBusy));
+        // An expired backoff cannot start a new admission attempt. A proof
+        // already in progress may still finish and take an uncontended lease.
+        guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline);
+        if (guard.entry_error == null) capi.clearLastError();
+        backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
+    }
+    return guard;
 }
 
 /// Cursor continuation uses a previously pinned immutable generation.
 pub fn enterHandlePinned(ptr: ?*anyopaque, access: HandleAccess) ?HandleGuard {
-    return enterHandleInternal(ptr, access, true);
+    return enterHandleInternal(ptr, access, .read_only, true);
 }
 
-fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?HandleGuard {
-    const handle, const slot = handleRegistry().enter(ptr) orelse return null;
-    var parent_slot: ?*HandleRegistry.Slot = null;
-    const lock_handle = if (handle.parent_id) |id| blk: {
-        const parent, const parent_entry = handleRegistry().enter(id) orelse {
-            HandleRegistry.leave(slot);
-            return null;
-        };
-        parent_slot = parent_entry;
-        break :blk parent;
-    } else handle;
+/// Registry pins are acquired before preparation. They keep the connection,
+/// path admission budget, and non-Lite root alive until all plan bytes are freed.
+/// Ordinary guards consume these references. Prepared calls instead release
+/// access with leaveAccess, tear down the plan, then release the pins explicitly.
+const HandleEntry = struct {
+    handle: *Handle,
+    slot: *HandleRegistry.Slot,
+    lock_handle: *Handle,
+    parent_slot: ?*HandleRegistry.Slot,
+
+    fn capture(ptr: ?*anyopaque) ?HandleEntry {
+        const handle, const slot = handleRegistry().enter(ptr) orelse return null;
+        var parent_slot: ?*HandleRegistry.Slot = null;
+        const lock_handle = if (handle.parent_id) |id| blk: {
+            const parent, const parent_entry = handleRegistry().enter(id) orelse {
+                HandleRegistry.leave(slot);
+                return null;
+            };
+            parent_slot = parent_entry;
+            break :blk parent;
+        } else handle;
+        return .{ .handle = handle, .slot = slot, .lock_handle = lock_handle, .parent_slot = parent_slot };
+    }
+    fn failedGuard(self: HandleEntry, access: HandleAccess, code: capi.ErrorCode) HandleGuard {
+        return .{ .handle = self.handle, .slot = self.slot, .parent_slot = self.parent_slot, .lock_handle = self.lock_handle, .access = access, .access_held = false, .entry_error = code };
+    }
+    fn release(self: HandleEntry) void {
+        if (self.parent_slot) |slot| HandleRegistry.leave(slot);
+        HandleRegistry.leave(self.slot);
+    }
+    fn preparationAdmission(self: HandleEntry) *@import("sql.zig").PreparationAdmission {
+        if (self.lock_handle.lite_connection) |connection| return &connection.gate.sql_preparation;
+        return &self.lock_handle.sql_preparation;
+    }
+};
+
+fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent, pinned: bool) ?HandleGuard {
+    return enterCapturedHandle(HandleEntry.capture(ptr) orelse return null, access, intent, pinned);
+}
+
+fn enterCapturedHandle(entry: HandleEntry, access: HandleAccess, intent: StorageIntent, pinned: bool) HandleGuard {
+    return enterCapturedHandleWithDeadline(entry, access, intent, pinned, null);
+}
+
+fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, intent: StorageIntent, pinned: bool, deadline: ?i96) HandleGuard {
+    const handle = entry.handle;
+    const slot = entry.slot;
+    const lock_handle = entry.lock_handle;
+    const parent_slot = entry.parent_slot;
     if (lock_handle.lite_connection) |connection| {
         connection.mutex.lockUncancelable(handleLockIo());
         var guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = access, .connection = connection };
+        connection.admission_deadline_ns = deadline;
+        defer connection.admission_deadline_ns = null;
+        // An attempt already in progress may spend time queued locally or
+        // proving the allocator. Its first lease try must still be allowed;
+        // only contention waits consult the deadline. The retry loop checks
+        // expiry before starting a new attempt after backoff.
         if (!pinned) {
             guard.path_lease = connection.acquire() catch |err| {
                 guard.entry_error = capi.mapError(err);
@@ -936,7 +1052,7 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
             };
         } else connection.gate.mutex.lockUncancelable(handleLockIo());
         guard.connection_gate_held = true;
-        const root = (if (pinned) connection.pin() else connection.refresh(&guard.path_lease)) catch |err| {
+        const root = (if (pinned) connection.pin() else connection.refresh(&guard.path_lease, intent)) catch |err| {
             guard.entry_error = capi.mapError(err);
             return guard;
         };
@@ -5800,17 +5916,34 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
         return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_json), .{ .name = "antfly_db_sql_json" }), .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
     out_buf.* = .{};
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const entry = HandleEntry.capture(handle_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    // Free independent preparation memory outside the API/path gates, but
+    // retain these pins until every byte is refunded to its stable owner.
+    defer entry.release();
+    const admission = entry.preparationAdmission();
+    var budget = admission.budget(std.heap.c_allocator);
+    var prepared = PreparedEmbeddedSql.init(&budget, request_json.bytes());
+    defer if (prepared) |*value| value.deinit() else |_| {};
+    if (comptime builtin.is_test) if (admission.test_after_prepare) |hook|
+        hook.notify(hook.ptr, budget.live, budget.peak, if (prepared) |_| true else |_| false);
+    const intent: StorageIntent = if (prepared) |value|
+        (if (@import("sql.zig").statementMayMutate(value.compiled.statement)) .mutation else .read_only)
+    else |_|
+        .read_only;
+    const guard = enterWithAdmissionRetry(entry, handle_ptr, .exclusive, intent, true).?;
+    defer guard.leaveAccess();
     if (guard.entry_error) |code| {
-        guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
-    defer guard.leave();
     const handle = guard.handle;
     if (handle.parent_id != null) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": SQL sessions require a root database handle");
     // Managed owners require Raft routing and credentials supplied by API SQL.
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return capi.recordError(.unsupported, @src().fn_name ++ ": storage owner binding is already configured");
-    executeEmbeddedSql(handle, "default", request_json.bytes(), out_buf) catch |err| {
+    const result = if (prepared) |*value|
+        executePreparedEmbeddedSql(handle, "default", request_json.bytes(), &budget, value, out_buf)
+    else |err|
+        embeddedSqlPreparationFailure(handle, request_json.bytes(), err);
+    result catch |err| {
         if (err == error.RowPolicyAuthenticationRequired) return capi.recordError(.unsupported, @src().fn_name ++ ": row policy requires an authenticated identity");
         const diagnostic = antfly.capi_dependencies.sql_errors.describe(err);
         if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("Embedded SQL execution internal failure err={s}", .{@errorName(err)});
@@ -5821,40 +5954,73 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
     return .ok;
 }
 
+const EmbeddedSqlRequest = struct {
+    statement: []const u8,
+    parameters: []const std.json.Value = &.{},
+    limit: usize = 128,
+    session_id: ?u64 = null,
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+};
+const EmbeddedSqlBudget = antfly.capi_dependencies.sql_memory_budget;
+const PreparedEmbeddedSql = struct {
+    parsed: std.json.Parsed(EmbeddedSqlRequest),
+    compiled: @import("sql.zig").compiler.Compiled,
+
+    fn init(budget: *EmbeddedSqlBudget, request_json: []const u8) !PreparedEmbeddedSql {
+        if (request_json.len > @import("sql.zig").runtime.resource_limits.request_bytes) return error.SqlRequestTooLarge;
+        const a = budget.allocator();
+        var parsed = std.json.parseFromSlice(EmbeddedSqlRequest, a, request_json, .{ .allocate = .alloc_always }) catch |err| {
+            if (err == error.OutOfMemory) {
+                // A request-local program limit is distinct from shared
+                // preparation pressure (or a backing allocator failure).
+                return if (budget.exhausted) error.SqlWorkingMemoryLimitExceeded else err;
+            }
+            return error.InvalidSqlParameters;
+        };
+        errdefer parsed.deinit();
+        if (parsed.value.database != null or parsed.value.namespace != null) return error.UnsupportedSqlExecution;
+        const compiled = @import("sql.zig").compiler.compile(a, parsed.value.statement, .{}) catch |err| {
+            if (err == error.OutOfMemory and budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
+            return err;
+        };
+        return .{ .parsed = parsed, .compiled = compiled };
+    }
+    fn deinit(self: *PreparedEmbeddedSql) void {
+        self.compiled.deinit();
+        self.parsed.deinit();
+    }
+};
+
+fn embeddedSqlPreparationFailure(handle: *Handle, request_json: []const u8, failure: anyerror) anyerror!void {
+    // Preserve session validation and failed-transaction semantics even when
+    // schema-independent preparation failed before acquiring the handle.
+    const session = try @import("sql_session.zig").requestSession(handle, request_json);
+    if (session) |value| if (value.active) {
+        value.failed = true;
+    };
+    return failure;
+}
+
 pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json: []const u8, out_buf: *capi.Buffer) !void {
+    var budget = EmbeddedSqlBudget{ .backing = handle.alloc, .limit = @import("sql.zig").runtime.resource_limits.preparation_bytes };
+    var prepared = PreparedEmbeddedSql.init(&budget, request_json) catch |err| return embeddedSqlPreparationFailure(handle, request_json, err);
+    defer prepared.deinit();
+    return executePreparedEmbeddedSql(handle, table_name, request_json, &budget, &prepared, out_buf);
+}
+
+fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_json: []const u8, budget: *EmbeddedSqlBudget, prepared: *PreparedEmbeddedSql, out_buf: *capi.Buffer) !void {
     const session = try @import("sql_session.zig").requestSession(handle, request_json);
     errdefer if (session) |value| {
         if (value.active) value.failed = true;
     };
-    if (request_json.len > @import("sql.zig").runtime.resource_limits.request_bytes) return error.SqlRequestTooLarge;
-    // Lite has no authenticated principal capability. Hold a raw lease for
-    // the entire statement, including DDL paths that do not call row APIs,
-    // so policy activation cannot race an already-admitted SQL statement.
     var row_policy_lease = try handle.database().*.local_execution.row_policy_gate.enterRaw();
     defer row_policy_lease.release();
     const sql = @import("sql.zig");
-    const Budget = antfly.capi_dependencies.sql_memory_budget;
-    var preparation_budget = Budget{ .backing = handle.alloc, .limit = sql.runtime.resource_limits.preparation_bytes };
-    const temporary = preparation_budget.allocator();
-    const Request = struct {
-        statement: []const u8,
-        parameters: []const std.json.Value = &.{},
-        limit: usize = 128,
-        session_id: ?u64 = null,
-        database: ?[]const u8 = null,
-        namespace: ?[]const u8 = null,
-    };
-    var parsed = std.json.parseFromSlice(Request, temporary, request_json, .{ .allocate = .alloc_always }) catch |err| {
-        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
-        return error.InvalidSqlParameters;
-    };
-    defer parsed.deinit();
-    if (parsed.value.database != null or parsed.value.namespace != null) return error.UnsupportedSqlExecution;
-    var compiled = sql.compiler.compile(temporary, parsed.value.statement, .{}) catch |err| {
-        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
-        return err;
-    };
-    defer compiled.deinit();
+    const Budget = EmbeddedSqlBudget;
+    const temporary = budget.allocator();
+    const parsed = &prepared.parsed;
+    const compiled = &prepared.compiled;
     try requireEmbeddedSqlCatalogOwnership(handle, compiled.statement);
     // Allocate the fallback receipt before entering any commit path.
     var commit_receipt: ?[]u8 = switch (compiled.statement) {
@@ -5890,7 +6056,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
     }
     var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
-    var result = sql.runtime.execute(handle.alloc, adapter.backend(), &compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
+    var result = sql.runtime.execute(handle.alloc, adapter.backend(), compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
         if (err == error.SqlNotNullViolation or err == error.SqlUntranslatableCharacter) out_buf.* = try stringifyJson(.{ .@"error" = error_context.diagnostic(err) });
         if (err == error.SqlMutationOutcomeUnknown) if (adapter.outcome_transaction_id) |txn_id| {
             out_buf.* = embeddedSqlUnknownReceipt(&commit_receipt, txn_id);
@@ -7841,6 +8007,105 @@ test "capi resolver curation waits preserve accepted responses when capture fail
     }
 }
 
+test "capi resolver curation reports absorbed outcomes once per namespace" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try TestDirectory.init("resolver-absorbed-response");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    const root = try openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const handle = try publishHandle(root);
+    defer antfly_db_close(handle);
+    try @import("tables.zig").create(root, "entities", "{}", false);
+    // Two consumers share one namespace; the third has an overlapping one.
+    for (0..3) |i| try root.db.addResolver(.{
+        .name = try std.fmt.allocPrint(a, "r-{d}", .{i}),
+        .table = "entities",
+        .source_artifact = try std.fmt.allocPrint(a, "source-{d}", .{i}),
+        .resolution_artifact = try std.fmt.allocPrint(a, "resolved-{d}", .{i}),
+        .key_template = if (i < 2) "concept/{{_entity.text}}" else "concept/{{_key}}",
+        .aliases = if (i == 2) &.{.{ .key = "concept/annotation", .target = "concept/note" }} else &.{},
+        .promote = false,
+    });
+    var out: capi.Buffer = .{};
+    defer antfly_buffer_free(&out);
+    const Check = struct {
+        fn outcomes(alloc: std.mem.Allocator, buffer: capi.Buffer, disposition: []const u8, count: usize, configured: bool) !void {
+            const response = try std.json.parseFromSliceLeaky(std.json.Value, alloc, buffer.ptr.?[0..buffer.len], .{});
+            const namespaces = response.object.get("namespaces").?.array.items;
+            const rows = response.object.get("results").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), namespaces.len);
+            try std.testing.expectEqual(@as(usize, 3), rows.len);
+            var templates: std.StringHashMapUnmanaged(void) = .empty;
+            for (namespaces) |namespace| {
+                const template = namespace.object.get("key_template").?.string;
+                try std.testing.expect(!(try templates.getOrPut(alloc, template)).found_existing);
+                const absorbed = namespace.object.get("absorbed").?.array.items;
+                const extra: usize = if (count > 0 and configured and std.mem.eql(u8, template, "concept/{{_key}}")) 1 else 0;
+                try std.testing.expectEqual(count + extra, absorbed.len);
+                var keys: std.StringHashMapUnmanaged(void) = .empty;
+                for (absorbed) |item| {
+                    try std.testing.expect(!(try keys.getOrPut(alloc, item.object.get("key").?.string)).found_existing);
+                    try std.testing.expectEqualStrings(disposition, item.object.get("disposition").?.string);
+                }
+                if (count > 0) {
+                    try std.testing.expect(keys.contains("concept/notes"));
+                    try std.testing.expect(keys.contains("concept/noting"));
+                    try std.testing.expectEqual(extra == 1, keys.contains("concept/annotation"));
+                }
+            }
+            for (rows) |row| {
+                try std.testing.expect(!row.object.contains("absorbed"));
+                try std.testing.expect(templates.contains(row.object.get("key_template").?.string));
+            }
+        }
+    };
+    for ([_]struct { disposition: []const u8, reviewed: bool = false, configured: bool = false }{
+        .{ .disposition = "suppress", .configured = true },
+        .{ .disposition = "release" },
+        .{ .disposition = "suppress", .reviewed = true },
+    }) |fixture| {
+        const disposition = fixture.disposition;
+        for ([_]struct { from: []const u8, into: []const u8 }{
+            .{ .from = "concept/notes", .into = "concept/note" },
+            .{ .from = "concept/noting", .into = "concept/notes" },
+        }) |merge| {
+            antfly_buffer_free(&out);
+            const request = try std.fmt.allocPrint(a, "{{\"action\":\"merge\",\"into\":\"{s}\"}}", .{merge.into});
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_curate_entity_json(handle, .fromSlice("entities"), .fromSlice(merge.from), .fromSlice(request), &out));
+        }
+        antfly_buffer_free(&out);
+        const request = try std.fmt.allocPrint(a, "{{\"action\":\"suppress\",\"absorbed\":\"{s}\",\"actor\":\"user\",\"reason\":\"generic\",\"wait\":{{\"timeout_ms\":1000}}}}", .{disposition});
+        var proposal_id: ?[]const u8 = null;
+        if (fixture.reviewed) {
+            const proposal = try std.fmt.allocPrint(a, "{{\"action\":\"suppress\",\"key\":\"concept/note\",\"options\":{{\"absorbed\":\"{s}\"}}}}", .{disposition});
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_propose_curation_json(handle, .fromSlice("entities"), .fromSlice(proposal), &out));
+            const created = try std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+            proposal_id = created.object.get("id").?.string;
+            antfly_buffer_free(&out);
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_decide_curation_proposal_json(handle, .fromSlice("entities"), .fromSlice(proposal_id.?), .fromSlice("{\"accept\":true}"), &out));
+        } else {
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_curate_entity_json(handle, .fromSlice("entities"), .fromSlice("concept/note"), .fromSlice(request), &out));
+        }
+        try Check.outcomes(a, out, disposition, 2, fixture.configured);
+        antfly_buffer_free(&out);
+        // Retrying has no new cascade to report.
+        if (proposal_id) |id| {
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_decide_curation_proposal_json(handle, .fromSlice("entities"), .fromSlice(id), .fromSlice("{\"accept\":true}"), &out));
+            const retried = try std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{});
+            for (retried.object.get("results").?.array.items) |row| try std.testing.expect(!row.object.contains("absorbed"));
+        } else {
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_curate_entity_json(handle, .fromSlice("entities"), .fromSlice("concept/note"), .fromSlice(request), &out));
+            try Check.outcomes(a, out, disposition, 0, false);
+        }
+        for ([_][]const u8{ "concept/note", "concept/notes", "concept/noting", "concept/annotation" }) |key| {
+            antfly_buffer_free(&out);
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_curate_entity_json(handle, .fromSlice("entities"), .fromSlice(key), .fromSlice("{\"action\":\"unsuppress\"}"), &out));
+        }
+    }
+}
+
 test "capi resolver curation observation batches policy-free descriptors and fences namespace moves" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -9474,7 +9739,10 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
         }
         fn exercise(self: *@This()) !void {
             var handle: ?*anyopaque = null;
-            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(self.path, &handle));
+            // Exercise all 32 connections and 6,400 writes without paying for
+            // a power-loss barrier on every functional progress assertion.
+            const options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .flags = capi.open_flag_no_sync };
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(self.path, &options, &handle));
             defer antfly_db_close(handle);
             for (0..200) |i| {
                 var request_buffer: [256]u8 = undefined;
@@ -9516,6 +9784,150 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
     spawned = 0;
     defer for (workers[0..joined]) |worker| alloc.free(worker.path);
     for (workers[0..joined]) |worker| if (worker.failure) |err| return err;
+}
+
+test "capi SQL preparation shares live bytes across queued connections and close" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = handleLockIo();
+    var local_budget = EmbeddedSqlBudget{ .backing = a, .limit = 64 };
+    try std.testing.expectError(error.SqlWorkingMemoryLimitExceeded, PreparedEmbeddedSql.init(&local_budget, "{\"statement\":\"SELECT 1\"}"));
+    try std.testing.expectEqual(@as(usize, 0), local_budget.live);
+    var directory = try TestDirectory.init("sql-shared-preparation");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    const options: LiteResolvedOpenOptions = .{ .no_sync = true, .profile = .hosted };
+    const first = try openLiteHandleAlloc(path, options, true);
+    const first_id = try publishHandle(first);
+    var first_closed = false;
+    defer if (!first_closed) antfly_db_close(first_id);
+    const second = try openLiteHandleAlloc(path, options, false);
+    const second_id = try publishHandle(second);
+    defer antfly_db_close(second_id);
+    const gate = first.lite_connection.?.gate;
+    try std.testing.expect(gate == second.lite_connection.?.gate);
+    const admission = &gate.sql_preparation;
+    const payload = try a.alloc(u8, 200 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    const large = try std.fmt.allocPrint(a, "{{\"statement\":\"SELECT $1\",\"parameters\":[\"{s}\"]}}", .{payload});
+    defer a.free(large);
+    const Probe = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        prepared: [3]std.Io.Event = @splat(.unset),
+        released: std.Io.Event = .unset,
+        success: [3]bool = @splat(false),
+        first_live: usize = 0,
+        first_peak: usize = 0,
+        fn notify(ptr: *anyopaque, live: usize, peak: usize, success: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const index = self.calls.fetchAdd(1, .monotonic);
+            if (index >= self.prepared.len) return;
+            self.success[index] = success;
+            if (index == 0) {
+                self.first_live = live;
+                self.first_peak = peak;
+            }
+            self.prepared[index].set(handleLockIo());
+            if (index == 0) self.released.waitUncancelable(handleLockIo());
+        }
+    };
+    var probe: Probe = .{};
+    admission.test_after_prepare = .{ .ptr = &probe, .notify = Probe.notify };
+    defer admission.test_after_prepare = null;
+    const Request = struct {
+        id: *anyopaque,
+        json: []const u8,
+        result: capi.ErrorCode = .invalid_argument,
+        memory_error: bool = false,
+        fn run(self: *@This()) void {
+            var output: capi.Buffer = .{};
+            defer antfly_buffer_free(&output);
+            self.result = antfly_db_sql_json(self.id, .fromSlice(self.json), &output);
+            if (output.ptr) |ptr| self.memory_error = std.mem.indexOf(u8, ptr[0..output.len], "53200") != null;
+        }
+    };
+    var requests = [_]Request{
+        .{ .id = first_id, .json = large },
+        .{ .id = second_id, .json = large },
+        .{ .id = first_id, .json = "{\"statement\":\"SELECT 1\"}" },
+    };
+    var workers: [3]std.Thread = undefined;
+    var started: usize = 0;
+    var gate_locked = false;
+    defer {
+        if (gate_locked) gate.mutex.unlock(io);
+        probe.released.set(io);
+        for (workers[0..started]) |thread| thread.join();
+    }
+    workers[0] = try std.Thread.spawn(.{}, Request.run, .{&requests[0]});
+    started = 1;
+    probe.prepared[0].waitUncancelable(io);
+    try std.testing.expect(probe.success[0]);
+    try std.testing.expect(probe.first_live > payload.len);
+    try std.testing.expectEqual(probe.first_live, admission.used.load(.acquire));
+    // Derive the cap from measured allocator capacity, not the JSON wire size.
+    // The first plan can be retried, but a second equally large plan cannot fit.
+    admission.limit = probe.first_peak + probe.first_live / 4;
+    gate.mutex.lockUncancelable(io);
+    gate_locked = true;
+    workers[1] = try std.Thread.spawn(.{}, Request.run, .{&requests[1]});
+    started = 2;
+    probe.prepared[1].waitUncancelable(io);
+    try std.testing.expect(!probe.success[1]);
+    try std.testing.expectEqual(probe.first_live, admission.used.load(.acquire));
+    workers[2] = try std.Thread.spawn(.{}, Request.run, .{&requests[2]});
+    started = 3;
+    probe.prepared[2].waitUncancelable(io);
+    try std.testing.expect(probe.success[2]);
+    try std.testing.expect(admission.used.load(.acquire) <= admission.limit);
+    const Closing = struct {
+        id: *anyopaque,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            antfly_db_close(self.id);
+            self.done.set(handleLockIo());
+        }
+    };
+    var closing: Closing = .{ .id = first_id };
+    const closer = try std.Thread.spawn(.{}, Closing.run, .{&closing});
+    defer {
+        if (gate_locked) {
+            gate.mutex.unlock(io);
+            gate_locked = false;
+        }
+        probe.released.set(io);
+        closer.join();
+        first_closed = true;
+    }
+    const decoded = handleRegistry().decode(first_id).?;
+    const slot = handleRegistry().slotFor(decoded.index).?;
+    while (slot.state.load(.acquire) & 1 == 0) std.Thread.yield() catch {};
+    try std.testing.expect(!closing.done.isSet());
+    // Closing/stale handles are rejected before parsing or charging any bytes.
+    var rejected: capi.Buffer = .{};
+    defer antfly_buffer_free(&rejected);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_sql_json(first_id, .fromSlice(large), &rejected));
+    try std.testing.expectEqual(@as(usize, 3), probe.calls.load(.acquire));
+    gate.mutex.unlock(io);
+    gate_locked = false;
+    probe.released.set(io);
+    for (workers[0..started]) |thread| thread.join();
+    started = 0;
+    try std.testing.expectEqual(capi.ErrorCode.ok, requests[0].result);
+    try std.testing.expectEqual(capi.ErrorCode.internal, requests[1].result);
+    try std.testing.expect(requests[1].memory_error);
+    try std.testing.expectEqual(capi.ErrorCode.ok, requests[2].result);
+    try std.testing.expectEqual(@as(usize, 0), admission.used.load(.acquire));
+    // Refusals are request-local; refunded capacity admits the large plan again.
+    admission.test_after_prepare = null;
+    var retry: Request = .{ .id = second_id, .json = large };
+    retry.run();
+    try std.testing.expectEqual(capi.ErrorCode.ok, retry.result);
+    try std.testing.expectEqual(@as(usize, 0), admission.used.load(.acquire));
+    std.debug.print("SQL_PREPARATION_ADMISSION retained_bytes={d} cap_bytes={d} rejected_large=1 admitted_small=1 refunded_bytes=all\n", .{ probe.first_live, admission.limit });
 }
 
 test "capi SQL connections share storage while session IDs and close remain independent" {
@@ -10423,7 +10835,10 @@ test "capi native memory grouped episodes advance without a waiting write in roo
     const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
     defer a.free(path);
     var root: ?*anyopaque = null;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &root));
+    // This checks background progress across namespaces, not power-loss
+    // durability. Keep real file I/O without syncing each idle-table setup.
+    const options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .flags = capi.open_flag_no_sync };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &root));
     defer antfly_db_close(root);
     try std.testing.expectEqual(capi.ErrorCode.ok, @import("tables.zig").antfly_db_create_table_json(root, .fromSlice("history"), .fromSlice("{}")));
     var table: ?*anyopaque = null;

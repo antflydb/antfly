@@ -24472,15 +24472,21 @@ pub const RaftApplyStore = struct {
         return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:job:", .{group_id});
     }
     fn resolverNamespaceReadReady(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64) !bool {
-        // v15 adds journal-driven incremental pin repair. Existing v12/v13/v14
+        // v21 tracks edits during qualification. Existing v12-v20
         // declaration and profile proofs remain valid during owner backfill.
         if (try stagingGet(txn, try resolverNamespaceBootstrapKey(a, group)) != null) return true;
+        if (try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v20", .{group})) != null) return true;
+        if (try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v19", .{group})) != null) return true;
+        if (try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v18", .{group})) != null) return true;
+        if (try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v17", .{group})) != null) return true;
+        if (try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v16", .{group})) != null) return true;
+        if (try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v15", .{group})) != null) return true;
         if (try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v14", .{group})) != null) return true;
         if (try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v13", .{group})) != null) return true;
         return try stagingGet(txn, try std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v12", .{group})) != null;
     }
     fn resolverNamespaceBootstrapKey(a: std.mem.Allocator, group_id: u64) ![]const u8 {
-        return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v15", .{group_id});
+        return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v21", .{group_id});
     }
     fn resolverConfigs(a: std.mem.Allocator, root: std.json.Value) ![]const @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig {
         const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
@@ -28702,6 +28708,7 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
     var fields: [8][]const u8 = undefined;
     var count: usize = 0;
     var storage: @import("antfly_local_sources").common_table_storage.Settings = .{};
+    var object_storage_generation: u64 = 0;
     var lake_index_catalog_json: []const u8 = "";
     while (pos < encoded.len and count < fields.len) : (count += 1) {
         const length = try readInt(encoded, &pos, u32);
@@ -28717,7 +28724,9 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
             pos += length;
         }
         lake_index_catalog_json = try readLakeIndexCatalogExtension(encoded, &pos);
-        storage = (try readTableStorageExtension(encoded, &pos)).storage;
+        const extension = try readTableStorageExtension(encoded, &pos);
+        storage = extension.storage;
+        object_storage_generation = extension.object_storage_generation;
     }
     // Legacy, read-schema, and restore-intent records respectively. Borrow all
     // framed fields to validate the encoding, but copy only query-owned data.
@@ -28725,6 +28734,7 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
     return .{ .table_id = table_id, .name = name, .query_definition = if (mode != .identity) system_catalog.QueryDefinition{
         .table_id = table_id,
         .storage_engine = storage.engine,
+        .object_storage_generation = object_storage_generation,
         .schema_json = fields[1],
         .read_schema_json = if (mode == .schema or count == 5) "" else fields[2],
         .indexes_json = if (mode == .schema) "" else fields[if (count == 5) 2 else 3],
@@ -41002,6 +41012,11 @@ test "metadata.lake index object table engine framing preserves empty topology a
     const projection = try decodeTableQueryProjection(a, table_bytes, true);
     defer projection.deinit(a);
     try std.testing.expectEqual(.object, projection.query_definition.?.storage_engine);
+    try std.testing.expectEqual(table.object_storage_generation, projection.query_definition.?.object_storage_generation);
+    for ([_]TableProjectionMode{ .schema, .query }) |mode| {
+        const borrowed = try borrowTableProjection(table_bytes, mode);
+        try std.testing.expectEqual(table.object_storage_generation, borrowed.query_definition.?.object_storage_generation);
+    }
     var roundtrip = (try decodeTransitionCommand(a, wire)).?;
     defer roundtrip.deinit(a);
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, roundtrip.apply_table_topology.create.table));
@@ -42561,9 +42576,9 @@ test "resolver curation namespace propagation query profile references reuse can
     try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 2, .name = "source", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = &.{cfg} }, .{}) } });
     var turns: usize = 0;
     while (try store.pendingResolverNamespaceWork(a, group, true)) |work| {
-        // Static membership now backfills 2,001 pin postings in 128-work
-        // pages, in addition to directory enrollment and binding publication.
-        try std.testing.expect(turns < (pairs.len * 3 + 123) / 124 + 8);
+        // Complete routing dependencies precede membership publication. Both
+        // passes retain the same bounded per-turn work/write admission.
+        try std.testing.expect(turns < (pairs.len * 12 + 123) / 124 + 16);
         try store.applyStandaloneCommand(group, .{ .advance_resolver_namespace = work.advance });
         turns += 1;
     }
@@ -42655,13 +42670,13 @@ test "resolver curation namespace propagation query profile references reuse can
     // source binding. These durable reads do not depend on a route cache lease.
     var pin_turns: usize = 0;
     while (try store.pendingResolverNamespaceWork(a, group, true)) |work| {
-        // All aliases in this fixture share the affected root. Its member,
-        // shortcut and cleanup pages remain bounded by the repair budget.
-        try std.testing.expect(pin_turns < (aliases.len * 12 + 127) / 128 + 32);
+        // A leaf edit must not repair the other 999 pins sharing its root.
+        // Include normal source-binding publication in the bounded turn count.
+        try std.testing.expect(pin_turns < 4);
         try store.applyStandaloneCommand(group, .{ .advance_resolver_namespace = work.advance });
         pin_turns += 1;
     }
-    try std.testing.expect(pin_turns > 1);
+    try std.testing.expect(pin_turns > 0 and pin_turns <= 4);
     {
         var txn = try store.store.beginReadTxn();
         defer txn.abort();

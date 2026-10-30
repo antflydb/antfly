@@ -40,7 +40,7 @@ fn defaultMlDir(allocator: std.mem.Allocator) []const u8 {
     return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "ml" }) catch "./ml";
 }
 
-const RunConfig = struct {
+const InferenceSettings = struct {
     const WarmModelConfig = struct {
         kind: []const u8,
         name: []const u8,
@@ -53,59 +53,55 @@ const RunConfig = struct {
     };
 
     const PromptCacheConfig = struct {
-        enabled: bool = true,
+        enabled: bool = false,
         mode: inference.runtime.kv.prompt_cache.Mode = .block_hash,
         max_bytes_mb: usize = 512,
         min_tokens: usize = 64,
         ttl_ms: u64 = 300_000,
     };
 
-    const InferenceAdmissionConfig = struct {
-        max_concurrent_requests: ?u32 = null,
-    };
-
-    const AdmissionConfig = struct {
-        inference: ?InferenceAdmissionConfig = null,
-    };
-
+    // Shared DB-client settings are accepted for config portability. A serving
+    // process never proxies to this URL or uses this client credential.
+    api_url: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
     models_dir: ?[]const u8 = null,
     ml_dir: ?[]const u8 = null,
     content_security: ?inference.scraping.ContentSecurityConfig = null,
     s3_credentials: ?inference.scraping.S3CredentialsConfig = null,
     preload: []const WarmModelConfig = &.{},
-    keep_alive_ms: ?u64 = null,
+    keep_alive: ?[]const u8 = null,
     max_loaded_models: ?usize = null,
     http_max_body_mb: ?usize = null,
-    /// Deprecated compatibility alias for admission.inference.max_concurrent_requests.
-    max_concurrent_requests: ?u32 = null,
-    admission: ?AdmissionConfig = null,
     pool_size: ?usize = null,
-    generation_batching: ?inference.server.GenerationBatchingConfig = null,
+    generation_batching: ?platform.inference_settings.GenerationBatching = null,
     kernel_jit: ?inference.graph.kernel_jit.Config = null,
     prompt_cache: ?PromptCacheConfig = null,
-    process_memory_budget_mb: ?usize = null,
 };
 
-fn resolvedMaxConcurrentRequests(cfg: RunConfig) !?u32 {
-    const canonical = if (cfg.admission) |admission|
-        if (admission.inference) |inference_admission|
-            inference_admission.max_concurrent_requests
-        else
-            null
-    else
-        null;
-    if (canonical != null and cfg.max_concurrent_requests != null and
-        canonical.? != cfg.max_concurrent_requests.?)
-    {
-        return error.InvalidInferenceConfig;
+const RunConfig = struct {
+    resources: platform.resource_policy.Resources = .{},
+    inference: InferenceSettings = .{},
+};
+
+const MemoryBudgetFields = std.EnumSet(std.meta.FieldEnum(inference.runtime.tier.memory.BudgetOverridesMib));
+
+fn mergedMemoryBudgets(config: platform.resource_policy.InferenceMemory, cli: inference.runtime.tier.memory.BudgetOverridesMib, selected: MemoryBudgetFields) !inference.runtime.tier.memory.Limits {
+    var result = config.limits(inference.runtime.tier.memory.Limits);
+    const cli_limits = try cli.toByteLimits();
+    inline for (.{ .{ "host", "host_limit_bytes" }, .{ "backend", "backend_limit_bytes" }, .{ "combined", "combined_limit_bytes" }, .{ "kv", "kv_limit_bytes" }, .{ "scratch", "scratch_limit_bytes" } }) |names| {
+        if (selected.contains(@field(std.meta.FieldEnum(inference.runtime.tier.memory.BudgetOverridesMib), names[0])))
+            @field(result, names[1]) = @field(cli_limits, names[1]);
     }
-    return canonical orelse cfg.max_concurrent_requests;
+    return result;
 }
 
 fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(RunConfig) {
     const raw = try inference.util.c_file.readFileMax(allocator, path, std.math.maxInt(usize));
     defer allocator.free(raw);
-    return try parseRunConfig(allocator, raw);
+    return parseRunConfig(allocator, raw) catch |err| {
+        platform.inference_settings.diagnoseInvalidConfig(allocator, raw);
+        return err;
+    };
 }
 
 fn validateKnownObjectFields(comptime T: type, object: std.json.ObjectMap) !void {
@@ -126,33 +122,19 @@ fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parse
         .object => |object| object,
         else => return error.InvalidInferenceConfig,
     };
-    if (root.get("preload")) |preload_value| {
-        const preload = switch (preload_value) {
-            .array => |array| array,
-            else => return error.InvalidInferenceConfig,
-        };
-        for (preload.items) |model_value| {
-            const model = switch (model_value) {
-                .object => |object| object,
-                else => return error.InvalidInferenceConfig,
-            };
-            try validateKnownObjectFields(RunConfig.WarmModelConfig, model);
-        }
+    try platform.inference_settings.validateCanonicalLocations(root);
+    if (root.get("resources")) |value| {
+        _ = platform.resource_policy.Resources.parse(allocator, value) catch return error.InvalidInferenceConfig;
     }
-    if (root.get("admission")) |admission_value| {
-        const admission = switch (admission_value) {
-            .object => |object| object,
-            else => return error.InvalidInferenceConfig,
-        };
-        if (admission.count() != @intFromBool(admission.get("inference") != null))
-            return error.InvalidInferenceConfig;
-        if (admission.get("inference")) |inference_value| {
-            const inference_admission = switch (inference_value) {
-                .object => |object| object,
-                else => return error.InvalidInferenceConfig,
-            };
-            if (inference_admission.count() != @intFromBool(inference_admission.get("max_concurrent_requests") != null))
-                return error.InvalidInferenceConfig;
+    if (root.get("inference")) |value| {
+        if (value != .object) return error.InvalidInferenceConfig;
+        try validateKnownObjectFields(InferenceSettings, value.object);
+        if (value.object.get("preload")) |preload| {
+            if (preload != .array) return error.InvalidInferenceConfig;
+            for (preload.array.items) |model| {
+                if (model != .object) return error.InvalidInferenceConfig;
+                try validateKnownObjectFields(InferenceSettings.WarmModelConfig, model.object);
+            }
         }
     }
     const parsed = try std.json.parseFromSlice(RunConfig, allocator, raw, .{
@@ -160,7 +142,7 @@ fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parse
         .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
-    if (parsed.value.prompt_cache) |value| {
+    if (parsed.value.inference.prompt_cache) |value| {
         try (inference.server.PromptCacheConfig{
             .enabled = value.enabled,
             .mode = value.mode,
@@ -169,8 +151,9 @@ fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parse
             .ttl_ms = value.ttl_ms,
         }).validate();
     }
-    if (parsed.value.kernel_jit) |value| try value.validate();
-    _ = try resolvedMaxConcurrentRequests(parsed.value);
+    if (parsed.value.inference.kernel_jit) |value| try value.validate();
+    if (parsed.value.inference.keep_alive) |value| _ = try platform.inference_settings.parseKeepAliveMs(value);
+    try parsed.value.resources.validate();
     return parsed;
 }
 
@@ -267,7 +250,7 @@ fn parsePositiveU64(value: []const u8) !u64 {
     return parsed;
 }
 
-fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConfig.WarmModelConfig) ![]inference.server.WarmModel {
+fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const InferenceSettings.WarmModelConfig) ![]inference.server.WarmModel {
     if (values.len == 0) return &.{};
     const out = try allocator.alloc(inference.server.WarmModel, values.len);
     errdefer allocator.free(out);
@@ -405,6 +388,7 @@ const run_usage_options =
     \\  --config <path>                     JSON run configuration
     \\  --max-loaded-models <count>          Residency limit; 0 means unlimited
     \\  --max-concurrent-requests <count>    Request concurrency limit
+    \\  --max-work-units <count>             Independent weighted work/media capacity
     \\  --http-max-body-mb <n>                Encoded HTTP body limit (MiB; default: 10)
     \\  --process-memory-budget-mb <n>       Whole-process/container memory envelope
     \\  --host-budget-mb <n>                 Host-memory admission override (MiB)
@@ -491,9 +475,11 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     var config_path: ?[]const u8 = null;
     const max_loaded_models_override = try inference.run_options.parseMaxLoadedModelsOverride(args);
     var max_concurrent_requests_override: ?usize = null;
+    var max_work_units_override: ?usize = null;
     var http_max_body_bytes_override: ?usize = null;
     var process_memory_budget_mb_override: ?usize = null;
     var budget_overrides_mib = inference.runtime.tier.memory.BudgetOverridesMib{};
+    var budget_cli_fields: MemoryBudgetFields = .{};
     var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
     var allow_insecure_public_bind = false;
     var allow_unknown_models = true;
@@ -527,6 +513,9 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
         } else if (std.mem.eql(u8, args[i], "--max-concurrent-requests") and i + 1 < args.len) {
             max_concurrent_requests_override = try parseAdmissionLimit(args[i + 1]);
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--max-work-units") and i + 1 < args.len) {
+            max_work_units_override = try parseAdmissionLimit(args[i + 1]);
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--http-max-body-mb") and i + 1 < args.len) {
             http_max_body_bytes_override = try inference.server.httpBodyLimitBytesFromMib(try parseAdmissionLimit(args[i + 1]));
             i += 1;
@@ -535,18 +524,23 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--host-budget-mb") and i + 1 < args.len) {
             budget_overrides_mib.host = try std.fmt.parseInt(usize, args[i + 1], 10);
+            budget_cli_fields.insert(.host);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--backend-budget-mb") and i + 1 < args.len) {
             budget_overrides_mib.backend = try std.fmt.parseInt(usize, args[i + 1], 10);
+            budget_cli_fields.insert(.backend);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--combined-budget-mb") and i + 1 < args.len) {
             budget_overrides_mib.combined = try std.fmt.parseInt(usize, args[i + 1], 10);
+            budget_cli_fields.insert(.combined);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--kv-budget-mb") and i + 1 < args.len) {
             budget_overrides_mib.kv = try std.fmt.parseInt(usize, args[i + 1], 10);
+            budget_cli_fields.insert(.kv);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--scratch-budget-mb") and i + 1 < args.len) {
             budget_overrides_mib.scratch = try std.fmt.parseInt(usize, args[i + 1], 10);
+            budget_cli_fields.insert(.scratch);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--kernel-jit-mode")) {
             if (i + 1 >= args.len) return error.MissingKernelJitMode;
@@ -569,10 +563,10 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     if (loaded_cfg) |parsed| {
         const cfg = parsed.value;
         if (!models_overridden) {
-            if (cfg.models_dir) |value| models_dir = value;
+            if (cfg.inference.models_dir) |value| models_dir = value;
         }
         if (!ml_overridden) {
-            if (cfg.ml_dir) |value| ml_dir = value;
+            if (cfg.inference.ml_dir) |value| ml_dir = value;
         }
     }
 
@@ -593,20 +587,21 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     var config_preload_models: []inference.server.WarmModel = &.{};
     defer if (config_preload_models.len > 0) allocator.free(config_preload_models);
 
-    const budget_override_limits = try budget_overrides_mib.toByteLimits();
+    const resource_policy = if (loaded_cfg) |parsed| parsed.value.resources else platform.resource_policy.Resources{};
+    const budget_override_limits = try mergedMemoryBudgets(resource_policy.inference.memory, budget_overrides_mib, budget_cli_fields);
     const process_memory_resolution = try resolveProcessMemoryBudgetMib(
         process_memory_budget_mb_override,
         platform.env.getenv("ANTFLY_PROCESS_MEMORY_BUDGET_MB"),
         platform.env.getenv("ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB"),
-        if (loaded_cfg) |parsed| parsed.value.process_memory_budget_mb else null,
+        null,
     );
     const process_memory_limit_bytes = if (process_memory_resolution.value_mib) |value|
         (try (inference.runtime.tier.memory.BudgetOverridesMib{ .host = value }).toByteLimits()).host_limit_bytes
     else
-        0;
+        resource_policy.memory.max_bytes;
     std.log.info(
         "process memory policy operator_source={s} configured_limit_bytes={d}",
-        .{ @tagName(process_memory_resolution.source), process_memory_limit_bytes },
+        .{ if (process_memory_resolution.value_mib == null and resource_policy.memory.max_bytes != 0) "config" else @tagName(process_memory_resolution.source), process_memory_limit_bytes },
     );
     var node_cfg = inference.server.NodeConfig{
         .models_dir = models_dir,
@@ -620,7 +615,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
         },
         .preload = preload_models.items,
         .process_memory_limit_bytes = process_memory_limit_bytes,
-        .process_memory_limit_provenance = if (process_memory_resolution.value_mib != null)
+        .process_memory_limit_provenance = if (process_memory_resolution.value_mib != null or resource_policy.memory.max_bytes != 0)
             .explicit
         else
             .automatic,
@@ -634,19 +629,21 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     };
     if (loaded_cfg) |parsed| {
         const cfg = parsed.value;
-        node_cfg.content_security = cfg.content_security;
-        node_cfg.s3_credentials = cfg.s3_credentials;
+        node_cfg.request_limits = cfg.resources.inference.request_limits;
+        node_cfg.max_concurrent_requests = cfg.resources.inference.admission.max_concurrent_requests;
+        node_cfg.max_work_units = cfg.resources.inference.admission.workCapacity();
+        node_cfg.content_security = cfg.inference.content_security;
+        node_cfg.s3_credentials = cfg.inference.s3_credentials;
         if (preload_models.items.len == 0) {
-            config_preload_models = try preloadModelsFromConfig(allocator, cfg.preload);
+            config_preload_models = try preloadModelsFromConfig(allocator, cfg.inference.preload);
             node_cfg.preload = config_preload_models;
         }
-        if (cfg.keep_alive_ms) |value| node_cfg.keep_alive_ms = value;
-        if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
-        if (try resolvedMaxConcurrentRequests(cfg)) |value| node_cfg.max_concurrent_requests = value;
-        if (cfg.pool_size) |value| node_cfg.pool_size = value;
-        if (cfg.http_max_body_mb) |value| node_cfg.http_max_body_bytes = try inference.server.httpBodyLimitBytesFromMib(value);
-        if (cfg.generation_batching) |value| node_cfg.generation_batching = value;
-        if (cfg.prompt_cache) |value| node_cfg.prompt_cache = .{
+        if (cfg.inference.keep_alive) |value| node_cfg.keep_alive_ms = try platform.inference_settings.parseKeepAliveMs(value);
+        if (cfg.inference.max_loaded_models) |value| node_cfg.max_loaded_models = value;
+        if (cfg.inference.pool_size) |value| node_cfg.pool_size = value;
+        if (cfg.inference.http_max_body_mb) |value| node_cfg.http_max_body_bytes = try inference.server.httpBodyLimitBytesFromMib(value);
+        if (cfg.inference.generation_batching) |value| node_cfg.generation_batching = inference.server.GenerationBatchingConfig.fromSettings(value);
+        if (cfg.inference.prompt_cache) |value| node_cfg.prompt_cache = .{
             .enabled = value.enabled,
             .mode = value.mode,
             .max_bytes_mb = value.max_bytes_mb,
@@ -655,7 +652,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
         };
     }
     node_cfg.kernel_jit = try resolveKernelJitConfig(
-        if (loaded_cfg) |parsed| parsed.value.kernel_jit else null,
+        if (loaded_cfg) |parsed| parsed.value.inference.kernel_jit else null,
         platform.env.getenv("ANTFLY_INFERENCE_KERNEL_JIT_MODE"),
         kernel_jit_mode_override,
     );
@@ -669,6 +666,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     }
     if (max_loaded_models_override) |value| node_cfg.max_loaded_models = value;
     if (max_concurrent_requests_override) |value| node_cfg.max_concurrent_requests = value;
+    if (max_work_units_override) |value| node_cfg.max_work_units = value;
     if (http_max_body_bytes_override) |value| node_cfg.http_max_body_bytes = value;
 
     var node = try inference.server.Node.init(allocator, node_cfg);
@@ -843,7 +841,8 @@ fn printUsage(usage_name: []const u8) void {
         \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --config <path>       JSON runtime configuration, including full kernel JIT policy
         \\  --max-loaded-models <n> Bound resident model count with LRU eviction
-        \\  --max-concurrent-requests <n> Bound weighted in-flight request capacity before returning 503
+        \\  --max-concurrent-requests <n> Bound executing requests before returning 503
+        \\  --max-work-units <n> Independent weighted work/media capacity
         \\  --host-budget-mb <n> Process-wide inference host-memory admission override (MiB)
         \\  --backend-budget-mb <n> Process-wide inference device-memory admission override (MiB)
         \\  --combined-budget-mb <n> Process-wide inference combined-memory admission override (MiB)
@@ -871,100 +870,107 @@ fn printUsage(usage_name: []const u8) void {
     , .{ usage_name, usage_name });
 }
 
-test "run config parses shared scraping fields and ignores api_url" {
+test "run config parses shared scraping fields and ignores canonical client settings" {
     const raw =
         \\{
-        \\  "api_url": "http://127.0.0.1:8082",
-        \\  "models_dir": "/tmp/models",
-        \\  "ml_dir": "/tmp/ml",
-        \\  "content_security": {
-        \\    "block_private_ips": true
+        \\  "resources": {
+        \\    "inference": {
+        \\      "admission": {
+        \\        "max_concurrent_requests": 12
+        \\      }
+        \\    }
         \\  },
-        \\  "s3_credentials": {
-        \\    "endpoint": "s3.amazonaws.com"
-        \\  },
-        \\  "preload": [
-        \\    { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
-        \\  ],
-        \\  "max_loaded_models": 8,
-        \\  "admission": { "inference": { "max_concurrent_requests": 12 } },
-        \\  "pool_size": 4,
-        \\  "generation_batching": {
-        \\    "mode": "on",
-        \\    "max_step_items": 8,
-        \\    "max_step_query_tokens": 256,
-        \\    "max_decode_wait_us": 750,
-        \\    "max_idle_prefill_chunk_size": 1024
-        \\  },
-        \\  "kernel_jit": { "mode": "shadow", "cache_dir": "/tmp/jit", "qualified_profile_path": "/tmp/jit-profile.json", "max_cache_bytes_mb": 256, "preload_budget_ms": 120000 },
-        \\  "prompt_cache": { "enabled": true, "mode": "block_hash", "max_bytes_mb": 64, "min_tokens": 32, "ttl_ms": 1000 }
+        \\  "inference": {
+        \\    "api_url": "http://127.0.0.1:8082",
+        \\    "api_key": "unused-client-credential",
+        \\    "models_dir": "/tmp/models",
+        \\    "ml_dir": "/tmp/ml",
+        \\    "content_security": {
+        \\      "block_private_ips": true
+        \\    },
+        \\    "s3_credentials": {
+        \\      "endpoint": "s3.amazonaws.com"
+        \\    },
+        \\    "preload": [
+        \\      {
+        \\        "kind": "generator",
+        \\        "name": "antflydb/gemma-e2b",
+        \\        "backend": "metal",
+        \\        "format": "gguf",
+        \\        "quantization": "q4_k"
+        \\      }
+        \\    ],
+        \\    "max_loaded_models": 8,
+        \\    "pool_size": 4,
+        \\    "generation_batching": {
+        \\      "mode": "on",
+        \\      "max_step_items": 8,
+        \\      "max_step_query_tokens": 256,
+        \\      "max_decode_wait_us": 750,
+        \\      "max_idle_prefill_chunk_size": 1024
+        \\    },
+        \\    "kernel_jit": {
+        \\      "mode": "shadow",
+        \\      "cache_dir": "/tmp/jit",
+        \\      "qualified_profile_path": "/tmp/jit-profile.json",
+        \\      "max_cache_bytes_mb": 256,
+        \\      "preload_budget_ms": 120000
+        \\    },
+        \\    "prompt_cache": {
+        \\      "enabled": true,
+        \\      "mode": "block_hash",
+        \\      "max_bytes_mb": 64,
+        \\      "min_tokens": 32,
+        \\      "ttl_ms": 1000
+        \\    }
+        \\  }
         \\}
     ;
     const parsed = try parseRunConfig(std.testing.allocator, raw);
     defer parsed.deinit();
 
-    try std.testing.expectEqualStrings("/tmp/models", parsed.value.models_dir.?);
-    try std.testing.expectEqual(@as(?u32, 12), parsed.value.admission.?.inference.?.max_concurrent_requests);
-    try std.testing.expectEqualStrings("/tmp/ml", parsed.value.ml_dir.?);
-    try std.testing.expectEqual(@as(?bool, true), parsed.value.content_security.?.block_private_ips);
-    try std.testing.expectEqualStrings("s3.amazonaws.com", parsed.value.s3_credentials.?.endpoint.?);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.preload.len);
-    try std.testing.expectEqualStrings("generator", parsed.value.preload[0].kind);
-    try std.testing.expectEqualStrings("antflydb/gemma-e2b", parsed.value.preload[0].name);
-    try std.testing.expectEqualStrings("metal", parsed.value.preload[0].backend.?);
-    try std.testing.expectEqualStrings("gguf", parsed.value.preload[0].format.?);
-    try std.testing.expectEqualStrings("q4_k", parsed.value.preload[0].quantization.?);
-    try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);
-    try std.testing.expectEqual(@as(?usize, 4), parsed.value.pool_size);
-    try std.testing.expectEqual(inference.server.GenerationBatchingMode.on, parsed.value.generation_batching.?.mode);
-    try std.testing.expectEqual(@as(usize, 8), parsed.value.generation_batching.?.max_step_items);
-    try std.testing.expectEqual(@as(usize, 256), parsed.value.generation_batching.?.max_step_query_tokens);
-    try std.testing.expectEqual(@as(u32, 750), parsed.value.generation_batching.?.max_decode_wait_us);
-    try std.testing.expectEqual(@as(usize, 1024), parsed.value.generation_batching.?.max_idle_prefill_chunk_size);
-    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.shadow, parsed.value.kernel_jit.?.mode);
-    try std.testing.expectEqualStrings("/tmp/jit", parsed.value.kernel_jit.?.cache_dir.?);
-    try std.testing.expectEqualStrings("/tmp/jit-profile.json", parsed.value.kernel_jit.?.qualified_profile_path.?);
-    try std.testing.expectEqual(@as(usize, 256), parsed.value.kernel_jit.?.max_cache_bytes_mb);
-    try std.testing.expectEqual(@as(u64, 120_000), parsed.value.kernel_jit.?.preload_budget_ms);
-    try std.testing.expectEqual(true, parsed.value.prompt_cache.?.enabled);
-    try std.testing.expectEqual(inference.runtime.kv.prompt_cache.Mode.block_hash, parsed.value.prompt_cache.?.mode);
-    try std.testing.expectEqual(@as(usize, 64), parsed.value.prompt_cache.?.max_bytes_mb);
-    try std.testing.expectEqual(@as(usize, 32), parsed.value.prompt_cache.?.min_tokens);
-    try std.testing.expectEqual(@as(u64, 1000), parsed.value.prompt_cache.?.ttl_ms);
+    try std.testing.expectEqualStrings("/tmp/models", parsed.value.inference.models_dir.?);
+    try std.testing.expectEqual(@as(u32, 12), parsed.value.resources.inference.admission.max_concurrent_requests);
+    try std.testing.expectEqualStrings("/tmp/ml", parsed.value.inference.ml_dir.?);
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.inference.content_security.?.block_private_ips);
+    try std.testing.expectEqualStrings("s3.amazonaws.com", parsed.value.inference.s3_credentials.?.endpoint.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.inference.preload.len);
+    try std.testing.expectEqualStrings("generator", parsed.value.inference.preload[0].kind);
+    try std.testing.expectEqualStrings("antflydb/gemma-e2b", parsed.value.inference.preload[0].name);
+    try std.testing.expectEqualStrings("metal", parsed.value.inference.preload[0].backend.?);
+    try std.testing.expectEqualStrings("gguf", parsed.value.inference.preload[0].format.?);
+    try std.testing.expectEqualStrings("q4_k", parsed.value.inference.preload[0].quantization.?);
+    try std.testing.expectEqual(@as(?usize, 8), parsed.value.inference.max_loaded_models);
+    try std.testing.expectEqual(@as(?usize, 4), parsed.value.inference.pool_size);
+    try std.testing.expectEqual(.on, parsed.value.inference.generation_batching.?.mode);
+    try std.testing.expectEqual(@as(usize, 8), parsed.value.inference.generation_batching.?.max_step_items);
+    try std.testing.expectEqual(@as(usize, 256), parsed.value.inference.generation_batching.?.max_step_query_tokens);
+    try std.testing.expectEqual(@as(u32, 750), parsed.value.inference.generation_batching.?.max_decode_wait_us);
+    try std.testing.expectEqual(@as(usize, 1024), parsed.value.inference.generation_batching.?.max_idle_prefill_chunk_size);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.shadow, parsed.value.inference.kernel_jit.?.mode);
+    try std.testing.expectEqualStrings("/tmp/jit", parsed.value.inference.kernel_jit.?.cache_dir.?);
+    try std.testing.expectEqualStrings("/tmp/jit-profile.json", parsed.value.inference.kernel_jit.?.qualified_profile_path.?);
+    try std.testing.expectEqual(@as(usize, 256), parsed.value.inference.kernel_jit.?.max_cache_bytes_mb);
+    try std.testing.expectEqual(@as(u64, 120_000), parsed.value.inference.kernel_jit.?.preload_budget_ms);
+    try std.testing.expectEqual(true, parsed.value.inference.prompt_cache.?.enabled);
+    try std.testing.expectEqual(inference.runtime.kv.prompt_cache.Mode.block_hash, parsed.value.inference.prompt_cache.?.mode);
+    try std.testing.expectEqual(@as(usize, 64), parsed.value.inference.prompt_cache.?.max_bytes_mb);
+    try std.testing.expectEqual(@as(usize, 32), parsed.value.inference.prompt_cache.?.min_tokens);
+    try std.testing.expectEqual(@as(u64, 1000), parsed.value.inference.prompt_cache.?.ttl_ms);
 }
 
-test "run config accepts canonical and legacy inference admission spellings" {
-    const disabled = try parseRunConfig(std.testing.allocator,
-        \\{"admission":{"inference":{"max_concurrent_requests":0}}}
-    );
-    defer disabled.deinit();
-    try std.testing.expectEqual(@as(?u32, 0), disabled.value.admission.?.inference.?.max_concurrent_requests);
-
-    const legacy = try parseRunConfig(std.testing.allocator, "{\"max_concurrent_requests\":1}");
-    defer legacy.deinit();
-    try std.testing.expectEqual(@as(?u32, 1), try resolvedMaxConcurrentRequests(legacy.value));
-
-    const matching = try parseRunConfig(std.testing.allocator,
-        \\{"max_concurrent_requests":1,"admission":{"inference":{"max_concurrent_requests":1}}}
-    );
-    defer matching.deinit();
-    try std.testing.expectEqual(@as(?u32, 1), try resolvedMaxConcurrentRequests(matching.value));
-
-    try std.testing.expectError(error.InvalidInferenceConfig, parseRunConfig(std.testing.allocator,
-        \\{"max_concurrent_requests":1,"admission":{"inference":{"max_concurrent_requests":2}}}
-    ));
-    try std.testing.expectError(
-        error.InvalidInferenceConfig,
-        parseRunConfig(std.testing.allocator, "{\"admission\":{\"infer\":{\"max_concurrent_requests\":1}}}"),
-    );
+test "run config rejects removed resource spellings" {
+    inline for (.{ "{\"admission\":{}}", "{\"memory\":{}}", "{\"request_limits\":{}}", "{\"max_concurrent_requests\":1}" }) |raw| {
+        try std.testing.expectError(error.InvalidInferenceConfig, parseRunConfig(std.testing.allocator, raw));
+    }
 }
 
 test "run config uses automatic loading policy for CUDA preload" {
     const parsed = try parseRunConfig(std.testing.allocator,
-        \\{"preload":[{"kind":"generator","name":"gemma-a4b","backend":"cuda","residency_mode":"resident","memory_budget_mb":16384}]}
+        \\{"inference":{"preload":[{"kind":"generator","name":"gemma-a4b","backend":"cuda","residency_mode":"resident","memory_budget_mb":16384}]}}
     );
     defer parsed.deinit();
-    const models = try preloadModelsFromConfig(std.testing.allocator, parsed.value.preload);
+    const models = try preloadModelsFromConfig(std.testing.allocator, parsed.value.inference.preload);
     defer std.testing.allocator.free(models);
     try std.testing.expectEqual(@as(usize, 1), models.len);
     try std.testing.expectEqual(inference.backends.BackendType.cuda, models[0].backend.?);
@@ -1000,13 +1006,13 @@ test "run config rejects unknown preload policy fields" {
     try std.testing.expectError(
         error.InvalidInferenceConfig,
         parseRunConfig(std.testing.allocator,
-            \\{"preload":[{"kind":"generator","name":"gemma-a4b","backend":"cuda","prepared_pak":"required"}]}
+            \\{"inference":{"preload":[{"kind":"generator","name":"gemma-a4b","backend":"cuda","prepared_pak":"required"}]}}
         ),
     );
     try std.testing.expectError(
         error.InvalidInferenceConfig,
         parseRunConfig(std.testing.allocator,
-            \\{"preload":[{"kind":"generator","name":"gemma-a4b","load_worker":6}]}
+            \\{"inference":{"preload":[{"kind":"generator","name":"gemma-a4b","load_worker":6}]}}
         ),
     );
 }
@@ -1015,7 +1021,7 @@ test "run config rejects unrepresentable prompt cache values" {
     const allocator = std.testing.allocator;
     const bytes_overflow = try std.fmt.allocPrint(
         allocator,
-        "{{\"prompt_cache\":{{\"max_bytes_mb\":{d}}}}}",
+        "{{\"inference\":{{\"prompt_cache\":{{\"max_bytes_mb\":{d}}}}}}}",
         .{inference.runtime.kv.prompt_cache.max_config_bytes_mb + 1},
     );
     defer allocator.free(bytes_overflow);
@@ -1023,7 +1029,7 @@ test "run config rejects unrepresentable prompt cache values" {
 
     const ttl_overflow = try std.fmt.allocPrint(
         allocator,
-        "{{\"prompt_cache\":{{\"ttl_ms\":{d}}}}}",
+        "{{\"inference\":{{\"prompt_cache\":{{\"ttl_ms\":{d}}}}}}}",
         .{inference.runtime.kv.prompt_cache.max_config_ttl_ms + 1},
     );
     defer allocator.free(ttl_overflow);
@@ -1031,26 +1037,26 @@ test "run config rejects unrepresentable prompt cache values" {
 }
 
 test "run config parses opt-in radix prompt cache mode" {
-    const parsed = try parseRunConfig(std.testing.allocator, "{\"prompt_cache\":{\"enabled\":true,\"mode\":\"radix\"}}");
+    const parsed = try parseRunConfig(std.testing.allocator, "{\"inference\":{\"prompt_cache\":{\"enabled\":true,\"mode\":\"radix\"}}}");
     defer parsed.deinit();
-    try std.testing.expect(parsed.value.prompt_cache.?.enabled);
-    try std.testing.expectEqual(inference.runtime.kv.prompt_cache.Mode.radix, parsed.value.prompt_cache.?.mode);
+    try std.testing.expect(parsed.value.inference.prompt_cache.?.enabled);
+    try std.testing.expectEqual(inference.runtime.kv.prompt_cache.Mode.radix, parsed.value.inference.prompt_cache.?.mode);
 }
 
 test "kernel JIT config defaults off and rejects invalid budgets" {
-    const parsed = try parseRunConfig(std.testing.allocator, "{\"kernel_jit\":{}}");
+    const parsed = try parseRunConfig(std.testing.allocator, "{\"inference\":{\"kernel_jit\":{}}}");
     defer parsed.deinit();
-    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.off, parsed.value.kernel_jit.?.mode);
-    try std.testing.expectEqual(@as(usize, 1024), parsed.value.kernel_jit.?.max_cache_bytes_mb);
-    try std.testing.expectEqual(@as(u64, 300_000), parsed.value.kernel_jit.?.preload_budget_ms);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.off, parsed.value.inference.kernel_jit.?.mode);
+    try std.testing.expectEqual(@as(usize, 1024), parsed.value.inference.kernel_jit.?.max_cache_bytes_mb);
+    try std.testing.expectEqual(@as(u64, 300_000), parsed.value.inference.kernel_jit.?.preload_budget_ms);
 
     try std.testing.expectError(
         error.InvalidKernelJitPreloadBudget,
-        parseRunConfig(std.testing.allocator, "{\"kernel_jit\":{\"preload_budget_ms\":999}}"),
+        parseRunConfig(std.testing.allocator, "{\"inference\":{\"kernel_jit\":{\"preload_budget_ms\":999}}}"),
     );
     try std.testing.expectError(
         error.InvalidKernelJitCacheDir,
-        parseRunConfig(std.testing.allocator, "{\"kernel_jit\":{\"cache_dir\":\"\"}}"),
+        parseRunConfig(std.testing.allocator, "{\"inference\":{\"kernel_jit\":{\"cache_dir\":\"\"}}}"),
     );
 }
 
@@ -1122,12 +1128,42 @@ test "run max concurrent request parser accepts zero as unlimited" {
 test "run config preserves per-model GLiNER CUDA precision" {
     const a = std.testing.allocator;
     const parsed = try parseRunConfig(a,
-        \\{"preload":[{"kind":"extractor","name":"fastino/GLiNER2.5-Decide-1B","backend":"cuda","cuda_precision":"fp32"},{"kind":"extractor","name":"default"}]}
+        \\{"inference":{"preload":[{"kind":"extractor","name":"fastino/GLiNER2.5-Decide-1B","backend":"cuda","cuda_precision":"fp32"},{"kind":"extractor","name":"default"}]}}
     );
     defer parsed.deinit();
-    const models = try preloadModelsFromConfig(a, parsed.value.preload);
+    const models = try preloadModelsFromConfig(a, parsed.value.inference.preload);
     defer a.free(models);
     try std.testing.expectEqual(.fp32, models[0].cuda_precision.?);
     try std.testing.expect(models[1].cuda_precision == null);
     try std.testing.expect(models[0].a4bRequest() == null);
+}
+
+test "standalone resources use shared byte policy and preserve explicit CLI automatic zero" {
+    var parsed = try parseRunConfig(std.testing.allocator,
+        \\{"resources":{"memory":{"max_bytes":536870912},"inference":{"memory":{"max_host_bytes":123456789,"max_device_bytes":21474836480},"admission":{"max_concurrent_requests":1,"max_work_units":8},"request_limits":{"max_items_per_request":1}}}}
+    );
+    defer parsed.deinit();
+    const policy = parsed.value.resources;
+    const merged = try mergedMemoryBudgets(policy.inference.memory, .{ .host = 0, .kv = 1024 }, MemoryBudgetFields.init(.{ .host = true, .kv = true }));
+    try std.testing.expectEqual(@as(usize, 0), merged.host_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 21474836480), merged.backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 1024), merged.kv_limit_bytes);
+    try std.testing.expectEqual(@as(u32, 1), policy.inference.admission.max_concurrent_requests);
+    try std.testing.expectEqual(@as(?u32, 8), policy.inference.admission.max_work_units);
+    try std.testing.expectError(error.InvalidInferenceConfig, parseRunConfig(std.testing.allocator, "{\"resources\":{\"inference\":{\"request_limits\":{\"max_items_per_request\":0}}}}"));
+}
+
+test "standalone canonical execution settings share lifetime and batching" {
+    const parsed = try parseRunConfig(std.testing.allocator,
+        \\{"inference":{"keep_alive":"90s","generation_batching":{"mode":"on","max_step_query_tokens":123}}}
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 90000), try platform.inference_settings.parseKeepAliveMs(parsed.value.inference.keep_alive.?));
+    const settings = inference.server.GenerationBatchingConfig.fromSettings(parsed.value.inference.generation_batching.?);
+    try std.testing.expectEqual(.on, settings.mode);
+    try std.testing.expectEqual(@as(usize, 123), settings.max_step_query_tokens);
+    const zero = try parseRunConfig(std.testing.allocator, "{\"inference\":{\"keep_alive\":\"0\"}}");
+    defer zero.deinit();
+    try std.testing.expectEqual(@as(u64, 0), try platform.inference_settings.parseKeepAliveMs(zero.value.inference.keep_alive.?));
+    try std.testing.expectError(error.InvalidInferenceConfig, parseRunConfig(std.testing.allocator, "{\"inference\":{\"keep_alive_ms\":5000}}"));
 }

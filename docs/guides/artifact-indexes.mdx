@@ -1,8 +1,8 @@
 ---
 title: Artifact-Backed Indexes
-order: 2
-sidebar: concepts
 description: How one full-text, vector, or graph index unions the records that enrichments generate, and how to tell when it is ready
+sidebar: concepts
+order: 3
 ---
 
 <Questions>
@@ -282,3 +282,50 @@ Then prompt it with the outcome, for example "Create an artifact-backed embeddin
 - [Document Engine](/docs/guides/document-engine): how the planner composes full-text, vector, filter, and graph inputs over any index
 - [Multimodal Embeddings](/docs/guides/multimodal): a single-source embeddings index over remote media
 - [Tune Hybrid Search](/docs/guides/hybrid-search): fusion, reranking, and pruning over the results
+
+
+## Private GCS source artifacts
+
+Native document extraction can fetch `gs://` sources through the same named
+external-I/O connections used by object storage. Grant `content.fetch` explicitly;
+`objects.read` alone does not authorize artifact downloads. For example:
+
+```json
+{
+  "connections": {
+    "source-pdfs": {
+      "kind": "external_io",
+      "capabilities": ["content.fetch"],
+      "external_io": {
+        "protocol": "gcs",
+        "buckets": ["private-originals"],
+        "prefix": "objects/sha256",
+        "credentials": {"source": "default"}
+      }
+    }
+  }
+}
+```
+
+Here `default` uses Google application default credentials, including GKE
+Workload Identity. The selected workload needs read permission on the bucket.
+Keep credential values in the server keystore, never in source documents.
+Set the document-extraction producer's `config.credentials` to `source-pdfs`.
+When omitted, Antfly selects the most specific matching connection; equally
+specific matches fail closed and require an explicit name. URLs outside the
+bucket/prefix scope fail before credential discovery.
+
+Store an immutable source URL such as
+`gs://private-originals/objects/sha256/CONTENT_HASH.pdf?generation=1793305553268935`.
+The generation is sent to Google's JSON API and verified on the response. An
+unavailable or mismatched generation fails rather than falling back to latest.
+Only the optional `generation` query parameter is accepted, never URL credentials
+or signed query strings. Fetches retain the configured download byte, deadline,
+cancellation and destination restrictions. A bare `gs://` URL without an
+applicable configured connection never opts into ambient Google credentials.
+
+Cloud uses this same runtime configuration: configure a read-only instance GCS
+provider connection and bind its verified Workload Identity principal to the
+source bucket. Self-hosted deployments configure `connections` directly. This
+artifact transport requires a release containing native GCS content fetching;
+GCS external-I/O support in v0.3.0-rc.6 alone is insufficient.

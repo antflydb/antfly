@@ -24,6 +24,9 @@ test {
     _ = @import("antfly_local_sources").storage_db_query_search_exec;
     _ = @import("antfly_local_sources").sql_document_row;
     _ = @import("antfly_local_sources").storage_document_mutation_revision;
+    _ = @import("antfly_local_sources").storage_conditional_source;
+    _ = @import("antfly_local_sources").storage_logical_source;
+    _ = @import("antfly_local_sources").storage_document_projection;
     _ = @import("antfly_local_sources").functions_decisions;
     _ = @import("antfly_local_sources").functions_expressions;
     _ = @import("antfly_local_sources").functions_runtime;
@@ -176,6 +179,109 @@ test "decision functions graph evaluation preserves vector hit offset restrictio
     ));
 }
 
+test "api query contract conditional source projection preserves authorization-stage ownership" {
+    try @import("antfly_local_sources").api_query_contract.testing.expectConditionalSourceProjection();
+}
+
+test "api query contract conditional source spans preserve strict public wire semantics" {
+    try @import("antfly_local_sources").api_query_contract.testing.expectConditionalSourceWireSpans();
+}
+
 test "decision provider shared Cloudflare extraction preserves exact numbers and measured usage" {
     try @import("antfly_extracting").testCloudflareExtraction();
+}
+
+test "api query contract native scalar indexed array source receipt" {
+    try @import("antfly_local_sources").api_query_contract.testing.expectNativeScalarArraySource();
+}
+
+test "api query contract native retrieval borrows the admitted scalar program" {
+    const std = @import("std");
+    const local = @import("antfly_local_sources");
+    const query = local.api_query_contract;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/db", .{tmp.sub_path});
+    defer a.free(path);
+    var db = try local.storage_db_mod.DB.open(a, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const padding = try a.alloc(u8, 32768);
+    defer a.free(padding);
+    @memset(padding, 'x');
+    const json = try std.fmt.allocPrint(a, "{{\"arr\":[{{\"n\":1}},{{\"n\":2}}],\"payload\":\"{s}\"}}", .{padding});
+    defer a.free(json);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = json }}, .sync_level = .full_index });
+    var owned = try query.parseQueryRequest(a, null, "docs", "{\"fields\":[\"arr.1.n\"],\"select\":{\"value\":{\"case\":[{\"when\":{\"literal\":true},\"then\":{\"field\":\"payload\"}}]},\"n\":{\"field\":\"arr.1.n\"}}}");
+    defer owned.deinit(a);
+    try std.testing.expect(owned.req.field_projection_plan.?.get(owned.req.field_projection_json).? == owned.projection_plan.?);
+    var result = try db.search(a, owned.req);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("{\"arr\":[{\"n\":2}]}", result.hits[0].stored_data.?);
+    var computed = try std.json.parseFromSlice(std.json.Value, a, result.hits[0].computed_json.?, .{});
+    defer computed.deinit();
+    try std.testing.expectEqualStrings(padding, computed.value.object.get("value").?.string);
+    try std.testing.expectEqual(@as(i64, 2), computed.value.object.get("n").?.integer);
+}
+
+test "api query contract raw JSON budgets match VM for escaped strings and wide objects" {
+    const std = @import("std");
+    const local = @import("antfly_local_sources");
+    const sql = local.sql_scalar;
+    const ast = local.sql_ast;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const expression: ast.Scalar = .{ .column = "payload" };
+    var program = try sql.bind(a, &expression, &.{.{ .name = "payload", .type = .json }}, &.{}, .{ .constant_bytes = 0, .constant_steps = 0 });
+    defer program.deinit();
+    const Mock = struct {
+        raw: []const u8,
+        polls: usize = 0,
+        cancel: bool = false,
+        fn read(ptr: *anyopaque, _: std.mem.Allocator, _: u32) !?[]const u8 {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).raw;
+        }
+        fn poll(ptr: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.polls += 1;
+            if (self.cancel and self.polls >= 4) return error.Canceled;
+        }
+        fn compare(p: *const sql.Program, alloc: std.mem.Allocator, raw: []const u8, value: std.json.Value, steps: usize) !void {
+            const normal = try p.evaluate(alloc, &.{sql.Datum.json(value)}, &.{}, .{ .steps = steps, .output_bytes = 1024 * 1024 });
+            var self: @This() = .{ .raw = raw };
+            const limits: sql.EvalLimits = .{ .steps = steps, .output_bytes = 1024 * 1024, .output_column_loader = .{ .context = &self, .read = read }, .checkpoint = poll, .checkpoint_context = &self };
+            const result = try p.evaluateOutput(alloc, &.{}, &.{}, limits);
+            try std.testing.expect(result == .raw);
+            try std.testing.expect(result.raw.value.bytes.ptr == raw.ptr);
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, result.raw.value.bytes, .{});
+            try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(alloc, normal.value, .{}), try std.json.Stringify.valueAlloc(alloc, parsed, .{}));
+            try std.testing.expect(self.polls > 4);
+            self.polls = 0;
+            self.cancel = true;
+            try std.testing.expectError(error.Canceled, p.evaluateOutput(alloc, &.{}, &.{}, limits));
+        }
+    };
+    for ([_]bool{ false, true }) |unicode| {
+        var raw: std.Io.Writer.Allocating = .init(a);
+        var text: std.Io.Writer.Allocating = .init(a);
+        try raw.writer.writeByte('"');
+        for (0..@as(usize, if (unicode) 20000 else 100000)) |_| {
+            try raw.writer.writeAll(if (unicode) "\\uD83D\\uDE80" else "\\n");
+            try text.writer.writeAll(if (unicode) "🚀" else "\n");
+        }
+        try raw.writer.writeByte('"');
+        try Mock.compare(&program, a, raw.written(), .{ .string = text.written() }, 4);
+    }
+    var raw: std.Io.Writer.Allocating = .init(a);
+    try raw.writer.writeByte('{');
+    for (0..20000) |i| {
+        if (i != 0) try raw.writer.writeByte(',');
+        try raw.writer.print("\"k{d}\":\"\"", .{i});
+    }
+    try raw.writer.writeByte('}');
+    try Mock.compare(&program, a, raw.written(), try std.json.parseFromSliceLeaky(std.json.Value, a, raw.written(), .{}), 20002);
+    var empty: Mock = .{ .raw = "" };
+    if (program.evaluateOutput(a, &.{}, &.{}, .{ .output_column_loader = .{ .context = &empty, .read = Mock.read } })) |_| return error.TestExpectedError else |_| {}
 }

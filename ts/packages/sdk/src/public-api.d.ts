@@ -43,7 +43,7 @@ export interface paths {
         put?: never;
         /**
          * ingestLakeChanges
-         * @description Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table admin permission and iceberg_writer policy.
+         * @description Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table write permission without a row filter and iceberg_writer policy. Catalog initialization, file commits and maintenance require table admin permission.
          */
         post: operations["ingestLakeChanges"];
         delete?: never;
@@ -4871,7 +4871,7 @@ export interface paths {
         put?: never;
         /**
          * Chunk content with optional model-aware embeddings
-         * @description Splits content into chunks. Without `embedding`, the fixed chunker and
+         * @description Splits content into chunks. Without `embedding` or `outputs`, the fixed chunker and
          *     legacy response remain unchanged. With `embedding`, the resolved target
          *     model constrains boundaries for text, PDF pages, images or explicit tiles,
          *     composited GIF frames, audio windows and consecutive video windows.
@@ -4884,6 +4884,18 @@ export interface paths {
          *     terminal record must not be treated as complete source coverage.
          *     Continuations bind the original source version and semantic plan;
          *     retries may deterministically recompute and must deduplicate chunk IDs.
+         *
+         *     Named `outputs` independently embed, transcribe, classify, or diarize
+         *     each source. A `diarize` target returns source-scoped `speaker_spans`
+         *     without ASR. On transcription outputs, `diarize: true` enables the same
+         *     source-scoped voice identities. Set `policy.audio_speaker_turns: true`
+         *     with a diarization-enabled boundary target to split audio at detected
+         *     turns while respecting model limits. Speaker analysis runs before the
+         *     first chunk only as far as that chunk requires; matching outputs share
+         *     embeddings and timelines. Continuations reuse cached speaker state and
+         *     boundary directories, with durable checkpoints for recovery. Adding speaker
+         *     annotations alone preserves parent IDs; enabling speaker boundaries
+         *     binds the speaker model revision and settings into the plan.
          *
          *     ## Models
          *
@@ -4979,12 +4991,12 @@ export interface paths {
          *
          *     Downloaded and inline encoded media is limited cumulatively across the request
          *     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-         *     `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+         *     `resources.inference.admission.max_work_units` is positive—16 MiB times that effective work capacity (derived from request concurrency when omitted). A zero configured
          *     download limit disables nonempty media. Remote URL byte potential is reserved before
          *     fetch; inline sources reserve their actual encoded size without adding it to the
          *     existing request-body reservation. Accepted image headers are then validated and
          *     decoded source pixels are admitted at a conservative 16 bytes per pixel against
-         *     the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero
+         *     the lower of 512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero
          *     concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
          *     limits each source edge. Malformed images return 400, while dimension or aggregate
          *     excess returns 413 before model loading. Initial capacity admission occurs before
@@ -5125,16 +5137,17 @@ export interface paths {
         put?: never;
         /**
          * Read text from images (OCR/document understanding)
-         * @description Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+         * @description Reads text from images and documents with a local reader model. OCR and document-reading tasks can also run on a vision-capable generator or a connected provider.
          *
          *     ## Models
          *
          *     Models are auto-discovered from `models_dir/readers/` at startup.
          *     Use the `/ai/v1/models` endpoint to list available models.
          *
-         *     - **TrOCR**: Pure OCR for printed/handwritten text
+         *     - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+         *     - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+         *     - **PaddleOCR**: Text detection and recognition with page-space regions
          *     - **Donut**: Document understanding with structured output (receipts, forms)
-         *     - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
          *     - **Pix2Struct**: Visual question answering with natural-language prompts
          *     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened fields
          *
@@ -5153,11 +5166,11 @@ export interface paths {
          *     weighted capacity unit and at least one unit per two declared images. The effective
          *     ceiling is the minimum of the configured per-image limit times image count, the
          *     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-         *     `admission.inference.max_concurrent_requests`. Admission happens before model resolution or download.
+         *     `resources.inference.admission.max_work_units`. Admission happens before model resolution or download.
          *
          *     After download, image headers are validated before model loading. Decoded source
          *     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-         *     512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
+         *     512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work capacity
          *     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
          *     from downloaded-byte admission before inference. `max_image_dimension` limits
          *     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -5568,7 +5581,7 @@ export interface paths {
          *     ## Readers
          *
          *     - Vision2Seq models from `models_dir/readers/`
-         *     - TrOCR, Donut, Florence-2 for OCR and document understanding
+         *     - LightOnOCR-3, Florence-2, PaddleOCR, Donut, Pix2Struct, and Moondream for OCR and document understanding
          *
          *     ## Transcribers
          *
@@ -13080,6 +13093,14 @@ export interface components {
              * @example 0.5
              */
             search_effort?: number;
+            /** @description Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging. */
+            select?: {
+                [key: string]: components["schemas"]["ProjectionExpression"];
+            };
+            /** @description Request-local values bound by select expressions through param. Parameters are data, never executable expressions or read grants. The serialized parameter object is limited to 1 MiB and 1024 named parameters. */
+            params?: {
+                [key: string]: unknown;
+            };
             /**
              * @description List of fields to include in the results. If not specified, all fields are returned.
              *     Use to reduce response size and improve performance. This field is required when
@@ -14110,6 +14131,58 @@ export interface components {
              * @description Published graph metric score generation used for this hit.
              */
             published_generation: number;
+        };
+        /**
+         * @description Exactly one expression node: literal, field, ref, param, call with args,
+         *     case with optional else, cast, or a binary operator. Pure expressions
+         *     lower to the same typed scalar IR as SQL SELECT and CASE. AI/provider
+         *     calls remain in evaluate, never execute implicitly in select.
+         *     value_identity(field) returns an opaque identity for a present logical
+         *     value (including JSON null); missing has no identity. is_missing(field)
+         *     distinguishes missing from present null. Identity reads require the same
+         *     authorization and retained source revision as value reads. Metadata may
+         *     accelerate them; unsupported/old metadata falls back to ordinary reads.
+         *     Untaken CASE branches do not load fields or evaluate erroring calls.
+         *     Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from,
+         *     is_not_distinct_from, and, or, add, subtract, multiply, divide and concat.
+         *     Expressions are limited to depth 64 including referenced aliases, and
+         *     8192 nodes per request. Alias dependencies are acyclic; each alias is a
+         *     requested output and is evaluated once per row.
+         */
+        ProjectionExpression: {
+            literal?: unknown;
+            /** @description Logical source path. Dots traverse objects; numeric array components select an original index (items.1.name), and named components traverse arrays collecting present values (items.name). Nested user keys such as metadata._type are allowed. Internal root fields are reserved except _id. */
+            field?: string;
+            ref?: string;
+            param?: string;
+            /** @description Public pure SQL scalar function name, including value_identity and is_missing. Internal and provider-backed functions are forbidden. */
+            call?: string;
+            args?: components["schemas"]["ProjectionExpression"][];
+            case?: {
+                when: components["schemas"]["ProjectionExpression"];
+                then: components["schemas"]["ProjectionExpression"];
+            }[];
+            else?: components["schemas"]["ProjectionExpression"];
+            cast?: {
+                /** @enum {string} */
+                type: "string" | "integer" | "number" | "boolean" | "json" | "datetime";
+                expression: components["schemas"]["ProjectionExpression"];
+            };
+            eq?: components["schemas"]["ProjectionExpression"][];
+            neq?: components["schemas"]["ProjectionExpression"][];
+            lt?: components["schemas"]["ProjectionExpression"][];
+            lte?: components["schemas"]["ProjectionExpression"][];
+            gt?: components["schemas"]["ProjectionExpression"][];
+            gte?: components["schemas"]["ProjectionExpression"][];
+            is_distinct_from?: components["schemas"]["ProjectionExpression"][];
+            is_not_distinct_from?: components["schemas"]["ProjectionExpression"][];
+            and?: components["schemas"]["ProjectionExpression"][];
+            or?: components["schemas"]["ProjectionExpression"][];
+            add?: components["schemas"]["ProjectionExpression"][];
+            subtract?: components["schemas"]["ProjectionExpression"][];
+            multiply?: components["schemas"]["ProjectionExpression"][];
+            divide?: components["schemas"]["ProjectionExpression"][];
+            concat?: components["schemas"]["ProjectionExpression"][];
         };
         /** @description A single query result hit */
         QueryHit: {
@@ -15662,10 +15735,34 @@ export interface components {
              */
             allow_partial?: boolean;
         };
+        /** @description Source-wide online speaker clustering on a fixed 1.5 s grid with 3 s embedding windows. Identities are stable within a source and recipe. Silence and ambiguous voices remain unassigned. Analysis advances incrementally; admitted cached timelines and durable centroid/sample-position checkpoints are shared across matching outputs and continuations. Missing checkpoints reconstruct the required prefix deterministically. */
+        ChunkDiarizationConfig: {
+            /** @description Speaker ONNX registry reference; defaults to 3D-Speaker CAM++. For kind=diarize the target model selects the speaker model. */
+            model?: string;
+            /** @description Optional SHA-256 pin of the speaker ONNX file, including when paired with a transcription model. */
+            model_identity?: string;
+            /**
+             * Format: float
+             * @default 0.45
+             */
+            similarity_threshold?: number;
+            /**
+             * Format: float
+             * @default 0.03
+             */
+            ambiguity_margin?: number;
+            /**
+             * Format: float
+             * @default 0.01
+             */
+            min_rms?: number;
+            /** @default 64 */
+            max_speakers?: number;
+        };
         ChunkOutputTarget: {
             name: string;
             /** @enum {string} */
-            kind: "embedding" | "transcribe" | "classify";
+            kind: "embedding" | "transcribe" | "classify" | "diarize";
             model: string;
             /**
              * @description False retains this model as a planning boundary while skipping its inference; used for independent output repairs.
@@ -15686,8 +15783,13 @@ export interface components {
             task_type?: string;
             dimensions?: number;
             language?: string;
-            /** @default false */
+            /**
+             * @description Convenience option on transcription outputs; enables source-wide diarization with the default speaker model.
+             * @default false
+             */
             diarize?: boolean;
+            /** @description Speaker settings for diarize or transcribe outputs; also accepted on the selected audio embedding boundary with audio_speaker_turns=true. */
+            diarization?: components["schemas"]["ChunkDiarizationConfig"];
             /** @default 5 */
             top_k?: number;
         };
@@ -15735,6 +15837,11 @@ export interface components {
             tile_height?: number;
             /** @default 0 */
             tile_overlap?: number;
+            /**
+             * @description Split audio chunks at detected speaker transitions, additionally respecting the boundary model limits. Requires a diarization-enabled boundary target, zero overlap_ns and zero audio_pause_ns. The boundary diarization recipe participates in plan identity. Analysis runs even with execute=false because these boundaries depend on audio inference.
+             * @default false
+             */
+            audio_speaker_turns?: boolean;
             /**
              * Format: int64
              * @description Optional minimum silence duration for choosing an earlier boundary; no samples are discarded.
@@ -16800,13 +16907,392 @@ export interface components {
         MediaOutputConfig: {
             output_name: string;
         };
+        /** @description Names of row fields that carry source metadata. Each overrides the matching static field. */
+        DocumentExtractionSourceConfig: {
+            /** @description Row field holding the source filename. */
+            filename_field?: string;
+            /** @description Row field holding the source content type. */
+            content_type_field?: string;
+            /** @description Row field holding the source ETag. */
+            etag_field?: string;
+            /** @description Row field holding the source checksum. */
+            checksum_field?: string;
+            /** @description Row field holding the source version. */
+            version_field?: string;
+            /** @description Row field holding the source last-modified timestamp. */
+            last_modified_field?: string;
+        };
+        /** @description Reader provider for OCR. Every provider except `apple` requires `model`; Apple uses Vision text recognition and accepts no model, credentials, or prompt. */
+        DocumentExtractionReaderConfig: {
+            /** @enum {string} */
+            provider: "antfly" | "openai" | "cloudflare" | "vertex" | "apple";
+            /** @description Reader model, such as `lightonai/LightOnOCR-3-0.8B`. */
+            model?: string;
+            /** @description Provider-level prompt. Hosted readers send their own read instruction when it is omitted. */
+            prompt?: string;
+            /**
+             * Format: int64
+             * @description Maximum output tokens per page.
+             */
+            max_tokens?: number;
+            /** @description Reader endpoint URL. */
+            api_url?: string;
+            /** @description Reader endpoint URL; takes precedence over `api_url`. */
+            url?: string;
+            /** @description Provider API base URL. */
+            base_url?: string;
+            /** @description API key, normally a `${secret:...}` reference. */
+            api_key?: string;
+            /** @description Bearer token, normally a `${secret:...}` reference. */
+            bearer_token?: string;
+            /** @description Capability token for an Antfly inference endpoint. */
+            capability_token?: string;
+            /** @description Revision of the capability token. */
+            capability_revision?: string;
+            /** @description Cloudflare account ID. Required for `cloudflare`. */
+            account_id?: string;
+            /** @description Cloudflare AI Gateway ID. */
+            gateway_id?: string;
+            /** @description Google Cloud project for `vertex`. */
+            project_id?: string;
+            /** @description Google Cloud location for `vertex`. */
+            location?: string;
+            /** @description Path to Google Cloud credentials for `vertex`. */
+            credentials_path?: string;
+            /** @description Apple Vision recognition languages. Defaults to `en-US`. */
+            recognition_languages?: string[];
+            /**
+             * @description Apple Vision recognition level.
+             * @default accurate
+             * @enum {string}
+             */
+            recognition_level?: "accurate" | "fast";
+            /**
+             * @description Apple Vision language correction.
+             * @default false
+             */
+            uses_language_correction?: boolean;
+        };
+        /** @description How PDF pages are rasterized for OCR. */
+        DocumentExtractionRenderConfig: {
+            /**
+             * @description Render resolution in dots per inch.
+             * @default 150
+             */
+            dpi?: number;
+            /**
+             * @description `requested_dpi` renders at `dpi` within the caps. `model_input` renders near the model's preferred input size.
+             * @default requested_dpi
+             * @enum {string}
+             */
+            resolution?: "requested_dpi" | "model_input";
+            /**
+             * Format: int64
+             * @description Maximum pixels per rendered page.
+             * @default 40000000
+             */
+            max_pixels?: number;
+            /**
+             * @description Maximum width or height of a rendered page.
+             * @default 4096
+             */
+            max_dimension?: number;
+        };
+        /** @description Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode. */
+        DocumentExtractionOcrQualityConfig: {
+            /**
+             * @description Pages with fewer meaningful characters are read with OCR.
+             * @default 50
+             */
+            min_content_chars?: number;
+            /**
+             * @description Minimum words before the garbled-text check applies.
+             * @default 20
+             */
+            garbled_min_words?: number;
+            /**
+             * @description Words sampled by the garbled-text check.
+             * @default 50
+             */
+            garbled_sample_words?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of single-character words before text counts as garbled.
+             * @default 0.4
+             */
+            max_single_char_word_ratio?: number;
+            /**
+             * @description Minimum characters for a line to count in the corrupted-line check.
+             * @default 15
+             */
+            substantial_line_min_chars?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of corrupted lines.
+             * @default 0.2
+             */
+            max_corrupted_line_ratio?: number;
+            /**
+             * Format: double
+             * @description Font corruption score at which text is replaced by OCR.
+             * @default 0.5
+             */
+            font_corruption_score_threshold?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of Unicode replacement characters.
+             * @default 0.05
+             */
+            max_replacement_char_ratio?: number;
+        };
+        /** @description Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers run their own OCR task; generators receive a transcription instruction. */
+        DocumentExtractionOcrConfig: {
+            reader?: components["schemas"]["DocumentExtractionReaderConfig"];
+            generator?: components["schemas"]["GeneratorConfig"];
+            /**
+             * @description `auto` reads PDF pages whose native text fails the `quality` checks, and images. `always` reads every page.
+             * @default auto
+             * @enum {string}
+             */
+            mode?: "auto" | "always";
+            /** @description Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts. */
+            prompt?: string;
+            render?: components["schemas"]["DocumentExtractionRenderConfig"];
+            quality?: components["schemas"]["DocumentExtractionOcrQualityConfig"];
+        };
+        /** @description Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN. */
+        CloudflareSTTConfig: {
+            /** @enum {string} */
+            provider: "cloudflare";
+            account_id: string;
+            gateway_id?: string;
+            /** @default @cf/openai/whisper-large-v3-turbo */
+            model: string;
+            api_key?: string;
+            /** @description Optional deployment-owned full native endpoint override. */
+            base_url?: string;
+            language_code?: string;
+            voice?: string;
+        };
+        /**
+         * @description Configuration for OpenAI STT (Whisper) provider.
+         *
+         *     API key via `api_key` field or `OPENAI_API_KEY` environment variable.
+         *
+         *     **Model:** whisper-1
+         *
+         *     **Supported Formats:** mp3, wav, webm, ogg, flac (max 25MB)
+         *
+         *     **Docs:** https://platform.openai.com/docs/guides/speech-to-text
+         * @example {
+         *       "model": "whisper-1"
+         *     }
+         */
+        OpenAISTTConfig: {
+            /**
+             * @description Whisper model to use.
+             * @default whisper-1
+             */
+            model?: string;
+            /** @description OpenAI API key. Falls back to OPENAI_API_KEY environment variable. */
+            api_key?: string;
+            /**
+             * Format: uri
+             * @description API base URL. Falls back to OPENAI_BASE_URL environment variable.
+             */
+            base_url?: string;
+        };
+        /**
+         * @description Configuration for Google Cloud Speech-to-Text provider (Vertex AI).
+         *
+         *     Uses Application Default Credentials (ADC) for authentication.
+         *
+         *     **Features:** Streaming, speaker diarization, automatic punctuation
+         *
+         *     **Docs:** https://cloud.google.com/speech-to-text/docs
+         * @example {
+         *       "project_id": "my-gcp-project",
+         *       "language_code": "en-US",
+         *       "enable_automatic_punctuation": true
+         *     }
+         */
+        VertexSTTConfig: {
+            /** @description Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable. */
+            project_id?: string;
+            /**
+             * @description Google Cloud location.
+             * @default us-central1
+             */
+            location?: string;
+            /** @description Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain. */
+            credentials_path?: string;
+            /**
+             * @description Default language code (e.g., 'en-US', 'es-ES').
+             * @default en-US
+             */
+            language_code?: string;
+            /**
+             * @description Enable automatic punctuation.
+             * @default true
+             */
+            enable_automatic_punctuation?: boolean;
+            /**
+             * @description Use enhanced models for better accuracy (costs more).
+             * @default false
+             */
+            use_enhanced?: boolean;
+            /** @description Recognition model (e.g., 'latest_long', 'telephony', 'medical_dictation'). */
+            model?: string;
+        };
+        /**
+         * @description Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider.
+         *
+         *     Uses the Antfly inference service for speech-to-text inference.
+         *
+         *     **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base
+         *
+         *     **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC
+         *
+         *     **Docs:** See inference documentation
+         * @example {
+         *       "api_url": "http://localhost:8080",
+         *       "model": "openai/whisper-base"
+         *     }
+         */
+        AntflySTTConfig: {
+            /**
+             * Format: uri
+             * @description Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
+             */
+            api_url?: string;
+            /** @description Explicit Antfly transcriber model name (e.g., 'openai/whisper-tiny'). */
+            model: string;
+        };
+        /** @description On-device SpeechAnalyzer file transcription. Requires a macOS Apple provider build and supported Speech assets. Diarization is unsupported. */
+        AppleSTTConfig: {
+            /**
+             * @description Supported Speech locale; Apple transcription does not infer a language.
+             * @default en-US
+             */
+            language_code?: string;
+            /** @default true */
+            timestamps?: boolean;
+            /**
+             * @description Explicitly permit preparing and installing the selected Speech assets.
+             * @default false
+             */
+            download_assets?: boolean;
+        };
+        /**
+         * @description The STT provider to use.
+         * @enum {string}
+         */
+        STTProvider: "cloudflare" | "openai" | "vertex" | "antfly" | "apple";
+        /**
+         * @description Unified configuration for an STT provider.
+         *
+         *     Select the provider type and configure provider-specific settings.
+         *
+         *     **Supported Providers:**
+         *     - `openai` - OpenAI Whisper (whisper-1)
+         *     - `vertex` - Google Cloud Speech-to-Text (Vertex AI)
+         *     - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT)
+         *
+         *     **Example:**
+         *     ```yaml
+         *     provider: antfly
+         *     api_url: "http://localhost:8080"
+         *     model: openai/whisper-base
+         *     ```
+         * @example {
+         *       "provider": "antfly",
+         *       "api_url": "http://localhost:8080",
+         *       "model": "openai/whisper-base"
+         *     }
+         */
+        STTConfig: (components["schemas"]["CloudflareSTTConfig"] | components["schemas"]["OpenAISTTConfig"] | components["schemas"]["VertexSTTConfig"] | components["schemas"]["AntflySTTConfig"] | components["schemas"]["AppleSTTConfig"]) & {
+            provider: components["schemas"]["STTProvider"];
+        };
+        /** @description Transcribes audio units. */
+        DocumentExtractionTranscriptionConfig: {
+            transcriber: components["schemas"]["STTConfig"];
+        };
+        /** @description Conditions a source must meet. Every condition given must match. */
+        DocumentExtractionRouteMatch: {
+            /** @description Exact content type. */
+            content_type?: string;
+            /** @description Content type prefix, such as `image/`. */
+            content_type_prefix?: string;
+            /** @description Filename extension or list of extensions. */
+            extension?: string | string[];
+            /** @description Leading bytes or list of leading-byte prefixes. */
+            magic_prefix?: string | string[];
+        };
+        DocumentExtractionRoute: {
+            match?: components["schemas"]["DocumentExtractionRouteMatch"];
+            extractor: {
+                /**
+                 * @description Extractor for matching sources. `image` is an alias of `ocr` and `transcript` of `audio`. An `ocr` route requires an `ocr` block and an `audio` route requires a `transcription` block; otherwise the configuration is rejected with `DocumentExtractionModelRequired`.
+                 * @enum {string}
+                 */
+                type: "pdf" | "html" | "text" | "email" | "docx" | "pptx" | "xlsx" | "archive" | "ocr" | "image" | "audio" | "transcript" | "unsupported";
+                /** @description Unit type recorded for the extracted units, such as `page` or `transcript_segment`. */
+                unit?: string;
+            };
+        };
+        /**
+         * @description Configuration for the `document_extraction` producer. It downloads the source URL and persists derived units such as PDF pages, sections, images, and audio.
+         *
+         *     Native text (PDF text layers, Office documents, HTML, email, plain text) is extracted with no model. Scanned pages and images are read only when `ocr` names a reader or generator, and audio is transcribed only when `transcription` names a transcriber. Units that need a producer that is not configured report `extraction_status` `ocr_not_configured` or `transcription_not_configured`.
+         *
+         *     **Example:**
+         *     ```json
+         *     {
+         *       "source": {"filename_field": "filename", "content_type_field": "mime_type"},
+         *       "ocr": {"reader": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}},
+         *       "transcription": {"transcriber": {"provider": "antfly", "model": "openai/whisper-small"}}
+         *     }
+         *     ```
+         */
+        DocumentExtractionConfig: {
+            source?: components["schemas"]["DocumentExtractionSourceConfig"];
+            /** @description Static filename used for content detection when the row has none. */
+            filename?: string;
+            /** @description Static content type. Overrides the downloaded response's content type. */
+            content_type?: string;
+            /** @description Static ETag recorded as source version metadata. */
+            etag?: string;
+            /** @description Static checksum recorded as source version metadata. */
+            checksum?: string;
+            /** @description Static source version. Together with the other metadata it lets extraction skip unchanged sources. */
+            version?: string;
+            /** @description Static last-modified timestamp recorded as source version metadata. */
+            last_modified?: string;
+            /** @description Credential reference used to download the source URL. */
+            credentials?: string;
+            /**
+             * @description Strip HTML markup from HTML sources before storing their text.
+             * @default true
+             */
+            html_strip_tags?: boolean;
+            ocr?: components["schemas"]["DocumentExtractionOcrConfig"];
+            transcription?: components["schemas"]["DocumentExtractionTranscriptionConfig"];
+            /**
+             * @description How sources that match no explicit route are handled. `mixed_files` (alias `default`) detects PDFs, HTML, email, Office documents, ZIP archives, images, audio, and text. `explicit_only` (alias `none`) records unmatched sources as unsupported. Detection never requests a producer: detected images and audio without a configured producer report `ocr_not_configured` or `transcription_not_configured`.
+             * @default mixed_files
+             * @enum {string}
+             */
+            route_preset?: "mixed_files" | "explicit_only";
+            /** @description Routes evaluated in order before the preset. The first route whose match applies selects the extractor. */
+            routes?: components["schemas"]["DocumentExtractionRoute"][];
+        };
         EnrichmentProducerConfig: {
             /** @enum {string} */
             type: "copy" | "generator" | "extractor" | "decision" | "reader" | "transcriber" | "document_extraction" | "vector_labels" | "media_output";
             /** @description Producer-specific configuration. Generator schemas and generated extractors share constrained output admission, batching, validation retry, and immutable artifact replay. */
             config?: components["schemas"]["ConstrainedGeneratorProducerConfig"] | components["schemas"]["GeneratedExtractorConfig"] | {
                 [key: string]: unknown;
-            } | components["schemas"]["VectorLabelsConfig"] | components["schemas"]["MediaOutputConfig"];
+            } | components["schemas"]["VectorLabelsConfig"] | components["schemas"]["MediaOutputConfig"] | components["schemas"]["DocumentExtractionConfig"];
         };
         /** @description Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer. */
         EnrichmentNeighborContextConfig: {
@@ -16842,11 +17328,6 @@ export interface components {
              */
             max_document_pages?: number;
         };
-        /**
-         * @description The STT provider to use.
-         * @enum {string}
-         */
-        STTProvider: "cloudflare" | "openai" | "vertex" | "antfly" | "apple";
         /**
          * @description Speech-to-text provider for the `transcriber` enrichment shorthand.
          *
@@ -18902,6 +19383,7 @@ export interface components {
             embedding?: components["schemas"]["MediaOutputCoverageValues"];
             transcribe?: components["schemas"]["MediaOutputCoverageValues"];
             classify?: components["schemas"]["MediaOutputCoverageValues"];
+            diarize?: components["schemas"]["MediaOutputCoverageValues"];
         };
         /** @description Runtime state for the durable embeddings enrichment worker. */
         EnrichmentRuntimeStatus: {
@@ -22526,7 +23008,7 @@ export interface components {
              * @description Native HTTP mutations return this progress resource relative to the request URI. Follow its bounded pages for individual consumer proofs.
              */
             progress_url?: string;
-            /** @description Native mutation outcomes, stored once per namespace. Consumer progress rows reference these by key_template. The results array is reserved for inspection and embedded consumer summaries. */
+            /** @description Mutation outcomes, stored once per namespace. Read absorbed keys and dispositions here; consumer progress rows reference these by key_template. The results array is reserved for inspection and embedded consumer summaries. */
             namespaces?: components["schemas"]["EntityNamespaceOutcome"][];
             results: {
                 source_table: string;
@@ -22538,15 +23020,6 @@ export interface components {
                 };
                 /** Format: uint64 */
                 revision?: number;
-                /**
-                 * @deprecated
-                 * @description Legacy per-consumer outcomes; native mutations return namespaces instead.
-                 */
-                absorbed?: {
-                    key: string;
-                    /** @enum {string} */
-                    disposition: "release" | "suppress";
-                }[];
                 changed?: boolean;
                 /** Format: uint64 */
                 replay_sequence?: number;
@@ -23139,7 +23612,7 @@ export interface components {
         InferenceReadRequest: {
             /**
              * @description Name of reader model from models_dir/readers/
-             * @example microsoft/trocr-base-printed
+             * @example lightonai/LightOnOCR-3-0.8B
              */
             model: string;
             /**
@@ -23162,7 +23635,6 @@ export interface components {
             images?: components["schemas"]["InferenceImageURL"][];
             /**
              * @description Optional task prompt for document understanding models.
-             *     - TrOCR: Not used (pure OCR)
              *     - Donut CORD: "<s_cord-v2>" for receipt parsing
              *     - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>"
              *     - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
@@ -24410,284 +24882,7 @@ export interface components {
          * @enum {string}
          */
         InferenceModelBackend: "auto" | "native" | "metal" | "cuda" | "xla" | "webgpu" | "wasm";
-        /**
-         * @description Optional artifact format preference for loading a model.
-         * @enum {string}
-         */
-        InferenceModelFormat: "gguf" | "onnx" | "safetensors" | "hybrid";
-        /**
-         * @description Optional quantization preference for loading a model.
-         * @enum {string}
-         */
-        InferenceModelQuantization: "q4_k" | "q8" | "fp16";
-        /**
-         * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits.
-         * @enum {string}
-         */
-        InferenceA4bResidencyMode: "auto" | "streamed" | "resident";
-        /**
-         * @description Backend priority entry for model loading. Use `backend` or `backend:device`,
-         *     where device defaults to `auto`.
-         *
-         *     Backends:
-         *     - `native` - Native CPU backend
-         *     - `metal` - Apple Metal backend
-         *     - `cuda` - NVIDIA CUDA backend
-         *     - `xla` - PJRT/XLA compiled backend
-         *     - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds
-         *
-         *     Devices:
-         *     - `auto` - Auto-detect best available (default)
-         *     - `cuda` - NVIDIA CUDA GPU
-         *     - `tpu` - Google TPU (used by XLA)
-         *     - `cpu` - Force CPU only
-         */
-        InferenceBackendPriorityEntry: string;
-        /** @description Model reference used by startup preload and model-loading configuration. */
-        InferenceModelRef: {
-            kind: components["schemas"]["InferenceModelKind"];
-            /**
-             * @description Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
-             * @example antflydb/gemma-e2b
-             */
-            name: string;
-            backend?: components["schemas"]["InferenceModelBackend"];
-            /**
-             * @description Per-model GLiNER CUDA inference precision for extractor preloads. Requires
-             *     CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests
-             *     fail closed until the exact model/profile has release qualification.
-             *     Precision is part of the loaded-session cache identity.
-             * @enum {string}
-             */
-            cuda_precision?: "auto" | "fp32" | "fp16" | "bf16";
-            format?: components["schemas"]["InferenceModelFormat"];
-            quantization?: components["schemas"]["InferenceModelQuantization"];
-            /**
-             * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits. Other model geometries reject this field.
-             * @default auto
-             */
-            residency_mode?: components["schemas"]["InferenceA4bResidencyMode"];
-            /**
-             * Format: uint32
-             * @description Per-model A4B memory envelope in MiB. Zero selects the backend default (2048 MiB streamed on Metal or 16384 MiB resident on qualified CUDA); CUDA rejects any envelope too small for full residency. Other model geometries reject this field.
-             * @default 0
-             */
-            memory_budget_mb?: number;
-        };
-        /** @description Native generator prompt KV cache configuration. */
-        InferencePromptCacheConfig: {
-            /**
-             * @description Enable inference-native prompt KV cache reuse for generator requests. On by default; set false to disable.
-             * @default true
-             */
-            enabled?: boolean;
-            /**
-             * @description Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
-             *     full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an
-             *     opt-in page-aligned compressed radix tree with shared-prefix ownership and
-             *     leaf-only LRU eviction; it is currently qualified for native and Metal
-             *     backends. Eligible Metal requests use eager paged attention; explicit compiled
-             *     generation is incompatible with prompt caching. `simple` keeps the linear-scan
-             *     retained-prefix cache and is only suitable for small caches or debugging.
-             * @default block_hash
-             * @enum {string}
-             */
-            mode?: "simple" | "block_hash" | "radix";
-            /**
-             * @description Node-wide target for live prompt-cache entries. The runtime divides it
-             *     across participating model caches and evicts using estimated metadata
-             *     and logical host/device KV bytes. Backend allocators may retain reusable
-             *     capacity, so this is not a hard cap on process or accelerator memory.
-             * @default 512
-             */
-            max_bytes_mb?: number;
-            /**
-             * @description Minimum prompt length eligible for prompt KV caching.
-             * @default 64
-             */
-            min_tokens?: number;
-            /**
-             * @description Idle time-to-live for prompt KV cache entries. Refreshed on every cache
-             *     hit, so only entries left unused for this duration expire.
-             * @default 300000
-             */
-            ttl_ms?: number;
-        };
-        /** @description Process-local foreground request admission settings. */
-        InferenceAdmissionConfig: {
-            inference?: components["schemas"]["InferenceRequestAdmissionConfig"];
-        };
-        InferenceRequestAdmissionConfig: {
-            /**
-             * @description Maximum concurrent inference requests in this process. The same
-             *     value also sizes the weighted work budget shared by every executing
-             *     inference endpoint: each request consumes one request slot and at
-             *     least one unit, while request body size, generation workload, and
-             *     image byte/count reservations can consume more than one unit. The
-             *     request count can therefore never exceed this value, while expensive
-             *     requests may exhaust weighted capacity sooner. Read and
-             *     image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB
-             *     per unit and at least one unit per two images. A positive capacity also
-             *     clamps each such request's downloaded-image ceiling to 16 MiB times
-             *     this value. When either ceiling is exhausted, new HTTP requests are
-             *     rejected immediately with 503 Service Unavailable and Retry-After: 1;
-             *     they are not retained
-             *     in an in-process queue. Set to 0 to disable both ceilings, admission
-             *     unit accounting, and the capacity-derived clamp. The default is 32.
-             * @default 32
-             * @example 32
-             */
-            max_concurrent_requests?: number;
-        };
-        InferenceConfig: components["schemas"]["InferenceRuntimeConfig"] & {
-            admission?: components["schemas"]["InferenceAdmissionConfig"];
-        };
-        InferenceRuntimeConfig: {
-            /**
-             * @deprecated
-             * @description Deprecated compatibility alias for
-             *     `admission.inference.max_concurrent_requests`. New configurations
-             *     should use the process-level admission setting. If both spellings
-             *     are supplied, they must have the same value.
-             * @example 32
-             */
-            max_concurrent_requests?: number;
-            /**
-             * Format: uri
-             * @description URL of an out-of-process Antfly inference service that the Antfly
-             *     server should call for embedding, chunking, reranking, and
-             *     generation. Omit it to use the in-process inference runtime
-             *     (the default in standalone mode). `antfly inference run` ignores
-             *     this field; it configures the client side only.
-             * @example http://localhost:8080
-             */
-            api_url?: string;
-            /** @description API key used when calling an authenticated shared Antfly inference API. */
-            api_key?: string;
-            /**
-             * @description Base directory containing model subdirectories. Antfly inference auto-discovers models from:
-             *     - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name`
-             *     - `{models_dir}/embedders/` - Embedding models
-             *     - `{models_dir}/rerankers/` - Reranking models
-             *     - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
-             *     - `{models_dir}/rewriters/` - Seq2Seq rewriter models
-             *
-             *     Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models`
-             *     (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed`
-             *     chunker needs no models.
-             * @example ~/.antfly/inference/models
-             */
-            models_dir?: string;
-            /**
-             * @description Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*`
-             *     API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`.
-             *
-             *     Defaults to ~/.antfly/inference/ml.
-             * @example ~/.antfly/inference/ml
-             */
-            ml_dir?: string;
-            /** @description Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline. */
-            content_security?: components["schemas"]["InferenceContentSecurityConfig"];
-            /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
-            s3_credentials?: components["schemas"]["InferenceCredentials"];
-            /**
-             * @description How long to keep models loaded in memory after last use (Ollama-compatible).
-             *     Models are automatically unloaded after this duration of inactivity.
-             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
-             *     Defaults to "5m". Set to "0" to disable idle-time eviction; models can
-             *     still be evicted under resource pressure or to enforce max_loaded_models.
-             * @default 5m
-             * @example 5m
-             */
-            keep_alive?: string;
-            /**
-             * @description Maximum total models loaded across all registry types (embedders, rerankers,
-             *     generators, chunkers, etc.). When the limit is reached, the least-recently-used
-             *     idle model from any registry is evicted to make room. Set to 0 for unlimited.
-             *     Defaults to 10.
-             * @default 10
-             * @example 3
-             */
-            max_loaded_models?: number;
-            /**
-             * @deprecated
-             * @description Legacy compatibility field. The current Zig inference runtime does not
-             *     create per-model pipeline pools from this setting; configuring it has no effect.
-             */
-            pool_size?: number;
-            /** @description Native generator prompt KV cache settings. */
-            prompt_cache?: components["schemas"]["InferencePromptCacheConfig"];
-            /**
-             * @deprecated
-             * @description Legacy compatibility field. The current Zig inference runtime selects a
-             *     backend from model metadata, explicit preload settings, and compiled capabilities;
-             *     configuring this list has no effect.
-             */
-            backend_priority?: components["schemas"]["InferenceBackendPriorityEntry"][];
-            /**
-             * @deprecated
-             * @description Legacy Go-runtime queue setting. The current Zig runtime does not retain
-             *     excess inference requests in memory and ignores this field.
-             */
-            max_queue_size?: number;
-            /**
-             * @deprecated
-             * @description Legacy Go-runtime queue/request timeout. The current Zig runtime ignores
-             *     this field; its HTTP listener applies a separate fixed transport timeout.
-             */
-            request_timeout?: string;
-            /**
-             * @description Models to preload and warm at startup. Generators run a tiny generation
-             *     request so native/Metal weights, KV setup, and kernels use the same
-             *     budgeted path as request-time generation. Other model kinds use the
-             *     best available warm path for that kind.
-             * @example [
-             *       {
-             *         "kind": "generator",
-             *         "name": "antflydb/gemma-e2b",
-             *         "backend": "metal",
-             *         "format": "gguf",
-             *         "quantization": "q4_k"
-             *       }
-             *     ]
-             */
-            preload?: components["schemas"]["InferenceModelRef"][];
-            /**
-             * @deprecated
-             * @description Legacy compatibility field. The current Zig runtime uses explicit host,
-             *     backend, combined, KV, and scratch budgets instead and ignores this field.
-             */
-            max_memory_mb?: number;
-            /**
-             * @description Per-model loading strategy overrides. Maps model names to their loading strategy.
-             *     Models not in this map load on demand. keep_alive controls their idle
-             *     eviction; setting it to "0" disables idle eviction but does not preload or pin them.
-             *
-             *     When a model has strategy "eager" in this map:
-             *     - It is loaded at startup through the same startup warmup path
-             *     - It is never unloaded, even when keep_alive>0 (pinned in memory)
-             *
-             *     This allows mixing eager and lazy models in the same pool.
-             * @example {
-             *       "BAAI/bge-small-en-v1.5": "eager",
-             *       "mirth/chonky-mmbert-small-multilingual-1": "lazy"
-             *     }
-             */
-            model_strategies?: {
-                [key: string]: "eager" | "lazy" | "bounded";
-            };
-            /**
-             * @deprecated
-             * @description Legacy compatibility field controlling whether dashboards show model
-             *     download commands. It defaults to true for standalone deployments;
-             *     managed deployments historically set it to false. Download-command
-             *     availability is a build-time setting in the current Zig runtime, so
-             *     configuring this field has no effect.
-             * @default true
-             */
-            allow_downloads?: boolean;
-            log?: components["schemas"]["Inferenceschemas-Config"];
-        };
+        InferenceConfig: components["schemas"]["InferenceServerConfig"];
         /** @description Runtime backends compiled into this inference server. */
         InferenceBackendRuntimes: {
             /**
@@ -24746,96 +24941,6 @@ export interface components {
             frame_index?: number;
             /** @description Animation: display delay in milliseconds */
             frame_delay_ms?: number;
-        };
-        /** @description Inference merges configured fields over a fail-closed baseline. HTTP(S), file, and S3 content require explicit allowlists; data URIs remain allowed within the configured size budget. */
-        InferenceContentSecurityConfig: {
-            /**
-             * @description Explicit HTTP(S) host allowlist for inference downloads. Omission and an explicit empty list both deny all hosts. With block_private_ips enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address.
-             * @example [
-             *       "93.184.216.34"
-             *     ]
-             */
-            allowed_hosts?: string[];
-            /**
-             * @description Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special destinations.
-             * @default true
-             */
-            block_private_ips?: boolean;
-            /**
-             * @description Maximum size of downloaded content in bytes
-             * @default 104857600
-             * @example 104857600
-             */
-            max_download_size_bytes?: number;
-            /**
-             * @description Maximum HTTP download duration in seconds. Defaults to 30; 0 disables the deadline.
-             * @default 30
-             */
-            download_timeout_seconds?: number;
-            /** @description Maximum source-image width or height for accepted inference image inputs, including generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation applies the same image-header admission before model execution. Non-inference scraping consumers do not enforce this setting. */
-            max_image_dimension?: number;
-            /**
-             * @description Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission and an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
-             * @example [
-             *       "/Users/data/",
-             *       "my-bucket/uploads/"
-             *     ]
-             */
-            allowed_paths?: string[];
-            /**
-             * @description User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
-             * @example AntflyDB/1.0
-             */
-            user_agent?: string;
-        };
-        InferenceCredentials: {
-            /**
-             * @description S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
-             * @example s3.amazonaws.com
-             */
-            endpoint?: string;
-            /**
-             * @description Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
-             * @default true
-             */
-            use_ssl?: boolean;
-            /**
-             * @description AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
-             * @example your-access-key-id
-             */
-            access_key_id?: string;
-            /**
-             * @description AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
-             * @example your-secret-access-key
-             */
-            secret_access_key?: string;
-            /**
-             * @description Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
-             * @example your-session-token
-             */
-            session_token?: string;
-        };
-        /**
-         * @description Logging verbosity level
-         * @default info
-         * @example info
-         * @enum {string}
-         */
-        InferenceLevel: "debug" | "info" | "warn" | "error";
-        /**
-         * @description Logging output format style. 'terminal' for colorized console, 'json' for structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
-         * @default terminal
-         * @example terminal
-         * @enum {string}
-         */
-        InferenceStyle: "terminal" | "json" | "logfmt" | "noop";
-        /**
-         * @deprecated
-         * @description Legacy inference-local logging configuration. The current unified Zig runtime ignores it; configure the top-level `log` object instead.
-         */
-        "Inferenceschemas-Config": {
-            level?: components["schemas"]["InferenceLevel"];
-            style?: components["schemas"]["InferenceStyle"];
         };
         /** @description A single embedding result */
         InferenceEmbeddingObject: {
@@ -29251,6 +29356,8 @@ export interface components {
         };
         /** @description Original-source coordinates; time intervals are half-open integer nanoseconds and text spans are UTF-8 byte offsets. */
         ChunkCoordinates: {
+            /** @description Source-scoped speaker of a chunk made with audio_speaker_turns; omitted for unassigned intervals. */
+            speaker_index?: number;
             /** @enum {string} */
             kind: "text" | "pdf" | "image" | "gif" | "audio" | "video";
             /** Format: int64 */
@@ -29303,13 +29410,21 @@ export interface components {
             coordinates: components["schemas"]["ChunkCoordinates"];
             input_tokens: number;
         };
+        ChunkSpeakerSpan: {
+            /** Format: int64 */
+            start_ns: number;
+            /** Format: int64 */
+            end_ns: number;
+            /** @description Source-scoped voice index in order of first appearance; absent for silence or ambiguous audio. */
+            speaker_index?: number;
+        };
         ChunkTranscriptSpan: {
             text: string;
             /** Format: int64 */
             start_ns: number;
             /** Format: int64 */
             end_ns: number;
-            /** @description Speaker index local to this output sub-window; global identities require diarization stitching. */
+            /** @description Source-scoped when the output carries speaker_scope=source. Older receipts without that marker use sub-window-local numbering. */
             speaker_index?: number;
         };
         ChunkOutputLabel: {
@@ -29318,9 +29433,18 @@ export interface components {
             score: number;
         };
         ChunkOutputResult: {
+            /** @description SHA-256 of the speaker ONNX bytes used for this output. Included in recipe identity for diarization and paired transcription or embedding boundaries. */
+            speaker_model_revision?: string;
+            /**
+             * @description Speaker indices are shared across all windows of this source and diarization recipe.
+             * @enum {string}
+             */
+            speaker_scope?: "source";
+            /** @description Timed voice annotations for kind=diarize, including unassigned intervals. No transcript is required. */
+            speaker_spans?: components["schemas"]["ChunkSpeakerSpan"][];
             name: string;
             /** @enum {string} */
-            kind: "embedding" | "transcribe" | "classify";
+            kind: "embedding" | "transcribe" | "classify" | "diarize";
             required: boolean;
             model: string;
             model_identity: string;
@@ -29437,12 +29561,44 @@ export interface components {
              */
             detail?: "auto" | "low" | "high";
         };
+        /** @description Antfly gateway-only, request-local table image reference. The gateway uses the ingress identity through the ordinary query path, checks the current revision, optional source identity, digest, MIME, byte length and pixel bound, then materializes provider-compatible image evidence. It never forwards this locator or a credential upstream. The digest is not an access grant. Direct inference servers without table access reject this form. */
+        DecisionTableSource: {
+            table: string;
+            document_id: string;
+            field: string;
+            revision_field: string;
+            revision: string;
+            identity?: string;
+            sha256: string;
+            /** @enum {string} */
+            mime_type: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+            byte_length: number;
+            /** @default 67108864 */
+            max_pixels?: number;
+            /** @description Additional caller selection, conjoined with the gateway's live row policy; never an authorization override. */
+            filter_query?: {
+                [key: string]: unknown;
+            };
+            permissions_field?: string;
+            /** @description Optional narrowing check against permissions_field.public/readers; it cannot grant table or row access. */
+            principals?: string[];
+        };
+        DecisionEvidenceTableImage: {
+            /** @enum {string} */
+            type: "input_image";
+            source: components["schemas"]["DecisionTableSource"];
+            /**
+             * @default auto
+             * @enum {string}
+             */
+            detail?: "auto" | "low" | "high";
+        };
         DecisionEvidenceMessage: {
             /** @enum {string} */
             type?: "message";
             /** @enum {string} */
             role: "user";
-            content: string | (components["schemas"]["DecisionEvidenceText"] | components["schemas"]["DecisionEvidenceImage"])[];
+            content: string | (components["schemas"]["DecisionEvidenceText"] | components["schemas"]["DecisionEvidenceImage"] | components["schemas"]["DecisionEvidenceTableImage"])[];
         };
         /** @description Text or ordered user messages containing text and images. Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a model that supports both images and constrained output; native, Gemini, and Vertex generators require inline images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported. */
         DecisionEvidence: string | components["schemas"]["DecisionEvidenceMessage"][];
@@ -30002,6 +30158,557 @@ export interface components {
             input_tokens: number;
             /** @description Zero for classifiers, which generate no tokens. */
             output_tokens: number;
+        };
+        QueryAdmissionConfig: {
+            /**
+             * @description Maximum concurrent query, search, and retrieval requests in this
+             *     process. The default is 32. The budget is shared by REST, MCP,
+             *     retrieval-agent, A2A, and direct API-kernel execution. Full-text,
+             *     vector, hybrid, graph, aggregation, federated searches, and document
+             *     scans consume it. Point lookups and operational/control-plane reads
+             *     remain outside it. Excess HTTP work is rejected immediately with
+             *     HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure
+             *     response. Excess work is not queued. Set to 0 to disable query
+             *     admission. This budget is independent of transport safeguards,
+             *     write admission, and
+             *     resources.inference.admission.max_concurrent_requests.
+             * @default 32
+             * @example 32
+             */
+            max_concurrent_requests?: number;
+        };
+        /** @description Operator-owned ceilings shared by all named graph operations in one admitted query. Public requests cannot raise these values. Explored work, scanned anchors, and exact-distinct capacity are request-consumptive; intermediate and retained-state ceilings bound simultaneously live state. */
+        GraphExecutionConfig: {
+            /**
+             * @description Cumulative node expansions across every named operation and path spur in one request.
+             * @default 100000
+             */
+            max_explored_nodes?: number;
+            /**
+             * @description Cumulative edge expansions across every named operation and path spur in one request.
+             * @default 1000000
+             */
+            max_explored_edges?: number;
+            /**
+             * @description Cumulative owned bytes of materialized edges read while executing one request.
+             * @default 67108864
+             */
+            max_explored_edge_bytes?: number;
+            /**
+             * @description Cumulative source anchors scanned by exact MATCH operations in one request.
+             * @default 1000000
+             */
+            max_scanned_anchors?: number;
+            /**
+             * @description Maximum simultaneously live traversal, pathfinding, or MATCH frontier states.
+             * @default 100000
+             */
+            max_intermediate_states?: number;
+            /**
+             * @description Maximum simultaneously retained bytes of admitted graph execution state.
+             * @default 67108864
+             */
+            max_retained_state_bytes?: number;
+            /**
+             * @description Cumulative exact-distinct identities admitted across all named aggregates in one request.
+             * @default 100000
+             */
+            max_distinct_identities?: number;
+            /**
+             * @description Request-consumptive bytes for exact-distinct identities, indexes, and ownership transfer.
+             * @default 16777216
+             */
+            max_distinct_state_bytes?: number;
+        };
+        WriteAdmissionConfig: {
+            /**
+             * @description Maximum concurrent foreground data mutations in this process. The
+             *     default is 16. Table batch writes, cross-table batches, linear merges,
+             *     and transaction commits consume this budget. Schema, index, backup,
+             *     restore, repair, and other administrative operations use dedicated
+             *     control or background-maintenance paths. Set to 0 to disable write
+             *     admission.
+             *
+             *     Excess HTTP work in either foreground class is rejected immediately
+             *     with HTTP 429 and Retry-After: 1; asynchronous protocols use their
+             *     native failure response. Excess work is not queued. Both budgets are
+             *     independent of transport safeguards and
+             *     resources.inference.admission.max_concurrent_requests.
+             * @default 16
+             * @example 16
+             */
+            max_concurrent_requests?: number;
+        };
+        /** @description Inference memory ceilings in bytes. Omitted or zero values select automatic policy; physical capacity and the process envelope remain authoritative. */
+        InferenceMemoryConfig: {
+            /** @description Host memory ceiling. */
+            max_host_bytes?: number;
+            /** @description Accelerator memory ceiling. */
+            max_device_bytes?: number;
+            /** @description Combined host and accelerator ceiling; integrated devices also enforce this across CPU and GPU leases. */
+            max_combined_bytes?: number;
+            /** @description KV cache memory ceiling. */
+            max_kv_bytes?: number;
+            /** @description Scratch memory ceiling. */
+            max_scratch_bytes?: number;
+        };
+        InferenceAdmissionConfig: {
+            /** @description Weighted work and media capacity, independent of request count. Omitted derives capacity from concurrency; zero disables weighted accounting. */
+            max_work_units?: number;
+            /**
+             * @description Maximum concurrent inference requests admitted by this process.
+             *     The budget covers embedded inference routes, direct providers, and
+             *     public connection inference forwarding. Remote forwarding holds a
+             *     slot for the full upstream request. The runtime-reserved
+             *     `local-inference` connection dispatches in process and is admitted
+             *     once by the destination inference route; configured URLs remain
+             *     remote boundaries even when they alias the local listener.
+             *     Embedded standalone uses one shared coordinator for all of those
+             *     surfaces; API-only runtimes use the same setting as a local forwarding
+             *     gate. Weighted work/media capacity is controlled independently by
+             *     max_work_units; when omitted it derives from max_concurrent_requests.
+             *     Request count zero disables only the request-count gate. An explicit
+             *     max_work_units remains authoritative. Excess work is rejected with
+             *     503 and Retry-After; it is not queued.
+             * @default 32
+             * @example 32
+             */
+            max_concurrent_requests?: number;
+        };
+        /** @description Deployment request ceilings only narrow model capabilities. Applied equally to direct calls, HTTP and discovery. Omitted values retain native limits. */
+        InferenceRequestLimitsConfig: {
+            /** @description Maximum items in one public or direct request. Independent callers may still be combined into a larger native execution microbatch. */
+            max_items_per_request?: number;
+            /** @description Maximum effective input tokens per item, including expanded image prompts. */
+            max_input_tokens_per_item?: number;
+            /** @description Maximum generated output tokens per item. Omitted request max_tokens resolves to a bounded effective default. */
+            max_output_tokens_per_item?: number;
+            /** @description Maximum aggregate decoded image pixels in a request batch; also bounds execution microbatch pixels. */
+            max_decoded_pixels_per_batch?: number;
+        };
+        /** @description Shared node-local resource policy for DB and standalone inference. All memory quantities are bytes. */
+        ResourcesConfig: {
+            memory?: {
+                /** @description Whole-process memory envelope; zero selects automatic cgroup or host detection. Physical capacity always clamps this value. */
+                max_bytes?: number;
+            };
+            query?: {
+                admission?: components["schemas"]["QueryAdmissionConfig"];
+                request_limits?: {
+                    graph?: components["schemas"]["GraphExecutionConfig"];
+                };
+            };
+            write?: {
+                admission?: components["schemas"]["WriteAdmissionConfig"];
+            };
+            inference?: {
+                memory?: components["schemas"]["InferenceMemoryConfig"];
+                admission?: components["schemas"]["InferenceAdmissionConfig"];
+                request_limits?: components["schemas"]["InferenceRequestLimitsConfig"];
+            };
+        };
+        /**
+         * @description Low-level content download policy. File downloads always require an
+         *     explicit nonempty `allowed_paths` list. In the generic scraper, omitted
+         *     `allowed_hosts` for HTTP(S) and `allowed_paths` for S3 do not restrict
+         *     those sources; explicit empty lists deny them. Consumers may merge this object over a
+         *     stricter baseline before downloading. Antfly inference does so: omitted
+         *     or empty inference policies, and omitted inference allowlists, deny
+         *     HTTP(S), file, and S3 content until explicit allowlists are configured.
+         *     Do not assume omission has identical policy semantics across consumers.
+         */
+        ContentSecurityConfig: {
+            /**
+             * @description Whitelist for HTTP(S) downloads. With block_private_ips enabled (the default), IP literals and every address resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address. Set block_private_ips to false only to opt into private or special destinations. The generic scraper treats omission as unrestricted subject to that policy and an explicit empty list as deny-all; Antfly inference requires an explicit allowlist.
+             * @example [
+             *       "93.184.216.34"
+             *     ]
+             */
+            allowed_hosts?: string[];
+            /**
+             * @description Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special destinations.
+             * @default true
+             */
+            block_private_ips?: boolean;
+            /**
+             * @description RFC 6052 network-specific NAT64 prefixes used by this deployment. Resolved IPv6 addresses under these prefixes are decoded and checked against the private IPv4 policy. Prefix length must be 32, 40, 48, 56, 64, or 96.
+             * @example [
+             *       "2001:db8:64::/96"
+             *     ]
+             */
+            nat64_prefixes?: string[];
+            /**
+             * @description Maximum size of downloaded content in bytes
+             * @default 104857600
+             * @example 104857600
+             */
+            max_download_size_bytes?: number;
+            /**
+             * @description Maximum HTTP(S) and S3 download duration in seconds. Defaults to 30. Zero disables this configured ceiling, but a caller-supplied request deadline still applies. A deadline-bound file:// fetch fails closed because portable filesystem I/O does not expose a preemptive timeout.
+             * @default 30
+             */
+            download_timeout_seconds?: number;
+            /** @description Maximum source-image width or height enforced for accepted inference image inputs, including generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Images are rejected rather than resized. Batch generation applies the same image-header admission before model execution; non-inference scraping consumers do not enforce this setting. */
+            max_image_dimension?: number;
+            /**
+             * @description Whitelist of allowed path prefixes for file:// and s3:// URLs. File downloads require an explicit nonempty path allowlist; omission and an empty list deny local file access. For S3 the generic scraper treats omission as unrestricted and an empty list as deny-all; Antfly inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
+             * @example [
+             *       "/Users/data/",
+             *       "my-bucket/uploads/"
+             *     ]
+             */
+            allowed_paths?: string[];
+            /**
+             * @description User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
+             * @example AntflyDB/1.0
+             */
+            user_agent?: string;
+        };
+        /** @description Native generator prompt KV cache configuration. */
+        PromptCacheConfig: {
+            /**
+             * @description Enable inference-native prompt KV cache reuse for generator requests.
+             * @default false
+             */
+            enabled?: boolean;
+            /**
+             * @description Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
+             *     full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an
+             *     opt-in page-aligned compressed radix tree with shared-prefix ownership and
+             *     leaf-only LRU eviction; it is currently qualified for native and Metal
+             *     backends. Eligible Metal requests use eager paged attention; explicit compiled
+             *     generation is incompatible with prompt caching. `simple` keeps the linear-scan
+             *     retained-prefix cache and is only suitable for small caches or debugging.
+             * @default block_hash
+             * @enum {string}
+             */
+            mode?: "simple" | "block_hash" | "radix";
+            /**
+             * @description Node-wide target for live prompt-cache entries. The runtime divides it
+             *     across participating model caches and evicts using estimated metadata
+             *     and logical host/device KV bytes. Backend allocators may retain reusable
+             *     capacity, so this is not a hard cap on process or accelerator memory.
+             * @default 512
+             */
+            max_bytes_mb?: number;
+            /**
+             * @description Minimum prompt length eligible for prompt KV caching.
+             * @default 64
+             */
+            min_tokens?: number;
+            /**
+             * @description Idle time-to-live for prompt KV cache entries. Refreshed on every cache
+             *     hit, so only entries left unused for this duration expire.
+             * @default 300000
+             */
+            ttl_ms?: number;
+        };
+        /**
+         * @description Runtime kernel JIT operating mode. `off` disables compilation. `shadow`
+         *     compiles and validates without dispatching JIT kernels. `on` may activate
+         *     qualified kernels while preserving the production fallback. `required`
+         *     fails model loading when there are no eligible routes or any scoped
+         *     route cannot qualify, rejects sessions that are not direct Metal or
+         *     CUDA sessions, and requires at least one configured startup preload.
+         *     Backend preference remains separately configured; this mode neither
+         *     enables nor selects a backend. Runtime JIT is currently supported on
+         *     Linux and macOS; other platforms reject non-`off` modes rather than
+         *     silently degrading.
+         * @enum {string}
+         */
+        KernelJitMode: "off" | "shadow" | "on" | "required";
+        /**
+         * @description Runtime Metal and CUDA kernel JIT configuration. Live compilation and
+         *     GPU qualification run only for models in the configured startup
+         *     `preload` list, before serving begins. A cold dynamic model load never
+         *     benchmarks against an in-use GPU: `on` and `shadow` retain bundled
+         *     kernels, while `required` rejects the load. When runtime JIT is enabled,
+         *     startup also materializes every vision, audio, and projection session
+         *     declared by each preloaded model without running media inference.
+         *     Preload every model that must use runtime-JIT kernels; `required`
+         *     rejects an empty preload list.
+         */
+        KernelJitConfig: {
+            /** @default off */
+            mode?: components["schemas"]["KernelJitMode"];
+            /** @description Persistent artifact cache directory on Linux and macOS. Omit to use ~/.antfly/inference/jit when HOME is available. */
+            cache_dir?: string;
+            /**
+             * @description Persistent cache size limit in MiB. Set to 0 to disable disk persistence.
+             * @default 1024
+             */
+            max_cache_bytes_mb?: number;
+            /**
+             * @description Per direct model session pre-publication start budget for
+             *     best-effort `on` and `shadow` JIT work. A compiler or qualification
+             *     operation already started may overrun the budget. Multimodal model
+             *     preloads may create several direct sessions, each with this budget.
+             *     `required` completes or fails all required routes and may exceed
+             *     this value.
+             * @default 300000
+             */
+            preload_budget_ms?: number;
+        };
+        /**
+         * @description Model registry kind.
+         * @enum {string}
+         */
+        ModelKind: "generator" | "embedder" | "reranker" | "chunker" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor";
+        /**
+         * @description Optional backend preference for model loading or request execution.
+         *     `auto` keeps the node default behavior.
+         *     `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
+         *     `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
+         *     `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+         *     `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
+         * @enum {string}
+         */
+        ModelBackend: "auto" | "native" | "metal" | "cuda" | "xla" | "webgpu" | "wasm";
+        /**
+         * @description Optional artifact format preference for loading a model.
+         * @enum {string}
+         */
+        ModelFormat: "gguf" | "onnx" | "safetensors" | "hybrid";
+        /**
+         * @description Optional quantization preference for loading a model.
+         * @enum {string}
+         */
+        ModelQuantization: "q4_k" | "q8" | "fp16";
+        /**
+         * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0
+         *     Metal or CUDA runtime. On Metal, `auto` chooses full residency only when
+         *     the complete expert set and safety reserves fit the configured budget;
+         *     otherwise it uses bounded streaming. On the qualified SM89 CUDA lane,
+         *     `auto` resolves to resident mode and fails closed unless its envelope fits.
+         * @enum {string}
+         */
+        A4bResidencyMode: "auto" | "streamed" | "resident";
+        /**
+         * @description Model reference used by startup preload and model-loading configuration.
+         *     When a preload selects an explicit backend, that warmed session also
+         *     becomes the model's default in-process session for later `auto`
+         *     requests; callers do not need to repeat the backend on every request.
+         */
+        ModelRef: {
+            kind: components["schemas"]["ModelKind"];
+            /**
+             * @description Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
+             * @example antflydb/gemma-e2b
+             */
+            name: string;
+            backend?: components["schemas"]["ModelBackend"];
+            format?: components["schemas"]["ModelFormat"];
+            quantization?: components["schemas"]["ModelQuantization"];
+            /**
+             * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0
+             *     Metal or CUDA runtime. On Metal, `auto` chooses full residency only
+             *     when the complete expert set and safety reserves fit the configured
+             *     budget; otherwise it uses bounded streaming. On the qualified SM89
+             *     CUDA lane, `auto` resolves to resident mode and fails closed unless
+             *     its envelope fits. Other model geometries reject this field.
+             * @default auto
+             */
+            residency_mode?: components["schemas"]["A4bResidencyMode"];
+            /**
+             * Format: uint32
+             * @description Per-model A4B memory envelope in MiB. Zero selects the backend default:
+             *     the conservative 2048 MiB streamed floor on Metal, or the qualified
+             *     16384 MiB resident envelope on CUDA. Explicit values below 2048 fail;
+             *     CUDA also rejects any envelope too small for full residency. Other
+             *     model geometries reject this field.
+             * @default 0
+             */
+            memory_budget_mb?: number;
+        };
+        /**
+         * @description Logging verbosity level
+         * @default info
+         * @example info
+         * @enum {string}
+         */
+        Level: "debug" | "info" | "warn" | "error";
+        /**
+         * @description Logging output format style. 'terminal' for colorized console, 'json' for structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
+         * @default terminal
+         * @example terminal
+         * @enum {string}
+         */
+        Style: "terminal" | "json" | "logfmt" | "noop";
+        /** @description Logging configuration for Antfly inference services */
+        Config: {
+            level?: components["schemas"]["Level"];
+            style?: components["schemas"]["Style"];
+        };
+        RuntimeConfig: {
+            /**
+             * @description Encoded HTTP inference body ceiling in MiB, independent of decoded-media resource policy.
+             * @default 10
+             */
+            http_max_body_mb?: number;
+            /**
+             * Format: uri
+             * @description URL of an out-of-process Antfly inference service that the Antfly
+             *     server should call for embedding, chunking, reranking, and
+             *     generation. Omit it to use the in-process inference runtime
+             *     (the default in standalone mode). `antfly inference run` ignores
+             *     this field; it configures the client side only.
+             * @example http://localhost:8080
+             */
+            api_url?: string;
+            /** @description Client-only API key used when calling an authenticated shared Antfly inference API. Both standalone inference executables accept and ignore this field when serving models. */
+            api_key?: string;
+            /**
+             * @description Base directory containing model subdirectories. Antfly inference auto-discovers models from:
+             *     - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name`
+             *     - `{models_dir}/embedders/` - Embedding models
+             *     - `{models_dir}/rerankers/` - Reranking models
+             *     - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
+             *     - `{models_dir}/rewriters/` - Seq2Seq rewriter models
+             *
+             *     Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models`
+             *     (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed`
+             *     chunker needs no models.
+             * @example ~/.antfly/inference/models
+             */
+            models_dir?: string;
+            /**
+             * @description Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*`
+             *     API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`.
+             *
+             *     Defaults to ~/.antfly/inference/ml.
+             * @example ~/.antfly/inference/ml
+             */
+            ml_dir?: string;
+            /** @description Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when resources.inference.admission.max_work_units is positive—16 MiB times that effective work capacity (which defaults to request concurrency when max_work_units is omitted); zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline. */
+            content_security?: components["schemas"]["ContentSecurityConfig"];
+            /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
+            s3_credentials?: components["schemas"]["Credentials"];
+            /** @description Experimental execution batching; mode on explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply. */
+            generation_batching?: {
+                /**
+                 * @default off
+                 * @enum {string}
+                 */
+                mode?: "off" | "auto" | "on";
+                /** @default 2 */
+                max_step_items?: number;
+                /** @default 512 */
+                max_step_query_tokens?: number;
+                /** @default 1000 */
+                max_decode_wait_us?: number;
+                /** @default 2048 */
+                max_idle_prefill_chunk_size?: number;
+            };
+            /**
+             * @description How long to keep models loaded in memory after last use (Ollama-compatible).
+             *     Models are automatically unloaded after this duration of inactivity.
+             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
+             *     Defaults to "5m". Set to "0" to disable idle-time eviction; models can
+             *     still be evicted under resource pressure or to enforce max_loaded_models.
+             * @default 5m
+             * @example 5m
+             */
+            keep_alive?: string;
+            /**
+             * @description Maximum total models loaded across all registry types (embedders, rerankers,
+             *     generators, chunkers, etc.). When the limit is reached, the least-recently-used
+             *     idle model from any registry is evicted to make room. Set to 0 for unlimited.
+             *     Defaults to 10.
+             * @default 10
+             * @example 3
+             */
+            max_loaded_models?: number;
+            /**
+             * @deprecated
+             * @description Legacy compatibility field. The current Zig inference runtime does not
+             *     create per-model pipeline pools from this setting; configuring it has no effect.
+             */
+            pool_size?: number;
+            /** @description Native generator prompt KV cache settings. */
+            prompt_cache?: components["schemas"]["PromptCacheConfig"];
+            kernel_jit?: components["schemas"]["KernelJitConfig"];
+            /**
+             * @deprecated
+             * @description Legacy compatibility field. The current Zig inference runtime selects a
+             *     backend from model metadata, explicit preload settings, and compiled capabilities;
+             *     configuring this list has no effect.
+             */
+            backend_priority?: string[];
+            /**
+             * @deprecated
+             * @description Legacy Go-runtime queue setting. The current Zig runtime does not retain
+             *     excess inference requests in memory and ignores this field.
+             */
+            max_queue_size?: number;
+            /**
+             * @deprecated
+             * @description Legacy Go-runtime queue/request timeout. The current Zig runtime ignores
+             *     this field; its HTTP listener applies a separate fixed transport timeout.
+             */
+            request_timeout?: string;
+            /**
+             * @description Models to preload and warm at startup. Generators run a tiny generation
+             *     request so native/Metal weights, KV setup, and kernels use the same
+             *     budgeted path as request-time generation. Other model kinds use the
+             *     best available warm path for that kind. When runtime kernel JIT is
+             *     enabled, every vision, audio, and projection session declared by a
+             *     preloaded model is also loaded without running media inference.
+             *     Runtime kernel JIT `required` mode rejects an empty preload list.
+             * @example [
+             *       {
+             *         "kind": "generator",
+             *         "name": "antflydb/gemma-e2b",
+             *         "backend": "metal",
+             *         "format": "gguf",
+             *         "quantization": "q4_k"
+             *       }
+             *     ]
+             */
+            preload?: components["schemas"]["ModelRef"][];
+            /**
+             * @deprecated
+             * @description Legacy compatibility field. The current Zig runtime uses explicit host,
+             *     backend, combined, KV, and scratch budgets instead and ignores this field.
+             */
+            max_memory_mb?: number;
+            /**
+             * @description Per-model loading strategy overrides. Maps model names to their loading strategy.
+             *     Models not in this map load on demand. keep_alive controls their idle
+             *     eviction; setting it to "0" disables idle eviction but does not preload or pin them.
+             *
+             *     When a model has strategy "eager" in this map:
+             *     - It is loaded at startup through the same startup warmup path
+             *     - It is never unloaded, even when keep_alive>0 (pinned in memory)
+             *
+             *     This allows mixing eager and lazy models in the same pool.
+             * @example {
+             *       "BAAI/bge-small-en-v1.5": "eager",
+             *       "mirth/chonky-mmbert-small-multilingual-1": "lazy"
+             *     }
+             */
+            model_strategies?: {
+                [key: string]: "eager" | "lazy" | "bounded";
+            };
+            /**
+             * @deprecated
+             * @description Legacy compatibility field controlling whether dashboards show model
+             *     download commands. It defaults to true for standalone deployments;
+             *     managed deployments historically set it to false. Download-command
+             *     availability is a build-time setting in the current Zig runtime, so
+             *     configuring this field has no effect.
+             * @default true
+             */
+            allow_downloads?: boolean;
+            /**
+             * @deprecated
+             * @description Legacy inference-local logging field. The current unified Zig runtime
+             *     ignores it; configure the top-level `log` object instead.
+             */
+            log?: components["schemas"]["Config"];
+        };
+        InferenceServerConfig: {
+            resources?: components["schemas"]["ResourcesConfig"];
+            inference?: components["schemas"]["RuntimeConfig"];
         };
     };
     responses: {

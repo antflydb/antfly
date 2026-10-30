@@ -1,0 +1,82 @@
+---
+title: EmbeddingGemma 2
+description: Embed text, images, audio, and video into one vector space with EmbeddingGemma 2
+---
+
+EmbeddingGemma 2 (`google/embeddinggemma-2`) embeds text, images, audio, video,
+and ordered combinations of them into one vector space. Use it when a single
+index should hold mixed media, or when you want one embedding per document
+rather than one per part. Antfly runs it on CPU, Metal, and CUDA (Ampere or
+newer).
+
+## Pull the model
+
+```sh
+antfly inference pull hf:google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b --tasks embed
+```
+
+The weights keep their upstream license.
+
+## Embed
+
+Flat inputs return one vector per text or media part. A group returns one vector
+for all of its ordered content. Post this to `/ai/v1/embed`:
+
+```json
+{
+  "model": "embeddinggemma2",
+  "task_type": "RETRIEVAL_DOCUMENT",
+  "dimensions": 256,
+  "input": [
+    {
+      "title": "Account recovery",
+      "content": [
+        {"type": "text", "text": "How to reset a forgotten password."},
+        {"type": "image_url", "image_url": {"url": "https://example.com/reset.png"}}
+      ]
+    }
+  ]
+}
+```
+
+- `dimensions` is 768 (default), 512, 256, or 128.
+- `task_type` is `RETRIEVAL_DOCUMENT` (default), `RETRIEVAL_QUERY`,
+  `QUESTION_ANSWERING`, `FACT_VERIFICATION`, `CODE_RETRIEVAL_QUERY`,
+  `SEMANTIC_SIMILARITY`, `CLASSIFICATION`, or `CLUSTERING`. Index with the
+  document role and search with the query role; Antfly does this automatically
+  for index embedders.
+- `title` applies only to `RETRIEVAL_DOCUMENT` groups that contain text.
+- A request holds up to 64 groups of up to 64 parts, and a group must fit 8192
+  tokens including expanded media. Inputs that overflow fail rather than
+  truncate.
+- Video (MP4, MOV, or WebM) goes in a group as a `media` part and is sampled at
+  1 FPS, up to 32 frames. CUDA video needs Linux NVDEC and an H.264 MP4 of at
+  most 60 seconds.
+
+From the CLI:
+
+```sh
+antfly inference embed models/embedders/embeddinggemma2 --group \
+  --title 'Account recovery' --dimensions 256 \
+  --text 'Reset a forgotten password.' --image reset.png
+```
+
+## Pin the model in an index
+
+Each response includes a `model_identity` hash for the exact weights, processor,
+and execution recipe. Set it as the index embedder's `model_identity` so that a
+different model generation is rejected instead of silently mixing vectors.
+Rebuild the index when you change models, dimensions, or task profile.
+
+## Similarity decisions
+
+EmbeddingGemma 2 can answer `choice` and `multi_choice` questions on
+`/ai/v1/decisions` with `decision_method: "embedding_similarity"`: each choice is
+a description or a few examples, and the answer reports cosine similarities and
+a margin. Scores are similarities, not probabilities; set `min_similarity`,
+`min_margin`, or `similarity_thresholds` from your own evaluation. See
+[Typed Decisions](../../reference/decisions.md) for the request format, batches, and
+SQL use.
+
+Qualification evidence and benchmarks are in the
+[EmbeddingGemma 2 history](../../design/inference/history/embeddinggemma2/README.md).

@@ -108,6 +108,11 @@ test "api HTTP runtime discovery" {
     _ = httpx_handler;
 }
 
+test "httpx inference gateway source discovery" {
+    _ = @import("api/inference_gateway.zig");
+    _ = @import("api/inference_source.zig");
+}
+
 // Keep bounded merge storage contracts reachable in focused test builds.
 test "linear merge discovery" {
     _ = @import("api/linear_merge.zig");

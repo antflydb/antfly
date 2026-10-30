@@ -9904,6 +9904,21 @@ components:
             When omitted, Antfly uses the balanced default effort (`0.5`) unless
             lower-level vector search overrides are provided internally.
           example: 0.5
+        select:
+          type: object
+          minProperties: 1
+          maxProperties: 64
+          additionalProperties:
+            $ref: "#/components/schemas/ProjectionExpression"
+          x-zig-type: std.json.Value
+          x-go-type-skip-optional-pointer: false
+          description: Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
+        params:
+          type: object
+          additionalProperties: true
+          x-zig-type: std.json.Value
+          x-go-type-skip-optional-pointer: false
+          description: Request-local values bound by select expressions through param. Parameters are data, never executable expressions or read grants. The serialized parameter object is limited to 1 MiB and 1024 named parameters.
         fields:
           x-go-type-skip-optional-pointer: false
           type: array
@@ -11187,6 +11202,81 @@ components:
           type: integer
           format: int64
           description: Published graph metric score generation used for this hit.
+    ProjectionExpression:
+      type: object
+      x-zig-type: std.json.Value
+      x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+      description: |
+        Exactly one expression node: literal, field, ref, param, call with args,
+        case with optional else, cast, or a binary operator. Pure expressions
+        lower to the same typed scalar IR as SQL SELECT and CASE. AI/provider
+        calls remain in evaluate, never execute implicitly in select.
+        value_identity(field) returns an opaque identity for a present logical
+        value (including JSON null); missing has no identity. is_missing(field)
+        distinguishes missing from present null. Identity reads require the same
+        authorization and retained source revision as value reads. Metadata may
+        accelerate them; unsupported/old metadata falls back to ordinary reads.
+        Untaken CASE branches do not load fields or evaluate erroring calls.
+        Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from,
+        is_not_distinct_from, and, or, add, subtract, multiply, divide and concat.
+        Expressions are limited to depth 64 including referenced aliases, and
+        8192 nodes per request. Alias dependencies are acyclic; each alias is a
+        requested output and is evaluated once per row.
+      properties:
+        literal:
+          x-go-type: json.RawMessage
+        field:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          description: Logical source path. Dots traverse objects; numeric array components select an original index (items.1.name), and named components traverse arrays collecting present values (items.name). Nested user keys such as metadata._type are allowed. Internal root fields are reserved except _id.
+        ref: {type: string, minLength: 1, maxLength: 1024}
+        param: {type: string, minLength: 1, maxLength: 1024}
+        call:
+          type: string
+          description: Public pure SQL scalar function name, including value_identity and is_missing. Internal and provider-backed functions are forbidden.
+        args:
+          type: array
+          maxItems: 64
+          items: {$ref: "#/components/schemas/ProjectionExpression"}
+        case:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: object
+            additionalProperties: false
+            required: [when, then]
+            properties:
+              when: {$ref: "#/components/schemas/ProjectionExpression"}
+              then: {$ref: "#/components/schemas/ProjectionExpression"}
+        else:
+          $ref: "#/components/schemas/ProjectionExpression"
+          x-go-type-skip-optional-pointer: false
+        cast:
+          type: object
+          x-go-type-skip-optional-pointer: false
+          additionalProperties: false
+          required: [type, expression]
+          properties:
+            type: {type: string, enum: [string, integer, number, boolean, json, datetime]}
+            expression: {$ref: "#/components/schemas/ProjectionExpression"}
+        eq: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        neq: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        lt: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        lte: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        gt: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        gte: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        is_distinct_from: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        is_not_distinct_from: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        and: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        or: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        add: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        subtract: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        multiply: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        divide: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
+        concat: {type: array, minItems: 2, maxItems: 2, items: {$ref: "#/components/schemas/ProjectionExpression"}}
     QueryHit:
       type: object
       description: A single query result hit
@@ -11200,6 +11290,7 @@ components:
 
         _computed:
           type: object
+          x-zig-type: raw_json_object
           additionalProperties: true
           description: Named query-time computed values, separate from stored source.
         _id:
@@ -12370,7 +12461,7 @@ paths:
       operationId: ingestLakeChanges
       tags: [table_management]
       summary: ingestLakeChanges
-      description: Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table admin permission and iceberg_writer policy.
+      description: Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table write permission without a row filter and iceberg_writer policy. Catalog initialization, file commits and maintenance require table admin permission.
       requestBody:
         required: true
         content:

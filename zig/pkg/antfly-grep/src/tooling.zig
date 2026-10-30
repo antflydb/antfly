@@ -21,6 +21,7 @@ const values = [_]ValueSpec{
     .{ .name = "--decision-context", .choices = "legacy shared-v1" },
     .{ .name = "--decision-transport", .choices = "single antfly-batch" },
     .{ .name = "--media", .choices = "text images" },
+    .{ .name = "--indexed-media-transport", .choices = "inline source" },
     .{ .name = "--max-image-bytes" },
     .{ .name = "--max-image-pixels" },
     .{ .name = "--backend", .choices = "http antfly local" },

@@ -99,7 +99,7 @@ what it can and cannot interrupt). It raises `UnsupportedError` if this
 build does not link the inference runtime or the runtime cannot start.
 
 For decision question types and examples, see the
-[typed decision guide](../../../docs/guides/decisions.md).
+[typed decision guide](../../../docs/reference/decisions.md).
 
 Each call takes the request JSON and returns the response JSON of the
 matching `/ai/v1` route of the Antfly inference HTTP API: `embed()`,
@@ -230,7 +230,9 @@ for the full C ABI contract.
 Multiple writable Lite connections may remain open, including across processes.
 Native operations queue within a process and take a kernel writer lease across
 processes. Pass `busy_timeout=<seconds or datetime.timedelta>` to `create()`/`open()`
-to wait for a competing operation. Closing one connection leaves others usable.
+to retry admission while another process holds the writer lease or advances the
+allocator checkpoint. This admission retry never replays a mutation body.
+Closing one connection leaves others usable.
 
 ## Graph edges and index readiness
 
@@ -331,6 +333,22 @@ Tests that need `libantfly` skip cleanly when it cannot be found, unless
 `tests/test_conformance.py` runs every case in
 `zig/pkg/antfly-embedded/capi-conformance/cases/*.json` through this public API, the
 same declarative cases the Go and Rust bindings run.
+
+Use `uv run pytest --durations=25` to separate fixture setup from test calls.
+The SQL FK/subquery regression keeps synchronous commits and checks reopen
+persistence; `ANTFLY_EMBEDDED_SQL_STRESS=1` runs the original 400-transaction
+stress workload. The ordinary case crosses the deletion boundary with nine
+children and checks the surviving keys. A native C ABI regression separately
+forces a runtime-generation refresh between the subquery and commit.
+
+Resolver restore tests share only immutable backup bytes and a backup file.
+Each restore API/storage combination gets its own database and verifies source
+isolation after migration. Background-progress tests must observe the real
+worker without calling `run_until_idle()`: the native Lite diagnostic
+`pending_work_stats()["background_publications"]["maintenance_rounds"]` counts
+namespace rounds reaching replay/idle completion, while `maintenance_errors`
+reports failures. Stability checks require further rounds with unchanged
+derived targets instead of assuming a fixed sleep was sufficient.
 
 ## SQL and multiple tables
 

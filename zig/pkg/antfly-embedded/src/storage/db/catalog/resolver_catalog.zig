@@ -80,7 +80,7 @@ pub const resolver_projection_bindings_reader_version: u32 = 13;
 pub const resolver_projection_work_reader_version: u32 = 14;
 pub const resolver_projection_delta_reader_version: u32 = 15;
 pub const resolver_static_profiles_reader_version: u32 = 19;
-pub const resolver_pin_index_reader_version: u32 = 23;
+pub const resolver_pin_index_reader_version: u32 = 29;
 pub const supported_reader_version: u32 = resolver_pin_index_reader_version;
 
 const reader_version_encodings = blk: {
@@ -1516,5 +1516,39 @@ test "resolver catalog encoding preserves optional empty projection dictionaries
             defer a.free(encoded);
             try std.testing.expectEqualStrings(data, encoded);
         }
+    }
+}
+
+/// Decode resolver declarations without importing provisioners or inference providers.
+pub fn collectDesiredResolvers(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    out: *std.ArrayListUnmanaged(ResolverConfig),
+) !void {
+    switch (value) {
+        .object => |object| {
+            if (object.get("resolvers")) |resolvers| {
+                if (resolvers == .array) {
+                    for (resolvers.array.items) |item| {
+                        if (item != .object) continue;
+                        const parsed = try ResolverConfig.parseValue(alloc, item);
+                        // `parsed.value` is owned by the parse arena; clone with
+                        // `alloc` so `out`'s entries free correctly (and so they
+                        // outlive the arena).
+                        defer parsed.deinit();
+                        try out.append(alloc, try ResolverConfig.clone(alloc, parsed.value));
+                    }
+                }
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or @import("../../../api/index_metadata.zig").isOpaqueEntry(entry.key_ptr.*)) continue;
+                try collectDesiredResolvers(alloc, entry.value_ptr.*, out);
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| try collectDesiredResolvers(alloc, item, out);
+        },
+        else => {},
     }
 }

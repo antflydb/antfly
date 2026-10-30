@@ -139,11 +139,11 @@ const CliConfig = struct {
     ard_public_catalog_enabled: bool = false,
     inference_models_dir: ?[]const u8 = null,
     inference_ml_dir: ?[]const u8 = null,
-    inference_host_budget_mb: usize = 0,
-    inference_backend_budget_mb: usize = 0,
-    inference_combined_budget_mb: usize = 0,
-    inference_kv_budget_mb: usize = 0,
-    inference_scratch_budget_mb: usize = 0,
+    inference_host_budget_mb: ?usize = null,
+    inference_backend_budget_mb: ?usize = null,
+    inference_combined_budget_mb: ?usize = null,
+    inference_kv_budget_mb: ?usize = null,
+    inference_scratch_budget_mb: ?usize = null,
     inference_process_memory_budget_mb: ?usize = null,
     inference_kernel_jit_mode: ?antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode = null,
     inference_preload_models: std.ArrayListUnmanaged(inference_bridge.WarmModel) = .empty,
@@ -233,7 +233,8 @@ const InferenceRuntimeConfigWire = struct {
 
     embedded_enabled: bool = true,
     worker_environment: []const struct { name: []const u8, value: []const u8 } = &.{},
-    max_concurrent_requests: ?usize = null,
+    resources: platform.resource_policy.Resources = .{},
+    generation_batching: platform.inference_settings.GenerationBatching = .{},
     kernel_jit: KernelJit = .{},
     prompt_cache: PromptCache = .{},
 };
@@ -4963,11 +4964,20 @@ pub fn runFromIterator(
     try ensureDirPath(setup_io.io(), resolved.auth_store_root_dir);
 
     const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
+    const trusted_principal_secret = try resolveRuntimeSecretValue(alloc, &secret_store, "antfly.trusted_principal.secret");
+    defer if (trusted_principal_secret) |value| alloc.free(value);
+    const trusted_principal_issuer = try resolveRuntimeSecretValue(alloc, &secret_store, "antfly.trusted_principal.issuer");
+    defer if (trusted_principal_issuer) |value| alloc.free(value);
+    // A hosted verifier secures public requests without creating a local
+    // password authority. Local user-store bootstrap still follows auth_enabled.
+    const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
     // The storage kernel sizes its ResourceManager when its context is
     // created, so the operator's process envelope must be resolved first.
-    const process_memory_resolution = resolveProcessMemoryBudget(
-        cli,
-        init.environ_map,
+    const process_memory_resolution = process_memory_budget.resolveSystemWithConfig(
+        cli.inference_process_memory_budget_mb,
+        init.environ_map.get(process_memory_budget.canonical_env),
+        init.environ_map.get(process_memory_budget.inference_compat_env),
+        if (loaded_config) |cfg| cfg.resources.memory.max_bytes else 0,
     ) catch |err| {
         std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
         return err;
@@ -5167,10 +5177,17 @@ pub fn runFromIterator(
     while (environment_iterator.next()) |entry| {
         try worker_environment.append(alloc, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
     }
+    var inference_resource_policy = if (loaded_cfg) |cfg| cfg.resources else platform.resource_policy.Resources{};
+    if (cli.inference_host_budget_mb) |value| inference_resource_policy.inference.memory.max_host_bytes = try mibToBytes(value);
+    if (cli.inference_backend_budget_mb) |value| inference_resource_policy.inference.memory.max_device_bytes = try mibToBytes(value);
+    if (cli.inference_combined_budget_mb) |value| inference_resource_policy.inference.memory.max_combined_bytes = try mibToBytes(value);
+    if (cli.inference_kv_budget_mb) |value| inference_resource_policy.inference.memory.max_kv_bytes = try mibToBytes(value);
+    if (cli.inference_scratch_budget_mb) |value| inference_resource_policy.inference.memory.max_scratch_bytes = try mibToBytes(value);
     const inference_runtime_config_json = try std.json.Stringify.valueAlloc(alloc, InferenceRuntimeConfigWire{
         .embedded_enabled = embedded_inference_enabled,
         .worker_environment = worker_environment.items,
-        .max_concurrent_requests = resolveInferenceMaxConcurrentRequests(loaded_cfg),
+        .resources = inference_resource_policy,
+        .generation_batching = configured_inference.generation_batching,
         .kernel_jit = .{
             .mode = effective_kernel_jit_mode,
             .cache_dir = configured_inference.kernel_jit.cache_dir,
@@ -5194,11 +5211,11 @@ pub fn runFromIterator(
         .data_dir_len = data_dir.len,
         .models_dir = inference_bridge.OptionalString.init(cli.inference_models_dir orelse if (loaded_cfg) |cfg| cfg.inference.models_dir else null),
         .ml_dir = inference_bridge.OptionalString.init(cli.inference_ml_dir orelse if (loaded_cfg) |cfg| cfg.inference.ml_dir else null),
-        .host_limit_bytes = try mibToBytes(cli.inference_host_budget_mb),
-        .backend_limit_bytes = try mibToBytes(cli.inference_backend_budget_mb),
-        .combined_limit_bytes = try mibToBytes(cli.inference_combined_budget_mb),
-        .kv_limit_bytes = try mibToBytes(cli.inference_kv_budget_mb),
-        .scratch_limit_bytes = try mibToBytes(cli.inference_scratch_budget_mb),
+        .host_limit_bytes = try mibToBytes(cli.inference_host_budget_mb orelse 0),
+        .backend_limit_bytes = try mibToBytes(cli.inference_backend_budget_mb orelse 0),
+        .combined_limit_bytes = try mibToBytes(cli.inference_combined_budget_mb orelse 0),
+        .kv_limit_bytes = try mibToBytes(cli.inference_kv_budget_mb orelse 0),
+        .scratch_limit_bytes = try mibToBytes(cli.inference_scratch_budget_mb orelse 0),
         .process_memory_limit_bytes = process_memory_limit_bytes,
         .process_memory_limit_provenance = inferenceMemoryLimitProvenance(
             process_memory_resolution.effective_source,
@@ -5274,6 +5291,7 @@ pub fn runFromIterator(
             return err;
         };
     }
+    try internal_service_auth.validateCredentialIsolation(internal_service_secret, trusted_principal_secret);
 
     var auth_backend: ?LegacyAuthBackend = null;
     defer if (comptime !control_only_storage_sources) if (auth_backend) |*backend| backend.close();
@@ -5334,7 +5352,7 @@ pub fn runFromIterator(
     }
 
     const public_listener = resolvePublicListener(cli);
-    antfly.common.listener_security.warnIfUnauthenticated("public", public_listener.bind_host, public_listener.bind_port, auth_enabled);
+    antfly.common.listener_security.warnIfUnauthenticated("public", public_listener.bind_host, public_listener.bind_port, effective_auth_enabled);
     const local_node_id = cli.local_node_id orelse 1;
     const public_api_url = try std.fmt.allocPrint(
         alloc,
@@ -5609,15 +5627,17 @@ pub fn runFromIterator(
             .hot_standby_failover_safe_mutations_only = hot_standby_mutation_guard_enabled,
             .hot_standby_remote_apply_mutations_enabled = hotStandbyRemoteApplyMutationsEnabled(hot_standby_sync_policy.policy),
             .hot_standby_catalog_create_enabled = hot_standby_role_requested and cli.hot_standby_table_id == 0 and cli.hot_standby_shard_id == 0,
-            .auth_enabled = auth_enabled,
+            .auth_enabled = effective_auth_enabled,
+            .trusted_principal_secret = trusted_principal_secret,
+            .trusted_principal_issuer = trusted_principal_issuer,
             .chatgpt = if (chatgpt) |*manager| manager else null,
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
-            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
-            .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
-            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
-            .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
+            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.resources.query.admission.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .graph_execution_limits = if (loaded_config) |*cfg| cfg.resources.query.request_limits.graph else .{},
+            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.resources.write.admission.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
+            .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.resources.inference.admission.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .backup_operation_timeout_ms = if (loaded_config) |*cfg| cfg.backup.operation_timeout_ms else antfly.common.config.default_backup_operation_timeout_ms,
             .inference_request_admission_source = if (embedded_inference_enabled) .{
                 .ptr = antfly_node,
@@ -8281,6 +8301,13 @@ fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) 
     return false;
 }
 
+fn resolveRuntimeSecretValue(alloc: std.mem.Allocator, store: *antfly.common.secrets.FileStore, key: []const u8) !?[]u8 {
+    const value = (try store.getOwned(alloc, key)) orelse return null;
+    if (std.mem.trim(u8, value, " \t\r\n").len != 0) return value;
+    alloc.free(value);
+    return null;
+}
+
 fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
     if (cli.inference_models_dir) |value| return value;
     if (cfg) |loaded| return loaded.inference.models_dir;
@@ -8289,7 +8316,7 @@ fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.C
 
 fn resolveInferenceMaxConcurrentRequests(cfg: ?*const antfly.common.config.Config) u32 {
     return if (cfg) |config|
-        config.admission.inference.max_concurrent_requests
+        config.resources.inference.admission.max_concurrent_requests
     else
         antfly.common.config.default_inference_max_concurrent_requests;
 }
@@ -8310,11 +8337,11 @@ const InferenceBudgetOverrides = struct {
 
 fn resolveInferenceBudgetOverrides(cli: CliConfig) !InferenceBudgetOverrides {
     return .{
-        .host_limit_bytes = try mibToBytes(cli.inference_host_budget_mb),
-        .backend_limit_bytes = try mibToBytes(cli.inference_backend_budget_mb),
-        .combined_limit_bytes = try mibToBytes(cli.inference_combined_budget_mb),
-        .kv_limit_bytes = try mibToBytes(cli.inference_kv_budget_mb),
-        .scratch_limit_bytes = try mibToBytes(cli.inference_scratch_budget_mb),
+        .host_limit_bytes = try mibToBytes(cli.inference_host_budget_mb orelse 0),
+        .backend_limit_bytes = try mibToBytes(cli.inference_backend_budget_mb orelse 0),
+        .combined_limit_bytes = try mibToBytes(cli.inference_combined_budget_mb orelse 0),
+        .kv_limit_bytes = try mibToBytes(cli.inference_kv_budget_mb orelse 0),
+        .scratch_limit_bytes = try mibToBytes(cli.inference_scratch_budget_mb orelse 0),
     };
 }
 
@@ -11456,11 +11483,11 @@ test "parse cli accepts inference budget overrides" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 4096), cfg.inference_host_budget_mb);
-    try std.testing.expectEqual(@as(usize, 12288), cfg.inference_backend_budget_mb);
-    try std.testing.expectEqual(@as(usize, 16384), cfg.inference_combined_budget_mb);
-    try std.testing.expectEqual(@as(usize, 2048), cfg.inference_kv_budget_mb);
-    try std.testing.expectEqual(@as(usize, 1024), cfg.inference_scratch_budget_mb);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.inference_host_budget_mb.?);
+    try std.testing.expectEqual(@as(usize, 12288), cfg.inference_backend_budget_mb.?);
+    try std.testing.expectEqual(@as(usize, 16384), cfg.inference_combined_budget_mb.?);
+    try std.testing.expectEqual(@as(usize, 2048), cfg.inference_kv_budget_mb.?);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.inference_scratch_budget_mb.?);
     try std.testing.expectEqual(@as(?usize, 14000), cfg.inference_process_memory_budget_mb);
     try std.testing.expectEqual(antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode.required, cfg.inference_kernel_jit_mode.?);
 }
@@ -11498,9 +11525,7 @@ test "inference config falls back to common config" {
         .transcribers = antfly.transcribing.Registry.init(alloc),
         .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
-        .admission = .{
-            .inference = .{ .max_concurrent_requests = 0 },
-        },
+        .resources = .{ .inference = .{ .admission = .{ .max_concurrent_requests = 0 } } },
         .inference = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:8089"),
             .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),

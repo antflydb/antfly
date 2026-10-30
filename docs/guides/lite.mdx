@@ -1,13 +1,13 @@
 ---
 title: Antfly Lite
-order: 5
-sidebar: concepts
 description: How the embedded single-file profile of Antfly works, what it shares with a normal instance, and how data moves between the two
 prerequisites:
   - "Antfly Lite CLI built or installed"
 difficulty: intermediate
 estimatedTime: "20 min"
 tags: [lite, embedded, local-first, backup, migration]
+sidebar: concepts
+order: 5
 ---
 
 <Questions>
@@ -338,12 +338,18 @@ package main
 
 import (
 	"log"
+	"os"
 
 	"github.com/antflydb/antfly/go/pkg/embedded"
 )
 
 func main() {
-	db, err := embedded.Create("go-app.aflite")
+	// Create on first run; Open never creates or upgrades a file.
+	open := embedded.Open
+	if _, err := os.Stat("go-app.aflite"); os.IsNotExist(err) {
+		open = embedded.Create
+	}
+	db, err := open("go-app.aflite")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -351,21 +357,34 @@ func main() {
 
 	err = db.Batch([]embedded.WriteIntent{{
 		Key:   "doc:go:1",
-		Value: []byte(`{"title":"embedded go lite"}`),
+		Value: []byte(`{"title":"Embedded Lite","body":"Antfly Lite keeps data in one local file."}`),
 	}}, 1)
 	if err != nil {
 		log.Fatal(err)
 	}
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		log.Fatal(err)
+	}
 
-	status, err := db.StatusJSON()
+	doc, err := db.LookupJSON("doc:go:1")
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("%s", status)
+	log.Printf("lookup: %s", doc)
+
+	hits, err := db.SearchJSON([]byte(`{"full_text_search":{"match":{"field":"body","text":"local file"}},"limit":3}`))
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("search: %s", hits)
+
+	if err := db.BackupToFile("go-app.afb"); err != nil {
+		log.Fatal(err)
+	}
 }
 ```
 
-`Create` is the explicit first-use path; `Open` takes an existing file and never creates or upgrades one. Constants such as `embedded.InferenceModeCallerSuppliedArtifacts` and `embedded.InferenceModeDisabledDeferred` let you branch on status without hard-coding strings. Building from the source tree means building the C ABI first (see below, then `go test -tags libantfly ./...` in `go/pkg/embedded`). Two runnable templates live in the repository: `examples/antfly-lite-go` (create, write, lookup, status, backup) and `examples/antfly-lite-retrieval-go` (schema, full-text and dense indexes with caller-supplied embeddings, hybrid search, backup). Both are gated by `zig build lite-test` against the built `libantfly`.
+`Create` is the explicit first-use path; `Open` takes an existing file and never creates or upgrades one. Constants such as `embedded.InferenceModeCallerSuppliedArtifacts` and `embedded.InferenceModeDisabledDeferred` let you branch on status without hard-coding strings. Building from the source tree means building the C ABI first (see below, then `go test -tags libantfly ./...` in `go/pkg/embedded`). For a complete application, [antfly-docs-knowledge-base](https://github.com/antflydb/antfly/tree/main/examples/antfly-docs-knowledge-base) builds a knowledge base over Antfly's docs on Lite: chunking and embedding, a GLiNER knowledge graph, hybrid search, graph traversal, and backups. Its model-free `smoke` command runs in `zig build lite-test` against the built `libantfly`.
 
 A `*embedded.DB` is safe to share across goroutines, like `*sql.DB`. Searches and lookups run in parallel with each other and with writes; concurrent `Batch` calls on one handle queue rather than fail. Only one writer handle can have a file open at a time, including across processes. Set `OpenOptions.BusyTimeout` to wait for the other writer to close instead of failing immediately with `embedded.Busy`.
 

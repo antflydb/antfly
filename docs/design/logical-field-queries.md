@@ -885,3 +885,153 @@ registers fetched proofs under one lock, with epoch validity rechecked after I/O
 Owner/nonce/epoch/publication rules are unchanged. This cache stores scalar source
 facts; it does not establish complete cross-write predicate membership or bypass
 current authorization, selected-range digests or original-byte work budgets.
+
+
+### Conditional source delivery
+
+`fields: string[]` remains the source mask. `select` is a map of named pure
+scalar expressions returned in `_computed`, with data-only `params`. It lowers
+to the same SQL scalar IR used by SELECT / CASE. `value_identity(field)` and
+`is_missing(field)` support conditional CASE delivery without introducing physical
+companion fields or a second projection protocol. Present JSON null differs from
+missing. Requested source fields remain in `_source` regardless of CASE results.
+All dependencies are bound before execution; only executed branches load values.
+Native current identity metadata may avoid payload I/O. Missing/stale metadata,
+source-dependent stages, and provider layouts use correct ordinary-read fallbacks.
+Authorization and query membership precede delivery. See [the grep design](antfly-grep.md#conditional-source-projection-and-future-storage-authorities)
+for limits, worker transport, verified-image reuse and gateway batching. The
+unreleased `source_projection` / `_source_projection` API is replaced by this
+shared expression surface. No on-disk document format migration is required.
+
+### Projection execution and ownership
+
+Projection admission resolves alias dependencies with a bounded, iterative
+worklist. Cycles are rejected before compilation. The 64-level expression limit
+includes referenced expressions, rather than resetting at each alias; each
+binding is compiled once. Requested outputs evaluate in dependency order with
+memoized row values, so aliases never recursively enter scalar VMs. Public alias
+order is preserved, and lazy CASE still avoids reading untaken operands.
+
+Dotted scalar field paths support numeric array indexes (`items.1.name`) and
+array traversal (`items.name`, collecting present values). They resolve against
+the original source positions, before output masks compact arrays. Internal
+field restrictions apply at the root; nested user keys such as `metadata._type`
+remain accessible. `fields` and `select` are independent: adding a computed
+constant must not change the selected `_source`.
+
+Native scalar reads parse authenticated range views directly. Row-scoped values
+remain pinned until the row retires, borrowing input where the parser supports it. A local source-finalization receipt identifies the exact
+masked byte allocation, preventing a second mask application. Normalized query
+responses cannot copy this pointer receipt: hydration and final serialization
+re-establish it only after validating the request-bound execution fingerprint
+and all selected outputs. Validation happens before source masking, and the
+prepared computed output is reused during serialization. Existing retained
+revision and authorization proofs remain mandatory.
+
+Computed results retain validated JSON spans through worker hydration and final
+HTTP encoding. This avoids repeated DOM construction, unescaping/re-escaping and
+repeated numeric conversion. Duplicate keys, malformed JSON and incomplete or mismatched
+execution receipts fail closed. Public encoding strips the private execution
+marker while preserving logical values with the same numeric semantics as the
+typed VM. Growing serialization buffers
+use independently reclaimable scratch (preserving quota wrappers); only exact
+result bytes remain in the response owner. The public JSON shape stays
+`_computed: object`; the raw representation is an internal Zig wire optimization.
+
+
+### Numeric representation and execution receipts
+
+The raw output path is an optimization of the typed VM, not a separate value
+model. Direct fields, selected CASE arms, aliases and ordinary JSON operations
+must agree regardless of output order or whether another output materialized the
+source first. JSON numbers use the existing typed parser/formatter, recursively
+inside arrays and objects. This includes floating-point rounding, underflow and
+negative zero. Explicit SQL numeric operators retain their existing typed rules.
+The streaming path must not introduce a lossless/approximate distinction merely
+because a field can be forwarded. Canonical value-identity ABI golden vectors
+cover these boundaries; this change does not alter that ABI.
+
+The request retains the bound immutable program and prepares unconditional field
+read sets once. Exact encoded-input address/length witnesses govern borrowing
+through hydration finalization and response encoding. Each row can read its
+unconditional direct fields together under one pinned scope. CASE inputs remain
+lazy, and unsupported source layouts use ordinary reads. Scope lifetime ends
+before row scratch; request program ownership ends separately from value copies.
+
+A selected projected hit may own a local completed-output receipt. Ordinary
+candidates carry only a nullable pointer. Exact immutable copies rebind their
+own receipt, moves transfer ownership, and replacing/freeing bytes retires it.
+Receipts certify syntax/execution for the request fingerprint, never revision,
+membership or authorization. No public JSON input can carry one. Transported
+outputs validate the complete binding set, syntax and fingerprint locally before
+regaining a receipt. Producer-standard trailing markers can be omitted by a
+borrowed object view during serialization without another payload-sized object.
+Other worker layouts keep the strict general fallback. Explicit immutable object
+receipts cannot disable validation for ordinary caller-constructed or parsed raw
+values; generic RawValue remains slice-sized.
+
+
+### Provenance, normalization and in-process consumers
+
+Pure column/CASE forwarding may retain row-scoped normalized bytes and the
+selected source path through references. Logical-node counts, height, output
+limits and cancellation checks remain charged when a normalized value is reused.
+Strict immutable native scalar extents can supply a one-node normalization proof;
+numeric/composite or unqualified input retains ordinary normalization. Identity
+and missing checks on such aliases do not require a payload DOM. Derived values
+and typed consumers keep the shared VM semantics.
+
+Public source fields and unconditional direct operands may share a bounded
+selected-row read, while CASE-only operands stay lazy. Byte windows are bounded
+independently of metadata windows and cannot outlive the pinned read transaction.
+Public array masks apply after scalar resolution against original positions.
+A synchronous internal typed-result consumer borrows the same authorized public
+query result before encoding; it cannot bypass admission, policy, read-cut,
+revision or lifecycle checks. It must copy retained data before returning and
+preserve query cancellation and failure semantics. No public API or persistent
+format is introduced by this delivery optimization.
+
+
+Column-backed producers must plan `select` dependencies independently of public
+`fields`, including with an empty public mask. Hydration may conservatively fetch
+all potential scalar operands while evaluation remains lazy. Requested `_source`
+and `_computed` are both delivered; public array compaction cannot change scalar
+indexes. A typed borrowed consumer requires eager hydration before its callback
+and cannot opt into spooled/consumed page delivery. Ordinary column-only wire
+encoding continues to stream without an extra source DOM.
+
+An internal consumer should select the narrowest existing projection that
+preserves its semantics. Source masks suffice for object-only path access;
+numeric array selections need scalar binding before source compaction. Identity
+outputs stay separate from source keys. Typed delivery removes response encoding;
+it does not imply that computing every source value again as a scalar is free.
+
+A synchronous internal `ResultView` may carry row-aligned encoded public sources
+instead of constructing `_source` maps. Eligibility uses the same exact-byte
+public-source witness as ordinary wire delivery; absent witnesses retain typed
+preparation and validation. A column-backed source remains typed. Both forms are
+borrowed under the original query lifecycle and cannot outlive the producer.
+Consumers must bound encoded input before parsing it and retain owned copies of
+anything used afterward. Computed identities stay separate from both source
+representations. This changes no public JSON schema or authorization boundary.
+
+For a native consumer borrowing encoded results, a public source mask can
+compile to the private projection IR with zero named outputs. This is physical
+delivery preparation after catalog/lake routing; ordinary wire queries retain
+their established plan and do not implicitly compile a scalar program. Its worker completion fingerprint attests final source preparation,
+while public `_computed` remains absent. Native synchronous delivery is an
+optional method on the same table-read boundary, not an alternate authorization
+route. Bound, provisioned and hosted readers preserve read cuts and producer
+leases through consumption. Older readers may use one source-only compatibility
+fallback with identical query semantics; an explicit scalar selection cannot
+be dropped, and a consumer failure cannot replay a completed result.
+
+Source-only preparation does not alter retained/cursor or offset planning.
+Consumer-bearing native reads with a retained cut or graph dialect use the
+existing finalized wire path rather than remerging an already-paged response.
+
+Result-consumer ownership is explicit at query dispatch. Query-only and modern
+search bodies preserve the same admitted delivery contract. Nested join and
+retrieval execution may share catalog state, but must request owned responses
+until its parent has assembled the final result; it cannot inherit and invoke
+the parent's consumer merely by sharing that catalog resolver.

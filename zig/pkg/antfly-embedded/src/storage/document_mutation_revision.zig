@@ -19,6 +19,7 @@
 const std = @import("std");
 const keys = @import("internal_keys.zig");
 const projection = @import("document_projection.zig");
+const value_identity = @import("source_value_identity.zig");
 const prefix = "\x00\x00__metadata__:document_mutation_revision_v1:";
 pub const Key = [prefix.len + 32]u8;
 const content_prefix = "\x00\x00__metadata__:document_content_authority_v1:";
@@ -244,7 +245,7 @@ const backfill_key = "\x00\x00__metadata__:document_content_backfill_v2";
 /// Cursor and cache records share one physical transaction; user data and
 /// logical mutation revisions are never rewritten by this migration.
 pub const BackfillPage = struct {
-    const Entry = struct { physical: []const u8, content: Content, directory: ?[]const u8 };
+    const Entry = struct { physical: []const u8, content: Content, directory: ?[]const u8, identities: ?[]const u8 = null };
     arena: std.heap.ArenaAllocator,
     before: ?[]const u8,
     after: []const u8,
@@ -313,7 +314,15 @@ pub const BackfillPage = struct {
                         if (err == error.NotFound) break :blk true;
                         return err;
                     };
-                    break :blk !try projection.isCurrent(a, encoded, proof);
+                    if (!try projection.isCurrent(a, encoded, proof)) break :blk true;
+                    const paths = (try projection.Directory.open(a, encoded, proof)) orelse break :blk false;
+                    if (paths.version < 2) break :blk true;
+                    const certificate = metadata.get(&value_identity.keyForRevision(keyForPhysical(last).?)) catch |err| {
+                        if (err == error.NotFound) break :blk true;
+                        return err;
+                    };
+                    const qualified = value_identity.Certificate.open(certificate, encoded, proof) orelse break :blk true;
+                    break :blk qualified.needsCoverageRepair(paths);
                 } else false;
                 if (cached == null or needs_projection) {
                     // Independently scoped primary bytes die after this row;
@@ -325,8 +334,10 @@ pub const BackfillPage = struct {
                         std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
                         break :blk Content{ .revision = try load(&metadata, keyForPhysical(last).?), .bytes = raw.len, .kind = last[last.len - 1], .digest = digest };
                     };
-                    const directory = try projection.buildAuthority(a, raw, content.kind, content.digest);
-                    if (cached == null or directory != null) try entries.append(a, .{ .physical = last, .content = content, .directory = directory });
+                    const publication = try value_identity.buildAuthority(a, raw, content.kind, content.digest);
+                    const directory = publication.directory;
+                    const identities = publication.identities;
+                    if (cached == null or directory != null) try entries.append(a, .{ .physical = last, .content = content, .directory = directory, .identities = identities });
                     bytes +|= raw.len;
                 }
             }
@@ -351,6 +362,7 @@ pub const BackfillPage = struct {
             if (entry.directory) |directory| if (try loadContent(txn, entry.physical)) |current_content| {
                 if (std.meta.eql(current_content, entry.content)) {
                     try txn.put(&projection.keyForRevision(keyForPhysical(entry.physical).?), directory);
+                    if (entry.identities) |identities| try txn.put(&value_identity.keyForRevision(keyForPhysical(entry.physical).?), identities);
                     changed = true;
                 }
             };
@@ -364,14 +376,18 @@ pub const BackfillPage = struct {
 /// One revision per affected document per transaction, including artifact-only
 /// commits. Capture fixed keys rather than retaining every artifact key.
 pub const Capture = struct {
-    const Change = union(enum) { unchanged, deleted, written: struct { proof: Content, directory: ?[]u8 } };
+    const Change = union(enum) { unchanged, deleted, written: struct { proof: Content, directory: ?[]u8, identities: ?[]u8 = null } };
     documents: std.AutoHashMapUnmanaged(Key, Change) = .empty,
     staged: bool = false,
+    identity_reuse: value_identity.ReuseStats = .{},
     poisoned: bool = false,
 
     pub fn deinit(self: *Capture, alloc: std.mem.Allocator) void {
         var values = self.documents.valueIterator();
-        while (values.next()) |value| if (value.* == .written) if (value.written.directory) |directory| alloc.free(directory);
+        while (values.next()) |value| if (value.* == .written) {
+            if (value.written.directory) |directory| alloc.free(directory);
+            if (value.written.identities) |identities| alloc.free(identities);
+        };
         self.documents.deinit(alloc);
     }
 
@@ -386,6 +402,45 @@ pub const Capture = struct {
     /// Hash primary bytes once at the common physical writer boundary. The
     /// fixed map entry coalesces repeated writes and retains no document body.
     pub fn touchValue(self: *Capture, alloc: std.mem.Allocator, physical: []const u8, value: ?[]const u8) !void {
+        return self.touchValuePrepared(alloc, physical, value, null);
+    }
+
+    /// The writer's snapshot qualifies prior metadata before any primary write.
+    /// Fresh/unsupported rows require no primary-body read. Repeated writes use
+    /// this transaction's most recent publication rather than the older snapshot.
+    pub fn touchValueWithReader(self: *Capture, alloc: std.mem.Allocator, reader: anytype, physical: []const u8, value: ?[]const u8) !void {
+        try self.touch(alloc, physical);
+        if (!keys.isStoredDocumentRowKey(physical) or value == null or value.?.len < projection.minimum_bytes)
+            return self.touchValuePrepared(alloc, physical, value, null);
+        const key = keyForPhysical(physical).?;
+        const entry = self.documents.getPtr(key).?;
+        if (entry.* != .unchanged) return self.touchValuePrepared(alloc, physical, value, null);
+        errdefer self.poisoned = true;
+        const previous_proof = loadContent(reader, physical) catch |err| switch (err) {
+            error.InvalidDocumentContentAuthority, error.InvalidDocumentMutationRevision => null,
+            else => return err,
+        };
+        const proof = previous_proof orelse return self.touchValuePrepared(alloc, physical, value, null);
+        if (proof.bytes < projection.minimum_bytes) return self.touchValuePrepared(alloc, physical, value, null);
+        var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const raw_directory = reader.get(&projection.keyForRevision(key)) catch |err| {
+            if (err == error.NotFound) return self.touchValuePrepared(alloc, physical, value, null);
+            return err;
+        };
+        if (raw_directory.len > projection.maximum_bytes) return self.touchValuePrepared(alloc, physical, value, null);
+        if (!std.mem.startsWith(u8, raw_directory, "DPD2")) return self.touchValuePrepared(alloc, physical, value, null);
+        const directory = try scratch.dupe(u8, raw_directory);
+        const raw_certificate = reader.get(&value_identity.keyForRevision(key)) catch |err| {
+            if (err == error.NotFound) return self.touchValuePrepared(alloc, physical, value, null);
+            return err;
+        };
+        if (raw_certificate.len > value_identity.maximum_bytes) return self.touchValuePrepared(alloc, physical, value, null);
+        return self.touchValuePrepared(alloc, physical, value, .{ .bytes = proof.bytes, .kind = proof.kind, .digest = proof.digest, .directory = directory, .identities = raw_certificate });
+    }
+
+    fn touchValuePrepared(self: *Capture, alloc: std.mem.Allocator, physical: []const u8, value: ?[]const u8, prior: ?value_identity.Prior) !void {
         try self.touch(alloc, physical);
         if (!keys.isStoredDocumentRowKey(physical)) return;
         const entry = self.documents.getPtr(keyForPhysical(physical).?).?;
@@ -394,9 +449,21 @@ pub const Capture = struct {
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
             const kind = physical[physical.len - 1];
-            break :blk .{ .written = .{ .proof = .{ .revision = 0, .bytes = bytes.len, .kind = kind, .digest = digest }, .directory = try projection.buildAuthority(alloc, bytes, kind, digest) } };
+            const previous: ?value_identity.Prior = if (entry.* == .written and entry.written.directory != null and entry.written.identities != null)
+                .{ .bytes = entry.written.proof.bytes, .kind = entry.written.proof.kind, .digest = entry.written.proof.digest, .directory = entry.written.directory.?, .identities = entry.written.identities.? }
+            else
+                prior;
+            var reuse: value_identity.ReuseStats = .{};
+            const publication = if (previous) |qualified| try value_identity.buildAuthorityReusing(alloc, bytes, kind, digest, qualified, &reuse) else try value_identity.buildAuthority(alloc, bytes, kind, digest);
+            self.identity_reuse.reused_bytes +|= reuse.reused_bytes;
+            self.identity_reuse.reused_leaves +|= reuse.reused_leaves;
+            self.identity_reuse.canonical_bytes +|= reuse.canonical_bytes;
+            break :blk .{ .written = .{ .proof = .{ .revision = 0, .bytes = bytes.len, .kind = kind, .digest = digest }, .directory = publication.directory, .identities = publication.identities } };
         } else .deleted;
-        if (entry.* == .written) if (entry.written.directory) |directory| alloc.free(directory);
+        if (entry.* == .written) {
+            if (entry.written.directory) |directory| alloc.free(directory);
+            if (entry.written.identities) |identities| alloc.free(identities);
+        }
         entry.* = next;
     }
 
@@ -435,12 +502,18 @@ pub const Capture = struct {
             switch (entry.value_ptr.*) {
                 .written => |value| if (value.directory) |directory| {
                     try txn.put(&projection.keyForRevision(key), directory);
+                    if (value.identities) |identities| try txn.put(&value_identity.keyForRevision(key), identities);
                 },
                 // Small writes do not add a cache lookup/delete to the hot
                 // path. A previous directory is harmless: digest/length checks
                 // exclude it, and a rewrite or deletion replaces/removes it.
-                .deleted => txn.delete(&projection.keyForRevision(key)) catch |err| {
-                    if (err != error.NotFound) return err;
+                .deleted => {
+                    txn.delete(&projection.keyForRevision(key)) catch |err| {
+                        if (err != error.NotFound) return err;
+                    };
+                    txn.delete(&value_identity.keyForRevision(key)) catch |err| {
+                        if (err != error.NotFound) return err;
+                    };
                 },
                 .unchanged => {},
             }
@@ -905,4 +978,86 @@ test "projected authority backfill fences concurrent replacement and preserves l
         try std.testing.expect(try projection.isCurrent(a, directory, proof));
         try write.commit();
     }
+}
+
+test "document mutation revision reuses qualified leaf identities across metadata updates and rejects stale proofs" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    // Escapes exercise the expensive typed canonicalization path as well as
+    // borrowed ASCII. Added/reordered siblings must not change path identity.
+    const escaped = try temp.alloc(u8, 96 * 1024);
+    for (escaped, 0..) |*byte, i| byte.* = "\\u0061"[i % 6];
+    const original = try std.fmt.allocPrint(temp, "{{\"payload\":{{\"image\":\"{s}\"}},\"revision\":1}}", .{escaped});
+    const changed = try std.fmt.allocPrint(temp, "{{\"acl\":\"new\",\"payload\":{{\"extra\":true,\"image\":\"{s}\"}},\"revision\":2}}", .{escaped});
+    const physical = try keys.documentKeyAlloc(temp, "reuse");
+    var capture: Capture = .{};
+    defer capture.deinit(a);
+    try capture.touchValue(a, physical, original);
+    const reference_digest = blk: {
+        var result: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(changed, &result, .{});
+        break :blk result;
+    };
+    const reference = try value_identity.buildAuthority(temp, changed, keys.primary_kind, reference_digest);
+    try capture.touchValue(a, physical, changed);
+    const updated = capture.documents.get(keyForPhysical(physical).?).?.written;
+    try std.testing.expectEqualSlices(u8, reference.directory.?, updated.directory.?);
+    try std.testing.expectEqualSlices(u8, reference.identities.?, updated.identities.?);
+    try std.testing.expect(capture.identity_reuse.reused_bytes >= escaped.len);
+    try std.testing.expect(capture.identity_reuse.canonical_bytes < 128);
+    // Same payload at a different path cannot reuse the old path's proof.
+    const renamed = try std.fmt.allocPrint(temp, "{{\"payload\":{{\"other\":\"{s}\"}},\"revision\":3}}", .{escaped});
+    capture.identity_reuse = .{};
+    try capture.touchValue(a, physical, renamed);
+    try std.testing.expectEqual(@as(usize, 0), capture.identity_reuse.reused_bytes);
+    // A corrupt/unknown canonical ABI must force reference canonicalization.
+    const current = capture.documents.get(keyForPhysical(physical).?).?.written;
+    const stale = try temp.dupe(u8, current.identities.?);
+    stale[79] ^= 1;
+    var stats: value_identity.ReuseStats = .{};
+    const rejected = try value_identity.buildAuthorityReusing(temp, renamed, keys.primary_kind, current.proof.digest, .{ .bytes = current.proof.bytes, .kind = current.proof.kind, .digest = current.proof.digest, .directory = current.directory.?, .identities = stale }, &stats);
+    try std.testing.expectEqualSlices(u8, current.identities.?, rejected.identities.?);
+    try std.testing.expectEqual(@as(usize, 0), stats.reused_bytes);
+    // Real writer integration: snapshot-qualified metadata, repeated writes,
+    // committed revisions and ordinary conditional identity readers agree.
+    var backend = @import("lsm_backend.zig").Backend.init(a, .{ .flush_threshold = 1024 * 1024 });
+    defer backend.close();
+    var store = try @import("docstore.zig").DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    try store.put(physical, original);
+    var write = try store.beginWriteTxn();
+    var committed = false;
+    defer if (!committed) write.abort();
+    try write.put(physical, changed);
+    try std.testing.expect(write.document_revisions.identity_reuse.reused_bytes >= escaped.len);
+    try write.put(physical, renamed);
+    try write.commit();
+    committed = true;
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    const proof = (try loadContent(&read, physical)).?;
+    try std.testing.expectEqual(@as(u64, 2), proof.revision);
+    const encoded = try read.get(&value_identity.keyForRevision(keyForPhysical(physical).?));
+    const expected = capture.documents.get(keyForPhysical(physical).?).?.written;
+    try std.testing.expectEqualSlices(u8, expected.identities.?, encoded);
+}
+
+test "document mutation revision reused publications release every allocation on failure" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const physical = try keys.documentKeyAlloc(a, "reuse-failure");
+            defer a.free(physical);
+            const first = "{\"large\":\"" ++ @as([16 * 1024]u8, @splat('x')) ++ "\",\"revision\":1}";
+            const second = "{\"large\":\"" ++ @as([16 * 1024]u8, @splat('x')) ++ "\",\"revision\":2}";
+            var capture: Capture = .{};
+            defer capture.deinit(a);
+            try capture.touchValue(a, physical, first);
+            try capture.touchValue(a, physical, second);
+            try std.testing.expect(capture.identity_reuse.reused_bytes >= 16 * 1024);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

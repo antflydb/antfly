@@ -92,6 +92,63 @@ test "lite detached writer admission fences documents and index catalogs" {
     try std.testing.expectEqual(@as(usize, 0), admission.active);
 }
 
+test "lite empty write commits preserve checkpoints and release writer admission" {
+    const Admission = struct {
+        entered: usize = 0,
+        active: usize = 0,
+        fn enter(ptr: *anyopaque, _: PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered += 1;
+            self.active += 1;
+        }
+        fn leave(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.active -= 1;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "empty-write.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("retained", "value");
+        try write.commit();
+    }
+    var admission: Admission = .{};
+    store.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer store.writer_admission = null;
+    const checkpoint = store.file.activeCheckpoint();
+    const header = store.file.header;
+    for (0..16) |_| {
+        var empty = try store.beginWrite();
+        var empty_live = true;
+        defer if (empty_live) empty.abort();
+        try std.testing.expectEqualStrings("value", try empty.get("retained"));
+        const entered = admission.entered;
+        try empty.commit();
+        empty_live = false;
+        try std.testing.expectEqual(entered, admission.entered);
+        try std.testing.expectEqual(@as(usize, 0), admission.active);
+        try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
+        try std.testing.expectEqualDeep(header, store.file.header);
+    }
+    {
+        var next = try store.beginWrite();
+        errdefer next.abort();
+        try next.put("after", "progress");
+        try next.commit();
+    }
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("progress", try read.get("after"));
+}
+
 test "lite reclamation stale quota estimates expire after roots shrink" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1405,10 +1462,10 @@ pub const Store = struct {
     secret_store_uncertain: bool = false,
     mutex: PublicationMutex = .{},
     writer_mutex: std.Io.Mutex = .init,
-    writer_ready: std.Io.Condition = .init,
+    writer_ready: platform_sync.BroadcastCondition = .init,
     generation_lock: std.Io.RwLock = .init,
     commit_mutex: std.Io.Mutex = .init,
-    commit_ready: std.Io.Condition = .init,
+    commit_ready: platform_sync.BroadcastCondition = .init,
     commit_head: ?*MutationRequest = null,
     commit_tail: ?*MutationRequest = null,
     commit_draining: bool = false,
@@ -3169,6 +3226,13 @@ pub const Txn = struct {
     pub fn commit(self: *Txn) !void {
         if (self.read_only) return error.ReadOnly;
         const store = self.store orelse return error.ReadOnly;
+        // Metadata probes may use a write transaction without staging changes.
+        // Release their admission and snapshot directly: entering publication
+        // would unnecessarily run retirement pressure and allocator proof work.
+        if (self.pending_count == 0) {
+            self.abort();
+            return;
+        }
         const allocator = self.allocator;
         var mutations = try allocator.alloc(native.DocumentMutation, self.pending_count);
         defer allocator.free(mutations);
@@ -4753,6 +4817,48 @@ test "lite native docstore runtime scans ordered snapshot" {
     try std.testing.expectEqualStrings("doc:b", next.key);
     const seek = (try cursor.seekAtOrAfter("doc:bb")).?;
     try std.testing.expectEqualStrings("doc:c", seek.key);
+}
+
+test "lite resolver consumer bootstrap discards stale projections without reading external values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "resolver-bootstrap.aflite");
+    defer allocator.free(path);
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    const consumers = @import("resolver_consumers.zig");
+    const stale = consumers.profiles_prefix ++ "stale";
+    const neighbor = "\x00antfly/embedded/resolver-consumers/v7/static0";
+    const large = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(large);
+    @memset(large, 'x');
+    {
+        var seed = try Txn.openWrite(&store);
+        errdefer seed.abort();
+        try seed.put(stale, large);
+        try seed.put(neighbor, large);
+        try seed.commit();
+    }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    {
+        var write = try Txn.openWrite(&store);
+        errdefer write.abort();
+        const before = store.file.test_page_reads.load(.monotonic);
+        try consumers.bootstrap(arena.allocator(), &write);
+        // Two MiB of discarded/adjacent values must not be read to migrate
+        // one stale key. Count logical reads so the assertion ignores caches.
+        try std.testing.expect(store.file.test_page_reads.load(.monotonic) - before < 64);
+        try std.testing.expectError(error.NotFound, write.get(stale));
+        try std.testing.expectEqualStrings("1", try write.get(consumers.marker));
+        try write.commit();
+    }
+    var read = try Txn.openRead(&store);
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(stale));
+    try std.testing.expectEqualStrings(large, try read.get(neighbor));
+    try std.testing.expectEqualStrings("1", try read.get(consumers.marker));
 }
 
 test "lite native write cursors merge pending writes and deletes in order" {

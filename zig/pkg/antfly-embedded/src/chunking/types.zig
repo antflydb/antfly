@@ -54,8 +54,8 @@ pub const AudioChunkOptions = if (build_options.bench_minimal_deps) struct {
     overlap_duration_ms: u32 = 0,
 } else lib.AudioChunkOptions;
 
-pub const EmbeddingTarget = if (build_options.bench_minimal_deps) @import("inference_api").ChunkEmbeddingTarget else lib.EmbeddingTarget;
-pub const MediaPolicy = if (build_options.bench_minimal_deps) @import("inference_api").MediaChunkPolicy else lib.MediaPolicy;
+pub const EmbeddingTarget = if (build_options.bench_minimal_deps) @import("antfly_chunking_api_openapi").ChunkEmbeddingTarget else lib.EmbeddingTarget;
+pub const MediaPolicy = if (build_options.bench_minimal_deps) @import("antfly_chunking_api_openapi").MediaChunkPolicy else lib.MediaPolicy;
 
 pub const Replay = if (build_options.bench_minimal_deps) struct { source_version: []const u8, source_fingerprint: []const u8, plan_id: []const u8, ordinal: u64 } else lib.Replay;
 pub fn cloneReplay(a: Allocator, value: Replay) !Replay {

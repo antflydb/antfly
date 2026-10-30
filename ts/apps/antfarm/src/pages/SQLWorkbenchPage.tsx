@@ -3,8 +3,10 @@ import {
   DashboardPage,
   DashboardPageHeader,
   DashboardPageTitle,
+  Field,
+  FieldLabel,
+  HighlightedCodeBlock,
   Input,
-  Label,
   Textarea,
 } from "@antfly/design-system";
 import { SQLExecutionError, type SQLResponse } from "@antfly/sdk";
@@ -104,43 +106,47 @@ export default function SQLWorkbenchPage() {
         Integers remain exact; NULL and JSON null are distinct. Nothing is retried automatically.
       </p>
       <div className="flex gap-4">
-        <div>
-          <Label htmlFor="sql-database">Database</Label>
+        <Field className="w-auto">
+          <FieldLabel htmlFor="sql-database">Database</FieldLabel>
           <Input
             id="sql-database"
             value={database}
             disabled={busy || !!session}
             onChange={(e) => setDatabase(e.target.value)}
           />
-        </div>
-        <div>
-          <Label htmlFor="sql-namespace">Namespace</Label>
+        </Field>
+        <Field className="w-auto">
+          <FieldLabel htmlFor="sql-namespace">Namespace</FieldLabel>
           <Input
             id="sql-namespace"
             value={namespace}
             disabled={busy || !!session}
             onChange={(e) => setNamespace(e.target.value)}
           />
-        </div>
+        </Field>
       </div>
-      <Label htmlFor="sql-statement">Statement</Label>
-      <Textarea
-        id="sql-statement"
-        className="min-h-40 font-mono"
-        value={statement}
-        onChange={(e) => setStatement(e.target.value)}
-        spellCheck={false}
-      />
-      <Label htmlFor="sql-parameters">
-        Positional parameters (JSON array; quote large integers)
-      </Label>
-      <Textarea
-        id="sql-parameters"
-        className="font-mono"
-        value={parameters}
-        onChange={(e) => setParameters(e.target.value)}
-        spellCheck={false}
-      />
+      <Field>
+        <FieldLabel htmlFor="sql-statement">Statement</FieldLabel>
+        <Textarea
+          id="sql-statement"
+          className="min-h-40 font-mono"
+          value={statement}
+          onChange={(e) => setStatement(e.target.value)}
+          spellCheck={false}
+        />
+      </Field>
+      <Field>
+        <FieldLabel htmlFor="sql-parameters">
+          Positional parameters (JSON array; quote large integers)
+        </FieldLabel>
+        <Textarea
+          id="sql-parameters"
+          className="font-mono"
+          value={parameters}
+          onChange={(e) => setParameters(e.target.value)}
+          spellCheck={false}
+        />
+      </Field>
       <div className="flex gap-2">
         <Button
           disabled={busy || uncertain || !statement.trim()}
@@ -188,9 +194,7 @@ export default function SQLWorkbenchPage() {
         </p>
       )}
       {diagnostic && (
-        <pre role="alert" className="whitespace-pre-wrap rounded border p-3">
-          {diagnostic}
-        </pre>
+        <HighlightedCodeBlock role="alert" code={diagnostic} variant="destructive" wrap />
       )}
       {uncertain && (
         <Button variant="outline" onClick={() => setUncertain(false)}>
@@ -210,7 +214,11 @@ export default function SQLWorkbenchPage() {
             </p>
           )}
           {result.ddl_receipt && (
-            <pre className="whitespace-pre-wrap">{JSON.stringify(result.ddl_receipt, null, 2)}</pre>
+            <HighlightedCodeBlock
+              code={JSON.stringify(result.ddl_receipt, null, 2)}
+              language="json"
+              wrap
+            />
           )}
           <div className="overflow-auto">
             <table className="w-full text-left text-sm">

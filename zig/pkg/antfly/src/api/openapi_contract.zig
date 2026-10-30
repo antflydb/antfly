@@ -537,6 +537,8 @@ test "generated route policy inventory is unique and describes wire modes" {
     try std.testing.expect(found_streaming_research);
     try std.testing.expect(found_streaming_inference_connection);
     try std.testing.expectEqual(server.routes.len, request_admission_policy.public_operation_policies.len);
+    try std.testing.expectEqual(.none, request_admission_policy.publicOperationClass("listEntityResolverProgress").?);
+    try std.testing.expectEqual(.none, request_admission_policy.publicOperationClass("namespaceListEntityResolverProgress").?);
 
     for (server.routes) |route| {
         try std.testing.expect(request_admission_policy.publicOperationClass(route.operation_id) != null);

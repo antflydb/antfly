@@ -3969,7 +3969,18 @@ fn embedDenseBatchAttempt(dense_embedder: embedder_mod.DenseEmbedder, runtime: *
 }
 
 fn embedDenseBatchAttemptLimits(dense_embedder: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32, limits: ?DenseBatchLimits) ![]const []const f32 {
-    if (limits) |bounded| return plannedDenseBatches(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, assetProviderRequestContext(runtime), bounded);
+    if (limits) |bounded| {
+        // Foreground calls promise an interruptible provider. Background
+        // publication also uses a context for deadline/progress fences, but
+        // must continue to support legacy synchronous providers.
+        if (!denseProviderSupportsContext(dense_embedder)) {
+            if (foregroundProviderRequestContext(runtime)) |context| {
+                try context.check();
+                return error.UncancellableInferenceProvider;
+            }
+        }
+        return plannedDenseBatches(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, assetProviderRequestContext(runtime), bounded);
+    }
     // Context-aware callbacks still require an explicit reentrancy guarantee.
     // Custom and legacy providers retain their serial path by default.
     const parallelism = @min(@min(generatedEmbedParallelBatches(), @max(@as(usize, 1), dense_embedder.dense_batch_concurrency)), texts.len);
@@ -4017,6 +4028,12 @@ fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbe
 
 const DenseBatchLimits = struct { items: usize, bytes: usize };
 
+fn denseProviderSupportsContext(provider: embedder_mod.DenseEmbedder) bool {
+    return provider.dense_embed_batch_with_context_fn != null or
+        provider.dense_embed_with_context_fn != null or
+        (provider.part_lease != null and provider.dense_embed_batch_planned_fn != null);
+}
+
 fn denseBatchParallelism(provider: embedder_mod.DenseEmbedder) usize {
     if (provider.dense_embed_batch_with_context_fn == null) return 1;
     return @min(generatedEmbedParallelBatches(), @max(@as(usize, 1), provider.dense_batch_concurrency));
@@ -4061,7 +4078,18 @@ fn parallelDenseBatchPlanned(alloc: Allocator, io: Io, provider: embedder_mod.De
         dims: u32,
         context: inference_request_context.RequestContext,
         fn run(self: *@This()) anyerror![]const []const f32 {
-            return self.provider.embedDenseBatchWithContext(self.alloc, self.name, self.texts, self.dims, self.context);
+            if (denseProviderSupportsContext(self.provider))
+                return self.provider.embedDenseBatchWithContext(self.alloc, self.name, self.texts, self.dims, self.context);
+            // Legacy providers are serialized by denseBatchParallelism. Keep
+            // limits and cancellation fences around their synchronous call,
+            // without claiming the provider itself can be interrupted.
+            try self.context.check();
+            const vectors = try self.provider.embedDenseBatch(self.alloc, self.name, self.texts, self.dims);
+            self.context.check() catch |err| {
+                embedder_mod.freeDenseEmbeddingBatch(self.alloc, vectors);
+                return err;
+            };
+            return vectors;
         }
     };
     const vectors = try alloc.alloc([]const f32, texts.len);
@@ -4120,6 +4148,95 @@ fn parallelDenseBatchPlanned(alloc: Allocator, io: Io, provider: embedder_mod.De
     }
     try context.check();
     return vectors;
+}
+
+test "bounded dense legacy providers remain serial and obey item byte and cancellation fences" {
+    const Harness = struct {
+        calls: usize = 0,
+        batches: usize = 0,
+        largest_items: usize = 0,
+        largest_bytes: usize = 0,
+        cancel_on_return: bool = false,
+        cancelled: bool = false,
+        fn isCancelled(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            return self.cancelled;
+        }
+        fn batch(ptr: *anyopaque, alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batches += 1;
+            self.largest_items = @max(self.largest_items, texts.len);
+            self.largest_bytes = @max(self.largest_bytes, textBatchByteStats(texts).total_bytes);
+            const out = try alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |vector| alloc.free(vector);
+                alloc.free(out);
+            }
+            for (texts, out) |text, *vector| {
+                vector.* = try embed(ptr, alloc, name, text, dims);
+                initialized += 1;
+            }
+            if (self.cancel_on_return) self.cancelled = true;
+            return out;
+        }
+        fn embed(ptr: *anyopaque, alloc: Allocator, _: []const u8, text: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const vector = try alloc.alloc(f32, dims);
+            @memset(vector, @as(f32, @floatFromInt(try std.fmt.parseUnsigned(u32, text, 10))));
+            return vector;
+        }
+    };
+    var harness: Harness = .{};
+    const provider: embedder_mod.DenseEmbedder = .{ .ptr = &harness, .dense_embed_fn = Harness.embed, .dense_embed_batch_fn = Harness.batch, .dense_batch_concurrency = 4 };
+    try std.testing.expectEqual(@as(usize, 1), denseBatchParallelism(provider));
+    const alloc = std.testing.allocator;
+    const context: inference_request_context.RequestContext = .{ .io = std.testing.io, .deadline_ns = null };
+    const texts = [_][]const u8{ "1", "2", "3", "4", "5" };
+    const vectors = try plannedDenseBatches(alloc, std.testing.io, provider, "model", &texts, 1, context, .{ .items = 2, .bytes = 2 });
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+    for (vectors, 1..) |vector, value| try std.testing.expectEqual(@as(f32, @floatFromInt(value)), vector[0]);
+    try std.testing.expectEqual(@as(usize, 5), harness.calls);
+    try std.testing.expectEqual(@as(usize, 3), harness.batches);
+    try std.testing.expectEqual(@as(usize, 2), harness.largest_items);
+    try std.testing.expectEqual(@as(usize, 2), harness.largest_bytes);
+    const byte_limited = try plannedDenseBatches(alloc, std.testing.io, provider, "model", &texts, 1, context, .{ .items = 4, .bytes = 2 });
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, byte_limited);
+    try std.testing.expectEqual(@as(usize, 6), harness.batches);
+    try std.testing.expectEqual(@as(usize, 2), harness.largest_items);
+    try std.testing.expectError(error.InferenceEncodedBytesExceeded, plannedDenseBatches(alloc, std.testing.io, provider, "model", &.{"123"}, 1, context, .{ .items = 2, .bytes = 2 }));
+    var expired = context;
+    expired.deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, plannedDenseBatches(alloc, std.testing.io, provider, "model", &texts, 1, expired, .{ .items = 2, .bytes = 2 }));
+    try std.testing.expectEqual(@as(usize, 10), harness.calls);
+    var cancelled = context;
+    cancelled.cancellation = .{ .ptr = &harness, .is_cancelled_fn = Harness.isCancelled };
+    harness.cancel_on_return = true;
+    // Cancellation arriving inside an uninterruptible callback must release
+    // all returned vectors and stop before a second bounded batch is issued.
+    try std.testing.expectError(error.Cancelled, plannedDenseBatches(alloc, std.testing.io, provider, "model", &texts, 1, cancelled, .{ .items = 2, .bytes = 2 }));
+    try std.testing.expectEqual(@as(usize, 7), harness.batches);
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .io = std.testing.io },
+        .ownership = undefined,
+        .active_provider_guard = .{ .deadline_ns = std.math.maxInt(u64) },
+    };
+    // An explicit foreground cancellation contract still requires a
+    // controlled callback; bounding a batch must not weaken that contract.
+    try std.testing.expectError(error.UncancellableInferenceProvider, embedDenseBatchAttemptLimits(provider, &runtime, "model", &texts, 1, .{ .items = 2, .bytes = 2 }));
+    try std.testing.expectEqual(@as(usize, 7), harness.batches);
 }
 
 test "parallel dense inference preserves order drains failures and bounds provider concurrency" {
@@ -5435,6 +5552,7 @@ fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment
                     .embedding => delta.embedding = values,
                     .transcribe => delta.transcribe = values,
                     .classify => delta.classify = values,
+                    .diarize => delta.diarize = values,
                 }
             }
         }
@@ -10824,7 +10942,10 @@ test "shared PDF enrollment skips completed metadata and byte fingerprints befor
     defer cache.deinit();
     var lease = try cache.adoptOwned(url, null, .{ .content_type = try alloc.dupe(u8, "application/pdf"), .data = try alloc.dupe(u8, source) });
     defer lease.deinit();
-    for ([_][]const u8{ "{}", "{\"etag\":\"revision-one\"}" }) |config_json| {
+    for ([_][]const u8{
+        "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}",
+        "{\"etag\":\"revision-one\",\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}",
+    }) |config_json| {
         const producer_json = try std.fmt.allocPrint(alloc, "{{\"type\":\"document_extraction\",\"config\":{s}}}", .{config_json});
         defer alloc.free(producer_json);
         const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .doc_key = "source", .index_name = "reader", .artifact_name = "reader", .source_field = "url", .producer_json = producer_json };
@@ -14549,6 +14670,7 @@ fn indexDocumentProducerRequired(a: Allocator, item: AssetProducerBatchItem) !bo
     return provider == .string and std.mem.eql(u8, provider.string, "antfly");
 }
 fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer_mod.Producer, items: []AssetProducerBatchItem, window: *GeneratedReplayWindow, scope: *FailureScope) !void {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     const Task = struct {
         runtime: *EnrichmentRuntime,
         producer: asset_producer_mod.Producer,
@@ -14701,10 +14823,10 @@ fn mediaRepairDecision(a: Allocator, desired: @import("inference_chunker").outpu
     var changed = false;
     for (original) |value| if (std.mem.eql(u8, value.name, desired.name)) {
         seen = true;
-        const identity = try desired.recipeIdentity(a, if (current_identity) |current| current.model_identity else value.model_identity, if (current_identity) |current| current.model_revision else value.model_revision);
+        const identity = try desired.receiptRecipeIdentity(a, current_identity orelse value);
         changed = changed or !std.mem.eql(u8, &identity, value.recipe_id);
         if (desired.model_identity) |pin| changed = changed or !std.mem.eql(u8, pin, value.model_identity);
-        failed = failed or (value.status != .complete and !value.terminal) or (value.status == .complete and value.embedding == null and value.spans == null and value.labels == null);
+        failed = failed or (value.status != .complete and !value.terminal) or (value.status == .complete and value.embedding == null and value.spans == null and value.labels == null and value.speaker_spans == null);
     };
     return .{ .needed = !seen or failed or changed };
 }
@@ -14807,24 +14929,27 @@ fn repairMediaOutputPrepared(runtime: *EnrichmentRuntime, request: enrichment_ty
         if (current_identity) |identity| {
             replacement.model_identity = identity.model_identity;
             replacement.model_revision = identity.model_revision;
+            replacement.speaker_model_revision = identity.speaker_model_revision;
         }
         replacement.kind = desired.kind;
         replacement.required = desired.required;
-        const failure_identity = try desired.recipeIdentity(scratch, replacement.model_identity, replacement.model_revision);
+        const failure_identity = try desired.receiptRecipeIdentity(scratch, replacement);
         replacement.recipe_id = try scratch.dupe(u8, &failure_identity);
         replacement.status = .failed;
         replacement.code = @errorName(failure.?);
         replacement.embedding = null;
         replacement.spans = null;
         replacement.labels = null;
+        replacement.speaker_spans = null;
         try replacements.append(scratch, replacement);
     };
     if (replacements.items.len == 0 and failure != null) {
         const model_identity = if (current_identity) |value| value.model_identity else "";
         const model_revision = if (current_identity) |value| value.model_revision else "";
-        const identity = try desired.recipeIdentity(scratch, model_identity, model_revision);
+        const speaker_revision = if (current_identity) |value| value.speaker_model_revision else null;
+        const identity = if (desired.hasDiarization()) try desired.speakerRecipeIdentity(scratch, model_identity, model_revision, speaker_revision orelse "") else try desired.recipeIdentity(scratch, model_identity, model_revision);
         const owned_identity = try scratch.dupe(u8, &identity);
-        try replacements.append(scratch, .{ .name = desired.name, .kind = desired.kind, .required = desired.required, .model = desired.model, .model_identity = model_identity, .model_revision = model_revision, .recipe_id = owned_identity, .start_ns = metadata.descriptor.coordinates.start_ns, .end_ns = metadata.descriptor.coordinates.end_ns, .status = .failed, .code = @errorName(failure.?) });
+        try replacements.append(scratch, .{ .name = desired.name, .kind = desired.kind, .required = desired.required, .model = desired.model, .model_identity = model_identity, .model_revision = model_revision, .speaker_model_revision = speaker_revision, .recipe_id = owned_identity, .start_ns = metadata.descriptor.coordinates.start_ns, .end_ns = metadata.descriptor.coordinates.end_ns, .status = .failed, .code = @errorName(failure.?) });
     }
     if (replacements.items.len == 0) return error.InvalidChunkOutput;
     // Old embedded receipts predate explicit attempt counters: an existing
@@ -14967,7 +15092,7 @@ fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.
             const values = try std.json.parseFromSliceLeaky([]@import("inference_chunker").outputs.Result, decision_arena.allocator(), parent.outputs_json orelse "[]", .{});
             for (values) |value| {
                 if (!std.mem.eql(u8, value.name, name) or !value.reusable()) continue;
-                const recipe = try target.recipeIdentity(decision_arena.allocator(), if (current_output) |current| current.model_identity else value.model_identity, if (current_output) |current| current.model_revision else value.model_revision);
+                const recipe = try target.receiptRecipeIdentity(decision_arena.allocator(), current_output orelse value);
                 if (skips.items.len < 4096 and std.mem.eql(u8, &recipe, value.recipe_id)) try skips.append(decision_arena.allocator(), .{ .ordinal = parent.descriptor.ordinal, .sub_index = value.sub_index });
             }
         }
@@ -15412,6 +15537,7 @@ const IndexDocumentCheckpoint = struct {
     }
 };
 fn retireIndexDocumentCheckpoint(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, authority: ?*const @import("../artifact_producer_context.zig").Token) !void {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     var arena = std.heap.ArenaAllocator.init(runtime.alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -15950,6 +16076,7 @@ fn processDocumentExtractionAsset(
         .prepared_pdf_session = if (prepared_pdf_session) |*session| session else null,
     };
     defer collect_ctx.deinit();
+    var prepared_marking = document_extraction_mod.UnconfiguredGeneratedTextSink{ .alloc = document_extraction_alloc, .config = &extraction_config, .inner = collect_ctx.sink() };
     const extraction_result = if (prepared_pdf_session) |*session|
         document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
             document_extraction_alloc,
@@ -15957,7 +16084,7 @@ fn processDocumentExtractionAsset(
             if (extraction_config.content_type.len > 0) extraction_config.content_type else downloaded.content_type,
             extraction_config.ocr_mode,
             extraction_config.ocr_quality,
-            collect_ctx.sink(),
+            prepared_marking.sink(),
             if (page_text_spool) |*spool| spool.cache() else null,
         )
     else
@@ -25954,7 +26081,7 @@ fn replayModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, request: en
     config.embedding.?.task_type = try a.dupe(u8, metadata.task_type);
     config.embedding.?.model_identity = try a.dupe(u8, metadata.model_identity);
     var policy = @import("../../../chunking/types.zig").MediaPolicy{};
-    inline for (@typeInfo(@TypeOf(metadata.policy)).@"struct".field_names) |name| @field(policy, name) = @intCast(@field(metadata.policy, name));
+    inline for (@typeInfo(@TypeOf(metadata.policy)).@"struct".field_names) |name| @field(policy, name) = if (@TypeOf(@field(metadata.policy, name)) == bool) @field(metadata.policy, name) else @intCast(@field(metadata.policy, name));
     config.policy = policy;
     // Route through the consumer's canonical endpoint, never a recipe-supplied
     // URL or credential. Existing execution context supplies authenticated I/O.
@@ -26052,7 +26179,7 @@ fn modelEmbeddingMetadataForWindow(a: Allocator, request: enrichment_types.Gener
         }
     }
     if (value.status == .complete and value.embedding != null) try value.validate(target);
-    const recipe = try target.recipeIdentity(a, value.model_identity, value.model_revision);
+    const recipe = try target.receiptRecipeIdentity(a, value);
     if (!std.mem.eql(u8, &recipe, value.recipe_id)) return error.IncompatibleChunkEmbeddingTarget;
     inline for (.{ "model", "model_identity", "model_revision" }) |field| {
         a.free(@field(result, field));
@@ -34940,7 +35067,7 @@ fn extractSourceText(
     defer parsed.deinit();
     if (parsed.value != .object) return null;
     const source = enrichment_types.sourceFieldValue(parsed.value, request.source_field, request.group_artifact_name.len > 0);
-    if (source != .string) return null;
+    if (source != .string or source.string.len == 0) return null;
     return try alloc.dupe(u8, source.string);
 }
 
@@ -38357,6 +38484,27 @@ test "extractSourceText without template returns null for missing field" {
     try std.testing.expect(result == null);
 }
 
+test "enrichment extractSourceText empty fields and templates share no output while preserving whitespace" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "", "{{body}}" }) |template_| {
+        const request: enrichment_types.GeneratedEnrichmentRequest = .{
+            .kind = .dense_embedding,
+            .index_name = "idx",
+            .doc_key = "doc:1",
+            .source_field = "body",
+            .source_template = template_,
+        };
+        for ([_][]const u8{ "{\"body\":\"\"}", "{}", "{\"body\":null}" }) |doc| {
+            const result = try extractSourceText(alloc, .{}, doc, request);
+            defer if (result) |text| alloc.free(text);
+            try std.testing.expect(result == null);
+        }
+        const whitespace = (try extractSourceText(alloc, .{}, "{\"body\":\" \\t\\n\"}", request)).?;
+        defer alloc.free(whitespace);
+        try std.testing.expectEqualStrings(" \t\n", whitespace);
+    }
+}
+
 test "extractSourceText with template skips _embeddings field" {
     const alloc = std.testing.allocator;
     const doc = "{\"title\":\"Hello\",\"_embeddings\":[1,2,3]}";
@@ -41133,4 +41281,34 @@ test "enrichment maintenance document failures share durable retry policy" {
     }
     try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.CloudflareRateLimited));
     try std.testing.expectEqual(EnrichmentErrorDisposition.fatal_worker, enrichmentErrorDisposition(error.OutOfMemory));
+}
+
+test "model aware media diarized repair receipts reuse source identities and detect companion deployments" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const O = @import("inference_chunker").outputs;
+    const target = O.Target{ .name = "speech", .kind = .transcribe, .model = "whisper", .diarize = true };
+    const primary: [64]u8 = @splat('a');
+    const speaker: [64]u8 = @splat('b');
+    var receipt = O.Result{ .name = "speech", .kind = .transcribe, .model = "whisper", .required = true, .model_identity = &primary, .model_revision = &primary, .speaker_model_revision = &speaker, .recipe_id = "", .status = .complete, .speaker_scope = .source, .start_ns = 0, .end_ns = 1, .spans = &.{.{ .text = "hello", .start_ns = 0, .end_ns = 1, .speaker_index = 0 }} };
+    const recipe = try target.receiptRecipeIdentity(alloc, receipt);
+    receipt.recipe_id = &recipe;
+    var metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 0, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 1 } }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "whisper", .model_identity = &primary, .task_type = "TRANSCRIBE", .dimensions = 0, .policy = .{}, .outputs_json = try std.json.Stringify.valueAlloc(alloc, &[_]O.Result{receipt}, .{ .emit_null_optional_fields = false }) };
+    try std.testing.expect(!(try mediaRepairDecision(alloc, target, &metadata, receipt)).needed);
+    const next_speaker: [64]u8 = @splat('c');
+    var deployed = receipt;
+    deployed.speaker_model_revision = &next_speaker;
+    try std.testing.expect((try mediaRepairDecision(alloc, target, &metadata, deployed)).needed);
+    var configured = target;
+    configured.diarization = .{ .similarity_threshold = 0.7 };
+    try std.testing.expect((try mediaRepairDecision(alloc, configured, &metadata, receipt)).needed);
+    // Legacy local labels cannot satisfy a request for the new source scope.
+    var legacy = receipt;
+    legacy.speaker_model_revision = null;
+    const legacy_recipe = try target.recipeIdentity(alloc, legacy.model_identity, legacy.model_revision);
+    legacy.recipe_id = &legacy_recipe;
+    metadata.outputs_json = try std.json.Stringify.valueAlloc(alloc, &[_]O.Result{legacy}, .{ .emit_null_optional_fields = false });
+    try std.testing.expect((try mediaRepairDecision(alloc, target, &metadata, receipt)).needed);
 }
