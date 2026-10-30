@@ -43,17 +43,17 @@ instance role. `region` defaults to `AWS_REGION`, then
 
 ## Extraction
 
-Extract entities, relations, and structured records with a generated extractor
-backed by an Anthropic Claude on Bedrock generator. Use it as an `extractor` producer on an
-enrichment, or send the `config` object with `inputs` added to `/ai/v1/extract`:
+Use `bedrock` as an extraction provider: name the model and the schema, and
+Antfly runs a generated extractor on that model. As an `extractor` producer on an
+enrichment:
 
 ```json
 {
   "type": "extractor",
   "config": {
-    "method": "generated",
-    "generator": {"provider": "bedrock", "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0", "region": "us-east-1"},
-    "probabilities": "verdict_only",
+    "provider": "bedrock",
+    "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "region": "us-east-1",
     "schema": {
       "entities": ["person", "company"],
       "relations": [{"type": "works_for"}]
@@ -62,10 +62,25 @@ enrichment, or send the `config` object with `inputs` added to `/ai/v1/extract`:
 }
 ```
 
-Admitted model families: Anthropic Claude 3 and later model IDs and cross-region inference profiles. Output is returned through a forced Converse tool call. Other models, and task variants such as
-audio, image, search, or embedding models, are rejected when the config is
-saved. `verdict_only` is required unless the model reports token
-log-probabilities.
+The schema takes `entities` and `relations`. Admitted model families: Anthropic Claude 3 and later model IDs and cross-region inference profiles. Output is returned through a forced Converse tool call.
+Other models, and task variants such as audio, image, search, or embedding
+models, are rejected when the config is saved. Scores are verdict-only.
+
+To set instructions, output mode, probabilities, or batching, use the
+generated form instead, which takes the same generator config under
+`generator`:
+
+```json
+{
+  "method": "generated",
+  "generator": {"provider": "bedrock", "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0", "region": "us-east-1"},
+  "probabilities": "verdict_only",
+  "instructions": "Only extract people named in the signature block.",
+  "schema": {"entities": ["person"]}
+}
+```
+
+The generated form, with `inputs` added, is also what `/ai/v1/extract` accepts.
 
 ## Related
 

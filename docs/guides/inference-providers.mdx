@@ -41,21 +41,21 @@ environment variables; see [Secrets management](/docs/secrets).
 | Provider | [Embedder](#embedder) | [Reranker](#reranker) | [Chunker](#chunker) | [Reader](#reader) | [Transcriber](#transcriber) | [Speech](#speech-synthesizer) | [Generator](#generator) | [Extractor](#extractor) | [Decider](#decider) | [Web search](#web-search) |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
 | [Antfly](/docs/guides/providers/antfly) (`antfly`) | ✓ | ✓ | ✓ | ✓ | ✓ |  | ✓ | ✓ | ✓ |  |
-| [Anthropic](/docs/guides/providers/anthropic) (`anthropic`) |  |  |  |  |  |  | ✓ |  |  |  |
+| [Anthropic](/docs/guides/providers/anthropic) (`anthropic`) |  |  |  |  |  |  | ✓ | ✓ |  |  |
 | [Apple](/docs/guides/providers/apple) (`apple`) |  |  |  | ✓ | ✓ |  | ✓ |  |  |  |
-| [AWS Bedrock](/docs/guides/providers/bedrock) (`bedrock`) | ✓ |  |  |  |  |  | ✓ |  |  |  |
+| [AWS Bedrock](/docs/guides/providers/bedrock) (`bedrock`) | ✓ |  |  |  |  |  | ✓ | ✓ |  |  |
 | [Brave](/docs/guides/providers/web-search) (`brave`) |  |  |  |  |  |  |  |  |  | ✓ |
 | [ChatGPT plan](/docs/guides/providers/chatgpt) (`chatgpt`) |  |  |  |  |  |  | ✓ |  |  |  |
 | [Cloudflare Workers AI](/docs/guides/providers/cloudflare) (`cloudflare`) | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |
 | [Cohere](/docs/guides/providers/cohere) (`cohere`) | ✓ | ✓ |  |  |  |  |  |  |  |  |
 | [ElevenLabs](/docs/guides/providers/elevenlabs) (`elevenlabs`) |  |  |  |  |  | ✓ |  |  |  |  |
 | [Exa](/docs/guides/providers/web-search) (`exa`) |  |  |  |  |  |  |  |  |  | ✓ |
-| [Gemini API](/docs/guides/providers/google) (`gemini`) | ✓ |  |  |  |  |  | ✓ |  |  |  |
-| [Google Vertex AI](/docs/guides/providers/google) (`vertex`) | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |
+| [Gemini API](/docs/guides/providers/google) (`gemini`) | ✓ |  |  |  |  |  | ✓ | ✓ |  |  |
+| [Google Vertex AI](/docs/guides/providers/google) (`vertex`) | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ |  | ✓ |
 | [Jev (TypeSafe)](/docs/guides/providers/jev) (`jev`) |  |  |  |  |  |  |  |  | ✓ |  |
 | [Linkup](/docs/guides/providers/web-search) (`linkup`) |  |  |  |  |  |  |  |  |  | ✓ |
 | [Ollama](/docs/guides/providers/ollama) (`ollama`) | ✓ |  |  |  |  |  | ✓ |  |  |  |
-| [OpenAI](/docs/guides/providers/openai) (`openai`) | ✓ |  |  | ✓ | ✓ | ✓ | ✓ |  | ✓ |  |
+| [OpenAI](/docs/guides/providers/openai) (`openai`) | ✓ |  |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |
 | [OpenRouter](/docs/guides/providers/openrouter) (`openrouter`) | ✓ |  |  |  |  |  | ✓ |  |  |  |
 | [Pioneer](/docs/guides/providers/pioneer) (`pioneer`) |  |  |  |  |  |  |  | ✓ |  |  |
 | [Serper](/docs/guides/providers/web-search) (`serper`) |  |  |  |  |  |  |  |  |  | ✓ |
@@ -131,10 +131,11 @@ to use tools, because text-only callbacks cannot carry tool calls and results.
 
 Pulls entities, relations, and structured records out of text. Configured under
 `extractors` and used by the `extractor` enrichment producer and graph indexes.
-A generator can also act as an extractor through a constrained output schema
-(`"method": "generated"`): OpenAI, Gemini, Vertex AI, Anthropic, and Bedrock
-Claude models qualify, as described on each provider page. The table lists
-only dedicated extraction providers.
+OpenAI, Gemini, Vertex AI, Anthropic, and Bedrock Claude models extract
+directly: set the extractor's `provider` and `model`, and Antfly runs the model
+with a constrained output schema. The generated form (`"method": "generated"`)
+adds instructions, output mode, probabilities, and batching, and works with any
+qualified generator.
 Direct endpoint: `/ai/v1/extract`.
 
 ### Decider
