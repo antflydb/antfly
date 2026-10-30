@@ -11221,3 +11221,129 @@ test "external lake Parquet typed cache payload faults retain dictionary ownersh
     try Scenario.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }
+
+test "external lake Parquet speculative pull phases preserve CPU headroom and drop saturated work" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const scheduling = @import("../../sql/parallel_scheduler.zig");
+    const caching = @import("lake_serving_cache.zig");
+    const Cursor = @import("lake_parquet_cursor.zig").Cursor;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    try appendPlainI64DataPage(&bytes, a, &.{11});
+    const split = bytes.items.len;
+    try appendPlainI64DataPage(&bytes, a, &.{22});
+    var chunks = [_]external_source.ColumnChunk{
+        .{ .column_id = @constCast("a"), .file_offset = 0, .compressed_len = split, .uncompressed_len = split, .physical_type = @constCast("int64"), .encoding = @constCast("plain") },
+        .{ .column_id = @constCast("b"), .file_offset = split, .compressed_len = bytes.items.len - split, .uncompressed_len = bytes.items.len - split, .physical_type = @constCast("int64"), .encoding = @constCast("plain") },
+    };
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 1, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = @constCast("version"), .byte_len = bytes.items.len, .row_count = 1, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const Reader = struct {
+        bytes: []const u8,
+        width: usize,
+        calls: std.atomic.Value(usize) = .init(0),
+        entered: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        fn read(raw: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, offset: u64, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.calls.fetchAdd(1, .acq_rel) + 1 == self.width) self.entered.set(std.testing.io);
+            try self.gate.wait(std.testing.io);
+            return alloc.dupe(u8, self.bytes[@intCast(offset)..][0..len]);
+        }
+        fn cpu(gate: ?*std.Io.Event) anyerror!usize {
+            if (gate) |g| try g.wait(std.testing.io);
+            return 7;
+        }
+    };
+    const Run = struct {
+        reader: *Reader,
+        shared: *caching.Reader,
+        inventory: external_source.Inventory,
+        names: []const []const u8,
+        speculative: bool,
+        fn execute(self: *@This()) !i64 {
+            var budget: @import("../../sql/memory_budget.zig") = .{ .backing = std.heap.page_allocator, .limit = 6 * 1024 * 1024 };
+            defer std.debug.assert(budget.live == 0);
+            var cursor = try Cursor.init(budget.allocator(), .{ .ctx = self.reader, .read_range_alloc = Reader.read }, self.inventory, "data", 0, self.names, .{});
+            defer cursor.deinit();
+            cursor.shared_reader = self.shared;
+            cursor.scheduler = self.shared.scheduler;
+            cursor.speculative = self.speculative;
+            try cursor.prepareEvidence();
+            const batch = (try cursor.next()).?;
+            var result: i64 = 0;
+            for (batch.columns) |column| result += try column.integerAt(0);
+            return result;
+        }
+    };
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var nonce: u8 = 0;
+    const Mode = enum { success, cancel, cpu_full, io_full };
+    for (1..3) |width| for ([_]Mode{ .success, .cancel, .cpu_full, .io_full }) |mode| {
+        var scheduler: scheduling.Scheduler = .{ .max_workers = 1, .max_io_workers = if (mode == .io_full) 0 else 2 };
+        var cache = caching.Cache.init(a);
+        defer cache.deinit();
+        var shared: caching.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(memory.client()), .scope = @splat(nonce), .context = .{ .io = io }, .scheduler = &scheduler };
+        defer shared.drain(true);
+        nonce += 1;
+        var reader: Reader = .{ .bytes = bytes.items, .width = width };
+        var cpu_gate: std.Io.Event = .unset;
+        var busy: ?scheduling.Task(anyerror!usize) = if (mode == .cpu_full) scheduler.submit(io, 1, Reader.cpu, .{@as(?*std.Io.Event, &cpu_gate)}) else null;
+        defer if (busy) |*task| {
+            _ = task.cancel(io) catch {};
+        };
+        const names = [_][]const u8{ "a", "b" };
+        var run: Run = .{ .reader = &reader, .shared = &shared, .inventory = inventory, .names = names[0..width], .speculative = true };
+        var task = scheduler.submitPullTransient(io, 6 * 1024 * 1024, Run.execute, .{&run}).?;
+        defer if (task.future != null) {
+            _ = task.cancel(io) catch {};
+        };
+        if (mode == .io_full) {
+            try std.testing.expectError(error.ConcurrencyUnavailable, task.await(io));
+            try std.testing.expectEqual(@as(usize, 0), reader.calls.load(.acquire));
+        } else {
+            try reader.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } });
+            while (!scheduler.mutex.tryLock()) std.atomic.spinLoopHint();
+            const cpus = scheduler.workers - scheduler.io_workers;
+            const ios = scheduler.io_workers;
+            const pulls = scheduler.pull_workers;
+            scheduler.mutex.unlock();
+            try std.testing.expectEqual(@as(usize, @intFromBool(mode == .cpu_full)), cpus);
+            try std.testing.expectEqual(width, ios);
+            try std.testing.expectEqual(@as(usize, 1), pulls);
+            if (mode == .success) {
+                var unrelated = scheduler.submit(io, 1, Reader.cpu, .{@as(?*std.Io.Event, null)}).?;
+                try std.testing.expectEqual(@as(usize, 7), try unrelated.await(io));
+            }
+            if (mode == .cancel) {
+                try std.testing.expectError(error.Canceled, task.cancel(io));
+            } else {
+                reader.gate.set(io);
+                if (mode == .cpu_full) {
+                    try std.testing.expectError(error.ConcurrencyUnavailable, task.await(io));
+                    try std.testing.expectEqual(@as(usize, 0), cache.decoded.entries.count());
+                } else try std.testing.expectEqual(@as(i64, if (width == 1) 11 else 33), try task.await(io));
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), scheduler.pull_workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+        if (mode == .cpu_full or mode == .io_full) {
+            // Optional admission failure never rejects the authoritative pull.
+            reader.gate.set(io);
+            run.speculative = false;
+            try std.testing.expectEqual(@as(i64, if (width == 1) 11 else 33), try run.execute());
+        }
+        if (busy) |*held| {
+            cpu_gate.set(io);
+            try std.testing.expectEqual(@as(usize, 7), try held.await(io));
+            busy = null;
+        }
+        try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    };
+}

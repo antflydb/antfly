@@ -179,11 +179,22 @@ pub fn inspectColumnChunkResourceUsage(column_chunk_bytes: []const u8) !ColumnCh
     return usage;
 }
 
+/// Uncompressed bytes borrow the encoded input for this decoding scope.
+/// Only decompressed storage is owned. Final vectors/dictionaries must own
+/// their values independently before the caller releases its encoded lease.
 pub const PagePayload = struct {
-    bytes: []u8,
+    bytes: []const u8,
+    owned: bool = true,
+
+    /// Transfer decompressed storage or copy a borrowed input into a retained
+    /// page owner. Synchronous vector decoding does not need this promotion.
+    pub fn intoOwned(self: PagePayload, alloc: Allocator) !PagePayload {
+        if (self.owned) return self;
+        return .{ .bytes = try alloc.dupe(u8, self.bytes) };
+    }
 
     pub fn deinit(self: PagePayload, alloc: Allocator) void {
-        alloc.free(self.bytes);
+        if (self.owned) alloc.free(self.bytes);
     }
 };
 
@@ -3271,7 +3282,7 @@ pub fn decodePagePayloadAlloc(
         (header.page_type != .data_page_v2 or header.data_is_compressed);
     if (!values_are_compressed) {
         if (compressed_payload.len != expected_len) return error.InvalidParquetPage;
-        return .{ .bytes = try alloc.dupe(u8, compressed_payload) };
+        return .{ .bytes = compressed_payload, .owned = false };
     }
 
     const decoded_values = try decodeCompressedExactAlloc(
@@ -5064,8 +5075,8 @@ test "parquet compact strings use page buffers preserve null prefixes and unwind
     try std.testing.expectError(error.InvalidParquetPage, packedBytePage(a, header, invalid, true));
 }
 
-// This budget admits the encoded payload and exactly one final i64 vector.
-// A chunk aggregation copy would exceed it, even for one physical page.
+// The encoded lease is already admitted separately. Decoding needs only its
+// final vector: neither a payload copy nor a chunk aggregation buffer can fit.
 test "parquet single page transfers final typed vector within exact live budget" {
     const a = std.testing.allocator;
     const count = 8192;
@@ -5076,11 +5087,42 @@ test "parquet single page transfers final typed vector within exact live budget"
     defer header.deinit(a);
     const chunk = try std.mem.concat(a, u8, &.{ header.items, payload });
     defer a.free(chunk);
-    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = payload.len * 2 };
+    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = payload.len };
     const values = try scanPlainI64ColumnChunkAlloc(budget.allocator(), chunk, .uncompressed);
     defer budget.allocator().free(values);
     for (values, 0..) |value, i| try std.testing.expectEqual(-@as(i64, @intCast(i)), value);
     try std.testing.expectEqual(payload.len, budget.live);
-    try std.testing.expectEqual(payload.len * 2, budget.peak);
+    try std.testing.expectEqual(payload.len, budget.peak);
     std.debug.print("SINGLE_PAGE_VECTOR rows={} retained={} peak={}\n", .{ count, budget.live, budget.peak });
+}
+
+test "external lake Parquet payload borrows uncompressed leases and owns decompression" {
+    const a = std.testing.allocator;
+    var input = [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 };
+    var header: Header = .{ .page_type = .data_page, .value_count = 1, .encoding = .plain, .compressed_page_size = 8, .uncompressed_page_size = 8 };
+    var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const raw = try decodePagePayloadAlloc(failure.allocator(), header, .uncompressed, &input);
+    try std.testing.expect(!raw.owned);
+    try std.testing.expectEqual(@intFromPtr(&input), @intFromPtr(raw.bytes.ptr));
+    raw.deinit(failure.allocator());
+    // The physical codec may be Snappy while a V2 page stores its data plain.
+    header.page_type = .data_page_v2;
+    header.data_is_compressed = false;
+    const plain_v2 = try decodePagePayloadAlloc(failure.allocator(), header, .snappy, &input);
+    try std.testing.expect(!plain_v2.owned);
+    plain_v2.deinit(failure.allocator());
+    header.page_type = .data_page;
+    header.data_is_compressed = true;
+    const compressed = try snappy.encode(a, &input);
+    defer a.free(compressed);
+    header.compressed_page_size = @intCast(compressed.len);
+    const decoded = try decodePagePayloadAlloc(a, header, .snappy, compressed);
+    defer decoded.deinit(a);
+    try std.testing.expect(decoded.owned);
+    try std.testing.expectEqualSlices(u8, &input, decoded.bytes);
+    // Final values have independent ownership before an encoded lease expires.
+    const values = try decodePlainI64Alloc(a, header, raw.bytes);
+    defer a.free(values);
+    @memset(&input, 255);
+    try std.testing.expectEqual(@as(i64, 7), values[0]);
 }

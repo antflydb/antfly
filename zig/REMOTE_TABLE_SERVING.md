@@ -2432,3 +2432,40 @@ Encoded page occupancy, identity, ordering, reader protocol and all wire formats
 are unchanged. A dense internal-page fixture built by the production builder
 exercises a single-key mutation with a 4-MiB allocator, and allocation-failure
 checks cover shared seed creation, reuse and teardown.
+
+
+### Parked lookahead and borrowed physical payloads
+
+Row-group lookahead uses a bounded pull coordinator. While a provider read is
+pending it holds its retained-state reservation, but no runnable CPU slot.
+Optional coordinators can consume at most half the shared pull descriptors and
+retained-byte allowance, leaving capacity for required query operators.
+Bloom probes, page-directory discovery, headers and encoded payloads run as
+separately admitted I/O phases. A decode requests CPU admission only after its
+encoded lease is ready, and leaves the established I/O byte headroom available.
+Sibling phases drain before a pending decode retries admission. When no live
+phase can make progress under pressure, optional warming stops; it never runs
+unadmitted fetches or decodes on a caller lane. Required query advancement keeps
+its existing bounded caller fallback. Cancellation joins every phase before
+releasing input leases, cursor state or query metadata.
+
+An uncompressed physical page, including a V2 page whose values are explicitly
+uncompressed, borrows its fetched encoded payload during synchronous decoding.
+Decompressed payloads still own their allocation. Final typed vectors and
+cached dictionaries own their values independently of the input lease.
+Deferred projection framing explicitly promotes borrowed payloads to owned
+storage before returning to the caller, since selected-value evaluation can
+outlive the fetch. This removes a payload-sized copy from complete decoding
+without introducing a cache or result lifetime dependency on a remote read.
+Runtime ABI **76** fences the in-memory payload, cursor and scheduler layout
+changes. Reader protocol **97**, stored recipes and all persisted formats remain
+unchanged.
+
+Native qualification blocks one- and two-column speculative reads and checks
+zero CPU occupancy while I/O is parked, unrelated CPU progress, cancellation,
+CPU/I/O saturation, required-query fallback and complete reservation release.
+Ownership checks overwrite encoded input before deferred nullable string and
+numeric evaluation, and cover allocation failures. A single 8192-row PLAIN i64
+page now needs only its 64-KiB final vector in the decoder allocator; a borrowed
+payload consumes no allocation there. Compressed codecs and retained projection
+payloads keep their existing ownership costs.
