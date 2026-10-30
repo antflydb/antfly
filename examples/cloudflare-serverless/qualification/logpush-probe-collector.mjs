@@ -14,6 +14,7 @@
 // limitations under the License.
 
 // Diagnostic only. Source identities and delivery completeness are not assumed.
+import{persistCanonicalRows}from'./canonical-windows.mjs';
 import{resourceFailureCode}from'../performance.mjs';
 import{sanitizeTailEvent}from'./metrics-tail.mjs';
 import{sanitizeOtel}from'./otel-evidence.mjs';
@@ -69,8 +70,9 @@ export default {async fetch(request,env){
    if(path!=='/ingest'){
     const signal=path==='/v1/traces'?'traces':'logs';let envelopes;try{envelopes=[JSON.parse(text)];}catch{try{envelopes=lines.map(line=>JSON.parse(line));}catch{fail('TelemetryJsonInvalid');}}
     if(envelopes.length>1000)fail('TelemetryRecordBudgetExceeded');const rows=[];for(const envelope of envelopes){rows.push(...await sanitizeOtel(envelope,env.SOURCE_WORKER,signal));if(rows.length>1000)fail('TelemetryRecordBudgetExceeded');}
-    const digest=await hash(bytes),value=JSON.stringify({schema:1,qualification:false,signal,collector_version:env.WORKER_VERSION?.id??null,received_at:Date.now(),raw_batch_sha256:digest,rows});if(encoder.encode(value).byteLength>4*1024*1024)fail('TelemetrySanitizedBudgetExceeded');if(rows.length)await env.LOGS.put(prefix+'batches/'+signal+'-'+digest+'.json',value,{onlyIf:{etagDoesNotMatch:'*'},httpMetadata:{contentType:'application/json'}});return Response.json({});
+    const digest=await hash(bytes),value=JSON.stringify({schema:1,qualification:false,signal,collector_version:env.WORKER_VERSION?.id??null,received_at:Date.now(),raw_batch_sha256:digest,rows});if(encoder.encode(value).byteLength>4*1024*1024)fail('TelemetrySanitizedBudgetExceeded');if(rows.length){if(env.WINDOWED_EVIDENCE==='true')await persistCanonicalRows(env,JSON.parse(value));else await env.LOGS.put(prefix+'batches/'+signal+'-'+digest+'.json',value,{onlyIf:{etagDoesNotMatch:'*'},httpMetadata:{contentType:'application/json'}});}return Response.json({});
    }
+   if(env.WINDOWED_EVIDENCE==='true')fail('TelemetryCanonicalOtelRequired');
    if(lines.length>1000)fail('TelemetryRecordBudgetExceeded');
    const rows=[];for(const line of lines){if(encoder.encode(line).byteLength>256*1024)fail('TelemetryRecordBudgetExceeded');let row;try{row=JSON.parse(line);}catch{fail('TelemetryJsonInvalid');}rejectionShape={json_type:row===null?'null':Array.isArray(row)?'array':typeof row,content:row?.content==='tests'?'tests':row?.content==='test'?'test':row&&Object.hasOwn(row,'content')?'other':'absent',has_script_name:typeof row?.ScriptName==='string',keys:row&&typeof row==='object'?Object.keys(row).filter(key=>['content','test','filename','ScriptName','Event','Logs'].includes(key)):[],key_count:row&&typeof row==='object'?Object.keys(row).length:0};rows.push(await sanitizeLogpushProbe(row,env.SOURCE_WORKER));}
    const digest=await hash(bytes),value=JSON.stringify({schema:1,qualification:false,received_at:Date.now(),raw_batch_sha256:digest,rows});if(encoder.encode(value).byteLength>4*1024*1024)fail('TelemetrySanitizedBudgetExceeded');

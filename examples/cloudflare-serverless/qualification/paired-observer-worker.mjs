@@ -15,4 +15,4 @@
 
 import{resourceFailureCode}from'../performance.mjs';
 import{fetchObserver,persistObserverTail}from'./paired-observer.mjs';
-export default{fetch:fetchObserver,tail(events,env,ctx){ctx.waitUntil(persistObserverTail(events,env).catch(async(error)=>{await env.LOGS.put('observer-v1/rejections/'+crypto.randomUUID()+'.json',JSON.stringify({at:Date.now(),error:'ObserverTailFailed',cause:/^(?:Counter|Observer)[A-Za-z]+$/.test(error?.message??'')?error.message:resourceFailureCode(error)??'ObserverStorageFailed'}));throw Error('ObserverTailFailed');}));}};
+export default{fetch:fetchObserver,tail(events,env,ctx){ctx.waitUntil(persistObserverTail(events,env).catch(async(error)=>{await env.LOGS.put('observer-v1/rejections/'+crypto.randomUUID()+'.json',JSON.stringify({at:Date.now(),error:'ObserverTailFailed',cause:/^(?:Counter|Observer|Telemetry)[A-Za-z]+$/.test(error?.message??'')?error.message:resourceFailureCode(error)??'ObserverStorageFailed'}));throw Error('ObserverTailFailed');}));}};

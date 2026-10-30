@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import{minuteOf,windowPrefix}from'./canonical-windows.mjs';
 import{DiagnosticCoverage}from'./live-diagnostics.mjs';
 const uuid=v=>typeof v==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(v);
 const sha=v=>typeof v==='string'&&/^[a-f0-9]{64}$/.test(v);
@@ -26,9 +27,11 @@ export function reconcileTailCounter(objects,roots,{source,version,counterVersio
  const prefix='probe-v1/'+captureId+'/counter/',seen=new Set(),records=[],all=[];
  for(const object of objects){
   const d=object.value;if(d?.source!=='provider-tail-dispatch')continue;
-  if(d.schema!==1||d.qualification!==false||d.producer!==source||!uuid(d.delivery_id)||object.key!==prefix+d.delivery_id+'.json'||seen.has(d.delivery_id)||!Array.isArray(d.records)||d.records.length>1000||d.count!==d.records.length||!Number.isSafeInteger(d.received_at)||d.received_at>settledAt){failures.push('TailCounterDeliveryInvalid');continue;}seen.add(d.delivery_id);
+  const windowed=d.schema===2&&d.evidence_layout==='window-v1'&&Number.isSafeInteger(d.minute)&&d.minute>=0&&d.minute%60000===0&&uuid(d.dispatch_id)&&sha(d.archive_sha256);
+  const validKey=windowed?object.key===windowPrefix(captureId,d.minute)+'counter/'+d.delivery_id+'.json':d.schema===1&&object.key===prefix+d.delivery_id+'.json';
+  if(!validKey||d.qualification!==false||d.producer!==source||!uuid(d.delivery_id)||seen.has(d.delivery_id)||!Array.isArray(d.records)||d.records.length>1000||d.count!==d.records.length||!Number.isSafeInteger(d.received_at)||d.received_at>settledAt){failures.push('TailCounterDeliveryInvalid');continue;}seen.add(d.delivery_id);
   for(const r of d.records){
-   if(r.script!==source||!Number.isSafeInteger(r.timestamp)||r.timestamp<0){failures.push('TailCounterRecordInvalid');continue;}
+   if(r.script!==source||!Number.isSafeInteger(r.timestamp)||r.timestamp<0||windowed&&minuteOf(r.timestamp)!==d.minute){failures.push('TailCounterRecordInvalid');continue;}
    const selected=r.timestamp>=timeframe.from&&r.timestamp<=timeframe.to;
    if(selected||sha(r.attempt_id_sha256)){
     if(!versions.includes(r.version_id)||d.collector_version!==counterVersion)failures.push('TailCounterVersionMismatch');
@@ -38,7 +41,7 @@ export function reconcileTailCounter(objects,roots,{source,version,counterVersio
   }
  }
  const ids=new Map(),canonical=[];
- for(const root of roots){if(root.script!==source||root.start<timeframe.from||root.start>timeframe.to||!root.terminal)continue;if(!versions.includes(root.version_id)||!sha(root.invocation_id_sha256))failures.push('TailCounterCanonicalIdentityInvalid');else{const old=ids.get(root.invocation_id_sha256);if(old){if(['script','version_id','start','end','handler','outcome'].some(k=>old[k]!==root[k])||JSON.stringify(old.event)!==JSON.stringify(root.event))failures.push('TailCounterCanonicalIdentityInvalid');}else{ids.set(root.invocation_id_sha256,root);canonical.push(root);}}}
+ for(const root of roots){if(root.script!==source||root.start<timeframe.from||root.start>timeframe.to||!root.terminal)continue;if(!versions.includes(root.version_id)||!sha(root.invocation_id_sha256))failures.push('TailCounterCanonicalIdentityInvalid');else{const old=ids.get(root.invocation_id_sha256);if(old){if(['script','version_id','start','end','handler','outcome'].some(k=>old[k]!==root[k])||JSON.stringify(old.event)!==JSON.stringify(root.event)||old.source_row_sha256!==root.source_row_sha256)failures.push('TailCounterCanonicalIdentityInvalid');}else{ids.set(root.invocation_id_sha256,root);canonical.push(root);}}}
  if(canonical.length!==records.length)failures.push('TailCounterPopulationMismatch');
  const frequencies=rows=>{const m=new Map();for(const value of rows)m.set(value,(m.get(value)??0)+1);return JSON.stringify([...m].sort((a,b)=>a[0]-b[0]));};
  if(frequencies(canonical.map(r=>r.start))!==frequencies(records.map(r=>r.timestamp)))failures.push('TailCounterTimestampPopulationMismatch');
@@ -59,6 +62,8 @@ export async function reconcileTailCounterSnapshots(first,second,scope){
  const failures=[],prefix='probe-v1/'+scope?.captureId+'/',window=scope?.timeframe;
  const valid=s=>s?.qualification===false&&s.capture_id===scope?.captureId&&uuid(s.collector_version)&&Number.isSafeInteger(s.snapshot_started_at)&&Number.isSafeInteger(s.snapshot_finished_at)&&s.snapshot_finished_at>=s.snapshot_started_at&&Array.isArray(s.objects)&&s.objects.length<=20000&&s.objects.every(o=>typeof o?.key==='string'&&o.key.startsWith(prefix)&&(o.value?.source!=='provider-tail-dispatch'||Array.isArray(o.value.records)&&o.value.records.length<=1000&&o.value.records.every(r=>r&&typeof r==='object'))&&(o.value?.rows==null||Array.isArray(o.value.rows)&&o.value.rows.length<=1000&&o.value.rows.every(r=>r&&typeof r==='object')))&&new Set(s.objects.map(o=>o.key)).size===s.objects.length;
  if(!valid(first)||!valid(second)||!window||first.snapshot_started_at<window.to+60000||second.snapshot_started_at<first.snapshot_finished_at+30000)return{qualification:false,complete:false,failures:['TailCounterSettlementInvalid']};
+ const windowed=first.evidence_layout==='window-v1'||second.evidence_layout==='window-v1';
+ if(windowed){for(const s of[first,second]){if(s.evidence_layout!=='window-v1')failures.push('TailCounterLayoutInvalid');for(const o of s.objects){if(o.value?.rejection)failures.push('TailCounterIngestionRejected');if(o.value?.rows){const d=o.value;if(d.schema!==2||d.evidence_layout!=='window-v1'||!Number.isSafeInteger(d.minute)||d.minute<0||d.minute%60000!==0||!o.key.startsWith(windowPrefix(scope.captureId,d.minute)+'batches/')||!sha(d.archive_sha256)||d.rows.some(r=>!Number.isSafeInteger(r.start)||r.start<d.minute||r.start>=d.minute+60000||!sha(r.source_row_sha256)))failures.push('TailCounterLayoutInvalid');}if(o.value?.source==='provider-tail-dispatch'&&o.value.schema!==2)failures.push('TailCounterLayoutInvalid');}}}
  const selected=s=>s.objects.flatMap(o=>o.value?.source==='provider-tail-dispatch'?o.value.records.filter(r=>r.timestamp>=window.from&&r.timestamp<=window.to||scope.witnesses&&[scope.witnesses.before,scope.witnesses.after].includes(r.attempt_id_sha256)).map(r=>JSON.stringify({key:o.key,producer:o.value.producer,collector_version:o.value.collector_version,record:r})):o.value?.rows?.filter(r=>r.script===scope.source&&r.start>=window.from&&r.start<=window.to).map(r=>JSON.stringify(r))??[]).sort();
  const digest=async v=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify(v)))),b=>b.toString(16).padStart(2,'0')).join('');
  const hashes=[];for(const s of[first,second]){const roots=s.objects.flatMap(o=>(o.value?.rows??[]).filter(r=>r.terminal&&r.script===scope.source&&r.start>=window.from&&r.start<=window.to)),proof=reconcileTailCounter(s.objects,roots,{...scope,settledAt:s.snapshot_finished_at});failures.push(...proof.failures);hashes.push(await digest(selected(s)));}

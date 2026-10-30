@@ -271,3 +271,21 @@ compiled native binary and summary are independently sealed as four artifacts
 (7,383,987 bytes) at
 `dist/qualification/compact-serving-scale-1793349006920/evidence.json`, SHA-256
 `8ab6559cb29a3f57c10e18a173ba63f6cf32686a0d7dcd095af130848e3fde5a`.
+
+The next diagnostic implementation is described in
+[bounded, windowed serverless diagnostic evidence](serverless-windowed-diagnostic-evidence.md).
+It adds opt-in immutable minute partitions, a separate sanitized verbose archive,
+file-backed window catalogs and strict independent-counter reconciliation. The
+hosted gate remains pending a new paired provider run; historical failed
+captures are preserved.
+
+The new opt-in packed/deferred 50,000-record native regression passes as well.
+It retains and verifies 25,000 exact payloads, replays the original receipt, and
+checks the newer indexed point record after two collection cycles. The large
+128-record, 1 KiB seed batches use materialized trees; the small concurrent
+newer record exercises the eligible deferred tail. Both format flags remain
+explicitly enabled. Results: 843 first-cycle steps, 397 second-cycle steps,
+5,589 sweep deletions, 7,281 cleanup deletions, peak 116 operations per step,
+and 1,963 objects after final cleanup. The native runner reports one pass,
+zero failures and zero allocator leaks. This is a deterministic in-memory
+object-provider correctness test, not a throughput or hosted latency result.

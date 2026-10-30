@@ -1139,6 +1139,12 @@ test "serverless multiprovider native collection scale preserves a retained tail
     try fixture.init();
     defer fixture.deinit();
     fixture.wal.document_index_enabled = true;
+    const use_packed = if (std.c.getenv("ANTFLY_NATIVE_GC_PACKED")) |value|
+        std.mem.eql(u8, std.mem.span(value), "1")
+    else
+        false;
+    fixture.wal.packed_pages_enabled = use_packed;
+    fixture.wal.deferred_indexes_enabled = use_packed;
     const body: [1024]u8 = @splat('x');
     const rows = 50_000;
     var first: ?[]const []const u8 = null;
@@ -1268,7 +1274,7 @@ test "serverless multiprovider native collection scale preserves a retained tail
     };
     try std.testing.expect(point.indexed and point.record != null);
     try std.testing.expectEqual(@as(u64, 50_001), point.record.?.lsn);
-    std.debug.print("native GC scale: rows=50000 retained=25000 cycles=2 steps={d} second_steps={d} marked={d} deleted={d} cleanup_deleted={d} peak_operations={d} before_objects={d} job_end_objects={d} after_cleanup_first={d} after_objects={d}\n", .{ steps, second_steps, marked, deleted, cleanup_deleted, peak_operations, before_objects, job_end_objects, after_cleanup_first, after_objects });
+    std.debug.print("native GC scale: packed={} deferred={} rows=50000 retained=25000 cycles=2 steps={d} second_steps={d} marked={d} deleted={d} cleanup_deleted={d} peak_operations={d} before_objects={d} job_end_objects={d} after_cleanup_first={d} after_objects={d}\n", .{ use_packed, use_packed, steps, second_steps, marked, deleted, cleanup_deleted, peak_operations, before_objects, job_end_objects, after_cleanup_first, after_objects });
 }
 
 test "serverless multiprovider grouped frontier commit recovers all marks after a lost acknowledgement" {
