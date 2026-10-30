@@ -229,7 +229,7 @@ def seed(library: str, database: Path, count: int, no_sync: bool) -> None:
         )
 
 
-def native_worker(config, index, ready, start, results):
+def native_worker(config, index, ready, start, results, finish=None):
     announced = False
     try:
         af = sdk(config["library"])
@@ -262,9 +262,16 @@ def native_worker(config, index, ready, start, results):
                     busy.append(time.perf_counter_ns() - began_call)
                 sequence += 1
             ended = time.monotonic()
+            # Diagnostics can acquire admission and run proofs. Wait until every
+            # timed call has finished before allowing these reads.
+            if finish is not None:
+                finish.wait()
             usage = usage_delta(before, resource.getrusage(resource.RUSAGE_SELF))
             final_stats = measurement_stats(db)
             proof_observed_until = time.monotonic()
+            # Keep peer close/publication work out of all final snapshots.
+            if finish is not None:
+                finish.wait()
             proofs = {
                 field: final_stats[field] - initial_stats[field]
                 for field in PROOF_FIELDS
@@ -307,6 +314,8 @@ def native_worker(config, index, ready, start, results):
         # result so a close failure cannot follow an already accepted success.
         results.put(result)
     except BaseException:
+        if finish is not None:
+            finish.abort()
         failure = {
             "index": index,
             "status": "error",
@@ -476,6 +485,7 @@ def native_cases(args):
             seed_stats = json.loads(seeded.stdout)
             ready, results = context.Queue(), context.Queue()
             start = context.Event()
+            finish = context.Barrier(concurrency, timeout=args.watchdog)
             config = {
                 "library": library,
                 "database": str(database),
@@ -487,7 +497,8 @@ def native_cases(args):
             }
             processes = [
                 context.Process(
-                    target=native_worker, args=(config, i, ready, start, results)
+                    target=native_worker,
+                    args=(config, i, ready, start, results, finish),
                 )
                 for i in range(concurrency)
             ]
@@ -549,6 +560,7 @@ def native_cases(args):
                 )
             finally:
                 start.set()
+                finish.abort()
                 for process in processes:
                     if process.is_alive():
                         process.terminate()

@@ -108,6 +108,17 @@ class ContentionReportTests(unittest.TestCase):
                 self.payload = payload
 
         database = Database()
+        phases = []
+        finish = SimpleNamespace(
+            wait=lambda: phases.append("barrier"), abort=lambda: phases.append("abort")
+        )
+        original_close = database.__class__.__exit__
+
+        def close(db, *args):
+            phases.append("close")
+            return original_close(db, *args)
+
+        database.__class__.__exit__ = close
         api = SimpleNamespace(open=lambda *a, **k: database, BusyError=RuntimeError)
         ready, results = queue.Queue(), queue.Queue()
         zero = dict.fromkeys(bench.PROOF_FIELDS, 0)
@@ -137,13 +148,23 @@ class ContentionReportTests(unittest.TestCase):
         )
         with (
             patch.object(bench, "sdk", return_value=api),
-            patch.object(bench, "measurement_stats", side_effect=[zero, final]),
+            patch.object(
+                bench,
+                "measurement_stats",
+                side_effect=lambda _: (
+                    phases.append("snapshot")
+                    or (zero if phases.count("snapshot") == 1 else final)
+                ),
+            ),
             patch.object(bench.time, "monotonic", side_effect=[0, 1, 1.1, 2.1, 2.2, 3]),
             patch.object(bench.time, "perf_counter_ns", side_effect=[100, 150]),
         ):
             bench.native_worker(
-                config, 4, ready, SimpleNamespace(wait=lambda _: True), results
+                config, 4, ready, SimpleNamespace(wait=lambda _: True), results, finish
             )
+        self.assertEqual(
+            phases, ["snapshot", "barrier", "snapshot", "barrier", "close"]
+        )
         result = results.get_nowait()
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["success_latency_ns"], [50])
