@@ -3487,6 +3487,20 @@ const AdmissionFollowupProbe = struct {
     }
 };
 
+test "capi native allocator proof live commits carry a checked peer certificate" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("live-proof-certificate", 1000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    // Keep the writer open: a competing process must not need a quiet whole-
+    // graph walk merely because this checked writer is still serving traffic.
+    var peer = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), fixture.connection.owner.path, .{ .read_only = true, .internal_reader = true });
+    defer peer.close();
+    try std.testing.expect(try peer.inheritAllocatorCertificate());
+    try std.testing.expect(peer.free_pages_verified);
+    try std.testing.expect((try peer.check()).valid);
+}
+
 test "capi native allocator proof maintenance yields before refreshing an active proof" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("proof-maintenance-yield", 1000, .batch);
