@@ -23,7 +23,8 @@
 //!   {{#flag}}..{{/flag}}  kept when the bool field `flag` is true
 //!   {{^flag}}..{{/flag}}  kept when it is false
 //!
-//! Sections nest. A missing field is a compile error.
+//! Sections nest. A missing field is a compile error. Kernel text never
+//! contains `{{`, but may put `{` right before a tag.
 
 const std = @import("std");
 
@@ -32,7 +33,7 @@ pub fn render(comptime tmpl: []const u8, comptime ctx: anytype) []const u8 {
         @setEvalBranchQuota(200_000_000);
         var out: []const u8 = "";
         var i: usize = 0;
-        while (std.mem.indexOfPos(u8, tmpl, i, "{{")) |open| {
+        while (nextTag(tmpl, i)) |open| {
             out = out ++ tmpl[i..open];
             const close = std.mem.indexOfPos(u8, tmpl, open, "}}") orelse @compileError("unclosed {{ in template");
             const tag = tmpl[open + 2 .. close];
@@ -61,11 +62,19 @@ fn flag(comptime ctx: anytype, comptime name: []const u8) bool {
     return @field(ctx, name);
 }
 
+/// Start of the next tag at or after `from`. In `{{{` the first brace is
+/// kernel text.
+fn nextTag(comptime tmpl: []const u8, comptime from: usize) ?usize {
+    var open = std.mem.indexOfPos(u8, tmpl, from, "{{") orelse return null;
+    while (open + 2 < tmpl.len and tmpl[open + 2] == '{') open += 1;
+    return open;
+}
+
 /// Index of the `{{/name}}` closing the section opened just before `from`.
 fn sectionEnd(comptime tmpl: []const u8, comptime from: usize, comptime name: []const u8) usize {
     var depth: usize = 0;
     var i = from;
-    while (std.mem.indexOfPos(u8, tmpl, i, "{{")) |open| {
+    while (nextTag(tmpl, i)) |open| {
         const close = std.mem.indexOfPos(u8, tmpl, open, "}}").?;
         const tag = tmpl[open + 2 .. close];
         i = close + 2;

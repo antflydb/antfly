@@ -2299,6 +2299,7 @@ extern "C" __global__ void termite_attention_f32(
     dst[idx] = denom > 0.0f ? acc / denom : 0.0f;
 }
 
+// tile-codegen:begin attention.block family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_attention_f32_block(
     float* dst,
     const float* q,
@@ -2383,6 +2384,7 @@ extern "C" __global__ void termite_attention_f32_block(
         dst[out_idx] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
     }
 }
+// tile-codegen:end attention.block family
 
 // Qwen3-VL vision attention for graph-layout [B, S, H, 64] tensors.  The
 // generic scalar fallback assigns one thread to every output channel and
@@ -2682,6 +2684,7 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64(
     }
 }
 
+// tile-codegen:begin attention.bert_prefill family (do not edit; run: zig build tile-kernel-codegen -- --write)
 // Eight-query tile of the same S=256, D=64 BERT attention.  Each warp owns a
 // query row, which removes the cross-warp hand-offs in the single-query
 // schedule and gives BERT's medium-batch prefill enough independent work to
@@ -2926,6 +2929,7 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q16(
     dst[q_base + lane] = acc0 / denom;
     dst[q_base + lane + 32u] = acc1 / denom;
 }
+// tile-codegen:end attention.bert_prefill family
 
 // Opt-in WMMA candidate for full BERT/XLM-R prefill attention. A block owns
 // 16 query rows for one [batch, head] pair and streams all 256 keys in four
@@ -4040,6 +4044,7 @@ __device__ __forceinline__ float termite_block_reduce_sum_f32(float value, float
     return value;
 }
 
+// tile-codegen:begin attention.gqa_fast family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_decode_scalars_fast_f32(
     float* dst,
     const float* q,
@@ -4246,7 +4251,8 @@ extern "C" __global__ void termite_gqa_attention_prefill_fast_f32(
         dst[out_idx] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
     }
 }
-
+// tile-codegen:end attention.gqa_fast family
+// tile-codegen:begin attention.gqa_decode family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_decode_f32(
     float* dst,
     const float* q,
@@ -4476,6 +4482,7 @@ extern "C" __global__ void termite_gqa_attention_decode_scalars_f32(
         dst[out_idx] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
     }
 }
+// tile-codegen:end attention.gqa_decode family
 
 // quant-kernel-codegen:begin generated CUDA attention kernels (do not edit; run: zig build quant-kernel-codegen -- --write)
 // Opt-in generated attention candidate from graph/quant_kernel_compiler.zig.
@@ -14437,6 +14444,7 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_f32_tile8_e4b(
     }
 }
 
+// tile-codegen:begin attention.qkv_tiled family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_f32_qkv_nobias_tiled(
     float* dst_q,
     float* dst_k,
@@ -14550,6 +14558,7 @@ extern "C" __global__ void termite_linear_bf16_weight_f32_qkv_nobias_tiled(
     }
     if (tid == 0u) dst[local] = partial[0];
 }
+// tile-codegen:end attention.qkv_tiled family
 
 extern "C" __global__ void termite_linear_q8_0_qkv_nobias_f32_tile4(
     float* dst_q,
@@ -18804,6 +18813,7 @@ extern "C" __global__ void antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1(
 #include "../kernels/gliner25_attention.cuh"
 
 // Laya inference kernels. Keep outside compiler-owned generated regions.
+// tile-codegen:begin attention.block_laya family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_laya_local_attention_f32(
     float* dst,
     const float* q,
@@ -18885,6 +18895,7 @@ extern "C" __global__ void termite_laya_local_attention_f32(
         dst[out_idx] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
     }
 }
+// tile-codegen:end attention.block_laya family
 
 // Laya action features use uncalibrated, padded-option-masked logits.
 // One block owns each question; only thread zero reduces the at-most-20 options.
@@ -18921,6 +18932,7 @@ extern "C" __global__ void termite_laya_action_features_f32(
     dst[row * (dim + 4u) + dim + 3u] = (float)valid / 255.0f;
 }
 
+// tile-codegen:begin attention.warp family (do not edit; run: zig build tile-kernel-codegen -- --write)
 // Four warps score independent keys. No block barrier inside the key loop.
 // All reductions and activations remain FP32; no tensor-core narrowing.
 extern "C" __global__ void termite_laya_attention_warp_f32(
@@ -18986,47 +18998,6 @@ extern "C" __global__ void termite_laya_attention_warp_f32(
     }
 }
 
-extern "C" __global__ void termite_laya_packed_geglu_f32(
-    float* dst, const float* src, unsigned int rows, unsigned int width
-) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * width) return;
-    unsigned int row = i / width, col = i % width;
-    float x = src[(size_t)row * 2u * width + col];
-    float gelu = isfinite(x) ? 0.5f * x * (1.0f + erff(x * 0.7071067811865476f)) : 0.0f;
-    dst[i] = gelu * src[(size_t)row * 2u * width + width + col];
-}
-
-// Full-head split-half RoPE for the GLiNER ModernBERT encoder. One thread
-// rotates a pair in both Q and K and copies V from the packed projection,
-// avoiding three slices and repeated trigonometry in separate RoPE launches.
-extern "C" __global__ void termite_gliner_qkv_rope_f32(
-    float* q, float* k, float* v, const float* packed,
-    unsigned int batch, unsigned int sequence, unsigned int heads,
-    unsigned int dimension, float theta
-) {
-    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned int half = dimension / 2u;
-    const unsigned int count = batch * sequence * heads * half;
-    if (index >= count) return;
-    const unsigned int chunk = index / half, d = index % half;
-    const unsigned int row = chunk / heads, head = chunk % heads;
-    const unsigned int hidden = heads * dimension;
-    const unsigned int source = row * 3u * hidden + head * dimension + d;
-    const unsigned int dest = chunk * dimension + d;
-    const float frequency = 1.0f / powf(theta, (2.0f * (float)d) / (float)dimension);
-    const float angle = (float)(row % sequence) * frequency;
-    const float s = sinf(angle), c = cosf(angle);
-    const float q0 = packed[source], q1 = packed[source + half];
-    const float k0 = packed[source + hidden], k1 = packed[source + hidden + half];
-    q[dest] = q0 * c - q1 * s;
-    q[dest + half] = q0 * s + q1 * c;
-    k[dest] = k0 * c - k1 * s;
-    k[dest + half] = k0 * s + k1 * c;
-    v[dest] = packed[source + 2u * hidden];
-    v[dest + half] = packed[source + 2u * hidden + half];
-}
-
 // GLiNER ModernBERT: dynamic shared scores cover only the attended key
 // window. Global layers support 8192 keys; local layers retain bounded scratch.
 extern "C" __global__ void termite_gliner_encoder_attention_f32(
@@ -19090,6 +19061,48 @@ extern "C" __global__ void termite_gliner_encoder_attention_f32(
             acc += scores[ki - begin] * v[(b * seq + ki) * hidden + head * dim + tid];
         dst[base + tid] = denominator > 0.0f ? acc / denominator : 0.0f;
     }
+}
+// tile-codegen:end attention.warp family
+
+extern "C" __global__ void termite_laya_packed_geglu_f32(
+    float* dst, const float* src, unsigned int rows, unsigned int width
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * width) return;
+    unsigned int row = i / width, col = i % width;
+    float x = src[(size_t)row * 2u * width + col];
+    float gelu = isfinite(x) ? 0.5f * x * (1.0f + erff(x * 0.7071067811865476f)) : 0.0f;
+    dst[i] = gelu * src[(size_t)row * 2u * width + width + col];
+}
+
+// Full-head split-half RoPE for the GLiNER ModernBERT encoder. One thread
+// rotates a pair in both Q and K and copies V from the packed projection,
+// avoiding three slices and repeated trigonometry in separate RoPE launches.
+extern "C" __global__ void termite_gliner_qkv_rope_f32(
+    float* q, float* k, float* v, const float* packed,
+    unsigned int batch, unsigned int sequence, unsigned int heads,
+    unsigned int dimension, float theta
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int half = dimension / 2u;
+    const unsigned int count = batch * sequence * heads * half;
+    if (index >= count) return;
+    const unsigned int chunk = index / half, d = index % half;
+    const unsigned int row = chunk / heads, head = chunk % heads;
+    const unsigned int hidden = heads * dimension;
+    const unsigned int source = row * 3u * hidden + head * dimension + d;
+    const unsigned int dest = chunk * dimension + d;
+    const float frequency = 1.0f / powf(theta, (2.0f * (float)d) / (float)dimension);
+    const float angle = (float)(row % sequence) * frequency;
+    const float s = sinf(angle), c = cosf(angle);
+    const float q0 = packed[source], q1 = packed[source + half];
+    const float k0 = packed[source + hidden], k1 = packed[source + hidden + half];
+    q[dest] = q0 * c - q1 * s;
+    q[dest + half] = q0 * s + q1 * c;
+    k[dest] = k0 * c - k1 * s;
+    k[dest + half] = k0 * s + k1 * c;
+    v[dest] = packed[source + 2u * hidden];
+    v[dest + half] = packed[source + 2u * hidden + half];
 }
 
 // Diagnostic mixed-precision GLiNER global and local attention. FP16 Q/K/V and
@@ -19645,6 +19658,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
     }
 }
 
+// tile-codegen:begin attention.gliner_boundary_tc family (do not edit; run: zig build tile-kernel-codegen -- --write)
 // Wider direct boundary attention for sequences of at least 512 tokens.
 // Query/key fragments stay in registers; 16-column relative tiles scatter
 // only their diagonal gathers. This requires no global relative-product cache
@@ -20052,6 +20066,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attent
         __syncthreads();
     }
 }
+// tile-codegen:end attention.gliner_boundary_tc family
 
 // Native Attention Matching repeat-only kernels; host dispatch is opt-in.
 #include "../../../graph/templates/cuda_gqa_repeat_split_f16.cuh"
