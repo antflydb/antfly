@@ -15,7 +15,8 @@
 
 //! Metal device sampling passes over 1024-logit blocks: the nucleus
 //! (top-p) pipeline (max, probabilities, mass, radix histograms of the
-//! probability bits, Gumbel pick) and the plain Gumbel-max sampler.
+//! probability bits, Gumbel pick), the plain Gumbel-max sampler, and the
+//! top-k samplers (insertion top-k, top-p, min-p, one xorshift draw).
 //!
 //! Kernels are built from shared statements (block bounds, softcap and
 //! penalties, the Gumbel hash, threadgroup trees). Most are written one
@@ -164,9 +165,200 @@ const gumbel = kernel("termite_sample_gumbel_partials", "device const float *log
     "if (tid == 0u) { partial_values[block] = sh_vals[0]; partial_ids[block] = sh_ids[0]; }",
 }))});
 
+// ---------------------------------------------------------------- top-k
+
+/// Insertion into the descending `top_vals` / `top_idx` lists of length `n`.
+fn insertTopK(comptime ind: []const u8, comptime n: []const u8, comptime v: []const u8, comptime id: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        \\{0s}if ({2s} <= top_vals[{1s} - 1u]) continue;
+        \\{0s}uint insert_at = {1s} - 1u;
+        \\{0s}while (insert_at > 0u && {2s} > top_vals[insert_at - 1u]) {{
+        \\{0s}    top_vals[insert_at] = top_vals[insert_at - 1u];
+        \\{0s}    top_idx[insert_at] = top_idx[insert_at - 1u];
+        \\{0s}    insert_at -= 1u;
+        \\{0s}}}
+        \\{0s}top_vals[insert_at] = {2s};
+        \\{0s}top_idx[insert_at] = {3s};
+        \\
+    , .{ ind, n, v, id });
+}
+
+fn clearTopK(comptime ind: []const u8, comptime n: []const u8) []const u8 {
+    return ind ++ "for (uint i = 0u; i < " ++ n ++ "; ++i) { top_vals[i] = -INFINITY; top_idx[i] = 0u; }\n";
+}
+
+fn topKArrays(comptime n: []const u8) []const u8 {
+    return "    thread float top_vals[" ++ n ++ "];\n    thread uint top_idx[" ++ n ++ "];\n";
+}
+
+fn scaledLogit(comptime ind: []const u8) []const u8 {
+    return ind ++ "float adjusted = termite_apply_sampling_penalties(logits[i], i, penalties, p.penalty_count, p);\n" ++
+        ind ++ "float scaled = (p.temperature > 0.0f) ? (adjusted / p.temperature) : adjusted;\n";
+}
+
+/// `probs[i] = exp(top_vals[i] - best_scaled)` over the kept candidates.
+fn candidateProbs(comptime ind: []const u8, comptime n: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        \\{0s}for (uint i = 0u; i < {1s}; ++i) {{
+        \\{0s}    float prob = exp(top_vals[i] - best_scaled);
+        \\{0s}    probs[i] = prob;
+        \\{0s}    sum += prob;
+        \\{0s}    if (prob > max_prob) max_prob = prob;
+        \\{0s}}}
+        \\
+    , .{ ind, n });
+}
+
+/// Top-p over the sorted candidates: zero everything below the first
+/// probability where the running mass reaches top_p * sum.
+fn topP(comptime ind: []const u8, comptime n: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        \\{0s}if (p.top_p > 0.0f && p.top_p < 1.0f) {{
+        \\{0s}    float threshold = p.top_p * sum;
+        \\{0s}    float cumulative = 0.0f;
+        \\{0s}    float nucleus_cutoff = probs[{1s} - 1u];
+        \\{0s}    for (uint i = 0u; i < {1s}; ++i) {{
+        \\{0s}        cumulative += probs[i];
+        \\{0s}        if (cumulative >= threshold) {{ nucleus_cutoff = probs[i]; break; }}
+        \\{0s}    }}
+        \\{0s}    sum = 0.0f;
+        \\{0s}    for (uint i = 0u; i < {1s}; ++i) {{
+        \\{0s}        if (probs[i] < nucleus_cutoff) probs[i] = 0.0f;
+        \\{0s}        sum += probs[i];
+        \\{0s}    }}
+        \\{0s}}}
+        \\
+    , .{ ind, n });
+}
+
+const limit = "uint limit = candidate_count != 0u ? candidate_count : p.out_dim;";
+
+/// Min-p, then one xorshift draw over the remaining mass (`n` candidates,
+/// or `limit` when `limited`).
+fn minPAndDraw(comptime n: []const u8, comptime limited: bool, comptime pick: []const u8) []const u8 {
+    const pre = if (limited) "        " ++ limit ++ "\n" else "";
+    return std.fmt.comptimePrint(
+        \\    if (p.min_p > 0.0f && p.min_p < 1.0f) {{
+        \\        float threshold = max_prob * p.min_p;
+        \\        sum = 0.0f;
+        \\{1s}        for (uint i = 0u; i < {0s}; ++i) {{
+        \\            float prob = probs[i];
+        \\            if (prob < threshold) {{ probs[i] = 0.0f; }} else {{ sum += prob; }}
+        \\        }}
+        \\    }}
+        \\    if (sum <= 0.0f) {{ output[0] = best_idx; return; }}
+        \\    uint state = p.seed ^ 0x9e3779b9u;
+        \\    state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+        \\    float target = (float(state) / 4294967296.0f) * sum;
+        \\    float cumulative = 0.0f;
+        \\{2s}    for (uint i = 0u; i < {0s}; ++i) {{
+        \\        cumulative += probs[i];
+        \\        if (cumulative >= target) {{ output[0] = {3s}; return; }}
+        \\    }}
+        \\    output[0] = best_idx;
+        \\}}
+        \\
+    , .{ if (limited) "limit" else n, pre, if (limited) "    " ++ limit ++ "\n" else "", pick });
+}
+
+const sample_args = "device const float *logits [[buffer(0)]], device float *probs [[buffer(1)]], device uint *output [[buffer(2)]], " ++ params ++ " [[buffer(3)]], " ++ penalty_buffer ++ " [[buffer(4)]], uint gid [[thread_position_in_grid]]";
+
+/// Single-thread sampler: top-k (or the whole vocabulary under top-p for
+/// small vocabularies) by insertion, then min-p and one draw.
+const logits_1x = "kernel void termite_sample_logits_1x(" ++ sample_args ++ ") {\n" ++
+    \\    if (gid != 0) return;
+    \\    if (p.out_dim == 0u) { output[0] = 0u; return; }
+    \\    const uint max_top_k = 256u;
+    \\
+++ topKArrays("256") ++
+    \\    uint candidate_count = 0u;
+    \\    if (p.top_k > 0u && p.top_k <= max_top_k) {
+    \\        candidate_count = min(p.top_k, p.out_dim);
+    \\    } else if (p.top_p > 0.0f && p.top_p < 1.0f && p.out_dim <= max_top_k) {
+    \\        candidate_count = p.out_dim;
+    \\    }
+    \\    float cutoff = -INFINITY;
+    \\    if (candidate_count != 0u) {
+    \\
+++ clearTopK("        ", "candidate_count") ++
+    "        for (uint i = 0u; i < p.out_dim; ++i) {\n" ++ scaledLogit("            ") ++ insertTopK("            ", "candidate_count", "scaled", "i") ++ "        }\n" ++
+    \\        cutoff = top_vals[candidate_count - 1u];
+    \\    }
+    \\    float best_scaled = -INFINITY;
+    \\    uint best_idx = 0u;
+    \\    for (uint i = 0u; i < p.out_dim; ++i) {
+    \\
+++ scaledLogit("        ") ++
+    \\        if (candidate_count != 0u && scaled < cutoff) continue;
+    \\        if (scaled > best_scaled) { best_scaled = scaled; best_idx = i; }
+    \\    }
+    \\    if (!(best_scaled > -INFINITY)) { output[0] = 0u; return; }
+    \\    if (p.temperature <= 0.0f) { output[0] = best_idx; return; }
+    \\    float sum = 0.0f;
+    \\    float max_prob = 0.0f;
+    \\    if (candidate_count != 0u) {
+    \\
+++ candidateProbs("        ", "candidate_count") ++ topP("        ", "candidate_count") ++
+    \\    } else {
+    \\        for (uint i = 0u; i < p.out_dim; ++i) {
+    \\            float adjusted = termite_apply_sampling_penalties(logits[i], i, penalties, p.penalty_count, p);
+    \\            float scaled = adjusted / p.temperature;
+    \\            float prob = exp(scaled - best_scaled);
+    \\            probs[i] = prob;
+    \\            sum += prob;
+    \\            if (prob > max_prob) max_prob = prob;
+    \\        }
+    \\    }
+    \\
+++ minPAndDraw("", true, "(candidate_count != 0u ? top_idx[i] : i)");
+
+/// Per-512-logit block top-k (up to 64), one thread per block.
+const topk_partials = "kernel void termite_sample_topk_partials(device const float *logits [[buffer(0)]], device float *partial_values [[buffer(1)]], device uint *partial_ids [[buffer(2)]], " ++ params ++ " [[buffer(3)]], " ++ penalty_buffer ++ " [[buffer(4)]], uint block [[thread_position_in_grid]]) {\n" ++
+    \\    const uint block_size = 512u;
+    \\    const uint max_top_k = 64u;
+    \\    uint top_k = min(p.top_k, max_top_k);
+    \\    if (top_k == 0u) return;
+    \\
+++ topKArrays("64") ++ clearTopK("    ", "top_k") ++
+    \\    uint start = block * block_size;
+    \\    uint end = min(start + block_size, p.out_dim);
+    \\    for (uint i = start; i < end; ++i) {
+    \\
+++ scaledLogit("        ") ++ insertTopK("        ", "top_k", "scaled", "i") ++
+    \\    }
+    \\    uint base = block * top_k;
+    \\    for (uint i = 0u; i < top_k; ++i) {
+    \\        partial_values[base + i] = top_vals[i];
+    \\        partial_ids[base + i] = top_idx[i];
+    \\    }
+    \\}
+    \\
+;
+
+/// Merges the block top-k lists, then samples like termite_sample_logits_1x.
+const topk_reduce = "kernel void termite_sample_topk_reduce(device const float *partial_values [[buffer(0)]], device const uint *partial_ids [[buffer(1)]], device float *probs [[buffer(2)]], device uint *output [[buffer(3)]], constant termite_metal_topk_reduce_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n" ++
+    \\    if (gid != 0u) return;
+    \\    if (p.candidate_count == 0u || p.top_k == 0u) { output[0] = 0u; return; }
+    \\    const uint max_top_k = 64u;
+    \\    uint top_k = min(p.top_k, max_top_k);
+    \\
+++ topKArrays("64") ++ clearTopK("    ", "top_k") ++
+    \\    for (uint i = 0u; i < p.candidate_count; ++i) {
+    \\        float v = partial_values[i];
+    \\
+++ insertTopK("        ", "top_k", "v", "partial_ids[i]") ++
+    \\    }
+    \\    float best_scaled = top_vals[0];
+    \\    uint best_idx = top_idx[0];
+    \\    if (!(best_scaled > -INFINITY)) { output[0] = 0u; return; }
+    \\    float sum = 0.0f;
+    \\    float max_prob = 0.0f;
+    \\
+++ candidateProbs("    ", "top_k") ++ topP("    ", "top_k") ++ minPAndDraw("top_k", false, "top_idx[i]");
+
 pub fn metalRegion() []const u8 {
     comptime {
         @setEvalBranchQuota(1_000_000);
-        return max_partials ++ max_reduce ++ probs_partials ++ sum_reduce ++ histogram_serial ++ histogram ++ nucleus_gumbel ++ gumbel;
+        return max_partials ++ max_reduce ++ probs_partials ++ sum_reduce ++ histogram_serial ++ histogram ++ nucleus_gumbel ++ gumbel ++ logits_1x ++ topk_partials ++ topk_reduce;
     }
 }
