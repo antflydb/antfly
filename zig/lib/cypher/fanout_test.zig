@@ -36,12 +36,14 @@ test "parallel acquisition preserves cohort barriers and cleans failed busy and 
     const Fixture = struct {
         activity: Activity,
         controller: std.Thread.Id,
-        mode: enum { normal, busy, capture_error, fork_error, revoked, deadline },
+        mode: enum { normal, busy, capture_error, fork_error, revoked, deadline, validate_error, routing_error },
         owners: [12]Owner = undefined,
         admitted: atomic = .init(0),
         held: atomic = .init(0),
         forks: atomic = .init(0),
         closed: atomic = .init(0),
+        validated: atomic = .init(0),
+        routed: atomic = .init(0),
         busy: std.atomic.Value(bool) = .init(true),
         revoked: std.atomic.Value(bool) = .init(false),
         expired: std.atomic.Value(bool) = .init(false),
@@ -60,6 +62,28 @@ test "parallel acquisition preserves cohort barriers and cleans failed busy and 
                 self.allocator.free(self.token);
             }
             fn check(_: *anyopaque) !void {}
+            fn finalize(ptr: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.checkThread();
+                try self.f.activity.enter();
+                defer self.f.activity.leave();
+                try std.testing.expectEqual(@as(usize, 12), self.f.forks.load(.acquire));
+                if (self.index == 3 and self.f.mode == .validate_error) return error.Forbidden;
+                _ = self.f.validated.fetchAdd(1, .release);
+            }
+            fn routes(ptr: *anyopaque) ![]const b.AdjacencyRoute {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.checkThread();
+                try self.f.activity.enter();
+                defer self.f.activity.leave();
+                // Metadata is an operation on the finalized read capability.
+                // No owner may start it while another still validates.
+                try std.testing.expectEqual(@as(usize, 12), self.f.validated.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 12), self.f.held.load(.acquire));
+                if (self.index == 3 and self.f.mode == .routing_error) return error.Forbidden;
+                _ = self.f.routed.fetchAdd(1, .release);
+                return &.{.{ .index = "links", .outgoing = .{ .empty = true }, .incoming = .{ .empty = true } }};
+            }
             fn close(ptr: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 self.checkThread();
@@ -82,7 +106,7 @@ test "parallel acquisition preserves cohort barriers and cleans failed busy and 
                     else => {},
                 };
                 _ = f.forks.fetchAdd(1, .monotonic);
-                return .{ .ptr = self, .validate = @This().check, .close = @This().close, .backend = .{ .ptr = self, .vtable = &.{ .bind = undefined, .checkpoint = @This().check, .scan = undefined, .get = undefined, .expand = undefined } } };
+                return .{ .load_adjacency_routes = @This().routes, .ptr = self, .validate = @This().check, .close = @This().close, .backend = .{ .ptr = self, .vtable = &.{ .bind = undefined, .checkpoint = @This().check, .scan = undefined, .get = undefined, .expand = undefined } } };
             }
         };
         const ThisFixture = @This();
@@ -112,7 +136,7 @@ test "parallel acquisition preserves cohort barriers and cleans failed busy and 
             owner.allocator = a;
             owner.token = try a.dupe(u8, "retained");
             _ = self.held.fetchAdd(1, .monotonic);
-            return .{ .ptr = owner, .validate = Owner.check, .fork = Owner.fork, .release = Owner.release };
+            return .{ .ptr = owner, .validate = Owner.finalize, .fork = Owner.fork, .release = Owner.release };
         }
     };
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(4) });
@@ -128,10 +152,13 @@ test "parallel acquisition preserves cohort barriers and cleans failed busy and 
         if (mode == .normal or mode == .busy) {
             var set = try d.ReadSet.acquire(shared.allocator(), source, &targets);
             try std.testing.expectEqual(@as(usize, 0), f.held.load(.monotonic));
+            try std.testing.expectEqual(@as(usize, 12), f.routed.load(.acquire));
+            for (set.snapshots) |snapshot| try std.testing.expectEqual(@as(usize, 1), snapshot.adjacency_routes.len);
             set.deinit();
         } else if (mode == .deadline) {
             try std.testing.expectError(error.DeadlineExceeded, d.ReadSet.acquire(shared.allocator(), source, &targets));
         } else try std.testing.expectError(error.Forbidden, d.ReadSet.acquire(shared.allocator(), source, &targets));
+        if (mode == .validate_error) try std.testing.expectEqual(@as(usize, 0), f.routed.load(.acquire));
         try std.testing.expectEqual(f.forks.load(.monotonic), f.closed.load(.monotonic));
         try std.testing.expectEqual(@as(usize, 0), f.held.load(.monotonic));
         try std.testing.expectEqual(@as(usize, 0), f.activity.active.load(.monotonic));

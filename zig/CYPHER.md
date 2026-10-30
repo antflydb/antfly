@@ -4751,8 +4751,8 @@ Retained physical graph roots now supply a conservative endpoint directory.
 Two boundary seeks in each outgoing/reverse root produce inclusive endpoint
 envelopes without scanning rows or changing persistent write metadata. Producer
 ownership records may widen an envelope; logical endpoints outside primary
-shard ranges remain included. The directory is captured during the existing
-owner-fork wave and lives exactly as long as that owner's retained capability.
+shard ranges remain included. The directory is captured in a bounded owner wave after the entire cohort
+has finalized validation and lives exactly as long as that owner's retained capability.
 Routing consults these graph envelopes before document-placement certificates.
 Unknown/legacy capabilities keep broadcast routing. Empty proofs exclude empty
 owners; broad or overlapping envelopes retain false positives. Durable managed
@@ -4774,3 +4774,11 @@ An authorization, cancellation or other owner failure takes precedence over a
 memory decline. Copy admission follows the same rule. Focused tests combine a
 128-KiB scratch quota with four simultaneous 256-KiB attempts, and separately
 combine quota failures with a forbidden owner.
+
+
+Routing metadata acquisition is a separate post-validation cohort phase.
+Deferred retained capabilities accept only the validation operation until their
+original fence has been finalized. Every owner finishes that barrier before
+any directory operation starts; a metadata failure closes every captured
+snapshot and releases every fence. The same bounded scheduler preserves local
+thread affinity during validation and directory reads.

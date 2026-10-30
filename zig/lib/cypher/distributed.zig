@@ -47,6 +47,9 @@ pub const Target = struct {
 pub const Snapshot = struct {
     /// Borrowed from this exact retained capability, never live catalog state.
     adjacency_routes: []const b.AdjacencyRoute = &.{},
+    /// Optional metadata read, invoked only after every retained participant
+    /// has finalized validation. Returned proofs live with this capability.
+    load_adjacency_routes: ?*const fn (*anyopaque) anyerror![]const b.AdjacencyRoute = null,
     /// Set only when source.checkpoint already performs exactly this snapshot's
     /// validation. Independent authority checks remain mandatory by default.
     validation_covered_by_source: bool = false,
@@ -112,6 +115,13 @@ pub const ReadSet = struct {
         try phase.run();
         phase.kind = .validate;
         try phase.run();
+        const routing = for (slots) |slot| {
+            if (slot.snapshot.?.load_adjacency_routes != null) break true;
+        } else false;
+        if (routing) {
+            phase.kind = .routes;
+            try phase.run();
+        }
         const snapshots = try a.alloc(Snapshot, targets.len);
         errdefer a.free(snapshots);
         for (slots, snapshots) |slot, *snapshot| snapshot.* = slot.snapshot.?;
@@ -149,7 +159,7 @@ pub const ReadSet = struct {
         a: A,
         source: Source,
         slots: []AcquireSlot,
-        kind: enum { admit, capture, fork, validate },
+        kind: enum { admit, capture, fork, validate, routes },
         fn call(self: *@This(), index: usize) void {
             self.invoke(&self.slots[index]) catch |err| {
                 self.slots[index].err = err;
@@ -162,6 +172,10 @@ pub const ReadSet = struct {
                 .capture => slot.fence = try self.source.capture(self.source.ptr, self.a, slot.target),
                 .fork => slot.snapshot = try slot.fence.?.fork(slot.fence.?.ptr, self.a),
                 .validate => try slot.fence.?.validate(slot.fence.?.ptr),
+                .routes => {
+                    const snapshot = &slot.snapshot.?;
+                    if (snapshot.load_adjacency_routes) |load| snapshot.adjacency_routes = try load(snapshot.ptr);
+                },
             }
         }
         fn release(self: *@This(), index: usize) void {

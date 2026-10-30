@@ -162,14 +162,12 @@ pub const Statement = struct {
             self.read = read;
             errdefer self.read = null;
             const snapshot = try a.create(Owner);
-            snapshot.* = .{ .a = a, .statement = statement, .read = read, .client = undefined, .routing_arena = .init(a) };
+            snapshot.* = .{ .a = a, .statement = statement, .read = read, .client = undefined, .routing_arena = .init(a), .table = self.plan.table.name };
             errdefer a.destroy(snapshot);
             errdefer snapshot.routing_arena.deinit();
             snapshot.client = .{ .channel = .{ .ptr = snapshot, .call = Owner.call, .typed = Owner.callTyped }, .incarnation = statement.graph.incarnation, .revision = statement.graph.revision, .allowed_versions = statement.versions };
             const adjacency_needed = if (self.plan.table.indexes) |indexes| indexes.len != 0 else statement.graph.relationships.len != 0;
-            const routing = if (!adjacency_needed) cypher.rpc.Reply{} else try Owner.callTyped(snapshot, snapshot.routing_arena.allocator(), .{ .operation = .adjacency_routes, .table = self.plan.table.name, .graph_incarnation = statement.graph.incarnation, .graph_revision = statement.graph.revision });
-            try cypher.backend.validateAdjacencyRoutes(routing.adjacency_routes);
-            return .{ .adjacency_routes = routing.adjacency_routes, .backend = snapshot.client.backend(), .ptr = snapshot, .validate = Owner.validate, .close = Owner.close, .validation_covered_by_source = true };
+            return .{ .load_adjacency_routes = if (adjacency_needed) Owner.loadAdjacencyRoutes else null, .backend = snapshot.client.backend(), .ptr = snapshot, .validate = Owner.validate, .close = Owner.close, .validation_covered_by_source = true };
         }
     };
     const Owner = struct {
@@ -178,6 +176,13 @@ pub const Statement = struct {
         read: port.GraphRead,
         client: cypher.rpc.Client,
         routing_arena: std.heap.ArenaAllocator,
+        table: []const u8,
+        fn loadAdjacencyRoutes(ptr: *anyopaque) ![]const cypher.backend.AdjacencyRoute {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const routing = try callTyped(ptr, self.routing_arena.allocator(), .{ .operation = .adjacency_routes, .table = self.table, .graph_incarnation = self.statement.graph.incarnation, .graph_revision = self.statement.graph.revision });
+            try cypher.backend.validateAdjacencyRoutes(routing.adjacency_routes);
+            return routing.adjacency_routes;
+        }
         fn validate(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try checkpoint(self.statement);
@@ -348,7 +353,8 @@ test "graph admission batches preserve reclaimable allocators for legacy owner c
     var statement: Statement = undefined;
     statement.input = .{ .catalog_json = "", .tables = &.{}, .cut_id = @splat('a'), .expires_ms = std.math.maxInt(u64), .ttl_now_ns = 1 };
     var marker: u8 = 0;
-    var owner: Statement.Owner = .{ .a = std.testing.allocator, .statement = &statement, .read = .{ .ptr = &marker, .vtable = &.{ .invoke = Legacy.invoke, .release = Legacy.release } }, .client = undefined };
+    var owner: Statement.Owner = .{ .a = std.testing.allocator, .statement = &statement, .read = .{ .ptr = &marker, .vtable = &.{ .invoke = Legacy.invoke, .release = Legacy.release } }, .client = undefined, .routing_arena = .init(std.testing.allocator), .table = "docs" };
+    defer owner.routing_arena.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const reply = try Statement.Owner.callTyped(&owner, arena.allocator(), .{ .operation = .validate, .graph_incarnation = 1, .graph_revision = 1 });
