@@ -4633,6 +4633,24 @@ remaining global population allowance. Discarded attempts remain charged as
 work, never query bindings or logical anchors. Encounter order, trailing empty
 EOF proofs, cancellation and the 2 MiB aggregate capture quota are preserved.
 
+The access-path qualification passes all 507 core Cypher tests and the callback
+ABI gate, plus 13 transport, five retained-cut/SQL, five local C API, one portable
+embedded and 52 independent runtime-boundary cases. Reported native suites have
+zero leaks. Focused debug checks cover bounded long-string packets, composite
+cursor ownership, source-owner routing and all 12 parallel-probe outcomes. The
+merged Go SDK passes its complete test suite. The merge also adds the scoped
+`objectstore` dependency to inference source owners: upstream GCS credential
+configuration now names that module directly.
+
+The corrected merged CLI and combined native gate succeed in all 147 build
+steps. The expanded authenticated property-plan/SQL-overlay regression passes
+in 30.73 seconds, including the composite two-anchor ceiling and both derived
+long-string membership cases. The replicated-owner regression passes in 286.83
+seconds, covering HTTP queries and writes, catalog revisions, expressions,
+mutations, normalization and postimage authorization. These runs exercise the
+rebuilt executable; they do not rerun or clear the enrichment fault-campaign
+caveat below.
+
 The distributed enrichment caveat above remains open. Two combined public
 campaigns passed 19 cases but the owner-loss case ended with a durable
 `committed_repair_required` receipt; all three data owners exhausted retries on
