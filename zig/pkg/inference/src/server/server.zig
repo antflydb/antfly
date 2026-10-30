@@ -7703,8 +7703,9 @@ pub const Node = struct {
             item.source_fingerprint = if (image.source_fingerprint) |value| try allocator.dupe(u8, value) else null;
             item.page_number = image.page_number;
         }
+        const usage = try readers_api.measuredUsage(out);
         const execution = try qwenReadExecution(allocator, results);
-        return .{ .items = out, .execution = execution };
+        return .{ .items = out, .execution = execution, .usage = usage };
     }
 
     const ConcurrentOcrBenchTask = struct {
@@ -33141,6 +33142,7 @@ test "Qwen3-VL encoded read results own page identities and report serial execut
             defer batch.deinit(allocator);
             try std.testing.expectEqual(@as(i64, 21), batch.usage.?.prompt_tokens);
             try std.testing.expectEqual(@as(i64, 4), batch.usage.?.completion_tokens);
+            try std.testing.expectEqual(@as(i64, 25), batch.usage.?.total_tokens);
             try std.testing.expectEqual(readers_api.Completion.complete, batch.items[0].completion);
             try std.testing.expectEqual(readers_api.Completion.length, batch.items[1].completion);
             try std.testing.expectEqual(@as(?usize, 11), batch.items[1].prompt_tokens);
