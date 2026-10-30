@@ -11387,7 +11387,7 @@ pub const Node = struct {
         // tokens, so plan its encoder bytes from the exact prepared request.
         const reference_encoder_bytes: ?usize = if ((backend == .metal or backend == .cuda) and execution_options.metal_execution_policy != .optimized_v2) bytes: {
             failure.* = .{ .stage = "tokenizing" };
-            const planned = try boundary_executor.referenceEncoderDeviceBytes(scratch, &config, loaded.getTokenizer(), &request, execution_options);
+            const planned = try boundary_executor.referenceEncoderDeviceBytes(if (backend == .cuda) .cuda else .metal, scratch, &config, loaded.getTokenizer(), &request, execution_options);
             failure.* = .{ .stage = "model" };
             break :bytes planned;
         } else null;
