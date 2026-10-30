@@ -24,8 +24,6 @@ const std = @import("std");
 const gpu = @import("gpu.zig");
 const whisper = @import("whisper_logits.zig");
 const gpu_model = @import("gpu_model.zig");
-const rms_norm = @import("rms_norm.zig");
-const argmax = @import("argmax.zig");
 const whisper_model = @import("whisper_model.zig");
 
 const File = struct { path: []const u8, data: []const u8 };
@@ -38,29 +36,8 @@ const files = [_]File{
     .{ .path = "src/ops/cuda/generated/tile_whisper_model.cu", .data = gpu_model.renderModule(whisper_model.kernels, .cuda, "src/tile/whisper_model.zig") },
 };
 
-/// Generated regions inside hand-maintained files: the text between the
-/// begin and end marker lines is owned by the generator.
-const Region = struct { path: []const u8, begin: []const u8, end: []const u8, data: []const u8 };
-
-fn region(comptime path: []const u8, comptime indent: []const u8, comptime family: []const u8, comptime data: []const u8) Region {
-    return .{
-        .path = path,
-        .begin = indent ++ "// tile-codegen:begin " ++ family ++ " family (do not edit; run: zig build tile-kernel-codegen -- --write)\n",
-        .end = indent ++ "// tile-codegen:end " ++ family ++ " family\n",
-        .data = data,
-    };
-}
-const metal_kernels_m = "src/backends/metal_kernels.m";
-const cuda_bundle = "src/ops/cuda/artifacts/inference_cuda_kernels.cu";
-
-const regions = [_]Region{
-    region(metal_kernels_m, "           ", "rms_norm", rms_norm.metalRegion(&rms_norm.kernels)),
-    region(cuda_bundle, "", "rms_norm", rms_norm.cudaRegion(&rms_norm.kernels)),
-    region(metal_kernels_m, "           ", "layer_norm", rms_norm.metalRegion(&rms_norm.layer_norm_kernels)),
-    region(cuda_bundle, "", "layer_norm", rms_norm.cudaRegion(&rms_norm.layer_norm_kernels)),
-    region(metal_kernels_m, "           ", "argmax", argmax.metalRegion()),
-    region(cuda_bundle, "", "argmax", argmax.cudaRegion()),
-};
+/// Generated regions inside hand-maintained files, by family.
+const regions = @import("families.zig").regions;
 
 const opencl_source = gpu_model.renderModule(whisper_model.kernels, .opencl, "src/tile/whisper_model.zig");
 

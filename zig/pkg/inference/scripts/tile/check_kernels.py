@@ -21,7 +21,8 @@ they use) from an old and a new Metal (`metal_kernels.m`) or CUDA
 shim, runs every launch with one OS thread per GPU thread (barriers, warp
 shuffles and `simd_sum` are real rendezvous points), and requires every
 output buffer to match bit for bit. Families and their launch grids live in
-kernel_specs.py. Needs clang++ (C++20); no GPU or vendor toolchain.
+kernel_specs.py or specs/<family>.py. Needs clang++ (C++20); no GPU or
+vendor toolchain.
 
     python check_kernels.py metal rms_norm <old metal_kernels.m> <new metal_kernels.m>
     python check_kernels.py cuda layer_norm <old .cu> <new .cu>
@@ -259,9 +260,26 @@ def strip_device(text):
     return re.sub(r"\b(__device__|__forceinline__|__host__)\b\s*", "", text)
 
 
+def load_spec(family):
+    """A family from kernel_specs.py, or `specs/<family>.py` exporting `spec`.
+
+    A spec may add C++ to the shim per backend: `"shim": {"metal": ..., "cuda": ...}`.
+    """
+    if hasattr(kernel_specs, family):
+        return getattr(kernel_specs, family)
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "specs", family + ".py")
+    if not os.path.exists(path):
+        sys.exit(f"no spec for family {family!r} in kernel_specs.py or specs/{family}.py")
+    import importlib.util
+    mod_spec = importlib.util.spec_from_file_location("spec_" + family, path)
+    mod = importlib.util.module_from_spec(mod_spec)
+    mod_spec.loader.exec_module(mod)
+    return mod.spec
+
+
 def main():
     backend, family, old_path, new_path = sys.argv[1:5]
-    spec = getattr(kernel_specs, family)
+    spec = load_spec(family)
     names = list(spec["kernels"].keys())
     grid = spec["grid"]
     if backend == "metal":
@@ -272,7 +290,7 @@ def main():
         names = [n for n in names if spec["kernels"][n].get("backend") == "cuda"]
         old_src, new_src = open(old_path).read(), open(new_path).read()
         kernel_re = r'extern "C" __global__\s+(?:void\s+)?(?:__launch_bounds__\([^)]*\)\s*)?(?:void\s+)?{}\s*\('
-    src = COMMON + (METAL_SHIM if backend == "metal" else CUDA_SHIM)
+    src = COMMON + (METAL_SHIM if backend == "metal" else CUDA_SHIM) + spec.get("shim", {}).get(backend, "")
     sigs = {}
     for ns, text in (("before", old_src), ("after", new_src)):
         kernels, helpers, structs = collect(text, names, kernel_re)
