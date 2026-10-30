@@ -80,4 +80,4 @@ async function reconcileWindowCatalogs(first,second,scope){
  return{schema:2,qualification:false,evidence_layout:'window-v1',source:scope.source,timeframe:second.timeframe,terminals,native_terminals:native,physical_attempts:scope.ledger?.attempts?.length??null,outcomes,resource_failures:resources,windows,complete:failures.length===0,failures:[...new Set(failures)]};
 }
 
-export function observerDiagnosticsComplete(observer,health,diagnostics){return !observer.observed_resource_failures?.length&&health?.rejections_present===false&&diagnostics?.length===8&&diagnostics.every(d=>d.complete);}
+export function observerDiagnosticsComplete(observer,health,diagnostics,destinations){return destinations?.complete===true&&!observer.observed_resource_failures?.length&&health?.rejections_present===false&&diagnostics?.length===8&&diagnostics.every(d=>d.complete);}

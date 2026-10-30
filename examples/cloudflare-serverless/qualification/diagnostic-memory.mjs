@@ -30,6 +30,7 @@ export class DiagnosticAdmission {
  }
 }
 export const diagnosticAdmission=new DiagnosticAdmission();
+export const exportAdmission=new DiagnosticAdmission({maxQueued:64});
 
 // A byte cap alone does not bound JSON.parse's heap amplification. Preflight
 // the complete payload (including NDJSON) without building a token tree.

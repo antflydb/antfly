@@ -16,7 +16,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {gzipSync} from 'node:zlib';
-import {DiagnosticAdmission,diagnosticAdmission,checkDiagnosticJson,parseDiagnosticJson} from '../qualification/diagnostic-memory.mjs';
+import {DiagnosticAdmission,diagnosticAdmission,exportAdmission,checkDiagnosticJson,parseDiagnosticJson} from '../qualification/diagnostic-memory.mjs';
 import {diagnosticStorage} from '../qualification/diagnostic-storage.mjs';
 import {readBody} from '../qualification/logpush-probe-collector.mjs';
 import {sanitizeTailEvent} from '../qualification/metrics-tail.mjs';
@@ -54,7 +54,7 @@ test('gzip magic can span chunks and compressed/decompressed byte limits cancel 
  let canceled=false;const oversized=new ReadableStream({pull(controller){controller.enqueue(new Uint8Array(1024*1024));},cancel(){canceled=true;}});await assert.rejects(readBody(new Request('https://fixture.invalid',{method:'POST',body:oversized,duplex:'half'})),/BodyExceeded/);assert.equal(canceled,true);
 });
 test('receiver waits before touching its body and resource errors retain safe exact boundary attribution',async()=>{
- const held=gate(),entered=gate(),first=diagnosticAdmission.run(async()=>{entered.release();await held.promise;});await entered.promise;
+ const held=gate(),entered=gate(),first=exportAdmission.run(async()=>{entered.release();await held.promise;});await entered.promise;
  let bodyReads=0;const fake={headers:new Headers({Authorization:'Bearer local-only'}),url:'https://fixture.invalid/v1/traces',method:'POST',get body(){bodyReads++;return new ReadableStream({start(controller){controller.enqueue(new TextEncoder().encode('{}'));controller.close();}});}};
  const request=receiver.fetch(fake,{API_TOKEN:'local-only',SOURCE_SCOPES:JSON.stringify(scopes),LOGS:new Bucket()});await new Promise(resolve=>setTimeout(resolve,10));assert.equal(bodyReads,0);held.release();await first;assert.equal((await request).status,400);assert.ok(bodyReads>0);
  const failure=Error('SQLITE_NOMEM private-secret'),samples=[],bucket={put:async()=>{throw failure;}};const env=diagnosticStorage({LOGS:bucket,ARCHIVE:bucket},'tail-observer',{emit:sample=>samples.push(sample)});assert.equal(env.LOGS,env.ARCHIVE);await assert.rejects(env.LOGS.put('private-key','private-body'),e=>e===failure);
@@ -76,7 +76,7 @@ test('an injected reader allocation failure survives a later healthy response an
  const {observerCall,observerDiagnosticsComplete}=await import('../qualification/paired-observer-client.mjs'),reader=(await import('../qualification/paired-evidence-reader.mjs')).default,{mkdtemp,writeFile,rm}=await import('node:fs/promises'),{resolve}=await import('node:path'),dir=await mkdtemp(resolve('dist','reader-resource-test-')),token='local-reader-resource';await writeFile(resolve(dir,'token'),token,{mode:0o600});
  const observer={id:'antfly-1278-observe-test',reader_id:'antfly-1278-observe-test-reader',reader_origin:'https://antfly-1278-observe-test-reader.example.workers.dev',token_file:resolve(dir,'token')},bucket=new Bucket();await bucket.put('probe-v1/'+scopes[0].capture_id+'/x.json','{}');let failed=true;
  const env={API_TOKEN:token,SOURCE_SCOPES:JSON.stringify(scopes),LOGS:{list:o=>bucket.list(o),get:async key=>{if(failed)throw Error('SQLITE_NOMEM [test-only injected read failure] secret');return bucket.get(key);}}};
- try{const request=(url,options)=>reader.fetch(new Request(url,options),env);await assert.rejects(observerCall(observer,'/source/'+scopes[0].source+'/page',{}, {fetch:request}),/ObserverResourceFailure:SQLITE_NOMEM/);assert.deepEqual(observer.observed_resource_failures.map(r=>[r.component,r.failure_code]),[['evidence-reader','SQLITE_NOMEM']]);failed=false;const healthy=await observerCall(observer,'/health',{}, {fetch:request});assert.equal(healthy.rejections_present,false);assert.equal(observerDiagnosticsComplete(observer,healthy,Array(8).fill({complete:true})),false);assert.ok(!JSON.stringify(observer.observed_resource_failures).includes('secret'));
+ try{const request=(url,options)=>reader.fetch(new Request(url,options),env);await assert.rejects(observerCall(observer,'/source/'+scopes[0].source+'/page',{}, {fetch:request}),/ObserverResourceFailure:SQLITE_NOMEM/);assert.deepEqual(observer.observed_resource_failures.map(r=>[r.component,r.failure_code]),[['evidence-reader','SQLITE_NOMEM']]);failed=false;const healthy=await observerCall(observer,'/health',{}, {fetch:request});assert.equal(healthy.rejections_present,false);assert.equal(observerDiagnosticsComplete(observer,healthy,Array(8).fill({complete:true}),{complete:true}),false);assert.ok(!JSON.stringify(observer.observed_resource_failures).includes('secret'));
  }finally{await rm(dir,{recursive:true,force:true});}
 });
 test('unauthorized observer requests do not enter diagnostic admission or create rejection records',async()=>{

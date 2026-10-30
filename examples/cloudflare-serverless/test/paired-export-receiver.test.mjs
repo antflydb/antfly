@@ -24,3 +24,13 @@ test('receiver health reports late rejections outside its bounded shape sample',
  const response=await receiver.fetch(new Request('https://receiver.invalid/v1/traces',{method:'POST',headers:{Authorization:'Bearer local-only'},body:'{}'}),env);assert.equal(response.status,400);
  const health=await(await receiver.fetch(new Request('https://receiver.invalid/health',{headers:{Authorization:'Bearer local-only'}}),env)).json();assert.equal(health.shapes.length,8);assert.equal(health.rejections_present,true);
 });
+
+test('windowed preparation coalesces source rows across decode chunks before bounded publication',async()=>{
+ const{prepareExport,publishExport}=await import('../qualification/prepare-export.mjs'),bucket=new Bucket(),archive=new Bucket(),env={API_TOKEN:'local',SOURCE_SCOPES:JSON.stringify(scopes),LOGS:bucket,ARCHIVE:archive,WINDOWED_EVIDENCE:'true'},input=JSON.stringify({resourceSpans:Array.from({length:1000},(_,i)=>{const value=group();value.resource.attributes=[attr('service.name',scopes[i%8].source)];return value;})}),prepared=await prepareExport(input,'traces',env,{digest:'a'.repeat(64)});
+ assert.equal(prepared.summary.records,1000);assert.equal(prepared.summary.chunks,8);assert.equal(prepared.entries.length,8);assert.ok(prepared.summary.peak_sanitized_buffer_bytes<=4*1024*1024);assert.equal(bucket.writes,0);assert.equal(archive.writes,0);await publishExport(env,prepared);assert.equal(archive.writes,8);let rows=0;for(const object of archive.objects.values())rows+=JSON.parse(new TextDecoder().decode(object.body)).rows.length;assert.equal(rows,1000);
+});
+
+test('receiver publication drains every peer after failure before releasing encoded-byte ownership',async()=>{
+ const{publishExport}=await import('../qualification/prepare-export.mjs'),{prepareCanonicalRows}=await import('../qualification/canonical-windows.mjs'),bucket=new Bucket(),archive=new Bucket(),env={WINDOWED_EVIDENCE:'true',LOGS:bucket,ARCHIVE:archive};let release,entered;const hold=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve),put=archive.put.bind(archive);let calls=0,finished=false;
+ const entries=await Promise.all(scopes.slice(0,4).map(async scope=>({scope,prepared:await prepareCanonicalRows({...env,SOURCE_WORKER:scope.source,CAPTURE_ID:scope.capture_id},{signal:'logs',received_at:Date.now(),raw_batch_sha256:'a'.repeat(64),rows:[]})})));archive.put=async(...args)=>{if(++calls===1)throw Error('SQLITE_NOMEM [test-only injected archive failure]');entered();await hold;return put(...args);};const result=publishExport(env,{entries}).finally(()=>finished=true);await started;assert.equal(finished,false);release();await assert.rejects(result,/SQLITE_NOMEM/);assert.equal(calls,4);
+});

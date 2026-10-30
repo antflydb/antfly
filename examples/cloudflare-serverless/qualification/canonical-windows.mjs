@@ -68,14 +68,17 @@ export async function ensureCanonicalLayout(env){
  await immutable(env.LOGS,proofPrefix(env.CAPTURE_ID)+'LAYOUT.json',value);
  if(!ready){ready=new Set();readyLayouts.set(identity,ready);}if(ready.size<64)ready.add(key);
 }
-export async function persistCanonicalRows(env,value){
- await ensureCanonicalLayout(env);
+export async function prepareCanonicalRows(env,value){
+ if(env.WINDOWED_EVIDENCE!=='true'||!env.ARCHIVE||env.ARCHIVE===env.LOGS)throw Error('TelemetryCanonicalArchiveRequired');
  const rows=await compactRows(value.rows);if(new Set(rows.map(row=>minuteOf(row.start))).size>32)throw Error('TelemetryCanonicalPartitionBudgetExceeded');const archiveBytes=enc.encode(JSON.stringify(value)),archiveHash=await sha(archiveBytes);
  if(archiveBytes.length>4*1024*1024)throw Error('TelemetrySanitizedBudgetExceeded');
- await immutable(env.ARCHIVE,'archive-v1/'+env.CAPTURE_ID+'/otel/'+archiveHash+'.json',value);
+ const archive={key:'archive-v1/'+env.CAPTURE_ID+'/otel/'+archiveHash+'.json',body:archiveBytes,sha256:archiveHash},partitions=[];let bytes=archiveBytes.length;
  const groups=new Map();for(const row of rows){const minute=minuteOf(row.start),group=groups.get(minute)??[];group.push(row);groups.set(minute,group);}
- for(const[minute,selected]of groups){const body={schema:2,qualification:false,evidence_layout:canonicalLayout,signal:value.signal,collector_version:value.collector_version,received_at:value.received_at,raw_batch_sha256:value.raw_batch_sha256,archive_sha256:archiveHash,minute,rows:selected};const digest=await sha(JSON.stringify(body));await immutable(env.LOGS,windowPrefix(env.CAPTURE_ID,minute)+'batches/'+digest+'.json',body);}
+ for(const[minute,selected]of groups){const body={schema:2,qualification:false,evidence_layout:canonicalLayout,signal:value.signal,collector_version:value.collector_version,received_at:value.received_at,raw_batch_sha256:value.raw_batch_sha256,archive_sha256:archiveHash,minute,rows:selected},digest=await sha(JSON.stringify(body)),part=await prepareImmutable(windowPrefix(env.CAPTURE_ID,minute)+'batches/'+digest+'.json',body);bytes+=part.body.length;partitions.push(part);}
+ return {archive,partitions,bytes};
 }
+export async function publishCanonicalRows(env,prepared){await ensureCanonicalLayout(env);await immutablePrepared(env.ARCHIVE,prepared.archive);for(const part of prepared.partitions)await immutablePrepared(env.LOGS,part);}
+export async function persistCanonicalRows(env,value){return publishCanonicalRows(env,await prepareCanonicalRows(env,value));}
 export async function prepareCanonicalTail(env,value,witnesses=[]){
  if(env.WINDOWED_EVIDENCE!=='true'||!env.ARCHIVE||env.ARCHIVE===env.LOGS)throw Error('TelemetryCanonicalArchiveRequired');
  if(witnesses.some(v=>typeof v!=='string'||! /^[a-f0-9]{64}$/.test(v))||witnesses.length>8)throw Error('TelemetryCanonicalWitnessInvalid');

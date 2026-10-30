@@ -286,3 +286,53 @@ The one older completed rehearsal predates that claim. An explicit
 identity and unused recovery actors, records its report hash in the transition,
 and archives the original manifests before assigning fresh namespace identities.
 It does not amend the failed report or confer qualification.
+
+### Receiver publication and diagnostic-only setup replay
+
+The second generation (`e70dc832-870c-46a2-aeeb-be9ce175c335`, rehearsal
+`8680ef80-6f4e-4980-8d71-a3a0a0fa3f94`) retained 21 receiver
+`TelemetryDiagnosticAdmissionExceeded` rejections in its final health sample.
+All four candidate seed corpora completed, but setup had not completed on the
+control and no measured workload ran. A separately saved settled-minute
+preflight had native Tail records but no matching canonical trace population.
+It correctly failed rather than inferring coverage from received logs.
+Deployed settings confirm logs/traces enabled at sampling rate one; the owned
+export destinations report delivery errors. Neither incomplete generation
+establishes absence of allocator faults.
+
+The receiver now prepares and persists separately as well. It coalesces
+sanitized rows by source across decoded resource fragments, with at most 1,000
+rows / four MiB per archive and a global four-MiB sanitized buffering charge.
+Prepared encoded bytes fit the same 16-MiB write budget used by the Tail
+pipeline. Up to four source batches persist concurrently. Encoded payload
+references are cleared before their reservation is released, including error
+paths; all peer physical writes have already settled. Waiting HTTP bodies stay
+unread behind one preparation lane, with at most 64 small tickets and the
+existing 15-second admission wait. The additional waiting tickets do not admit
+additional decoded JSON trees. The read-only reader retains four waiting slots.
+
+A 1,000-record/eight-source fixture produces eight coalesced archive batches
+instead of one batch per source per decode fragment. Actual-workerd tests send
+32 concurrent compressed exports, verify all 8,192 archived records and the
+prepared-byte ceiling, and check the dense 6,000-record case. Rejection sampling
+remains bounded on health; a new authenticated read-only `/rejections` paginator
+can inspect later scoped errors without reading archives or other generations.
+The destination-status lifecycle action returns only owned destination status;
+optional diagnostic excerpts redact the disposable token and bearer values.
+
+`run-paired-rehearsal --resume-setup=<completed-report>` is explicitly limited to
+failed diagnostic setup with no measured workload, no client resource failure,
+no used cold epochs, unchanged code/module/bundle/corpus identity and a matching
+closed execution claim. It replays every seed mutation with the original stable
+operation IDs; it does not append a second seed prefix. The new diagnostic has
+its own execution/attempt ledger and before/after witnesses, carries the prior
+report hash and seed execution ID, and still performs full body/receipt
+verification after its measured workload. Full gate trials and measured runs
+are not resumed by this facility. The original failed reports remain failed.
+
+Qualification additionally reads the two owned Cloudflare destination job statuses.
+Both signals must have a successful delivery after the measured interval, and
+any delivery error during capture or settlement remains disqualifying after a
+later success. Missing, stale, disabled or mismatched destination status fails
+closed. This covers receiver failures that can occur before JavaScript persists
+a rejection marker; it is additional evidence, not an allocator root-cause claim.
