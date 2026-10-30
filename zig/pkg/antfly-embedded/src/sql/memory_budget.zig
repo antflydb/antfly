@@ -17,20 +17,40 @@
 //! The owner must have a stable address and outlive every allocated object.
 const std = @import("std");
 const Budget = @This();
-/// Reclamation must run before allocator locks. Nested allocator calls share
-/// this thread-local guard so a cache free cannot re-enter an enclosing budget.
+/// Track known allocator locks across nested calls. Reclamation skips busy
+/// foreign locks and can reuse this thread's locks only for refundable frees.
 pub const AllocationGuard = struct {
     threadlocal var depth: usize = 0;
+    threadlocal var locks: [128]?*std.atomic.Mutex = @splat(null);
+    threadlocal var reclamation_depth: usize = 0;
     pub fn active() bool {
         return depth != 0;
     }
-    pub fn enter() void {
+    pub fn allowed() bool {
+        return depth < locks.len;
+    }
+    pub fn held(mutex: *std.atomic.Mutex) bool {
+        for (locks[0..@min(depth, locks.len)]) |locked| if (locked == mutex) return true;
+        return false;
+    }
+    pub fn enter(mutex: *std.atomic.Mutex) void {
+        if (depth < locks.len) locks[depth] = mutex;
         depth += 1;
     }
     pub fn leave() void {
         depth -= 1;
     }
+    pub fn beginReclaim() void {
+        reclamation_depth += 1;
+    }
+    pub fn endReclaim() void {
+        reclamation_depth -= 1;
+    }
+    pub fn reuse(mutex: *std.atomic.Mutex) bool {
+        return reclamation_depth != 0 and held(mutex);
+    }
 };
+
 pub fn parentAllocator(a: std.mem.Allocator) ?std.mem.Allocator {
     if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return null;
     const self: *Budget = @ptrCast(@alignCast(a.ptr));
@@ -46,6 +66,13 @@ pub const Pressure = struct {
     /// allocator's quotas or refund semantics from optional work planning.
     capacity: ?struct { backing: std.mem.Allocator, available: *const fn (*anyopaque) usize } = null,
 };
+/// Stable owners register optional residency without retaining a request or
+/// allocator callback beyond unregister. The list lock protects callback life.
+pub const Reclaimer = struct { ptr: *anyopaque, reclaim: *const fn (*anyopaque) bool, next: ?*Reclaimer = null };
+reclamation_mutex: std.atomic.Mutex = .unlocked,
+reclamation_count: std.atomic.Value(usize) = .init(0),
+reclaimers: ?*Reclaimer = null,
+reclaim_cursor: ?*Reclaimer = null,
 pressure: ?Pressure = null,
 backing: std.mem.Allocator,
 limit: usize,
@@ -61,6 +88,52 @@ mutex: std.atomic.Mutex = .unlocked,
 /// Reservations grow with actual allocator capacity, never a size estimate.
 admission: ?struct { ptr: *anyopaque, reserve: *const fn (*anyopaque, usize) bool, release: *const fn (*anyopaque, usize) void } = null,
 admission_exhausted: bool = false,
+
+pub fn registerReclaimer(self: *Budget, owner: *Reclaimer) void {
+    @import("antfly_platform").sync.lockYielding(&self.reclamation_mutex);
+    defer self.reclamation_mutex.unlock();
+    owner.next = self.reclaimers;
+    self.reclaimers = owner;
+    _ = self.reclamation_count.fetchAdd(1, .release);
+}
+pub fn unregisterReclaimer(self: *Budget, owner: *Reclaimer) void {
+    @import("antfly_platform").sync.lockYielding(&self.reclamation_mutex);
+    defer self.reclamation_mutex.unlock();
+    var link = &self.reclaimers;
+    while (link.*) |current| {
+        if (current == owner) {
+            link.* = current.next;
+            if (self.reclaim_cursor == owner) self.reclaim_cursor = current.next;
+            owner.next = null;
+            _ = self.reclamation_count.fetchSub(1, .release);
+            return;
+        }
+        link = &current.next;
+    }
+    unreachable;
+}
+fn reclaimOne(self: *Budget) bool {
+    @import("antfly_platform").sync.lockYielding(&self.reclamation_mutex);
+    defer self.reclamation_mutex.unlock();
+    const first = self.reclaim_cursor orelse self.reclaimers orelse return false;
+    var current = first;
+    while (true) {
+        const next = current.next orelse self.reclaimers.?;
+        if (current.reclaim(current.ptr)) {
+            self.reclaim_cursor = next;
+            return true;
+        }
+        current = next;
+        if (current == first) return false;
+    }
+}
+pub fn preflight(self: *Budget, a: std.mem.Allocator, growth: usize) void {
+    if (growth == 0 or !AllocationGuard.allowed() or self.reclamation_count.load(.acquire) == 0) return;
+    while (true) {
+        const available = headroom(a) orelse headroom(self.allocator()) orelse return;
+        if (growth <= available or !self.reclaimOne()) return;
+    }
+}
 
 pub fn finishAdmission(self: *Budget) void {
     self.lock();
@@ -145,11 +218,12 @@ pub fn headroom(a: std.mem.Allocator) ?usize {
     if (@import("spill.zig").Manager.parentAllocator(a)) |parent| return headroom(parent);
     if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return null;
     const self: *Budget = @ptrCast(@alignCast(a.ptr));
-    self.lock();
+    const held = AllocationGuard.held(&self.mutex);
+    if (!held) self.lock();
     var available = self.limit -| if (self.monotonic) self.spent else self.live;
     var backing = self.backing;
     const pressure = self.pressure;
-    self.mutex.unlock();
+    if (!held) self.mutex.unlock();
     if (pressure) |shared| if (shared.capacity) |capacity| {
         available = @min(available, capacity.available(shared.ptr));
         backing = capacity.backing;
@@ -276,7 +350,7 @@ fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?
 fn allocate(comptime scratch: bool, ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
     const self: *Budget = @ptrCast(@alignCast(ptr));
     @import("spill.zig").Manager.prepareAllocator(if (scratch) reclaimingAllocator(self.allocator()) else self.allocator(), len);
-    AllocationGuard.enter();
+    AllocationGuard.enter(&self.mutex);
     defer AllocationGuard.leave();
     self.lock();
     defer self.mutex.unlock();
@@ -295,7 +369,7 @@ fn resize(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize
 fn resizeMode(comptime scratch: bool, ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
     const self: *Budget = @ptrCast(@alignCast(ptr));
     @import("spill.zig").Manager.prepareAllocator(if (scratch) reclaimingAllocator(self.allocator()) else self.allocator(), len -| bytes.len);
-    AllocationGuard.enter();
+    AllocationGuard.enter(&self.mutex);
     defer AllocationGuard.leave();
     self.lock();
     defer self.mutex.unlock();
@@ -315,7 +389,7 @@ fn remap(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize,
 fn remapMode(comptime scratch: bool, ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
     const self: *Budget = @ptrCast(@alignCast(ptr));
     @import("spill.zig").Manager.prepareAllocator(if (scratch) reclaimingAllocator(self.allocator()) else self.allocator(), len -| bytes.len);
-    AllocationGuard.enter();
+    AllocationGuard.enter(&self.mutex);
     defer AllocationGuard.leave();
     self.lock();
     defer self.mutex.unlock();
@@ -342,10 +416,11 @@ fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) v
 }
 fn freeMode(comptime scratch: bool, ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
     const self: *Budget = @ptrCast(@alignCast(ptr));
-    AllocationGuard.enter();
+    const reuse = AllocationGuard.reuse(&self.mutex);
+    AllocationGuard.enter(&self.mutex);
     defer AllocationGuard.leave();
-    self.lock();
-    defer self.mutex.unlock();
+    if (!reuse) self.lock();
+    defer if (!reuse) self.mutex.unlock();
     const backing = if (scratch) reclaimingAllocator(self.backing) else self.backing;
     backing.rawFree(bytes, alignment, ra);
     self.releaseAdmission(bytes.len);

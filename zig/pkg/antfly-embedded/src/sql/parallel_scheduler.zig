@@ -41,7 +41,7 @@ pub const LockedAllocator = struct {
     fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         @import("spill.zig").Manager.prepareAllocator(self.allocator(), len);
-        @import("memory_budget.zig").AllocationGuard.enter();
+        @import("memory_budget.zig").AllocationGuard.enter(self.shared_mutex orelse &self.mutex);
         defer @import("memory_budget.zig").AllocationGuard.leave();
         self.lock();
         defer self.unlock();
@@ -50,7 +50,7 @@ pub const LockedAllocator = struct {
     fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         @import("spill.zig").Manager.prepareAllocator(self.allocator(), len -| bytes.len);
-        @import("memory_budget.zig").AllocationGuard.enter();
+        @import("memory_budget.zig").AllocationGuard.enter(self.shared_mutex orelse &self.mutex);
         defer @import("memory_budget.zig").AllocationGuard.leave();
         self.lock();
         defer self.unlock();
@@ -59,7 +59,7 @@ pub const LockedAllocator = struct {
     fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
         @import("spill.zig").Manager.prepareAllocator(self.allocator(), len -| bytes.len);
-        @import("memory_budget.zig").AllocationGuard.enter();
+        @import("memory_budget.zig").AllocationGuard.enter(self.shared_mutex orelse &self.mutex);
         defer @import("memory_budget.zig").AllocationGuard.leave();
         self.lock();
         defer self.unlock();
@@ -67,8 +67,13 @@ pub const LockedAllocator = struct {
     }
     fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
-        self.lock();
-        defer self.unlock();
+        const Guard = @import("memory_budget.zig").AllocationGuard;
+        const mutex = self.shared_mutex orelse &self.mutex;
+        const reuse = Guard.reuse(mutex);
+        Guard.enter(mutex);
+        defer Guard.leave();
+        if (!reuse) self.lock();
+        defer if (!reuse) self.unlock();
         self.backing.rawFree(bytes, alignment, ra);
     }
 };

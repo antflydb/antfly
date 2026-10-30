@@ -2550,19 +2550,29 @@ is individually reclaimable and charged to the same statement allocator.
 A reader targets at most 16 MiB and half of its retained bytes plus current
 statement headroom, less its pending output reservation. The target contracts
 as sibling work consumes memory. Unknown allocator headroom retains a 64-KiB
-fallback. Known arena/monotonic backings keep that conservative target and four
-root slots, and stay outside shared reclamation. Cache metadata uses independently
+fallback. Arena, monotonic and opaque free paths keep that conservative target
+and four root slots, and stay outside shared reclamation. Cache metadata uses independently
 reclaimable scratch allocation without bypassing enclosing quotas. Root entries and unique-owner metadata are separately bounded at 1024
 and 4096. One required indivisible block may exceed the optional target; required
 allocations can reclaim that cache reference. Pins retain their data until the
 borrower releases them. No statement, disk, scheduler or response quota grows.
 
-Scoped spill managers share a round-robin reclamation registry. Before required
-allocation, they reclaim idle sibling cache roots until admission fits or no
-reclaimable root remains. Known budget and synchronization wrappers preflight
-before their locks; a thread-local guard prevents nested allocator calls from
-re-entering an enclosing budget during reclamation. Busy cache metadata is skipped without waiting for its
-lock; no provider work runs under the registry lock. Cache metadata admission
+Scoped spill managers share a round-robin reclamation registry. Stable reclaim
+hooks also attach that registry to each enclosing known statement budget, so
+result encoding and other direct budget allocations can release idle spill
+residency. Hooks select caches charged to that budget and unregister before the
+manager retires; empty statements take an atomic fast path without a list lock.
+Budget hook and cache-directory locks have an explicit order, with nonblocking
+reverse lookup to keep concurrent registration and reclamation independent.
+Before required allocation, they reclaim idle sibling cache roots until
+admission fits or no reclaimable root remains. Known budget and synchronization
+wrappers preflight before their locks. A thread-local guard tracks allocator
+locks held by the current thread. Reclamation pre-acquires every known free path
+without waiting; only proven refundable teardown can reuse those locks for
+deallocation. Ordinary allocation remains non-reentrant. This covers arena
+growth behind a shared synchronization wrapper without reclaiming arena-owned
+payloads. Busy cache metadata or allocator locks are skipped; no provider work
+runs under the registry lock. Cache metadata admission
 can decline without losing the required row or poisoning its budget. Genuine
 allocator and integrity errors still propagate. Cache teardown unregisters its
 stable owner before retiring every retained block and metadata allocation.

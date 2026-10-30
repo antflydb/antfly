@@ -27,6 +27,10 @@ const frame_bytes = 25;
 const snappy = @import("../encoding/snappy.zig");
 
 pub const Manager = struct {
+    const BudgetLink = struct { manager: *Manager, budget: *@import("memory_budget.zig"), hook: @import("memory_budget.zig").Reclaimer };
+    payload_budget_links: [32]BudgetLink = undefined,
+    payload_budget_count: usize = 0,
+    payload_cache_users: usize = 0,
     /// Scoped allocation owners retain the enclosing statement's disk and FD
     /// admission. Children close before this borrowed owner is destroyed.
     quota_parent: ?*Manager = null,
@@ -113,6 +117,8 @@ pub const Manager = struct {
         defer root.payload_cache_mutex.unlock();
         cache.next_cache = root.payload_caches;
         root.payload_caches = cache;
+        self.payload_cache_users += 1;
+        if (self.payload_cache_users == 1) self.registerPayloadBudgets();
     }
     fn unregisterPayloadCache(self: *Manager, cache: *PayloadCache) void {
         const root = self.cacheRoot();
@@ -124,6 +130,11 @@ pub const Manager = struct {
                 link.* = current.next_cache;
                 if (root.payload_reclaim_cursor == cache) root.payload_reclaim_cursor = current.next_cache;
                 cache.next_cache = null;
+                self.payload_cache_users -= 1;
+                if (self.payload_cache_users == 0) {
+                    for (self.payload_budget_links[0..self.payload_budget_count]) |*link_| link_.budget.unregisterReclaimer(&link_.hook);
+                    self.payload_budget_count = 0;
+                }
                 return;
             }
             link = &current.next_cache;
@@ -131,19 +142,54 @@ pub const Manager = struct {
         unreachable;
     }
     fn reclaimPayloadCache(self: *Manager) bool {
+        return self.reclaimPayloadCacheFor(null);
+    }
+    fn reclaimPayloadCacheFor(self: *Manager, budget: ?*@import("memory_budget.zig")) bool {
         const root = self.cacheRoot();
-        @import("antfly_platform").sync.lockYielding(&root.payload_cache_mutex);
+        // Budget hooks hold their own lifetime lock. Registration takes this
+        // directory lock first, so callbacks must never wait for it in reverse.
+        if (!root.payload_cache_mutex.tryLock()) return false;
         defer root.payload_cache_mutex.unlock();
         const first = root.payload_reclaim_cursor orelse root.payload_caches orelse return false;
         var current = first;
         while (true) {
             const next = current.next_cache orelse root.payload_caches.?;
-            if (current.evict()) {
+            if ((budget == null or containsBudget(current.manager.?.alloc, budget.?)) and current.evict()) {
                 root.payload_reclaim_cursor = next;
                 return true;
             }
             current = next;
             if (current == first) return false;
+        }
+    }
+    fn allocatorParent(a: Allocator) ?Allocator {
+        if (@import("memory_budget.zig").parentAllocator(a)) |parent| return parent;
+        if (parentAllocator(a)) |parent| return parent;
+        return @import("parallel_scheduler.zig").LockedAllocator.parentAllocator(a);
+    }
+    fn containsBudget(a: Allocator, budget: *@import("memory_budget.zig")) bool {
+        var current = a;
+        for (0..32) |_| {
+            if (@import("memory_budget.zig").parentAllocator(current) != null and current.ptr == @as(*anyopaque, @ptrCast(budget))) return true;
+            current = allocatorParent(current) orelse return false;
+        }
+        return false;
+    }
+    fn reclaimBudget(raw: *anyopaque) bool {
+        const link: *BudgetLink = @ptrCast(@alignCast(raw));
+        return link.manager.reclaimPayloadCacheFor(link.budget);
+    }
+    fn registerPayloadBudgets(self: *Manager) void {
+        var current = self.alloc;
+        for (0..32) |_| {
+            if (@import("memory_budget.zig").parentAllocator(current) != null) {
+                const budget: *@import("memory_budget.zig") = @ptrCast(@alignCast(current.ptr));
+                const link = &self.payload_budget_links[self.payload_budget_count];
+                link.* = .{ .manager = self, .budget = budget, .hook = .{ .ptr = link, .reclaim = reclaimBudget } };
+                self.payload_budget_count += 1;
+                budget.registerReclaimer(&link.hook);
+            }
+            current = allocatorParent(current) orelse return;
         }
     }
     fn reclaimableAllocator(a: Allocator) bool {
@@ -165,7 +211,11 @@ pub const Manager = struct {
                 continue;
             }
             const reclaimed = @import("antfly_platform").allocator.reclaimingScratch(current);
-            return reclaimed.ptr == current.ptr and reclaimed.vtable == current.vtable;
+            if (reclaimed.ptr != current.ptr or reclaimed.vtable != current.vtable) return false;
+            if (current.vtable == std.heap.smp_allocator.vtable or current.vtable == std.heap.page_allocator.vtable) return true;
+            if (comptime @import("builtin").link_libc) if (current.vtable == std.heap.c_allocator.vtable) return true;
+            if (comptime @import("builtin").is_test) if (current.vtable == std.testing.allocator.vtable) return true;
+            return false;
         }
         return false;
     }
@@ -173,15 +223,18 @@ pub const Manager = struct {
     /// admission can then reclaim a nested manager's idle payloads safely.
     pub fn prepareAllocator(a: Allocator, growth: usize) void {
         const Budget = @import("memory_budget.zig");
-        if (Budget.AllocationGuard.active() or growth == 0) return;
+        if (!Budget.AllocationGuard.allowed() or growth == 0) return;
         var current = a;
         for (0..32) |_| {
             if (parentAllocator(current) != null) {
                 const manager: *Manager = @ptrCast(@alignCast(current.ptr));
                 manager.prepareAllocationFor(a, growth);
-                return;
+                current = manager.alloc;
+                continue;
             }
             if (Budget.parentAllocator(current)) |parent| {
+                const budget: *Budget = @ptrCast(@alignCast(current.ptr));
+                budget.preflight(a, growth);
                 current = parent;
                 continue;
             }
@@ -195,19 +248,16 @@ pub const Manager = struct {
         }
     }
     fn prepareAllocationFor(self: *Manager, a: Allocator, growth: usize) void {
-        if (@import("memory_budget.zig").AllocationGuard.active()) return;
+        if (!@import("memory_budget.zig").AllocationGuard.allowed()) return;
         while (true) {
             const available = @import("memory_budget.zig").headroom(a) orelse return;
             if (growth <= available or !self.reclaimPayloadCache()) return;
         }
     }
-    fn prepareAllocation(self: *Manager, growth: usize) void {
-        self.prepareAllocationFor(self.alloc, growth);
-    }
     fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *Manager = @ptrCast(@alignCast(raw));
-        self.prepareAllocation(len);
-        @import("memory_budget.zig").AllocationGuard.enter();
+        prepareAllocator(self.allocator(), len);
+        @import("memory_budget.zig").AllocationGuard.enter(&self.allocation_mutex);
         defer @import("memory_budget.zig").AllocationGuard.leave();
         self.allocationLock();
         defer self.allocation_mutex.unlock();
@@ -215,8 +265,8 @@ pub const Manager = struct {
     }
     fn resizeAllocation(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *Manager = @ptrCast(@alignCast(raw));
-        self.prepareAllocation(len -| bytes.len);
-        @import("memory_budget.zig").AllocationGuard.enter();
+        prepareAllocator(self.allocator(), len -| bytes.len);
+        @import("memory_budget.zig").AllocationGuard.enter(&self.allocation_mutex);
         defer @import("memory_budget.zig").AllocationGuard.leave();
         self.allocationLock();
         defer self.allocation_mutex.unlock();
@@ -224,8 +274,8 @@ pub const Manager = struct {
     }
     fn remapAllocation(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
         const self: *Manager = @ptrCast(@alignCast(raw));
-        self.prepareAllocation(len -| bytes.len);
-        @import("memory_budget.zig").AllocationGuard.enter();
+        prepareAllocator(self.allocator(), len -| bytes.len);
+        @import("memory_budget.zig").AllocationGuard.enter(&self.allocation_mutex);
         defer @import("memory_budget.zig").AllocationGuard.leave();
         self.allocationLock();
         defer self.allocation_mutex.unlock();
@@ -233,8 +283,12 @@ pub const Manager = struct {
     }
     fn freeAllocation(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const self: *Manager = @ptrCast(@alignCast(raw));
-        self.allocationLock();
-        defer self.allocation_mutex.unlock();
+        const Guard = @import("memory_budget.zig").AllocationGuard;
+        const reuse = Guard.reuse(&self.allocation_mutex);
+        Guard.enter(&self.allocation_mutex);
+        defer Guard.leave();
+        if (!reuse) self.allocationLock();
+        defer if (!reuse) self.allocation_mutex.unlock();
         self.alloc.rawFree(bytes, alignment, ra);
     }
     fn increment(self: *Manager, comptime field: []const u8, value: anytype) void {
@@ -346,6 +400,7 @@ pub const Manager = struct {
         return .{ .manager = self, .file = file, .id = self.sequence };
     }
     pub fn deinit(self: *Manager) void {
+        std.debug.assert(self.payload_cache_users == 0 and self.payload_budget_count == 0);
         if (self.execution_pages) |owner| {
             owner.deinit();
             self.allocator().destroy(owner);
@@ -1410,7 +1465,7 @@ pub const CachePressure = struct {
             const available = @min(shared orelse std.math.maxInt(usize), local orelse std.math.maxInt(usize));
             if (growth <= available) break;
             if (self.evict(self.context)) continue;
-            if (!@import("memory_budget.zig").AllocationGuard.active() and growth > (shared orelse std.math.maxInt(usize)) and self.manager.reclaimPayloadCache()) continue;
+            if (@import("memory_budget.zig").AllocationGuard.allowed() and growth > (shared orelse std.math.maxInt(usize)) and self.manager.reclaimPayloadCache()) continue;
             break;
         }
     }
@@ -3822,12 +3877,12 @@ const PayloadCache = struct {
     fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *PayloadCache = @ptrCast(@alignCast(raw));
         const manager = self.manager.?;
-        manager.prepareAllocationFor(self.metadata_backing.?, len +| self.reserve);
+        Manager.prepareAllocator(self.metadata_backing.?, len +| self.reserve);
         if (@import("memory_budget.zig").headroom(self.metadata_backing.?)) |available| if (len +| self.reserve > available) {
             self.denied = true;
             return null;
         };
-        @import("memory_budget.zig").AllocationGuard.enter();
+        @import("memory_budget.zig").AllocationGuard.enter(&manager.allocation_mutex);
         defer @import("memory_budget.zig").AllocationGuard.leave();
         manager.allocationLock();
         defer manager.allocation_mutex.unlock();
@@ -3844,10 +3899,13 @@ const PayloadCache = struct {
     fn free(raw: *anyopaque, buffer: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const self: *PayloadCache = @ptrCast(@alignCast(raw));
         self.metadata_bytes -= buffer.len;
-        @import("memory_budget.zig").AllocationGuard.enter();
+        const Guard = @import("memory_budget.zig").AllocationGuard;
+        const manager = self.manager.?;
+        const reuse = Guard.reuse(&manager.allocation_mutex);
+        Guard.enter(&manager.allocation_mutex);
         defer @import("memory_budget.zig").AllocationGuard.leave();
-        self.manager.?.allocationLock();
-        defer self.manager.?.allocation_mutex.unlock();
+        if (!reuse) manager.allocationLock();
+        defer if (!reuse) manager.allocation_mutex.unlock();
         self.metadata_backing.?.rawFree(buffer, alignment, ra);
     }
     fn target(self: *const PayloadCache) usize {
@@ -3931,6 +3989,9 @@ const PayloadCache = struct {
         self.newest = entry;
     }
     fn evictLocked(self: *PayloadCache) bool {
+        const Guard = @import("memory_budget.zig").AllocationGuard;
+        if (self.registered) Guard.beginReclaim();
+        defer if (self.registered) Guard.endReclaim();
         const entry = self.oldest orelse {
             const freed = self.metadata_bytes != 0;
             self.entries.deinit(self.allocator());
@@ -3957,9 +4018,65 @@ const PayloadCache = struct {
         }
         return true;
     }
+    // Reclamation holds a directory/budget callback lifetime lock. Never wait
+    // for another thread's allocator mutex: it may itself be preflighting.
+    // Pre-acquire every known free path, then reuse these locks for teardown.
+    const FreeLocks = struct {
+        held: [128]*std.atomic.Mutex = undefined,
+        count: usize = 0,
+        fn take(self: *FreeLocks, mutex: *std.atomic.Mutex) bool {
+            const Guard = @import("memory_budget.zig").AllocationGuard;
+            if (Guard.held(mutex)) return true;
+            if (self.count == self.held.len or !Guard.allowed() or !mutex.tryLock()) return false;
+            self.held[self.count] = mutex;
+            self.count += 1;
+            Guard.enter(mutex);
+            return true;
+        }
+        fn allocator(self: *FreeLocks, a: Allocator) bool {
+            var current = a;
+            for (0..32) |_| {
+                if (Manager.parentAllocator(current)) |parent| {
+                    const manager: *Manager = @ptrCast(@alignCast(current.ptr));
+                    if (!self.take(&manager.allocation_mutex)) return false;
+                    current = parent;
+                } else if (@import("memory_budget.zig").parentAllocator(current)) |parent| {
+                    const budget: *@import("memory_budget.zig") = @ptrCast(@alignCast(current.ptr));
+                    if (!self.take(&budget.mutex)) return false;
+                    current = parent;
+                } else if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(current)) |parent| {
+                    const locked: *@import("parallel_scheduler.zig").LockedAllocator = @ptrCast(@alignCast(current.ptr));
+                    if (!self.take(locked.shared_mutex orelse &locked.mutex)) return false;
+                    current = parent;
+                } else return Manager.reclaimableAllocator(current);
+            }
+            return false;
+        }
+        fn block(self: *FreeLocks, value: *Block) bool {
+            if (!self.allocator(value.a) or !self.allocator(value.arena.child_allocator)) return false;
+            if (value.encoded) |encoded| if (encoded.json_owner) |owner| if (!self.allocator(owner.arena.child_allocator)) return false;
+            for (value.dependencies.items) |body| if (!self.block(body)) return false;
+            return true;
+        }
+        fn deinit(self: *FreeLocks) void {
+            while (self.count != 0) {
+                self.count -= 1;
+                @import("memory_budget.zig").AllocationGuard.leave();
+                self.held[self.count].unlock();
+            }
+        }
+    };
     fn evict(self: *PayloadCache) bool {
+        const Guard = @import("memory_budget.zig").AllocationGuard;
+        if (!Guard.allowed() or (!self.registered and Guard.active())) return false;
         if (!self.mutex.tryLock()) return false;
         defer self.mutex.unlock();
+        var locks: FreeLocks = .{};
+        defer locks.deinit();
+        if (self.registered) {
+            if (!locks.take(&self.manager.?.allocation_mutex) or !locks.allocator(self.metadata_backing.?)) return false;
+            if (self.oldest) |entry| if (!locks.block(entry.block)) return false;
+        }
         return self.evictLocked();
     }
     fn trim(self: *PayloadCache) void {
@@ -9808,7 +9925,7 @@ test "SQL adaptive payload cache counts shared bodies and aliases and unwinds me
             const value = try a.create(Sequential.OwnedBlock);
             value.* = .{ .a = a, .arena = .init(a), .physical_offset = offset };
             errdefer value.release();
-            _ = try value.arena.allocator().alloc(u8, 8192);
+            _ = try value.arena.allocator().alloc(u8, 4096);
             return value;
         }
         fn run(backing: Allocator) !void {
@@ -9860,50 +9977,69 @@ test "SQL adaptive payload cache counts shared bodies and aliases and unwinds me
 }
 
 test "SQL adaptive payload cache returns idle sibling capacity to required scoped allocations" {
-    const Hook = struct {
-        fn check(_: *anyopaque) !void {}
-    };
-    var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 512 << 10 };
-    defer std.debug.assert(budget.live == 0);
-    var marker: u8 = 0;
-    var manager: Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = Hook.check };
-    defer manager.deinit();
-    var nested: @import("memory_budget.zig") = .{ .backing = manager.allocator(), .limit = 512 << 10 };
-    defer std.debug.assert(nested.live == 0);
-    var scoped = manager.scoped(nested.allocator());
-    defer scoped.deinit();
-    var first: PayloadCache = .{};
-    var second: PayloadCache = .{};
-    second.bind(&scoped);
-    defer second.deinit();
-    first.bind(&manager);
-    defer first.deinit();
-    for ([_]*PayloadCache{ &first, &second }, 0..) |cache, offset| {
-        const a = cache.manager.?.allocator();
-        const block = try a.create(Sequential.OwnedBlock);
-        block.* = .{ .a = a, .arena = .init(a), .physical_offset = offset };
-        defer block.release();
-        _ = try block.arena.allocator().alloc(u8, 32 << 10);
-        const rows = try block.arena.allocator().alloc(Row, 1);
-        rows[0] = .{ .values = &.{}, .keys = &.{}, .ordinal = 42 };
-        block.rows = rows;
-        try cache.insert(block, 0);
+    for (0..4) |mode| {
+        const Hook = struct {
+            fn check(_: *anyopaque) !void {}
+        };
+        var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 512 << 10 };
+        defer std.debug.assert(budget.live == 0);
+        var marker: u8 = 0;
+        var shared_backing: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = budget.allocator() };
+        var manager: Manager = .{ .alloc = if (mode == 3) shared_backing.allocator() else budget.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = Hook.check };
+        defer manager.deinit();
+        var nested: @import("memory_budget.zig") = .{ .backing = manager.allocator(), .limit = 512 << 10 };
+        defer std.debug.assert(nested.live == 0);
+        var scoped = if (mode == 3) Manager{ .alloc = nested.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = Hook.check } else manager.scoped(nested.allocator());
+        defer scoped.deinit();
+        var first: PayloadCache = .{};
+        var second: PayloadCache = .{};
+        second.bind(&scoped);
+        defer second.deinit();
+        first.bind(&manager);
+        defer first.deinit();
+        for ([_]*PayloadCache{ &first, &second }, 0..) |cache, offset| {
+            const a = cache.manager.?.allocator();
+            const block = try a.create(Sequential.OwnedBlock);
+            block.* = .{ .a = a, .arena = .init(a), .physical_offset = offset };
+            defer block.release();
+            _ = try block.arena.allocator().alloc(u8, 32 << 10);
+            const rows = try block.arena.allocator().alloc(Row, 1);
+            rows[0] = .{ .values = &.{}, .keys = &.{}, .ordinal = 42 };
+            block.rows = rows;
+            try cache.insert(block, 0);
+        }
+        const pinned = first.get(0, 0).?;
+        defer pinned.release();
+        var region = std.heap.ArenaAllocator.init(budget.allocator());
+        defer region.deinit();
+        var locked_region: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = region.allocator(), .shared_mutex = if (mode == 3) &shared_backing.mutex else null };
+        const remaining: usize = if (mode == 3) 40 << 10 else 8 << 10;
+        const ballast = try budget.allocator().alloc(u8, @import("memory_budget.zig").headroom(budget.allocator()).? - remaining);
+        defer budget.allocator().free(ballast);
+        const required_allocator = switch (mode) {
+            0 => nested.allocator(),
+            1 => budget.allocator(),
+            else => locked_region.allocator(),
+        };
+        const required = block: {
+            // A busy reader must not make another operator wait for its cache lock.
+            first.lock();
+            defer first.mutex.unlock();
+            // A sibling can be preflighting while holding its allocator lock.
+            // Reclamation must skip it rather than wait under a budget hook.
+            second.manager.?.allocationLock();
+            const skipped = !second.evict();
+            second.manager.?.allocation_mutex.unlock();
+            try std.testing.expect(skipped);
+            break :block try required_allocator.alloc(u8, 32 << 10);
+        };
+        defer required_allocator.free(required);
+        if (mode == 3) try std.testing.expect(region.queryCapacity() > remaining);
+        try std.testing.expectEqual(@as(u64, 42), pinned.rows[0].ordinal);
+        try std.testing.expectEqual(@as(usize, 0), second.entries.count());
+        try std.testing.expect(!budget.isLocallyExhausted());
+        try std.testing.expect(budget.live <= budget.limit);
     }
-    const pinned = first.get(0, 0).?;
-    defer pinned.release();
-    const ballast = try budget.allocator().alloc(u8, @import("memory_budget.zig").headroom(budget.allocator()).? - (8 << 10));
-    defer budget.allocator().free(ballast);
-    const required = block: {
-        // A busy reader must not make another operator wait for its cache lock.
-        first.lock();
-        defer first.mutex.unlock();
-        break :block try nested.allocator().alloc(u8, 32 << 10);
-    };
-    defer nested.allocator().free(required);
-    try std.testing.expectEqual(@as(u64, 42), pinned.rows[0].ordinal);
-    try std.testing.expectEqual(@as(usize, 0), second.entries.count());
-    try std.testing.expect(!budget.isLocallyExhausted());
-    try std.testing.expect(budget.live <= budget.limit);
 }
 
 test "SQL adaptive payload cache keeps region allocators outside shared reclamation" {
