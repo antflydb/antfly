@@ -17961,6 +17961,9 @@ fn glinerWordEmbeddings(ctx: *anyopaque, request: *const ops.GlinerWordEmbedding
 }
 
 fn glinerLabelGruCombined(ctx: *anyopaque, request: *const ops.GlinerLabelGruCombinedRequest) anyerror!?CT {
+    // CUDA's checked-in kernel implements only CountLSTMv2's residual form.
+    // Decline the CountLSTMv1 request rather than silently returning h1 + h0.
+    if (!request.add_residual) return null;
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const label_tensor = tensorFromCt(request.label_embeddings);
     try ensureF32(label_tensor);

@@ -32,6 +32,7 @@ const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const model_compatibility = @import("../models/compatibility.zig");
 const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
+const gliner_specialty = @import("../models/gliner_specialty_qualification.zig");
 const managed_receipt = @import("../registry/managed_receipt.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const c_file = @import("../util/c_file.zig");
@@ -3422,6 +3423,7 @@ pub const LoadedModel = struct {
     }
 
     pub fn supportsClassification(self: *LoadedModel) bool {
+        if (self.manifest.gliner_specialty_profile) |profile| return profile == .gliguard;
         return model_caps.modelSupportsCapability(
             @tagName(self.manifest.model_type),
             self.manifest.gliner_model_type,
@@ -3431,6 +3433,7 @@ pub const LoadedModel = struct {
     }
 
     pub fn supportsExtraction(self: *LoadedModel) bool {
+        if (self.manifest.gliner_specialty_profile) |profile| return profile == .pii_multi;
         return model_caps.modelSupportsCapability(
             @tagName(self.manifest.model_type),
             self.manifest.gliner_model_type,
@@ -3440,6 +3443,7 @@ pub const LoadedModel = struct {
     }
 
     pub fn supportsRelationExtraction(self: *LoadedModel) bool {
+        if (self.manifest.gliner_specialty_profile != null) return false;
         return model_caps.modelSupportsCapability(
             @tagName(self.manifest.model_type),
             self.manifest.gliner_model_type,
@@ -8630,7 +8634,7 @@ pub const ModelManager = struct {
                     // separate pathname check leaves a replacement window.
                     try man.verifyBoundarySidecar("tokenizer.json", bytes);
                     break :blk try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(self.allocator, bytes, .{ .strict_unigram_normalizer = true });
-                } else if (man.gliner_architecture == .span and man.gliner_span_declared) blk: {
+                } else if (man.gliner_architecture == .span and (man.gliner_span_declared or man.gliner_specialty_profile != null)) blk: {
                     const path = man.tokenizer_json_path orelse return error.NoTokenizerFound;
                     const bytes = try c_file.readFileMax(self.allocator, path, 32 * 1024 * 1024);
                     defer self.allocator.free(bytes);
@@ -8639,7 +8643,9 @@ pub const ModelManager = struct {
                         if (digest.size_bytes != expected.size_bytes or !std.mem.eql(u8, &digest.sha256, &expected.sha256))
                             return error.GlinerDecisionArtifactMismatch;
                     } else return error.MissingGlinerDecisionIdentity;
-                    const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(self.allocator, bytes);
+                    const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(self.allocator, bytes, .{
+                        .strict_unigram_normalizer = man.gliner_specialty_profile != null,
+                    });
                     gliner_span_tokenizer_digest = digest;
                     break :blk tokenizer;
                 } else try loadHuggingFaceTokenizerFromManifest(self.allocator, &man);
@@ -10457,7 +10463,55 @@ fn estimateModelLoadAdmission(
         session_factory.metalDebertaFastPathAdmissionAmounts(man)
     else
         runtime.tier.memory.AdmissionAmounts{};
-    return nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
+    var plan = try nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
+    if (backend_runtime.backend == .metal) {
+        const host_source_bytes = metalQualifiedSpecialtyF32HostSourceBytes(man, weights);
+        try addMetalResidentHostSource(&plan, host_source_bytes);
+    }
+    return plan;
+}
+
+/// Exact specialty sessions borrow their immutable F32 safetensors while
+/// installing Metal mirrors. The lazy tier cache retains those source pages
+/// after construction, so reserve them with the model rather than letting the
+/// first request discover host pressure through a cache credit that cannot
+/// evict another idle model. Size is only a cheap admission prefilter; session
+/// construction still authenticates the complete weight digest and F32 tensor
+/// inventory before execution.
+fn metalQualifiedSpecialtyF32HostSourceBytes(
+    man: manifest_mod.ModelManifest,
+    artifact_bytes: usize,
+) usize {
+    const declared = man.gliner_specialty_profile orelse return 0;
+    const artifact_kind = man.nativeWeightArtifactKind() orelse return 0;
+    if (man.gliner_architecture != .span or
+        man.gliner_span_encoder_family != .deberta or
+        artifact_kind != .safetensors or
+        man.safetensors_index_path != null)
+    {
+        return 0;
+    }
+    const size_profile = gliner_specialty.profileForWeightSize(
+        std.math.cast(u64, artifact_bytes) orelse return 0,
+    ) orelse return 0;
+    return if (size_profile == declared) artifact_bytes else 0;
+}
+
+fn addMetalResidentHostSource(plan: *ModelLoadAdmissionPlan, bytes: usize) !void {
+    if (bytes == 0) return;
+    const resident_host = std.math.add(
+        usize,
+        plan.resident.host_weight_bytes,
+        bytes,
+    ) catch return error.ResourceLimitExceeded;
+    // Preserve the existing import staging above the newly resident source.
+    const peak_host = std.math.add(
+        usize,
+        plan.peak.host_weight_bytes,
+        bytes,
+    ) catch return error.ResourceLimitExceeded;
+    plan.resident.host_weight_bytes = resident_host;
+    plan.peak.host_weight_bytes = peak_host;
 }
 
 fn a4bGpuModelLoadAdmission(
@@ -13120,6 +13174,106 @@ test "gpu model admission classifies weights and persistent scratch" {
     try std.testing.expectEqual(@as(usize, 0), metal.resident.host_weight_bytes);
     try std.testing.expectEqual(weights + extra_backend_resident.backend_weight_bytes, metal.resident.backend_weight_bytes);
     try std.testing.expectEqual(extra_backend_resident.backend_scratch_bytes, metal.resident.backend_scratch_bytes);
+}
+
+test "qualified F32 GLiNER specialty Metal admission retains host source without broadening generic models" {
+    const pii_bytes: usize = @intCast(gliner_specialty.pii_weight.size_bytes);
+    const guard_bytes: usize = @intCast(gliner_specialty.gliguard_weight.size_bytes);
+    const specialty = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .safetensors_path = "model.safetensors",
+        .gliner_architecture = .span,
+        .gliner_span_encoder_family = .deberta,
+        .gliner_specialty_profile = .pii_multi,
+    };
+    try std.testing.expectEqual(pii_bytes, metalQualifiedSpecialtyF32HostSourceBytes(specialty, pii_bytes));
+    try std.testing.expectEqual(@as(usize, 0), metalQualifiedSpecialtyF32HostSourceBytes(specialty, guard_bytes));
+
+    var guard = specialty;
+    guard.gliner_specialty_profile = .gliguard;
+    try std.testing.expectEqual(guard_bytes, metalQualifiedSpecialtyF32HostSourceBytes(guard, guard_bytes));
+
+    var generic = specialty;
+    generic.gliner_specialty_profile = null;
+    try std.testing.expectEqual(@as(usize, 0), metalQualifiedSpecialtyF32HostSourceBytes(generic, pii_bytes));
+    var legacy_decide = specialty;
+    legacy_decide.gliner_specialty_profile = null;
+    legacy_decide.gliner_span_declared = true;
+    try std.testing.expectEqual(@as(usize, 0), metalQualifiedSpecialtyF32HostSourceBytes(legacy_decide, pii_bytes));
+    var reduced = specialty;
+    reduced.safetensors_path = null;
+    reduced.gguf_path = "model.gguf";
+    try std.testing.expectEqual(@as(usize, 0), metalQualifiedSpecialtyF32HostSourceBytes(reduced, pii_bytes));
+
+    var plan = try nativeModelLoadAdmission(1024, .metal, .{ .backend_scratch_bytes = 64 });
+    const old_peak_host = plan.peak.host_weight_bytes;
+    try addMetalResidentHostSource(&plan, pii_bytes);
+    try std.testing.expectEqual(pii_bytes, plan.resident.host_weight_bytes);
+    try std.testing.expectEqual(old_peak_host + pii_bytes, plan.peak.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 64), plan.resident.backend_scratch_bytes);
+
+    var overflow = ModelLoadAdmissionPlan{
+        .peak = .{ .host_weight_bytes = std.math.maxInt(usize) },
+        .resident = .{},
+    };
+    try std.testing.expectError(error.ResourceLimitExceeded, addMetalResidentHostSource(&overflow, 1));
+    try std.testing.expectEqual(@as(usize, 0), overflow.resident.host_weight_bytes);
+    try std.testing.expectEqual(std.math.maxInt(usize), overflow.peak.host_weight_bytes);
+}
+
+test "specialty Metal host baseline evicts prior model and avoids lazy cache double charge" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.initWithRuntimeEpoch(
+        allocator,
+        .{ .allocator = allocator, .preferred_backends = &.{.metal} },
+        0x51ec,
+    );
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+
+    // Build a lifecycle-complete idle model, then replace its fixture CPU
+    // lease with the GPU-host residency used by a Metal specialty source.
+    var pii_probe = TeardownTestProbe{};
+    const pii = try teardownTestModel(&manager, &pii_probe);
+    pii.resource_lease.?.release();
+    pii.resource_lease = try manager.acquireAmountsWithEviction(
+        .gpu,
+        .{ .host_limit_bytes = 64 },
+        .{ .host_weight_bytes = 64 },
+    );
+    pii.active_handles = 0;
+    pii.last_used_ns = 1;
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "specialty-pii-metal"), pii);
+
+    // A second qualified model cannot share this deliberately tiny host
+    // domain. Acquiring its model-owned source reservation must evict PII
+    // before any request-time lazy tensor asks the tier cache for credit.
+    var guard_lease = try manager.acquireAmountsWithEviction(
+        .gpu,
+        .{ .host_limit_bytes = 64 },
+        .{ .host_weight_bytes = 64 },
+    );
+    defer guard_lease.release();
+    try std.testing.expect(pii_probe.closed);
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 64), manager.admissionController().snapshot().host_weight_bytes);
+
+    // The session tier cache receives the same resident amount as its baseline.
+    // Materializing the complete borrowed F32 source therefore owns no second
+    // aggregate credit and remains admissible after the eviction transition.
+    var cache = runtime.tier.cache.SharedCache.init(.{ .host_limit_bytes = 64 });
+    defer cache.deinitAdmission();
+    try cache.configureAdmission(
+        allocator,
+        manager.admissionController(),
+        .gpu,
+        .{ .host_limit_bytes = 64 },
+        .{ .host_limit_bytes = 64 },
+    );
+    try cache.reserve(.host, 64);
+    try std.testing.expectEqual(@as(usize, 64), manager.admissionController().snapshot().host_weight_bytes);
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, cache.admissionAmounts());
+    cache.noteRelease(.host, 64);
 }
 
 test "projector residency follows its request-scoped lifecycle" {

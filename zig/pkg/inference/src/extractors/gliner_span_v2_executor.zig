@@ -42,7 +42,20 @@ const observation = @import("extraction_observer.zig");
 const CT = compute.CT;
 const document = @import("../pipelines/gliner_boundary_long_document.zig");
 
+pub const SpanExtractionProfile = struct {
+    pub const CountLayer = enum { count_lstm };
+    pub const OmittedOverlap = enum { api, legacy_greedy };
+
+    count_layer: CountLayer = .count_lstm,
+    max_width: usize = 8,
+    omitted_overlap: OmittedOverlap = .api,
+    allow_long_documents: bool = false,
+};
+
 pub const Options = struct {
+    /// Exact specialty profiles set this only after artifact qualification.
+    span_extraction_profile: ?SpanExtractionProfile = null,
+    /// Compatibility switch for the already-qualified ModernBERT span model.
     modern_span_extraction: bool = false,
     /// Admitted accelerator classification rows per physical forward.
     classification_batch_items: usize = 1,
@@ -74,14 +87,37 @@ pub const Options = struct {
     decide_request: ?decision_api.Request = null,
 };
 
+fn spanExtractionProfile(options: Options) ?SpanExtractionProfile {
+    if (options.span_extraction_profile) |profile| return profile;
+    if (options.modern_span_extraction) return .{ .allow_long_documents = true };
+    return null;
+}
+
+test "span extraction requires an explicit profile and rejects specialty windows" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"entities":["person"]},"inputs":[{"content":"Ada"}]}
+    , .{});
+    defer request.deinit();
+    try std.testing.expectError(error.UnsupportedGlinerSpanV2Task, preflight(&request, .{}));
+    try preflight(&request, .{ .span_extraction_profile = .{} });
+
+    var windowed = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"entities":["person"]},"inputs":[{"content":"Ada","options":{"long_document":{"mode":"window"}}}]}
+    , .{});
+    defer windowed.deinit();
+    try std.testing.expectError(error.UnsupportedGlinerSpanV2Task, preflight(&windowed, .{ .span_extraction_profile = .{} }));
+}
+
 fn progress(options: Options, index: ?usize, stage: []const u8) !void {
     if (options.control) |control| try control.check();
     if (observation.Stage.fromFailure(stage)) |phase| observation.emit(options.observer, .{ .phase = phase });
     if (options.failure) |failure| failure.* = .{ .input_index = index, .stage = stage };
 }
 
-/// Classification is the only span task on this route; entity, relation and
-/// structure extraction for span checkpoints stay on schema_version 1.
+/// Classification is always available on this route. Entity/relation span
+/// heads require an exact, service-selected extraction profile; unsupported
+/// structured heads remain fail-closed.
 pub fn preflight(request: *const wire.Request, options: Options) !void {
     try boundary_executor.preflight(request, .{ .control = options.control, .failure = options.failure, .max_response_bytes = options.max_response_bytes, .pipeline = options.pipeline });
     for (request.items, 0..) |item, index| {
@@ -89,7 +125,10 @@ pub fn preflight(request: *const wire.Request, options: Options) !void {
         const schema = item.compiled.schema;
         const spans = schema.entities.len != 0 or schema.relations.len != 0;
         if (schema.classifications.len == 0 and !spans) return error.UnsupportedGlinerSpanV2Task;
-        if (spans and !options.modern_span_extraction) return error.UnsupportedGlinerSpanV2Task;
+        const extraction_profile = spanExtractionProfile(options);
+        if (spans and extraction_profile == null) return error.UnsupportedGlinerSpanV2Task;
+        if (spans and extraction_profile.?.max_width != 8) return error.UnsupportedGlinerSpanV2Task;
+        if (spans and item.options.long_document.mode == .window and !extraction_profile.?.allow_long_documents) return error.UnsupportedGlinerSpanV2Task;
         if (schema.entity_attributes.len != 0 or schema.structures.len != 0 or schema.joint_ie != null) return error.UnsupportedGlinerSpanV2Task;
         for (schema.entities) |entity| if (entity.validators.len != 0) return error.UnsupportedGlinerSpanV2Task;
         for (schema.relations) |relation| if (relation.source != null or relation.target != null) return error.UnsupportedGlinerSpanV2Task;
@@ -162,6 +201,31 @@ pub fn classificationLogitsProfiled(
     const batches = try classificationBatchLogits(cb, allocator, config, &.{sample}, &.{task_label_counts}, profile);
     defer allocator.free(batches);
     return batches[0];
+}
+
+/// One prepared sequence through the same qualified encoder path used by the
+/// span classifier. The caller owns the returned backend tensor.
+pub fn encodeSample(
+    cb: *const compute.ComputeBackend,
+    allocator: Allocator,
+    config: EncoderConfig,
+    sample: processor.Sample,
+) !CT {
+    if (sample.input_ids.len == 0) return error.InvalidExtractionInput;
+    const attention_mask = try allocator.alloc(i64, sample.input_ids.len);
+    defer allocator.free(attention_mask);
+    @memset(attention_mask, 1);
+    return switch (config) {
+        .deberta => |deberta| blk: {
+            cb.preferEagerQuantMirrors(true);
+            break :blk try deberta_arch.forwardCtProfiled(cb, allocator, deberta, sample.input_ids, attention_mask, 1, sample.input_ids.len, deberta_mod.glinerPrefersWeightMirrors(deberta), null);
+        },
+        .modern_bert => |modern| blk: {
+            var execution_config = modern;
+            execution_config.metal_f16_weight_mirrors = true;
+            break :blk try modern_bert_arch.forwardCT(cb, allocator, execution_config, sample.input_ids, attention_mask, 1, sample.input_ids.len);
+        },
+    };
 }
 
 /// One padded encoder forward and one classifier/readback for distinct rows.
@@ -542,6 +606,102 @@ pub fn deviceScratchUpperBound(config: EncoderConfig, tokens: usize) !usize {
     return std.math.mul(usize, total, 2);
 }
 
+pub const SpanExtractionGeometry = struct {
+    tokens: usize = 0,
+    words: usize = 0,
+    labels: usize = 0,
+    max_width: usize = 8,
+
+    pub fn spanRows(self: SpanExtractionGeometry) !usize {
+        return std.math.mul(usize, self.words, self.max_width) catch return error.ResourceLimitExceeded;
+    }
+};
+
+/// Geometry is derived from prepared inputs, after the schema and text have
+/// consumed the same hard sequence budget that execution will use. Specialty
+/// span extraction is serial, so independent maxima are a safe request bound.
+pub fn maxSpanExtractionGeometry(request: *const wire.Request, request_plan: *const Plan, profile: SpanExtractionProfile) !SpanExtractionGeometry {
+    if (request.items.len != request_plan.items.len or profile.max_width != 8) return error.InvalidExtractionInput;
+    var result = SpanExtractionGeometry{ .max_width = profile.max_width };
+    for (request.items, request_plan.items) |item, prepared| {
+        if (item.compiled.schema.entities.len == 0 and item.compiled.schema.relations.len == 0) continue;
+        if (prepared.document != null or prepared.batches.len != 1 or prepared.batches[0].samples.len != 1) return error.UnsupportedGlinerSpanV2Task;
+        const sample = prepared.batches[0].samples[0];
+        result.tokens = @max(result.tokens, sample.input_ids.len);
+        result.words = @max(result.words, sample.words.len);
+        var labels: usize = 0;
+        for (sample.groups) |group| {
+            if (group.kind != .classification) labels = @max(labels, group.child_markers.len);
+        }
+        result.labels = @max(result.labels, labels);
+    }
+    return result;
+}
+
+fn checkedProduct(values: []const usize) !usize {
+    var result: usize = 1;
+    for (values) |value| result = std.math.mul(usize, result, value) catch return error.ResourceLimitExceeded;
+    return result;
+}
+
+fn checkedAdd(left: usize, right: usize) !usize {
+    return std.math.add(usize, left, right) catch return error.ResourceLimitExceeded;
+}
+
+/// Backend scratch for one serial markerV0/count_lstm extraction sequence.
+/// The encoder and head are sequential. The head bound follows the shortened
+/// lifetimes in `gliner_span_extraction`: at most the retained encoder hidden
+/// plus span construction, or retained spans plus CountLSTM projection and
+/// score/readback buffers. A factor of two covers backend workspace and
+/// allocator rounding, consistent with the classifier estimator above.
+pub fn spanExtractionDeviceScratchUpperBound(config: EncoderConfig, geometry: SpanExtractionGeometry) !usize {
+    if (geometry.tokens == 0 or geometry.words == 0 or geometry.labels == 0 or geometry.max_width != 8) return error.InvalidExtractionInput;
+    const h: usize = config.hiddenSize();
+    const f = @sizeOf(f32);
+    const spans = try geometry.spanRows();
+    const encoder_peak = try deviceScratchUpperBound(config, geometry.tokens);
+    const hidden_bytes = try checkedProduct(&.{ geometry.tokens, h, f });
+    const word_values = try checkedProduct(&.{ geometry.words, h });
+    const span_values = try checkedProduct(&.{ spans, h });
+    const label_values = try checkedProduct(&.{ geometry.labels, h });
+    const score_values = try checkedProduct(&.{ spans, geometry.labels });
+
+    // Two word projections with one retained output peak at <=10*W*H.
+    // Gather/concat/out-project peak at <=10*S*H after prompt frees.
+    const construction_values = @max(try checkedProduct(&.{ 10, word_values }), try checkedProduct(&.{ 10, span_values }));
+    // Resident slot-zero CountLSTM: label + GRU + concat + 4H projector
+    // intermediates/output <=9*Q*H. Scoring retains spans and permits one
+    // device score tensor plus one readback staging tensor.
+    var scoring_values = try checkedAdd(span_values, try checkedProduct(&.{ 9, label_values }));
+    scoring_values = try checkedAdd(scoring_values, try checkedProduct(&.{ 2, score_values }));
+    const head_values = @max(construction_values, scoring_values);
+    const rounded_head = try checkedProduct(&.{ 2, head_values, f });
+    const head_peak = try checkedAdd(hidden_bytes, rounded_head);
+    return @max(encoder_peak, head_peak);
+}
+
+/// Host-side readback and one disposable per-label decoder workspace. Output
+/// values and request text remain covered by the normal response/working-set
+/// budgets; this prevents all label decoders from accumulating in the result
+/// arena while retaining a deterministic admission estimate.
+pub fn spanExtractionHostScratchUpperBound(geometry: SpanExtractionGeometry, max_candidates: usize) !usize {
+    if (geometry.words == 0 or geometry.labels == 0 or geometry.max_width != 8 or max_candidates == 0) return error.InvalidExtractionInput;
+    const spans = try geometry.spanRows();
+    const readback = try checkedProduct(&.{ spans, geometry.labels, @sizeOf(f32) });
+    const candidate_bytes = @sizeOf(@import("../pipelines/gliner_boundary_decode.zig").Candidate);
+    // Candidate builder capacity (up to about 2C), ranked rows, by-end rows,
+    // and the selected result coexist in the explicit weighted decoder.
+    const candidate_arrays = try checkedProduct(&.{ 5, max_candidates, candidate_bytes });
+    const words = std.math.divCeil(usize, max_candidates, 64) catch return error.ResourceLimitExceeded;
+    const candidate_rows = try checkedAdd(max_candidates, 1);
+    const history = try checkedProduct(&.{ candidate_rows, words, @sizeOf(u64) });
+    const scalar_arrays = try checkedProduct(&.{ 2, candidate_rows, @sizeOf(usize) });
+    var decoder = try checkedAdd(candidate_arrays, history);
+    decoder = try checkedAdd(decoder, scalar_arrays);
+    decoder = try checkedAdd(decoder, max_candidates); // keep flags
+    return checkedAdd(readback, decoder);
+}
+
 /// DeBERTa span checkpoints retain their established request ceiling. A
 /// ModernBERT span checkpoint may use its declared context because all three
 /// supported backends use bounded-memory attention; runtime admission still
@@ -569,6 +729,34 @@ test "gliner span v2 device scratch bound covers a large 512-token sequence" {
     // Materialized 16-head 512x512 scores alone are 16 MiB per matrix.
     try std.testing.expect(bytes >= 3 * 16 * 512 * 512 * 4);
     try std.testing.expect(bytes < 512 * 1024 * 1024);
+}
+
+test "PII span scratch includes width-eight construction scoring and readback" {
+    const config = EncoderConfig{ .deberta = .{
+        .hidden_size = 768,
+        .num_hidden_layers = 12,
+        .num_attention_heads = 12,
+        .intermediate_size = 3072,
+        .position_buckets = 256,
+    } };
+    const geometry = SpanExtractionGeometry{ .tokens = 512, .words = 400, .labels = 42, .max_width = 8 };
+    const classifier = try deviceScratchUpperBound(config, geometry.tokens);
+    const extraction = try spanExtractionDeviceScratchUpperBound(config, geometry);
+    try std.testing.expect(extraction > classifier);
+    // The retained span matrix alone is about 9.4 MiB; construction carries
+    // several simultaneous width-expanded projections and must dominate it.
+    try std.testing.expect(extraction > 128 * 1024 * 1024);
+    try std.testing.expect(extraction < 1024 * 1024 * 1024);
+
+    const host = try spanExtractionHostScratchUpperBound(geometry, 4096);
+    try std.testing.expect(host > 400 * 8 * 42 * @sizeOf(f32));
+    try std.testing.expect(host < 16 * 1024 * 1024);
+}
+
+test "PII span scratch rejects unsupported geometry and checked overflow" {
+    const config = EncoderConfig{ .deberta = .{} };
+    try std.testing.expectError(error.InvalidExtractionInput, spanExtractionDeviceScratchUpperBound(config, .{ .tokens = 32, .words = 8, .labels = 4, .max_width = 7 }));
+    try std.testing.expectError(error.ResourceLimitExceeded, spanExtractionDeviceScratchUpperBound(config, .{ .tokens = 32, .words = std.math.maxInt(usize), .labels = 4 }));
 }
 
 test "gliner span v2 preserves DeBERTa 512 ceiling and admits Decide 1B context with bounded scratch" {
@@ -719,14 +907,29 @@ pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, c
         if (remaining_values == 0) return error.ExtractionOutputLimitExceeded;
         try progress(options, index, "encoder");
         if (item.compiled.schema.entities.len != 0 or item.compiled.schema.relations.len != 0) {
-            if (config != .modern_bert or !options.modern_span_extraction) return error.UnsupportedGlinerSpanV2Task;
+            const extraction_profile = spanExtractionProfile(options) orelse return error.UnsupportedGlinerSpanV2Task;
             var native_options = item.options.native(options.pipeline);
             native_options.control = options.control;
             native_options.max_output_values = remaining_values;
             var extracted = if (prepared_item.document != null)
-                try @import("gliner_span_long_executor.zig").extract(cb, allocator, config.modern_bert, item, prepared_item, native_options)
-            else
-                try @import("gliner_span_extraction.zig").run(cb, allocator, config.modern_bert, prepared_item.batches[0].samples[0], &item.compiled, native_options);
+                if (config == .modern_bert and extraction_profile.allow_long_documents)
+                    try @import("gliner_span_long_executor.zig").extract(cb, allocator, config.modern_bert, item, prepared_item, native_options)
+                else
+                    return error.UnsupportedGlinerSpanV2Task
+            else blk: {
+                const sample = prepared_item.batches[0].samples[0];
+                // Preserve the established ModernBERT wrapper. Exact specialty
+                // profiles use the shared hidden-state head and may select the
+                // already-qualified DeBERTa encoder.
+                if (config == .modern_bert and options.span_extraction_profile == null)
+                    break :blk try @import("gliner_span_extraction.zig").run(cb, allocator, config.modern_bert, sample, &item.compiled, native_options);
+                const hidden = try encodeSample(cb, allocator, config, sample);
+                defer cb.free(hidden);
+                break :blk try @import("gliner_span_extraction.zig").runFromHidden(cb, allocator, hidden, @intCast(config.hiddenSize()), sample, &item.compiled, native_options, .{
+                    .max_width = extraction_profile.max_width,
+                    .legacy_greedy_overlap = extraction_profile.omitted_overlap == .legacy_greedy and !item.options.overlap_explicit,
+                });
+            };
             defer extracted.deinit();
             const sample = extracted.samples[0];
             var used = sample.relations.len;

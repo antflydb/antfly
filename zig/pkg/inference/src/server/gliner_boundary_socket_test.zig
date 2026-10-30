@@ -53,7 +53,13 @@ pub const Loopback = struct {
     }
 
     pub fn initWithCapacity(a: Allocator, node: *Node, capacity: u32) !*Loopback {
+        return initWithCapacityAndBodyLimit(a, node, capacity, 64 * 1024);
+    }
+
+    pub fn initWithCapacityAndBodyLimit(a: Allocator, node: *Node, capacity: u32, max_body_size: usize) !*Loopback {
         if (capacity == 0 or capacity > 16) return error.InvalidLoopbackCapacity;
+        if (max_body_size == 0) return error.InvalidLoopbackCapacity;
+        const body_buffer_budget = std.math.mul(usize, max_body_size, @intCast(capacity)) catch return error.InvalidLoopbackCapacity;
         // Caller-owned listeners need the same exclusive startup precondition
         // as Node.serve. Publish the resource owner before request workers can
         // race its lazy creation; this neither loads a model nor reserves work.
@@ -72,18 +78,22 @@ pub const Loopback = struct {
         self.server = httpx.Server.initWithConfig(transport_allocator, self.server_io.io(), .{
             .host = "127.0.0.1",
             .port = 0,
-            .max_body_size = 64 * 1024,
+            .max_body_size = max_body_size,
             .max_headers = 32,
             .max_connections = capacity,
             .max_request_tasks = capacity,
-            .max_h1_inflight_bodies = 1,
+            // Partial-body reservations must cover every request this owned
+            // loopback can run concurrently. Complete bodies bypass this
+            // reservation, so a smaller value would make tests depend on TCP
+            // packet boundaries.
+            .max_h1_inflight_bodies = capacity,
             .header_read_timeout_ms = short_timeout_ms,
             .body_read_timeout_ms = short_timeout_ms,
             .response_write_timeout_ms = short_timeout_ms,
             .keep_alive_timeout_ms = short_timeout_ms,
             .keep_alive = false,
             .max_requests_per_connection = 1,
-            .request_body_buffer_budget_bytes = capacity * 64 * 1024,
+            .request_body_buffer_budget_bytes = body_buffer_budget,
         });
         errdefer self.server.deinit();
         // The ingress deadline is fixed by this test owner, never by request

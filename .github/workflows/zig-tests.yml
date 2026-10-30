@@ -778,6 +778,7 @@ jobs:
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
           python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
+          python3 -m unittest discover -s scripts/gliner_specialty -p 'test_*.py'
 
       - name: Test Laya data and qualification contracts
         run: |
