@@ -389,6 +389,8 @@ pub const Options = struct {
     video_encoded: ?*@import("embedding_gemma2_video.zig").Encoded = null,
     /// Request-owned storage allocated outside a recyclable embedding stage.
     video_composition: ?*VideoComposition = null,
+    audio_decode_options: @import("audio.zig").DecodeOptions = .{},
+    max_audio_decode_working_bytes: usize = 64 * 1024 * 1024,
     task_type: []const u8 = "RETRIEVAL_DOCUMENT",
     dimensions: usize = 768,
     /// Expanded input limit, including prompts, wrappers, and media tokens.
@@ -2110,17 +2112,41 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     if (!cfg.vision) return error.NoVisionSession;
     const effective = control orelse Control{};
     try effective.check();
+    // Bound container metadata before allocating it, without charging the
+    // compressed MP4 as device input or opening the decoder before admission.
+    const inspected = inspect: {
+        var host_permit = try session.admitHostPreprocess(try std.math.add(usize, bytes.len, 128 * 1024 * 1024));
+        defer host_permit.deinit();
+        const Check = struct {
+            fn check(raw: ?*const anyopaque) anyerror!void {
+                const c: *const Control = @ptrCast(@alignCast(raw.?));
+                try c.check();
+            }
+        };
+        break :inspect @import("../ops/cuda/video.zig").inspectEmbedding(a, bytes, .{ .context = &effective, .check_fn = Check.check }) catch |err| return videoInputError(err);
+    };
+    const request = try cudaVideoRequest(inspected, bytes.len, options);
     var execution_waiter = Scheduler.Waiter{};
     try enterModel(session, lock, effective, &execution_waiter);
     defer leaveModel(lock, &execution_waiter);
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
     const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(managed.backend.ptr));
-    const request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = @min(options.max_tokens, 4546), .input_bytes = bytes.len, .host_preprocess_bytes = 128 * 1024 * 1024, .workspace_bytes = 1536 * 1024 * 1024, .output_bytes = options.dimensions * @sizeOf(f32) };
-    var permit = session.admit(request) catch |err| reclaim: {
+    defer if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS", false)) {
+        const physical = compute.ctx.device_allocations.snapshot();
+        std.log.info("embeddinggemma2 CUDA video memory frames={d} sequence={d} workspace_bytes={d} device_live_bytes={d} device_peak_bytes={d} device_limit_bytes={d} decoder_cache_bytes={d}", .{
+            inspected.frames, request.sequence, request.workspace_bytes, physical.live, physical.peak, physical.limit, compute.ctx.video_cache_budget.bytes,
+        });
+    };
+    var pressure: ?@import("../runtime/tier/memory.zig").AdmissionPressure = null;
+    var permit = session.admitWithPressure(request, &pressure) catch |err| reclaim: {
+        logCudaVideoAdmission(session, request, "preflight", err, pressure);
         if (err != error.ResourceTemporarilyUnavailable and err != error.ResourceLimitExceeded) return err;
         try compute.evictEmbeddingGemma2Caches();
-        break :reclaim try session.admit(request);
+        break :reclaim session.admitWithPressure(request, &pressure) catch |retry_err| {
+            logCudaVideoAdmission(session, request, "preflight_after_reclaim", retry_err, pressure);
+            return retry_err;
+        };
     };
     defer permit.deinit();
     const cb = &managed.backend;
@@ -2129,7 +2155,10 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     const before = MediaTransferSnapshot.init(cb);
     defer observeResidentTransfers(cb, before, options);
     const started = mediaNow();
-    var projected = projector.encodeEmbeddingGemma2VideoResident(cb, a, bytes, options.max_tokens) catch |err| return videoInputError(err);
+    var projected = projector.encodeEmbeddingGemma2VideoResident(cb, a, bytes, options.max_tokens) catch |err| {
+        std.log.warn("embeddinggemma2 CUDA video failed phase=decode_projection error={s}", .{@errorName(err)});
+        return videoInputError(err);
+    };
     defer projected.deinit();
     if (options.timings) |t| {
         t.vision_ns += mediaNow() - started;
@@ -2163,12 +2192,46 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     defer video_input.deinit(a, cb);
     if (options.timings) |t| t.pack_ns += mediaNow() - pack_started;
     const encoder_started = mediaNow();
-    try permit.retainForRun(.{ .batch = 1, .sequence = length, .input_bytes = bytes.len, .host_preprocess_bytes = length * 32, .workspace_bytes = try cudaEncoderWorkspace(length, 1), .preprocessing_complete = true, .output_bytes = options.dimensions * @sizeOf(f32) });
+    if (length != request.sequence) return error.InvalidVideoInput;
+    const encoder_request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = length, .input_bytes = bytes.len, .backend_input_bytes = length * 512 * @sizeOf(f32), .host_preprocess_bytes = length * 32, .workspace_planned = true, .workspace_bytes = try cudaEncoderWorkspace(length, 1), .preprocessing_complete = true, .output_bytes = options.dimensions * @sizeOf(f32) };
+    permit.retainForRun(encoder_request) catch |err| {
+        logCudaVideoAdmission(session, encoder_request, "encoder_retain", err, null);
+        return err;
+    };
     const vector = try compute.runEmbeddingGemma2(a, cfg.resident orelse return error.UnsupportedEmbeddingGemma2Backend, .{ .resident_embeddings = video_input.embeddings }, video_input.mask, 1, length, options.dimensions, cb.execution_control);
     errdefer a.free(vector);
     if (options.timings) |t| t.encoder_ns += mediaNow() - encoder_started;
     try effective.check();
     return .{ .vector = vector, .input_tokens = length };
+}
+
+fn cudaVideoRequest(clip: @import("../ops/cuda/video.zig").EmbeddingInspection, input_bytes: usize, options: Options) !@import("../backends/session.zig").RunRequest {
+    if (clip.frames == 0 or clip.frames > 32 or clip.width == 0 or clip.height == 0 or clip.width > 4096 or clip.height > 4096) return error.InvalidVideoGeometry;
+    const g = projector.embeddingGemma2VideoGeometry(clip.width, clip.height);
+    const sequence = clip.frames * (g.tokens + 2) + 2;
+    if (sequence > options.max_tokens) return error.EmbeddingInputTooLong;
+    const pixels = @as(usize, clip.width) * clip.height;
+    const patches = @as(usize, g.width / 16) * (g.height / 16);
+    // Retain the qualified CUDA media arena allowance. Add owned RGB/patch
+    // staging, pending and concatenated vision inputs, and both accumulation
+    // and compact projection buffers. NVDEC surfaces have their own cache
+    // reservation, acquired from the same controller by reserveDecoder.
+    const media_workspace = 384 * 1024 * 1024 + pixels * 3 +
+        @as(usize, g.width) * g.height * 3 * @sizeOf(f32) +
+        @min(clip.frames, 4) * patches * 768 * @sizeOf(f32) * 2 +
+        2 * 32 * 140 * 512 * @sizeOf(f32);
+    return .{ .batch = 1, .sequence = sequence, .input_bytes = input_bytes, .backend_input_bytes = sequence * 512 * @sizeOf(f32), .host_preprocess_bytes = 128 * 1024 * 1024, .workspace_planned = true, .workspace_bytes = @max(media_workspace, try cudaEncoderWorkspace(sequence, 1)), .output_bytes = options.dimensions * @sizeOf(f32) };
+}
+
+/// Snapshot after a failed attempt: concurrent requests may change occupancy,
+/// while pressure identifies the constraint observed by the atomic admission.
+fn logCudaVideoAdmission(session: Session, request: @import("../backends/session.zig").RunRequest, phase: []const u8, err: anyerror, pressure: ?@import("../runtime/tier/memory.zig").AdmissionPressure) void {
+    const admission = session.run_admission orelse return;
+    const amounts = admission.estimateRequest(request, session.outputInfo()) catch return;
+    std.log.warn("embeddinggemma2 CUDA video admission failed phase={s} error={s} pressure={s} sequence={d} workspace_bytes={d} requested={any} occupied_snapshot={any} domain_snapshot={any} limits={any} shared_limits={any}", .{
+        phase,   @errorName(err),                 if (pressure) |p| @tagName(p) else "none",                     request.sequence, request.workspace_bytes,
+        amounts, admission.controller.snapshot(), admission.controller.snapshotBackend(admission.backend_class), admission.limits, admission.controller.shared_limits,
+    });
 }
 
 fn videoInputError(err: anyerror) anyerror {
@@ -2208,9 +2271,9 @@ fn cudaGroupRequest(group: Group, options: Options) !@import("../backends/sessio
                 tower = @max(tower, try projector.embeddingGemma2ImageScratch(info.width, info.height, 2 * 1024 * 1024 * 1024));
             },
             .audio => |bytes| {
-                const audio_tokens = try projector.embeddingGemma2EncodedAudioSequenceBound(bytes);
+                const audio_tokens = try projector.embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes, options.audio_decode_options);
                 tokens = try std.math.add(usize, tokens, audio_tokens);
-                host = @max(host, 64 * 1024 * 1024 + audio_tokens * 32 * 1024);
+                host = @max(host, try std.math.add(usize, options.max_audio_decode_working_bytes, 64 * 1024 * 1024 + audio_tokens * 32 * 1024));
                 tower = @max(tower, 512 * 1024 * 1024);
             },
             else => return error.BatchIncompatible,
@@ -2228,7 +2291,7 @@ fn embedCudaGroup(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, 
     for (group.content, parts) |part, *dest| dest.* = switch (part) {
         .text => |text| .{ .text = text },
         .image => |image| .{ .image = image },
-        .audio => |audio| .{ .audio = .{ .bytes = audio } },
+        .audio => |audio| .{ .audio = .{ .bytes = audio, .decode_options = options.audio_decode_options } },
         .raster, .video, .sampled_video, .pcm => return error.UnsupportedInput,
     };
     const prefix = if (group.title) |title| try std.fmt.allocPrint(a, "title: {s} | text: ", .{title}) else try a.dupe(u8, try encoder.taskPrefix(options.task_type));
@@ -2252,7 +2315,7 @@ fn embedCudaGroup(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, 
     defer permit.deinit();
     const before = MediaTransferSnapshot.init(&managed.backend);
     defer observeResidentTransfers(&managed.backend, before, options);
-    var prepared = try @import("embedding_gemma2_content.zig").prepareResident(&managed.backend, a, tokenizer, prefix, parts, options.max_tokens, 64 * 1024 * 1024, control);
+    var prepared = try @import("embedding_gemma2_content.zig").prepareResident(&managed.backend, a, tokenizer, prefix, parts, options.max_tokens, options.max_audio_decode_working_bytes, control);
     defer prepared.deinit();
     try permit.retainForRun(.{ .batch = 1, .sequence = prepared.sequence, .input_bytes = input_bytes, .host_preprocess_bytes = prepared.sequence * 2 * @sizeOf(i64), .workspace_bytes = try cudaEncoderWorkspace(prepared.sequence, 1), .preprocessing_complete = true, .output_bytes = options.dimensions * @sizeOf(f32) });
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
@@ -4879,6 +4942,43 @@ test "embeddinggemma2 mixed preparation drains cancellation partial errors and d
     denied.deinit();
 }
 
+test "embeddinggemma2 CUDA video inspected admission fits constrained scratch and retains encoder phase" {
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var marker: u8 = 0;
+    const session = Session{ .ptr = &marker, .vtable = &PhaseTestSession.vtable, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .gpu,
+        .limits = .{ .scratch_limit_bytes = 1024 * 1024 * 1024 },
+        .static_workspace_bytes = 1536 * 1024 * 1024,
+        .model_profile = .{ .embedding_gemma2_cuda = true },
+        .check_live_memory = false,
+    } };
+    const small = try cudaVideoRequest(.{ .width = 640, .height = 480, .frames = 1 }, 4096, .{});
+    const large = try cudaVideoRequest(.{ .width = 4096, .height = 4096, .frames = 32 }, 256 * 1024 * 1024, .{});
+    try std.testing.expect(small.sequence < large.sequence);
+    try std.testing.expect(small.workspace_bytes < large.workspace_bytes);
+    var occupied = try session.admitHostPreprocess(768 * 1024 * 1024);
+    const before_denial = controller.snapshot();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admit(small));
+    try std.testing.expectEqual(before_denial, controller.snapshot());
+    occupied.deinit();
+    var constrained = session;
+    constrained.run_admission.?.limits.scratch_limit_bytes = 256 * 1024 * 1024;
+    try std.testing.expectError(error.ResourceLimitExceeded, constrained.admit(small));
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+    // Even a large compressed source is host-only; dynamic input accounting
+    // must not manufacture six device copies of the compressed MP4.
+    var permit = try session.admit(large);
+    try permit.retainForRun(.{ .sequence = large.sequence, .input_bytes = large.input_bytes, .backend_input_bytes = large.backend_input_bytes, .host_preprocess_bytes = large.sequence * 32, .workspace_planned = true, .workspace_bytes = try cudaEncoderWorkspace(large.sequence, 1), .preprocessing_complete = true, .output_bytes = 768 * 4 });
+    permit.deinit();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admit(.{ .sequence = 4546, .workspace_bytes = 1536 * 1024 * 1024 }));
+    try std.testing.expectError(error.EmbeddingInputTooLong, cudaVideoRequest(.{ .width = 640, .height = 480, .frames = 32 }, 4096, .{ .max_tokens = 128 }));
+    try std.testing.expectError(error.InvalidVideoGeometry, cudaVideoRequest(.{ .width = 0, .height = 480, .frames = 1 }, 4096, .{}));
+}
+
 test "embeddinggemma2 NVDEC cache admission policy is linked on portable hosts" {
     _ = @import("../ops/cuda/video_cache_budget.zig");
     _ = @import("../ops/cuda/embedding_gemma2_execution.zig");
@@ -4894,6 +4994,53 @@ test "embeddinggemma2 CUDA header admission scales text instead of reserving max
     try std.testing.expect(short.workspace_bytes < long.workspace_bytes);
     try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), short.host_preprocess_bytes);
     try std.testing.expect(short.workspace_bytes < 1536 * 1024 * 1024);
+}
+
+test "embeddinggemma2 CUDA one second WAV stays within production scratch admission" {
+    const a = std.testing.allocator;
+    const samples: [16000]f32 = @splat(0);
+    const wav = try @import("audio.zig").wav.encodeInterleaved(a, &samples, 1, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 });
+    defer a.free(wav);
+    const request = try cudaGroupRequest(.{ .content = &.{.{ .audio = wav }} }, .{ .max_audio_decode_working_bytes = @import("audio.zig").default_decode_working_bytes });
+    try std.testing.expect(request.sequence < 512);
+    try std.testing.expect(request.workspace_bytes < 768 * 1024 * 1024);
+    // Resident weights plus this request also fit the 4608 MiB device bucket.
+    try std.testing.expect(3195 * 1024 * 1024 + request.workspace_bytes < 4608 * 1024 * 1024);
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    const limits = memory.Limits{ .backend_limit_bytes = 4608 * 1024 * 1024, .combined_limit_bytes = 6144 * 1024 * 1024, .scratch_limit_bytes = 768 * 1024 * 1024 };
+    var weights = try controller.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = 3195 * 1024 * 1024 }, false);
+    defer weights.release();
+    var dummy: u8 = 0;
+    const session = Session{ .ptr = &dummy, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 512 * 1024 * 1024, .model_profile = .{ .hidden_size = 512, .embedding_gemma2_cuda = true }, .check_live_memory = false } };
+    var permit = try session.admit(request);
+    defer permit.deinit();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admit(.{ .batch = 1, .sequence = 8192, .workspace_bytes = 1536 * 1024 * 1024 }));
+}
+
+test "embeddinggemma2 CUDA audio admission preserves decode hint precedence" {
+    // MP3 decoders can scan past leading padding; admission cannot require a
+    // byte-zero signature when the caller supplies the encoded format.
+    const padded = "\x00\xff\xfb\x90\x00";
+    const group = Group{ .content = &.{.{ .audio = padded }} };
+    try std.testing.expectError(error.UnsupportedAudioFormat, cudaGroupRequest(group, .{}));
+    const hints = [_]@import("audio.zig").DecodeOptions{
+        .{ .format_hint = .mp3 },
+        .{ .mime_hint = "audio/mpeg" },
+        .{ .file_name_hint = "padded.mp3" },
+    };
+    for (hints) |hint| {
+        const request = try cudaGroupRequest(group, .{ .audio_decode_options = hint });
+        // Unknown duration keeps the full sequence and tower envelope.
+        try std.testing.expectEqual(@as(usize, 8192), request.sequence);
+        try std.testing.expect(request.workspace_bytes >= 512 * 1024 * 1024);
+    }
+    // A format hint must also override a misleading signature. Parsing this
+    // as WAV would fail before the hinted MP3 decoder could inspect it.
+    const misleading = Group{ .content = &.{.{ .audio = "RIFFxxxxWAVE" }} };
+    const request = try cudaGroupRequest(misleading, .{ .audio_decode_options = .{ .format_hint = .mp3 } });
+    try std.testing.expectEqual(@as(usize, 8192), request.sequence);
 }
 
 test "embeddinggemma2 CUDA prepared mixed cohorts preserve singleton vectors and retry after cancellation" {

@@ -3,18 +3,47 @@
 
 const std = @import("std");
 
+/// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On Metal, `auto` chooses full residency only when the complete expert set and safety reserves fit the configured budget; otherwise it uses bounded streaming. On the qualified SM89 CUDA lane, `auto` resolves to resident mode and fails closed unless its envelope fits.
+pub const A4bResidencyMode = enum {
+    auto,
+    streamed,
+    resident,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .streamed => "streamed",
+            .resident => "resident",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "streamed", .streamed },
+            .{ "resident", .resident },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const AgentDecision = struct {
     /// The question being answered
     question_id: []const u8,
     /// User answer, scalar or structured depending on the question kind
-    answer: ?std.json.Value = null,
+    answer: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// Used for confirm/review steps where the draft may be accepted as-is
     approved: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "question_id", "question_id", false },
-        .{ "answer", "answer", true },
+        .{ "answer", "answer", false },
         .{ "approved", "approved", true },
     };
 
@@ -30,9 +59,16 @@ pub const AgentDecision = struct {
         try jw.beginObject();
         try jw.objectField("question_id");
         try jw.write(self.question_id);
-        if (self.answer) |value| {
-            try jw.objectField("answer");
-            try jw.write(value);
+        switch (self.answer) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("answer");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("answer");
+                try jw.write(value);
+            },
         }
         if (self.approved) |value| {
             try jw.objectField("approved");
@@ -1939,6 +1975,39 @@ pub const AntflyRerankerConfig = struct {
     }
 };
 
+/// Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider. Uses the Antfly inference service for speech-to-text inference. **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC **Docs:** See inference documentation
+pub const AntflySTTConfig = struct {
+    /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// Explicit Antfly transcriber model name (e.g., 'openai/whisper-tiny').
+    model: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "api_url", "api_url", true },
+        .{ "model", "model", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.endObject();
+    }
+};
+
 pub const AntflyType = enum {
     search_as_you_type,
     substring,
@@ -2297,6 +2366,47 @@ pub const AppleGeneratorConfig = struct {
         }
         if (self.temperature) |value| {
             try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// On-device SpeechAnalyzer file transcription. Requires a macOS Apple provider build and supported Speech assets. Diarization is unsupported.
+pub const AppleSTTConfig = struct {
+    /// Supported Speech locale; Apple transcription does not infer a language.
+    language_code: ?[]const u8 = null,
+    timestamps: ?bool = null,
+    /// Explicitly permit preparing and installing the selected Speech assets.
+    download_assets: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "language_code", "language_code", true },
+        .{ "timestamps", "timestamps", true },
+        .{ "download_assets", "download_assets", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
+            try jw.write(value);
+        }
+        if (self.download_assets) |value| {
+            try jw.objectField("download_assets");
             try jw.write(value);
         }
         try jw.endObject();
@@ -4082,6 +4192,8 @@ pub const ChoiceDecisionQuestion = struct {
 
 /// Original-source coordinates; time intervals are half-open integer nanoseconds and text spans are UTF-8 byte offsets.
 pub const ChunkCoordinates = struct {
+    /// Source-scoped speaker of a chunk made with audio_speaker_turns; omitted for unassigned intervals.
+    speaker_index: ?i64 = null,
     kind: []const u8,
     start_byte: ?i64 = null,
     end_byte: ?i64 = null,
@@ -4112,6 +4224,7 @@ pub const ChunkCoordinates = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "speaker_index", "speaker_index", true },
         .{ "kind", "kind", false },
         .{ "start_byte", "start_byte", true },
         .{ "end_byte", "end_byte", true },
@@ -4145,6 +4258,10 @@ pub const ChunkCoordinates = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.speaker_index) |value| {
+            try jw.objectField("speaker_index");
+            try jw.write(value);
+        }
         try jw.objectField("kind");
         try jw.write(self.kind);
         if (self.start_byte) |value| {
@@ -4237,6 +4354,65 @@ pub const ChunkDescriptor = struct {
     ordinal: i64,
     coordinates: ChunkCoordinates,
     input_tokens: i64,
+};
+
+/// Source-wide online speaker clustering on a fixed 1.5 s grid with 3 s embedding windows. Identities are stable within a source and recipe. Silence and ambiguous voices remain unassigned. Analysis advances incrementally; admitted cached timelines and durable centroid/sample-position checkpoints are shared across matching outputs and continuations. Missing checkpoints reconstruct the required prefix deterministically.
+pub const ChunkDiarizationConfig = struct {
+    /// Speaker ONNX registry reference; defaults to 3D-Speaker CAM++. For kind=diarize the target model selects the speaker model.
+    model: ?[]const u8 = null,
+    /// Optional SHA-256 pin of the speaker ONNX file, including when paired with a transcription model.
+    model_identity: ?[]const u8 = null,
+    similarity_threshold: ?f32 = null,
+    ambiguity_margin: ?f32 = null,
+    min_rms: ?f32 = null,
+    max_speakers: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "model_identity", "model_identity", true },
+        .{ "similarity_threshold", "similarity_threshold", true },
+        .{ "ambiguity_margin", "ambiguity_margin", true },
+        .{ "min_rms", "min_rms", true },
+        .{ "max_speakers", "max_speakers", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.model_identity) |value| {
+            try jw.objectField("model_identity");
+            try jw.write(value);
+        }
+        if (self.similarity_threshold) |value| {
+            try jw.objectField("similarity_threshold");
+            try jw.write(value);
+        }
+        if (self.ambiguity_margin) |value| {
+            try jw.objectField("ambiguity_margin");
+            try jw.write(value);
+        }
+        if (self.min_rms) |value| {
+            try jw.objectField("min_rms");
+            try jw.write(value);
+        }
+        if (self.max_speakers) |value| {
+            try jw.objectField("max_speakers");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ChunkEmbeddingContext = struct {
@@ -4702,6 +4878,12 @@ pub const ChunkOutputLabel = struct {
 };
 
 pub const ChunkOutputResult = struct {
+    /// SHA-256 of the speaker ONNX bytes used for this output. Included in recipe identity for diarization and paired transcription or embedding boundaries.
+    speaker_model_revision: ?[]const u8 = null,
+    /// Speaker indices are shared across all windows of this source and diarization recipe.
+    speaker_scope: ?[]const u8 = null,
+    /// Timed voice annotations for kind=diarize, including unassigned intervals. No transcript is required.
+    speaker_spans: ?[]const ChunkSpeakerSpan = null,
     name: []const u8,
     kind: []const u8,
     required: bool,
@@ -4725,6 +4907,9 @@ pub const ChunkOutputResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "speaker_model_revision", "speaker_model_revision", true },
+        .{ "speaker_scope", "speaker_scope", true },
+        .{ "speaker_spans", "speaker_spans", true },
         .{ "name", "name", false },
         .{ "kind", "kind", false },
         .{ "required", "required", false },
@@ -4754,6 +4939,18 @@ pub const ChunkOutputResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.speaker_model_revision) |value| {
+            try jw.objectField("speaker_model_revision");
+            try jw.write(value);
+        }
+        if (self.speaker_scope) |value| {
+            try jw.objectField("speaker_scope");
+            try jw.write(value);
+        }
+        if (self.speaker_spans) |value| {
+            try jw.objectField("speaker_spans");
+            try jw.write(value);
+        }
         try jw.objectField("name");
         try jw.write(self.name);
         try jw.objectField("kind");
@@ -4821,7 +5018,10 @@ pub const ChunkOutputTarget = struct {
     task_type: ?[]const u8 = null,
     dimensions: ?i64 = null,
     language: ?[]const u8 = null,
+    /// Convenience option on transcription outputs; enables source-wide diarization with the default speaker model.
     diarize: ?bool = null,
+    /// Speaker settings for diarize or transcribe outputs; also accepted on the selected audio embedding boundary with audio_speaker_turns=true.
+    diarization: ?ChunkDiarizationConfig = null,
     top_k: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -4837,6 +5037,7 @@ pub const ChunkOutputTarget = struct {
         .{ "dimensions", "dimensions", true },
         .{ "language", "language", true },
         .{ "diarize", "diarize", true },
+        .{ "diarization", "diarization", true },
         .{ "top_k", "top_k", true },
     };
 
@@ -4886,6 +5087,10 @@ pub const ChunkOutputTarget = struct {
         }
         if (self.diarize) |value| {
             try jw.objectField("diarize");
+            try jw.write(value);
+        }
+        if (self.diarization) |value| {
+            try jw.objectField("diarization");
             try jw.write(value);
         }
         if (self.top_k) |value| {
@@ -4952,11 +5157,46 @@ pub const ChunkSourceReference = struct {
     }
 };
 
+pub const ChunkSpeakerSpan = struct {
+    start_ns: i64,
+    end_ns: i64,
+    /// Source-scoped voice index in order of first appearance; absent for silence or ambiguous audio.
+    speaker_index: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "start_ns", "start_ns", false },
+        .{ "end_ns", "end_ns", false },
+        .{ "speaker_index", "speaker_index", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("start_ns");
+        try jw.write(self.start_ns);
+        try jw.objectField("end_ns");
+        try jw.write(self.end_ns);
+        if (self.speaker_index) |value| {
+            try jw.objectField("speaker_index");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const ChunkTranscriptSpan = struct {
     text: []const u8,
     start_ns: i64,
     end_ns: i64,
-    /// Speaker index local to this output sub-window; global identities require diarization stitching.
+    /// Source-scoped when the output carries speaker_scope=source. Older receipts without that marker use sub-window-local numbering.
     speaker_index: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -5235,6 +5475,273 @@ pub const ClassificationTransformationResult = struct {
         }
         try jw.objectField("confidence");
         try jw.write(self.confidence);
+        try jw.endObject();
+    }
+};
+
+/// Cloudflare Workers AI embedding. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+pub const CloudflareEmbedderConfig = struct {
+    provider: []const u8,
+    account_id: []const u8,
+    /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
+    gateway_id: ?[]const u8 = null,
+    model: []const u8,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned endpoint override.
+    url: ?[]const u8 = null,
+    /// Expected fixed model output dimension; the adapter validates returned vectors and never requests unsupported resizing.
+    dimensions: ?i64 = null,
+    /// Alias of dimensions.
+    dimension: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "account_id", "account_id", false },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "model", "model", false },
+        .{ "api_key", "api_key", true },
+        .{ "url", "url", true },
+        .{ "dimensions", "dimensions", true },
+        .{ "dimension", "dimension", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("account_id");
+        try jw.write(self.account_id);
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        if (self.dimension) |value| {
+            try jw.objectField("dimension");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+pub const CloudflareGeneratorConfig = struct {
+    provider: []const u8,
+    account_id: []const u8,
+    /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
+    gateway_id: ?[]const u8 = null,
+    model: []const u8,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned endpoint override.
+    url: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    frequency_penalty: ?f32 = null,
+    presence_penalty: ?f32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "account_id", "account_id", false },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "model", "model", false },
+        .{ "api_key", "api_key", true },
+        .{ "url", "url", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "temperature", "temperature", true },
+        .{ "top_p", "top_p", true },
+        .{ "frequency_penalty", "frequency_penalty", true },
+        .{ "presence_penalty", "presence_penalty", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("account_id");
+        try jw.write(self.account_id);
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.frequency_penalty) |value| {
+            try jw.objectField("frequency_penalty");
+            try jw.write(value);
+        }
+        if (self.presence_penalty) |value| {
+            try jw.objectField("presence_penalty");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Cloudflare Workers AI reranking. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+pub const CloudflareRerankerConfig = struct {
+    provider: []const u8,
+    account_id: []const u8,
+    /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
+    gateway_id: ?[]const u8 = null,
+    model: []const u8,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned endpoint override.
+    url: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "account_id", "account_id", false },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "model", "model", false },
+        .{ "api_key", "api_key", true },
+        .{ "url", "url", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("account_id");
+        try jw.write(self.account_id);
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
+pub const CloudflareSTTConfig = struct {
+    provider: []const u8,
+    account_id: []const u8,
+    gateway_id: ?[]const u8 = null,
+    model: []const u8,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned full native endpoint override.
+    base_url: ?[]const u8 = null,
+    language_code: ?[]const u8 = null,
+    voice: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "account_id", "account_id", false },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "model", "model", false },
+        .{ "api_key", "api_key", true },
+        .{ "base_url", "base_url", true },
+        .{ "language_code", "language_code", true },
+        .{ "voice", "voice", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("account_id");
+        try jw.write(self.account_id);
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.voice) |value| {
+            try jw.objectField("voice");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -6189,6 +6696,39 @@ pub const ConfidenceStepConfig = struct {
     }
 };
 
+/// Logging configuration for Antfly inference services
+pub const Config = struct {
+    level: ?Level = null,
+    style: ?Style = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "level", "level", true },
+        .{ "style", "style", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.level) |value| {
+            try jw.objectField("level");
+            try jw.write(value);
+        }
+        if (self.style) |value| {
+            try jw.objectField("style");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const ConfigureExtensionRequest = struct {
     config_json: []const u8,
 };
@@ -6800,6 +7340,83 @@ pub const ContentPart = union(enum) {
             .image_url_content_part => |v| try jw.write(v.*),
             .text_content_part => |v| try jw.write(v.*),
         }
+    }
+};
+
+/// Low-level content download policy. File downloads always require an explicit nonempty `allowed_paths` list. In the generic scraper, omitted `allowed_hosts` for HTTP(S) and `allowed_paths` for S3 do not restrict those sources; explicit empty lists deny them. Consumers may merge this object over a stricter baseline before downloading. Antfly inference does so: omitted or empty inference policies, and omitted inference allowlists, deny HTTP(S), file, and S3 content until explicit allowlists are configured. Do not assume omission has identical policy semantics across consumers.
+pub const ContentSecurityConfig = struct {
+    /// Whitelist for HTTP(S) downloads. With block_private_ips enabled (the default), IP literals and every address resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address. Set block_private_ips to false only to opt into private or special destinations. The generic scraper treats omission as unrestricted subject to that policy and an explicit empty list as deny-all; Antfly inference requires an explicit allowlist.
+    allowed_hosts: ?[]const []const u8 = null,
+    /// Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special destinations.
+    block_private_ips: ?bool = null,
+    /// RFC 6052 network-specific NAT64 prefixes used by this deployment. Resolved IPv6 addresses under these prefixes are decoded and checked against the private IPv4 policy. Prefix length must be 32, 40, 48, 56, 64, or 96.
+    nat64_prefixes: ?[]const []const u8 = null,
+    /// Maximum size of downloaded content in bytes
+    max_download_size_bytes: ?i64 = null,
+    /// Maximum HTTP(S) and S3 download duration in seconds. Defaults to 30. Zero disables this configured ceiling, but a caller-supplied request deadline still applies. A deadline-bound file:// fetch fails closed because portable filesystem I/O does not expose a preemptive timeout.
+    download_timeout_seconds: ?i64 = null,
+    /// Maximum source-image width or height enforced for accepted inference image inputs, including generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Images are rejected rather than resized. Batch generation applies the same image-header admission before model execution; non-inference scraping consumers do not enforce this setting.
+    max_image_dimension: ?i64 = null,
+    /// Whitelist of allowed path prefixes for file:// and s3:// URLs. File downloads require an explicit nonempty path allowlist; omission and an empty list deny local file access. For S3 the generic scraper treats omission as unrestricted and an empty list as deny-all; Antfly inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
+    allowed_paths: ?[]const []const u8 = null,
+    /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
+    user_agent: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "allowed_hosts", "allowed_hosts", true },
+        .{ "block_private_ips", "block_private_ips", true },
+        .{ "nat64_prefixes", "nat64_prefixes", true },
+        .{ "max_download_size_bytes", "max_download_size_bytes", true },
+        .{ "download_timeout_seconds", "download_timeout_seconds", true },
+        .{ "max_image_dimension", "max_image_dimension", true },
+        .{ "allowed_paths", "allowed_paths", true },
+        .{ "user_agent", "user_agent", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.allowed_hosts) |value| {
+            try jw.objectField("allowed_hosts");
+            try jw.write(value);
+        }
+        if (self.block_private_ips) |value| {
+            try jw.objectField("block_private_ips");
+            try jw.write(value);
+        }
+        if (self.nat64_prefixes) |value| {
+            try jw.objectField("nat64_prefixes");
+            try jw.write(value);
+        }
+        if (self.max_download_size_bytes) |value| {
+            try jw.objectField("max_download_size_bytes");
+            try jw.write(value);
+        }
+        if (self.download_timeout_seconds) |value| {
+            try jw.objectField("download_timeout_seconds");
+            try jw.write(value);
+        }
+        if (self.max_image_dimension) |value| {
+            try jw.objectField("max_image_dimension");
+            try jw.write(value);
+        }
+        if (self.allowed_paths) |value| {
+            try jw.objectField("allowed_paths");
+            try jw.write(value);
+        }
+        if (self.user_agent) |value| {
+            try jw.objectField("user_agent");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 
@@ -9226,6 +9843,9 @@ pub const CurationProposalDecisionResult = struct {
     changed: ?bool = null,
     atomicity: ?[]const u8 = null,
     applied: ?bool = null,
+    /// Relative native consumer-progress resource; resolve against the decision request URI.
+    progress_url: ?[]const u8 = null,
+    namespaces: ?[]const EntityNamespaceOutcome = null,
     results: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -9235,6 +9855,8 @@ pub const CurationProposalDecisionResult = struct {
         .{ "changed", "changed", true },
         .{ "atomicity", "atomicity", true },
         .{ "applied", "applied", true },
+        .{ "progress_url", "progress_url", true },
+        .{ "namespaces", "namespaces", true },
         .{ "results", "results", true },
     };
 
@@ -9266,6 +9888,14 @@ pub const CurationProposalDecisionResult = struct {
         }
         if (self.applied) |value| {
             try jw.objectField("applied");
+            try jw.write(value);
+        }
+        if (self.progress_url) |value| {
+            try jw.objectField("progress_url");
+            try jw.write(value);
+        }
+        if (self.namespaces) |value| {
+            try jw.objectField("namespaces");
             try jw.write(value);
         }
         if (self.results) |value| {
@@ -9633,11 +10263,17 @@ pub const DeciderConfig = struct {
     output: ?ConstrainedOutput = null,
     probabilities: ?ConstrainedProbabilities = null,
     batch: ?ConstrainedGenerationBatch = null,
-    /// Required for Antfly and OpenAI; Jev defaults to jev-latest.
+    /// Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
     model: ?[]const u8 = null,
+    /// Required with the cloudflare provider; Workers AI account identifier.
+    account_id: ?[]const u8 = null,
+    /// Optional Cloudflare AI Gateway identifier.
+    gateway_id: ?[]const u8 = null,
     /// Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
     model_identity: ?[]const u8 = null,
-    /// EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities.
+    /// Named dense embedder for provider-neutral embedding_similarity routing. Specify matching embedding_options.dimensions. Native fitted calibrations require the original Antfly model path; hosted routes use explicit thresholds and estimated token admission.
+    embedder: ?[]const u8 = null,
+    /// Geometry and acceptance defaults for embedding_similarity decisions. Named embedders require dimensions matching their configured dense output. Direct Antfly model routes support EmbeddingGemma 2 dimensions and fitted calibrations. Acceptance is serialized onto each question and can be overridden per question. Raw cosine similarities never represent probabilities.
     embedding_options: ?std.json.Value = null,
     /// Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1 and appends /decisions.
     url: ?[]const u8 = null,
@@ -9660,7 +10296,10 @@ pub const DeciderConfig = struct {
         .{ "probabilities", "probabilities", true },
         .{ "batch", "batch", true },
         .{ "model", "model", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
         .{ "model_identity", "model_identity", true },
+        .{ "embedder", "embedder", true },
         .{ "embedding_options", "embedding_options", true },
         .{ "url", "url", true },
         .{ "api_key", "api_key", true },
@@ -9713,8 +10352,20 @@ pub const DeciderConfig = struct {
             try jw.objectField("model");
             try jw.write(value);
         }
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
         if (self.model_identity) |value| {
             try jw.objectField("model_identity");
+            try jw.write(value);
+        }
+        if (self.embedder) |value| {
+            try jw.objectField("embedder");
             try jw.write(value);
         }
         if (self.embedding_options) |value| {
@@ -9915,6 +10566,40 @@ pub const DecisionEvidenceMessage = struct {
     }
 };
 
+pub const DecisionEvidenceTableImage = struct {
+    type: []const u8,
+    source: DecisionTableSource,
+    detail: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "source", "source", false },
+        .{ "detail", "detail", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("source");
+        try jw.write(self.source);
+        if (self.detail) |value| {
+            try jw.objectField("detail");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const DecisionEvidenceText = struct {
     type: []const u8,
     text: []const u8,
@@ -10070,6 +10755,91 @@ pub const DecisionRequest = union(enum) {
 pub const DecisionSimilarity = struct {
     value: []const u8,
     similarity: f64,
+};
+
+/// Antfly gateway-only, request-local table image reference. The gateway uses the ingress identity through the ordinary query path, checks the current revision, optional source identity, digest, MIME, byte length and pixel bound, then materializes provider-compatible image evidence. It never forwards this locator or a credential upstream. The digest is not an access grant. Direct inference servers without table access reject this form.
+pub const DecisionTableSource = struct {
+    table: []const u8,
+    document_id: []const u8,
+    field: []const u8,
+    revision_field: []const u8,
+    revision: []const u8,
+    identity: ?[]const u8 = null,
+    sha256: []const u8,
+    mime_type: []const u8,
+    byte_length: i64,
+    max_pixels: ?i64 = null,
+    /// Additional caller selection, conjoined with the gateway's live row policy; never an authorization override.
+    filter_query: ?std.json.ArrayHashMap(std.json.Value) = null,
+    permissions_field: ?[]const u8 = null,
+    /// Optional narrowing check against permissions_field.public/readers; it cannot grant table or row access.
+    principals: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", false },
+        .{ "document_id", "document_id", false },
+        .{ "field", "field", false },
+        .{ "revision_field", "revision_field", false },
+        .{ "revision", "revision", false },
+        .{ "identity", "identity", true },
+        .{ "sha256", "sha256", false },
+        .{ "mime_type", "mime_type", false },
+        .{ "byte_length", "byte_length", false },
+        .{ "max_pixels", "max_pixels", true },
+        .{ "filter_query", "filter_query", true },
+        .{ "permissions_field", "permissions_field", true },
+        .{ "principals", "principals", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.objectField("document_id");
+        try jw.write(self.document_id);
+        try jw.objectField("field");
+        try jw.write(self.field);
+        try jw.objectField("revision_field");
+        try jw.write(self.revision_field);
+        try jw.objectField("revision");
+        try jw.write(self.revision);
+        if (self.identity) |value| {
+            try jw.objectField("identity");
+            try jw.write(value);
+        }
+        try jw.objectField("sha256");
+        try jw.write(self.sha256);
+        try jw.objectField("mime_type");
+        try jw.write(self.mime_type);
+        try jw.objectField("byte_length");
+        try jw.write(self.byte_length);
+        if (self.max_pixels) |value| {
+            try jw.objectField("max_pixels");
+            try jw.write(value);
+        }
+        if (self.filter_query) |value| {
+            try jw.objectField("filter_query");
+            try jw.write(value);
+        }
+        if (self.permissions_field) |value| {
+            try jw.objectField("permissions_field");
+            try jw.write(value);
+        }
+        if (self.principals) |value| {
+            try jw.objectField("principals");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const DecisionUsage = struct {
@@ -11185,6 +11955,598 @@ pub const DocumentArtifactTableReprocessResponse = struct {
     }
 };
 
+/// Configuration for the `document_extraction` producer. It downloads the source URL and persists derived units such as PDF pages, sections, images, and audio. Native text (PDF text layers, Office documents, HTML, email, plain text) is extracted with no model. Scanned pages and images are read only when `ocr` names a reader or generator, and audio is transcribed only when `transcription` names a transcriber. Units that need a producer that is not configured report `extraction_status` `ocr_not_configured` or `transcription_not_configured`. **Example:** ```json { "source": {"filename_field": "filename", "content_type_field": "mime_type"}, "ocr": {"reader": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}}, "transcription": {"transcriber": {"provider": "antfly", "model": "openai/whisper-small"}} } ```
+pub const DocumentExtractionConfig = struct {
+    source: ?DocumentExtractionSourceConfig = null,
+    /// Static filename used for content detection when the row has none.
+    filename: ?[]const u8 = null,
+    /// Static content type. Overrides the downloaded response's content type.
+    content_type: ?[]const u8 = null,
+    /// Static ETag recorded as source version metadata.
+    etag: ?[]const u8 = null,
+    /// Static checksum recorded as source version metadata.
+    checksum: ?[]const u8 = null,
+    /// Static source version. Together with the other metadata it lets extraction skip unchanged sources.
+    version: ?[]const u8 = null,
+    /// Static last-modified timestamp recorded as source version metadata.
+    last_modified: ?[]const u8 = null,
+    /// Credential reference used to download the source URL.
+    credentials: ?[]const u8 = null,
+    /// Strip HTML markup from HTML sources before storing their text.
+    html_strip_tags: ?bool = null,
+    ocr: ?DocumentExtractionOcrConfig = null,
+    transcription: ?DocumentExtractionTranscriptionConfig = null,
+    /// How sources that match no explicit route are handled. `mixed_files` (alias `default`) detects PDFs, HTML, email, Office documents, ZIP archives, images, audio, and text. `explicit_only` (alias `none`) records unmatched sources as unsupported. Detection never requests a producer: detected images and audio without a configured producer report `ocr_not_configured` or `transcription_not_configured`.
+    route_preset: ?[]const u8 = null,
+    /// Routes evaluated in order before the preset. The first route whose match applies selects the extractor.
+    routes: ?[]const DocumentExtractionRoute = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "source", "source", true },
+        .{ "filename", "filename", true },
+        .{ "content_type", "content_type", true },
+        .{ "etag", "etag", true },
+        .{ "checksum", "checksum", true },
+        .{ "version", "version", true },
+        .{ "last_modified", "last_modified", true },
+        .{ "credentials", "credentials", true },
+        .{ "html_strip_tags", "html_strip_tags", true },
+        .{ "ocr", "ocr", true },
+        .{ "transcription", "transcription", true },
+        .{ "route_preset", "route_preset", true },
+        .{ "routes", "routes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.filename) |value| {
+            try jw.objectField("filename");
+            try jw.write(value);
+        }
+        if (self.content_type) |value| {
+            try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.etag) |value| {
+            try jw.objectField("etag");
+            try jw.write(value);
+        }
+        if (self.checksum) |value| {
+            try jw.objectField("checksum");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.last_modified) |value| {
+            try jw.objectField("last_modified");
+            try jw.write(value);
+        }
+        if (self.credentials) |value| {
+            try jw.objectField("credentials");
+            try jw.write(value);
+        }
+        if (self.html_strip_tags) |value| {
+            try jw.objectField("html_strip_tags");
+            try jw.write(value);
+        }
+        if (self.ocr) |value| {
+            try jw.objectField("ocr");
+            try jw.write(value);
+        }
+        if (self.transcription) |value| {
+            try jw.objectField("transcription");
+            try jw.write(value);
+        }
+        if (self.route_preset) |value| {
+            try jw.objectField("route_preset");
+            try jw.write(value);
+        }
+        if (self.routes) |value| {
+            try jw.objectField("routes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers run their own OCR task; generators receive a transcription instruction.
+pub const DocumentExtractionOcrConfig = struct {
+    reader: ?DocumentExtractionReaderConfig = null,
+    generator: ?GeneratorConfig = null,
+    /// `auto` reads PDF pages whose native text fails the `quality` checks, and images. `always` reads every page.
+    mode: ?[]const u8 = null,
+    /// Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts.
+    prompt: ?[]const u8 = null,
+    render: ?DocumentExtractionRenderConfig = null,
+    quality: ?DocumentExtractionOcrQualityConfig = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "reader", "reader", true },
+        .{ "generator", "generator", true },
+        .{ "mode", "mode", true },
+        .{ "prompt", "prompt", true },
+        .{ "render", "render", true },
+        .{ "quality", "quality", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.reader) |value| {
+            try jw.objectField("reader");
+            try jw.write(value);
+        }
+        if (self.generator) |value| {
+            try jw.objectField("generator");
+            try jw.write(value);
+        }
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.render) |value| {
+            try jw.objectField("render");
+            try jw.write(value);
+        }
+        if (self.quality) |value| {
+            try jw.objectField("quality");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode.
+pub const DocumentExtractionOcrQualityConfig = struct {
+    /// Pages with fewer meaningful characters are read with OCR.
+    min_content_chars: ?i64 = null,
+    /// Minimum words before the garbled-text check applies.
+    garbled_min_words: ?i64 = null,
+    /// Words sampled by the garbled-text check.
+    garbled_sample_words: ?i64 = null,
+    /// Maximum ratio of single-character words before text counts as garbled.
+    max_single_char_word_ratio: ?f64 = null,
+    /// Minimum characters for a line to count in the corrupted-line check.
+    substantial_line_min_chars: ?i64 = null,
+    /// Maximum ratio of corrupted lines.
+    max_corrupted_line_ratio: ?f64 = null,
+    /// Font corruption score at which text is replaced by OCR.
+    font_corruption_score_threshold: ?f64 = null,
+    /// Maximum ratio of Unicode replacement characters.
+    max_replacement_char_ratio: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "min_content_chars", "min_content_chars", true },
+        .{ "garbled_min_words", "garbled_min_words", true },
+        .{ "garbled_sample_words", "garbled_sample_words", true },
+        .{ "max_single_char_word_ratio", "max_single_char_word_ratio", true },
+        .{ "substantial_line_min_chars", "substantial_line_min_chars", true },
+        .{ "max_corrupted_line_ratio", "max_corrupted_line_ratio", true },
+        .{ "font_corruption_score_threshold", "font_corruption_score_threshold", true },
+        .{ "max_replacement_char_ratio", "max_replacement_char_ratio", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.min_content_chars) |value| {
+            try jw.objectField("min_content_chars");
+            try jw.write(value);
+        }
+        if (self.garbled_min_words) |value| {
+            try jw.objectField("garbled_min_words");
+            try jw.write(value);
+        }
+        if (self.garbled_sample_words) |value| {
+            try jw.objectField("garbled_sample_words");
+            try jw.write(value);
+        }
+        if (self.max_single_char_word_ratio) |value| {
+            try jw.objectField("max_single_char_word_ratio");
+            try jw.write(value);
+        }
+        if (self.substantial_line_min_chars) |value| {
+            try jw.objectField("substantial_line_min_chars");
+            try jw.write(value);
+        }
+        if (self.max_corrupted_line_ratio) |value| {
+            try jw.objectField("max_corrupted_line_ratio");
+            try jw.write(value);
+        }
+        if (self.font_corruption_score_threshold) |value| {
+            try jw.objectField("font_corruption_score_threshold");
+            try jw.write(value);
+        }
+        if (self.max_replacement_char_ratio) |value| {
+            try jw.objectField("max_replacement_char_ratio");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Reader provider for OCR. Every provider except `apple` requires `model`; Apple uses Vision text recognition and accepts no model, credentials, or prompt.
+pub const DocumentExtractionReaderConfig = struct {
+    provider: []const u8,
+    /// Reader model, such as `lightonai/LightOnOCR-3-0.8B`.
+    model: ?[]const u8 = null,
+    /// Provider-level prompt. Hosted readers send their own read instruction when it is omitted.
+    prompt: ?[]const u8 = null,
+    /// Maximum output tokens per page.
+    max_tokens: ?i64 = null,
+    /// Reader endpoint URL.
+    api_url: ?[]const u8 = null,
+    /// Reader endpoint URL; takes precedence over `api_url`.
+    url: ?[]const u8 = null,
+    /// Provider API base URL.
+    base_url: ?[]const u8 = null,
+    /// API key, normally a `${secret:...}` reference.
+    api_key: ?[]const u8 = null,
+    /// Bearer token, normally a `${secret:...}` reference.
+    bearer_token: ?[]const u8 = null,
+    /// Capability token for an Antfly inference endpoint.
+    capability_token: ?[]const u8 = null,
+    /// Revision of the capability token.
+    capability_revision: ?[]const u8 = null,
+    /// Cloudflare account ID. Required for `cloudflare`.
+    account_id: ?[]const u8 = null,
+    /// Cloudflare AI Gateway ID.
+    gateway_id: ?[]const u8 = null,
+    /// Google Cloud project for `vertex`.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for `vertex`.
+    location: ?[]const u8 = null,
+    /// Path to Google Cloud credentials for `vertex`.
+    credentials_path: ?[]const u8 = null,
+    /// Apple Vision recognition languages. Defaults to `en-US`.
+    recognition_languages: ?[]const []const u8 = null,
+    /// Apple Vision recognition level.
+    recognition_level: ?[]const u8 = null,
+    /// Apple Vision language correction.
+    uses_language_correction: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", true },
+        .{ "prompt", "prompt", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "api_url", "api_url", true },
+        .{ "url", "url", true },
+        .{ "base_url", "base_url", true },
+        .{ "api_key", "api_key", true },
+        .{ "bearer_token", "bearer_token", true },
+        .{ "capability_token", "capability_token", true },
+        .{ "capability_revision", "capability_revision", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "recognition_languages", "recognition_languages", true },
+        .{ "recognition_level", "recognition_level", true },
+        .{ "uses_language_correction", "uses_language_correction", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.bearer_token) |value| {
+            try jw.objectField("bearer_token");
+            try jw.write(value);
+        }
+        if (self.capability_token) |value| {
+            try jw.objectField("capability_token");
+            try jw.write(value);
+        }
+        if (self.capability_revision) |value| {
+            try jw.objectField("capability_revision");
+            try jw.write(value);
+        }
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.recognition_languages) |value| {
+            try jw.objectField("recognition_languages");
+            try jw.write(value);
+        }
+        if (self.recognition_level) |value| {
+            try jw.objectField("recognition_level");
+            try jw.write(value);
+        }
+        if (self.uses_language_correction) |value| {
+            try jw.objectField("uses_language_correction");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// How PDF pages are rasterized for OCR.
+pub const DocumentExtractionRenderConfig = struct {
+    /// Render resolution in dots per inch.
+    dpi: ?i64 = null,
+    /// `requested_dpi` renders at `dpi` within the caps. `model_input` renders near the model's preferred input size.
+    resolution: ?[]const u8 = null,
+    /// Maximum pixels per rendered page.
+    max_pixels: ?i64 = null,
+    /// Maximum width or height of a rendered page.
+    max_dimension: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "dpi", "dpi", true },
+        .{ "resolution", "resolution", true },
+        .{ "max_pixels", "max_pixels", true },
+        .{ "max_dimension", "max_dimension", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.dpi) |value| {
+            try jw.objectField("dpi");
+            try jw.write(value);
+        }
+        if (self.resolution) |value| {
+            try jw.objectField("resolution");
+            try jw.write(value);
+        }
+        if (self.max_pixels) |value| {
+            try jw.objectField("max_pixels");
+            try jw.write(value);
+        }
+        if (self.max_dimension) |value| {
+            try jw.objectField("max_dimension");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const DocumentExtractionRoute = struct {
+    match: ?DocumentExtractionRouteMatch = null,
+    extractor: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "match", "match", true },
+        .{ "extractor", "extractor", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.match) |value| {
+            try jw.objectField("match");
+            try jw.write(value);
+        }
+        try jw.objectField("extractor");
+        try jw.write(self.extractor);
+        try jw.endObject();
+    }
+};
+
+/// Conditions a source must meet. Every condition given must match.
+pub const DocumentExtractionRouteMatch = struct {
+    /// Exact content type.
+    content_type: ?[]const u8 = null,
+    /// Content type prefix, such as `image/`.
+    content_type_prefix: ?[]const u8 = null,
+    /// Filename extension or list of extensions.
+    extension: ?std.json.Value = null,
+    /// Leading bytes or list of leading-byte prefixes.
+    magic_prefix: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "content_type", "content_type", true },
+        .{ "content_type_prefix", "content_type_prefix", true },
+        .{ "extension", "extension", true },
+        .{ "magic_prefix", "magic_prefix", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.content_type) |value| {
+            try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.content_type_prefix) |value| {
+            try jw.objectField("content_type_prefix");
+            try jw.write(value);
+        }
+        if (self.extension) |value| {
+            try jw.objectField("extension");
+            try jw.write(value);
+        }
+        if (self.magic_prefix) |value| {
+            try jw.objectField("magic_prefix");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Names of row fields that carry source metadata. Each overrides the matching static field.
+pub const DocumentExtractionSourceConfig = struct {
+    /// Row field holding the source filename.
+    filename_field: ?[]const u8 = null,
+    /// Row field holding the source content type.
+    content_type_field: ?[]const u8 = null,
+    /// Row field holding the source ETag.
+    etag_field: ?[]const u8 = null,
+    /// Row field holding the source checksum.
+    checksum_field: ?[]const u8 = null,
+    /// Row field holding the source version.
+    version_field: ?[]const u8 = null,
+    /// Row field holding the source last-modified timestamp.
+    last_modified_field: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "filename_field", "filename_field", true },
+        .{ "content_type_field", "content_type_field", true },
+        .{ "etag_field", "etag_field", true },
+        .{ "checksum_field", "checksum_field", true },
+        .{ "version_field", "version_field", true },
+        .{ "last_modified_field", "last_modified_field", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.filename_field) |value| {
+            try jw.objectField("filename_field");
+            try jw.write(value);
+        }
+        if (self.content_type_field) |value| {
+            try jw.objectField("content_type_field");
+            try jw.write(value);
+        }
+        if (self.etag_field) |value| {
+            try jw.objectField("etag_field");
+            try jw.write(value);
+        }
+        if (self.checksum_field) |value| {
+            try jw.objectField("checksum_field");
+            try jw.write(value);
+        }
+        if (self.version_field) |value| {
+            try jw.objectField("version_field");
+            try jw.write(value);
+        }
+        if (self.last_modified_field) |value| {
+            try jw.objectField("last_modified_field");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Transcribes audio units.
+pub const DocumentExtractionTranscriptionConfig = struct {
+    transcriber: STTConfig,
+};
+
 /// Executable physical mapping used by a document property's `x-antfly-field` annotation. The mapping must accept the JSON Schema value type. Declarations for the same dotted path across document types must normalize to an identical physical mapping, and present values that cannot be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize to the same mapping in every alternative; conditional and dynamically named mappings are rejected.
 pub const DocumentFieldMapping = struct {
     type: ?FieldMappingType = null,
@@ -11198,7 +12560,7 @@ pub const DocumentFieldMapping = struct {
     include_in_all: ?bool = null,
     /// Whether this exact scalar field can be used in order_by. Supported sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed text, search_as_you_type, geo, embedding, blob, html, object, and array fields are not directly sortable; use an exact scalar subfield such as title.keyword for sorted string pagination. Antfly derives the required typed doc values when enabled.
     sortable: ?bool = null,
-    /// Missing/null sort policy. The current production policy rejects missing or null native sort values.
+    /// Missing/null sort policy. The default missing_rejected rejects missing or null native sort values. Opt in to nulls_ordered for nulls first ascending and last descending, with JSON null cursor components. Nullable native layouts require a complete producer proof.
     missing_null_policy: ?[]const u8 = null,
     /// Named one-level multifields emitted from this property's value. For example, a text title can expose a sortable keyword subfield.
     fields: ?std.json.ArrayHashMap(DocumentSubfieldMapping) = null,
@@ -11296,6 +12658,68 @@ pub const DocumentSchema = struct {
     }
 };
 
+pub const DocumentSource = struct {
+    /// Image-only perspective correction. Four clockwise corners in original image-edge pixels, ordered top-left, top-right, bottom-right, bottom-left. OCR evidence remains in original source coordinates.
+    quadrilateral: ?[]const []const f64 = null,
+    /// Unique source identity within the request. Separate sources are never implicitly merged.
+    id: []const u8,
+    /// Inline data URI or location allowed by the deployment content security policy.
+    url: []const u8,
+    media_type: []const u8,
+    /// Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide.
+    pages: ?[]const i64 = null,
+    /// Include slide speaker notes as separate evidence, never silently as visible slide text.
+    include_notes: ?bool = null,
+    /// Include hidden slides.
+    include_hidden: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "quadrilateral", "quadrilateral", true },
+        .{ "id", "id", false },
+        .{ "url", "url", false },
+        .{ "media_type", "media_type", false },
+        .{ "pages", "pages", true },
+        .{ "include_notes", "include_notes", true },
+        .{ "include_hidden", "include_hidden", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.quadrilateral) |value| {
+            try jw.objectField("quadrilateral");
+            try jw.write(value);
+        }
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("url");
+        try jw.write(self.url);
+        try jw.objectField("media_type");
+        try jw.write(self.media_type);
+        if (self.pages) |value| {
+            try jw.objectField("pages");
+            try jw.write(value);
+        }
+        if (self.include_notes) |value| {
+            try jw.objectField("include_notes");
+            try jw.write(value);
+        }
+        if (self.include_hidden) |value| {
+            try jw.objectField("include_hidden");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Mapping for one named multifield emitted from its parent document property. Multifields are intentionally one level deep and read the parent property's JSON value rather than a nested JSON property.
 pub const DocumentSubfieldMapping = struct {
     type: ?FieldMappingType = null,
@@ -11309,7 +12733,7 @@ pub const DocumentSubfieldMapping = struct {
     include_in_all: ?bool = null,
     /// Whether this exact scalar subfield can be used in order_by. Antfly derives the required typed doc values when enabled.
     sortable: ?bool = null,
-    /// Missing/null sort policy. The current production policy rejects missing or null native sort values.
+    /// Missing/null sort policy. The default missing_rejected rejects missing or null native sort values. Opt in to nulls_ordered for nulls first ascending and last descending, with JSON null cursor components. Nullable native layouts require a complete producer proof.
     missing_null_policy: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -11649,30 +13073,31 @@ pub const EdgesResponse = struct {
 
 /// A unified configuration for an embedding provider. Embedders can be configured with templates to customize how documents are converted to text before embedding. Templates use Handlebars syntax and support various built-in helpers. **Template System:** - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/) - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes) - **Context**: Templates receive the full document as context **Built-in Helpers:** 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML ```handlebars {{scrubHtml html_content}} ``` - Removes `<script>` and `<style>` tags - Adds newlines after block elements (p, div, h1-h6, li, etc.) - Returns plain text with preserved readability 2. **eq** - Equality comparison for conditionals ```handlebars {{#if (eq status "active")}}Active user{{/if}} {{#if (eq @key "special")}}Special field{{/if}} ``` 3. **media** - GenKit dotprompt media directive for multimodal content ```handlebars {{media url=imageDataURI}} {{media url=this.image_url}} {{media url="https://example.com/image.jpg"}} {{media url="s3://endpoint/bucket/image.png"}} {{media url="file:///path/to/image.jpg"}} ``` **Supported URL Schemes:** - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`) - `http://` / `https://` - Web URLs with automatic content type detection - `file://` - Local filesystem paths - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`) **Automatic Content Processing:** - **Images**: Downloaded, resized (if needed), converted to data URIs - **PDFs**: Text extracted or first page rendered as image - **HTML**: Readable text extracted using Mozilla Readability **Security Controls:** Downloads are protected by content security settings (see Configuration Reference): - Allowed host whitelist - Private IP blocking (prevents SSRF attacks) - Download size limits (default: 100MB) - HTTP downloads time out after 30 seconds by default; zero disables the deadline - Image dimension limits (default: 2048px, auto-resized) See: https://antfly.io/docs/configuration#security--cors 4. **encodeToon** is not available in these templates. It is a helper of the retrieval agent's `document_renderer`, which renders documents into the generation prompt as TOON by default. **Template Examples:** Document with metadata: ```handlebars Title: {{metadata.title}} Date: {{metadata.date}} Tags: {{#each metadata.tags}}{{this}}, {{/each}} {{content}} ``` HTML content extraction: ```handlebars Product: {{name}} Description: {{scrubHtml description_html}} Price: ${{price}} ``` Multimodal with image: ```handlebars Product: {{title}} {{media url=image}} Description: {{description}} ``` Conditional formatting: ```handlebars {{title}} {{#if author}}By: {{author}}{{/if}} {{#if (eq category "premium")}}⭐ Premium Content{{/if}} {{body}} ``` **Environment Variables:** - `GEMINI_API_KEY` - API key for Google AI - `OPENAI_API_KEY` - API key for OpenAI - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434) **Importing Pre-computed Embeddings:** You can import existing embeddings (from OpenAI, Cohere, or any provider), but only for indexes configured with `external: true`. External indexes accept vectors written directly through the document `_embeddings` field and do not generate prompts from `field` or `template`. **Steps:** 1. Create an embeddings index with `external: true` 2. For dense indexes, set the index `dimension` 3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }` **Example:** ```json { "title": "My Document", "content": "Document text...", "_embeddings": { "my_vector_index": [0.1, 0.2, 0.3, ...] } } ``` **Delete Behavior:** - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged **Use Cases:** - Migrating from another vector database with existing embeddings - Using embeddings generated by external systems - Importing pre-computed OpenAI, Cohere, or other provider embeddings - Batch processing embeddings offline before ingestion
 pub const EmbedderConfig = struct {
+    provider: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
+    gateway_id: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned endpoint override.
+    url: ?[]const u8 = null,
+    /// Expected fixed model output dimension; the adapter validates returned vectors and never requests unsupported resizing.
+    dimensions: ?i64 = null,
+    /// Alias of dimensions.
+    dimension: ?i64 = null,
     /// Wire protocol. New configurations default to embed_content; existing catalogs retain their pinned protocol. No automatic fallback.
     request_format: ?[]const u8 = null,
     /// Retrieval task representation, independent of model name. Defaults to prompt with embed_content and task_type with legacy protocols. Changing it requires re-embedding.
     task_encoding: ?[]const u8 = null,
     /// Maximum inputs per upstream request. embed_content requires 1 so independent records never become one aggregated embedding.
     batch_size: ?i64 = null,
-    provider: ?[]const u8 = null,
     /// The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
     project_id: ?[]const u8 = null,
     /// The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API.
     location: ?[]const u8 = null,
-    /// The name of the embedding model to use.
-    model: ?[]const u8 = null,
-    /// The dimension of the embedding vector (768, 1536, or 3072 recommended).
-    dimension: ?i64 = null,
-    /// The Google API key. Can also be set via GEMINI_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// The URL of the Google API endpoint (optional, uses default if not specified).
-    url: ?[]const u8 = null,
     retrieval: ?EmbeddingRetrievalConfig = null,
     /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain.
     credentials_path: ?[]const u8 = null,
-    /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
-    dimensions: ?i64 = null,
     /// The AWS region for the Bedrock service (e.g., 'us-east-1').
     region: ?[]const u8 = null,
     /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
@@ -11699,19 +13124,21 @@ pub const EmbedderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "model", "model", true },
+        .{ "api_key", "api_key", true },
+        .{ "url", "url", true },
+        .{ "dimensions", "dimensions", true },
+        .{ "dimension", "dimension", true },
         .{ "request_format", "request_format", true },
         .{ "task_encoding", "task_encoding", true },
         .{ "batch_size", "batch_size", true },
-        .{ "provider", "provider", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
-        .{ "model", "model", true },
-        .{ "dimension", "dimension", true },
-        .{ "api_key", "api_key", true },
-        .{ "url", "url", true },
         .{ "retrieval", "retrieval", true },
         .{ "credentials_path", "credentials_path", true },
-        .{ "dimensions", "dimensions", true },
         .{ "region", "region", true },
         .{ "input_type", "input_type", true },
         .{ "truncate", "truncate", true },
@@ -11736,6 +13163,38 @@ pub const EmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.provider) |value| {
+            try jw.objectField("provider");
+            try jw.write(value);
+        }
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        if (self.dimension) |value| {
+            try jw.objectField("dimension");
+            try jw.write(value);
+        }
         if (self.request_format) |value| {
             try jw.objectField("request_format");
             try jw.write(value);
@@ -11748,10 +13207,6 @@ pub const EmbedderConfig = struct {
             try jw.objectField("batch_size");
             try jw.write(value);
         }
-        if (self.provider) |value| {
-            try jw.objectField("provider");
-            try jw.write(value);
-        }
         if (self.project_id) |value| {
             try jw.objectField("project_id");
             try jw.write(value);
@@ -11760,32 +13215,12 @@ pub const EmbedderConfig = struct {
             try jw.objectField("location");
             try jw.write(value);
         }
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
-        if (self.dimension) |value| {
-            try jw.objectField("dimension");
-            try jw.write(value);
-        }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.url) |value| {
-            try jw.objectField("url");
-            try jw.write(value);
-        }
         if (self.retrieval) |value| {
             try jw.objectField("retrieval");
             try jw.write(value);
         }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
-            try jw.write(value);
-        }
-        if (self.dimensions) |value| {
-            try jw.objectField("dimensions");
             try jw.write(value);
         }
         if (self.region) |value| {
@@ -11842,6 +13277,7 @@ pub const EmbedderConfig = struct {
 
 /// The embedding provider to use.
 pub const EmbedderProvider = enum {
+    cloudflare,
     gemini,
     vertex,
     ollama,
@@ -11853,6 +13289,7 @@ pub const EmbedderProvider = enum {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
+            .cloudflare => "cloudflare",
             .gemini => "gemini",
             .vertex => "vertex",
             .ollama => "ollama",
@@ -11871,6 +13308,7 @@ pub const EmbedderProvider = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "cloudflare", .cloudflare },
             .{ "gemini", .gemini },
             .{ "vertex", .vertex },
             .{ "ollama", .ollama },
@@ -12990,7 +14428,7 @@ pub const EnrichmentConfig = struct {
     full_text_index: ?bool = null,
     /// Produced asset content type for asset enrichments.
     content_type: ?[]const u8 = null,
-    /// Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle.
+    /// Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}. A named-embedder similarity decider also requires embedders={name: frozen EmbedderConfig}; the dependency travels with the specification for deterministic replay instead of resolving mutable node configuration. Credentials use secret references or environment defaults. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle.
     producer: ?std.json.Value = null,
     /// Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
     producer_json: ?[]const u8 = null,
@@ -13449,13 +14887,102 @@ pub const EnrichmentRuntimeStatus = struct {
     }
 };
 
+pub const EntityConsumerProgressPage = struct {
+    entity_table: []const u8,
+    key: []const u8,
+    catalog_revision: u64,
+    /// True when enumeration has no further pages; it does not certify replay completion.
+    complete: bool,
+    next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
+    results: []const std.json.Value,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("entity_table");
+        try jw.write(self.entity_table);
+        try jw.objectField("key");
+        try jw.write(self.key);
+        try jw.objectField("catalog_revision");
+        try jw.write(self.catalog_revision);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        switch (self.next_cursor) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("next_cursor");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("next_cursor");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("results");
+        try jw.write(self.results);
+        try jw.endObject();
+    }
+};
+
 pub const EntityCurationResult = struct {
     entity_table: []const u8,
     key: []const u8,
     complete: bool,
-    /// Server entity corrections commit once on the destination table, atomically across matching namespaces. Source replay remains asynchronous. Lite retains resolver atomicity.
+    /// Entity corrections commit atomically across matching namespaces on the destination table; replay is asynchronous. Other atomicity values identify the scope guaranteed by the responding adapter.
     atomicity: []const u8,
+    /// True only when replay completion was observed for all consumers, or no consumers exist. Admission without wait is conservative.
+    applied: ?bool = null,
+    /// Native HTTP mutations return this progress resource relative to the request URI. Follow its bounded pages for individual consumer proofs.
+    progress_url: ?[]const u8 = null,
+    /// Mutation outcomes, stored once per namespace. Read absorbed keys and dispositions here; consumer progress rows reference these by key_template. The results array is reserved for inspection and embedded consumer summaries.
+    namespaces: ?[]const EntityNamespaceOutcome = null,
     results: []const std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "entity_table", "entity_table", false },
+        .{ "key", "key", false },
+        .{ "complete", "complete", false },
+        .{ "atomicity", "atomicity", false },
+        .{ "applied", "applied", true },
+        .{ "progress_url", "progress_url", true },
+        .{ "namespaces", "namespaces", true },
+        .{ "results", "results", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("entity_table");
+        try jw.write(self.entity_table);
+        try jw.objectField("key");
+        try jw.write(self.key);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        try jw.objectField("atomicity");
+        try jw.write(self.atomicity);
+        if (self.applied) |value| {
+            try jw.objectField("applied");
+            try jw.write(value);
+        }
+        if (self.progress_url) |value| {
+            try jw.objectField("progress_url");
+            try jw.write(value);
+        }
+        if (self.namespaces) |value| {
+            try jw.objectField("namespaces");
+            try jw.write(value);
+        }
+        try jw.objectField("results");
+        try jw.write(self.results);
+        try jw.endObject();
+    }
 };
 
 pub const EntityDistinctRequest = struct {
@@ -13564,6 +15091,13 @@ pub const EntityMergeRequest = struct {
         }
         try jw.endObject();
     }
+};
+
+pub const EntityNamespaceOutcome = struct {
+    key_template: []const u8,
+    revision: u64,
+    changed: bool,
+    absorbed: []const std.json.Value,
 };
 
 pub const EntitySuppressRequest = struct {
@@ -14742,7 +16276,7 @@ pub const ExternalIoProtocol = enum {
 };
 
 pub const ExternalLakeCredentialRef = struct {
-    /// Name of a configured external_io connection with lake_read capability.
+    /// Name of a configured external_io connection with lake.read capability.
     ref: []const u8,
     /// Allowed object prefix relative to the configured bucket or filesystem root.
     scope: ?[]const u8 = null,
@@ -15526,6 +17060,8 @@ pub const ExtractionInputRequest = union(enum) {
         if (objectHasAnyKey(source.object, &.{
             "model",
             "schema_version",
+            "read_artifact",
+            "documents",
             "inputs",
             "schema",
             "options",
@@ -16648,11 +18184,15 @@ pub const ExtractionRelationSchema = struct {
     }
 };
 
-/// Atomic extraction request. Every input is validated before inference; failures return no partial data.
+/// Atomic extraction request. Supply exactly one of inputs, documents or read_artifact. Every input is validated before inference; failures return no partial data.
 pub const ExtractionRequest = struct {
     model: []const u8,
     schema_version: ?std.json.Value = null,
-    inputs: []const ExtractionInput,
+    /// Opaque handle returned by read with retain_artifact. Mutually exclusive with inputs and documents. Reuses the immutable complete reading without downloading or running OCR again. Handles expire and are local to the serving process.
+    read_artifact: ?[]const u8 = null,
+    /// Complete PDF/PPTX/image sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping.
+    documents: ?[]const DocumentSource = null,
+    inputs: ?[]const ExtractionInput = null,
     schema: ExtractionSchema,
     options: ?ExtractionOptions = null,
 
@@ -16660,7 +18200,9 @@ pub const ExtractionRequest = struct {
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "schema_version", "schema_version", true },
-        .{ "inputs", "inputs", false },
+        .{ "read_artifact", "read_artifact", true },
+        .{ "documents", "documents", true },
+        .{ "inputs", "inputs", true },
         .{ "schema", "schema", false },
         .{ "options", "options", true },
     };
@@ -16681,8 +18223,18 @@ pub const ExtractionRequest = struct {
             try jw.objectField("schema_version");
             try jw.write(value);
         }
-        try jw.objectField("inputs");
-        try jw.write(self.inputs);
+        if (self.read_artifact) |value| {
+            try jw.objectField("read_artifact");
+            try jw.write(value);
+        }
+        if (self.documents) |value| {
+            try jw.objectField("documents");
+            try jw.write(value);
+        }
+        if (self.inputs) |value| {
+            try jw.objectField("inputs");
+            try jw.write(value);
+        }
         try jw.objectField("schema");
         try jw.write(self.schema);
         if (self.options) |value| {
@@ -17356,9 +18908,9 @@ pub const FieldStatistics = struct {
     /// Number of rows with null values for this field.
     null_count: ?i64 = null,
     /// Minimum value for numeric/date fields.
-    min_value: ?std.json.Value = null,
+    min_value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// Maximum value for numeric/date fields.
-    max_value: ?std.json.Value = null,
+    max_value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// Average size in bytes for variable-length fields.
     avg_size: ?i64 = null,
 
@@ -17366,8 +18918,8 @@ pub const FieldStatistics = struct {
     pub const openApiFieldMetadata = .{
         .{ "cardinality", "cardinality", true },
         .{ "null_count", "null_count", true },
-        .{ "min_value", "min_value", true },
-        .{ "max_value", "max_value", true },
+        .{ "min_value", "min_value", false },
+        .{ "max_value", "max_value", false },
         .{ "avg_size", "avg_size", true },
     };
 
@@ -17389,13 +18941,27 @@ pub const FieldStatistics = struct {
             try jw.objectField("null_count");
             try jw.write(value);
         }
-        if (self.min_value) |value| {
-            try jw.objectField("min_value");
-            try jw.write(value);
+        switch (self.min_value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("min_value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("min_value");
+                try jw.write(value);
+            },
         }
-        if (self.max_value) |value| {
-            try jw.objectField("max_value");
-            try jw.write(value);
+        switch (self.max_value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max_value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max_value");
+                try jw.write(value);
+            },
         }
         if (self.avg_size) |value| {
             try jw.objectField("avg_size");
@@ -17413,6 +18979,32 @@ pub const FilterSpec = struct {
     operator: []const u8,
     /// Filter value (string, number, boolean, or array for range/in operators)
     value: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "field", "field", false },
+        .{ "operator", "operator", false },
+        .{ "value", "value", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("field");
+        try jw.write(self.field);
+        try jw.objectField("operator");
+        try jw.write(self.operator);
+        try jw.objectField("value");
+        try jw.write(self.value);
+        try jw.endObject();
+    }
 };
 
 /// Configuration for deterministic follow-up suggestions derived from the original query and the standard Antfly follow-up templates.
@@ -18722,24 +20314,24 @@ pub const GenerationStepConfig = struct {
 /// A unified configuration for a generative AI provider.
 pub const GeneratorConfig = struct {
     provider: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    /// Optional AI Gateway ID, sent through cf-aig-gateway-id.
+    gateway_id: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned endpoint override.
+    url: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    frequency_penalty: ?f32 = null,
+    presence_penalty: ?f32 = null,
     /// The Google Cloud project ID.
     project_id: ?[]const u8 = null,
     /// The Google Cloud location (e.g., 'us-central1').
     location: ?[]const u8 = null,
-    /// The name of the generative model to use.
-    model: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-2.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter.
-    top_p: ?f32 = null,
     /// Top-k sampling parameter.
     top_k: ?i64 = null,
-    /// The Google API key.
-    api_key: ?[]const u8 = null,
-    /// The URL of the Google API endpoint.
-    url: ?[]const u8 = null,
     /// Path to service account JSON key file.
     credentials_path: ?[]const u8 = null,
     /// AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1.
@@ -18755,10 +20347,6 @@ pub const GeneratorConfig = struct {
     connection_id: ?[]const u8 = null,
     /// OpenAI completion budget, including visible output and reasoning tokens. Use for reasoning models instead of max_tokens; the two are mutually exclusive.
     max_completion_tokens: ?i64 = null,
-    /// Penalty for token frequency (-2.0 to 2.0).
-    frequency_penalty: ?f32 = null,
-    /// Penalty for token presence (-2.0 to 2.0).
-    presence_penalty: ?f32 = null,
     /// Conservative input-token ceiling per image. Required for image calls when tokens_per_minute is configured; choose a bound valid for the model and image policy.
     max_image_input_tokens: ?i64 = null,
     rate_limit: ?RateLimitConfig = null,
@@ -18766,15 +20354,19 @@ pub const GeneratorConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", true },
-        .{ "project_id", "project_id", true },
-        .{ "location", "location", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
         .{ "model", "model", true },
-        .{ "temperature", "temperature", true },
-        .{ "max_tokens", "max_tokens", true },
-        .{ "top_p", "top_p", true },
-        .{ "top_k", "top_k", true },
         .{ "api_key", "api_key", true },
         .{ "url", "url", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "temperature", "temperature", true },
+        .{ "top_p", "top_p", true },
+        .{ "frequency_penalty", "frequency_penalty", true },
+        .{ "presence_penalty", "presence_penalty", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "top_k", "top_k", true },
         .{ "credentials_path", "credentials_path", true },
         .{ "region", "region", true },
         .{ "workspace_id", "workspace_id", true },
@@ -18783,8 +20375,6 @@ pub const GeneratorConfig = struct {
         .{ "reasoning_effort", "reasoning_effort", true },
         .{ "connection_id", "connection_id", true },
         .{ "max_completion_tokens", "max_completion_tokens", true },
-        .{ "frequency_penalty", "frequency_penalty", true },
-        .{ "presence_penalty", "presence_penalty", true },
         .{ "max_image_input_tokens", "max_image_input_tokens", true },
         .{ "rate_limit", "rate_limit", true },
     };
@@ -18803,32 +20393,16 @@ pub const GeneratorConfig = struct {
             try jw.objectField("provider");
             try jw.write(value);
         }
-        if (self.project_id) |value| {
-            try jw.objectField("project_id");
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
             try jw.write(value);
         }
-        if (self.location) |value| {
-            try jw.objectField("location");
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
             try jw.write(value);
         }
         if (self.model) |value| {
             try jw.objectField("model");
-            try jw.write(value);
-        }
-        if (self.temperature) |value| {
-            try jw.objectField("temperature");
-            try jw.write(value);
-        }
-        if (self.max_tokens) |value| {
-            try jw.objectField("max_tokens");
-            try jw.write(value);
-        }
-        if (self.top_p) |value| {
-            try jw.objectField("top_p");
-            try jw.write(value);
-        }
-        if (self.top_k) |value| {
-            try jw.objectField("top_k");
             try jw.write(value);
         }
         if (self.api_key) |value| {
@@ -18837,6 +20411,38 @@ pub const GeneratorConfig = struct {
         }
         if (self.url) |value| {
             try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.frequency_penalty) |value| {
+            try jw.objectField("frequency_penalty");
+            try jw.write(value);
+        }
+        if (self.presence_penalty) |value| {
+            try jw.objectField("presence_penalty");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
             try jw.write(value);
         }
         if (self.credentials_path) |value| {
@@ -18871,14 +20477,6 @@ pub const GeneratorConfig = struct {
             try jw.objectField("max_completion_tokens");
             try jw.write(value);
         }
-        if (self.frequency_penalty) |value| {
-            try jw.objectField("frequency_penalty");
-            try jw.write(value);
-        }
-        if (self.presence_penalty) |value| {
-            try jw.objectField("presence_penalty");
-            try jw.write(value);
-        }
         if (self.max_image_input_tokens) |value| {
             try jw.objectField("max_image_input_tokens");
             try jw.write(value);
@@ -18893,6 +20491,7 @@ pub const GeneratorConfig = struct {
 
 /// Generator providers implemented by Antfly's generation runtime.
 pub const GeneratorProvider = enum {
+    cloudflare,
     gemini,
     vertex,
     bedrock,
@@ -18906,6 +20505,7 @@ pub const GeneratorProvider = enum {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
+            .cloudflare => "cloudflare",
             .gemini => "gemini",
             .vertex => "vertex",
             .bedrock => "bedrock",
@@ -18926,6 +20526,7 @@ pub const GeneratorProvider = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "cloudflare", .cloudflare },
             .{ "gemini", .gemini },
             .{ "vertex", .vertex },
             .{ "bedrock", .bedrock },
@@ -19193,6 +20794,10 @@ pub const GlobalStatefulQueryRequest = struct {
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
     /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
+    /// Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
+    select: ?std.json.Value = null,
+    /// Request-local values bound by select expressions through param. Parameters are data, never executable expressions or read grants. The serialized parameter object is limited to 1 MiB and 1024 named parameters.
+    params: ?std.json.Value = null,
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
@@ -19266,6 +20871,8 @@ pub const GlobalStatefulQueryRequest = struct {
         .{ "aggregations", "aggregations", true },
         .{ "embeddings", "embeddings", true },
         .{ "search_effort", "search_effort", true },
+        .{ "select", "select", true },
+        .{ "params", "params", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
         .{ "highlight", "highlight", true },
@@ -19376,6 +20983,14 @@ pub const GlobalStatefulQueryRequest = struct {
         }
         if (self.search_effort) |value| {
             try jw.objectField("search_effort");
+            try jw.write(value);
+        }
+        if (self.select) |value| {
+            try jw.objectField("select");
+            try jw.write(value);
+        }
+        if (self.params) |value| {
+            try jw.objectField("params");
             try jw.write(value);
         }
         if (self.fields) |value| {
@@ -20729,6 +22344,83 @@ pub const GraphEdgeWeightRange = struct {
 pub const GraphExactResultStats = struct {
     /// Number of primary result items returned (paths or aggregates).
     returned_items: u64,
+};
+
+/// Operator-owned ceilings shared by all named graph operations in one admitted query. Public requests cannot raise these values. Explored work, scanned anchors, and exact-distinct capacity are request-consumptive; intermediate and retained-state ceilings bound simultaneously live state.
+pub const GraphExecutionConfig = struct {
+    /// Cumulative node expansions across every named operation and path spur in one request.
+    max_explored_nodes: ?i64 = null,
+    /// Cumulative edge expansions across every named operation and path spur in one request.
+    max_explored_edges: ?i64 = null,
+    /// Cumulative owned bytes of materialized edges read while executing one request.
+    max_explored_edge_bytes: ?i64 = null,
+    /// Cumulative source anchors scanned by exact MATCH operations in one request.
+    max_scanned_anchors: ?i64 = null,
+    /// Maximum simultaneously live traversal, pathfinding, or MATCH frontier states.
+    max_intermediate_states: ?i64 = null,
+    /// Maximum simultaneously retained bytes of admitted graph execution state.
+    max_retained_state_bytes: ?i64 = null,
+    /// Cumulative exact-distinct identities admitted across all named aggregates in one request.
+    max_distinct_identities: ?i64 = null,
+    /// Request-consumptive bytes for exact-distinct identities, indexes, and ownership transfer.
+    max_distinct_state_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_explored_nodes", "max_explored_nodes", true },
+        .{ "max_explored_edges", "max_explored_edges", true },
+        .{ "max_explored_edge_bytes", "max_explored_edge_bytes", true },
+        .{ "max_scanned_anchors", "max_scanned_anchors", true },
+        .{ "max_intermediate_states", "max_intermediate_states", true },
+        .{ "max_retained_state_bytes", "max_retained_state_bytes", true },
+        .{ "max_distinct_identities", "max_distinct_identities", true },
+        .{ "max_distinct_state_bytes", "max_distinct_state_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_explored_nodes) |value| {
+            try jw.objectField("max_explored_nodes");
+            try jw.write(value);
+        }
+        if (self.max_explored_edges) |value| {
+            try jw.objectField("max_explored_edges");
+            try jw.write(value);
+        }
+        if (self.max_explored_edge_bytes) |value| {
+            try jw.objectField("max_explored_edge_bytes");
+            try jw.write(value);
+        }
+        if (self.max_scanned_anchors) |value| {
+            try jw.objectField("max_scanned_anchors");
+            try jw.write(value);
+        }
+        if (self.max_intermediate_states) |value| {
+            try jw.objectField("max_intermediate_states");
+            try jw.write(value);
+        }
+        if (self.max_retained_state_bytes) |value| {
+            try jw.objectField("max_retained_state_bytes");
+            try jw.write(value);
+        }
+        if (self.max_distinct_identities) |value| {
+            try jw.objectField("max_distinct_identities");
+            try jw.write(value);
+        }
+        if (self.max_distinct_state_bytes) |value| {
+            try jw.objectField("max_distinct_state_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes.
@@ -23283,7 +24975,7 @@ pub const GraphRelationshipPropertyPredicate = struct {
     field: []const u8,
     op: []const u8,
     /// Non-null scalar comparison value. Omit for is_null and is_not_null.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// Datetime compares RFC3339 instants rather than string ordering.
     value_type: ?[]const u8 = null,
 
@@ -23291,7 +24983,7 @@ pub const GraphRelationshipPropertyPredicate = struct {
     pub const openApiFieldMetadata = .{
         .{ "field", "field", false },
         .{ "op", "op", false },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "value_type", "value_type", true },
     };
 
@@ -23309,9 +25001,16 @@ pub const GraphRelationshipPropertyPredicate = struct {
         try jw.write(self.field);
         try jw.objectField("op");
         try jw.write(self.op);
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.value_type) |value| {
             try jw.objectField("value_type");
@@ -24264,6 +25963,7 @@ pub const GraphWhereExpression = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
+        if (source.object.count() != 1) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
             "and",
         })) {
@@ -24424,7 +26124,7 @@ pub const HierarchyAncestor = struct {
     key: ?[]const u8 = null,
     artifact_name: ?[]const u8 = null,
     source_field: ?[]const u8 = null,
-    provenance: ?std.json.Value = null,
+    provenance: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -24433,7 +26133,7 @@ pub const HierarchyAncestor = struct {
         .{ "key", "key", true },
         .{ "artifact_name", "artifact_name", true },
         .{ "source_field", "source_field", true },
-        .{ "provenance", "provenance", true },
+        .{ "provenance", "provenance", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -24466,9 +26166,16 @@ pub const HierarchyAncestor = struct {
             try jw.objectField("source_field");
             try jw.write(value);
         }
-        if (self.provenance) |value| {
-            try jw.objectField("provenance");
-            try jw.write(value);
+        switch (self.provenance) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("provenance");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("provenance");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -25297,6 +27004,7 @@ pub const IndexConfig = struct {
 
 /// Embedding provider configuration accepted when Antfly creates and maintains an embeddings index. This purpose-specific subset reuses the canonical provider configurations; it does not define a second provider namespace.
 pub const IndexEmbedderConfig = union(enum) {
+    cloudflare_embedder_config: CloudflareEmbedderConfig,
     ollama_embedder_config: OllamaEmbedderConfig,
     open_ai_embedder_config: OpenAIEmbedderConfig,
     open_router_embedder_config: OpenRouterEmbedderConfig,
@@ -25324,6 +27032,9 @@ pub const IndexEmbedderConfig = union(enum) {
                 return error.MissingField;
             },
         };
+        if (std.mem.eql(u8, disc_str, "cloudflare")) {
+            return .{ .cloudflare_embedder_config = try std.json.parseFromSliceLeaky(CloudflareEmbedderConfig, allocator, input, options) };
+        }
         if (std.mem.eql(u8, disc_str, "ollama")) {
             return .{ .ollama_embedder_config = try std.json.parseFromSliceLeaky(OllamaEmbedderConfig, allocator, input, options) };
         }
@@ -25365,6 +27076,9 @@ pub const IndexEmbedderConfig = union(enum) {
             .string => |s| s,
             else => return error.UnexpectedToken,
         };
+        if (std.mem.eql(u8, disc_str, "cloudflare")) {
+            return .{ .cloudflare_embedder_config = try std.json.parseFromValueLeaky(CloudflareEmbedderConfig, allocator, source, options) };
+        }
         if (std.mem.eql(u8, disc_str, "ollama")) {
             return .{ .ollama_embedder_config = try std.json.parseFromValueLeaky(OllamaEmbedderConfig, allocator, source, options) };
         }
@@ -25394,6 +27108,7 @@ pub const IndexEmbedderConfig = union(enum) {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
+            .cloudflare_embedder_config => |v| try jw.write(v),
             .ollama_embedder_config => |v| try jw.write(v),
             .open_ai_embedder_config => |v| try jw.write(v),
             .open_router_embedder_config => |v| try jw.write(v),
@@ -25903,42 +27618,16 @@ pub const IndexType = enum {
     }
 };
 
-/// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits.
-pub const InferenceA4bResidencyMode = enum {
-    auto,
-    streamed,
-    resident,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .auto => "auto",
-            .streamed => "streamed",
-            .resident => "resident",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "auto", .auto },
-            .{ "streamed", .streamed },
-            .{ "resident", .resident },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Process-local foreground request admission settings.
 pub const InferenceAdmissionConfig = struct {
-    inference: ?InferenceRequestAdmissionConfig = null,
+    /// Weighted work and media capacity, independent of request count. Omitted derives capacity from concurrency; zero disables weighted accounting.
+    max_work_units: ?i64 = null,
+    /// Maximum concurrent inference requests admitted by this process. The budget covers embedded inference routes, direct providers, and public connection inference forwarding. Remote forwarding holds a slot for the full upstream request. The runtime-reserved `local-inference` connection dispatches in process and is admitted once by the destination inference route; configured URLs remain remote boundaries even when they alias the local listener. Embedded standalone uses one shared coordinator for all of those surfaces; API-only runtimes use the same setting as a local forwarding gate. Weighted work/media capacity is controlled independently by max_work_units; when omitted it derives from max_concurrent_requests. Request count zero disables only the request-count gate. An explicit max_work_units remains authoritative. Excess work is rejected with 503 and Retry-After; it is not queued.
+    max_concurrent_requests: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "inference", "inference", true },
+        .{ "max_work_units", "max_work_units", true },
+        .{ "max_concurrent_requests", "max_concurrent_requests", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -25951,8 +27640,12 @@ pub const InferenceAdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.inference) |value| {
-            try jw.objectField("inference");
+        if (self.max_work_units) |value| {
+            try jw.objectField("max_work_units");
+            try jw.write(value);
+        }
+        if (self.max_concurrent_requests) |value| {
+            try jw.objectField("max_concurrent_requests");
             try jw.write(value);
         }
         try jw.endObject();
@@ -26025,9 +27718,6 @@ pub const InferenceAudioContext = enum {
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
-
-/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
-pub const InferenceBackendPriorityEntry = []const u8;
 
 /// Runtime backends compiled into this inference server.
 pub const InferenceBackendRuntimes = struct {
@@ -26777,163 +28467,7 @@ pub const InferenceChunkResponse = struct {
     cache_hit: bool,
 };
 
-pub const InferenceConfig = struct {
-    /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
-    max_concurrent_requests: ?i64 = null,
-    /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
-    api_url: ?[]const u8 = null,
-    /// API key used when calling an authenticated shared Antfly inference API.
-    api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
-    models_dir: ?[]const u8 = null,
-    /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
-    ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
-    content_security: ?InferenceContentSecurityConfig = null,
-    /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
-    s3_credentials: ?InferenceCredentials = null,
-    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
-    keep_alive: ?[]const u8 = null,
-    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
-    max_loaded_models: ?i64 = null,
-    /// Legacy compatibility field. The current Zig inference runtime does not create per-model pipeline pools from this setting; configuring it has no effect.
-    pool_size: ?i64 = null,
-    /// Native generator prompt KV cache settings.
-    prompt_cache: ?InferencePromptCacheConfig = null,
-    /// Legacy compatibility field. The current Zig inference runtime selects a backend from model metadata, explicit preload settings, and compiled capabilities; configuring this list has no effect.
-    backend_priority: ?[]const InferenceBackendPriorityEntry = null,
-    /// Legacy Go-runtime queue setting. The current Zig runtime does not retain excess inference requests in memory and ignores this field.
-    max_queue_size: ?i64 = null,
-    /// Legacy Go-runtime queue/request timeout. The current Zig runtime ignores this field; its HTTP listener applies a separate fixed transport timeout.
-    request_timeout: ?[]const u8 = null,
-    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
-    preload: ?[]const InferenceModelRef = null,
-    /// Legacy compatibility field. The current Zig runtime uses explicit host, backend, combined, KV, and scratch budgets instead and ignores this field.
-    max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map load on demand. keep_alive controls their idle eviction; setting it to "0" disables idle eviction but does not preload or pin them. When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
-    model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Legacy compatibility field controlling whether dashboards show model download commands. It defaults to true for standalone deployments; managed deployments historically set it to false. Download-command availability is a build-time setting in the current Zig runtime, so configuring this field has no effect.
-    allow_downloads: ?bool = null,
-    log: ?InferenceschemasConfig = null,
-    admission: ?InferenceAdmissionConfig = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "max_concurrent_requests", "max_concurrent_requests", true },
-        .{ "api_url", "api_url", true },
-        .{ "api_key", "api_key", true },
-        .{ "models_dir", "models_dir", true },
-        .{ "ml_dir", "ml_dir", true },
-        .{ "content_security", "content_security", true },
-        .{ "s3_credentials", "s3_credentials", true },
-        .{ "keep_alive", "keep_alive", true },
-        .{ "max_loaded_models", "max_loaded_models", true },
-        .{ "pool_size", "pool_size", true },
-        .{ "prompt_cache", "prompt_cache", true },
-        .{ "backend_priority", "backend_priority", true },
-        .{ "max_queue_size", "max_queue_size", true },
-        .{ "request_timeout", "request_timeout", true },
-        .{ "preload", "preload", true },
-        .{ "max_memory_mb", "max_memory_mb", true },
-        .{ "model_strategies", "model_strategies", true },
-        .{ "allow_downloads", "allow_downloads", true },
-        .{ "log", "log", true },
-        .{ "admission", "admission", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.max_concurrent_requests) |value| {
-            try jw.objectField("max_concurrent_requests");
-            try jw.write(value);
-        }
-        if (self.api_url) |value| {
-            try jw.objectField("api_url");
-            try jw.write(value);
-        }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.models_dir) |value| {
-            try jw.objectField("models_dir");
-            try jw.write(value);
-        }
-        if (self.ml_dir) |value| {
-            try jw.objectField("ml_dir");
-            try jw.write(value);
-        }
-        if (self.content_security) |value| {
-            try jw.objectField("content_security");
-            try jw.write(value);
-        }
-        if (self.s3_credentials) |value| {
-            try jw.objectField("s3_credentials");
-            try jw.write(value);
-        }
-        if (self.keep_alive) |value| {
-            try jw.objectField("keep_alive");
-            try jw.write(value);
-        }
-        if (self.max_loaded_models) |value| {
-            try jw.objectField("max_loaded_models");
-            try jw.write(value);
-        }
-        if (self.pool_size) |value| {
-            try jw.objectField("pool_size");
-            try jw.write(value);
-        }
-        if (self.prompt_cache) |value| {
-            try jw.objectField("prompt_cache");
-            try jw.write(value);
-        }
-        if (self.backend_priority) |value| {
-            try jw.objectField("backend_priority");
-            try jw.write(value);
-        }
-        if (self.max_queue_size) |value| {
-            try jw.objectField("max_queue_size");
-            try jw.write(value);
-        }
-        if (self.request_timeout) |value| {
-            try jw.objectField("request_timeout");
-            try jw.write(value);
-        }
-        if (self.preload) |value| {
-            try jw.objectField("preload");
-            try jw.write(value);
-        }
-        if (self.max_memory_mb) |value| {
-            try jw.objectField("max_memory_mb");
-            try jw.write(value);
-        }
-        if (self.model_strategies) |value| {
-            try jw.objectField("model_strategies");
-            try jw.write(value);
-        }
-        if (self.allow_downloads) |value| {
-            try jw.objectField("allow_downloads");
-            try jw.write(value);
-        }
-        if (self.log) |value| {
-            try jw.objectField("log");
-            try jw.write(value);
-        }
-        if (self.admission) |value| {
-            try jw.objectField("admission");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
+pub const InferenceConfig = InferenceServerConfig;
 
 pub const InferenceConnection = struct {
     provider: InferenceProviderType,
@@ -27009,76 +28543,6 @@ pub const InferenceConnection = struct {
 };
 
 pub const InferenceContentPart = ContentPart;
-
-/// Inference merges configured fields over a fail-closed baseline. HTTP(S), file, and S3 content require explicit allowlists; data URIs remain allowed within the configured size budget.
-pub const InferenceContentSecurityConfig = struct {
-    /// Explicit HTTP(S) host allowlist for inference downloads. Omission and an explicit empty list both deny all hosts. With block_private_ips enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address.
-    allowed_hosts: ?[]const []const u8 = null,
-    /// Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special destinations.
-    block_private_ips: ?bool = null,
-    /// Maximum size of downloaded content in bytes
-    max_download_size_bytes: ?i64 = null,
-    /// Maximum HTTP download duration in seconds. Defaults to 30; 0 disables the deadline.
-    download_timeout_seconds: ?i64 = null,
-    /// Maximum source-image width or height for accepted inference image inputs, including generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation applies the same image-header admission before model execution. Non-inference scraping consumers do not enforce this setting.
-    max_image_dimension: ?i64 = null,
-    /// Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission and an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
-    allowed_paths: ?[]const []const u8 = null,
-    /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
-    user_agent: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "allowed_hosts", "allowed_hosts", true },
-        .{ "block_private_ips", "block_private_ips", true },
-        .{ "max_download_size_bytes", "max_download_size_bytes", true },
-        .{ "download_timeout_seconds", "download_timeout_seconds", true },
-        .{ "max_image_dimension", "max_image_dimension", true },
-        .{ "allowed_paths", "allowed_paths", true },
-        .{ "user_agent", "user_agent", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.allowed_hosts) |value| {
-            try jw.objectField("allowed_hosts");
-            try jw.write(value);
-        }
-        if (self.block_private_ips) |value| {
-            try jw.objectField("block_private_ips");
-            try jw.write(value);
-        }
-        if (self.max_download_size_bytes) |value| {
-            try jw.objectField("max_download_size_bytes");
-            try jw.write(value);
-        }
-        if (self.download_timeout_seconds) |value| {
-            try jw.objectField("download_timeout_seconds");
-            try jw.write(value);
-        }
-        if (self.max_image_dimension) |value| {
-            try jw.objectField("max_image_dimension");
-            try jw.write(value);
-        }
-        if (self.allowed_paths) |value| {
-            try jw.objectField("allowed_paths");
-            try jw.write(value);
-        }
-        if (self.user_agent) |value| {
-            try jw.objectField("user_agent");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
 
 /// Structured memory bound to the exact model, tokenizer and chat-template revisions. HTTP 409 CONTEXT_CHECKPOINT_STALE_REVISION means one of these revisions changed. Rebuild from the original transcript using the selected model; retrying the same checkpoint against another generator is not a fallback. Digest/history/format failures use CONTEXT_CHECKPOINT_MISMATCH.
 pub const InferenceContextCheckpoint = struct {
@@ -27466,61 +28930,6 @@ pub const InferenceContextToolResultOutcome = struct {
 pub const InferenceContextUnresolvedToolCall = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
-};
-
-pub const InferenceCredentials = struct {
-    /// S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
-    endpoint: ?[]const u8 = null,
-    /// Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
-    use_ssl: ?bool = null,
-    /// AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
-    access_key_id: ?[]const u8 = null,
-    /// AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
-    secret_access_key: ?[]const u8 = null,
-    /// Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
-    session_token: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "endpoint", "endpoint", true },
-        .{ "use_ssl", "use_ssl", true },
-        .{ "access_key_id", "access_key_id", true },
-        .{ "secret_access_key", "secret_access_key", true },
-        .{ "session_token", "session_token", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.endpoint) |value| {
-            try jw.objectField("endpoint");
-            try jw.write(value);
-        }
-        if (self.use_ssl) |value| {
-            try jw.objectField("use_ssl");
-            try jw.write(value);
-        }
-        if (self.access_key_id) |value| {
-            try jw.objectField("access_key_id");
-            try jw.write(value);
-        }
-        if (self.secret_access_key) |value| {
-            try jw.objectField("secret_access_key");
-            try jw.write(value);
-        }
-        if (self.session_token) |value| {
-            try jw.objectField("session_token");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
 };
 
 pub const InferenceDecideAnswer = union(enum) {
@@ -28363,6 +29772,91 @@ pub const InferenceDictationWord = struct {
     word: []const u8,
     start_ms: i64,
     end_ms: i64,
+};
+
+pub const InferenceDocumentJob = struct {
+    id: []const u8,
+    operation: []const u8,
+    state: []const u8,
+    attempt: i64,
+    sequence: i64,
+    expires_at_ms: i64,
+    usage: std.json.ArrayHashMap(std.json.Value),
+    @"error": ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "operation", "operation", false },
+        .{ "state", "state", false },
+        .{ "attempt", "attempt", false },
+        .{ "sequence", "sequence", false },
+        .{ "expires_at_ms", "expires_at_ms", false },
+        .{ "usage", "usage", false },
+        .{ "error", "error", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("attempt");
+        try jw.write(self.attempt);
+        try jw.objectField("sequence");
+        try jw.write(self.sequence);
+        try jw.objectField("expires_at_ms");
+        try jw.write(self.expires_at_ms);
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Durable document execution on the unified Antfly API. Requires configured durable job storage and local inference orchestration. The request uses the ordinary read or extract schema. Credentials must use server connections, environment variables, or secret references.
+pub const InferenceDocumentJobRequest = struct {
+    request: std.json.ArrayHashMap(std.json.Value),
+    retention_seconds: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "request", "request", false },
+        .{ "retention_seconds", "retention_seconds", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("request");
+        try jw.write(self.request);
+        if (self.retention_seconds) |value| {
+            try jw.objectField("retention_seconds");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized vectors.
@@ -29852,6 +31346,18 @@ pub const InferenceGenerateUsage = struct {
     completion_tokens: i64,
     /// Total tokens used (prompt + completion)
     total_tokens: i64,
+    /// Cumulative logical child invocations for a document run.
+    model_calls: ?i64 = null,
+    /// Physical child operation invocations, separate from logical composite calls.
+    physical_model_calls: ?i64 = null,
+    /// Cumulative rendered or decoded pixels charged by document work.
+    rendered_pixels: ?i64 = null,
+    /// Cumulative document text bytes charged before envelope serialization.
+    output_bytes: ?i64 = null,
+    /// Selected pages completed successfully.
+    completed_pages: ?i64 = null,
+    /// Selected pages visited, including unresolved work.
+    visited_pages: ?i64 = null,
     /// Prompt tokens served from inference-native prefix KV cache
     cached_prompt_tokens: ?i64 = null,
 
@@ -29860,6 +31366,12 @@ pub const InferenceGenerateUsage = struct {
         .{ "prompt_tokens", "prompt_tokens", false },
         .{ "completion_tokens", "completion_tokens", false },
         .{ "total_tokens", "total_tokens", false },
+        .{ "model_calls", "model_calls", true },
+        .{ "physical_model_calls", "physical_model_calls", true },
+        .{ "rendered_pixels", "rendered_pixels", true },
+        .{ "output_bytes", "output_bytes", true },
+        .{ "completed_pages", "completed_pages", true },
+        .{ "visited_pages", "visited_pages", true },
         .{ "cached_prompt_tokens", "cached_prompt_tokens", true },
     };
 
@@ -29879,6 +31391,30 @@ pub const InferenceGenerateUsage = struct {
         try jw.write(self.completion_tokens);
         try jw.objectField("total_tokens");
         try jw.write(self.total_tokens);
+        if (self.model_calls) |value| {
+            try jw.objectField("model_calls");
+            try jw.write(value);
+        }
+        if (self.physical_model_calls) |value| {
+            try jw.objectField("physical_model_calls");
+            try jw.write(value);
+        }
+        if (self.rendered_pixels) |value| {
+            try jw.objectField("rendered_pixels");
+            try jw.write(value);
+        }
+        if (self.output_bytes) |value| {
+            try jw.objectField("output_bytes");
+            try jw.write(value);
+        }
+        if (self.completed_pages) |value| {
+            try jw.objectField("completed_pages");
+            try jw.write(value);
+        }
+        if (self.visited_pages) |value| {
+            try jw.objectField("visited_pages");
+            try jw.write(value);
+        }
         if (self.cached_prompt_tokens) |value| {
             try jw.objectField("cached_prompt_tokens");
             try jw.write(value);
@@ -29923,39 +31459,63 @@ pub const InferenceKvCachePolicy = struct {
     }
 };
 
-/// Logging verbosity level
-pub const InferenceLevel = enum {
-    debug,
-    info,
-    warn,
-    @"error",
+pub const InferenceMediaContentPart = MediaContentPart;
+
+/// Inference memory ceilings in bytes. Omitted or zero values select automatic policy; physical capacity and the process envelope remain authoritative.
+pub const InferenceMemoryConfig = struct {
+    /// Host memory ceiling.
+    max_host_bytes: ?i64 = null,
+    /// Accelerator memory ceiling.
+    max_device_bytes: ?i64 = null,
+    /// Combined host and accelerator ceiling; integrated devices also enforce this across CPU and GPU leases.
+    max_combined_bytes: ?i64 = null,
+    /// KV cache memory ceiling.
+    max_kv_bytes: ?i64 = null,
+    /// Scratch memory ceiling.
+    max_scratch_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_host_bytes", "max_host_bytes", true },
+        .{ "max_device_bytes", "max_device_bytes", true },
+        .{ "max_combined_bytes", "max_combined_bytes", true },
+        .{ "max_kv_bytes", "max_kv_bytes", true },
+        .{ "max_scratch_bytes", "max_scratch_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .debug => "debug",
-            .info => "info",
-            .warn => "warn",
-            .@"error" => "error",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "debug", .debug },
-            .{ "info", .info },
-            .{ "warn", .warn },
-            .{ "error", .@"error" },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
+        try jw.beginObject();
+        if (self.max_host_bytes) |value| {
+            try jw.objectField("max_host_bytes");
+            try jw.write(value);
+        }
+        if (self.max_device_bytes) |value| {
+            try jw.objectField("max_device_bytes");
+            try jw.write(value);
+        }
+        if (self.max_combined_bytes) |value| {
+            try jw.objectField("max_combined_bytes");
+            try jw.write(value);
+        }
+        if (self.max_kv_bytes) |value| {
+            try jw.objectField("max_kv_bytes");
+            try jw.write(value);
+        }
+        if (self.max_scratch_bytes) |value| {
+            try jw.objectField("max_scratch_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
-
-pub const InferenceMediaContentPart = MediaContentPart;
 
 /// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
 pub const InferenceModelBackend = enum {
@@ -29993,38 +31553,6 @@ pub const InferenceModelBackend = enum {
             .{ "xla", .xla },
             .{ "webgpu", .webgpu },
             .{ "wasm", .wasm },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Optional artifact format preference for loading a model.
-pub const InferenceModelFormat = enum {
-    gguf,
-    onnx,
-    safetensors,
-    hybrid,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .gguf => "gguf",
-            .onnx => "onnx",
-            .safetensors => "safetensors",
-            .hybrid => "hybrid",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "gguf", .gguf },
-            .{ "onnx", .onnx },
-            .{ "safetensors", .safetensors },
-            .{ "hybrid", .hybrid },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -30233,104 +31761,6 @@ pub const InferenceModelKind = enum {
             .{ "extractor", .extractor },
         });
         return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Optional quantization preference for loading a model.
-pub const InferenceModelQuantization = enum {
-    q4_k,
-    q8,
-    fp16,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .q4_k => "q4_k",
-            .q8 => "q8",
-            .fp16 => "fp16",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "q4_k", .q4_k },
-            .{ "q8", .q8 },
-            .{ "fp16", .fp16 },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Model reference used by startup preload and model-loading configuration.
-pub const InferenceModelRef = struct {
-    kind: InferenceModelKind,
-    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
-    name: []const u8,
-    backend: ?InferenceModelBackend = null,
-    /// Per-model GLiNER CUDA inference precision for extractor preloads. Requires CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests fail closed until the exact model/profile has release qualification. Precision is part of the loaded-session cache identity.
-    cuda_precision: ?[]const u8 = null,
-    format: ?InferenceModelFormat = null,
-    quantization: ?InferenceModelQuantization = null,
-    /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits. Other model geometries reject this field.
-    residency_mode: ?InferenceA4bResidencyMode = null,
-    /// Per-model A4B memory envelope in MiB. Zero selects the backend default (2048 MiB streamed on Metal or 16384 MiB resident on qualified CUDA); CUDA rejects any envelope too small for full residency. Other model geometries reject this field.
-    memory_budget_mb: ?u32 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "kind", "kind", false },
-        .{ "name", "name", false },
-        .{ "backend", "backend", true },
-        .{ "cuda_precision", "cuda_precision", true },
-        .{ "format", "format", true },
-        .{ "quantization", "quantization", true },
-        .{ "residency_mode", "residency_mode", true },
-        .{ "memory_budget_mb", "memory_budget_mb", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("kind");
-        try jw.write(self.kind);
-        try jw.objectField("name");
-        try jw.write(self.name);
-        if (self.backend) |value| {
-            try jw.objectField("backend");
-            try jw.write(value);
-        }
-        if (self.cuda_precision) |value| {
-            try jw.objectField("cuda_precision");
-            try jw.write(value);
-        }
-        if (self.format) |value| {
-            try jw.objectField("format");
-            try jw.write(value);
-        }
-        if (self.quantization) |value| {
-            try jw.objectField("quantization");
-            try jw.write(value);
-        }
-        if (self.residency_mode) |value| {
-            try jw.objectField("residency_mode");
-            try jw.write(value);
-        }
-        if (self.memory_budget_mb) |value| {
-            try jw.objectField("memory_budget_mb");
-            try jw.write(value);
-        }
-        try jw.endObject();
     }
 };
 
@@ -30557,62 +31987,6 @@ pub const InferencePredictorsResponse = struct {
     }
 };
 
-/// Native generator prompt KV cache configuration.
-pub const InferencePromptCacheConfig = struct {
-    /// Enable inference-native prompt KV cache reuse for generator requests. On by default; set false to disable.
-    enabled: ?bool = null,
-    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an opt-in page-aligned compressed radix tree with shared-prefix ownership and leaf-only LRU eviction; it is currently qualified for native and Metal backends. Eligible Metal requests use eager paged attention; explicit compiled generation is incompatible with prompt caching. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
-    mode: ?[]const u8 = null,
-    /// Node-wide target for live prompt-cache entries. The runtime divides it across participating model caches and evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard cap on process or accelerator memory.
-    max_bytes_mb: ?i64 = null,
-    /// Minimum prompt length eligible for prompt KV caching.
-    min_tokens: ?i64 = null,
-    /// Idle time-to-live for prompt KV cache entries. Refreshed on every cache hit, so only entries left unused for this duration expire.
-    ttl_ms: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "enabled", "enabled", true },
-        .{ "mode", "mode", true },
-        .{ "max_bytes_mb", "max_bytes_mb", true },
-        .{ "min_tokens", "min_tokens", true },
-        .{ "ttl_ms", "ttl_ms", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.enabled) |value| {
-            try jw.objectField("enabled");
-            try jw.write(value);
-        }
-        if (self.mode) |value| {
-            try jw.objectField("mode");
-            try jw.write(value);
-        }
-        if (self.max_bytes_mb) |value| {
-            try jw.objectField("max_bytes_mb");
-            try jw.write(value);
-        }
-        if (self.min_tokens) |value| {
-            try jw.objectField("min_tokens");
-            try jw.write(value);
-        }
-        if (self.ttl_ms) |value| {
-            try jw.objectField("ttl_ms");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 /// Inference provider type for a connection.
 pub const InferenceProviderType = enum {
     gemini,
@@ -30664,10 +32038,32 @@ pub const InferenceProviderType = enum {
 };
 
 pub const InferenceReadObject = struct {
+    /// Original document source ID.
+    source_id: ?[]const u8 = null,
+    /// One-based original page or slide number.
+    number: ?i64 = null,
+    kind: ?[]const u8 = null,
+    /// Native layout/master content, source part identity, and visibility/coverage metadata; unsupported composition remains unresolved.
+    inherited_parts: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    native_text: ?[]const u8 = null,
+    /// Speaker notes, separate from slide text.
+    notes: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+    /// Default provenance for page text; mapped region origins override it.
+    origin: ?[]const u8 = null,
+    /// Coordinate space of regions; PDF points, slide EMUs or image pixels.
+    coordinate_space: ?[]const u8 = null,
+    /// Projective source transform.
+    transform: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Mapping from rendered pixels to original source coordinates, including page rotation and actual render DPI.
+    raster_to_source: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+    /// Tables and cells in source coordinates with provenance.
+    tables: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    findings: ?[]const []const u8 = null,
     /// Extracted text from the image
     text: []const u8,
     /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
-    fields: ?std.json.ArrayHashMap([]const u8) = null,
+    fields: OpenApiOptionalNullable(std.json.ArrayHashMap([]const u8)) = .absent,
     /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
     regions: ?[]const InferenceTextRegion = null,
     object: []const u8,
@@ -30676,8 +32072,21 @@ pub const InferenceReadObject = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "source_id", "source_id", true },
+        .{ "number", "number", true },
+        .{ "kind", "kind", true },
+        .{ "inherited_parts", "inherited_parts", true },
+        .{ "native_text", "native_text", true },
+        .{ "notes", "notes", true },
+        .{ "status", "status", true },
+        .{ "origin", "origin", true },
+        .{ "coordinate_space", "coordinate_space", true },
+        .{ "transform", "transform", true },
+        .{ "raster_to_source", "raster_to_source", false },
+        .{ "tables", "tables", true },
+        .{ "findings", "findings", true },
         .{ "text", "text", false },
-        .{ "fields", "fields", true },
+        .{ "fields", "fields", false },
         .{ "regions", "regions", true },
         .{ "object", "object", false },
         .{ "index", "index", false },
@@ -30693,11 +32102,77 @@ pub const InferenceReadObject = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.source_id) |value| {
+            try jw.objectField("source_id");
+            try jw.write(value);
+        }
+        if (self.number) |value| {
+            try jw.objectField("number");
+            try jw.write(value);
+        }
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        if (self.inherited_parts) |value| {
+            try jw.objectField("inherited_parts");
+            try jw.write(value);
+        }
+        if (self.native_text) |value| {
+            try jw.objectField("native_text");
+            try jw.write(value);
+        }
+        if (self.notes) |value| {
+            try jw.objectField("notes");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
+        if (self.coordinate_space) |value| {
+            try jw.objectField("coordinate_space");
+            try jw.write(value);
+        }
+        if (self.transform) |value| {
+            try jw.objectField("transform");
+            try jw.write(value);
+        }
+        switch (self.raster_to_source) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("raster_to_source");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("raster_to_source");
+                try jw.write(value);
+            },
+        }
+        if (self.tables) |value| {
+            try jw.objectField("tables");
+            try jw.write(value);
+        }
+        if (self.findings) |value| {
+            try jw.objectField("findings");
+            try jw.write(value);
+        }
         try jw.objectField("text");
         try jw.write(self.text);
-        if (self.fields) |value| {
-            try jw.objectField("fields");
-            try jw.write(value);
+        switch (self.fields) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("fields");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("fields");
+                try jw.write(value);
+            },
         }
         if (self.regions) |value| {
             try jw.objectField("regions");
@@ -30711,12 +32186,17 @@ pub const InferenceReadObject = struct {
     }
 };
 
+/// Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
 pub const InferenceReadRequest = struct {
     /// Name of reader model from models_dir/readers/
     model: []const u8,
+    /// Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
+    retain_artifact: ?bool = null,
+    /// Complete documents, mutually exclusive with images. Each source is independent; selected pages are read in original source order.
+    documents: ?[]const DocumentSource = null,
     /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
-    images: []const InferenceImageURL,
-    /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
+    images: ?[]const InferenceImageURL = null,
+    /// Optional task prompt for document understanding models. - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
     prompt: ?[]const u8 = null,
     /// Maximum tokens to generate
     max_tokens: ?i64 = null,
@@ -30724,7 +32204,9 @@ pub const InferenceReadRequest = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
-        .{ "images", "images", false },
+        .{ "retain_artifact", "retain_artifact", true },
+        .{ "documents", "documents", true },
+        .{ "images", "images", true },
         .{ "prompt", "prompt", true },
         .{ "max_tokens", "max_tokens", true },
     };
@@ -30741,8 +32223,18 @@ pub const InferenceReadRequest = struct {
         try jw.beginObject();
         try jw.objectField("model");
         try jw.write(self.model);
-        try jw.objectField("images");
-        try jw.write(self.images);
+        if (self.retain_artifact) |value| {
+            try jw.objectField("retain_artifact");
+            try jw.write(value);
+        }
+        if (self.documents) |value| {
+            try jw.objectField("documents");
+            try jw.write(value);
+        }
+        if (self.images) |value| {
+            try jw.objectField("images");
+            try jw.write(value);
+        }
         if (self.prompt) |value| {
             try jw.objectField("prompt");
             try jw.write(value);
@@ -30760,6 +32252,10 @@ pub const InferenceReadResponse = struct {
     object: []const u8,
     /// Read result objects, one per input image.
     data: []const InferenceReadObject,
+    /// Versioned reading metadata containing status, source fingerprints, definition fingerprint, pinned model identities, adapter version and optional artifact retention handle.
+    document: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Bounded progress and audit events. These contain model names and source IDs, never credentials.
+    events: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
     /// Name of model used for reading
     model: []const u8,
     usage: ?InferenceGenerateUsage = null,
@@ -30770,6 +32266,8 @@ pub const InferenceReadResponse = struct {
     pub const openApiFieldMetadata = .{
         .{ "object", "object", false },
         .{ "data", "data", false },
+        .{ "document", "document", true },
+        .{ "events", "events", true },
         .{ "model", "model", false },
         .{ "usage", "usage", true },
         .{ "execution", "execution", true },
@@ -30789,6 +32287,14 @@ pub const InferenceReadResponse = struct {
         try jw.write(self.object);
         try jw.objectField("data");
         try jw.write(self.data);
+        if (self.document) |value| {
+            try jw.objectField("document");
+            try jw.write(value);
+        }
+        if (self.events) |value| {
+            try jw.objectField("events");
+            try jw.write(value);
+        }
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.usage) |value| {
@@ -30804,17 +32310,52 @@ pub const InferenceReadResponse = struct {
 };
 
 pub const InferenceReadResult = struct {
+    /// Original document source ID.
+    source_id: ?[]const u8 = null,
+    /// One-based original page or slide number.
+    number: ?i64 = null,
+    kind: ?[]const u8 = null,
+    /// Native layout/master content, source part identity, and visibility/coverage metadata; unsupported composition remains unresolved.
+    inherited_parts: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    native_text: ?[]const u8 = null,
+    /// Speaker notes, separate from slide text.
+    notes: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+    /// Default provenance for page text; mapped region origins override it.
+    origin: ?[]const u8 = null,
+    /// Coordinate space of regions; PDF points, slide EMUs or image pixels.
+    coordinate_space: ?[]const u8 = null,
+    /// Projective source transform.
+    transform: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Mapping from rendered pixels to original source coordinates, including page rotation and actual render DPI.
+    raster_to_source: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+    /// Tables and cells in source coordinates with provenance.
+    tables: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    findings: ?[]const []const u8 = null,
     /// Extracted text from the image
     text: []const u8,
     /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
-    fields: ?std.json.ArrayHashMap([]const u8) = null,
+    fields: OpenApiOptionalNullable(std.json.ArrayHashMap([]const u8)) = .absent,
     /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
     regions: ?[]const InferenceTextRegion = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "source_id", "source_id", true },
+        .{ "number", "number", true },
+        .{ "kind", "kind", true },
+        .{ "inherited_parts", "inherited_parts", true },
+        .{ "native_text", "native_text", true },
+        .{ "notes", "notes", true },
+        .{ "status", "status", true },
+        .{ "origin", "origin", true },
+        .{ "coordinate_space", "coordinate_space", true },
+        .{ "transform", "transform", true },
+        .{ "raster_to_source", "raster_to_source", false },
+        .{ "tables", "tables", true },
+        .{ "findings", "findings", true },
         .{ "text", "text", false },
-        .{ "fields", "fields", true },
+        .{ "fields", "fields", false },
         .{ "regions", "regions", true },
     };
 
@@ -30828,11 +32369,77 @@ pub const InferenceReadResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.source_id) |value| {
+            try jw.objectField("source_id");
+            try jw.write(value);
+        }
+        if (self.number) |value| {
+            try jw.objectField("number");
+            try jw.write(value);
+        }
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        if (self.inherited_parts) |value| {
+            try jw.objectField("inherited_parts");
+            try jw.write(value);
+        }
+        if (self.native_text) |value| {
+            try jw.objectField("native_text");
+            try jw.write(value);
+        }
+        if (self.notes) |value| {
+            try jw.objectField("notes");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
+        if (self.coordinate_space) |value| {
+            try jw.objectField("coordinate_space");
+            try jw.write(value);
+        }
+        if (self.transform) |value| {
+            try jw.objectField("transform");
+            try jw.write(value);
+        }
+        switch (self.raster_to_source) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("raster_to_source");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("raster_to_source");
+                try jw.write(value);
+            },
+        }
+        if (self.tables) |value| {
+            try jw.objectField("tables");
+            try jw.write(value);
+        }
+        if (self.findings) |value| {
+            try jw.objectField("findings");
+            try jw.write(value);
+        }
         try jw.objectField("text");
         try jw.write(self.text);
-        if (self.fields) |value| {
-            try jw.objectField("fields");
-            try jw.write(value);
+        switch (self.fields) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("fields");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("fields");
+                try jw.write(value);
+            },
         }
         if (self.regions) |value| {
             try jw.objectField("regions");
@@ -30842,13 +32449,23 @@ pub const InferenceReadResult = struct {
     }
 };
 
-pub const InferenceRequestAdmissionConfig = struct {
-    /// Maximum concurrent inference requests in this process. The same value also sizes the weighted work budget shared by every executing inference endpoint: each request consumes one request slot and at least one unit, while request body size, generation workload, and image byte/count reservations can consume more than one unit. The request count can therefore never exceed this value, while expensive requests may exhaust weighted capacity sooner. Read and image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per two images. A positive capacity also clamps each such request's downloaded-image ceiling to 16 MiB times this value. When either ceiling is exhausted, new HTTP requests are rejected immediately with 503 Service Unavailable and Retry-After: 1; they are not retained in an in-process queue. Set to 0 to disable both ceilings, admission unit accounting, and the capacity-derived clamp. The default is 32.
-    max_concurrent_requests: ?i64 = null,
+/// Deployment request ceilings only narrow model capabilities. Applied equally to direct calls, HTTP and discovery. Omitted values retain native limits.
+pub const InferenceRequestLimitsConfig = struct {
+    /// Maximum items in one public or direct request. Independent callers may still be combined into a larger native execution microbatch.
+    max_items_per_request: ?i64 = null,
+    /// Maximum effective input tokens per item, including expanded image prompts.
+    max_input_tokens_per_item: ?i64 = null,
+    /// Maximum generated output tokens per item. Omitted request max_tokens resolves to a bounded effective default.
+    max_output_tokens_per_item: ?i64 = null,
+    /// Maximum aggregate decoded image pixels in a request batch; also bounds execution microbatch pixels.
+    max_decoded_pixels_per_batch: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "max_concurrent_requests", "max_concurrent_requests", true },
+        .{ "max_items_per_request", "max_items_per_request", true },
+        .{ "max_input_tokens_per_item", "max_input_tokens_per_item", true },
+        .{ "max_output_tokens_per_item", "max_output_tokens_per_item", true },
+        .{ "max_decoded_pixels_per_batch", "max_decoded_pixels_per_batch", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -30861,8 +32478,20 @@ pub const InferenceRequestAdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.max_concurrent_requests) |value| {
-            try jw.objectField("max_concurrent_requests");
+        if (self.max_items_per_request) |value| {
+            try jw.objectField("max_items_per_request");
+            try jw.write(value);
+        }
+        if (self.max_input_tokens_per_item) |value| {
+            try jw.objectField("max_input_tokens_per_item");
+            try jw.write(value);
+        }
+        if (self.max_output_tokens_per_item) |value| {
+            try jw.objectField("max_output_tokens_per_item");
+            try jw.write(value);
+        }
+        if (self.max_decoded_pixels_per_batch) |value| {
+            try jw.objectField("max_decoded_pixels_per_batch");
             try jw.write(value);
         }
         try jw.endObject();
@@ -31022,66 +32651,14 @@ pub const InferenceRole = enum {
     }
 };
 
-pub const InferenceRuntimeConfig = struct {
-    /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
-    max_concurrent_requests: ?i64 = null,
-    /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
-    api_url: ?[]const u8 = null,
-    /// API key used when calling an authenticated shared Antfly inference API.
-    api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
-    models_dir: ?[]const u8 = null,
-    /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
-    ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
-    content_security: ?InferenceContentSecurityConfig = null,
-    /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
-    s3_credentials: ?InferenceCredentials = null,
-    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
-    keep_alive: ?[]const u8 = null,
-    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
-    max_loaded_models: ?i64 = null,
-    /// Legacy compatibility field. The current Zig inference runtime does not create per-model pipeline pools from this setting; configuring it has no effect.
-    pool_size: ?i64 = null,
-    /// Native generator prompt KV cache settings.
-    prompt_cache: ?InferencePromptCacheConfig = null,
-    /// Legacy compatibility field. The current Zig inference runtime selects a backend from model metadata, explicit preload settings, and compiled capabilities; configuring this list has no effect.
-    backend_priority: ?[]const InferenceBackendPriorityEntry = null,
-    /// Legacy Go-runtime queue setting. The current Zig runtime does not retain excess inference requests in memory and ignores this field.
-    max_queue_size: ?i64 = null,
-    /// Legacy Go-runtime queue/request timeout. The current Zig runtime ignores this field; its HTTP listener applies a separate fixed transport timeout.
-    request_timeout: ?[]const u8 = null,
-    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
-    preload: ?[]const InferenceModelRef = null,
-    /// Legacy compatibility field. The current Zig runtime uses explicit host, backend, combined, KV, and scratch budgets instead and ignores this field.
-    max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map load on demand. keep_alive controls their idle eviction; setting it to "0" disables idle eviction but does not preload or pin them. When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
-    model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Legacy compatibility field controlling whether dashboards show model download commands. It defaults to true for standalone deployments; managed deployments historically set it to false. Download-command availability is a build-time setting in the current Zig runtime, so configuring this field has no effect.
-    allow_downloads: ?bool = null,
-    log: ?InferenceschemasConfig = null,
+pub const InferenceServerConfig = struct {
+    resources: ?ResourcesConfig = null,
+    inference: ?RuntimeConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "max_concurrent_requests", "max_concurrent_requests", true },
-        .{ "api_url", "api_url", true },
-        .{ "api_key", "api_key", true },
-        .{ "models_dir", "models_dir", true },
-        .{ "ml_dir", "ml_dir", true },
-        .{ "content_security", "content_security", true },
-        .{ "s3_credentials", "s3_credentials", true },
-        .{ "keep_alive", "keep_alive", true },
-        .{ "max_loaded_models", "max_loaded_models", true },
-        .{ "pool_size", "pool_size", true },
-        .{ "prompt_cache", "prompt_cache", true },
-        .{ "backend_priority", "backend_priority", true },
-        .{ "max_queue_size", "max_queue_size", true },
-        .{ "request_timeout", "request_timeout", true },
-        .{ "preload", "preload", true },
-        .{ "max_memory_mb", "max_memory_mb", true },
-        .{ "model_strategies", "model_strategies", true },
-        .{ "allow_downloads", "allow_downloads", true },
-        .{ "log", "log", true },
+        .{ "resources", "resources", true },
+        .{ "inference", "inference", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -31094,80 +32671,12 @@ pub const InferenceRuntimeConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.max_concurrent_requests) |value| {
-            try jw.objectField("max_concurrent_requests");
+        if (self.resources) |value| {
+            try jw.objectField("resources");
             try jw.write(value);
         }
-        if (self.api_url) |value| {
-            try jw.objectField("api_url");
-            try jw.write(value);
-        }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.models_dir) |value| {
-            try jw.objectField("models_dir");
-            try jw.write(value);
-        }
-        if (self.ml_dir) |value| {
-            try jw.objectField("ml_dir");
-            try jw.write(value);
-        }
-        if (self.content_security) |value| {
-            try jw.objectField("content_security");
-            try jw.write(value);
-        }
-        if (self.s3_credentials) |value| {
-            try jw.objectField("s3_credentials");
-            try jw.write(value);
-        }
-        if (self.keep_alive) |value| {
-            try jw.objectField("keep_alive");
-            try jw.write(value);
-        }
-        if (self.max_loaded_models) |value| {
-            try jw.objectField("max_loaded_models");
-            try jw.write(value);
-        }
-        if (self.pool_size) |value| {
-            try jw.objectField("pool_size");
-            try jw.write(value);
-        }
-        if (self.prompt_cache) |value| {
-            try jw.objectField("prompt_cache");
-            try jw.write(value);
-        }
-        if (self.backend_priority) |value| {
-            try jw.objectField("backend_priority");
-            try jw.write(value);
-        }
-        if (self.max_queue_size) |value| {
-            try jw.objectField("max_queue_size");
-            try jw.write(value);
-        }
-        if (self.request_timeout) |value| {
-            try jw.objectField("request_timeout");
-            try jw.write(value);
-        }
-        if (self.preload) |value| {
-            try jw.objectField("preload");
-            try jw.write(value);
-        }
-        if (self.max_memory_mb) |value| {
-            try jw.objectField("max_memory_mb");
-            try jw.write(value);
-        }
-        if (self.model_strategies) |value| {
-            try jw.objectField("model_strategies");
-            try jw.write(value);
-        }
-        if (self.allow_downloads) |value| {
-            try jw.objectField("allow_downloads");
-            try jw.write(value);
-        }
-        if (self.log) |value| {
-            try jw.objectField("log");
+        if (self.inference) |value| {
+            try jw.objectField("inference");
             try jw.write(value);
         }
         try jw.endObject();
@@ -31180,38 +32689,6 @@ pub const InferenceSparseVector = struct {
     indices: []const i32,
     /// Corresponding weights for each index (always positive)
     values: []const f32,
-};
-
-/// Logging output format style. 'terminal' for colorized console, 'json' for structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
-pub const InferenceStyle = enum {
-    terminal,
-    json,
-    logfmt,
-    noop,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .terminal => "terminal",
-            .json => "json",
-            .logfmt => "logfmt",
-            .noop => "noop",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "terminal", .terminal },
-            .{ "json", .json },
-            .{ "logfmt", .logfmt },
-            .{ "noop", .noop },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
 };
 
 pub const InferenceSynthesisRequest = struct {
@@ -31274,10 +32751,24 @@ pub const InferenceTextContent = struct {
 pub const InferenceTextContentPart = TextContentPart;
 
 pub const InferenceTextRegion = struct {
+    /// Region identity within its parent; nested regions use qualified paths.
+    id: ?i64 = null,
+    /// Default provenance of this region; nested region origins override it.
+    origin: ?[]const u8 = null,
+    /// Start UTF-8 byte offset in the containing page text; null when unmapped.
+    text_start: OpenApiOptionalNullable(i64) = .absent,
+    /// Exclusive end UTF-8 byte offset in the containing page text.
+    text_end: OpenApiOptionalNullable(i64) = .absent,
+    /// Accepted subregions in the same source coordinate space and page text offsets.
+    children: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    /// Tables owned by this region, including cells and provenance.
+    tables: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    /// Structured output owned by this region.
+    fields: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// Recognized text within the region
     text: []const u8,
-    /// Bounding box [x1, y1, x2, y2] in pixel coordinates
-    bbox: []const f64,
+    /// Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels for ordinary image requests. Null when source geometry cannot be established, including unsupported vertical PDF writing.
+    bbox: ?[]const f64,
     /// Recognition confidence score (0-1)
     confidence: ?f64 = null,
     /// Semantic label from layout analysis (e.g., text, title, table)
@@ -31285,6 +32776,13 @@ pub const InferenceTextRegion = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "origin", "origin", true },
+        .{ "text_start", "text_start", false },
+        .{ "text_end", "text_end", false },
+        .{ "children", "children", true },
+        .{ "tables", "tables", true },
+        .{ "fields", "fields", false },
         .{ "text", "text", false },
         .{ "bbox", "bbox", false },
         .{ "confidence", "confidence", true },
@@ -31301,6 +32799,55 @@ pub const InferenceTextRegion = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
+        switch (self.text_start) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("text_start");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("text_start");
+                try jw.write(value);
+            },
+        }
+        switch (self.text_end) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("text_end");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("text_end");
+                try jw.write(value);
+            },
+        }
+        if (self.children) |value| {
+            try jw.objectField("children");
+            try jw.write(value);
+        }
+        if (self.tables) |value| {
+            try jw.objectField("tables");
+            try jw.write(value);
+        }
+        switch (self.fields) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("fields");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("fields");
+                try jw.write(value);
+            },
+        }
         try jw.objectField("text");
         try jw.write(self.text);
         try jw.objectField("bbox");
@@ -32012,39 +33559,6 @@ pub const InferenceVadConfig = struct {
     }
 };
 
-/// Legacy inference-local logging configuration. The current unified Zig runtime ignores it; configure the top-level `log` object instead.
-pub const InferenceschemasConfig = struct {
-    level: ?InferenceLevel = null,
-    style: ?InferenceStyle = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "level", "level", true },
-        .{ "style", "style", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.level) |value| {
-            try jw.objectField("level");
-            try jw.write(value);
-        }
-        if (self.style) |value| {
-            try jw.objectField("style");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 pub const InstallExtensionRequest = struct {
     version: ?[]const u8 = null,
     scope: ExtensionScope,
@@ -32525,6 +34039,86 @@ pub const JoinType = enum {
             .{ "inner", .inner },
             .{ "left", .left },
             .{ "right", .right },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Runtime Metal and CUDA kernel JIT configuration. Live compilation and GPU qualification run only for models in the configured startup `preload` list, before serving begins. A cold dynamic model load never benchmarks against an in-use GPU: `on` and `shadow` retain bundled kernels, while `required` rejects the load. When runtime JIT is enabled, startup also materializes every vision, audio, and projection session declared by each preloaded model without running media inference. Preload every model that must use runtime-JIT kernels; `required` rejects an empty preload list.
+pub const KernelJitConfig = struct {
+    mode: ?KernelJitMode = null,
+    /// Persistent artifact cache directory on Linux and macOS. Omit to use ~/.antfly/inference/jit when HOME is available.
+    cache_dir: ?[]const u8 = null,
+    /// Persistent cache size limit in MiB. Set to 0 to disable disk persistence.
+    max_cache_bytes_mb: ?i64 = null,
+    /// Per direct model session pre-publication start budget for best-effort `on` and `shadow` JIT work. A compiler or qualification operation already started may overrun the budget. Multimodal model preloads may create several direct sessions, each with this budget. `required` completes or fails all required routes and may exceed this value.
+    preload_budget_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", true },
+        .{ "cache_dir", "cache_dir", true },
+        .{ "max_cache_bytes_mb", "max_cache_bytes_mb", true },
+        .{ "preload_budget_ms", "preload_budget_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.cache_dir) |value| {
+            try jw.objectField("cache_dir");
+            try jw.write(value);
+        }
+        if (self.max_cache_bytes_mb) |value| {
+            try jw.objectField("max_cache_bytes_mb");
+            try jw.write(value);
+        }
+        if (self.preload_budget_ms) |value| {
+            try jw.objectField("preload_budget_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Runtime kernel JIT operating mode. `off` disables compilation. `shadow` compiles and validates without dispatching JIT kernels. `on` may activate qualified kernels while preserving the production fallback. `required` fails model loading when there are no eligible routes or any scoped route cannot qualify, rejects sessions that are not direct Metal or CUDA sessions, and requires at least one configured startup preload. Backend preference remains separately configured; this mode neither enables nor selects a backend. Runtime JIT is currently supported on Linux and macOS; other platforms reject non-`off` modes rather than silently degrading.
+pub const KernelJitMode = enum {
+    off,
+    shadow,
+    on,
+    required,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .off => "off",
+            .shadow => "shadow",
+            .on => "on",
+            .required => "required",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "off", .off },
+            .{ "shadow", .shadow },
+            .{ "on", .on },
+            .{ "required", .required },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -33072,6 +34666,38 @@ pub const LegacyGraphSearchResult = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// Logging verbosity level
+pub const Level = enum {
+    debug,
+    info,
+    warn,
+    @"error",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .debug => "debug",
+            .info => "info",
+            .warn => "warn",
+            .@"error" => "error",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "debug", .debug },
+            .{ "info", .info },
+            .{ "warn", .warn },
+            .{ "error", .@"error" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
@@ -34169,6 +35795,8 @@ pub const MediaChunkPolicy = struct {
     tile_width: ?i64 = null,
     tile_height: ?i64 = null,
     tile_overlap: ?i64 = null,
+    /// Split audio chunks at detected speaker transitions, additionally respecting the boundary model limits. Requires a diarization-enabled boundary target, zero overlap_ns and zero audio_pause_ns. The boundary diarization recipe participates in plan identity. Analysis runs even with execute=false because these boundaries depend on audio inference.
+    audio_speaker_turns: ?bool = null,
     /// Optional minimum silence duration for choosing an earlier boundary; no samples are discarded.
     audio_pause_ns: ?i64 = null,
     audio_pause_search_ns: ?i64 = null,
@@ -34188,6 +35816,7 @@ pub const MediaChunkPolicy = struct {
         .{ "tile_width", "tile_width", true },
         .{ "tile_height", "tile_height", true },
         .{ "tile_overlap", "tile_overlap", true },
+        .{ "audio_speaker_turns", "audio_speaker_turns", true },
         .{ "audio_pause_ns", "audio_pause_ns", true },
         .{ "audio_pause_search_ns", "audio_pause_search_ns", true },
         .{ "audio_silence_milli", "audio_silence_milli", true },
@@ -34245,6 +35874,10 @@ pub const MediaChunkPolicy = struct {
         }
         if (self.tile_overlap) |value| {
             try jw.objectField("tile_overlap");
+            try jw.write(value);
+        }
+        if (self.audio_speaker_turns) |value| {
+            try jw.objectField("audio_speaker_turns");
             try jw.write(value);
         }
         if (self.audio_pause_ns) |value| {
@@ -34314,12 +35947,14 @@ pub const MediaOutputCoverageCounts = struct {
     embedding: ?MediaOutputCoverageValues = null,
     transcribe: ?MediaOutputCoverageValues = null,
     classify: ?MediaOutputCoverageValues = null,
+    diarize: ?MediaOutputCoverageValues = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "embedding", "embedding", true },
         .{ "transcribe", "transcribe", true },
         .{ "classify", "classify", true },
+        .{ "diarize", "diarize", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -34342,6 +35977,10 @@ pub const MediaOutputCoverageCounts = struct {
         }
         if (self.classify) |value| {
             try jw.objectField("classify");
+            try jw.write(value);
+        }
+        if (self.diarize) |value| {
+            try jw.objectField("diarize");
             try jw.write(value);
         }
         try jw.endObject();
@@ -39274,6 +40913,217 @@ pub const MetadataLeaderUnavailableError = struct {
     retry_after_ms: i32,
 };
 
+/// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
+pub const ModelBackend = enum {
+    auto,
+    native,
+    metal,
+    cuda,
+    xla,
+    webgpu,
+    wasm,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .native => "native",
+            .metal => "metal",
+            .cuda => "cuda",
+            .xla => "xla",
+            .webgpu => "webgpu",
+            .wasm => "wasm",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "native", .native },
+            .{ "metal", .metal },
+            .{ "cuda", .cuda },
+            .{ "xla", .xla },
+            .{ "webgpu", .webgpu },
+            .{ "wasm", .wasm },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Optional artifact format preference for loading a model.
+pub const ModelFormat = enum {
+    gguf,
+    onnx,
+    safetensors,
+    hybrid,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .gguf => "gguf",
+            .onnx => "onnx",
+            .safetensors => "safetensors",
+            .hybrid => "hybrid",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "gguf", .gguf },
+            .{ "onnx", .onnx },
+            .{ "safetensors", .safetensors },
+            .{ "hybrid", .hybrid },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Model registry kind.
+pub const ModelKind = enum {
+    generator,
+    embedder,
+    reranker,
+    chunker,
+    classifier,
+    rewriter,
+    reader,
+    transcriber,
+    extractor,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .generator => "generator",
+            .embedder => "embedder",
+            .reranker => "reranker",
+            .chunker => "chunker",
+            .classifier => "classifier",
+            .rewriter => "rewriter",
+            .reader => "reader",
+            .transcriber => "transcriber",
+            .extractor => "extractor",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "generator", .generator },
+            .{ "embedder", .embedder },
+            .{ "reranker", .reranker },
+            .{ "chunker", .chunker },
+            .{ "classifier", .classifier },
+            .{ "rewriter", .rewriter },
+            .{ "reader", .reader },
+            .{ "transcriber", .transcriber },
+            .{ "extractor", .extractor },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Optional quantization preference for loading a model.
+pub const ModelQuantization = enum {
+    q4_k,
+    q8,
+    fp16,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .q4_k => "q4_k",
+            .q8 => "q8",
+            .fp16 => "fp16",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "q4_k", .q4_k },
+            .{ "q8", .q8 },
+            .{ "fp16", .fp16 },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Model reference used by startup preload and model-loading configuration. When a preload selects an explicit backend, that warmed session also becomes the model's default in-process session for later `auto` requests; callers do not need to repeat the backend on every request.
+pub const ModelRef = struct {
+    kind: ModelKind,
+    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
+    name: []const u8,
+    backend: ?ModelBackend = null,
+    format: ?ModelFormat = null,
+    quantization: ?ModelQuantization = null,
+    /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On Metal, `auto` chooses full residency only when the complete expert set and safety reserves fit the configured budget; otherwise it uses bounded streaming. On the qualified SM89 CUDA lane, `auto` resolves to resident mode and fails closed unless its envelope fits. Other model geometries reject this field.
+    residency_mode: ?A4bResidencyMode = null,
+    /// Per-model A4B memory envelope in MiB. Zero selects the backend default: the conservative 2048 MiB streamed floor on Metal, or the qualified 16384 MiB resident envelope on CUDA. Explicit values below 2048 fail; CUDA also rejects any envelope too small for full residency. Other model geometries reject this field.
+    memory_budget_mb: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "name", "name", false },
+        .{ "backend", "backend", true },
+        .{ "format", "format", true },
+        .{ "quantization", "quantization", true },
+        .{ "residency_mode", "residency_mode", true },
+        .{ "memory_budget_mb", "memory_budget_mb", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.backend) |value| {
+            try jw.objectField("backend");
+            try jw.write(value);
+        }
+        if (self.format) |value| {
+            try jw.objectField("format");
+            try jw.write(value);
+        }
+        if (self.quantization) |value| {
+            try jw.objectField("quantization");
+            try jw.write(value);
+        }
+        if (self.residency_mode) |value| {
+            try jw.objectField("residency_mode");
+            try jw.write(value);
+        }
+        if (self.memory_budget_mb) |value| {
+            try jw.objectField("memory_budget_mb");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
 pub const MultiBatchRequest = struct {
     /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.
@@ -39928,6 +41778,48 @@ pub const OpenAIReasoningEffort = enum {
             .{ "max", .max },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Configuration for OpenAI STT (Whisper) provider. API key via `api_key` field or `OPENAI_API_KEY` environment variable. **Model:** whisper-1 **Supported Formats:** mp3, wav, webm, ogg, flac (max 25MB) **Docs:** https://platform.openai.com/docs/guides/speech-to-text
+pub const OpenAISTTConfig = struct {
+    /// Whisper model to use.
+    model: ?[]const u8 = null,
+    /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
+    base_url: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "api_key", "api_key", true },
+        .{ "base_url", "base_url", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 
@@ -40920,6 +42812,65 @@ pub const PriorArtifactContext = struct {
     }
 };
 
+/// Exactly one expression node: literal, field, ref, param, call with args, case with optional else, cast, or a binary operator. Pure expressions lower to the same typed scalar IR as SQL SELECT and CASE. AI/provider calls remain in evaluate, never execute implicitly in select. value_identity(field) returns an opaque identity for a present logical value (including JSON null); missing has no identity. is_missing(field) distinguishes missing from present null. Identity reads require the same authorization and retained source revision as value reads. Metadata may accelerate them; unsupported/old metadata falls back to ordinary reads. Untaken CASE branches do not load fields or evaluate erroring calls. Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from, is_not_distinct_from, and, or, add, subtract, multiply, divide and concat. Expressions are limited to depth 64 including referenced aliases, and 8192 nodes per request. Alias dependencies are acyclic; each alias is a requested output and is evaluated once per row.
+pub const ProjectionExpression = std.json.Value;
+
+/// Native generator prompt KV cache configuration.
+pub const PromptCacheConfig = struct {
+    /// Enable inference-native prompt KV cache reuse for generator requests.
+    enabled: ?bool = null,
+    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an opt-in page-aligned compressed radix tree with shared-prefix ownership and leaf-only LRU eviction; it is currently qualified for native and Metal backends. Eligible Metal requests use eager paged attention; explicit compiled generation is incompatible with prompt caching. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
+    mode: ?[]const u8 = null,
+    /// Node-wide target for live prompt-cache entries. The runtime divides it across participating model caches and evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard cap on process or accelerator memory.
+    max_bytes_mb: ?i64 = null,
+    /// Minimum prompt length eligible for prompt KV caching.
+    min_tokens: ?i64 = null,
+    /// Idle time-to-live for prompt KV cache entries. Refreshed on every cache hit, so only entries left unused for this duration expire.
+    ttl_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+        .{ "mode", "mode", true },
+        .{ "max_bytes_mb", "max_bytes_mb", true },
+        .{ "min_tokens", "min_tokens", true },
+        .{ "ttl_ms", "ttl_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.max_bytes_mb) |value| {
+            try jw.objectField("max_bytes_mb");
+            try jw.write(value);
+        }
+        if (self.min_tokens) |value| {
+            try jw.objectField("min_tokens");
+            try jw.write(value);
+        }
+        if (self.ttl_ms) |value| {
+            try jw.objectField("ttl_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const ProvenanceDecision = struct {
     schema_version: ?u32 = null,
     resource: std.json.Value,
@@ -41521,6 +43472,33 @@ pub const Query = union(enum) {
     }
 };
 
+pub const QueryAdmissionConfig = struct {
+    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and resources.inference.admission.max_concurrent_requests.
+    max_concurrent_requests: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_concurrent_requests", "max_concurrent_requests", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_concurrent_requests) |value| {
+            try jw.objectField("max_concurrent_requests");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const QueryBuilderRequest = struct {
     /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
     session_id: ?[]const u8 = null,
@@ -42057,7 +44035,7 @@ pub const QueryHit = struct {
     /// Source table provenance for composed query hits; equal IDs from union inputs remain distinct.
     _table: ?[]const u8 = null,
     /// Named query-time computed values, separate from stored source.
-    _computed: ?std.json.ArrayHashMap(std.json.Value) = null,
+    _computed: ?@import("antfly-json").RawObject = null,
     /// ID of the record.
     _id: []const u8,
     /// Relevance score of the hit, normalized so higher values always rank first.
@@ -42458,6 +44436,10 @@ pub const QueryRequest = struct {
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
     /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
+    /// Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
+    select: ?std.json.Value = null,
+    /// Request-local values bound by select expressions through param. Parameters are data, never executable expressions or read grants. The serialized parameter object is limited to 1 MiB and 1024 named parameters.
+    params: ?std.json.Value = null,
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
@@ -42522,6 +44504,8 @@ pub const QueryRequest = struct {
         .{ "aggregations", "aggregations", true },
         .{ "embeddings", "embeddings", true },
         .{ "search_effort", "search_effort", true },
+        .{ "select", "select", true },
+        .{ "params", "params", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
         .{ "highlight", "highlight", true },
@@ -42627,6 +44611,14 @@ pub const QueryRequest = struct {
         }
         if (self.search_effort) |value| {
             try jw.objectField("search_effort");
+            try jw.write(value);
+        }
+        if (self.select) |value| {
+            try jw.objectField("select");
+            try jw.write(value);
+        }
+        if (self.params) |value| {
+            try jw.objectField("params");
             try jw.write(value);
         }
         if (self.fields) |value| {
@@ -43452,7 +45444,7 @@ pub const RelationalCheckConstraint = struct {
     column: ?[]const u8 = null,
     op: ?RelationalComparisonOp = null,
     /// Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// String comparison collation; uses the same rules as ordered indexes.
     collation: ?[]const u8 = null,
     expression: ?RelationalScalarExpression = null,
@@ -43462,7 +45454,7 @@ pub const RelationalCheckConstraint = struct {
         .{ "name", "name", false },
         .{ "column", "column", true },
         .{ "op", "op", true },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "collation", "collation", true },
         .{ "expression", "expression", true },
     };
@@ -43487,9 +45479,16 @@ pub const RelationalCheckConstraint = struct {
             try jw.objectField("op");
             try jw.write(value);
         }
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.collation) |value| {
             try jw.objectField("collation");
@@ -44312,7 +46311,7 @@ pub const RelationalIndexPredicate = struct {
     column: []const u8,
     op: RelationalComparisonOp,
     /// Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// String comparison collation with the same semantics as ordered keys.
     collation: ?[]const u8 = null,
 
@@ -44320,7 +46319,7 @@ pub const RelationalIndexPredicate = struct {
     pub const openApiFieldMetadata = .{
         .{ "column", "column", false },
         .{ "op", "op", false },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "collation", "collation", true },
     };
 
@@ -44338,9 +46337,16 @@ pub const RelationalIndexPredicate = struct {
         try jw.write(self.column);
         try jw.objectField("op");
         try jw.write(self.op);
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.collation) |value| {
             try jw.objectField("collation");
@@ -44516,14 +46522,14 @@ pub const RelationalRowCondition = struct {
     column: []const u8,
     op: RelationalComparisonOp,
     /// Typed scalar operand. Omission means NULL. Integer columns also accept exact decimal strings.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     collation: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "column", "column", false },
         .{ "op", "op", false },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "collation", "collation", true },
     };
 
@@ -44541,9 +46547,16 @@ pub const RelationalRowCondition = struct {
         try jw.write(self.column);
         try jw.objectField("op");
         try jw.write(self.op);
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.collation) |value| {
             try jw.objectField("collation");
@@ -45429,13 +47442,13 @@ pub const ReplicationTransformOp = struct {
     /// Antfly document field path. Required for `$set`, `$unset`, etc.
     path: ?[]const u8 = null,
     /// Value for the operation. Can be a literal (string, number, boolean) or a `{{column}}` reference to a PG column value. Use `{{col.key}}` to navigate into decoded JSONB columns.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "op", "op", false },
         .{ "path", "path", true },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -45454,9 +47467,16 @@ pub const ReplicationTransformOp = struct {
             try jw.objectField("path");
             try jw.write(value);
         }
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -45501,6 +47521,8 @@ pub const RerankerCandidateLimitExceededError = struct {
 
 /// A unified configuration for a reranking provider.
 pub const RerankerConfig = struct {
+    account_id: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
     rate_limit: ?RateLimitConfig = null,
     provider: RerankerProvider,
     /// Field name to extract from documents for reranking.
@@ -45513,9 +47535,8 @@ pub const RerankerConfig = struct {
     candidate_count: ?i64 = null,
     /// Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
     top_n: ?i64 = null,
-    /// Optional bearer API key for remote Antfly inference. Supports secret references and defaults to ANTFLY_INFERENCE_API_KEY. Embedded inference does not resolve or use outbound credentials.
     api_key: ?[]const u8 = null,
-    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    /// Optional deployment-owned endpoint override.
     url: ?[]const u8 = null,
     /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
@@ -45524,6 +47545,8 @@ pub const RerankerConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
         .{ "rate_limit", "rate_limit", true },
         .{ "provider", "provider", true },
         .{ "field", "field", true },
@@ -45547,6 +47570,14 @@ pub const RerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
         if (self.rate_limit) |value| {
             try jw.objectField("rate_limit");
             try jw.write(value);
@@ -45642,12 +47673,14 @@ pub const RerankerProfile = struct {
 
 /// The reranking provider to use.
 pub const RerankerProvider = enum {
+    cloudflare,
     antfly,
     cohere,
     vertex,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
+            .cloudflare => "cloudflare",
             .antfly => "antfly",
             .cohere => "cohere",
             .vertex => "vertex",
@@ -45661,6 +47694,7 @@ pub const RerankerProvider = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "cloudflare", .cloudflare },
             .{ "antfly", .antfly },
             .{ "cohere", .cohere },
             .{ "vertex", .vertex },
@@ -48465,6 +50499,51 @@ pub const ResourceType = enum {
     }
 };
 
+/// Shared node-local resource policy for DB and standalone inference. All memory quantities are bytes.
+pub const ResourcesConfig = struct {
+    memory: ?std.json.Value = null,
+    query: ?std.json.Value = null,
+    write: ?std.json.Value = null,
+    inference: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "memory", "memory", true },
+        .{ "query", "query", true },
+        .{ "write", "write", true },
+        .{ "inference", "inference", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.memory) |value| {
+            try jw.objectField("memory");
+            try jw.write(value);
+        }
+        if (self.query) |value| {
+            try jw.objectField("query");
+            try jw.write(value);
+        }
+        if (self.write) |value| {
+            try jw.objectField("write");
+            try jw.write(value);
+        }
+        if (self.inference) |value| {
+            try jw.objectField("inference");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const RestoreJob = struct {
     /// Opaque durable restore-job identifier. Clients must not parse it as a number.
     job_id: []const u8,
@@ -49427,6 +51506,172 @@ pub const RowFilterEntry = struct {
         }
         try jw.objectField("filter");
         try jw.write(self.filter);
+        try jw.endObject();
+    }
+};
+
+pub const RuntimeConfig = struct {
+    /// Encoded HTTP inference body ceiling in MiB, independent of decoded-media resource policy.
+    http_max_body_mb: ?i64 = null,
+    /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
+    api_url: ?[]const u8 = null,
+    /// Client-only API key used when calling an authenticated shared Antfly inference API. Both standalone inference executables accept and ignore this field when serving models.
+    api_key: ?[]const u8 = null,
+    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
+    models_dir: ?[]const u8 = null,
+    /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
+    ml_dir: ?[]const u8 = null,
+    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when resources.inference.admission.max_work_units is positive—16 MiB times that effective work capacity (which defaults to request concurrency when max_work_units is omitted); zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
+    content_security: ?ContentSecurityConfig = null,
+    /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
+    s3_credentials: ?Credentials = null,
+    /// Experimental execution batching; mode on explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply.
+    generation_batching: ?std.json.Value = null,
+    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
+    keep_alive: ?[]const u8 = null,
+    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
+    max_loaded_models: ?i64 = null,
+    /// Legacy compatibility field. The current Zig inference runtime does not create per-model pipeline pools from this setting; configuring it has no effect.
+    pool_size: ?i64 = null,
+    /// Native generator prompt KV cache settings.
+    prompt_cache: ?PromptCacheConfig = null,
+    kernel_jit: ?KernelJitConfig = null,
+    /// Legacy compatibility field. The current Zig inference runtime selects a backend from model metadata, explicit preload settings, and compiled capabilities; configuring this list has no effect.
+    backend_priority: ?[]const []const u8 = null,
+    /// Legacy Go-runtime queue setting. The current Zig runtime does not retain excess inference requests in memory and ignores this field.
+    max_queue_size: ?i64 = null,
+    /// Legacy Go-runtime queue/request timeout. The current Zig runtime ignores this field; its HTTP listener applies a separate fixed transport timeout.
+    request_timeout: ?[]const u8 = null,
+    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind. When runtime kernel JIT is enabled, every vision, audio, and projection session declared by a preloaded model is also loaded without running media inference. Runtime kernel JIT `required` mode rejects an empty preload list.
+    preload: ?[]const ModelRef = null,
+    /// Legacy compatibility field. The current Zig runtime uses explicit host, backend, combined, KV, and scratch budgets instead and ignores this field.
+    max_memory_mb: ?i64 = null,
+    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map load on demand. keep_alive controls their idle eviction; setting it to "0" disables idle eviction but does not preload or pin them. When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
+    model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Legacy compatibility field controlling whether dashboards show model download commands. It defaults to true for standalone deployments; managed deployments historically set it to false. Download-command availability is a build-time setting in the current Zig runtime, so configuring this field has no effect.
+    allow_downloads: ?bool = null,
+    /// Legacy inference-local logging field. The current unified Zig runtime ignores it; configure the top-level `log` object instead.
+    log: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "http_max_body_mb", "http_max_body_mb", true },
+        .{ "api_url", "api_url", true },
+        .{ "api_key", "api_key", true },
+        .{ "models_dir", "models_dir", true },
+        .{ "ml_dir", "ml_dir", true },
+        .{ "content_security", "content_security", true },
+        .{ "s3_credentials", "s3_credentials", true },
+        .{ "generation_batching", "generation_batching", true },
+        .{ "keep_alive", "keep_alive", true },
+        .{ "max_loaded_models", "max_loaded_models", true },
+        .{ "pool_size", "pool_size", true },
+        .{ "prompt_cache", "prompt_cache", true },
+        .{ "kernel_jit", "kernel_jit", true },
+        .{ "backend_priority", "backend_priority", true },
+        .{ "max_queue_size", "max_queue_size", true },
+        .{ "request_timeout", "request_timeout", true },
+        .{ "preload", "preload", true },
+        .{ "max_memory_mb", "max_memory_mb", true },
+        .{ "model_strategies", "model_strategies", true },
+        .{ "allow_downloads", "allow_downloads", true },
+        .{ "log", "log", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.http_max_body_mb) |value| {
+            try jw.objectField("http_max_body_mb");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.models_dir) |value| {
+            try jw.objectField("models_dir");
+            try jw.write(value);
+        }
+        if (self.ml_dir) |value| {
+            try jw.objectField("ml_dir");
+            try jw.write(value);
+        }
+        if (self.content_security) |value| {
+            try jw.objectField("content_security");
+            try jw.write(value);
+        }
+        if (self.s3_credentials) |value| {
+            try jw.objectField("s3_credentials");
+            try jw.write(value);
+        }
+        if (self.generation_batching) |value| {
+            try jw.objectField("generation_batching");
+            try jw.write(value);
+        }
+        if (self.keep_alive) |value| {
+            try jw.objectField("keep_alive");
+            try jw.write(value);
+        }
+        if (self.max_loaded_models) |value| {
+            try jw.objectField("max_loaded_models");
+            try jw.write(value);
+        }
+        if (self.pool_size) |value| {
+            try jw.objectField("pool_size");
+            try jw.write(value);
+        }
+        if (self.prompt_cache) |value| {
+            try jw.objectField("prompt_cache");
+            try jw.write(value);
+        }
+        if (self.kernel_jit) |value| {
+            try jw.objectField("kernel_jit");
+            try jw.write(value);
+        }
+        if (self.backend_priority) |value| {
+            try jw.objectField("backend_priority");
+            try jw.write(value);
+        }
+        if (self.max_queue_size) |value| {
+            try jw.objectField("max_queue_size");
+            try jw.write(value);
+        }
+        if (self.request_timeout) |value| {
+            try jw.objectField("request_timeout");
+            try jw.write(value);
+        }
+        if (self.preload) |value| {
+            try jw.objectField("preload");
+            try jw.write(value);
+        }
+        if (self.max_memory_mb) |value| {
+            try jw.objectField("max_memory_mb");
+            try jw.write(value);
+        }
+        if (self.model_strategies) |value| {
+            try jw.objectField("model_strategies");
+            try jw.write(value);
+        }
+        if (self.allow_downloads) |value| {
+            try jw.objectField("allow_downloads");
+            try jw.write(value);
+        }
+        if (self.log) |value| {
+            try jw.objectField("log");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -50596,8 +52841,134 @@ pub const SSEToolMode = struct {
     }
 };
 
+/// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base ```
+pub const STTConfig = struct {
+    provider: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned full native endpoint override.
+    base_url: ?[]const u8 = null,
+    language_code: ?[]const u8 = null,
+    voice: ?[]const u8 = null,
+    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location.
+    location: ?[]const u8 = null,
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain.
+    credentials_path: ?[]const u8 = null,
+    /// Enable automatic punctuation.
+    enable_automatic_punctuation: ?bool = null,
+    /// Use enhanced models for better accuracy (costs more).
+    use_enhanced: ?bool = null,
+    /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    timestamps: ?bool = null,
+    /// Explicitly permit preparing and installing the selected Speech assets.
+    download_assets: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "model", "model", true },
+        .{ "api_key", "api_key", true },
+        .{ "base_url", "base_url", true },
+        .{ "language_code", "language_code", true },
+        .{ "voice", "voice", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "enable_automatic_punctuation", "enable_automatic_punctuation", true },
+        .{ "use_enhanced", "use_enhanced", true },
+        .{ "api_url", "api_url", true },
+        .{ "timestamps", "timestamps", true },
+        .{ "download_assets", "download_assets", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.provider) |value| {
+            try jw.objectField("provider");
+            try jw.write(value);
+        }
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.voice) |value| {
+            try jw.objectField("voice");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.enable_automatic_punctuation) |value| {
+            try jw.objectField("enable_automatic_punctuation");
+            try jw.write(value);
+        }
+        if (self.use_enhanced) |value| {
+            try jw.objectField("use_enhanced");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
+            try jw.write(value);
+        }
+        if (self.download_assets) |value| {
+            try jw.objectField("download_assets");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// The STT provider to use.
 pub const STTProvider = enum {
+    cloudflare,
     openai,
     vertex,
     antfly,
@@ -50605,6 +52976,7 @@ pub const STTProvider = enum {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
+            .cloudflare => "cloudflare",
             .openai => "openai",
             .vertex => "vertex",
             .antfly => "antfly",
@@ -50619,6 +52991,7 @@ pub const STTProvider = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "cloudflare", .cloudflare },
             .{ "openai", .openai },
             .{ "vertex", .vertex },
             .{ "antfly", .antfly },
@@ -51493,6 +53866,7 @@ pub const SqlSettingMutationRequest = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
+        if (source.object.count() != 1) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
             "drop",
         })) {
@@ -51724,6 +54098,10 @@ pub const StatefulQueryRequest = struct {
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
     /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
+    /// Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
+    select: ?std.json.Value = null,
+    /// Request-local values bound by select expressions through param. Parameters are data, never executable expressions or read grants. The serialized parameter object is limited to 1 MiB and 1024 named parameters.
+    params: ?std.json.Value = null,
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
@@ -51792,6 +54170,8 @@ pub const StatefulQueryRequest = struct {
         .{ "aggregations", "aggregations", true },
         .{ "embeddings", "embeddings", true },
         .{ "search_effort", "search_effort", true },
+        .{ "select", "select", true },
+        .{ "params", "params", true },
         .{ "fields", "fields", true },
         .{ "hierarchy", "hierarchy", true },
         .{ "highlight", "highlight", true },
@@ -51899,6 +54279,14 @@ pub const StatefulQueryRequest = struct {
         }
         if (self.search_effort) |value| {
             try jw.objectField("search_effort");
+            try jw.write(value);
+        }
+        if (self.select) |value| {
+            try jw.objectField("select");
+            try jw.write(value);
+        }
+        if (self.params) |value| {
+            try jw.objectField("params");
             try jw.write(value);
         }
         if (self.fields) |value| {
@@ -52262,6 +54650,38 @@ pub const StoreRootEnrollmentRequest = struct {
     identity: StoreRootEnrollmentIdentity,
     /// Ed25519 proof-of-possession signature in lowercase hex.
     signature: []const u8,
+};
+
+/// Logging output format style. 'terminal' for colorized console, 'json' for structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
+pub const Style = enum {
+    terminal,
+    json,
+    logfmt,
+    noop,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .terminal => "terminal",
+            .json => "json",
+            .logfmt => "logfmt",
+            .noop => "noop",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "terminal", .terminal },
+            .{ "json", .json },
+            .{ "logfmt", .logfmt },
+            .{ "noop", .noop },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const SuccessMessage = struct {
@@ -53688,7 +56108,7 @@ pub const TemplateFieldMapping = struct {
     include_in_all: ?bool = null,
     /// Whether this exact scalar field can be used in order_by. Supported sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed text, search_as_you_type, geo, embedding, blob, html, object, and array fields are not directly sortable; use an exact scalar subfield such as title.keyword for sorted string pagination. When true, Antfly derives the internal typed doc-value structures required for exact sorting; users should not configure doc_values directly.
     sortable: ?bool = null,
-    /// Missing/null sort policy for this mapped field. The current production policy rejects missing or null native sort values so sorted cursors remain replayable JSON scalar tuples.
+    /// Missing/null sort policy for this mapped field. The default missing_rejected rejects missing or null native sort values. Opt in to nulls_ordered to sort missing/null values first ascending and last descending, with JSON null in replayable sort cursor tuples. Native sorting requires a complete producer proof for nullable physical layouts.
     missing_null_policy: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -55044,7 +57464,7 @@ pub const TransactionStageReadSnapshot = struct {
     table: []const u8,
     key: []const u8,
     version: []const u8,
-    document: ?std.json.Value,
+    document: std.json.Value,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -55239,22 +57659,7 @@ pub const TransformOp = struct {
     /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
     path: []const u8,
     /// Value for operation (not required for $unset). Type depends on the supported operator. `$pull` removes every array element exactly equal to this JSON value; projected graph-edge values identify the relationship by `target`.
-    value: ?std.json.Value = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "op", "op", false },
-        .{ "path", "path", false },
-        .{ "value", "value", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -55262,9 +57667,16 @@ pub const TransformOp = struct {
         try jw.write(self.op);
         try jw.objectField("path");
         try jw.write(self.path);
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -56659,6 +59071,76 @@ pub const VertexRerankerConfig = struct {
     }
 };
 
+/// Configuration for Google Cloud Speech-to-Text provider (Vertex AI). Uses Application Default Credentials (ADC) for authentication. **Features:** Streaming, speaker diarization, automatic punctuation **Docs:** https://cloud.google.com/speech-to-text/docs
+pub const VertexSTTConfig = struct {
+    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location.
+    location: ?[]const u8 = null,
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain.
+    credentials_path: ?[]const u8 = null,
+    /// Default language code (e.g., 'en-US', 'es-ES').
+    language_code: ?[]const u8 = null,
+    /// Enable automatic punctuation.
+    enable_automatic_punctuation: ?bool = null,
+    /// Use enhanced models for better accuracy (costs more).
+    use_enhanced: ?bool = null,
+    /// Recognition model (e.g., 'latest_long', 'telephony', 'medical_dictation').
+    model: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "language_code", "language_code", true },
+        .{ "enable_automatic_punctuation", "enable_automatic_punctuation", true },
+        .{ "use_enhanced", "use_enhanced", true },
+        .{ "model", "model", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.enable_automatic_punctuation) |value| {
+            try jw.objectField("enable_automatic_punctuation");
+            try jw.write(value);
+        }
+        if (self.use_enhanced) |value| {
+            try jw.objectField("use_enhanced");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Configuration for Google Cloud Agent Search / Vertex AI Search. Use this for bounded Google Cloud search over configured data stores or verified websites. The provider token is `vertex` to match Antfly's existing Google Cloud provider convention. **Setup:** 1. Enable Discovery Engine API in Google Cloud 2. Create an Agent Search app/data store 3. Grant service account access to query the serving config **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
 pub const VertexSearchConfig = struct {
     provider: WebSearchProvider,
@@ -57296,6 +59778,33 @@ pub const WildcardQuery = struct {
                 try jw.objectField("boost");
                 try jw.write(value);
             },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const WriteAdmissionConfig = struct {
+    /// Maximum concurrent foreground data mutations in this process. The default is 16. Table batch writes, cross-table batches, linear merges, and transaction commits consume this budget. Schema, index, backup, restore, repair, and other administrative operations use dedicated control or background-maintenance paths. Set to 0 to disable write admission. Excess HTTP work in either foreground class is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Both budgets are independent of transport safeguards and resources.inference.admission.max_concurrent_requests.
+    max_concurrent_requests: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_concurrent_requests", "max_concurrent_requests", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_concurrent_requests) |value| {
+            try jw.objectField("max_concurrent_requests");
+            try jw.write(value);
         }
         try jw.endObject();
     }

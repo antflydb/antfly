@@ -3,6 +3,7 @@ from enum import StrEnum
 
 class RerankerProvider(StrEnum):
     ANTFLY = "antfly"
+    CLOUDFLARE = "cloudflare"
     COHERE = "cohere"
     VERTEX = "vertex"
 

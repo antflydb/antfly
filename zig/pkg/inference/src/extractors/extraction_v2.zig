@@ -455,6 +455,7 @@ pub fn errorDetails(err: anyerror) ?ErrorDetails {
         // UnsupportedGlinerBoundaryRuntime arm below (an unreviewed identity,
         // backend, feature, or malformed table) so the response names the
         // dimension instead of reporting a generic unsupported feature.
+        error.UnsupportedGlinerDecisionGeometry => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER decision extraction exceeds the qualified item, sequence or token limit" },
         error.GlinerBoundaryRequestItemsLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified request_items (batch size) limit" },
         error.GlinerBoundaryDocumentBytesLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified document_bytes limit" },
         error.GlinerBoundaryDocumentWordsLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified document_words limit" },

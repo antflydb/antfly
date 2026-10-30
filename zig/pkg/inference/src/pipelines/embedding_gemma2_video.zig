@@ -892,8 +892,50 @@ pub fn inspectPixelsWithSampling(bytes: []const u8, control: Control, sampling: 
     defer std.debug.assert(bounded.live == 0);
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
     defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
-    const plan = inspectPlan(bounded.allocator(), bytes, control, sampling, &pool, false) catch |err| return if ((err == error.OutOfMemory and bounded.denied) or err == error.SharedAdmissionExceeded) error.MemoryBudgetExceeded else err;
+    const plan = inspectPlan(bounded.allocator(), bytes, control, sampling, &pool, false) catch |err| {
+        // Executor-contract validation happens before backend acquisition. It
+        // must count supported CUDA MP4 pixels without requiring the portable
+        // AVC/MJPEG decoder to understand HEVC or AV1. Execution still chooses
+        // and validates its own backend; timestamp-window APIs stay portable.
+        if (err == error.UnsupportedVideoCodec and sampling == .reference) {
+            const adapter = control.imageWorkControl();
+            const clip = try @import("../ops/cuda/video.zig").inspectEmbedding(bounded.allocator(), bytes, .{ .context = adapter.context, .check_fn = adapter.check_fn });
+            if (clip.codec == .hevc or clip.codec == .av1) return @as(u64, clip.width) * clip.height * clip.frames;
+        }
+        return if ((err == error.OutOfMemory and bounded.denied) or err == error.SharedAdmissionExceeded) error.MemoryBudgetExceeded else err;
+    };
+    if (sampling == .reference) {
+        // Readers choose the first track supported by their route. A portable
+        // AVC/MJPEG track can follow a larger HEVC/AV1 track selected by CUDA.
+        // Charge the maximum across both viable routes before backend selection.
+        const adapter = control.imageWorkControl();
+        const clip = @import("../ops/cuda/video.zig").inspectEmbedding(bounded.allocator(), bytes, .{ .context = adapter.context, .check_fn = adapter.check_fn }) catch |err| {
+            try control.check();
+            if (err == error.OutOfMemory) return if (bounded.denied) error.MemoryBudgetExceeded else err;
+            // CUDA has a narrower envelope than portable decoding (including
+            // WebM/TS, MJPEG, and higher-depth AVC). Execution validates its route.
+            return plan.pixels;
+        };
+        return @max(plan.pixels, @as(u64, clip.width) * clip.height * clip.frames);
+    }
     return plan.pixels;
+}
+
+test "embeddinggemma2 video contract pixel inspection admits CUDA MP4 codecs without portable decoding" {
+    inline for (.{ "hevc-hvc1.mp4", "hevc-hev1.mp4", "hevc-hev1-inband.mp4", "av1.mp4" }) |name| {
+        try std.testing.expectEqual(@as(u64, 4 * 192 * 192), try inspectPixels(@embedFile("../testdata/video/codecs/" ++ name), .{}));
+    }
+}
+
+test "embeddinggemma2 video contract pixels cover CUDA track before smaller portable track" {
+    const bytes = @embedFile("../testdata/video/codecs/hevc-avc-tracks.mp4");
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    const portable = try inspectPlan(std.testing.allocator, bytes, .{}, .reference, &pool, false);
+    const cuda = try @import("../ops/cuda/video.zig").inspectEmbedding(std.testing.allocator, bytes, .{});
+    try std.testing.expectEqual(@as(u64, 32 * 32), portable.pixels);
+    try std.testing.expectEqual(@as(u64, 4 * 192 * 192), @as(u64, cuda.width) * cuda.height * cuda.frames);
+    try std.testing.expectEqual(@as(u64, 4 * 192 * 192), try inspectPixels(bytes, .{}));
+    try std.testing.expectError(error.Timeout, inspectPixels(bytes, .{ .deadline_ns = 0 }));
 }
 
 /// Geometry-derived share of a prepaid execution reservation. Counts maximum
@@ -5152,6 +5194,9 @@ test "embeddinggemma2 video ordered cohort publishes headers before waiting for 
     borrowed.packets = &packets;
     borrowed.track.timescale = 1;
     const configuration = Configuration{ .sampling = .{ .timestamps = .{ .end_ns = 12 * std.time.ns_per_s, .step_ns = std.time.ns_per_s, .max_frames = 12 } } };
+    var first_wake: std.Io.Event = .unset;
+    var second_wake: std.Io.Event = .unset;
+    var independent_wake: std.Io.Event = .unset;
     const first = try Prefetch.startConfigured(a, std.testing.io, null, &.{}, &borrowed, .{}, configuration);
     var second: ?*Prefetch = null;
     defer {
@@ -5165,27 +5210,32 @@ test "embeddinggemma2 video ordered cohort publishes headers before waiting for 
         first.deinit();
         if (second) |producer| producer.deinit();
     }
-    var polls: usize = 0;
-    while (first.published.load(.acquire) < 9 and polls < 1000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-    try std.testing.expect(first.published.load(.acquire) >= 9);
+    const Ready = struct {
+        fn wait(producer: *Prefetch, wake: *std.Io.Event, count: usize) !void {
+            producer.wake.store(wake, .release);
+            while (true) {
+                wake.reset();
+                if (producer.published.load(.acquire) >= count) return;
+                try std.testing.expect(!producer.finished.isSet());
+                try wake.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+            }
+        }
+    };
+    // Readiness is signaled by publication, rather than a scheduler-dependent
+    // polling deadline. Wake storage outlives every joined producer.
+    try Ready.wait(first, &first_wake, 9);
     var next = configuration;
     next.predecessor = first;
     second = try Prefetch.startConfigured(a, std.testing.io, null, &.{}, &borrowed, .{}, next);
     var header: [1]Prefetch.Job = undefined;
-    polls = 0;
-    var count: usize = 0;
-    while (count == 0 and polls < 1000) : (polls += 1) {
-        count = try second.?.header_queue.getUncancelable(std.testing.io, &header, 0);
-        if (count == 0) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-    }
+    try Ready.wait(second.?, &second_wake, 1);
+    const count = try second.?.header_queue.getUncancelable(std.testing.io, &header, 0);
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqual(@as(usize, 12), header[0].header.len);
     // An independent decoder does not inherit the full first row's dependency.
     const independent = try Prefetch.startConfigured(a, std.testing.io, null, &.{}, &borrowed, .{}, configuration);
     defer independent.deinit();
-    polls = 0;
-    while (independent.published.load(.acquire) < 2 and polls < 1000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-    try std.testing.expect(independent.published.load(.acquire) >= 2);
+    try Ready.wait(independent, &independent_wake, 2);
     try std.testing.expectEqual(@as(usize, 1), second.?.published.load(.acquire));
 }
 

@@ -24,14 +24,19 @@ Every mutation lives in an isolated source overlay; the checkout is read only.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
+import errno
 import json
 import os
+import platform
 import re
 import signal
+import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import sys
 from pathlib import Path
@@ -133,11 +138,17 @@ def control_catalog_contents() -> str:
         return False
 
     output = []
+    names = set()
     for line in (local / "source_catalog.zig").read_text().splitlines(keepends=True):
         declaration = re.fullmatch(
-            r'pub const \w+ = @import\("([^"\n]+\.zig)"\);\n?', line
+            r'pub const (?P<name>\w+) = @import\("(?P<path>[^"\n]+\.zig)"\);\n?', line
         )
-        if declaration and requires_physical((local / declaration[1]).resolve()):
+        if declaration:
+            name = declaration["name"]
+            if name in names:
+                raise ValueError(f"duplicate source catalog entry: {name}")
+            names.add(name)
+        if declaration and requires_physical((local / declaration["path"]).resolve()):
             continue
         output.append(line)
     output.insert(
@@ -166,6 +177,136 @@ def tree_rss(snapshot: str, root_pid: int) -> tuple[int, int]:
     return sum(sizes), max(sizes, default=0)
 
 
+def process_diagnostics(
+    snapshot: str, root_pid: int, cwd: Path | None = None
+) -> list[dict]:
+    """Attribute stalled work without retaining enormous compiler command lines."""
+    processes = {}
+    for line in snapshot.splitlines():
+        fields = line.split(None, 6)
+        if len(fields) != 7:
+            continue
+        pid, parent, rss, elapsed, cpu, state, command = fields
+        try:
+            processes[int(pid)] = (
+                int(parent),
+                int(rss) * 1024,
+                elapsed,
+                cpu,
+                state,
+                command,
+            )
+        except ValueError:
+            continue
+    descendants = {root_pid}
+    while True:
+        added = {pid for pid, row in processes.items() if row[0] in descendants}
+        if added <= descendants:
+            break
+        descendants |= added
+    result = []
+    for pid in sorted(descendants & processes.keys()):
+        parent, rss, elapsed, cpu, state, command = processes[pid]
+        try:
+            arguments = shlex.split(command)
+        except ValueError:
+            arguments = command.split()
+        expanded = []
+        for argument in arguments:
+            if (
+                cwd is not None
+                and argument.startswith("@")
+                and Path(arguments[0]).name == "zig"
+            ):
+                response = cwd / argument[1:]
+                try:
+                    if response.stat().st_size <= 4 * 1024 * 1024:
+                        expanded.extend(shlex.split(response.read_text()))
+                        continue
+                except (OSError, UnicodeError, ValueError):
+                    pass
+            expanded.append(argument)
+        artifact = None
+        if "--name" in expanded:
+            index = expanded.index("--name") + 1
+            if index < len(expanded):
+                artifact = expanded[index]
+        source = next(
+            (arg[len("-Mroot=") :] for arg in expanded if arg.startswith("-Mroot=")),
+            None,
+        )
+        result.append(
+            {
+                "pid": pid,
+                "parent_pid": parent,
+                "rss_bytes": rss,
+                "elapsed": elapsed,
+                "cpu_time": cpu,
+                "state": state,
+                "executable": Path(command.split()[0]).name,
+                "artifact": artifact,
+                "source_root": source,
+            }
+        )
+    return result
+
+
+def active_build_processes(root_pid: int, cwd: Path) -> list[dict]:
+    try:
+        snapshot = subprocess.check_output(
+            ["ps", "-axo", "pid=,ppid=,rss=,etime=,time=,state=,args="],
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return process_diagnostics(snapshot, root_pid, cwd)
+
+
+# Immutable Nix compiler from native run 40380791678 (glibc-linked Zig 0.17.0).
+# Its complete stripped Debug audit peaked at 7,656,402,944 bytes for the whole
+# process tree. The audit-only 9 GiB cap retains >25% above that sampled peak
+# and leaves 2 GiB for auxiliary claims inside the existing 20 GiB budget.
+# A different derivation must be measured before opting into this profile.
+QUALIFIED_AUDIT_COMPILER = Path(
+    "/nix/store/3swwykg6la02jblm03z3s4fxhiqdmpsm-zig-0.17.0/bin/zig"
+)
+
+
+def qualified_audit_memory(zig: str, jobs: int = 2) -> bool:
+    if jobs != 2 or sys.platform != "linux" or platform.machine() != "x86_64":
+        return False
+    executable = shutil.which(zig)
+    return (
+        executable is not None
+        and Path(executable).resolve() == QUALIFIED_AUDIT_COMPILER
+    )
+
+
+def cgroup_memory_stat() -> dict[str, int]:
+    """Separate anonymous compiler memory from reclaimable cached file pages."""
+    if sys.platform != "linux":
+        return {}
+    try:
+        fields = dict(
+            line.split()
+            for line in Path("/sys/fs/cgroup/memory.stat").read_text().splitlines()
+        )
+        return {
+            key: int(fields[key])
+            for key in (
+                "anon",
+                "file",
+                "file_mapped",
+                "file_dirty",
+                "inactive_file",
+                "kernel",
+            )
+            if key in fields
+        }
+    except (OSError, ValueError):
+        return {}
+
+
 def bounded_build_command(zig: str, arguments: list[str]) -> list[str]:
     return [
         sys.executable,
@@ -183,11 +324,44 @@ def write_report(path: Path, records: list[dict]) -> None:
     temporary.replace(path)
 
 
+class CompilerWatchdog:
+    """Bound each compiler and idle orchestration, independent of graph size."""
+
+    def __init__(self, seconds: float, started: float):
+        self.seconds = seconds
+        self.last_work = started
+        self.first_seen: dict[int, float] = {}
+
+    def expired(self, now: float, processes: list[dict]) -> bool:
+        compilers = [p for p in processes if p.get("executable") == "zig"]
+        live = {p["pid"] for p in compilers}
+        self.first_seen = {
+            pid: start for pid, start in self.first_seen.items() if pid in live
+        }
+        if compilers:
+            self.last_work = now
+        for process in compilers:
+            started = self.first_seen.setdefault(process["pid"], now)
+            elapsed = process.get("elapsed", "")
+            try:
+                days, _, clock = elapsed.rpartition("-")
+                seconds = 0
+                for component in clock.split(":"):
+                    seconds = seconds * 60 + int(component)
+                seconds += int(days or 0) * 86400
+            except ValueError:
+                seconds = now - started
+            if seconds >= self.seconds:
+                return True
+        return not compilers and now - self.last_work >= self.seconds
+
+
 def measured_build(
     command: list[str],
     cwd: Path,
     *,
     timeout_seconds: float = 1800,
+    compiler_timeout_seconds: float | None = None,
     progress=None,
     env=None,
 ) -> tuple[int, str, dict]:
@@ -196,7 +370,15 @@ def measured_build(
     peak_tree = peak_process = samples = 0
     min_disk_free = shutil.disk_usage(cwd).free
     timed_out = False
+    active_processes = []
+    cgroup = {}
+    peak_anon = peak_file = None
     last_report = started
+    watchdog = (
+        CompilerWatchdog(compiler_timeout_seconds, started)
+        if compiler_timeout_seconds is not None
+        else None
+    )
     with tempfile.TemporaryFile(mode="w+") as output:
         process = subprocess.Popen(
             command,
@@ -216,6 +398,9 @@ def measured_build(
                 now = time.monotonic()
                 if not timed_out and now - started > timeout_seconds:
                     timed_out = True
+                    # Capture before killing: wait4 cannot recover compiler CPU
+                    # clocks or the active artifact after its parent is killed.
+                    active_processes = active_build_processes(process.pid, cwd)
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
@@ -230,7 +415,26 @@ def measured_build(
                 min_disk_free = min(min_disk_free, shutil.disk_usage(cwd).free)
                 samples += 1
                 if now - last_report >= 30:
+                    cgroup = cgroup_memory_stat()
+                    if "anon" in cgroup:
+                        peak_anon = max(peak_anon or 0, cgroup["anon"])
+                    if "file" in cgroup:
+                        peak_file = max(peak_file or 0, cgroup["file"])
+                    if not timed_out:
+                        active_processes = active_build_processes(process.pid, cwd)
+                        if watchdog is not None and watchdog.expired(
+                            now, active_processes
+                        ):
+                            timed_out = True
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
                     current = {
+                        "active_processes": active_processes,
+                        "cgroup_memory_stat": cgroup,
+                        "peak_sampled_cgroup_anon_bytes": peak_anon,
+                        "peak_sampled_cgroup_file_bytes": peak_file,
                         "wall_seconds": round(now - started, 3),
                         "peak_build_tree_rss_bytes": peak_tree,
                         "peak_process_rss_bytes": peak_process,
@@ -257,12 +461,19 @@ def measured_build(
                 "wall_seconds": round(time.monotonic() - started, 3),
                 "cpu_seconds": round(usage.ru_utime + usage.ru_stime, 3),
                 "cpu_accounting_complete": not timed_out,
+                "active_processes": active_processes,
+                "cgroup_memory_stat": cgroup,
+                "peak_sampled_cgroup_anon_bytes": peak_anon,
+                "peak_sampled_cgroup_file_bytes": peak_file,
+                "cgroup_sample_interval_seconds": 30,
                 "peak_build_tree_rss_bytes": peak_tree,
                 "peak_process_rss_bytes": peak_process,
                 "rss_samples": samples,
                 "rss_sample_interval_seconds": 0.25,
                 "min_disk_free_bytes": min(min_disk_free, shutil.disk_usage(cwd).free),
                 "timed_out": timed_out,
+                "build_timeout_seconds": timeout_seconds,
+                "compiler_timeout_seconds": compiler_timeout_seconds,
             },
         )
 
@@ -270,7 +481,13 @@ def measured_build(
 def link_children(source: Path, destination: Path) -> None:
     destination.mkdir()
     for child in source.iterdir():
-        if child.name in {".git", ".worktrees", ".zig-cache", "zig-out"}:
+        if child.name in {
+            ".git",
+            ".worktrees",
+            ".zig-cache",
+            ".zig-global-cache",
+            "zig-out",
+        }:
             continue
         (destination / child.name).symlink_to(child, target_is_directory=child.is_dir())
 
@@ -321,11 +538,108 @@ def seed_global_cache(destination: Path) -> None:
             shutil.copyfile(archive, destination / "p" / name)
 
 
+class AuditWorkspace:
+    def __init__(self, root: Path, jobs: int):
+        self.root = root
+        self.cwd = root / "zig"
+        self.local_cache = self.cwd / ".zig-cache"
+        self.global_cache = self.cwd / ".zig-global-cache"
+        self.jobs = jobs
+
+
+def clone_audit_cache(
+    source: Path, destination: Path, *, rebase_from=None, rebase_to=None
+) -> None:
+    """Share immutable bytes; each worker owns manifests, locks and new output."""
+
+    def copy(source_file, destination_file):
+        relative = Path(source_file).relative_to(source)
+        if relative.parts[0] in {"o", "p"} and not relative.name.endswith(".lock"):
+            try:
+                os.link(source_file, destination_file)
+            except OSError as err:
+                if err.errno != errno.EXDEV:
+                    raise
+                # CI phase caches can live on a PVC while fixture temporary
+                # directories live on the runner filesystem. Copy immutable
+                # bytes once across that boundary instead of bootstrapping the
+                # compiler again. Same-volume worker snapshots still hard-link.
+                return shutil.copy2(source_file, destination_file)
+            return str(destination_file)
+        return shutil.copy2(source_file, destination_file)
+
+    shutil.copytree(source, destination, copy_function=copy, symlinks=True)
+    rebase_overlay_links(destination, rebase_from or source, rebase_to or destination)
+
+
+def rebase_overlay_links(destination: Path, old_root: Path, new_root: Path) -> None:
+    # Relative links already retain their meaning. Absolute links into either
+    # baseline cache/source overlay must not survive deletion of that baseline.
+    for directory, names, files in os.walk(destination, followlinks=False):
+        for name in names + files:
+            link = Path(directory) / name
+            if not link.is_symlink():
+                continue
+            target = Path(os.readlink(link))
+            if target.is_absolute() and target.is_relative_to(old_root):
+                replacement = new_root / target.relative_to(old_root)
+                link.unlink()
+                link.symlink_to(replacement)
+
+
+def clone_audit_workspace(source: AuditWorkspace, destination: AuditWorkspace) -> None:
+    # Snapshot the warmed source overlay, rather than reconstructing it from
+    # the checkout. Preserve metadata used by compiler manifests and keep all
+    # mutable source bytes private; only immutable cache objects are hard links.
+    shutil.copytree(
+        source.root,
+        destination.root,
+        symlinks=True,
+        ignore=shutil.ignore_patterns(".zig-cache", ".zig-global-cache", "zig-out"),
+    )
+    rebase_overlay_links(destination.root, source.root, destination.root)
+    for original, cloned in (
+        (source.local_cache, destination.local_cache),
+        (source.global_cache, destination.global_cache),
+    ):
+        clone_audit_cache(
+            original, cloned, rebase_from=source.root, rebase_to=destination.root
+        )
+
+
+def partition_cases(cases):
+    # Run 40738032138: independent probes need ~53 minutes after the baseline.
+    # Balance those probes across the same two compiler slots, rather than
+    # duplicating the cold build or increasing the runner's CPU/memory budget.
+    weights = {
+        "storage contract": 873,
+        "read coordination": 838,
+        "write coordination": 507,
+        "physical DB": 421,
+        "physical local query": 411,
+        "consumer test root": 78,
+        "owner integration test": 51,
+    }
+    groups = [[], []]
+    loads = [0, 0]
+    for case in sorted(cases, key=lambda case: weights.get(case[0], 900), reverse=True):
+        worker = min(range(2), key=loads.__getitem__)
+        groups[worker].append(case)
+        loads[worker] += weights.get(case[0], 900)
+    return groups
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zig", default="zig")
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--report", type=Path)
+    parser.add_argument(
+        "--case-workers",
+        type=int,
+        choices=(1, 2),
+        help="Parallel mutation workers; two requires the measured Linux profile",
+    )
     catalog_mode = parser.add_mutually_exclusive_group()
     catalog_mode.add_argument("--write-control-catalog", action="store_true")
     catalog_mode.add_argument("--check-control-catalog", action="store_true")
@@ -344,22 +658,27 @@ def main() -> None:
             )
         return
     records = []
+    report_lock = threading.RLock()
+    abort = threading.Event()
+    measured_memory = qualified_audit_memory(args.zig, args.jobs)
     if args.jobs <= 0:
         parser.error("--jobs must be positive")
 
+    case_workers = args.case_workers or (2 if measured_memory else 1)
+    if case_workers == 2 and not measured_memory:
+        parser.error(
+            "two mutation workers require the qualified two-slot Linux memory profile"
+        )
+
     def publish():
-        if args.report:
-            write_report(args.report, records)
+        with report_lock:
+            if args.report:
+                write_report(args.report, records)
 
     publish()
     with tempfile.TemporaryDirectory(prefix="antfly-storage-compilation-") as temporary:
         work = Path(temporary)
         root = work / "repo"
-        link_children(ZIG_ROOT.parent, root)
-        build_file = own(root, "zig/build.zig")
-        shutil.copyfile(build_file, build_file.with_name("project_build.zig"))
-        shutil.copyfile(ZIG_ROOT / "tools/fixtures/storage_compilation.zig", build_file)
-
         cases = (
             (
                 "read coordination",
@@ -430,18 +749,34 @@ def main() -> None:
                 },
             ),
         )
-        # Establish the overlay layout before the baseline. A mutation changes
-        # file contents only, not symlink resolution or compiler source paths.
-        for _, relative, _, _ in cases:
-            own(root, source_owner_path(relative))
-        local_cache = work / "cache"
-        global_cache = work / "global-cache"
-        seed_global_cache(global_cache)
 
-        def build(label: str) -> dict[str, str]:
+        def prepare_overlay(root):
+            link_children(ZIG_ROOT.parent, root)
+            build_file = own(root, "zig/build.zig")
+            shutil.copyfile(build_file, build_file.with_name("project_build.zig"))
+            shutil.copyfile(
+                ZIG_ROOT / "tools/fixtures/storage_compilation.zig", build_file
+            )
+            # File contents may change; compiler-relative paths never do.
+            for _, relative, _, _ in cases:
+                own(root, source_owner_path(relative))
+
+        prepare_overlay(root)
+        baseline = AuditWorkspace(root, args.jobs)
+        seed_global_cache(baseline.global_cache)
+
+        def build(label: str, workspace=baseline) -> dict[str, str]:
+            if abort.is_set():
+                raise RuntimeError("another storage audit worker failed")
             print(f"{label}: compiling production artifacts", flush=True)
             arguments = [
                 "build",
+                # In Zig 0.17 an implicit current-directory build root has no
+                # cache prefix. Authored inputs then hash as absolute paths,
+                # making a relocated warm cache cold. An explicit relative
+                # build file registers a relocatable build-root prefix.
+                "--build-file",
+                "./build.zig",
                 "check-storage-compilation",
                 "-Doptimize=debug",
                 # Ownership and cache invalidation depend on Debug code and
@@ -451,58 +786,90 @@ def main() -> None:
                 "-Dmetal=false",
                 "-Dsystem-blas=false",
                 "-Dantfly-version=compilation-check",
-                f"-j{args.jobs}",
+                f"-j{workspace.jobs}",
                 "--summary",
                 "all",
                 "--color",
                 "off",
                 "--cache-dir",
-                str(local_cache),
+                ".zig-cache",
             ]
+            if measured_memory:
+                # Keep every qualified axis explicit; other compiler/profile
+                # combinations retain the production reservations unchanged.
+                arguments.extend(
+                    [
+                        "-Dnative-linux-ownership-memory=true",
+                        "-Dcpu=baseline",
+                        "-Dcuda=false",
+                        "-Dinference-optimize=debug",
+                    ]
+                )
             command = bounded_build_command(args.zig, arguments)
             record = {
                 "case": label,
+                "memory_profile": "nix-glibc-0.17-stripped-debug"
+                if measured_memory
+                else "production",
                 "status": "running",
                 "command": command,
                 "disk_free_before_bytes": shutil.disk_usage(work).free,
             }
-            records.append(record)
-            publish()
+            record["workspace"] = workspace.root.name
+            with report_lock:
+                records.append(record)
+                publish()
 
             def progress(current):
-                record.update(current)
-                publish()
+                if abort.is_set():
+                    raise RuntimeError("another storage audit worker failed")
+                with report_lock:
+                    record.update(current)
+                    publish()
 
             try:
                 returncode, output, measurements = measured_build(
                     command,
-                    root / "zig",
+                    workspace.cwd,
                     progress=progress,
-                    env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(global_cache)},
+                    env={
+                        **os.environ,
+                        "ZIG_LOCAL_CACHE_DIR": ".zig-cache",
+                        "ZIG_GLOBAL_CACHE_DIR": ".zig-global-cache",
+                    },
+                    # The cold graph has several independent archives and
+                    # owner/consumer executables. A newly started compiler is
+                    # not stalled because earlier units consumed 30 minutes.
+                    # Keep the original bound per compiler/idle period, plus
+                    # an absolute one-hour bound for the complete cold graph.
+                    timeout_seconds=3600 if label.endswith("cold") else 1800,
+                    compiler_timeout_seconds=1800,
                 )
             except BaseException as err:
-                record.update(status="interrupted", error=type(err).__name__)
-                publish()
+                with report_lock:
+                    record.update(status="interrupted", error=type(err).__name__)
+                    publish()
                 raise
             states = {
                 ("link:" + name if kind == "exe" else name): state
                 for kind, name, state in COMPILES.findall(output)
             }
             elapsed = measurements["wall_seconds"]
-            record.update(
-                {
-                    **measurements,
-                    "disk_free_after_bytes": shutil.disk_usage(work).free,
-                    "status": "failed" if returncode else "completed",
-                    "returncode": returncode,
-                    "artifacts": states,
-                }
-            )
-            publish()
+            with report_lock:
+                record.update(
+                    {
+                        **measurements,
+                        "disk_free_after_bytes": shutil.disk_usage(work).free,
+                        "status": "failed" if returncode else "completed",
+                        "returncode": returncode,
+                        "artifacts": states,
+                    }
+                )
+                publish()
             if returncode:
                 if measurements["timed_out"]:
                     print(
-                        f"{label}: production compilation exceeded 30 minutes",
+                        f"{label}: production compilation exceeded its build or compiler deadline",
                         flush=True,
                     )
                 # Zig's failed compiler command can span hundreds of KB.
@@ -510,6 +877,25 @@ def main() -> None:
                     "\n".join(line for line in output.splitlines() if len(line) < 1000)
                 )
                 raise RuntimeError(f"{label}: build failed ({returncode})")
+            if label.endswith("warm"):
+                rebuilt = sorted(
+                    {
+                        name
+                        for _, name, status in COMPILES.findall(output)
+                        if status == "success"
+                    }
+                )
+                if rebuilt:
+                    with report_lock:
+                        record.update(
+                            status="failed",
+                            error="UnexpectedWarmRebuild",
+                            rebuilt_artifacts=rebuilt,
+                        )
+                        publish()
+                    raise AssertionError(
+                        f"{label}: cache relocation rebuilt production artifacts: {rebuilt}"
+                    )
             missing = (ARCHIVES | CONSUMERS) - states.keys()
             if missing:
                 raise AssertionError(
@@ -530,45 +916,80 @@ def main() -> None:
         warm = build("warm")
         assert all(warm[name] == "cached" for name in ARCHIVES | CONSUMERS), warm
 
-        def restart_cache(reason: str) -> None:
+        def restart_cache(workspace, reason: str) -> None:
             # Remove Zig's objects and manifests together. A manifest retained
             # without its output can produce a false cache hit. The source
             # overlay stays at the same path with earlier edits still applied.
-            for directory in (local_cache, global_cache):
+            for directory in (workspace.local_cache, workspace.global_cache):
                 if directory.exists():
                     shutil.rmtree(directory)
-            seed_global_cache(global_cache)
-            build(f"{reason} cold")
-            warmed = build(f"{reason} warm")
+            seed_global_cache(workspace.global_cache)
+            build(f"{reason} cold", workspace)
+            warmed = build(f"{reason} warm", workspace)
             assert all(warmed[name] == "cached" for name in ARCHIVES | CONSUMERS), (
                 warmed
             )
 
-        for label, relative, rebuilt, cached in cases:
-            # Keep the measured warm cache across mutations. A second cold
-            # build adds a full production compile without testing another
-            # ownership property. Roll over only under real disk pressure.
-            if shutil.disk_usage(work).free < 12 * (1 << 30):
-                restart_cache(label)
-            path = own(root, source_owner_path(relative))
-            # Keep earlier edits in this private overlay. Restoring one would
-            # itself invalidate Zig's most recent manifest and confound the
-            # next case, even if it restores bytes from the cold build.
-            path.write_bytes(
-                path.read_bytes() + b"\n// storage compilation ownership regression\n"
-            )
-            states = build(label)
-            for name in rebuilt:
-                assert states.get(name) == "success", (label, name, states)
-            for name in cached:
-                assert states.get(name) == "cached", (label, name, states)
-            if label in {"physical DB", "physical local query"}:
-                for name in CONSUMERS:
-                    assert states.get("link:" + name) == "success", (
-                        label,
-                        name,
-                        states,
+        def run_cases(workspace, selected):
+            try:
+                for label, relative, rebuilt, cached in selected:
+                    # Each worker retains earlier edits and owns both caches.
+                    # A low-disk rollover cannot delete another worker's input.
+                    if shutil.disk_usage(work).free < 12 * (1 << 30):
+                        restart_cache(workspace, label)
+                    path = own(workspace.root, source_owner_path(relative))
+                    path.write_bytes(
+                        path.read_bytes()
+                        + b"\n// storage compilation ownership regression\n"
                     )
+                    states = build(label, workspace)
+                    for name in rebuilt:
+                        assert states.get(name) == "success", (label, name, states)
+                    for name in cached:
+                        assert states.get(name) == "cached", (label, name, states)
+                    if label in {"physical DB", "physical local query"}:
+                        for name in CONSUMERS:
+                            assert states.get("link:" + name) == "success", (
+                                label,
+                                name,
+                                states,
+                            )
+            except BaseException:
+                abort.set()
+                raise
+
+        if case_workers == 1:
+            run_cases(baseline, cases)
+            return
+
+        workers = []
+        for index in range(case_workers):
+            workspace = AuditWorkspace(work / f"worker-{index}", 1)
+            clone_audit_workspace(baseline, workspace)
+            # Require real compiler cache hits before accepting relocation.
+            # This fails closed if a future build starts embedding root paths.
+            states = build(f"worker {index} warm", workspace)
+            assert all(states[name] == "cached" for name in ARCHIVES | CONSUMERS), (
+                states
+            )
+            workers.append(workspace)
+        # Only hard-linked immutable objects remain shared. Drop the baseline
+        # references so a worker's disk-pressure rollover can reclaim its work.
+        shutil.rmtree(baseline.local_cache)
+        shutil.rmtree(baseline.global_cache)
+        executor = ThreadPoolExecutor(max_workers=case_workers)
+        try:
+            pending = [
+                executor.submit(run_cases, workspace, group)
+                for workspace, group in zip(
+                    workers, partition_cases(cases), strict=True
+                )
+            ]
+            for future in as_completed(pending):
+                future.result()
+        finally:
+            abort.set()
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 if __name__ == "__main__":

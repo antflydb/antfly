@@ -107,6 +107,76 @@ servers:
     description: Inference API server
 security: []
 paths:
+  /read/execute:
+    post:
+      operationId: executeReadDocumentRemote
+      summary: Execute a durable document task over a duplex persistence channel
+      description: Internal versioned peer protocol. The caller retains storage and lease authority. This single-use exchange must never be buffered, replayed, retried or redirected by intermediaries. X-Antfly-Document-Model selects the routing model and must match the initial request frame.
+      parameters:
+        - name: X-Antfly-Document-Model
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 2048
+        - name: X-Antfly-Document-Token-Budget
+          in: header
+          required: true
+          description: Remaining physical model token ceiling for this attempt, independently enforced and measured by the executor.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000000
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Duplex framed checkpoint RPC and one terminal task response
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+  /extract/execute:
+    post:
+      operationId: executeExtractDocumentRemote
+      summary: Execute a durable document task over a duplex persistence channel
+      description: Internal versioned peer protocol. The caller retains storage and lease authority. This single-use exchange must never be buffered, replayed, retried or redirected by intermediaries. X-Antfly-Document-Model selects the routing model and must match the initial request frame.
+      parameters:
+        - name: X-Antfly-Document-Model
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 2048
+        - name: X-Antfly-Document-Token-Budget
+          in: header
+          required: true
+          description: Remaining physical model token ceiling for this attempt, independently enforced and measured by the executor.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000000
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Duplex framed checkpoint RPC and one terminal task response
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
   /generate/context/checkpoint:
     post:
       summary: Prepare a portable native KV checkpoint
@@ -384,7 +454,7 @@ paths:
     post:
       summary: Chunk content with optional model-aware embeddings
       description: |
-        Splits content into chunks. Without `embedding`, the fixed chunker and
+        Splits content into chunks. Without `embedding` or `outputs`, the fixed chunker and
         legacy response remain unchanged. With `embedding`, the resolved target
         model constrains boundaries for text, PDF pages, images or explicit tiles,
         composited GIF frames, audio windows and consecutive video windows.
@@ -397,6 +467,18 @@ paths:
         terminal record must not be treated as complete source coverage.
         Continuations bind the original source version and semantic plan;
         retries may deterministically recompute and must deduplicate chunk IDs.
+
+        Named `outputs` independently embed, transcribe, classify, or diarize
+        each source. A `diarize` target returns source-scoped `speaker_spans`
+        without ASR. On transcription outputs, `diarize: true` enables the same
+        source-scoped voice identities. Set `policy.audio_speaker_turns: true`
+        with a diarization-enabled boundary target to split audio at detected
+        turns while respecting model limits. Speaker analysis runs before the
+        first chunk only as far as that chunk requires; matching outputs share
+        embeddings and timelines. Continuations reuse cached speaker state and
+        boundary directories, with durable checkpoints for recovery. Adding speaker
+        annotations alone preserves parent IDs; enabling speaker boundaries
+        binds the speaker model revision and settings into the plan.
 
         ## Models
 
@@ -576,12 +658,12 @@ paths:
 
         Downloaded and inline encoded media is limited cumulatively across the request
         to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-        `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+        `resources.inference.admission.max_work_units` is positive—16 MiB times that effective work capacity (derived from request concurrency when omitted). A zero configured
         download limit disables nonempty media. Remote URL byte potential is reserved before
         fetch; inline sources reserve their actual encoded size without adding it to the
         existing request-body reservation. Accepted image headers are then validated and
         decoded source pixels are admitted at a conservative 16 bytes per pixel against
-        the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero
+        the lower of 512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero
         concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
         limits each source edge. Malformed images return 400, while dimension or aggregate
         excess returns 413 before model loading. Initial capacity admission occurs before
@@ -875,16 +957,17 @@ paths:
     post:
       summary: Read text from images (OCR/document understanding)
       description: |
-        Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+        Reads text from images and documents with a local reader model. OCR and document-reading tasks can also run on a vision-capable generator or a connected provider.
 
         ## Models
 
         Models are auto-discovered from `models_dir/readers/` at startup.
         Use the `/ai/v1/models` endpoint to list available models.
 
-        - **TrOCR**: Pure OCR for printed/handwritten text
+        - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+        - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+        - **PaddleOCR**: Text detection and recognition with page-space regions
         - **Donut**: Document understanding with structured output (receipts, forms)
-        - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
         - **Pix2Struct**: Visual question answering with natural-language prompts
         - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened fields
 
@@ -903,11 +986,11 @@ paths:
         weighted capacity unit and at least one unit per two declared images. The effective
         ceiling is the minimum of the configured per-image limit times image count, the
         read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-        `admission.inference.max_concurrent_requests`. Admission happens before model resolution or download.
+        `resources.inference.admission.max_work_units`. Admission happens before model resolution or download.
 
         After download, image headers are validated before model loading. Decoded source
         pixels are admitted at a conservative 16 bytes per pixel against the lower of
-        512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
+        512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work capacity
         setting still uses the finite 512 MiB ceiling. The reservation grows atomically
         from downloaded-byte admission before inference. `max_image_dimension` limits
         each source edge; malformed images return 400 and dimension or aggregate excess
@@ -1649,7 +1732,7 @@ paths:
         ## Readers
 
         - Vision2Seq models from `models_dir/readers/`
-        - TrOCR, Donut, Florence-2 for OCR and document understanding
+        - LightOnOCR-3, Florence-2, PaddleOCR, Donut, Pix2Struct, and Moondream for OCR and document understanding
 
         ## Transcribers
 
@@ -2940,12 +3023,24 @@ components:
       type: object
       required:
         - model
-        - images
+      description: Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
+      x-antfly-exactly-one-of: [images, documents]
       properties:
         model:
           type: string
           description: Name of reader model from models_dir/readers/
-          example: microsoft/trocr-base-printed
+          example: lightonai/LightOnOCR-3-0.8B
+        retain_artifact:
+          type: boolean
+          default: false
+          description: Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
+        documents:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Complete documents, mutually exclusive with images. Each source is independent; selected pages are read in original source order.
+          items:
+            $ref: '../ai/extraction.yaml#/components/schemas/DocumentSource'
         images:
           type: array
           minItems: 1
@@ -2962,7 +3057,6 @@ components:
           type: string
           description: |
             Optional task prompt for document understanding models.
-            - TrOCR: Not used (pure OCR)
             - Donut CORD: "<s_cord-v2>" for receipt parsing
             - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>"
             - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
@@ -2973,7 +3067,7 @@ components:
           type: integer
           description: Maximum tokens to generate
           minimum: 1
-          maximum: 1024
+          maximum: 8192
           default: 256
           example: 256
     TextRegion:
@@ -2982,16 +3076,54 @@ components:
         - text
         - bbox
       properties:
+        id:
+          type: integer
+          minimum: 0
+          description: Region identity within its parent; nested regions use qualified paths.
+        origin:
+          type: string
+          enum: [native, transcription, interpretation, derived, estimated]
+          description: Default provenance of this region; nested region origins override it.
+        text_start:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+          description: Start UTF-8 byte offset in the containing page text; null when unmapped.
+        text_end:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+          description: Exclusive end UTF-8 byte offset in the containing page text.
+        children:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Accepted subregions in the same source coordinate space and page text offsets.
+        tables:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Tables owned by this region, including cells and provenance.
+        fields:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Structured output owned by this region.
         text:
           type: string
           description: Recognized text within the region
         bbox:
           type: array
+          nullable: true
           items:
             type: number
           minItems: 4
           maxItems: 4
-          description: Bounding box [x1, y1, x2, y2] in pixel coordinates
+          description: "Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels for ordinary image requests. Null when source geometry cannot be established, including unsupported vertical PDF writing."
         confidence:
           type: number
           description: Recognition confidence score (0-1)
@@ -3003,12 +3135,63 @@ components:
       required:
         - text
       properties:
+        source_id:
+          type: string
+          description: Original document source ID.
+        number:
+          type: integer
+          minimum: 1
+          description: One-based original page or slide number.
+        kind:
+          type: string
+          enum: [page, slide, image]
+        inherited_parts:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Native layout/master content, source part identity, and visibility/coverage metadata; unsupported composition remains unresolved.
+        native_text:
+          type: string
+        notes:
+          type: string
+          description: Speaker notes, separate from slide text.
+        status:
+          type: string
+          enum: [complete, unresolved, truncated]
+        origin:
+          type: string
+          enum: [native, transcription, interpretation, derived, estimated]
+          description: Default provenance for page text; mapped region origins override it.
+        coordinate_space:
+          type: string
+          description: Coordinate space of regions; PDF points, slide EMUs or image pixels.
+        transform:
+          type: object
+          additionalProperties: true
+          description: Projective source transform.
+        raster_to_source:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Mapping from rendered pixels to original source coordinates, including page rotation and actual render DPI.
+        tables:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Tables and cells in source coordinates with provenance.
+        findings:
+          type: array
+          items:
+            type: string
         text:
           type: string
           description: Extracted text from the image
-          example: 'Invoice Total: $123.45'
+          example: "Invoice Total: $123.45"
         fields:
           type: object
+          nullable: true
           additionalProperties:
             type: string
           description: |
@@ -3016,16 +3199,17 @@ components:
             Fields are flattened with dot notation for nested structures.
             Only present for models that output structured data.
           example:
-            menu.nm: Coffee
-            menu.price: $3.50
-            total: $123.45
+            menu.nm: "Coffee"
+            menu.price: "$3.50"
+            total: "$123.45"
         regions:
           type: array
           items:
-            $ref: '#/components/schemas/TextRegion'
+            $ref: "#/components/schemas/TextRegion"
           description: |
             Individual text regions with bounding boxes and recognized text.
             Populated by multi-stage OCR models (Surya, PaddleOCR).
+
     ReadResponse:
       type: object
       required:
@@ -3044,6 +3228,16 @@ components:
           items:
             $ref: '#/components/schemas/ReadObject'
           description: Read result objects, one per input image.
+        document:
+          type: object
+          additionalProperties: true
+          description: Versioned reading metadata containing status, source fingerprints, definition fingerprint, pinned model identities, adapter version and optional artifact retention handle.
+        events:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Bounded progress and audit events. These contain model names and source IDs, never credentials.
         model:
           type: string
           description: Name of model used for reading
@@ -4816,6 +5010,30 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used (prompt + completion)
+        model_calls:
+          type: integer
+          minimum: 0
+          description: Cumulative logical child invocations for a document run.
+        physical_model_calls:
+          type: integer
+          minimum: 0
+          description: Physical child operation invocations, separate from logical composite calls.
+        rendered_pixels:
+          type: integer
+          minimum: 0
+          description: Cumulative rendered or decoded pixels charged by document work.
+        output_bytes:
+          type: integer
+          minimum: 0
+          description: Cumulative document text bytes charged before envelope serialization.
+        completed_pages:
+          type: integer
+          minimum: 0
+          description: Selected pages completed successfully.
+        visited_pages:
+          type: integer
+          minimum: 0
+          description: Selected pages visited, including unresolved work.
         cached_prompt_tokens:
           type: integer
           description: Prompt tokens served from inference-native prefix KV cache
@@ -5082,205 +5300,10 @@ components:
             Idle time-to-live for prompt KV cache entries. Refreshed on every cache
             hit, so only entries left unused for this duration expire.
           default: 300000
-    AdmissionConfig:
-      type: object
-      additionalProperties: false
-      description: Process-local foreground request admission settings.
-      properties:
-        inference:
-          $ref: '#/components/schemas/RequestAdmissionConfig'
-    RequestAdmissionConfig:
-      type: object
-      additionalProperties: false
-      properties:
-        max_concurrent_requests:
-          type: integer
-          x-go-type-skip-optional-pointer: false
-          description: |
-            Maximum concurrent inference requests in this process. The same
-            value also sizes the weighted work budget shared by every executing
-            inference endpoint: each request consumes one request slot and at
-            least one unit, while request body size, generation workload, and
-            image byte/count reservations can consume more than one unit. The
-            request count can therefore never exceed this value, while expensive
-            requests may exhaust weighted capacity sooner. Read and
-            image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB
-            per unit and at least one unit per two images. A positive capacity also
-            clamps each such request's downloaded-image ceiling to 16 MiB times
-            this value. When either ceiling is exhausted, new HTTP requests are
-            rejected immediately with 503 Service Unavailable and Retry-After: 1;
-            they are not retained
-            in an in-process queue. Set to 0 to disable both ceilings, admission
-            unit accounting, and the capacity-derived clamp. The default is 32.
-          minimum: 0
-          maximum: 4294967295
-          default: 32
-          example: 32
     Config:
-      allOf:
-        - $ref: '#/components/schemas/RuntimeConfig'
-        - type: object
-          properties:
-            admission:
-              $ref: '#/components/schemas/AdmissionConfig'
+      $ref: './config.yaml#/components/schemas/InferenceServerConfig'
     RuntimeConfig:
-      type: object
-      properties:
-        max_concurrent_requests:
-          type: integer
-          minimum: 0
-          maximum: 4294967295
-          deprecated: true
-          description: |
-            Deprecated compatibility alias for
-            `admission.inference.max_concurrent_requests`. New configurations
-            should use the process-level admission setting. If both spellings
-            are supplied, they must have the same value.
-          example: 32
-        api_url:
-          type: string
-          format: uri
-          description: |
-            URL of an out-of-process Antfly inference service that the Antfly
-            server should call for embedding, chunking, reranking, and
-            generation. Omit it to use the in-process inference runtime
-            (the default in standalone mode). `antfly inference run` ignores
-            this field; it configures the client side only.
-          example: http://localhost:8080
-        api_key:
-          type: string
-          description: API key used when calling an authenticated shared Antfly inference API.
-        models_dir:
-          type: string
-          description: |
-            Base directory containing model subdirectories. Antfly inference auto-discovers models from:
-            - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name`
-            - `{models_dir}/embedders/` - Embedding models
-            - `{models_dir}/rerankers/` - Reranking models
-            - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
-            - `{models_dir}/rewriters/` - Seq2Seq rewriter models
-
-            Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models`
-            (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed`
-            chunker needs no models.
-          example: ~/.antfly/inference/models
-        ml_dir:
-          type: string
-          description: |
-            Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*`
-            API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`.
-
-            Defaults to ~/.antfly/inference/ml.
-          example: ~/.antfly/inference/ml
-        content_security:
-          $ref: '#/components/schemas/ContentSecurityConfig'
-          description: Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
-        s3_credentials:
-          $ref: '#/components/schemas/Credentials'
-          description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
-        keep_alive:
-          type: string
-          description: |
-            How long to keep models loaded in memory after last use (Ollama-compatible).
-            Models are automatically unloaded after this duration of inactivity.
-            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
-            Defaults to "5m". Set to "0" to disable idle-time eviction; models can
-            still be evicted under resource pressure or to enforce max_loaded_models.
-          default: 5m
-          example: 5m
-        max_loaded_models:
-          type: integer
-          description: |
-            Maximum total models loaded across all registry types (embedders, rerankers,
-            generators, chunkers, etc.). When the limit is reached, the least-recently-used
-            idle model from any registry is evicted to make room. Set to 0 for unlimited.
-            Defaults to 10.
-          default: 10
-          example: 3
-        pool_size:
-          type: integer
-          description: |
-            Legacy compatibility field. The current Zig inference runtime does not
-            create per-model pipeline pools from this setting; configuring it has no effect.
-          deprecated: true
-        prompt_cache:
-          $ref: '#/components/schemas/PromptCacheConfig'
-          description: Native generator prompt KV cache settings.
-        backend_priority:
-          type: array
-          items:
-            $ref: '#/components/schemas/BackendPriorityEntry'
-          description: |
-            Legacy compatibility field. The current Zig inference runtime selects a
-            backend from model metadata, explicit preload settings, and compiled capabilities;
-            configuring this list has no effect.
-          deprecated: true
-        max_queue_size:
-          type: integer
-          description: |
-            Legacy Go-runtime queue setting. The current Zig runtime does not retain
-            excess inference requests in memory and ignores this field.
-          deprecated: true
-        request_timeout:
-          type: string
-          description: |
-            Legacy Go-runtime queue/request timeout. The current Zig runtime ignores
-            this field; its HTTP listener applies a separate fixed transport timeout.
-          deprecated: true
-        preload:
-          type: array
-          description: |
-            Models to preload and warm at startup. Generators run a tiny generation
-            request so native/Metal weights, KV setup, and kernels use the same
-            budgeted path as request-time generation. Other model kinds use the
-            best available warm path for that kind.
-          items:
-            $ref: '#/components/schemas/ModelRef'
-          example:
-            - kind: generator
-              name: antflydb/gemma-e2b
-              backend: metal
-              format: gguf
-              quantization: q4_k
-        max_memory_mb:
-          type: integer
-          description: |
-            Legacy compatibility field. The current Zig runtime uses explicit host,
-            backend, combined, KV, and scratch budgets instead and ignores this field.
-          deprecated: true
-        model_strategies:
-          type: object
-          additionalProperties:
-            type: string
-            enum:
-              - eager
-              - lazy
-              - bounded
-          description: |
-            Per-model loading strategy overrides. Maps model names to their loading strategy.
-            Models not in this map load on demand. keep_alive controls their idle
-            eviction; setting it to "0" disables idle eviction but does not preload or pin them.
-
-            When a model has strategy "eager" in this map:
-            - It is loaded at startup through the same startup warmup path
-            - It is never unloaded, even when keep_alive>0 (pinned in memory)
-
-            This allows mixing eager and lazy models in the same pool.
-          example:
-            BAAI/bge-small-en-v1.5: eager
-            mirth/chonky-mmbert-small-multilingual-1: lazy
-        allow_downloads:
-          type: boolean
-          description: |
-            Legacy compatibility field controlling whether dashboards show model
-            download commands. It defaults to true for standalone deployments;
-            managed deployments historically set it to false. Download-command
-            availability is a build-time setting in the current Zig runtime, so
-            configuring this field has no effect.
-          default: true
-          deprecated: true
-        log:
-          $ref: '#/components/schemas/schemas-Config'
+      $ref: './config.yaml#/components/schemas/RuntimeConfig'
     BackendRuntimes:
       type: object
       description: Runtime backends compiled into this inference server.

@@ -84,7 +84,6 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "scripts/packaging/fixture_process.py",
                 "scripts/packaging/create_reproducible_tar.py",
                 "scripts/packaging/render_libantfly_pkgconfig.py",
-                "scripts/packaging/package_grep_release.py",
                 "zig/pkg/antfly-embedded/libantfly.pc.in",
                 "scripts/packaging/embedded-release-README.md",
                 "scripts/apache_engine_files.txt",
@@ -100,7 +99,6 @@ class ReleaseLicenseTests(unittest.TestCase):
                 destination = root / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / name, destination)
-            shutil.copytree(ROOT / "zig/pkg/antfly-grep", root / "zig/pkg/antfly-grep")
             shutil.copytree(
                 ROOT / "LICENSES/third-party", root / "LICENSES/third-party"
             )
@@ -124,7 +122,6 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "inference = Path.cwd().name == 'inference'\n"
                 "library = 'lib/libantfly.dylib' if any(arg.startswith('-Dtarget=aarch64-macos') for arg in args) else 'lib/libantfly.so'\n"
                 "names = (() if '--build-file' in args else ('bin/antfly',)) + (library, 'include/antfly.h')\n"
-                "if 'grep' in args: names += ('bin/antfly-grep',)\n"
                 "for name in names:\n"
                 "    path = prefix / name\n"
                 "    path.parent.mkdir(parents=True, exist_ok=True)\n"
@@ -186,12 +183,12 @@ pub fn build(b: *std.Build) void {
             compile_failed = False
             for product, target, steps, license_name in (
                 ("embedded", darwin_target, ["libantfly"], "LICENSES/Apache-2.0.txt"),
-                ("server", darwin_target, ["antfly", "libantfly", "grep"], "LICENSE"),
-                ("server", darwin_target, ["antfly", "libantfly", "grep"], "LICENSE"),
+                ("server", darwin_target, ["antfly", "libantfly"], "LICENSE"),
+                ("server", darwin_target, ["antfly", "libantfly"], "LICENSE"),
                 (
                     "server",
                     "aarch64-linux-musl",
-                    ["antfly", "libantfly", "grep"],
+                    ["antfly", "libantfly"],
                     "LICENSE",
                 ),
             ):
@@ -257,6 +254,7 @@ pub fn build(b: *std.Build) void {
                     if product != "embedded":
                         self.assertEqual(marker.read_text(), "keep compiled objects")
                     marker.write_text("keep compiled objects")
+                    self.assertNotIn("grep", args)
                     self.assertIn("--summary", args)
                     self.assertEqual(args[args.index("--summary") + 1], "all")
                     if probe_zig:
@@ -271,6 +269,9 @@ pub fn build(b: *std.Build) void {
                             rf"compile lib release-cache-probe fast \S+ {expected}",
                         )
                     with tarfile.open(root / "out" / (product + ".tar.gz")) as archive:
+                        self.assertFalse(
+                            any("antfly-grep" in name for name in archive.getnames())
+                        )
                         self.assertFalse(
                             any("stale-product" in name for name in archive.getnames())
                         )

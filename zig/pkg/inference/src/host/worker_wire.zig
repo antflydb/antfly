@@ -22,7 +22,7 @@ pub const version: u32 = 6;
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
 pub const Envelope = struct { operation: Operation, options: []const u8 = "", data: []const u8 };
-pub const Operation = enum { initialize, configure, provider, http, reserve, retain, release, prompt_cache, tokenizer_cache };
+pub const Operation = enum { initialize, configure, provider, http, reserve, retain, release, prompt_cache, tokenizer_cache, document_store };
 pub const Reply = struct { status: bridge.Status = .ok, options: []const u8 = "" };
 pub const Event = struct {
     kind: enum { progress, stream_start, stream_write, stream_close },
@@ -175,6 +175,7 @@ pub const AttachmentRef = struct {
     page_number: ?u32,
 };
 pub const Provider = struct {
+    document_store: ?[16]u8 = null,
     operation: c_int,
     deadline_ns: ?u64,
     numeric: bool,
@@ -266,6 +267,7 @@ pub const ProviderOutput = struct {
 };
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const Http = struct {
+    document_store: ?[16]u8 = null,
     streaming_body: bool = false,
     route: []const u8,
     method: http.HttpMethod,
@@ -408,6 +410,7 @@ test "inference worker typed numeric responses preserve ownership under allocati
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkNumericRoundTrip, .{});
 }
 
+pub const DocumentStoreRequest = struct { capability: [16]u8, metadata: []const u8 };
 test "native checkpoint worker streaming stays limited to exact POST resume routes" {
     inline for (.{ bridge.ai_api_prefix, bridge.public_api_prefix }) |prefix| {
         inline for (.{ "/generate/context/resume", "/generate/context/resume/batch" }) |suffix| {

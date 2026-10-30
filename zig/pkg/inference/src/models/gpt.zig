@@ -213,6 +213,7 @@ pub const Config = struct {
     vision_spatial_merge_size: u32 = 1,
     vision_temporal_patch_size: u32 = 1,
     vision_use_quick_gelu: bool = false,
+    vision_use_gelu_tanh: bool = false,
     vision_deepstack_visual_indexes_len: u8 = 0,
     vision_deepstack_visual_indexes: [max_vision_deepstack_layers]u32 = @as([max_vision_deepstack_layers]u32, @splat(0)),
     vision_deepstack_visual_indexes_truncated: bool = false,
@@ -227,6 +228,11 @@ pub const Config = struct {
     // layers with full-attention layers; linear layers require recurrent state
     // rather than the standard KV cache.
     qwen35_has_linear_attention: bool = false,
+    /// Runtime-only resident Metal policy. Host fallback is unavailable when
+    /// the page deliberately owns only device recurrent/convolution state.
+    qwen35_device_only_state: bool = false,
+    // Internal Metal-only vision admission contract; never loaded from model JSON.
+    qwen35_metal_resident_vision: bool = false,
     qwen35_full_attention_interval: u32 = 0,
     qwen35_linear_conv_kernel_dim: u32 = 0,
     qwen35_linear_key_head_dim: u32 = 0,
@@ -257,6 +263,10 @@ pub const Config = struct {
 
     // Weight naming
     weight_prefix: []const u8 = "",
+
+    /// Runtime-only storage choice for the native LightOn reader epoch.
+    /// Recurrent histories remain separately allocated for every linear layer.
+    compact_qwen35_kv: bool = false,
 
     pub fn effectiveKVHeads(self: Config) u32 {
         return if (self.num_key_value_heads > 0) self.num_key_value_heads else self.num_attention_heads;
@@ -329,6 +339,19 @@ pub const Config = struct {
             previous = index;
         }
         return true;
+    }
+
+    /// Qwen3.5 shares Qwen3-VL's vision tower, without DeepStack taps,
+    /// and applies M-RoPE to only a prefix of each language attention head.
+    pub fn hasQwen35VisionArchitectureContract(self: Config) bool {
+        if (!self.isQwen35() or !self.supportsNativeQwen2VlVision() or self.usesMoe()) return false;
+        if (self.vision_temporal_patch_size != 2 or self.vision_num_position_embeddings == 0 or
+            self.vision_out_hidden_size != self.hidden_size or self.vision_deepstack_visual_indexes_len != 0 or
+            self.vision_deepstack_visual_indexes_truncated or !self.mrope_interleaved) return false;
+        const rotary_dim = self.layerRopeActiveDim(@max(self.qwen35_full_attention_interval, 1) - 1);
+        return rotary_dim > 0 and rotary_dim <= self.headDim() and
+            rotary_dim == 2 * (self.mrope_section[0] + self.mrope_section[1] + self.mrope_section[2]) and
+            self.boi_token_index >= 0 and self.eoi_token_index >= 0;
     }
 
     pub fn tokenEmbeddingScale(self: Config) f32 {
@@ -503,6 +526,32 @@ pub const Config = struct {
         if (self.gemma4_mtp_assistant) return layer_index < self.num_hidden_layers;
         if (self.num_kv_shared_layers == 0) return false;
         return layer_index >= self.num_hidden_layers - self.num_kv_shared_layers;
+    }
+
+    pub fn usesCompactQwen35Kv(self: Config) bool {
+        if (!self.compact_qwen35_kv or !self.hasQwen35VisionArchitectureContract()) return false;
+        for (0..self.num_hidden_layers) |layer| if (!self.layerUsesQwen35LinearAttention(layer)) return true;
+        return false;
+    }
+
+    pub fn kvStorageLayerCount(self: Config) usize {
+        if (!self.usesCompactQwen35Kv()) return self.num_hidden_layers;
+        var count: usize = 0;
+        for (0..self.num_hidden_layers) |layer| if (!self.layerUsesQwen35LinearAttention(layer)) {
+            count += 1;
+        };
+        return count;
+    }
+
+    pub fn compactQwen35KvStorageLayerIndex(self: Config, layer: usize) ?usize {
+        if (!self.usesCompactQwen35Kv()) return layer;
+        if (layer >= self.num_hidden_layers) return null;
+        if (self.layerUsesQwen35LinearAttention(layer)) return null;
+        var count: usize = 0;
+        for (0..layer) |previous| if (!self.layerUsesQwen35LinearAttention(previous)) {
+            count += 1;
+        };
+        return count;
     }
 
     pub fn layerSharesKv(self: Config, layer_index: usize) bool {
@@ -1282,6 +1331,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
             };
             if (vision_obj.get("hidden_act")) |vv| if (vv == .string) {
                 config.vision_use_quick_gelu = std.mem.eql(u8, vv.string, "quick_gelu");
+                config.vision_use_gelu_tanh = std.mem.eql(u8, vv.string, "gelu_pytorch_tanh") or std.mem.eql(u8, vv.string, "gelu_new");
             };
             if (vision_obj.get("deepstack_visual_indexes")) |vv| {
                 parseVisionDeepstackVisualIndexes(&config, vv);
@@ -3829,4 +3879,39 @@ test "context GGUF irregular schedules validate every KV head geometry" {
                 try std.testing.expectEqual(heads, config.?.effectiveKVHeadsForLayer(i));
         }
     }
+}
+
+test "LightOnOCR3 official 0.8B config has partial M-RoPE and no DeepStack" {
+    const config = try parseConfig(std.testing.allocator, @embedFile("testdata/lightonocr3/config.json"));
+    try std.testing.expectEqual(ModelFamily.qwen3_5, config.family);
+    try std.testing.expect(config.hasQwen35VisionArchitectureContract());
+    try std.testing.expect(config.vision_use_gelu_tanh);
+    try std.testing.expectEqual(@as(u32, 1024), config.hidden_size);
+    try std.testing.expectEqual(@as(u32, 24), config.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 256), config.headDim());
+    try std.testing.expectEqual(@as(usize, 64), config.layerRopeActiveDim(3));
+    try std.testing.expect(config.isEosToken(248046));
+    try std.testing.expectEqual(@as(u32, 16), config.qwen35_linear_num_value_heads);
+    try std.testing.expect(config.layerUsesQwen35LinearAttention(0));
+    try std.testing.expect(!config.layerUsesQwen35LinearAttention(3));
+    try std.testing.expectEqual(@as(u32, 12), config.vision_num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 768), config.vision_hidden_size);
+    try std.testing.expectEqual(@as(u8, 0), config.vision_deepstack_visual_indexes_len);
+    var invalid = config;
+    invalid.mrope_section = .{ 24, 20, 20 };
+    try std.testing.expect(!invalid.hasQwen35VisionArchitectureContract());
+}
+
+test "LightOnOCR3 official 4B config uses grouped recurrent heads and larger vision tower" {
+    const config = try parseConfig(std.testing.allocator, @embedFile("testdata/lightonocr3/config-4b.json"));
+    try std.testing.expect(config.hasQwen35VisionArchitectureContract());
+    try std.testing.expectEqual(@as(u32, 2560), config.hidden_size);
+    try std.testing.expectEqual(@as(u32, 9216), config.intermediate_size);
+    try std.testing.expectEqual(@as(u32, 32), config.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 16), config.qwen35_linear_num_key_heads);
+    try std.testing.expectEqual(@as(u32, 32), config.qwen35_linear_num_value_heads);
+    try std.testing.expectEqual(@as(usize, 64), config.layerRopeActiveDim(3));
+    try std.testing.expectEqual(@as(u32, 24), config.vision_num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 1024), config.vision_hidden_size);
+    try std.testing.expect(config.isEosToken(248046));
 }

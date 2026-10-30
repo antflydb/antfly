@@ -10,7 +10,7 @@ description: Key terms and concepts used in Antfly and the broader AI/search eco
 
 The model runtime built into Antfly. It runs embedding, chunking, reranking, extraction, transcription, and generation models from GGUF, safetensors, and [ONNX](#onnx-open-neural-network-exchange) artifacts on native CPU, Metal, and CUDA backends, plus experimental PJRT/XLA and WASM/WebGPU backends. Standalone serves it in-process under `/ai/v1`; `antfly inference run` runs it as a separate process that a database reaches through `inference.api_url`.
 
-See: [Antfly Inference](/docs/guides/inference) | [Local Model Compatibility](/docs/guides/supported-models)
+See: [Antfly Inference](/docs/guides/inference) | [Local Model Compatibility](/docs/guides/supported-models) | [Inference Components and Providers](/docs/guides/inference-providers)
 
 ### CDC & Foreign Sources
 
@@ -20,7 +20,9 @@ See: [Mirror a PostgreSQL Table](/docs/guides/cdc-replication) | [CDC design](ht
 
 ### Document Extraction
 
-The `document_extraction` asset producer downloads a document URL during enrichment and persists derived units such as PDF pages and chunks. PDF pages with no native text use OCR by default with the local `antflydb/Florence-2-base` model. Set `ocr_fallback` to `false` or `ocr.enabled` to `false` to opt out. This durable ingestion path is distinct from [template](#templates) helpers such as `remoteMedia`, which prepare media for inference without persisting page artifacts.
+The `document_extraction` asset producer downloads a document URL during enrichment and persists derived units such as PDF pages and chunks. Native text is extracted with no model. Scanned pages and images are read when the config's `ocr` block names a reader, such as [LightOnOCR-3](/docs/guides/models/lightonocr3); without one they report `ocr_not_configured`. Audio is transcribed when a `transcription` block names a `transcriber`. This durable ingestion path is distinct from [template](#templates) helpers such as `remoteMedia`, which prepare media for inference without persisting page artifacts.
+
+See: [Index PDFs and Scanned Documents](/docs/guides/index-documents)
 
 ### Enrichments, Artifacts & Asset Producers
 
@@ -99,6 +101,12 @@ Models that produce text, images, or other content. In [RAG](#rag-retrieval-augm
 An open-source framework for building AI-powered applications, with abstractions for LLMs, [embeddings](#embeddings), and retrieval. Antfly ships a Genkit (Go) plugin, `github.com/antflydb/antfly/go/pkg/genkit/antfly`, that exposes an Antfly table and index as a Genkit retriever.
 
 See: [Antfly Genkit plugin](https://github.com/antflydb/antfly/tree/main/go/pkg/genkit/antfly) | [Genkit](https://github.com/firebase/genkit)
+
+### Inference Components & Providers
+
+Antfly names each kind of inference a component: embedder, reranker, chunker, reader (OCR), transcriber, speech synthesizer, generator, extractor, decider, and web search. A provider runs a component: the built-in Antfly runtime or a connected service such as OpenAI, Gemini, Bedrock, or Cloudflare. Each configured component is a named entry with a `provider` and a `model`.
+
+See: [Inference Components and Providers](/docs/guides/inference-providers)
 
 ### Model (ML/AI)
 

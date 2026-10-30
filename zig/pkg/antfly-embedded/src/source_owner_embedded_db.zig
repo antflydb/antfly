@@ -17,4 +17,5 @@ pub const physical_db = @import("storage/db/db.zig");
 pub const selected_db = @import("storage/db/mod.zig");
 pub const local_query = @import("storage/query.zig");
 
-pub const storage_engine = @import("storage/engine.zig");
+// Browser DBs execute their local implementation without a native archive ABI.
+pub const storage_engine = @import("storage/engine_dispatch.zig").implementation;

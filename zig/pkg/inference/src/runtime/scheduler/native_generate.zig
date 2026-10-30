@@ -213,6 +213,8 @@ pub const Policy = struct {
     /// Default query-token cap for a unified step. Decode items contribute 1
     /// token; prefill items contribute their `query_sequence_len`.
     max_step_query_tokens: usize = 512,
+    /// Optional bound for backends admitting one prefill plus decode rows.
+    max_step_prefill_items: ?usize = null,
     /// Backends opt in after heterogeneous position/KV batching passes their
     /// response-equivalence gate.
     allow_mixed_sequence_lengths: bool = false,
@@ -222,6 +224,21 @@ pub const Policy = struct {
     /// Maximum time a singleton decode may wait for an already-admitted peer.
     /// The wait is skipped when this is the only active request.
     max_decode_wait_us: u32 = 1_000,
+    /// Opt-in cohort target. The claim gate applies to every contender, so a
+    /// follower cannot bypass the first caller's bounded coalescing window.
+    /// One preserves the existing eager/C2 scheduling policy.
+    decode_coalesce_rows: usize = 1,
+    /// Count only pages with known next decode work when forming a cohort.
+    decode_coalesce_ready_only: bool = false,
+    /// A GPU turn can outlast the coalescing window. Give pending work a fresh
+    /// bounded window when that turn completes so its published peers can
+    /// rejoin, rather than permanently splitting into alternating tiny batches.
+    decode_coalesce_after_turn: bool = false,
+    /// Model-scoped wait between unsuccessful turn/step claims. A positive
+    /// duration parks waiting OS threads while their peer owns a GPU forward.
+    /// Zero preserves the cooperative polling policy for other backends.
+    contention_wait_us: u32 = 0,
+    event_waits: bool = false,
     /// Largest prefill issued for a sole request on an otherwise idle model.
     /// Admission budgets scratch at this size before generation starts. The
     /// ceiling remains configurable up to 2048. Model-specific performance
@@ -232,6 +249,7 @@ pub const Policy = struct {
         return .{
             .max_items = @max(self.max_step_items, 1),
             .max_query_tokens = @max(self.max_step_query_tokens, 1),
+            .max_prefill_items = self.max_step_prefill_items,
         };
     }
 };
@@ -255,6 +273,7 @@ pub const StepBudget = struct {
     /// of this budget; caller-side admission must gate at acquire time when
     /// pool headroom for the leader itself is uncertain.
     max_kv_blocks: ?usize = null,
+    max_prefill_items: ?usize = null,
 };
 
 pub const Stats = struct {
@@ -271,10 +290,13 @@ pub const Stats = struct {
     step_kv_block_skips_total: u64 = 0,
     decode_coalesce_waits_total: u64 = 0,
     decode_coalesce_wait_us_total: u64 = 0,
+    decode_coalesce_turn_boundaries_total: u64 = 0,
+    decode_coalesce_rebased_items_total: u64 = 0,
     step_batch_size_2_total: u64 = 0,
     step_batch_size_3_4_total: u64 = 0,
     step_batch_size_5_8_total: u64 = 0,
     step_batch_size_9_16_total: u64 = 0,
+    step_batch_size_17_plus_total: u64 = 0,
 };
 
 const ExecutionGate = enum {
@@ -312,6 +334,7 @@ const PendingDecode = struct {
     kv_position_offset: usize,
     kv_blocks_estimate: usize = 0,
     exclusive_step: bool = false,
+    enqueued_ns: u64 = 0,
 };
 
 fn decodeWorkCompatible(
@@ -376,6 +399,128 @@ pub const NativeGenerateCoordinator = struct {
     base_prefill_chunk_size: usize = 256,
     min_prefill_chunk_size: usize = 32,
 
+    waiters: ?*Waiter = null,
+    executor_event: ?*std.Io.Event = null,
+    executor_io: ?std.Io = null,
+
+    pub const Waiter = struct {
+        next: ?*Waiter = null,
+        event: std.Io.Event = .unset,
+        io: std.Io,
+        ready_ptr: ?*anyopaque = null,
+        ready_fn: ?*const fn (*anyopaque) bool = null,
+        draining: bool = false,
+        turn_request_id: ?RequestId = null,
+    };
+
+    pub fn registerExecutor(self: *NativeGenerateCoordinator, event: *std.Io.Event, io: std.Io) void {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        std.debug.assert(self.executor_event == null and self.waiters == null);
+        self.executor_event = event;
+        self.executor_io = io;
+    }
+
+    pub fn unregisterExecutor(self: *NativeGenerateCoordinator) void {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        std.debug.assert(self.in_turn == null and self.pending_decode.items.len == 0 and self.pending_prefill.items.len == 0);
+        self.executor_event = null;
+        self.executor_io = null;
+    }
+
+    pub fn hasExecutor(self: *const NativeGenerateCoordinator) bool {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        return self.executor_event != null;
+    }
+
+    pub fn markDraining(self: *NativeGenerateCoordinator, waiter: *Waiter) void {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        waiter.draining = true;
+    }
+
+    pub fn usesStepEvents(self: *const NativeGenerateCoordinator) bool {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        return self.policy.event_waits or self.executor_event != null;
+    }
+
+    pub fn attachWaiter(self: *NativeGenerateCoordinator, waiter: *Waiter) void {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        waiter.next = self.waiters;
+        self.waiters = waiter;
+    }
+
+    pub fn detachWaiter(self: *NativeGenerateCoordinator, waiter: *Waiter) void {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        var link = &self.waiters;
+        while (link.*) |current| {
+            if (current == waiter) {
+                link.* = current.next;
+                waiter.next = null;
+                return;
+            }
+            link = &current.next;
+        }
+        unreachable;
+    }
+
+    // A waiter only resets after its preceding wait has returned. Holding the
+    // coordinator lock orders reset against all queue-change notifications.
+    pub fn prepareWait(self: *NativeGenerateCoordinator, waiter: *Waiter) void {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        waiter.event.reset();
+    }
+
+    // Manual prefill shares the same turn selector as the dedicated decoder.
+    // Wake its selected owner, rather than polling or waking every page.
+    fn notifyTurnWaiterUnlocked(self: *NativeGenerateCoordinator, waiter: *Waiter) bool {
+        const request_id = waiter.turn_request_id orelse return false;
+        if (self.in_turn == null and self.pickNextTurn() == request_id) waiter.event.set(waiter.io);
+        return true;
+    }
+
+    fn notifyWaitersUnlocked(self: *NativeGenerateCoordinator) void {
+        if (self.executor_event) |event| event.set(self.executor_io.?);
+        var next = self.waiters;
+        while (next) |waiter| : (next = waiter.next) {
+            if (self.notifyTurnWaiterUnlocked(waiter)) continue;
+            if (self.executor_event == null or waiter.draining) waiter.event.set(waiter.io);
+        }
+    }
+
+    /// Call after publishing ready with release ordering. Dedicated execution
+    /// wakes only completed requests; queue changes wake the worker instead.
+    pub fn notifyWaiters(self: *NativeGenerateCoordinator) void {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        var next = self.waiters;
+        while (next) |waiter| : (next = waiter.next) {
+            if (self.notifyTurnWaiterUnlocked(waiter)) continue;
+            if (self.executor_event == null or waiter.draining or
+                (if (waiter.ready_fn) |ready| ready(waiter.ready_ptr.?) else true)) waiter.event.set(waiter.io);
+        }
+    }
+
+    pub fn eventWaitUs(self: *const NativeGenerateCoordinator) u32 {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        // In-flight work publishes an event after its result, not a periodic
+        // request-thread poll. An idle partial cohort still has a timer.
+        if (self.in_turn != null) return 1_000_000;
+        if (self.pending_decode.items.len == 0) return 1_000_000;
+        var earliest: u64 = std.math.maxInt(u64);
+        for (self.pending_decode.items) |item| earliest = @min(earliest, item.enqueued_ns);
+        const deadline = earliest +| (@as(u64, self.policy.max_decode_wait_us) * std.time.ns_per_us);
+        const remaining = deadline -| platform.time.monotonicNs();
+        return @intCast(@max(1, @min(1_000_000, (remaining +| (std.time.ns_per_us - 1)) / std.time.ns_per_us)));
+    }
+
     pub fn init(allocator: std.mem.Allocator) NativeGenerateCoordinator {
         return .{ .allocator = allocator };
     }
@@ -391,12 +536,14 @@ pub const NativeGenerateCoordinator = struct {
     pub fn setPolicy(self: *NativeGenerateCoordinator, policy: Policy) void {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        defer self.notifyWaitersUnlocked();
         self.policy = policy;
     }
 
     pub fn deinit(self: *NativeGenerateCoordinator) void {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        std.debug.assert(self.waiters == null and self.executor_event == null);
         for (self.entries.items) |*entry| {
             entry.prefill_chunk_plan.deinit(self.allocator);
         }
@@ -408,6 +555,7 @@ pub const NativeGenerateCoordinator = struct {
     pub fn acquire(self: *NativeGenerateCoordinator, admission: Admission) !Lease {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        defer self.notifyWaitersUnlocked();
         const request_id = self.next_request_id;
         self.next_request_id += 1;
         const reserved_units = @max(admission.requested_units, 1);
@@ -434,6 +582,7 @@ pub const NativeGenerateCoordinator = struct {
     pub fn release(self: *NativeGenerateCoordinator, lease: Lease) void {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        defer self.notifyWaitersUnlocked();
         const idx = self.indexOf(lease.request_id) orelse return;
         const entry = &self.entries.items[idx];
         self.removePendingPrefillByRequest(lease.request_id);
@@ -622,6 +771,7 @@ pub const NativeGenerateCoordinator = struct {
     ) !void {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        defer self.notifyWaitersUnlocked();
         if (self.findPendingPrefill(work_ptr) != null) return;
         try self.pending_prefill.append(self.allocator, .{
             .request_id = lease.request_id,
@@ -638,6 +788,7 @@ pub const NativeGenerateCoordinator = struct {
     pub fn cancelPrefillWork(self: *NativeGenerateCoordinator, work_ptr: *anyopaque) void {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        defer self.notifyWaitersUnlocked();
         self.removePendingPrefill(work_ptr);
     }
 
@@ -652,6 +803,7 @@ pub const NativeGenerateCoordinator = struct {
     ) !void {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        defer self.notifyWaitersUnlocked();
         if (self.findPendingDecode(work_ptr) != null) return;
         try self.pending_decode.append(self.allocator, .{
             .request_id = lease.request_id,
@@ -661,6 +813,7 @@ pub const NativeGenerateCoordinator = struct {
             .kv_position_offset = kv_position_offset,
             .kv_blocks_estimate = options.kv_blocks_estimate,
             .exclusive_step = options.exclusive_step,
+            .enqueued_ns = if (self.policy.decode_coalesce_rows > 1) platform.time.monotonicNs() else 0,
         });
         if (self.indexOf(lease.request_id)) |entry_idx| {
             self.entries.items[entry_idx].next_decode_work_total_sequence_len = null;
@@ -670,6 +823,7 @@ pub const NativeGenerateCoordinator = struct {
     pub fn cancelDecodeWork(self: *NativeGenerateCoordinator, work_ptr: *anyopaque) void {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        defer self.notifyWaitersUnlocked();
         self.removePendingDecode(work_ptr);
     }
 
@@ -714,6 +868,7 @@ pub const NativeGenerateCoordinator = struct {
     pub fn decodeCoalesceDelayUs(self: *const NativeGenerateCoordinator, lease: Lease) u32 {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        if (self.policy.decode_coalesce_rows > 1) return 0;
         if (self.policy.max_decode_wait_us == 0) return 0;
         if (self.policy.max_step_items <= 1) return 0;
         if (self.policy.max_active_requests_for_batching) |limit| {
@@ -909,6 +1064,45 @@ pub const NativeGenerateCoordinator = struct {
         }
     }
 
+    pub fn stepPollWaitUs(self: *const NativeGenerateCoordinator) u32 {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        return if (self.policy.decode_coalesce_rows > 1) 50 else 0;
+    }
+
+    fn deferDecodeCohort(self: *const NativeGenerateCoordinator, budget: StepBudget, now_ns: u64) bool {
+        if (self.policy.decode_coalesce_rows <= 1 or self.policy.max_decode_wait_us == 0 or
+            self.pending_decode.items.len == 0) return false;
+        const target = @min(self.policy.decode_coalesce_rows, @max(budget.max_items, 1), @max(budget.max_query_tokens, 1), self.entries.items.len);
+        if (target <= 1 or self.pending_decode.items.len >= target) return false;
+        var earliest: u64 = std.math.maxInt(u64);
+        for (self.pending_decode.items) |item| earliest = @min(earliest, item.enqueued_ns);
+        return now_ns < earliest +| (@as(u64, self.policy.max_decode_wait_us) * std.time.ns_per_us);
+    }
+
+    fn deferReadyDecodeCohort(self: *const NativeGenerateCoordinator, budget: StepBudget, now_ns: u64, leader: PendingDecode) bool {
+        if (self.policy.decode_coalesce_rows <= 1 or self.policy.max_decode_wait_us == 0 or leader.exclusive_step) return false;
+        var eligible: usize = 0;
+        var queued: usize = 0;
+        var earliest = leader.enqueued_ns;
+        for (self.entries.items) |entry| {
+            if (self.findPendingDecodeByRequest(entry.id)) |idx| {
+                const pending = self.pending_decode.items[idx];
+                if (pending.exclusive_step or (!self.policy.allow_mixed_sequence_lengths and
+                    !decodeWorkCompatible(pending, leader.total_sequence_len, leader.kv_sequence_len, leader.kv_position_offset))) continue;
+                eligible += 1;
+                queued += 1;
+                earliest = @min(earliest, pending.enqueued_ns);
+            } else if (entry.phase == .decode) {
+                const next = entry.next_decode_work_total_sequence_len orelse continue;
+                if (self.policy.allow_mixed_sequence_lengths or next == leader.total_sequence_len) eligible += 1;
+            }
+        }
+        const target = @min(self.policy.decode_coalesce_rows, @max(budget.max_items, 1), @max(budget.max_query_tokens, 1), eligible);
+        if (target <= 1 or queued >= target) return false;
+        return now_ns < earliest +| (@as(u64, self.policy.max_decode_wait_us) * std.time.ns_per_us);
+    }
+
     /// Unified step claim: replaces the prefill/decode/mixed claim trio with a
     /// single entry point that always packs whatever pending work fits the
     /// budget. The leader is always included; additional items are packed
@@ -928,6 +1122,52 @@ pub const NativeGenerateCoordinator = struct {
     ) !bool {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        return self.claimStepUnlocked(allocator, lease, leader_work_ptr, leader_phase, budget, out);
+    }
+
+    /// A single persistent executor selects and pins a leader while holding
+    /// the same lock used by idle cancellation. No borrowed pointer escapes
+    /// between selection and ownership of the turn. The output borrows storage;
+    /// do not deinit it. The returned lease only identifies this turn and must
+    /// not be released as a request admission lease.
+    pub fn claimNextStep(self: *NativeGenerateCoordinator, budget: StepBudget, storage: []StepItem, out: *std.ArrayListUnmanaged(StepItem)) ?Lease {
+        if (storage.len == 0) return null;
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        if (self.in_turn != null) return null;
+        const id = self.pickNextTurn() orelse return null;
+        const entry = self.entries.items[self.indexOf(id) orelse return null];
+        var phase: Phase = .waiting;
+        var work: ?*anyopaque = null;
+        if (self.findPendingDecodeByRequest(id)) |index| {
+            phase = .decode;
+            work = self.pending_decode.items[index].work_ptr;
+        } else if (self.findPendingPrefillByRequest(id)) |index| {
+            phase = .prefill;
+            work = self.pending_prefill.items[index].work_ptr;
+        }
+        // A manual vision/prefill turn may be selected without queued work.
+        // Its owner still calls awaitTurn/finishTurn and wakes the executor.
+        if (work == null) return null;
+        var lease = Lease{ .request_id = id, .reserved_units = entry.requested_units, .prompt_bytes = entry.prompt_bytes, .max_tokens = 0, .prefill_chunk_size = self.recommendPrefillChunkForUnlocked(id), .active_requests_snapshot = self.entries.items.len };
+        var bounded = budget;
+        bounded.max_items = @min(@max(bounded.max_items, 1), storage.len);
+        out.* = .initBuffer(storage);
+        // claimStepUnlocked only allocates when append exceeds capacity. Its
+        // max_items includes the leader and never exceeds the borrowed storage.
+        const claimed = self.claimStepUnlocked(self.allocator, &lease, work.?, phase, bounded, out) catch unreachable;
+        return if (claimed) lease else null;
+    }
+
+    fn claimStepUnlocked(
+        self: *NativeGenerateCoordinator,
+        allocator: std.mem.Allocator,
+        lease: *Lease,
+        leader_work_ptr: *anyopaque,
+        leader_phase: Phase,
+        budget: StepBudget,
+        out: *std.ArrayListUnmanaged(StepItem),
+    ) !bool {
         if (self.in_turn) |owner| {
             if (owner != lease.request_id) return false;
         } else {
@@ -935,11 +1175,21 @@ pub const NativeGenerateCoordinator = struct {
             if (selected != lease.request_id) return false;
         }
 
+        if (leader_phase == .decode and self.in_turn == null and self.policy.decode_coalesce_rows > 1) {
+            const now = platform.time.monotonicNs();
+            const delay = if (self.policy.decode_coalesce_ready_only) ready: {
+                const idx = self.findPendingDecodeByRequest(lease.request_id) orelse break :ready false;
+                break :ready self.deferReadyDecodeCohort(budget, now, self.pending_decode.items[idx]);
+            } else self.deferDecodeCohort(budget, now);
+            if (delay) return false;
+        }
+
         const max_items = @max(budget.max_items, 1);
         const max_query_tokens = @max(budget.max_query_tokens, 1);
 
         out.clearRetainingCapacity();
 
+        var prefill_items: usize = @intFromBool(leader_phase == .prefill);
         var query_tokens_total: usize = 0;
         var kv_blocks_total: usize = 0;
         var leader_exclusive = false;
@@ -1043,6 +1293,7 @@ pub const NativeGenerateCoordinator = struct {
         // can still be admitted.
         for (self.pending_prefill.items) |pending| {
             if (out.items.len >= max_items) break;
+            if (budget.max_prefill_items) |limit| if (prefill_items >= limit) break;
             if (pending.work_ptr == leader_work_ptr) continue;
             if (pending.exclusive_step) continue;
             const next_query = query_tokens_total + pending.query_sequence_len;
@@ -1064,6 +1315,7 @@ pub const NativeGenerateCoordinator = struct {
                 .kv_position_offset = pending.kv_position_offset,
             });
             query_tokens_total = next_query;
+            prefill_items += 1;
         }
 
         self.in_turn = lease.request_id;
@@ -1117,7 +1369,8 @@ pub const NativeGenerateCoordinator = struct {
             2 => self.stats.step_batch_size_2_total += 1,
             3...4 => self.stats.step_batch_size_3_4_total += 1,
             5...8 => self.stats.step_batch_size_5_8_total += 1,
-            else => self.stats.step_batch_size_9_16_total += 1,
+            9...16 => self.stats.step_batch_size_9_16_total += 1,
+            else => self.stats.step_batch_size_17_plus_total += 1,
         }
         if (prefill_count + decode_count <= 1) {
             self.stats.step_singleton_batches_total += 1;
@@ -1126,10 +1379,38 @@ pub const NativeGenerateCoordinator = struct {
         self.finishTurnUnlocked(lease, phase);
     }
 
+    fn contentionWaitUs(self: *const NativeGenerateCoordinator) u32 {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        return self.policy.contention_wait_us;
+    }
+
     pub fn awaitTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase, io: std.Io) !void {
-        while (!self.tryAcquireTurn(lease, phase)) {
+        return self.awaitTurnControlled(lease, phase, io, null);
+    }
+
+    /// Optional request control keeps this scheduler independent of its facade.
+    pub fn awaitTurnControlled(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase, io: std.Io, control: anytype) !void {
+        const events = self.usesStepEvents();
+        var waiter = Waiter{ .io = io, .turn_request_id = lease.request_id };
+        if (events) self.attachWaiter(&waiter);
+        defer if (events) self.detachWaiter(&waiter);
+        const wait_us = self.contentionWaitUs();
+        while (true) {
+            if (comptime @TypeOf(control) != @TypeOf(null)) {
+                if (control) |request_control| try request_control.check();
+            }
+            // Reset only after the preceding wait returned, then test the
+            // turn under the same lock that orders all queue notifications.
+            if (events) self.prepareWait(&waiter);
+            if (self.tryAcquireTurn(lease, phase)) return;
             self.noteTurnYield();
-            try io.sleep(std.Io.Duration.fromMilliseconds(0), .awake);
+            if (events) {
+                waiter.event.waitTimeout(io, .{ .duration = .{ .raw = .fromMicroseconds(10_000), .clock = .awake } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    else => return err,
+                };
+            } else try io.sleep(std.Io.Duration.fromMicroseconds(wait_us), .awake);
         }
     }
 
@@ -1168,7 +1449,16 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     fn finishTurnUnlocked(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) void {
+        defer self.notifyWaitersUnlocked();
         if (self.in_turn != lease.request_id) return;
+        if (self.policy.decode_coalesce_after_turn and self.policy.decode_coalesce_rows > 1 and
+            self.policy.max_decode_wait_us > 0)
+        {
+            const now = platform.time.monotonicNs();
+            for (self.pending_decode.items) |*pending| pending.enqueued_ns = now;
+            self.stats.decode_coalesce_turn_boundaries_total += 1;
+            self.stats.decode_coalesce_rebased_items_total += self.pending_decode.items.len;
+        }
         self.in_turn = null;
         self.in_turn_phase = null;
         switch (phase) {
@@ -1184,9 +1474,12 @@ pub const NativeGenerateCoordinator = struct {
         }
     }
 
+    /// Publish a runnable manual prefill turn. A broker still collecting its
+    /// group must leave its leases waiting until that group has been sealed.
     pub fn notePrefillProgress(self: *NativeGenerateCoordinator, lease: *Lease, processed_tokens: usize, total_prompt_tokens: usize) void {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        defer self.notifyWaitersUnlocked();
         const idx = self.indexOf(lease.request_id) orelse return;
         var entry = &self.entries.items[idx];
         entry.phase = .prefill;
@@ -1200,6 +1493,7 @@ pub const NativeGenerateCoordinator = struct {
     pub fn beginDecode(self: *NativeGenerateCoordinator, lease: *Lease, total_prompt_tokens: usize) void {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        defer self.notifyWaitersUnlocked();
         const idx = self.indexOf(lease.request_id) orelse return;
         var entry = &self.entries.items[idx];
         entry.phase = .decode;
@@ -1464,10 +1758,13 @@ pub fn aggregateStats(models: anytype) struct { snapshot: Snapshot, stats: Stats
         stats.step_kv_block_skips_total += st.step_kv_block_skips_total;
         stats.decode_coalesce_waits_total += st.decode_coalesce_waits_total;
         stats.decode_coalesce_wait_us_total += st.decode_coalesce_wait_us_total;
+        stats.decode_coalesce_turn_boundaries_total += st.decode_coalesce_turn_boundaries_total;
+        stats.decode_coalesce_rebased_items_total += st.decode_coalesce_rebased_items_total;
         stats.step_batch_size_2_total += st.step_batch_size_2_total;
         stats.step_batch_size_3_4_total += st.step_batch_size_3_4_total;
         stats.step_batch_size_5_8_total += st.step_batch_size_5_8_total;
         stats.step_batch_size_9_16_total += st.step_batch_size_9_16_total;
+        stats.step_batch_size_17_plus_total += st.step_batch_size_17_plus_total;
     }
 
     return .{ .snapshot = snapshot, .stats = stats };
@@ -3162,4 +3459,602 @@ test "mixed position decode coalesces a peer returning from its previous step" {
     try std.testing.expectEqual(@as(u32, 1000), coordinator.decodeCoalesceDelayUs(first));
     coordinator.policy.allow_mixed_sequence_lengths = false;
     try std.testing.expectEqual(@as(u32, 0), coordinator.decodeCoalesceDelayUs(first));
+}
+
+test "LightOnOCR3 cohort coalescing blocks followers until the full decoder step is ready" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 4, .decode_coalesce_rows = 4, .allow_mixed_sequence_lengths = true });
+    var leases: [4]Lease = undefined;
+    for (&leases) |*lease| lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(std.testing.allocator);
+    for (0..2) |row| try coordinator.enqueueDecodeWork(leases[row], @ptrFromInt(row + 1), 5, 4, 0, .{});
+    // A deliberately future timestamp makes this test independent of host
+    // scheduling delays. Neither leader nor follower can bypass the gate.
+    for (coordinator.pending_decode.items) |*item| item.enqueued_ns = std.math.maxInt(u64) - std.time.ns_per_s;
+    const budget = coordinator.defaultStepBudget();
+    try std.testing.expect(coordinator.deferDecodeCohort(budget, 0));
+    try std.testing.expect(!try coordinator.claimStep(std.testing.allocator, &leases[0], @ptrFromInt(1), .decode, budget, &step));
+    try std.testing.expect(!try coordinator.claimStep(std.testing.allocator, &leases[1], @ptrFromInt(2), .decode, budget, &step));
+    for (2..4) |row| try coordinator.enqueueDecodeWork(leases[row], @ptrFromInt(row + 1), 5 + row, 4 + row, 0, .{});
+    try std.testing.expect(try coordinator.claimStep(std.testing.allocator, &leases[0], @ptrFromInt(1), .decode, budget, &step));
+    try std.testing.expectEqual(@as(usize, 4), step.items.len);
+    coordinator.completeStep(&leases[0], step.items);
+}
+
+test "LightOnOCR3 cohort coalescing bounds sparse waits and shrinks after page retirement" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 4, .decode_coalesce_rows = 4, .allow_mixed_sequence_lengths = true });
+    var leases: [4]Lease = undefined;
+    for (&leases) |*lease| lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    for (0..2) |row| try coordinator.enqueueDecodeWork(leases[row], @ptrFromInt(row + 1), 5, 4, 0, .{});
+    for (coordinator.pending_decode.items) |*item| item.enqueued_ns = 1;
+    const budget = coordinator.defaultStepBudget();
+    try std.testing.expect(coordinator.deferDecodeCohort(budget, std.time.ns_per_us));
+    try std.testing.expect(!coordinator.deferDecodeCohort(budget, std.time.ns_per_ms + 1));
+    coordinator.release(leases[2]);
+    coordinator.release(leases[3]);
+    try std.testing.expect(!coordinator.deferDecodeCohort(budget, 1));
+    try std.testing.expectEqual(@as(u32, 50), coordinator.stepPollWaitUs());
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(std.testing.allocator);
+    try std.testing.expect(try coordinator.claimStep(std.testing.allocator, &leases[0], @ptrFromInt(1), .decode, budget, &step));
+    try std.testing.expectEqual(@as(usize, 2), step.items.len);
+    coordinator.completeStep(&leases[0], step.items);
+}
+
+test "LightOnOCR3 scheduler contention wait parks outside the lock and propagates cancellation" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .contention_wait_us = 100 });
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(first);
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(second);
+    try std.testing.expect(coordinator.tryAcquireTurn(&first, .prefill));
+    const Probe = struct {
+        coordinator: *NativeGenerateCoordinator,
+        called: bool = false,
+        observed_wait_us: i64 = -1,
+        observed_policy_us: u32 = 0,
+        fn sleep(raw: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.observed_wait_us = timeout.duration.raw.toMicroseconds();
+            // Reacquiring the coordinator proves awaitTurn released its lock.
+            self.observed_policy_us = self.coordinator.contentionWaitUs();
+            self.called = true;
+            return error.Canceled;
+        }
+    };
+    var probe = Probe{ .coordinator = &coordinator };
+    var vtable = std.testing.io.vtable.*;
+    vtable.sleep = Probe.sleep;
+    const io: std.Io = .{ .userdata = &probe, .vtable = &vtable };
+    try std.testing.expectError(error.Canceled, coordinator.awaitTurn(&second, .prefill, io));
+    try std.testing.expect(probe.called);
+    try std.testing.expectEqual(@as(i64, 100), probe.observed_wait_us);
+    try std.testing.expectEqual(@as(u32, 100), probe.observed_policy_us);
+    coordinator.finishTurn(&first, .prefill);
+    try coordinator.awaitTurn(&second, .prefill, io);
+    coordinator.finishTurn(&second, .prefill);
+}
+
+test "LightOnOCR3 ready cohorts exclude prefill and unknown next work" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 4, .decode_coalesce_rows = 4, .decode_coalesce_ready_only = true, .allow_mixed_sequence_lengths = true });
+    var leases: [4]Lease = undefined;
+    for (&leases) |*lease| lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    coordinator.beginDecode(&leases[0], 4);
+    coordinator.beginDecode(&leases[1], 4);
+    try coordinator.enqueueDecodeWork(leases[0], @ptrFromInt(1), 5, 4, 0, .{});
+    coordinator.pending_decode.items[0].enqueued_ns = 1;
+    const budget = coordinator.defaultStepBudget();
+    const leader = coordinator.pending_decode.items[0];
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, 1, leader));
+    coordinator.noteDecodeProgress(&leases[1], 1);
+    try std.testing.expect(coordinator.deferReadyDecodeCohort(budget, 1, leader));
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, std.time.ns_per_s, leader));
+    var exclusive = leader;
+    exclusive.exclusive_step = true;
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, 1, exclusive));
+    var single = budget;
+    single.max_items = 1;
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(single, 1, leader));
+    single = budget;
+    single.max_query_tokens = 1;
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(single, 1, leader));
+    coordinator.policy.allow_mixed_sequence_lengths = false;
+    coordinator.noteDecodeProgress(&leases[1], 2);
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, 1, leader));
+    coordinator.policy.allow_mixed_sequence_lengths = true;
+    try coordinator.enqueueDecodeWork(leases[1], @ptrFromInt(2), 6, 5, 0, .{});
+    try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, 1, leader));
+    try std.testing.expect(coordinator.deferDecodeCohort(budget, 1));
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(std.testing.allocator);
+    try std.testing.expect(try coordinator.claimStep(std.testing.allocator, &leases[0], @ptrFromInt(1), .decode, budget, &step));
+    try std.testing.expectEqual(@as(usize, 2), step.items.len);
+    coordinator.completeStep(&leases[0], step.items);
+}
+
+test "LightOnOCR3 step events preserve publication and detached waiter ownership" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .event_waits = true });
+    var first: NativeGenerateCoordinator.Waiter = .{ .io = std.testing.io };
+    var second: NativeGenerateCoordinator.Waiter = .{ .io = std.testing.io };
+    coordinator.attachWaiter(&first);
+    coordinator.attachWaiter(&second);
+    coordinator.prepareWait(&first);
+    coordinator.prepareWait(&second);
+    const lease = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 1 });
+    defer coordinator.release(lease);
+    try std.testing.expect(first.event.isSet() and second.event.isSet());
+    coordinator.detachWaiter(&first);
+    first.event.reset();
+    coordinator.prepareWait(&second);
+    coordinator.notifyWaiters();
+    try std.testing.expect(!first.event.isSet() and second.event.isSet());
+    coordinator.detachWaiter(&second);
+    try std.testing.expect(coordinator.waiters == null);
+}
+
+test "LightOnOCR3 executor claims a bounded cohort without allocating" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 64, .allow_mixed_sequence_lengths = true });
+    var leases: [17]Lease = undefined;
+    var count: usize = 0;
+    defer for (leases[0..count]) |lease| coordinator.release(lease);
+    for (&leases, 0..) |*lease, i| {
+        lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 1 });
+        count += 1;
+        coordinator.beginDecode(lease, 4);
+        try coordinator.enqueueDecodeWork(lease.*, @ptrFromInt(i + 1), 5, 4, 0, .{});
+    }
+    var storage: [16]StepItem = undefined;
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    const budget = coordinator.defaultStepBudget();
+    coordinator.allocator = std.testing.failing_allocator;
+    defer coordinator.allocator = std.testing.allocator;
+    var first = coordinator.claimNextStep(budget, &storage, &step).?;
+    try std.testing.expectEqual(@as(usize, 16), step.items.len);
+    try std.testing.expect(coordinator.claimNextStep(budget, &storage, &step) == null);
+    coordinator.completeStep(&first, step.items);
+    var last = coordinator.claimNextStep(budget, &storage, &step).?;
+    try std.testing.expectEqual(@as(usize, 1), step.items.len);
+    coordinator.completeStep(&last, step.items);
+    coordinator.allocator = std.testing.allocator;
+}
+
+test "LightOnOCR3 executor claims thirty-two rows without allocation and preserves overflow" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 64, .allow_mixed_sequence_lengths = true });
+    var leases: [33]Lease = undefined;
+    var count: usize = 0;
+    defer for (leases[0..count]) |lease| coordinator.release(lease);
+    for (&leases, 0..) |*lease, i| {
+        lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 1 });
+        count += 1;
+        coordinator.beginDecode(lease, 4);
+        try coordinator.enqueueDecodeWork(lease.*, @ptrFromInt(i + 1), 5, 4, 0, .{});
+    }
+    var storage: [32]StepItem = undefined;
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    const budget = coordinator.defaultStepBudget();
+    coordinator.allocator = std.testing.failing_allocator;
+    defer coordinator.allocator = std.testing.allocator;
+    try std.testing.expect(coordinator.claimNextStep(budget, storage[0..0], &step) == null);
+    var first = coordinator.claimNextStep(budget, &storage, &step).?;
+    try std.testing.expectEqual(@as(usize, 32), step.items.len);
+    try std.testing.expect(coordinator.claimNextStep(budget, &storage, &step) == null);
+    coordinator.completeStep(&first, step.items);
+    var last = coordinator.claimNextStep(budget, &storage, &step).?;
+    try std.testing.expectEqual(@as(usize, 1), step.items.len);
+    coordinator.completeStep(&last, step.items);
+    try std.testing.expectEqual(@as(u64, 1), coordinator.schedulerStats().step_batch_size_17_plus_total);
+    try std.testing.expectEqual(@as(u64, 0), coordinator.schedulerStats().step_batch_size_9_16_total);
+    coordinator.allocator = std.testing.allocator;
+}
+
+test "LightOnOCR3 logical64 executor drains two physical32 steps without allocating" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 32, .max_active_requests_for_batching = 64, .allow_mixed_sequence_lengths = true });
+    var leases: [64]Lease = undefined;
+    var count: usize = 0;
+    defer for (leases[0..count]) |lease| coordinator.release(lease);
+    for (&leases, 0..) |*lease, i| {
+        lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 1 });
+        count += 1;
+        coordinator.beginDecode(lease, 4);
+        try coordinator.enqueueDecodeWork(lease.*, @ptrFromInt(i + 1), 5, 4, 0, .{});
+    }
+    var storage: [32]StepItem = undefined;
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    const budget = coordinator.defaultStepBudget();
+    coordinator.allocator = std.testing.failing_allocator;
+    defer coordinator.allocator = std.testing.allocator;
+    var seen: u64 = 0;
+    for (0..2) |_| {
+        var leader = coordinator.claimNextStep(budget, &storage, &step).?;
+        try std.testing.expectEqual(@as(usize, 32), step.items.len);
+        for (step.items) |item| {
+            const index = @intFromPtr(item.work_ptr) - 1;
+            try std.testing.expect(index < 64);
+            const bit = @as(u64, 1) << @as(u6, @intCast(index));
+            try std.testing.expect(seen & bit == 0);
+            seen |= bit;
+        }
+        coordinator.completeStep(&leader, step.items);
+    }
+    try std.testing.expectEqual(std.math.maxInt(u64), seen);
+    try std.testing.expect(coordinator.claimNextStep(budget, &storage, &step) == null);
+    try std.testing.expectEqual(@as(u64, 2), coordinator.schedulerStats().step_batch_size_17_plus_total);
+    coordinator.allocator = std.testing.allocator;
+}
+
+test "LightOnOCR3 physical64 executor drains one complete step without allocating" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 64, .max_active_requests_for_batching = 64, .allow_mixed_sequence_lengths = true });
+    var leases: [64]Lease = undefined;
+    var count: usize = 0;
+    defer for (leases[0..count]) |lease| coordinator.release(lease);
+    for (&leases, 0..) |*lease, i| {
+        lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 1 });
+        count += 1;
+        coordinator.beginDecode(lease, 4);
+        try coordinator.enqueueDecodeWork(lease.*, @ptrFromInt(i + 1), 5, 4, 0, .{});
+    }
+    var storage: [64]StepItem = undefined;
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    const budget = coordinator.defaultStepBudget();
+    coordinator.allocator = std.testing.failing_allocator;
+    defer coordinator.allocator = std.testing.allocator;
+    var seen: u64 = 0;
+    for (0..1) |_| {
+        var leader = coordinator.claimNextStep(budget, &storage, &step).?;
+        try std.testing.expectEqual(@as(usize, 64), step.items.len);
+        for (step.items) |item| {
+            const index = @intFromPtr(item.work_ptr) - 1;
+            try std.testing.expect(index < 64);
+            const bit = @as(u64, 1) << @as(u6, @intCast(index));
+            try std.testing.expect(seen & bit == 0);
+            seen |= bit;
+        }
+        coordinator.completeStep(&leader, step.items);
+    }
+    try std.testing.expectEqual(std.math.maxInt(u64), seen);
+    try std.testing.expect(coordinator.claimNextStep(budget, &storage, &step) == null);
+    try std.testing.expectEqual(@as(u64, 1), coordinator.schedulerStats().step_batch_size_17_plus_total);
+    coordinator.allocator = std.testing.allocator;
+}
+
+test "LightOnOCR3 executor queue wakes preserve selective publication and cancellation" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    var wake: std.Io.Event = .unset;
+    coordinator.registerExecutor(&wake, std.testing.io);
+    defer coordinator.unregisterExecutor();
+    const Ready = struct {
+        fn check(raw: *anyopaque) bool {
+            const ready: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+            return ready.load(.acquire);
+        }
+    };
+    var pending: std.atomic.Value(bool) = .init(false);
+    var published: std.atomic.Value(bool) = .init(true);
+    var first: NativeGenerateCoordinator.Waiter = .{ .io = std.testing.io, .ready_ptr = &pending, .ready_fn = Ready.check };
+    var second: NativeGenerateCoordinator.Waiter = .{ .io = std.testing.io, .ready_ptr = &published, .ready_fn = Ready.check };
+    coordinator.attachWaiter(&first);
+    defer coordinator.detachWaiter(&first);
+    coordinator.attachWaiter(&second);
+    defer coordinator.detachWaiter(&second);
+    const lease = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 1 });
+    defer coordinator.release(lease);
+    try std.testing.expect(wake.isSet() and !first.event.isSet() and !second.event.isSet());
+    coordinator.notifyWaiters();
+    try std.testing.expect(!first.event.isSet() and second.event.isSet());
+    coordinator.prepareWait(&second);
+    coordinator.markDraining(&first);
+    coordinator.setPolicy(.{});
+    try std.testing.expect(first.event.isSet() and !second.event.isSet());
+}
+
+test "LightOnOCR3 executor yields to manual prefill and preserves turn ownership" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    var prefill = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .prompt_tokens = 4, .max_tokens = 1 });
+    defer coordinator.release(prefill);
+    var decode = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 1 });
+    defer coordinator.release(decode);
+    coordinator.notePrefillProgress(&prefill, 0, 4);
+    coordinator.beginDecode(&decode, 4);
+    var work: u8 = 0;
+    try coordinator.enqueueDecodeWork(decode, &work, 5, 4, 0, .{});
+    coordinator.max_decode_streak_before_prefill = 0;
+    var storage: [16]StepItem = undefined;
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    const budget = coordinator.defaultStepBudget();
+    try std.testing.expect(coordinator.claimNextStep(budget, &storage, &step) == null);
+    try std.testing.expect(coordinator.tryAcquireTurn(&prefill, .prefill));
+    try std.testing.expect(coordinator.claimNextStep(budget, &storage, &step) == null);
+    coordinator.finishTurn(&prefill, .prefill);
+    coordinator.beginDecode(&prefill, 4);
+    var claimed = coordinator.claimNextStep(budget, &storage, &step).?;
+    try std.testing.expectEqual(decode.request_id, claimed.request_id);
+    try std.testing.expect(!coordinator.cancelPendingWorkIfIdle(&work, .decode));
+    coordinator.completeStep(&claimed, step.items);
+}
+
+test "LightOnOCR3 manual prefill turn events wake only the next owner" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    var wake: std.Io.Event = .unset;
+    coordinator.registerExecutor(&wake, std.testing.io);
+    defer coordinator.unregisterExecutor();
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .prompt_tokens = 4, .max_tokens = 1 });
+    defer coordinator.release(first);
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .prompt_tokens = 4, .max_tokens = 1 });
+    defer coordinator.release(second);
+    var third = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .prompt_tokens = 4, .max_tokens = 1 });
+    defer coordinator.release(third);
+    coordinator.notePrefillProgress(&first, 0, 4);
+    coordinator.notePrefillProgress(&second, 0, 4);
+    coordinator.notePrefillProgress(&third, 0, 4);
+    try std.testing.expect(coordinator.tryAcquireTurn(&first, .prefill));
+    var next = NativeGenerateCoordinator.Waiter{ .io = std.testing.io, .turn_request_id = second.request_id };
+    coordinator.attachWaiter(&next);
+    defer coordinator.detachWaiter(&next);
+    var later = NativeGenerateCoordinator.Waiter{ .io = std.testing.io, .turn_request_id = third.request_id };
+    coordinator.attachWaiter(&later);
+    defer coordinator.detachWaiter(&later);
+    coordinator.notifyWaiters();
+    try std.testing.expect(!next.event.isSet() and !later.event.isSet());
+    coordinator.finishTurn(&first, .prefill);
+    try std.testing.expect(next.event.isSet() and !later.event.isSet());
+    coordinator.prepareWait(&next);
+    try std.testing.expect(coordinator.tryAcquireTurn(&second, .prefill));
+    coordinator.notifyWaiters();
+    try std.testing.expect(!next.event.isSet() and !later.event.isSet());
+    coordinator.finishTurn(&second, .prefill);
+    try std.testing.expect(later.event.isSet());
+}
+
+test "LightOnOCR3 canceled manual prefill wait detaches before releasing its lease" {
+    const Control = struct {
+        fn check(_: @This()) error{Cancelled}!void {
+            return error.Cancelled;
+        }
+    };
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .event_waits = true });
+    var owner = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .prompt_tokens = 4, .max_tokens = 1 });
+    defer coordinator.release(owner);
+    var waiting = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .prompt_tokens = 4, .max_tokens = 1 });
+    defer coordinator.release(waiting);
+    coordinator.notePrefillProgress(&owner, 0, 4);
+    coordinator.notePrefillProgress(&waiting, 0, 4);
+    try std.testing.expect(coordinator.tryAcquireTurn(&owner, .prefill));
+    try std.testing.expectError(error.Cancelled, coordinator.awaitTurnControlled(&waiting, .prefill, std.testing.io, @as(?Control, .{})));
+    try std.testing.expect(coordinator.waiters == null);
+    try std.testing.expectEqual(@as(?RequestId, owner.request_id), coordinator.in_turn);
+    coordinator.finishTurn(&owner, .prefill);
+}
+
+test "LightOnOCR3 cancellation while parked leaves the current prefill owner intact" {
+    const Control = struct {
+        entered: *std.atomic.Value(bool),
+        cancelled: *std.atomic.Value(bool),
+        fn check(self: @This()) error{Cancelled}!void {
+            self.entered.store(true, .release);
+            if (self.cancelled.load(.acquire)) return error.Cancelled;
+        }
+    };
+    const Waiting = struct {
+        coordinator: *NativeGenerateCoordinator,
+        lease: *Lease,
+        control: Control,
+        result: std.atomic.Value(u8) = .init(0),
+        fn run(self: *@This()) void {
+            self.coordinator.awaitTurnControlled(self.lease, .prefill, std.testing.io, @as(?Control, self.control)) catch |err| {
+                self.result.store(if (err == error.Cancelled) 1 else 2, .release);
+                return;
+            };
+            self.result.store(3, .release);
+        }
+    };
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .event_waits = true });
+    var owner = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .prompt_tokens = 4, .max_tokens = 1 });
+    defer coordinator.release(owner);
+    var lease = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .prompt_tokens = 4, .max_tokens = 1 });
+    defer coordinator.release(lease);
+    coordinator.notePrefillProgress(&owner, 0, 4);
+    coordinator.notePrefillProgress(&lease, 0, 4);
+    try std.testing.expect(coordinator.tryAcquireTurn(&owner, .prefill));
+    var entered: std.atomic.Value(bool) = .init(false);
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    var waiting = Waiting{ .coordinator = &coordinator, .lease = &lease, .control = .{ .entered = &entered, .cancelled = &cancelled } };
+    const thread = try std.Thread.spawn(.{}, Waiting.run, .{&waiting});
+    while (!entered.load(.acquire)) platform.time.sleepNs(std.time.ns_per_ms);
+    while (true) {
+        coordinator.lockCoordinator();
+        const parked = if (coordinator.waiters) |waiter| @atomicLoad(std.Io.Event, &waiter.event, .acquire) == .waiting else false;
+        coordinator.mutex.unlock();
+        if (parked) break;
+        platform.time.sleepNs(std.time.ns_per_ms);
+    }
+    cancelled.store(true, .release);
+    thread.join();
+    try std.testing.expectEqual(@as(u8, 1), waiting.result.load(.acquire));
+    try std.testing.expect(coordinator.waiters == null);
+    try std.testing.expectEqual(@as(?RequestId, owner.request_id), coordinator.in_turn);
+    coordinator.finishTurn(&owner, .prefill);
+}
+
+test "LightOnOCR3 collecting prefill groups leave ready decode runnable until sealing" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    const collecting = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .prompt_tokens = 4, .max_tokens = 1 });
+    defer coordinator.release(collecting);
+    var sealed = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .prompt_tokens = 4, .max_tokens = 1 });
+    defer coordinator.release(sealed);
+    var decode = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 4 });
+    defer coordinator.release(decode);
+    coordinator.beginDecode(&decode, 4);
+    // Even the strictest prefill priority must ignore unsealed groups.
+    coordinator.max_decode_streak_before_prefill = 0;
+    var work: u8 = 0;
+    var storage: [32]StepItem = undefined;
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    const budget = coordinator.defaultStepBudget();
+    for (0..2) |index| {
+        try coordinator.enqueueDecodeWork(decode, &work, 5 + index, 4 + index, 0, .{});
+        var claimed = coordinator.claimNextStep(budget, &storage, &step).?;
+        try std.testing.expectEqual(decode.request_id, claimed.request_id);
+        coordinator.completeStep(&claimed, step.items);
+    }
+    try coordinator.enqueueDecodeWork(decode, &work, 7, 6, 0, .{});
+    // The second group seals first. The older collecting lease must not
+    // block it, while the ready group keeps the established fairness rule.
+    coordinator.notePrefillProgress(&sealed, 0, 4);
+    try std.testing.expect(coordinator.claimNextStep(budget, &storage, &step) == null);
+    var waiting = collecting;
+    try std.testing.expect(!coordinator.tryAcquireTurn(&waiting, .prefill));
+    // A sealed group's leader can use the event-aware waiter even when its
+    // older follower is still waiting. No all-member polling is necessary.
+    coordinator.setPolicy(.{ .event_waits = true });
+    try coordinator.awaitTurnControlled(&sealed, .prefill, std.testing.io, null);
+    try std.testing.expect(coordinator.waiters == null);
+    coordinator.finishTurn(&sealed, .prefill);
+    coordinator.beginDecode(&sealed, 4);
+    coordinator.beginDecode(&waiting, 4);
+    var resumed = coordinator.claimNextStep(budget, &storage, &step).?;
+    try std.testing.expectEqual(decode.request_id, resumed.request_id);
+    coordinator.completeStep(&resumed, step.items);
+}
+
+test "LightOnOCR3 packed step admits one prefill and decode peers within its working set" {
+    const a = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(a);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 4, .max_step_query_tokens = 4096, .max_step_prefill_items = 1, .allow_mixed_sequence_lengths = true });
+    var prefill = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    defer coordinator.release(prefill);
+    var other = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    defer coordinator.release(other);
+    var decode = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    defer coordinator.release(decode);
+    var works: [3]u8 = @splat(0);
+    coordinator.notePrefillProgress(&prefill, 0, 554);
+    coordinator.notePrefillProgress(&other, 0, 662);
+    coordinator.beginDecode(&decode, 700);
+    coordinator.consecutive_decode_turns = coordinator.max_decode_streak_before_prefill;
+    try coordinator.enqueuePrefillWork(prefill, &works[0], 554, 554, 0, 0, .{});
+    try coordinator.enqueuePrefillWork(other, &works[1], 662, 662, 0, 0, .{});
+    try coordinator.enqueueDecodeWork(decode, &works[2], 701, 701, 0, .{});
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(a);
+    try std.testing.expect(try coordinator.claimStep(a, &prefill, &works[0], .prefill, coordinator.defaultStepBudget(), &step));
+    try std.testing.expectEqual(@as(usize, 2), step.items.len);
+    try std.testing.expectEqual(Phase.prefill, step.items[0].phase);
+    try std.testing.expectEqual(Phase.decode, step.items[1].phase);
+    coordinator.completeStep(&prefill, step.items);
+    try std.testing.expect(coordinator.findPendingPrefill(&works[1]) != null);
+    try std.testing.expect(try coordinator.claimStep(a, &other, &works[1], .prefill, coordinator.defaultStepBudget(), &step));
+    try std.testing.expectEqual(@as(usize, 1), step.items.len);
+    coordinator.completeStep(&other, step.items);
+}
+
+test "LightOnOCR3 packed step caps multiple unequal prefills while retaining decode peers" {
+    const a = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(a);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 4, .max_step_query_tokens = 4096, .max_step_prefill_items = 2, .allow_mixed_sequence_lengths = true });
+    var leases: [4]Lease = undefined;
+    for (&leases) |*lease| lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    defer for (leases) |lease| coordinator.release(lease);
+    var works: [4]u8 = @splat(0);
+    const lengths = [_]usize{ 432, 554, 662 };
+    for (lengths, 0..) |len, index| {
+        coordinator.notePrefillProgress(&leases[index], 0, len);
+        try coordinator.enqueuePrefillWork(leases[index], &works[index], len, len, 0, 0, .{});
+    }
+    coordinator.beginDecode(&leases[3], 700);
+    try coordinator.enqueueDecodeWork(leases[3], &works[3], 701, 701, 0, .{});
+    coordinator.consecutive_decode_turns = coordinator.max_decode_streak_before_prefill;
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(a);
+    try std.testing.expect(try coordinator.claimStep(a, &leases[0], &works[0], .prefill, coordinator.defaultStepBudget(), &step));
+    try std.testing.expectEqual(@as(usize, 3), step.items.len);
+    try std.testing.expectEqual(Phase.prefill, step.items[0].phase);
+    try std.testing.expectEqual(Phase.decode, step.items[1].phase);
+    try std.testing.expectEqual(Phase.prefill, step.items[2].phase);
+    try std.testing.expectEqual(@as(usize, 987), step.items[0].query_sequence_len + step.items[1].query_sequence_len + step.items[2].query_sequence_len);
+    coordinator.completeStep(&leases[0], step.items);
+    try std.testing.expect(coordinator.findPendingPrefill(&works[2]) != null);
+    coordinator.cancelPrefillWork(&works[2]);
+}
+
+test "LightOnOCR3 CUDA native generate coordinator turn coalescing reunites work aged behind a GPU turn" {
+    for ([_]bool{ false, true }) |enabled| {
+        var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+        defer coordinator.deinit();
+        coordinator.setPolicy(.{
+            .max_step_items = 4,
+            .max_step_query_tokens = 4,
+            .decode_coalesce_rows = 4,
+            .decode_coalesce_ready_only = true,
+            .decode_coalesce_after_turn = enabled,
+            .allow_mixed_sequence_lengths = true,
+            .max_decode_wait_us = 1000,
+        });
+        var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+        defer coordinator.release(first);
+        const second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+        defer coordinator.release(second);
+        coordinator.beginDecode(&first, 4);
+        var second_lease = second;
+        coordinator.beginDecode(&second_lease, 4);
+        try coordinator.enqueueDecodeWork(first, @ptrFromInt(1), 5, 4, 0, .{ .exclusive_step = true });
+        try coordinator.enqueueDecodeWork(second, @ptrFromInt(2), 5, 4, 0, .{});
+        // The waiting peer is already older than the 1ms window when the GPU
+        // finishes. Its enqueue age must not force a permanent separate batch.
+        coordinator.pending_decode.items[1].enqueued_ns = 1;
+        var step = std.ArrayListUnmanaged(StepItem).empty;
+        defer step.deinit(std.testing.allocator);
+        const budget = coordinator.defaultStepBudget();
+        try std.testing.expect(try coordinator.claimStep(std.testing.allocator, &first, @ptrFromInt(1), .decode, budget, &step));
+        try std.testing.expectEqual(@as(usize, 1), step.items.len);
+        coordinator.completeStep(&first, step.items);
+        const pending = coordinator.pending_decode.items[0];
+        const now = platform.time.monotonicNs();
+        if (enabled) {
+            try std.testing.expect(pending.enqueued_ns > 1 and pending.enqueued_ns <= now);
+            try std.testing.expect(coordinator.deferReadyDecodeCohort(budget, pending.enqueued_ns, pending));
+            try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, pending.enqueued_ns + std.time.ns_per_ms, pending));
+            try std.testing.expectEqual(@as(u64, 1), coordinator.stats.decode_coalesce_rebased_items_total);
+        } else {
+            try std.testing.expectEqual(@as(u64, 1), pending.enqueued_ns);
+            try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, now, pending));
+            try std.testing.expectEqual(@as(u64, 0), coordinator.stats.decode_coalesce_turn_boundaries_total);
+        }
+        // A published result re-enqueues quickly. Once all known peers are
+        // ready, batching proceeds immediately rather than sleeping to deadline.
+        try coordinator.enqueueDecodeWork(first, @ptrFromInt(3), 6, 5, 0, .{});
+        try std.testing.expect(!coordinator.deferReadyDecodeCohort(budget, platform.time.monotonicNs(), coordinator.pending_decode.items[0]));
+        var turn = second;
+        try std.testing.expect(try coordinator.claimStep(std.testing.allocator, &turn, @ptrFromInt(2), .decode, budget, &step));
+        try std.testing.expectEqual(@as(usize, 2), step.items.len);
+        coordinator.completeStep(&turn, step.items);
+        try std.testing.expectEqual(@as(u64, 3), coordinator.stats.step_decode_items_total);
+    }
 }

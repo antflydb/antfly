@@ -1,6 +1,10 @@
 import {
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldLabel,
+  FieldTitle,
   Input,
-  Label,
   RadioGroup,
   RadioGroupItem,
   Select,
@@ -18,6 +22,7 @@ import { liveModelSuggestions, useConnectedModels } from "@/hooks/use-connection
 import { cn } from "@/lib/utils";
 
 export const GENERATOR_PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, string>> = {
+  cloudflare: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
   antfly: "gemma-3-1b-it",
   ollama: "llama3.3:70b",
   gemini: "gemini-2.5-flash",
@@ -27,6 +32,7 @@ export const GENERATOR_PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, stri
 };
 
 export const GENERATOR_PROVIDER_LABELS: Partial<Record<GeneratorProvider, string>> = {
+  cloudflare: "Cloudflare Workers AI",
   antfly: "Antfly (Local)",
   bedrock: "Amazon Bedrock",
   anthropic: "Anthropic (Claude)",
@@ -48,6 +54,7 @@ export const GENERATOR_DEFAULT_CONFIG: GeneratorConfig = {
 
 /** Providers shown in the query-builder generator selectors. */
 export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
+  "cloudflare",
   "anthropic",
   "bedrock",
   "apple",
@@ -186,6 +193,22 @@ export function GeneratorSelector({
       });
       return;
     }
+    if (nextProvider === "cloudflare") {
+      onChange({
+        provider: "cloudflare",
+        account_id: "",
+        model: GENERATOR_PROVIDER_DEFAULTS.cloudflare!,
+        ...(value.max_tokens !== undefined && { max_tokens: value.max_tokens }),
+      });
+      return;
+    }
+    if (value.provider === "cloudflare") {
+      onChange({
+        provider: nextProvider,
+        model: liveGenerators[nextProvider]?.[0] ?? GENERATOR_PROVIDER_DEFAULTS[nextProvider] ?? "",
+      } as GeneratorConfig);
+      return;
+    }
     if (nextProvider === "anthropic") {
       // Do not inherit another vendor's credentials or sampling defaults.
       // Current Claude models can require their native sampling defaults.
@@ -226,32 +249,26 @@ export function GeneratorSelector({
   return (
     <div className={cn("space-y-4", className)}>
       <RadioGroup value={mode} onValueChange={handleModeChange} className="gap-2">
-        <label
-          htmlFor={defaultId}
-          className="flex items-start gap-3 rounded-none border p-3 cursor-pointer hover:bg-muted/30"
-        >
-          <RadioGroupItem value="default" id={defaultId} className="mt-0.5" />
-          <div className="space-y-1">
-            <Label htmlFor={defaultId} className="cursor-pointer">
-              {defaultLabel}
-            </Label>
-            <p className="text-xs text-muted-foreground">{defaultDescription}</p>
-          </div>
-        </label>
-        <label
-          htmlFor={customId}
-          className="flex items-start gap-3 rounded-none border p-3 cursor-pointer hover:bg-muted/30"
-        >
-          <RadioGroupItem value="custom" id={customId} className="mt-0.5" />
-          <div className="space-y-1">
-            <Label htmlFor={customId} className="cursor-pointer">
-              {customLabel}
-            </Label>
-            <p className="text-xs text-muted-foreground">
-              Pick a provider and model for this playground only.
-            </p>
-          </div>
-        </label>
+        <FieldLabel htmlFor={defaultId} className="cursor-pointer">
+          <Field orientation="horizontal" className="gap-3">
+            <RadioGroupItem value="default" id={defaultId} />
+            <FieldContent>
+              <FieldTitle>{defaultLabel}</FieldTitle>
+              <FieldDescription className="text-xs">{defaultDescription}</FieldDescription>
+            </FieldContent>
+          </Field>
+        </FieldLabel>
+        <FieldLabel htmlFor={customId} className="cursor-pointer">
+          <Field orientation="horizontal" className="gap-3">
+            <RadioGroupItem value="custom" id={customId} />
+            <FieldContent>
+              <FieldTitle>{customLabel}</FieldTitle>
+              <FieldDescription className="text-xs">
+                Pick a provider and model for this playground only.
+              </FieldDescription>
+            </FieldContent>
+          </Field>
+        </FieldLabel>
       </RadioGroup>
 
       {value?.provider === "chatgpt" && (
@@ -288,8 +305,8 @@ export function GeneratorSelector({
               : "grid-cols-1 lg:grid-cols-2"
           )}
         >
-          <div className="space-y-2">
-            <Label className="text-xs text-muted-foreground">Provider</Label>
+          <Field className="gap-2">
+            <FieldLabel className="text-xs text-muted-foreground">Provider</FieldLabel>
             <Select value={value.provider} onValueChange={handleProviderChange}>
               <SelectTrigger>
                 <SelectValue />
@@ -302,10 +319,34 @@ export function GeneratorSelector({
                 ))}
               </SelectContent>
             </Select>
-          </div>
+          </Field>
+          {value.provider === "cloudflare" && (
+            <>
+              <Field className="gap-2">
+                <FieldLabel className="text-xs text-muted-foreground">
+                  Cloudflare account ID
+                </FieldLabel>
+                <Input
+                  value={value.account_id}
+                  onChange={(event) => onChange({ ...value, account_id: event.target.value })}
+                />
+              </Field>
+              <Field className="gap-2">
+                <FieldLabel className="text-xs text-muted-foreground">
+                  AI Gateway ID (optional)
+                </FieldLabel>
+                <Input
+                  value={value.gateway_id ?? ""}
+                  onChange={(event) =>
+                    onChange({ ...value, gateway_id: event.target.value || undefined })
+                  }
+                />
+              </Field>
+            </>
+          )}
           {value.provider === "chatgpt" && (
-            <div className="space-y-2">
-              <Label className="text-xs text-muted-foreground">ChatGPT account</Label>
+            <Field className="gap-2">
+              <FieldLabel className="text-xs text-muted-foreground">ChatGPT account</FieldLabel>
               <Select
                 value={value.connection_id}
                 onValueChange={(id) =>
@@ -327,11 +368,11 @@ export function GeneratorSelector({
                   ))}
                 </SelectContent>
               </Select>
-            </div>
+            </Field>
           )}
           {value.provider !== "apple" && (
-            <div className="space-y-2">
-              <Label className="text-xs text-muted-foreground">Model</Label>
+            <Field className="gap-2">
+              <FieldLabel className="text-xs text-muted-foreground">Model</FieldLabel>
               <Combobox
                 options={modelOptions}
                 value={"model" in value ? value.model : undefined}
@@ -341,11 +382,11 @@ export function GeneratorSelector({
                 emptyText="Type a model name."
                 allowCustomValue={value.provider !== "chatgpt"}
               />
-            </div>
+            </Field>
           )}
           {showTemperature && value.provider !== "chatgpt" && (
-            <div className="space-y-2">
-              <Label className="text-xs text-muted-foreground">Temperature</Label>
+            <Field className="gap-2">
+              <FieldLabel className="text-xs text-muted-foreground">Temperature</FieldLabel>
               <Input
                 type="number"
                 value={value.temperature ?? defaultConfig.temperature ?? 0}
@@ -365,9 +406,9 @@ export function GeneratorSelector({
                 className={cn(temperatureDisabled && "bg-muted")}
               />
               {temperatureHelpText && (
-                <p className="text-xs text-muted-foreground">{temperatureHelpText}</p>
+                <FieldDescription className="text-xs">{temperatureHelpText}</FieldDescription>
               )}
-            </div>
+            </Field>
           )}
         </div>
       )}

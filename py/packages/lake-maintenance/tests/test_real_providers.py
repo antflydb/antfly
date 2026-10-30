@@ -409,7 +409,7 @@ def test_native_http_delegates_real_vacuum_and_replays_after_restart(
     connections = {
         "qualification": {
             "kind": "external_io",
-            "capabilities": ["lake_read", "lake_write", "storage.primary"],
+            "capabilities": ["lake.read", "lake.write", "storage.primary"],
             "external_io": {
                 "protocol": "s3",
                 "endpoint": IO_PROPERTIES["s3.endpoint"],

@@ -23,6 +23,68 @@ const ast = dependencies.sql_ast;
 pub const compiler = dependencies.sql_compiler;
 pub const runtime = dependencies.sql_runtime;
 
+/// Live preparation bytes shared by callers of one database, including plans
+/// queued for its API/writer gate. The owner is a stable path gate (or a pinned
+/// non-Lite root handle), never a serving runtime that admission can replace.
+pub const PreparationAdmission = struct {
+    limit: usize = runtime.resource_limits.preparation_bytes,
+    used: std.atomic.Value(usize) = .init(0),
+    test_after_prepare: if (@import("builtin").is_test) ?struct {
+        ptr: *anyopaque,
+        notify: *const fn (*anyopaque, usize, usize, bool) void,
+    } else void = if (@import("builtin").is_test) null else {},
+
+    pub fn budget(self: *PreparationAdmission, backing: std.mem.Allocator) dependencies.sql_memory_budget {
+        return .{
+            .backing = backing,
+            .limit = runtime.resource_limits.preparation_bytes,
+            .admission = .{ .ptr = self, .reserve = reserve, .release = release },
+        };
+    }
+    fn reserve(ptr: *anyopaque, bytes: usize) bool {
+        if (bytes == 0) return true;
+        const self: *PreparationAdmission = @ptrCast(@alignCast(ptr));
+        var used = self.used.load(.monotonic);
+        while (true) {
+            if (bytes > self.limit -| used) return false;
+            used = self.used.cmpxchgWeak(used, used + bytes, .acq_rel, .monotonic) orelse return true;
+        }
+    }
+    fn release(ptr: *anyopaque, bytes: usize) void {
+        if (bytes == 0) return;
+        const self: *PreparationAdmission = @ptrCast(@alignCast(ptr));
+        const previous = self.used.fetchSub(bytes, .release);
+        std.debug.assert(previous >= bytes);
+    }
+};
+
+/// Locking mode does not indicate whether SQL publishes persistent changes.
+/// EXPLAIN is read-only (ANALYZE rejects mutations); COMMIT can flush staged DML.
+pub fn statementMayMutate(statement: ast.Statement) bool {
+    return switch (statement) {
+        .select, .explain, .begin, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => false,
+        else => true,
+    };
+}
+
+test "capi SQL storage intent follows compiled statements including EXPLAIN and COMMIT" {
+    for ([_]struct { text: []const u8, mutates: bool }{
+        .{ .text = "SELECT 1", .mutates = false },
+        .{ .text = "EXPLAIN SELECT 1", .mutates = false },
+        .{ .text = "EXPLAIN INSERT INTO t (_id) VALUES ('x')", .mutates = false },
+        .{ .text = "EXPLAIN ANALYZE SELECT 1", .mutates = false },
+        .{ .text = "EXPLAIN ANALYZE INSERT INTO t (_id) VALUES ('x')", .mutates = false },
+        .{ .text = "/* SELECT */ INSERT INTO t (_id) VALUES ('x')", .mutates = true },
+        .{ .text = "BEGIN READ ONLY", .mutates = false },
+        .{ .text = "ROLLBACK", .mutates = false },
+        .{ .text = "COMMIT", .mutates = true },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.text, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(case.mutates, statementMayMutate(compiled.statement));
+    }
+}
+
 /// Highlight JSON is a SQL JSONB value. Build it directly in the cursor's
 /// region, owning strings before the captured search result is released.
 pub fn highlightsValueLeaky(a: std.mem.Allocator, items: anytype) !?std.json.Value {
@@ -279,6 +341,19 @@ pub fn Adapter(comptime native: type) type {
         pub fn localRequiresCoordination(self: *Self) !bool {
             if (databaseRequiresCoordination(self.db)) return true;
             if (self.handle) |handle| {
+                if (handle.owned_lite_backend != null) {
+                    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+                    defer arena.deinit();
+                    var view = self.db.core.acquireSchemaView();
+                    defer if (view) |*epoch| epoch.release();
+                    const version = if (view) |*epoch| epoch.version() else null;
+                    const metadata = self.liteCatalog(arena.allocator(), version) catch |err| switch (err) {
+                        error.IntegrityCatalogUnavailable => return true,
+                        else => return err,
+                    };
+                    for (metadata.table) |record| if (try integrity.requiresCoordination(arena.allocator(), record.schema_json)) return true;
+                    return false;
+                }
                 try @import("tables.zig").ensureDiscovered(handle);
                 // A missing namespace may contain inbound constraints. Force
                 // the complete catalog check rather than treating it as empty.
@@ -290,7 +365,47 @@ pub fn Adapter(comptime native: type) type {
             return false;
         }
 
+        fn liteCatalog(self: *Self, alloc: std.mem.Allocator, version: ?u32) !LocalCatalog {
+            const handle = self.handle.?;
+            const api = @import("tables.zig");
+            try api.loadCatalog(handle);
+            // A diagnostic without a directory entry cannot be proven free of
+            // inbound constraints. Known namespaces can use their declarations
+            // even when a serving provider could not be constructed.
+            var unavailable = handle.embedded_table_errors.keyIterator();
+            while (unavailable.next()) |name| {
+                if (!handle.embedded_table_records.contains(name.*)) return error.IntegrityCatalogUnavailable;
+            }
+            const count = handle.embedded_table_records.count() + 1;
+            const records = try alloc.alloc(topology.TableRecord, count);
+            const ranges = try alloc.alloc(topology.RangeRecord, count);
+            var used: usize = 0;
+            try self.appendMetadata(alloc, self.db, self.table_name, version, records, ranges, &used);
+            if (used == 0 and handle.embedded_table_errors.contains(self.table_name)) return error.IntegrityCatalogUnavailable;
+            if (self.db != &handle.db) try self.appendMetadata(alloc, &handle.db, "default", null, records, ranges, &used);
+            var entries = handle.embedded_table_records.iterator();
+            while (entries.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, self.table_name)) continue;
+                if (handle.embedded_tables.get(entry.key_ptr.*)) |loaded| {
+                    const before = used;
+                    try self.appendMetadata(alloc, &loaded.db, loaded.name, null, records, ranges, &used);
+                    if (used == before and handle.embedded_table_errors.contains(loaded.name)) return error.IntegrityCatalogUnavailable;
+                    continue;
+                }
+                const json = (try api.liteSchemaJson(handle, alloc, entry.value_ptr.*)) orelse {
+                    if (handle.embedded_table_errors.contains(entry.key_ptr.*)) return error.IntegrityCatalogUnavailable;
+                    continue;
+                };
+                const id = entry.value_ptr.*;
+                records[used] = .{ .table_id = id, .name = entry.key_ptr.*, .schema_json = json };
+                ranges[used] = .{ .group_id = id, .range_id = id, .table_id = id, .start_key = "", .doc_identity_shard_id = id, .doc_identity_range_id = id };
+                used += 1;
+            }
+            return .{ .table = records[0..used], .range = ranges[0..used] };
+        }
+
         pub fn localCatalog(self: *Self, alloc: std.mem.Allocator, version: u32) !LocalCatalog {
+            if (self.handle) |handle| if (handle.owned_lite_backend != null) return self.liteCatalog(alloc, version);
             // Coordinated constraints require the complete dependency catalog;
             // ordinary reads can proceed against healthy referenced tables.
             if (self.handle) |handle| {
@@ -374,11 +489,25 @@ pub fn Adapter(comptime native: type) type {
                     return output;
                 }
             }
-            const metadata = try self.localCatalog(alloc, table.schema_version);
+            const previous = if (self.transaction) |session| if (session.active) try session.commitRequests(alloc) else &.{} else &.{};
+            // Arbiters and their coverage belong to the selected table. Only
+            // staged transaction writes need the dependency catalog to replay
+            // earlier FK/unique effects. Do not open unrelated namespaces for
+            // every standalone ON CONFLICT probe; commit preparation still
+            // obtains the complete catalog for inbound/outbound constraints.
+            const metadata = if (previous.len != 0)
+                try self.localCatalog(alloc, table.schema_version)
+            else metadata: {
+                const tables = try alloc.alloc(topology.TableRecord, 1);
+                const ranges = try alloc.alloc(topology.RangeRecord, 1);
+                var used: usize = 0;
+                try self.appendMetadata(alloc, self.db, self.table_name, table.schema_version, tables, ranges, &used);
+                break :metadata LocalCatalog{ .table = tables[0..used], .range = ranges[0..used] };
+            };
             const writes = try dependencies.sql_mutation_images.writes(types.BatchWrite, alloc, mutations);
             const target_predicates = try dependencies.sql_conflict_predicate.toNative(alloc, target.conditions);
             const keys = try dependencies.sql_conflict_predicate.expressionsToNative(alloc, target.expressions);
-            const owners = try integrity.resolveConflictTargetOwnersWithScratch(alloc, scratch_alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, if (self.transaction) |session| if (session.active) try session.commitRequests(alloc) else &.{} else &.{}, .{});
+            const owners = try integrity.resolveConflictTargetOwnersWithScratch(alloc, scratch_alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, previous, .{});
             const output = try alloc.alloc(catalog.ConflictOwner, owners.len);
             for (owners, output) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .identities = owner.identities, .guard = owner };
             return output;

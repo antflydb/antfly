@@ -9,7 +9,6 @@ pub const server = @import("server.zig");
 pub const ServerRouter = server.ServerRouter;
 
 pub const A4bResidencyMode = types.A4bResidencyMode;
-pub const AdmissionConfig = types.AdmissionConfig;
 pub const AudioChunkConfig = types.AudioChunkConfig;
 pub const AudioContext = types.AudioContext;
 pub const BackendPriorityEntry = types.BackendPriorityEntry;
@@ -130,7 +129,6 @@ pub const ReadObject = types.ReadObject;
 pub const ReadRequest = types.ReadRequest;
 pub const ReadResponse = types.ReadResponse;
 pub const ReadResult = types.ReadResult;
-pub const RequestAdmissionConfig = types.RequestAdmissionConfig;
 pub const RerankObject = types.RerankObject;
 pub const RerankRequest = types.RerankRequest;
 pub const RerankResponse = types.RerankResponse;

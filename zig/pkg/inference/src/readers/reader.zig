@@ -124,7 +124,10 @@ const VisionLoadedReader = struct {
         var raw = try self.core.readRaw(image_data, forwarded);
         defer raw.deinit();
 
-        return parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
+        var parsed = try parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
+        parsed.completion = raw.completion;
+        parsed.completion_tokens = raw.completion_tokens;
+        return parsed;
     }
 
     pub fn readBatch(self: *VisionLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
@@ -177,6 +180,8 @@ const VisionLoadedReader = struct {
 
         for (raw_results, 0..) |raw, i| {
             out[i] = try parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
+            out[i].completion = raw.completion;
+            out[i].completion_tokens = raw.completion_tokens;
             filled += 1;
         }
         return .{
@@ -254,7 +259,10 @@ const NativeMoondreamLoadedReader = struct {
     pub fn read(self: *NativeMoondreamLoadedReader, image_data: []const u8, options: ReadOptions) !Result {
         var raw = try self.core.readRaw(image_data, options);
         defer raw.deinit();
-        return parseOutput(self.allocator, .moondream, raw.text, options.prompt);
+        var parsed = try parseOutput(self.allocator, .moondream, raw.text, options.prompt);
+        parsed.completion = if (std.mem.eql(u8, raw.finish_reason, "length")) .length else .complete;
+        parsed.completion_tokens = raw.tokens_used;
+        return parsed;
     }
 
     pub fn readBatch(self: *NativeMoondreamLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
@@ -453,6 +461,27 @@ pub const LoadedReader = union(enum) {
         if (batch.results.len != rasters.len) return error.InvalidReadResultCount;
         for (batch.results) |*result| try sanitizeResultUtf8(result);
         return batch;
+    }
+
+    /// The same completion budget used by each reader when max_tokens is omitted.
+    pub fn defaultMaxTokens(self: *LoadedReader) !?usize {
+        return switch (self.*) {
+            .vision => |*reader| blk: {
+                const prefix: usize = if (reader.core.dec_config.forced_bos_token_id == null) 1 else 2;
+                if (reader.core.dec_config.max_length <= prefix) return error.InvalidMaxTokens;
+                break :blk reader.core.dec_config.max_length - prefix;
+            },
+            .moondream => 256,
+            .multistage => null,
+        };
+    }
+
+    /// Resolve once and pass the same effective options to validation and execution.
+    /// Explicit values remain unchanged so callers can reject values over policy.
+    pub fn resolveMaxTokens(self: *LoadedReader, requested: ?usize, ceiling: ?usize) !?usize {
+        if (requested) |value| return value;
+        const model_default = try self.defaultMaxTokens() orelse return null;
+        return if (ceiling) |limit| @min(model_default, limit) else model_default;
     }
 
     /// Return the exact per-item textual input length produced by this loaded
@@ -1201,4 +1230,11 @@ test "Moondream readers route natively only with native checkpoint artifacts" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "moondream2/tokenizer.json", .data = "{}" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "moondream2/model.safetensors", .data = "" });
     try std.testing.expectEqual(ReaderKind.moondream, (try probeManifest(allocator, model_dir, man)).supported);
+}
+
+test "reader effective output options bound omitted defaults and preserve explicit values" {
+    var reader: LoadedReader = .{ .moondream = undefined };
+    try std.testing.expectEqual(@as(?usize, 64), try reader.resolveMaxTokens(null, 64));
+    try std.testing.expectEqual(@as(?usize, 256), try reader.resolveMaxTokens(null, null));
+    try std.testing.expectEqual(@as(?usize, 65), try reader.resolveMaxTokens(65, 64));
 }

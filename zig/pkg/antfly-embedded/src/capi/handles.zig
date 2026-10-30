@@ -66,6 +66,9 @@ pub const Handle = struct {
     sql_ddl_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     sql_commit_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     maintenance_references: usize = 0,
+    /// Independent proof readers borrow allocator/executor lifetime only;
+    /// they do not require detaching the foreground DB runtime.
+    allocator_verification_references: usize = 0,
     maintenance_publication: ?*@import("lite_connection.zig").PreparedPublication = null,
     maintenance_owner: ?*@import("lite_connection.zig").Owner = null,
     /// Live coordinator only; detached provider snapshots never drive groups.
@@ -138,6 +141,7 @@ pub const Handle = struct {
     write_mutex: std.Io.Mutex = .init,
     maintenance_mutex: std.Io.Mutex = .init,
     sql_commit_mutex: std.Io.Mutex = .init,
+    sql_preparation: @import("sql.zig").PreparationAdmission = .{},
 
     pub fn database(self: *Handle) *db_mod.DB {
         return self.selected_db orelse &self.db;

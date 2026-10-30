@@ -289,6 +289,14 @@ pub const TableReadSource = struct {
             req: db_types.SearchRequest,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?query_api.QueryResponse,
+        query_with_delivery: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_types.SearchRequest,
+            consistency: read_gate.ReadConsistency,
+            delivery: ?query_api.Delivery,
+        ) anyerror!?query_api.QueryResponse = null,
         preflight_query: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -809,6 +817,21 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?query_api.QueryResponse {
         return try BoundaryAbi.call("query", self.boundary_dispatch, self.vtable.query, .{ self.ptr, alloc, table_name, req, consistency });
+    }
+
+    /// Same admitted read and retry contract, with an optional synchronous
+    /// result consumer. Providers without it keep their owned wire response.
+    pub fn queryWithDelivery(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_types.SearchRequest,
+        consistency: read_gate.ReadConsistency,
+        delivery: ?query_api.Delivery,
+    ) !?query_api.QueryResponse {
+        if (delivery != null) if (self.vtable.query_with_delivery) |callback|
+            return try BoundaryAbi.call("query_with_delivery", self.boundary_dispatch, callback, .{ self.ptr, alloc, table_name, req, consistency, delivery });
+        return self.query(alloc, table_name, req, consistency);
     }
 
     pub const HydratedDocuments = struct {

@@ -396,6 +396,26 @@ pub fn resolveQueryExtractionAlloc(
     candidate_source: ?CandidateSource,
     embedder: ?embedder_mod.DenseEmbedder,
 ) ![]u8 {
+    return resolveQueryExtractionWithPolicyAlloc(gpa, resolvers, cfg, extraction, candidate_source, embedder, null);
+}
+
+pub const QueryPolicy = struct {
+    /// Complete adapters install both configured and live policy themselves.
+    /// Augmenting callbacks retain the established configured baseline.
+    replaces_configured_policy: bool = false,
+    ptr: *anyopaque,
+    prepare: *const fn (*anyopaque, *const ResolverConfig, Allocator, *resolver_lib.Resolver, []const resolver_lib.ExtractedEntity, ?[]const []const resolver_lib.Candidate) anyerror!void,
+};
+
+pub fn resolveQueryExtractionWithPolicyAlloc(
+    gpa: Allocator,
+    resolvers: []const ResolverConfig,
+    cfg: *const ResolverConfig,
+    extraction: []const u8,
+    candidate_source: ?CandidateSource,
+    embedder: ?embedder_mod.DenseEmbedder,
+    policy: ?QueryPolicy,
+) ![]u8 {
     if (cfg.source_artifact_kind == .chunk) return error.InvalidArgument;
     const key = try internal_keys.artifactNamedPrefixAlloc(gpa, "query", "asset", cfg.source_artifact);
     defer gpa.free(key);
@@ -427,7 +447,7 @@ pub fn resolveQueryExtractionAlloc(
     // while retaining the durable catalog's label-routing rules.
     for (resolvers) |*sibling| {
         if (std.mem.eql(u8, sibling.name, cfg.name) or !cfg.sharesRoutingDomain(sibling.*)) continue;
-        const outcome = (try processChangedExtractionWithConfigOptions(gpa, resolvers, sibling, store, null, key, candidate_source, embedder, .deferred, overlay.items, false)) orelse continue;
+        const outcome = (try processChangedExtractionWithConfigOptions(gpa, resolvers, sibling, store, null, key, candidate_source, embedder, .deferred, overlay.items, false, policy)) orelse continue;
         if (outcome.resolution_value) |value| {
             overlay.append(gpa, .{ .key = outcome.resolution_key, .value = value }) catch |err| {
                 gpa.free(outcome.resolution_key);
@@ -436,7 +456,7 @@ pub fn resolveQueryExtractionAlloc(
             };
         } else gpa.free(outcome.resolution_key);
     }
-    const outcome = (try processChangedExtractionWithConfigOptions(gpa, resolvers, cfg, store, null, key, candidate_source, embedder, .deferred, overlay.items, false)) orelse return error.InvalidArgument;
+    const outcome = (try processChangedExtractionWithConfigOptions(gpa, resolvers, cfg, store, null, key, candidate_source, embedder, .deferred, overlay.items, false, policy)) orelse return error.InvalidArgument;
     defer gpa.free(outcome.resolution_key);
     return outcome.resolution_value orelse error.InvalidArgument;
 }
@@ -453,7 +473,7 @@ pub fn processChangedExtractionWithConfig(
     persistence: PersistenceMode,
     pending_overlay: []const ArtifactWrite,
 ) !?ProcessOutcome {
-    return processChangedExtractionWithConfigOptions(gpa, resolvers, cfg, store, provider, changed_key, candidate_source, embedder, persistence, pending_overlay, true);
+    return processChangedExtractionWithConfigOptions(gpa, resolvers, cfg, store, provider, changed_key, candidate_source, embedder, persistence, pending_overlay, true, null);
 }
 
 fn processChangedExtractionWithConfigOptions(
@@ -468,6 +488,7 @@ fn processChangedExtractionWithConfigOptions(
     persistence: PersistenceMode,
     pending_overlay: []const ArtifactWrite,
     retain_work: bool,
+    query_policy: ?QueryPolicy,
 ) !?ProcessOutcome {
     var parsed = (try parseSourceArtifactKeyAlloc(gpa, changed_key)) orelse return null;
     defer parsed.deinit(gpa);
@@ -489,12 +510,14 @@ fn processChangedExtractionWithConfigOptions(
         cfg.scorer_json,
     );
     defer resolver.deinit();
-    const compiled_policy = try resolver_lib.policy_cache.acquire(cfg.aliases, cfg.merges, cfg.suppress_json, cfg.curation_json);
-    defer compiled_policy.release();
-    resolver.aliases = compiled_policy.aliases();
-    resolver.alias_index = compiled_policy.redirects();
-    resolver.curation_enabled = cfg.suppress_json.len > 0 or cfg.curation_json.len > 0;
-    resolver.curation_index = compiled_policy.index();
+    const compiled_policy = if (query_policy == null or !query_policy.?.replaces_configured_policy) try resolver_lib.policy_cache.acquire(cfg.aliases, cfg.merges, cfg.suppress_json, cfg.curation_json) else null;
+    defer if (compiled_policy) |lease| lease.release();
+    if (compiled_policy) |lease| {
+        resolver.aliases = lease.aliases();
+        resolver.alias_index = lease.redirects();
+        resolver.curation_enabled = cfg.suppress_json.len > 0 or cfg.curation_json.len > 0;
+        resolver.curation_index = lease.index();
+    }
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, parsed.resolution_scope_key, cfg.resolution_artifact);
     errdefer gpa.free(resolution_key);
@@ -592,7 +615,18 @@ fn processChangedExtractionWithConfigOptions(
         break :blk try store.get(gpa, dependency_key);
     } else null else null;
     defer if (mention_descriptions) |raw| gpa.free(raw);
+    const PolicyBridge = struct {
+        policy: QueryPolicy,
+        config: *const ResolverConfig,
+        fn prepare(ptr: *anyopaque, allocator: Allocator, target: *resolver_lib.Resolver, entities: []const resolver_lib.ExtractedEntity, candidates: ?[]const []const resolver_lib.Candidate) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.policy.prepare(self.policy.ptr, self.config, allocator, target, entities, candidates);
+        }
+    };
+    var policy_bridge: PolicyBridge = undefined;
+    if (query_policy) |loader| policy_bridge = .{ .policy = loader, .config = cfg };
     const stage = resolver_lib.ResolutionStage{
+        .query_policy = if (query_policy != null) .{ .resolver = &resolver, .ptr = &policy_bridge, .prepare = PolicyBridge.prepare } else null,
         .resolver = &resolver,
         .adjudicate = if (policy) |parsed_policy| parsed_policy.value else null,
         .adjudicator = if (batch_source) |source| if (source.vtable.adjudicate) |execute| .{ .ptr = source.ptr, .execute = execute, .execute_batch = source.vtable.adjudicate_batch, .model_revision = source.vtable.adjudicator_model_revision, .get_description = source.vtable.get_description } else null else null,

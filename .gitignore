@@ -118,3 +118,11 @@ zig-pkg/
 # Local terminal-recording takes and capture frames
 .recordings/
 .recording-current
+
+# Local checksum-verified release qualification inputs.
+/qualification-assets/
+/qualification-linux/
+/qualification-darwin/
+/qualification-server/
+# Local LangChain integration validation state
+/.state/

@@ -2574,6 +2574,10 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
         ));
         binding.written_tokens = rows;
 
+        // This fixture writes the physical prefix directly, bypassing the
+        // normal writer that establishes its logical row mapping.
+        binding.logical_contiguous = true;
+
         var decoded_keys: [rows * width]f32 = undefined;
         var decoded_values: [rows * width]f32 = undefined;
         try MetalKvStorage.gatherLayerKv(@ptrCast(owned), .{

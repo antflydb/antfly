@@ -1,0 +1,86 @@
+---
+title: LightOnOCR-3 document OCR
+description: Run LightOnOCR-3-0.8B and 4B document parsers through Antfly's native inference runtime
+---
+
+LightOnOCR-3 is Antfly's recommended OCR model. The 0.8B and 4B checkpoints are Apache-2.0 document parsers based on Qwen3.5. Each
+transcribes page images into Markdown, including HTML tables and LaTeX formulas.
+Antfly uses the integrated safetensors checkpoint with the native Qwen vision
+and hybrid-attention decoder paths.
+
+## Install
+
+```bash
+antfly inference pull lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671bd8e479c517a004f7566bd9
+```
+
+The pull installs the upstream configuration, tokenizer, chat template, image
+processor, and weights, plus a `model_manifest.json` declaring generation and
+reading. Refer to the model as `lightonai/LightOnOCR-3-0.8B`; the short alias `lightonocr3-0.8b` also resolves.
+
+The larger model uses the same image-only prompt and `/read` API:
+
+```bash
+antfly inference pull lightonai/LightOnOCR-3-4B:safetensors@b71010f095dc3735de7ee6b9969bff8f8f50b39a
+```
+
+Refer to it as `lightonai/LightOnOCR-3-4B`. The 0.8B model needs about 1.7 GB for
+weights and the 4B model about 9.1 GB, plus working memory. Both run on CPU,
+Metal, and CUDA.
+
+## Read a page
+
+Send a rendered PDF page or other document image to the inference service:
+
+```bash
+curl http://localhost:8080/ai/v1/read \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "lightonai/LightOnOCR-3-0.8B",
+    "images": [{"url": "data:image/png;base64,..."}],
+    "max_tokens": 1024
+  }'
+```
+
+Omit `prompt` or pass an empty string for transcription. This model is trained
+with an image-only prompt; a generic instruction such as `Transcribe this page`
+is rejected by `/read`. The alternative `"prompt": "grounding"` returns the
+model's native labeled bounding-box markers, descriptions, and chart tables in
+the result's `text`. These markers use coordinates normalized to 0–1000; they
+are not converted into pixel-coordinate `regions`.
+
+On Metal, and on CUDA with the LightOn batch profile, `/read` batches pages from
+the same request and from concurrent requests on the GPU.
+
+`/read` accepts up to 8192 output tokens per page and rejects truncated output.
+Use this endpoint for repeated page extraction so the reader can reuse its
+prepared execution state. The default output budget remains 256 tokens;
+request a larger budget explicitly for dense pages.
+
+## Read documents during ingestion
+
+To OCR scanned PDF pages and images as they are indexed, name the model as the
+`ocr.reader` of a `document_extraction` enrichment:
+
+```json
+{
+  "type": "document_extraction",
+  "config": {
+    "ocr": {
+      "reader": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}
+    }
+  }
+}
+```
+
+[Index PDFs and Scanned Documents](/docs/guides/index-documents) walks through the full table setup.
+
+## Image size
+
+The runtime takes its pixel limits from the installed image processor, capped at
+4096 merged vision tokens per image. Resize pages before submitting them when
+optimizing latency; LightOn's own speed evaluation uses a 1540-pixel long side.
+
+Execution details, GPU tuning switches, and measured throughput are in the
+[LightOnOCR-3 runtime notes](../../design/inference/lightonocr3-runtime.md). Published
+quality numbers are in [LightOn's evaluation](https://huggingface.co/blog/lightonai/lightonocr-3).

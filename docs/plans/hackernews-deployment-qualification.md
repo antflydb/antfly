@@ -73,7 +73,7 @@ may depend on this expiring bucket.
 
 ## October 10 measured blockers
 
-The [recorded results](../../examples/hackernews/archive-results-20261010.json)
+The [recorded results](../operations/hackernews/history/archive-results-20261010.json)
 contain the initial attempts over the same raw archive. Merged main rejected a large
 Parquet page with `ParquetRowGroupTooLarge`. The decoder fix eliminates redundant
 per-column row-reference arrays while retaining the existing materialization
@@ -284,7 +284,7 @@ Work starts from `origin/main` after PR #1066, in
 that checkout; the main checkout contains independent work.
 
 The updated detailed billing export is captured in
-[`archive-spend-20261011.json`](../../examples/hackernews/archive-spend-20261011.json).
+[`archive-spend-20261011.json`](../operations/hackernews/history/archive-spend-20261011.json).
 The six identified qualification pods cost $0.927106 gross. All HN-labelled
 benchmark pods since October 9 cost $7.996654 gross, including those six and
 other HN work. The shared import bucket has $0.277859 in exported charges;
@@ -360,7 +360,7 @@ not establish a running Firebase feed, replacement-pod recovery or serving SLO.
 
 ## First regional publication result and corrections
 
-[`publication-baseline-20261011.json`](../../examples/hackernews/publication-baseline-20261011.json)
+[`publication-baseline-20261011.json`](../operations/hackernews/history/publication-baseline-20261011.json)
 records the first completed regional one-file publication. The unchanged
 142,577-row file and all declared text/metadata indexes published, and SQL count
 passed. The qualification verdict failed: cold highlighted search took
@@ -379,7 +379,7 @@ source-free recipe identity or the segment format. This increases sidecar storag
 measured; it is not yet a qualified latency improvement. The serving candidate
 uses the same policy.
 
-The next [registration probe](../../examples/hackernews/publication-registration-20261011.json)
+The next [registration probe](../operations/hackernews/history/publication-registration-20261011.json)
 stopped before publication because the public full-text allow-list omitted
 `store_source`. Its pod was deleted and its artifact prefix was empty. Public
 create-table/create-index admission and response projection now preserve the
@@ -389,7 +389,7 @@ remain available from the authenticated segment. These are local contract
 checks, not regional latency measurements.
 
 The latest billing export still omits today's two pods. The
-[closed-pod evidence](../../examples/hackernews/archive-compute-bounds-20261011.json)
+[closed-pod evidence](../operations/hackernews/history/archive-compute-bounds-20261011.json)
 replaces their excess compute reservations with two full hours each at their
 admitted resources, preserving $10 per run for pending noncompute. This is an
 explicit upper estimate, not posted spend. Exposure is $113.301782 before another
@@ -508,7 +508,7 @@ Use the results to prioritize remaining work: publication-wide best-first traver
 if routing or irrelevant posting reads dominate; cross-file compaction if small
 historical files/segments dominate; broader bounded execution if composed or pending
 write paths remain disproportionately expensive. These changes require the ownership,
-GC and conservative bound contracts in `zig/NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md`.
+GC and conservative bound contracts in [native index execution contracts](../../zig/LAKES.md#native-index-execution-contracts).
 
 Release handoff follows the verified PR, not the benchmark binary: human-approved CI
 on the final PR revision, merge, immutable runtime release/image digest, development
@@ -535,7 +535,7 @@ identities, source authority and total normalization must remain unchanged. Qual
 this with the same 1,000-row current fixture and mutation/restart cursor checks.
 
 Final local evidence is in
-`examples/hackernews/combined-main-search-qualification-20261012.json`. The raw
+`docs/operations/hackernews/history/combined-main-search-qualification-20261012.json`. The raw
 empty-cache matrix measured 32.25–78.91 ms first-query, 7.87–9.03 ms warm p95,
 and 29.61–38.56 ms restart latency. Readiness-enabled runs measured 30.74–49.13 ms
 first-query latency and now prove positive warmup (42 planning pages before query).
@@ -639,7 +639,7 @@ separately before treating them as a performance comparison.
 
 ### Optimized 1,024-file local comparison, October 13
 
-[Recorded evidence](../../examples/hackernews/lake-scalability-qualification-20261013.json)
+[Recorded evidence](../operations/hackernews/history/lake-scalability-qualification-20261013.json)
 compares the retained optimized #1081 executable with the follow-up implementation
 on the same 142,577 logical rows, re-encoded into 1,024 Snappy files. Each executable
 ran two application-cache-cleared/restart cycles, 20 warm samples and 10 cursor
@@ -742,7 +742,7 @@ matrix results follow below.
 
 ### Rebuilt composed-query qualification, October 13
 
-[Recorded local evidence](../../examples/hackernews/composed-lake-qualification-20261013.json)
+[Recorded local evidence](../operations/hackernews/history/composed-lake-qualification-20261013.json)
 binds production revision `37fa71b50d` and the optimized executable's digest to two
 complete cycles on the same 142,577-row, 1,024-file fixture with 128 serving runs.
 Both cycles pass filters, highlights, composition, retained pagination and
@@ -779,7 +779,7 @@ measurements do not establish full-archive or managed Cloud latency.
 
 ### Restart outlier investigation after #1121
 
-[Investigation evidence](../../examples/hackernews/restart-latency-investigation-20261013.json)
+[Investigation evidence](../operations/hackernews/history/restart-latency-investigation-20261013.json)
 retains the original failures and records 35 isolated restart probes and four
 additional full sequences on the unchanged merged executable. The 4,385 ms
 single-search stall did not recur. Two sequences used process-local filesystem
@@ -869,7 +869,7 @@ They do not establish the cause of the original already-ready-cache stall or
 eliminate host paging. Keep the retained failures and require controlled-host,
 full-archive and managed Cloud qualification before treating latency as passed.
 
-[Follow-up evidence](../../examples/hackernews/cache-startup-qualification-20261013.json)
+[Follow-up evidence](../operations/hackernews/history/cache-startup-qualification-20261013.json)
 records the optimized build at `05420a779c` and three immediate-start cycles on
 the same 142,577-row fixture. First searches take 116–371 ms; a retained 128-hit
 cursor issued as the first request after restart takes 361–421 ms. Each cycle
@@ -1079,3 +1079,233 @@ recorded in the local request log. The historical failed warm matrix remains
 above rather than being replaced by this passing run. These bounded shared-host
 measurements do not prove the historical outlier's cause or qualify full-archive,
 concurrent-ingestion or Antfly Cloud service latency.
+
+
+### Matched comparison and RC handoff, October 20
+
+Work proceeds from `origin/main` at `51cfaa8f6ef8ccc8b14f7c7b3201b84a36863449`
+in `.worktrees/perf-hn-rc-search-comparison`. The published `v0.3.0-rc.1`
+runtime is a separate qualification target at
+`408644a86163292366dc54d5306f4a4657e4e755`; it contains #1128, while main
+has additional retained-query recovery and publication fixes. The optimized
+main builds and post-merge one-file comparison have completed; their results
+are recorded below separately from the release candidate. Latest-main results
+must not be represented as release-candidate results.
+
+The original local fixture was gone. A surviving bounded sample was downloaded
+from the existing import bucket without another export or cloud compute job.
+Its 142,577 rows and Parquet SHA-256
+`e568043355dd35700f29e9a6c055f3e4dd541724e4c844db3436f409d38b5a52`
+match the October 12 comparison exactly. Both engines use these source bytes.
+DuckDB 1.5.6 builds a local FTS index with four threads; extension loading and
+construction precede query timing. Antfly includes HTTP transport, uses default
+native scheduling, and declares the same metadata indexes with stored source.
+The shared macOS ARM64 host remains uncontrolled; OS caches are not flushed.
+The initial RC/DuckDB diagnostic runs overlap the optimized main build, so their
+latency differences are not controlled attribution to code or layout alone.
+Serving-cache reset and fresh process do not imply cold OS pages, and Antfly's
+readiness/profiling interval permits background warming.
+
+The RC archive was verified against the published artifact checksum
+`d784eb630cddd36ae0892eef9f361473b79337724ab6c6101cad5882bb431165`.
+Unhighlighted, highlighted and composed results are recorded separately; raw
+reports and logs remain outside the repository. No cross-engine score or order
+identity is asserted because analyzers and scoring differ.
+
+[Colony PR #795](https://github.com/antflydb/colony/pull/795) registers the RC as a
+candidate with automatic upgrades disabled, pinned to Artifact Registry digest
+`sha256:d686ce3bcda6a0d30f3617a99a5ea2ae83b8d720bb761e7d862c9dc9c3d69a77`.
+Catalog delivery is separate from a Colony application release. The existing
+manual instance-update target can select a pinned runtime for a disposable
+ready development instance without making it an automatic target. No catalog
+apply, managed instance upgrade, infrastructure apply or public route was run.
+
+Next, qualify the exact release through an organization-owned development Cloud
+instance and authenticated route, using durable tenant-scoped object storage.
+Verify operator/storage compatibility, publication, current updates, composed
+search, cursors, credential refresh, replacement recovery and restore behavior.
+Reconcile the existing budget before an archive-scale reservation. Promote the
+catalog only after environment evidence, and add the ongoing producer, public
+route and operational limits after managed acceptance. The optional standalone
+foundation in Colony #762 and its 20 GiB disk are not prerequisites. If required
+main fixes are absent from RC1 or RC qualification fails, publish and qualify a
+new RC before that rollout.
+
+#### Published RC1 results
+
+All RC matrices pass the harness correctness checks, including exact filters,
+projected highlights where requested, stable IDs/scores, 1,408 unique cursor hits
+and mutable composed cursor replay after restart. Each warm p95 uses 20 samples.
+Construction is measured separately from searches.
+
+| Measurement | DuckDB FTS, one file | RC1 plain, one file | RC1 highlighted, one file | RC1 highlighted, 1,024 files |
+| --- | ---: | ---: | ---: | ---: |
+| First archive search | 31–46 ms | 273 ms | 82 ms | 542 ms |
+| Warm archive p95 | 13–16 ms | 16 ms | 13 ms | 192 ms |
+| Archive search after restart | Not measured | 80 ms | 118 ms | 324 ms |
+| Cold union | Not measured | Not measured | 131 ms | 343 ms |
+| Warm union p95 | Not measured | Not measured | 36 ms | 196 ms |
+| Cold saved overlay | Not measured | Not measured | 580 ms | 671 ms |
+| Warm saved-overlay p95 | Not measured | Not measured | 43 ms | 240 ms |
+| Antfly publication readiness | Not comparable | 50 s | Reuses publication | 610 s |
+
+The unhighlighted RC `database`, `postgres`, `sqlite` and `AI` workload p95s
+are 18, 20, 16 and 28 ms; DuckDB's corresponding p95 ranges across two fresh
+processes are 13–16, 11–14, 11–12 and 13–14 ms. These are functional workload
+comparisons, not identical analyzers or relevance rankings. An individual cold
+highlighted run being faster than its unhighlighted predecessor does not prove
+highlighting reduces work; these are separate shared-host runs.
+
+The fragmented fixture preserves all rows but uses contiguous equal-count splits
+into 1,024 DataPageV2/Snappy files, totaling 68,995,609 bytes. Its canonical
+name/size/content-hash inventory digest is
+`c3fcf4a5e0ec1e8985332008e2a2327abc0e772dec7246aa8f7d3ef6c57c0498`.
+This is a newly generated layout, not an assertion of byte identity with the
+October 14 split files. During construction, a local artifact scan observed
+297,615 object files totaling 11,376,019,063 bytes across 65 attempt directories;
+large object names did not repeat in that scan. This is a construction-time
+observation, not retained live bytes after GC. Archive qualification must include
+construction duration, object counts and GC, rather than only foreground latency.
+The 1,024-file union and overlay still pass the 2,000 ms cold and 750 ms warm gates;
+neither retains a composed request above 750 ms and diagnostic drops are zero.
+
+
+Three additional RC1 restarts clear the serving cache and issue the saved-overlay
+query immediately after the readiness probe, with no profiling sleep. First
+requests take 979, 414 and 378 ms. The following 20 warm requests per cycle have
+p95 267, 257 and 213 ms; none exceeds 293 ms. Table identities, IDs and scores
+match the full-matrix result and each hit has a body highlight. These direct
+checks cover the previously unmeasured immediate-readiness window, while still
+retaining OS pages and using the shared host. They are not pod cold-start or
+managed scale-to-zero measurements.
+
+
+RC1's 273 ms plain cold request spends 239 ms in the lake search phase,
+28 ms afterward and under 1 ms before search; about 5 ms is outside lake
+execution. The cold gap to DuckDB is therefore mostly engine work in this sample,
+not HTTP transport. These coarse phases do not isolate reader opening from
+ranking, so they do not identify the precise optimization on their own.
+
+PR #1196 coverage and suggested qualification are recorded in the
+[review comment](https://github.com/antflydb/antfly/pull/1196#issuecomment-6296069184).
+That reviewed head is absent from both the RC and initial pinned main baseline;
+the RC evidence does not measure that PR's performance improvement.
+
+#### Main comparison after merging #1196
+
+PR #1196 merged as `f322acc4deaf5d57c8f6b117f0d21e2c5729e176`.
+The isolated benchmark branch merged that main revision without conflicts at
+`9ddf7e7f98e94c1d43b947c9f3b1c1975c03d088`; its changes relative to main
+are this qualification document. Both optimized builds passed. Preserved base
+`51cfaa8f6e` and merged-main executable SHA-256 values are respectively
+`c4ab2a09952bd3a031af7ceb5b86f33eb5fc24cb94a8533c1eda9084fab883b9`
+and `b0036ee479760d39f2deb9aa419fb2d7a1552efbc0b7d297e7516a14b92c5071`.
+These revisions include intervening changes beyond #1196, so their difference
+does not isolate the PR's causal effect.
+
+The merged `native_search_comparison.py` harness ran two serial cycles on the
+same one-file source, alternating binary order. Each case used a fresh private
+state, a 4,096 MiB process envelope, concurrency one, disabled navigation warming,
+an empty serving cache after publication, and an immediate first archive query
+without metric-refresh sleeps. Each warm p95 uses 20 samples. OS pages remained
+uncontrolled and CPU affinity was unset. Our build had finished before testing;
+other builds remained active, load average was approximately 10 and swap usage
+was approximately 32 GiB near the start. These are diagnostic observations.
+
+| Measurement | Pre-merge main, two cycles | Merged main, two cycles | Refreshed DuckDB, two cycles |
+| --- | ---: | ---: | ---: |
+| First plain BM25 search | 47 / 263 ms | 93 / 97 ms | 236 / 53 ms |
+| Warm plain BM25 p95 | 14 / 11 ms | 23 / 17 ms | 25 / 25 ms |
+| Search after restart | 38 / 52 ms | 52 / 94 ms | Not measured |
+| Publication readiness | 56 / 123 s | 66 / 106 s | Existing FTS index reused |
+| Physical post-run artifact bytes | 3.15 / 3.01 GB | 3.55 / 3.47 GB | Not comparable |
+| Physical post-run artifact objects | 83,976 / 80,277 | 96,100 / 93,692 | Not comparable |
+
+All four native cases passed ranked search, exact indexed filters, residual-filter
+agreement, snapshot pagination, restart scores and cursor replay, empty date
+filters and concurrent-search checks. The DuckDB refresh reused the same source
+and FTS database with the previous four-thread setup. Its fresh-process cold
+variation, and pre-merge main's cold variation, prevent a controlled cold-parity
+or regression claim. Merged-main warm p95 was higher than the pre-merge samples;
+an isolated rerun is needed before attributing that difference to code.
+The artifact counts include retained and attempt-private objects after the run,
+not live or post-GC storage. A single-file run does not qualify shared-scan gains
+over fragmented input.
+
+The first merged-main post-restart phase profile recorded 51 ms inside lake
+execution, including 35 ms search. Inclusive text subphases recorded 1.5 ms
+reader opening, 1.4 ms term planning, 2.2 ms navigation and 32.5 ms postings.
+They overlap and must not be summed. This is a restart profile, not the
+immediate cold request, whose profiling sleeps were intentionally bypassed.
+It does not support treating reader opening as the dominant remaining cost.
+
+The serial 1,024-file highlighted/composed comparison also completed, with the
+same source rows, memory envelope and cache settings. The harness generates one
+contiguous split fixture for the pair and records each file's content hash;
+these are not assertions of byte identity with the earlier RC split fixture.
+This pair has one fresh state per binary rather than two alternating cycles.
+Shared-host resource use changed during the pair, so the observed improvements
+do not establish a controlled speedup attributable to #1196.
+
+| Measurement, 1,024 files | Pre-merge main | Merged main |
+| --- | ---: | ---: |
+| Publication readiness | 727 s | 530 s |
+| First highlighted archive search | 510 ms | 394 ms |
+| Warm highlighted archive p95 | 231 ms | 101 ms |
+| Highlighted search after restart | 1,339 ms | 123 ms |
+| Cold union / warm union p95 | 1,155 / 679 ms | 195 / 235 ms |
+| Cold saved overlay / warm overlay p95 | 635 / 403 ms | 216 / 127 ms |
+| Maximum warm saved overlay | 2,844 ms | 132 ms |
+| Physical post-run artifact bytes | 8.58 GB | 8.63 GB |
+| Physical post-run artifact objects | 271,866 | 276,231 |
+| Whole-run child peak RSS | 522 MiB | 803 MiB |
+
+Both cases passed highlights without widening source projection, exact metadata
+filters and residual agreement, retained pagination and restart scores, plus
+union history, overlay nonmatching suppression, saved-source visibility and
+mutable composed cursor recovery after restart. Top-five archive HN identifiers
+and scores also match across revisions in both layouts. The measured composed
+cold/p95 pairs pass the existing 2,000/750 ms gates; these gates do not constrain
+every individual warm request. The baseline's 2,844 ms overlay outlier has a
+retained profile: native-leaf work takes 2,024 ms and cursor retention 700 ms,
+with zero diagnostic drops. Merged main retains no composed request above
+750 ms during this matrix; diagnostic drops remain zero. This bounded sample
+does not prove that the historical outlier is impossible.
+
+The merged-main fragmented restart profile records 121 ms inside lake execution:
+48 ms before search, 65 ms searching and 9 ms afterward. Inclusive text timings
+include 9 ms opening, 12 ms term planning, 11 ms navigation and 49 ms postings.
+Those nested scopes must not be summed. Both binaries emit catalog-routing
+snapshot retry warnings during construction, and merged main also defers native
+checkpoint warming after a deadline. Neither run terminates with an engine
+error. Physical footprint does not show a reduction in this pair; it includes
+retained and attempt-private artifacts and does not qualify GC or live storage
+cost. The RSS statistic is the maximum child-process RSS over the whole harness,
+including construction, not a query-only or aggregate process-tree measurement.
+
+Three further merged-main restarts clear the serving cache and query the saved
+overlay immediately after readiness, retaining the 4,096 MiB process budget and
+disabled navigation warming. First searches take 437, 200 and 228 ms; each
+following 20-query burst has p95 149, 167 and 197 ms. No warm query exceeds
+257 ms. Exact top-hit identities/scores and highlight presence pass, without
+pre-query metric-refresh sleeps. OS pages remain retained; this is not managed
+pod replacement or scale-to-zero qualification.
+
+Next, use an isolated fixed-resource environment for reproducible latency and
+construction attribution, recording admitted builder paths, scan/checkpoint
+work, provider requests and live versus orphan storage after bounded GC. Carry
+the construction retry and warming warnings into concurrent-ingestion and
+maintenance qualification. The new text timers support targeted investigation
+of postings/navigation and admission work rather than assuming reader opening
+dominates. Qualify any new RC through the managed Cloud route before promotion;
+these measurements are from main, not the published RC1 image.
+
+Main advanced to `6632c4dd276ac644d1a25a81f57ef83740d0549f` during the run,
+including #1232's merge-recovery and harness changes and #1214's HTTP method
+authorization fixes. The executable measurements above remain pinned to
+`f322acc4de`; those later changes are not covered by the runtime results.
+Use the actual next release revision for managed qualification rather than
+treating a moving main reference as already measured.
+
+Focused harness and metrics tests passed (16 tests). No new cloud compute,
+catalog apply, instance upgrade or release tag was created for these runs.

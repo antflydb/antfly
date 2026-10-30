@@ -22,12 +22,12 @@ const codec = @import("../backup_codec.zig");
 const portable = @import("../portable_backup.zig");
 const artifact_ids = @import("../db/artifact_ids.zig");
 const canonical = @import("../db/document_content_hash.zig");
-const staging = @import("restore_staging.zig");
+const portable_metadata = @import("portable_metadata.zig");
 const resolver_catalog = @import("../db/catalog/resolver_catalog.zig");
 const ProducerType = @import("../db/enrichment/asset_producer.zig").ProducerType;
 const enrichment_types = @import("../db/enrichment/enrichment_types.zig");
 const hbs = @import("handlebars");
-const template_runtime = @import("../../template.zig");
+const template_runtime = if (@import("builtin").is_test) @import("../../template.zig") else @import("../../template_inspection.zig");
 const chunking_types = @import("../../chunking/types.zig");
 
 pub const report_version = 1;
@@ -271,15 +271,6 @@ fn number(v: Value) u32 {
     return if (v == .integer and v.integer > 0 and v.integer <= std.math.maxInt(u32)) @intCast(v.integer) else 0;
 }
 
-fn producerEnabled(value: Value, fallback: bool) bool {
-    if (value == .bool) return value.bool;
-    if (value == .object) {
-        const enabled = get(value, "enabled");
-        return enabled != .bool or enabled.bool;
-    }
-    return fallback;
-}
-
 fn modelBackedProducer(producer: Value) bool {
     const producer_type = ProducerType.parse(str(get(producer, "type"))) orelse return false;
     const config = get(producer, "config");
@@ -289,10 +280,9 @@ fn modelBackedProducer(producer: Value) bool {
         // Labels may embed vocabulary prompts; media outputs may repair a
         // consumer. Both require destination inference evidence on restore.
         .generator, .extractor, .transcriber, .decision, .vector_labels, .media_output => true,
-        // Extraction uses the default OCR model for PDF fallback unless
-        // explicitly disabled; transcription is separately opt-in.
-        .document_extraction => producerEnabled(get(config, "ocr"), producerEnabled(get(config, "ocr_fallback"), true)) or
-            producerEnabled(get(config, "transcription"), producerEnabled(get(config, "transcribe_audio"), false)),
+        // Extraction needs a model only when an `ocr` or `transcription`
+        // block names one; native text extraction runs without inference.
+        .document_extraction => get(config, "ocr") == .object or get(config, "transcription") == .object,
         .reader => str(get(config, "model")).len > 0 or eq(provider, "antfly") or eq(provider, "openai") or eq(provider, "vertex") or eq(provider, "apple"),
         .copy => false,
     };
@@ -358,7 +348,7 @@ pub const Inspector = struct {
                 while (try reader.next()) |e| {
                     self.report.metadata_records += 1;
                     if (std.mem.endsWith(u8, e.key, ":indexes")) {
-                        const json = try staging.tableIndexesJsonFromPortableMetadata(self.allocator, e.value, null);
+                        const json = try portable_metadata.tableIndexesJsonFromPortableMetadata(self.allocator, e.value, null);
                         defer self.allocator.free(json);
                         try self.indexCatalogJson(json);
                     } else if (std.mem.endsWith(u8, e.key, ":replication_sources")) {
@@ -443,6 +433,23 @@ pub const Inspector = struct {
         defer parsed.deinit();
         switch (parsed.value) {
             .object => |object| {
+                // Catalog incarnations fence runtime ownership; they do not
+                // change the executable model contract. Remove only these
+                // top-level index fields from our private parse, preserving
+                // nested producer settings and every source file byte.
+                var definitions = object.iterator();
+                while (definitions.next()) |entry| {
+                    if (entry.value_ptr.* != .object) continue;
+                    _ = entry.value_ptr.object.orderedRemove("_index_incarnation");
+                    _ = entry.value_ptr.object.orderedRemove("_coverage_incarnation");
+                    // AIDX catalogs expose that same lifecycle identity on
+                    // the native wrapper, outside executable config_json.
+                    const definition = entry.value_ptr.*;
+                    const native_kind = str(get(definition, "kind"));
+                    if (get(definition, "config_json") == .string and
+                        (eq(native_kind, "dense_vector") or eq(native_kind, "sparse_vector")))
+                        _ = entry.value_ptr.object.orderedRemove("coverage_generation");
+                }
                 var sources = object.iterator();
                 while (sources.next()) |entry| try self.collectSources(entry.value_ptr.*, 0);
                 var it = object.iterator();
@@ -1071,7 +1078,7 @@ pub const Inspector = struct {
             try output.appendSlice(self.allocator, fragment);
             strip_next = strip.close;
         }
-        @import("../../template_remote.zig").validateRenderedTemplate(self.allocator, output.items) catch |err| {
+        @import("../../template_inspection.zig").validateRenderedTemplate(self.allocator, output.items) catch |err| {
             if (err == error.OutOfMemory) return err;
             try self.report.add(self.options, .source_unresolved, "template_error", doc, field, 0);
             return;
@@ -1163,7 +1170,7 @@ pub const Inspector = struct {
         const source_scheme = @import("antfly_scraping").contentScheme(scheme.scheme) catch
             return self.locator(prefix[0 .. colon + 1], doc, field);
         switch (source_scheme) {
-            .http, .https, .s3 => {},
+            .http, .https, .s3, .gs => {},
             .file, .data => unreachable, // Classified above.
         }
         if (!std.mem.startsWith(u8, prefix[colon + 1 ..], "//")) return;
@@ -1262,6 +1269,32 @@ pub const Inspector = struct {
                     return;
                 };
                 const origin = try std.fmt.allocPrint(a, "{s}://{s}", .{ uri.scheme, host });
+                try self.report.add(self.options, .connection, origin, doc, field, 0);
+            },
+            .gs => {
+                // Validate literal components with the runtime parser. An open
+                // template key or generation value is not a missing value yet.
+                // Keep the original spelling so invalid bucket casing cannot
+                // become valid merely through inventory normalization.
+                const candidate = if (complete) text else blk: {
+                    var probe = try std.Uri.parse(text);
+                    if (!path_complete and probe.path.percent_encoded.len <= 1)
+                        probe.path = .{ .percent_encoded = "/__preflight__" };
+                    if (probe.query) |query| {
+                        if (query.percent_encoded.len == 0) {
+                            probe.query = null;
+                        } else if (eq(query.percent_encoded, "generation=")) {
+                            probe.query = .{ .percent_encoded = "generation=1" };
+                        }
+                    }
+                    break :blk try std.fmt.allocPrint(a, "{f}", .{probe});
+                };
+                const location = @import("antfly_scraping").parseGcsLocationAlloc(a, candidate) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    try self.report.add(self.options, .source_unresolved, "invalid_gcs_uri", doc, field, 0);
+                    return;
+                };
+                const origin = try std.fmt.allocPrint(a, "gs://{s}", .{location.bucket});
                 try self.report.add(self.options, .connection, origin, doc, field, 0);
             },
             .file, .data => unreachable, // Classified before retrieval inspection.
@@ -1499,6 +1532,64 @@ test "backup preflight prior context selects runtime artifact items and rejects 
     try std.testing.expect(!report.analysis_complete);
     try std.testing.expectEqual(@as(u64, 1), count(report, .dynamic_loader));
     try std.testing.expectError(error.PreflightLimitExceeded, inspector.metadataJson(public));
+}
+
+test "backup preflight index incarnation does not change model compatibility" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"exact-model"},"_index_incarnation":17}}
+    );
+    const first = report.requirements.items[0].sha256;
+    const requirements = report.requirements.items.len;
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"exact-model"},"_index_incarnation":29,"_coverage_incarnation":11}}
+    );
+    try std.testing.expectEqual(requirements, report.requirements.items.len);
+    try std.testing.expectEqualStrings(&first, &report.requirements.items[0].sha256);
+    // Executable configuration must remain bound even when lifecycle identity
+    // is ignored. A different field or model still requires separate evidence.
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","type":"embeddings","field":"title","dimension":3,"embedder":{"provider":"antfly","model":"exact-model"},"_index_incarnation":17}}
+    );
+    try std.testing.expectEqual(requirements + 1, report.requirements.items.len);
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"different-model"},"_index_incarnation":17}}
+    );
+    try std.testing.expectEqual(requirements + 3, report.requirements.items.len);
+    // A similarly named nested producer setting is still executable input.
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"exact-model","_index_incarnation":17}}}
+    );
+    try std.testing.expectEqual(requirements + 5, report.requirements.items.len);
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"exact-model","_index_incarnation":29}}}
+    );
+    try std.testing.expectEqual(requirements + 7, report.requirements.items.len);
+}
+
+test "backup preflight native index coverage generation is not model identity" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","kind":"dense_vector","config_json":"{\"field\":\"body\",\"dims\":3,\"embedder\":{\"model\":\"exact-model\"}}","coverage_generation":17}}
+    );
+    const requirements = report.requirements.items.len;
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","kind":"dense_vector","config_json":"{\"field\":\"body\",\"dims\":3,\"embedder\":{\"model\":\"exact-model\"}}","coverage_generation":29}}
+    );
+    try std.testing.expectEqual(requirements, report.requirements.items.len);
+    // Keep every byte of the native executable config bound to evidence.
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","kind":"dense_vector","config_json":"{\"field\":\"title\",\"dims\":3,\"embedder\":{\"model\":\"exact-model\"}}","coverage_generation":17}}
+    );
+    try std.testing.expectEqual(requirements + 2, report.requirements.items.len);
 }
 
 test "backup preflight context property names remain valid index catalog names" {
@@ -1739,11 +1830,9 @@ test "backup preflight implicit producer detection excludes deterministic produc
         .{ .json = "{\"producer\":{\"type\":\"copy\"}}", .model_count = 0 },
         .{ .json = "{\"kind\":\"asset\",\"source_artifact_name\":\"vectors\",\"producer\":{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"}]}}}", .model_count = 1 },
         .{ .json = "{\"kind\":\"asset\",\"source_artifact_name\":\"clips\",\"producer\":{\"type\":\"media_output\",\"config\":{\"output_name\":\"speech\"}}}", .model_count = 1 },
-        .{ .json = "{\"producer\":{\"type\":\"document_extraction\"}}", .model_count = 1 },
-        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr_fallback\":false}}}", .model_count = 0 },
-        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr\":false}}}", .model_count = 0 },
-        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":false}}}}", .model_count = 0 },
-        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr\":false,\"transcription\":true}}}", .model_count = 1 },
+        .{ .json = "{\"producer\":{\"type\":\"document_extraction\"}}", .model_count = 0 },
+        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}}}}}", .model_count = 2 },
+        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"transcriber\":{\"provider\":\"apple\"}}}}}", .model_count = 2 },
     }) |case| {
         var report: Report = .{ .allocator = a };
         defer report.deinit();
@@ -2964,18 +3053,18 @@ test "backup preflight partial reader lists retain static local sources" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"blocked\"") != null);
 }
 
-test "backup preflight unsupported GCS helper schemes cannot be certified" {
+test "backup preflight GCS helpers require connections and reject unsupported aliases" {
     const a = std.testing.allocator;
-    var incorrectly_compatible = false;
     for ([_][]const u8{ "gs", "gcs" }) |scheme| {
         const uri = try std.fmt.allocPrint(a, "{s}://bucket/source.txt", .{scheme});
         defer a.free(uri);
-        try std.testing.expectError(error.UnsupportedUrlScheme, @import("antfly_scraping").downloadContentAlloc(a, uri, null, null));
+        const supported = eq(scheme, "gs");
+        try std.testing.expectError(if (supported) error.GcsConnectionNotFoundOrOutOfScope else error.UnsupportedUrlScheme, @import("antfly_scraping").downloadContentAlloc(a, uri, null, null));
         const source_template = try std.fmt.allocPrint(a, "{{{{remoteText url=\"{s}\"}}}}", .{uri});
         defer a.free(source_template);
         const producer = "{\"type\":\"copy\",\"config\":{}}";
         try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "copy", .kind = .asset, .template = source_template, .producer_json = producer });
-        try std.testing.expectError(error.TransientPromptFailure, @import("../../template_remote.zig").renderJsonToValidatedTextWithConfig(a, source_template, "{}", .{}));
+        try std.testing.expectError(if (supported) error.PermanentPromptFailure else error.TransientPromptFailure, @import("../../template_remote.zig").renderJsonToValidatedTextWithConfig(a, source_template, "{}", .{}));
         var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
         defer report.deinit();
         var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
@@ -2992,10 +3081,10 @@ test "backup preflight unsupported GCS helper schemes cannot be certified" {
         const json = try report.jsonAlloc(evidence);
         defer a.free(json);
         const compatible = std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"compatible\"") != null;
-        try std.testing.expect(!report.analysis_complete);
-        incorrectly_compatible = incorrectly_compatible or compatible;
+        try std.testing.expectEqual(supported, report.analysis_complete);
+        try std.testing.expectEqual(supported, compatible);
+        try std.testing.expectEqual(supported, count(report, .connection) > 0);
     }
-    try std.testing.expect(!incorrectly_compatible);
 }
 
 test "backup preflight partial reader JSON definitions keep known origins and fail closed on unknown structure" {
@@ -3175,6 +3264,70 @@ test "backup preflight S3 template prefixes defer only an open object key" {
         var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
         defer inspector.deinit();
         const metadata = try std.json.Stringify.valueAlloc(a, .{ .name = "reader", .kind = "asset", .source_template = case.text, .producer = .{ .type = "reader" } }, .{});
+        defer a.free(metadata);
+        try inspector.metadataJson(metadata);
+        try std.testing.expectEqual(case.connection, count(report, .connection));
+        try std.testing.expectEqual(case.unresolved, count(report, .source_unresolved));
+        try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
+        try std.testing.expectEqual(case.unresolved == 0, report.analysis_complete);
+    }
+}
+
+test "backup preflight GCS sources require bucket evidence and retain runtime locator validation" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson("[{\"kind\":\"asset\",\"source_field\":\"url\",\"producer_json\":\"{\\\"type\\\":\\\"document_extraction\\\"}\"}]");
+    try inspector.document("doc", "{\"url\":\"gs://bucket/objects/CaseSensitive.pdf?generation=123\"}", "");
+    try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
+    const requirement = for (report.requirements.items) |*r| {
+        if (r.kind == .connection) break r;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(&requirementHash(.connection, "gs://bucket"), &requirement.sha256);
+    try std.testing.expectEqual(Verdict.unknown, evaluate(requirement, null).verdict);
+    try std.testing.expectEqual(Verdict.unknown, evaluate(requirement, .{ .version = 1, .configuration_id = "empty" }).verdict);
+    const denied_caps = [_]Capability{.{ .requirement_sha256 = &requirement.sha256, .supported = false }};
+    try std.testing.expectEqual(Verdict.blocked, evaluate(requirement, .{ .version = 1, .configuration_id = "missing-reader", .requirements = &denied_caps }).verdict);
+    const caps = [_]Capability{.{ .requirement_sha256 = &requirement.sha256, .supported = true }};
+    try std.testing.expectEqual(Verdict.compatible, evaluate(requirement, .{ .version = 1, .configuration_id = "gcs-reader", .requirements = &caps }).verdict);
+    for ([_][]const u8{
+        "gs://bucket/",                 "gs://Bucket/key",                           "gs://user@bucket/key",         "gs://bucket:443/key",
+        "gs://bucket/key?generation=0", "gs://bucket/key?generation=1&generation=2", "gs://bucket/key?token=secret", "gs://bucket/key#page=1",
+        "gs://bucket/key%ZZ",
+    }) |uri| try inspector.locator(uri, "invalid", "url");
+    try std.testing.expectEqual(@as(u64, 9), count(report, .source_unresolved));
+    try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
+    const json = try report.jsonAlloc(null);
+    defer a.free(json);
+    for ([_][]const u8{ "CaseSensitive", "secret", "gs://bucket" }) |value|
+        try std.testing.expect(std.mem.indexOf(u8, json, value) == null);
+}
+
+test "backup preflight GCS templates defer only open locator components" {
+    const a = std.testing.allocator;
+    const Case = struct { text: []const u8, connection: u64, unresolved: u64 };
+    for ([_]Case{
+        .{ .text = "gs://bucket/{{key}}", .connection = 1, .unresolved = 0 },
+        .{ .text = "gs://bucket/key?generation={{generation}}", .connection = 1, .unresolved = 0 },
+        .{ .text = "gs://bucket/key?generation=123", .connection = 1, .unresolved = 0 },
+        .{ .text = "gs://bucket/key?{{query}}", .connection = 1, .unresolved = 0 },
+        .{ .text = "gs://bucket/", .connection = 0, .unresolved = 1 },
+        .{ .text = "gs://bucket/key?generation=", .connection = 0, .unresolved = 1 },
+        .{ .text = "gs://bucket/?generation={{generation}}", .connection = 0, .unresolved = 1 },
+        .{ .text = "gs://bucket/key?generation=0{{generation}}", .connection = 0, .unresolved = 1 },
+        .{ .text = "gs://bucket/key?token={{token}}", .connection = 0, .unresolved = 1 },
+        .{ .text = "gs://bucket:443/{{key}}", .connection = 0, .unresolved = 1 },
+        .{ .text = "gs://Bucket/{{key}}", .connection = 0, .unresolved = 1 },
+        .{ .text = "gs://{{bucket}}/key", .connection = 0, .unresolved = 0 },
+    }) |case| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .name = "pdf", .kind = "asset", .source_template = case.text, .producer = .{ .type = "document_extraction" } }, .{});
         defer a.free(metadata);
         try inspector.metadataJson(metadata);
         try std.testing.expectEqual(case.connection, count(report, .connection));

@@ -187,6 +187,24 @@ pub fn requireDatabase(handle: *h.Handle) !void {
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return error.UnsupportedSqlExecution;
 }
 
+/// Read schema declarations at the captured Lite root without constructing
+/// index/provider runtimes. This is metadata, not a serving-capability proof;
+/// integrity reads still open and validate every owner they actually use.
+pub fn liteSchemaJson(handle: *h.Handle, alloc: std.mem.Allocator, id: u64) !?[]u8 {
+    const backend = if (handle.owned_lite_backend) |*value| value else return error.UnsupportedSqlExecution;
+    const namespace = try catalog.namespaceAlloc(alloc, id);
+    defer alloc.free(namespace);
+    var options: h.db_mod.OpenOptions = .{};
+    try backend.configureDbOpenOptionsForNamespace(&options, namespace);
+    var probe = try options.primary_runtime_store.?.beginProbe();
+    defer probe.abort();
+    const json = probe.get(@import("../storage/internal_keys.zig").public_schema_json_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try alloc.dupe(u8, json);
+}
+
 pub fn get(handle: *h.Handle, name: []const u8) !*h.db_mod.DB {
     try loadCatalog(handle);
     if (std.mem.eql(u8, name, "default")) return &handle.db;
@@ -390,7 +408,7 @@ pub fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) callcon
         return @call(.auto, @extern(*const @TypeOf(antfly_db_list_tables_json), .{ .name = "antfly_db_list_tables_json" }), .{ ptr, out });
     h.capi.clearLastError();
     out.* = .{};
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = api.enterHandleWithIntent(ptr, .exclusive, .read_only) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return h.capi.ensureError(code, @src().fn_name);
@@ -420,7 +438,7 @@ pub fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?*anyopa
         return @call(.auto, @extern(*const @TypeOf(antfly_db_open_table), .{ .name = "antfly_db_open_table" }), .{ ptr, name, out });
     h.capi.clearLastError();
     out.* = null;
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = api.enterHandleWithIntent(ptr, .exclusive, .read_only) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return h.capi.ensureError(code, @src().fn_name);

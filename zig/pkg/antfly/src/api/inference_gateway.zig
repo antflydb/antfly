@@ -18,14 +18,15 @@ const std = @import("std");
 const httpx = @import("httpx");
 const sources = @import("antfly_local_sources");
 const registry = sources.common_provider_registry;
-const gateway = registry.gateway;
-const tasks = registry.tasks;
+const gateway = @import("antfly_local_sources").common_inference_gateway;
+const tasks = @import("antfly_local_sources").common_inference_tasks;
 const Json = std.json.Value;
 const payloads = @import("inference_payload.zig");
+pub const source_media = @import("inference_source.zig");
 const empty_registry = registry.Registry.init(std.heap.page_allocator);
 const generating = sources.generating_mod;
 
-pub const public_paths: []const []const u8 = &.{ "/ai/v1/models", "/ai/v1/chat/completions", "/ai/v1/embeddings", "/ai/v1/decisions", "/ai/v1/read", "/ai/v1/extract", "/ai/v1/rewrite", "/ai/v1/rerank", "/ai/v1/chunk", "/ai/v1/transcribe", "/ai/v1/dictate", "/ai/v1/synthesize", "/ai/v1/embed", "/ai/v1/generate", "/ai/v1/generate/batch", "/ml/v1/predict", "/ml/v1/predictors", "/ml/v1/models", "/ai/v1/transcription/sessions", "/ai/v1/transcription/sessions/:session_id", "/ai/v1/transcription/sessions/:session_id/audio", "/ai/v1/transcription/sessions/:session_id/events", "/ai/v1/transcription/sessions/:session_id/stream" };
+pub const public_paths: []const []const u8 = &.{ "/ai/v1/models", "/ai/v1/chat/completions", "/ai/v1/embeddings", "/ai/v1/decisions", "/ai/v1/read", "/ai/v1/extract", "/ai/v1/rewrite", "/ai/v1/rerank", "/ai/v1/chunk", "/ai/v1/transcribe", "/ai/v1/dictate", "/ai/v1/synthesize", "/ai/v1/embed", "/ai/v1/generate", "/ai/v1/generate/batch", "/ml/v1/predict", "/ml/v1/predictors", "/ml/v1/models", "/ai/v1/transcription/sessions", "/ai/v1/transcription/sessions/:session_id", "/ai/v1/transcription/sessions/:session_id/audio", "/ai/v1/transcription/sessions/:session_id/events", "/ai/v1/transcription/sessions/:session_id/stream", "/ai/v1/read/jobs", "/ai/v1/read/jobs/:job_id", "/ai/v1/read/jobs/:job_id/result", "/ai/v1/read/jobs/:job_id/events", "/ai/v1/read/jobs/:job_id/resume", "/ai/v1/read/jobs/:job_id/cancel", "/ai/v1/extract/jobs", "/ai/v1/extract/jobs/:job_id", "/ai/v1/extract/jobs/:job_id/result", "/ai/v1/extract/jobs/:job_id/events", "/ai/v1/extract/jobs/:job_id/resume", "/ai/v1/extract/jobs/:job_id/cancel" };
 
 pub fn taskForOperation(operation: []const u8) ?gateway.Task {
     const Pair = struct { []const u8, gateway.Task };
@@ -69,6 +70,7 @@ const ExecutionOptions = struct {
     attempt_limit: u8 = 8,
     operation: ?[]const u8 = null,
     attachments: ?[]const httpx.attachment_envelope.Attachment = null,
+    source_port: ?source_media.Port = null,
     authorization: ?[]const u8 = null,
     attempt_observer: ?httpx.AttemptObserver = null,
 };
@@ -369,8 +371,11 @@ pub fn execute(server: anytype, ctx: *httpx.Context, task: gateway.Task) !httpx.
 
 /// The registered handler supplies operation identity; URI spelling never selects an adapter.
 pub fn executeOperation(server: anytype, ctx: *httpx.Context, task: gateway.Task, operation: ?[]const u8) !httpx.Response {
+    return executeOperationWithSources(server, ctx, task, operation, null);
+}
+pub fn executeOperationWithSources(server: anytype, ctx: *httpx.Context, task: gateway.Task, operation: ?[]const u8, port: ?source_media.Port) !httpx.Response {
     var budget: sources.sql_memory_budget = .{ .backing = ctx.allocator, .limit = 64 * 1024 * 1024 };
-    return executeBounded(server, ctx, task, budget.allocator(), .{ .attempt_limit = try attemptBudget(ctx), .operation = operation }) catch |err| {
+    return executeBounded(server, ctx, task, budget.allocator(), .{ .attempt_limit = try attemptBudget(ctx), .operation = operation, .source_port = port }) catch |err| {
         if (err == error.InferenceResponseCommitted) return err;
         if (budget.exhausted) return error.InferenceRequestTooLarge;
         return err;
@@ -387,6 +392,7 @@ fn executeBounded(server: anytype, ctx: *httpx.Context, task: gateway.Task, back
     var execution = options;
     execution.attachments = payload.attachments;
     const request = payload.value;
+    try source_media.resolve(a, request, execution.source_port);
     if (request != .object) return error.InvalidInferenceRequest;
     if (try generatedSelector(task, request)) |model| return executeGenerated(server, ctx, task, a, request, model, execution);
     var effective = request;
@@ -541,7 +547,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             .predict => "ml/predict",
         }, encoded, fallback, observation, execution_options);
     }
-    if (task == .extract or task == .rewrite or task == .predict) {
+    if (task == .extract or task == .predict or (task == .rewrite and named.providers.rewriter_configs.get(target.configured.name).?.generator == null)) {
         const binding = if (task == .extract) named.providers.extractor_configs.get(target.configured.name).? else if (task == .rewrite) named.providers.rewriter_configs.get(target.configured.name).? else named.providers.predictor_configs.get(target.configured.name).?;
         var forwarded = request;
         try forwarded.object.put(a, "model", .{ .string = binding.model });
@@ -562,6 +568,17 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
         const encoded = try std.json.Stringify.valueAlloc(a, forwarded, .{});
         if (cfg.api_url.len > 0) return forwardEndpoint(server, ctx, cfg.api_url, null, "chunk", encoded, false, observation, execution_options);
         return forward(server, ctx, if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id, "chunk", encoded, false, observation, execution_options);
+    }
+    if (task == .read) {
+        const cfg = try named.readers.?.getConfig(target.configured.name);
+        if (cfg.provider == .antfly) {
+            const encoded = try tasks.readingBody(a, cfg, request);
+            // Reads are completed JSON results. Keep the full document envelope
+            // available to ordinary and batch callers, including artifact handles.
+            var read_options = execution_options;
+            read_options.response_delivery = .buffered;
+            return forward(server, ctx, try std.fmt.allocPrint(a, "readers/{s}", .{target.configured.name}), "read", encoded, fallback, observation, read_options);
+        }
     }
     if (task == .transcribe) {
         const cfg = try named.transcribers.?.getConfig(target.configured.name);
@@ -781,7 +798,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                 if (executor.inference_api_url) |url| cfg.url = try gateway.apiBaseAlloc(a, url);
                 cfg.api_key = cfg.api_key orelse executor.inference_api_key;
             }
-            const scores = try @import("../reranking/mod.zig").rerankContentWithOptions(a, &client, cfg, .{
+            const scores = try @import("../reranking/mod.zig").rerankContentWithOptions(a, if (cfg.provider == .cloudflare) try server.embedding_provider_runtime.httpClient() else &client, cfg, .{
                 .antfly_provider = server.antfly_provider,
                 .secret_store = server.cfg.secret_store,
                 .execution = .{ .default_endpoint = executor.inference_api_url },
@@ -818,6 +835,13 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                 .transcript = .{ .text = result.text orelse "", .language = result.language, .duration_ms = result.duration_ms, .segments = result.segments },
             });
             return ctx.json(.{ .object = "list", .model = model, .data = .{.{ .object = "transcription", .index = @as(usize, 0), .text = result.text orelse "", .language = result.language, .duration_ms = result.duration_ms, .segments = result.segments, .speakers = if (speakers.items.len > 0) speakers.items else null }} });
+        },
+        .rewrite => {
+            const inputs = request.object.get("inputs") orelse return error.InvalidInferenceRequest;
+            if (inputs != .array or inputs.array.items.len == 0 or inputs.array.items.len > 128) return error.InvalidInferenceRequest;
+            const texts = try a.alloc([]const u8, inputs.array.items.len);
+            for (inputs.array.items, texts) |input, *text| text.* = try string(input);
+            return ctx.json(try executor.rewrite(a, name, model, texts));
         },
         .synthesize => {
             var adapted = request;
@@ -1112,7 +1136,7 @@ fn prepareGeneration(a: std.mem.Allocator, cfg: generating.GeneratorConfig, requ
 
 fn generationAdapterSupportsImages(provider: generating.Provider) bool {
     return switch (provider) {
-        .openai, .openrouter, .ollama, .antfly, .gemini, .vertex, .bedrock, .anthropic => true,
+        .cloudflare, .openai, .openrouter, .ollama, .antfly, .gemini, .vertex, .bedrock, .anthropic => true,
         .apple, .mock, .chatgpt => false,
     };
 }
@@ -1157,7 +1181,7 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
         const prepared = try prepareGeneration(a, link.generator_config orelse try named.providers.getGeneratorConfig(link.generator_name.?), candidate, options.operation orelse "generate");
         cfg.* = prepared.config;
         try named.capabilities(qualified).require(prepared.requirements);
-        if (cfg.provider != .openai and cfg.provider != .openrouter and cfg.provider != .ollama and cfg.provider != .antfly and cfg.provider != .gemini and cfg.provider != .vertex and cfg.provider != .bedrock and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
+        if (cfg.provider != .cloudflare and cfg.provider != .openai and cfg.provider != .openrouter and cfg.provider != .ollama and cfg.provider != .antfly and cfg.provider != .gemini and cfg.provider != .vertex and cfg.provider != .bedrock and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
     }
     const previous_deadline = ctx.application_deadline_ns;
     const previous_clock = ctx.application_deadline_io;
@@ -1206,6 +1230,9 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
 }
 
 pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
+    return batchWithSources(server, ctx, null);
+}
+pub fn batchWithSources(server: anytype, ctx: *httpx.Context, port: ?source_media.Port) !httpx.Response {
     var budget: sources.sql_memory_budget = .{ .backing = ctx.allocator, .limit = 64 << 20 };
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();
@@ -1235,7 +1262,7 @@ pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
     const results = try a.alloc(Result, items.array.items.len);
     var succeeded: usize = 0;
     const deadline = @import("../request_deadline.zig").platformDeadline(ctx) orelse @import("connections.zig").inferenceInvocationDeadlineNs();
-    const options = ExecutionOptions{ .response_delivery = .buffered, .attempt_limit = try attemptBudget(ctx) };
+    const options = ExecutionOptions{ .response_delivery = .buffered, .attempt_limit = try attemptBudget(ctx), .source_port = port };
     for (items.array.items, results, 0..) |item, *result, index| {
         result.* = .{ .custom_id = item.object.get("custom_id").?.string, .index = index };
         if (ctx.isCancellationRequested()) return error.Canceled;
@@ -1542,9 +1569,15 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
     var guard = tasks.FallbackSink{ .downstream = observed };
     const encoded = try payloads.encodeMetadata(ctx.allocator, body, options.attachments);
     defer if (options.attachments != null) ctx.allocator.free(encoded);
-    var client = httpx.Client.initWithConfig(ctx.allocator, server.inferenceIo(), .{ .keep_alive = false });
-    defer client.deinit();
-    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, &client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = if (options.attachments != null) httpx.attachment_envelope.content_type else "application/json", .attempt_observer = observeAttempt(ctx, options.attempt_observer) }) catch |err| {
+    var owned_client: ?httpx.Client = null;
+    defer if (owned_client) |*client| client.deinit();
+    const client: ?*httpx.Client = if (owner == .target) null else if (std.mem.eql(u8, operation, "read"))
+        try server.embedding_provider_runtime.assetHttpClient()
+    else blk: {
+        owned_client = httpx.Client.initWithConfig(ctx.allocator, server.inferenceIo(), .{ .keep_alive = false });
+        break :blk &owned_client.?;
+    };
+    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = if (options.attachments != null) httpx.attachment_envelope.content_type else "application/json", .attempt_observer = observeAttempt(ctx, options.attempt_observer) }) catch |err| {
         if (transport.started or guard.committed) return error.InferenceResponseCommitted;
         return guard.failure orelse err;
     };

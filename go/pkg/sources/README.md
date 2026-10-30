@@ -1,7 +1,7 @@
 # Portable source ingestion
 
 This module acquires canonical text from GitHub repositories and collaboration
-resources, Google Drive (including Docs and Slides text exports), GCS, and S3.
+resources, Google Workspace (Drive, Gmail and Calendar), Slack, Discord, GCS, and S3.
 It has no Colony, Cloud account, PostgreSQL, or Antfly CLI dependency.
 
 `Connector` receives credentials through an injected client/access resolver.
@@ -50,8 +50,19 @@ reuse a connection. Other connection forms:
   scoped to the selected repositories/resources. Config accepts `repositories`
   with per-repository `repository`, `ref`, `prefix` and `include` selections.
   Supported includes: code, issues, prs, comments, reviews and discussions.
-- Drive: `provider: "google_drive"`, `credentials_env: "SOURCE_GOOGLE_JSON"`;
-  config has `folder_id` and optional `shared_drive_id`.
+- Google Workspace: `provider: "google_workspace"`,
+  `credentials_env: "SOURCE_GOOGLE_JSON"`, and explicit `services` containing
+  `drive`, `gmail`, and/or `calendar` (default: Drive only). Source configs select
+  `resource: "drive"` with `folder_id` and optional `shared_drive_id`,
+  `resource: "gmail"` with optional `label_ids`, or `resource: "calendar"` with
+  `calendar_ids`. One connection can supply separately shared sources for each.
+- Slack: `provider: "slack"`, `token_env: "SOURCE_SLACK_TOKEN"`; source config
+  has `team_id` and `channel_ids`. The token must read the selected channels and
+  their replies. Membership and workspace identity are checked explicitly.
+- Discord: `provider: "discord"`, `token_env: "SOURCE_DISCORD_TOKEN"`; source
+  config has `guild_id` and `channel_ids`. The bot needs message-content access,
+  channel visibility and history permissions. Threads are included by default;
+  `include_threads: false` limits selection to explicitly named channels.
 - GCS: `provider: "gcs"`, the same explicit Google JSON reference;
   config has `bucket` and optional `prefix` or `key`.
 - S3-compatible storage: optional `s3_endpoint`, `s3_insecure`, and
@@ -60,6 +71,16 @@ reuse a connection. Other connection forms:
 Google credentials are service-account or authorized-user JSON. There is no
 ambient ADC fallback or browser enrollment. The caller owns secret storage;
 Google token renewal is handled by the injected OAuth client.
+
+Set `attachments: true` on a Slack, Discord, Gmail, Calendar, or Drive source to
+extract attached/binary content. Text, HTML, DOCX and PPTX work directly; PDFs
+require `pdftotext`, and images require `tesseract`, or an injected extractor.
+Unsupported formats and failed extraction stop publication explicitly. Calendar
+Drive attachments also require the connection's `drive` service. Drive links,
+mail thread headers, calendar invitation UIDs, and attachment parent identities
+are retained as relationships; linked content remains independently authorized.
+See [collaboration source design](../../../docs/design/collaboration-sources.md)
+for the hosted onboarding flow, scale limits, and qualification requirements.
 
 ```sh
 antfly-source sync --config sources.json \
@@ -98,24 +119,34 @@ incomplete inventories leave the catalog stale. GitHub omitted identities are
 checked independently before deletion. Legacy provider-key rows are retired only when present in the ownership journal.
 
 The catalog is marked syncing before writes and published atomically after
-readiness and reconciliation. Its permission lease starts at enumeration, not
-retry completion (default 900 seconds, configurable 60..86400). Grep rejects
+readiness and reconciliation. For collaboration providers, a fresh container-access check before publication starts
+the permission lease. Other providers retain the enumeration-time lease
+(default 900 seconds, configurable 60..86400). Grep rejects
 pending, syncing, stale or expired bindings. Existing Antfly server authorization
 remains responsible for current access during retained query snapshots.
 
-Each item is at most 32 MiB of complete UTF-8 text; each inventory has at most
-10,000 items, and a sync reads at most 10 GiB. Metadata/state/catalog sizes are
+Each item is at most 32 MiB of complete UTF-8 text; collaboration inventories admit up to 100,000 items (other providers retain their
+10,000-item limit), and a sync reads at most 10 GiB. Metadata/state/catalog sizes are
 bounded separately. A bounded `max_objects` listing is not deletion authority and
-cannot establish a complete searchable publication. Binary extraction, Sheets
+cannot establish a complete searchable publication. Sheets
 whole-workbook extraction, visual rendering, provider-native ACL mirroring,
 webhooks, distributed scheduling and live-provider qualification are outside this
 runner's current text-ingestion scope. Removing a source from configuration hides
 it from the emitted catalog and retains its indexed records/state; it is not a
 purge request.
 
-Ownership of up to 100,000 potentially written rows is retained across interrupted
-inventories; active inventories remain limited to 10,000 items. Reconciliation
+Ownership of up to 1,000,000 potentially written rows is retained across interrupted
+inventories; active inventory limits still apply. Reconciliation
 checks deletion visibility before publishing a searchable catalog.
+
+Gmail persists history IDs and Calendar persists per-calendar sync tokens after a
+successful publication. Expired cursors trigger a complete rebuild. Successful
+inventory pages are checkpointed privately so rate-limited backfills can resume;
+checkpoints do not replace current access checks. Slack and Discord use complete
+polling inventories; event-driven ingestion and Drive changes cursors remain future
+work. Provider reads still verify pinned content on each publication. Calendar sync also
+refreshes previously imported Drive attachments, whose files can change without a
+Calendar event update.
 
 ## Durable Antfly catalog
 
@@ -177,15 +208,35 @@ exclusive key range, so reconciling one source cannot remove another source's
 records or unrelated application keys. Hosted deployments still reserve source
 tables to protect their ACL markers.
 
-The writer first queries normalized metadata, preserving `indexed_at` only when
-all canonical fields and the content digest are unchanged. Volatile enumeration
-positions are excluded. Non-destructive LinearMerge pages compare canonical
-content hashes and skip unchanged rows. Every page must pass the shared snapshot
-readiness barrier. Only a fully verified authoritative inventory can issue the
-final bounded cleanup, retaining its verified IDs without uploading their text a
-second time. Partial selections, failed reads, and repair retries never reconcile
-missing rows. Provider access/absence checks precede cleanup, and a fresh query
-proves the range contains no extra records before catalog publication.
+The writer first queries a bounded list of document identities using
+`{"query":{"doc_id":{"ids":["DOCUMENT_KEY"]}}}` and requires a successful fresh
+snapshot. It compares the complete normalized projection and content digest,
+including the outer ownership/filtering fields. Identical rows are verified
+without issuing a content merge, and keep their original `indexed_at`. Input
+text must match its normalized SHA-256 digest. Volatile enumeration positions
+are excluded. Mixed pages merge only the changed rows, with deletion disabled;
+those rows must pass the shared snapshot readiness barrier.
+
+Only a fully verified authoritative inventory can reconcile missing rows.
+After provider access/absence checks, a bounded fresh range query proves whether
+there are extra records. A clean range rechecks retained IDs in bounded fresh queries and finishes without a cleanup merge;
+otherwise the final scoped merge retains all verified IDs and a fresh query
+proves that cleanup is visible. Thus an unchanged sync sends no content or
+cleanup merges. Partial selections, failed reads and failed writes never
+reconcile missing rows. No-op results include verified rows in `Skipped`, with
+no mutation cursor or range acknowledgement.
+
+Read-only data-plane GETs and POST queries retry transient transport failures
+and HTTP 408/425/429/500/502/503/504 up to three total attempts, within a shared
+30-second budget or the caller's earlier deadline. Backoff is cancellable and
+honors a supported `Retry-After`; a cooldown longer than the remaining budget
+returns the error immediately. Batch, table creation and scoped merges are never
+blindly retried. An ambiguous or invalid merge acknowledgement closes that
+writer to further mutation or cleanup. Resume the durable source run: its
+ownership journal and pinned inventory survive, and a new writer uses fresh
+visibility proofs before deciding which rows or range still need work. A
+committed write or cleanup whose acknowledgement was lost is therefore not
+replayed just to obtain another acknowledgement.
 
 The existing `/tables/{table}/merge` endpoint accepts the versioned
 `application/vnd.antfly.scoped-merge.v1+json` envelope (`scoped_merge` with explicit
@@ -204,3 +255,132 @@ stable, and overlapping writers for the same source must be serialized (the
 standalone state lock or Colony's job admission). Distinct sources can sync
 independently. `antfly-grep` continues to use the catalog and ordinary queries;
 it does not schedule ingestion.
+
+
+Workspace consent expansion preserves standalone acquisition checkpoints and the
+published Gmail/Calendar incremental baseline. Only the connection's service list
+is excluded from replay identity; credential references, source selection and
+sharing remain bound, and resumed reads recheck current account/service access.
+Old checkpoints adopt this identity when their complete old configuration still
+matches. If that proof is unavailable after an earlier configuration change, use
+an explicit restart to select fresh content.
+
+
+Standalone collaboration leases begin at the start of the final permission audit.
+The audit receives the configured TTL as its deadline; an expired audit keeps its
+pinned inventory for retry and leaves the source stale. A slow check cannot mint
+a new full lease after its earliest scope checks have aged out.
+
+Google API errors retain a bounded reason code and provider `Retry-After` deadline.
+Documented `rateLimitExceeded` and `userRateLimitExceeded` responses are retryable
+on HTTP 403 as well as 429. Permission, domain-policy, usage-cap and unknown 403
+errors remain permanent. The same classification applies to Gmail, Calendar and
+legacy Drive/GCS acquisition, including Calendar-linked Drive downloads/exports.
+`IsRateLimited` recognizes wrapped errors for audit waits and progress accounting;
+provider messages and response bodies never enter persisted error diagnostics.
+
+Discord previews sample at most eight channel/thread containers and never follow
+archive cursors; narrowing the selection is required when the sample is exhausted.
+Normal syncs retain complete archive pagination. Google OAuth refresh failures use
+the same safe retry/cooldown contract as resource errors: transient failures retry,
+invalid grants remain permanent, and token response bodies are not retained.
+
+Calendar attachment previews acquire at most eight Drive files; unsampled files
+receive no Drive reads. Attachment downloads and native exports share the remaining
+parent byte budget. Discord resource lists reuse one guild authority snapshot and
+preserve provider rate limits instead of treating them as missing access.
+
+Slack lease renewal requires live granular history grants (and files:read for
+attachments); channel membership alone is insufficient. Missing scope proofs never
+renew a lease. Slack bot tokens require include_threads:false for channel sources.
+Calendar confidential visibility is private. Extractor v3 invalidates older
+visibility metadata. Discord moderators use effective parent-channel permissions;
+ordinary private-thread readers still require explicit membership.
+
+Gmail permission audits prove current body-reading authority through one live,
+one-result, ID-only search request. Gmail forbids search queries for metadata-only
+credentials, so a profile/label grant cannot renew retained bodies. Proof responses
+are never persisted, even with acquisition caching enabled. Successful proof is
+shared only within the current bounded audit, including empty mailboxes.
+
+Gmail attachment bytes are acquired lazily after preview selection and remaining
+parent byte limits. Previews read at most eight attachments; full sync retains all
+selected attachments and Calendar invitation relationships. Known oversized parts
+fail before download, and base64 size limits apply before decoded allocation.
+
+Discord acquisition and audits share guild authority, channel metadata and active
+threads only within the current operation and access-check window. New audits
+always recheck live grants. Moderators use the complete private archive endpoint;
+ordinary readers use joined private archives. Complete archive pagination and
+absence reconciliation retain accessible messages after a thread is archived.
+
+Calendar `writerWithoutPrivateAccess` is selectable like `reader`: ordinary events
+remain readable, while retained private/confidential details cannot be renewed or
+reused through this restricted role. Unknown and free/busy-only roles are rejected.
+
+Calendar alias/role resolution is shared within each bounded audit and acquisition
+phase. A 20-calendar audit makes 20 calendar metadata reads, rather than 230.
+New audits and publication checks clear proofs; long operations refresh expired
+proofs. Provider failures never become permission proofs.
+
+Drive authorization verifies the actual token's content scopes as well as the
+file's canDownload capability. A drive.file grant also requires isAppAuthorized
+on that file; metadata-only grants cannot authorize retained content. Missing or
+malformed scope proof remains retryable without renewing publication access.
+Permission metadata uses the exact token whose grant was checked, with no content
+reads or token-info requests. Scope text and tokens never enter diagnostics.
+
+Build Google clients with GoogleHTTPClient(ctx, credentials) after loading them
+through GoogleCredentialsForServices. This preserves verified service-account
+JWT scope provenance when token response scopes are omitted. Custom OAuth clients
+must expose an oauth2.Transport with actual token scope extras; opaque transports
+or authorized-user tokens without scope proof cannot authorize cached Drive data.
+
+## Local native end-to-end qualification
+
+The regular Go suite uses HTTP protocol fixtures. To exercise the real database,
+first build `antfly` and `antfly-grep` from the same checkout, start a dedicated
+loopback-only standalone, and pass its API to the opt-in test:
+
+```sh
+# From zig/, using the repository's supported compiler and worktree caches:
+make build
+zig build grep -Dgrep-only=true
+# Start in a separate terminal; keep all server state inside this worktree.
+source_e2e_dir="$PWD/../.cache/source-e2e"
+mkdir -p "$source_e2e_dir"
+cat > "$source_e2e_dir/config.json" <<EOF
+{"public_inference":{"enabled":false},"inference":{"models_dir":"$source_e2e_dir/models"},"secrets":{"native":{"name":"native","path":"$source_e2e_dir/secrets.json"},"environment":true}}
+EOF
+./zig-out/bin/antfly standalone --config "$source_e2e_dir/config.json" \
+  --host 127.0.0.1 --port 18080 --control-tick-ms 5 \
+  --data-dir "$source_e2e_dir/data" \
+  --replica-root-dir "$source_e2e_dir/replicas" \
+  --replica-catalog-path "$source_e2e_dir/catalog.txt" \
+  --snapshot-root-dir "$source_e2e_dir/snapshots" --auth false --health false
+
+# From go/pkg/sources/:
+ANTFLY_SOURCES_E2E_URL=http://127.0.0.1:18080/db/v1 \
+ANTFLY_GREP_TEST_BINARY="$PWD/../../../zig/zig-out/bin/antfly-grep" \
+GOWORK=off GOEXPERIMENT=simd go test -v -run '^TestLocalAntflySourcePipeline$' -timeout 20m
+```
+
+Use a fresh standalone data directory. The test refuses non-loopback endpoints
+and creates uniquely named synthetic tables in the supplied database. It runs the
+actual source CLI against a local S3 fixture, publishes 475 records plus another
+source sharing the table, and invokes native grep through file and table catalogs.
+It checks no-op synchronization, changed records, post-commit connection loss,
+cleanup recovery, upstream access failure, and preservation of foreign records.
+`ANTFLY_SOURCES_E2E_RECORDS=4` selects a short smoke run; the default is 475.
+`ANTFLY_SOURCE_TEST_BINARY` may select an already-built source CLI.
+
+Native GCS PDF artifact fetching has a separate opt-in test in
+`examples/grepstein/local_e2e_test.go`. From that example directory, set
+`ANTFLY_GREPSTEIN_E2E_BINARY` to the same Antfly binary and run
+`go test -v -run '^TestLocalNativeGCSExtraction$' -timeout 10m` with `GOWORK=off`
+and `GOEXPERIMENT=simd`. It starts its own isolated standalone with a scoped GCS
+connection and a local storage fixture, then verifies generation-bound PDF text
+extraction, the qualification gate, and owner-side bucket/prefix/version rejection.
+These tests do not qualify real Google identity exchange or model-based OCR,
+embeddings, relationship extraction, or production GPU capacity. They are
+explicitly opt-in and do not make normal source-module tests build Antfly.

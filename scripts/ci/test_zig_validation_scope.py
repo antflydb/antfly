@@ -106,7 +106,13 @@ class ZigValidationScopeTests(unittest.TestCase):
         )
 
         def selected(
-            job, *, full=False, pr="7", event="workflow_dispatch", **overrides
+            job,
+            *,
+            full=False,
+            pr="7",
+            event="workflow_dispatch",
+            matrix=False,
+            **overrides,
         ):
             values = {
                 "inputs.full_validation": full,
@@ -123,13 +129,18 @@ class ZigValidationScopeTests(unittest.TestCase):
                 "needs.changes.outputs.trace_validate": "true",
                 "needs.changes.outputs.e2e": "true",
                 "needs.e2e-base-build.result": "success" if pr else "skipped",
-                "needs.e2e-base-plan.result": "success"
-                if pr and not full
-                else "skipped",
+                "needs.e2e-base-plan.result": "success",
                 "needs.e2e-full-build.result": "skipped" if pr else "success",
             }
             values.update(overrides)
-            condition = blocks[job].split("${{", 1)[1].split("}}", 1)[0]
+            condition = (
+                blocks[job]
+                .split("include: >-", 1)[1]
+                .split("fromJSON(", 1)[1]
+                .split(") }}", 1)[0]
+                if matrix
+                else blocks[job].split("${{", 1)[1].split("}}", 1)[0]
+            )
             condition = re.sub(
                 r"\b(?:inputs|github|needs)\.[\w.-]+",
                 lambda m: repr(values[m[0]]),
@@ -145,7 +156,68 @@ class ZigValidationScopeTests(unittest.TestCase):
                 .replace("&&", " and ")
                 .replace("||", " or ")
             )
-            return bool(eval(" ".join(condition.split()), {"__builtins__": {}}))
+            result = eval(" ".join(condition.split()), {"__builtins__": {}})
+            return json.loads(result) if matrix else bool(result)
+
+        # Grep selects one profile for the same admitted suite as its gate.
+        # Full validation must not rerun the base compile/test job as well.
+        grep_profiles = (
+            ({}, "base", 500),
+            ({"full": True}, "full", 5000),
+            ({"pr": "", "event": "push"}, "full", 5000),
+            ({"pr": "", "event": "merge_group"}, "full", 5000),
+            ({"pr": ""}, "full", 5000),
+            (
+                {"pr": "", "event": "schedule", "github.event.schedule": "0 8 * * *"},
+                "full",
+                5000,
+            ),
+            (
+                {"pr": "", "event": "schedule", "github.event.schedule": "0 3 * * 0"},
+                "base",
+                500,
+            ),
+        )
+        for context, suite, count in grep_profiles:
+            with self.subTest(grep_context=context):
+                self.assertTrue(selected("grep-qualification", **context))
+                self.assertEqual(
+                    selected("grep-qualification", matrix=True, **context),
+                    [{"suite": suite, "cases": count}],
+                )
+        for context in (
+            {"needs.admission.result": "failure"},
+            {"github.run_attempt": 2},
+            {
+                "needs.changes.outputs.zig_tests": "false",
+                "needs.changes.outputs.model_check": "false",
+                "needs.changes.outputs.trace_validate": "false",
+            },
+            {"pr": "", "inputs.validation_scope": "inference-e2e"},
+            {"pr": "", "event": "push", "github.ref": "refs/heads/other"},
+        ):
+            with self.subTest(grep_skipped=context):
+                self.assertFalse(selected("grep-qualification", **context))
+        grep = blocks["grep-qualification"]
+        self.assertIn("name: zig-${{ matrix.suite }} / grep", grep)
+        self.assertIn("needs: [admission, changes]", grep)
+        self.assertIn("DIFFERENTIAL_CASES: ${{ matrix.cases }}", grep)
+        self.assertIn('--cases "$DIFFERENTIAL_CASES"', grep)
+        self.assertIn("grep grep-test", grep)
+        self.assertIn("test_grep_packaging.py", grep)
+        benchmarks = grep.split(
+            "      - name: Benchmark native CPU and cache configurations\n", 1
+        )[1].split("\n      - ", 1)[0]
+        self.assertIn("if: matrix.suite == 'full'", benchmarks)
+        self.assertIn("--extended --codecs", benchmarks)
+        self.assertIn("for jobs in 1 2 4 8;", benchmarks)
+        self.assertIn("name: zig-${{ matrix.suite }}-grep", grep)
+        for gate in ("zig-base", "zig-full"):
+            self.assertIn("grep-qualification]", blocks[gate])
+            self.assertIn(
+                "GREP_RESULT: ${{ needs.grep-qualification.result }}", blocks[gate]
+            )
+            self.assertIn('test "$GREP_RESULT" = "success"', blocks[gate])
 
         full_jobs = [
             "zig-full-tests",
@@ -160,10 +232,22 @@ class ZigValidationScopeTests(unittest.TestCase):
             "zig-base-wasm",
             "zig-base-lite-models",
             "zig-base",
-            "e2e-base-plan",
             "e2e-base-tests",
             "e2e-base",
         ]
+        self.assertTrue(selected("e2e-base-plan"))
+        self.assertTrue(selected("e2e-base-plan", full=True))
+        self.assertTrue(selected("e2e-base-plan", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "e2e-base-plan", full=True, **{"needs.admission.result": "failure"}
+            )
+        )
+        self.assertFalse(
+            selected(
+                "e2e-full-tests", full=True, **{"needs.e2e-base-plan.result": "failure"}
+            )
+        )
         for job in full_jobs:
             with self.subTest(job=job):
                 self.assertTrue(selected(job, full=True))
@@ -208,11 +292,13 @@ class ZigValidationScopeTests(unittest.TestCase):
         # coverage. Full validation must not hide a failed specialized lane.
         aggregate = blocks["e2e-full"]
         self.assertIn(
-            "e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]",
+            "e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance, better-auth]",
             aggregate,
         )
         self.assertIn("LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}", aggregate)
-        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1])
+        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1]).split(
+            "\n- uses:", 1
+        )[0]
         for build, tests, low_fd, required, native, success in (
             ("success", "success", "success", "true", "success", True),
             ("success", "success", "failure", "true", "success", False),
@@ -232,16 +318,30 @@ class ZigValidationScopeTests(unittest.TestCase):
                         **os.environ,
                         "BUILD_RESULT": build,
                         "TEST_RESULT": tests,
+                        "PLAN_RESULT": "success",
                         "LOW_FD_RESULT": low_fd,
                         "REQUIRE_LOW_FD": required,
                         "NATIVE_SDK_RESULT": native,
                         "PGWIRE_DRIVER_RESULT": "success",
+                        "BETTER_AUTH_RESULT": "success",
                     },
                     check=False,
                     capture_output=True,
                 )
                 self.assertEqual(result.returncode == 0, success, result.stderr)
 
+        self.assertTrue(selected("better-auth"))
+        self.assertTrue(selected("better-auth", full=True))
+        self.assertTrue(selected("better-auth", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "better-auth",
+                **{
+                    "needs.e2e-base-build.result": "failure",
+                    "needs.e2e-full-build.result": "skipped",
+                },
+            )
+        )
         self.assertTrue(selected("embedded-sdk-native"))
         self.assertTrue(selected("embedded-sdk-native", full=True))
         self.assertTrue(selected("embedded-sdk-native", pr="", event="push"))
@@ -271,9 +371,14 @@ class ZigValidationScopeTests(unittest.TestCase):
         # cannot be hidden by otherwise successful E2E and native SDK results.
         for job in ("e2e-base", "e2e-full"):
             command = textwrap.dedent(blocks[job].split("run: |\n", 1)[1])
-            if job == "e2e-base":
-                command = command.split("\n- uses:", 1)[0]
-            for driver in ("success", "failure", "skipped"):
+            command = command.split("\n- uses:", 1)[0]
+            for driver, auth in (
+                ("success", "success"),
+                ("failure", "success"),
+                ("skipped", "success"),
+                ("success", "failure"),
+                ("success", "skipped"),
+            ):
                 with self.subTest(job=job, driver=driver):
                     result = subprocess.run(
                         ["bash", "-c", command],
@@ -286,12 +391,15 @@ class ZigValidationScopeTests(unittest.TestCase):
                             "REQUIRE_LOW_FD": "true",
                             "NATIVE_SDK_RESULT": "success",
                             "PGWIRE_DRIVER_RESULT": driver,
+                            "BETTER_AUTH_RESULT": auth,
                         },
                         check=False,
                         capture_output=True,
                     )
                     self.assertEqual(
-                        result.returncode == 0, driver == "success", result.stderr
+                        result.returncode == 0,
+                        driver == auth == "success",
+                        result.stderr,
                     )
 
     def test_base_native_wasm_and_model_qualification_have_independent_owners(self):
@@ -350,7 +458,9 @@ class ZigValidationScopeTests(unittest.TestCase):
             0
         ]
         self.assertIn("zig-base-wasm, zig-base-lite-models", aggregate)
-        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1])
+        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1]).split(
+            "\n- uses:", 1
+        )[0]
         healthy = {
             "CHANGES_RESULT": "success",
             "X86_64_RESULT": "success",
@@ -447,7 +557,7 @@ class ZigValidationScopeTests(unittest.TestCase):
             "\n  e2e-full:\n", 1
         )[0]
         self.assertIn("name: Download ingestion native library", full)
-        self.assertIn("if: matrix.suite == 'antfly'", full)
+        self.assertIn("if: startsWith(matrix.suite, 'antfly-')", full)
         self.assertIn(
             "libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}",
             full,

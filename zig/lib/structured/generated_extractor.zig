@@ -100,15 +100,71 @@ pub fn isGenerated(a: A, raw: []const u8) !bool {
     const parsed = try std.json.parseFromSlice(V, a, raw, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return false;
+    if (shortFormProvider(parsed.value) != null) return true;
     const method = parsed.value.object.get("method") orelse return false;
     return method == .string and std.mem.eql(u8, method.string, "generated");
 }
 pub fn parse(a: A, raw: []const u8) !std.json.Parsed(Config) {
-    var parsed = try std.json.parseFromSlice(Config, a, raw, .{ .allocate = .alloc_always });
+    const canonical = try canonicalAlloc(a, raw);
+    defer if (canonical) |json| a.free(json);
+    var parsed = try std.json.parseFromSlice(Config, a, canonical orelse raw, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
     try parsed.value.validate();
     if (parsed.value.generator.provider != .antfly) try c.validateProviderSchema(parsed.value.generator, try c.hostedCapabilities(parsed.value.generator).select(parsed.value.output, parsed.value.probabilities), try outputSchema(parsed.arena.allocator(), parsed.value));
     return parsed;
+}
+
+/// Hosted generator providers accepted directly as extraction providers.
+/// `{"provider": "openai", "model": ..., "schema": ...}` is shorthand for a
+/// generated extractor backed by that generator; the generated form remains
+/// the way to set instructions, output mode, probabilities and batching.
+pub const ShortFormProvider = enum { openai, gemini, vertex, anthropic, bedrock, cloudflare, antfly };
+const short_form_providers = [_]ShortFormProvider{ .openai, .gemini, .vertex, .anthropic, .bedrock };
+
+fn shortFormProvider(value: V) ?ShortFormProvider {
+    if (value != .object or value.object.contains("method")) return null;
+    const provider = value.object.get("provider") orelse return null;
+    if (provider != .string) return null;
+    for (short_form_providers) |candidate| if (std.mem.eql(u8, provider.string, @tagName(candidate))) return candidate;
+    return null;
+}
+
+/// Rewrite the provider short form into the canonical generated form, or
+/// return null when `raw` is not the short form. Credential values, including
+/// `${secret:...}` references, are copied unchanged and never logged.
+pub fn canonicalAlloc(a: A, raw: []const u8) !?[]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const value = try std.json.parseFromSliceLeaky(V, scratch, raw, .{ .duplicate_field_behavior = .@"error" });
+    const provider = shortFormProvider(value) orelse return null;
+    const fields = value.object;
+    const generator_fields = [_][]const u8{ "provider", "model", "url", "api_url", "api_key", "bearer_token", "project_id", "location", "region", "credentials_path" };
+    for (fields.keys()) |key| {
+        var known = std.mem.eql(u8, key, "schema") or std.mem.eql(u8, key, "options");
+        for (generator_fields) |name| known = known or std.mem.eql(u8, key, name);
+        if (!known) return error.InvalidGeneratedExtractorConfig;
+    }
+    if (fields.contains("url") and fields.contains("api_url")) return error.InvalidGeneratedExtractorConfig;
+    if (fields.contains("api_key") and fields.contains("bearer_token")) return error.InvalidGeneratedExtractorConfig;
+    const model = fields.get("model") orelse return error.InvalidGeneratedExtractorConfig;
+    if (model != .string or model.string.len == 0) return error.InvalidGeneratedExtractorConfig;
+
+    var generator = c.object();
+    for (generator_fields) |name| if (fields.get(name)) |field| {
+        const key = if (std.mem.eql(u8, name, "api_url")) "url" else if (std.mem.eql(u8, name, "bearer_token")) "api_key" else name;
+        try c.put(scratch, &generator, key, field);
+    };
+    var out = c.object();
+    try c.put(scratch, &out, "method", .{ .string = "generated" });
+    try c.put(scratch, &out, "generator", generator);
+    try c.put(scratch, &out, "schema", fields.get("schema") orelse return error.InvalidGeneratedExtractorConfig);
+    // Token probabilities are the generated default only where the model
+    // reports them; otherwise the shorthand asserts verdict-only evidence.
+    if (!c.hostedCapabilities(.{ .provider = provider, .model = model.string }).token_logprobs)
+        try c.put(scratch, &out, "probabilities", .{ .string = "verdict_only" });
+    if (fields.get("options")) |options| try c.put(scratch, &out, "options", options);
+    return try std.json.Stringify.valueAlloc(a, out, .{});
 }
 fn relationLabel(value: V) ![]const u8 {
     if (value != .object) return error.InvalidGeneratedExtractorConfig;
@@ -569,4 +625,93 @@ test "generated extraction accepts mathematical integer endpoints through materi
         try c.put(a, &relation, "source", bad);
         try std.testing.expectError(error.InvalidConstrainedOutput, relationEndpoint(a, relation, "source"));
     }
+}
+
+test "provider short form resolves to the generator config of each hosted provider" {
+    const a = std.testing.allocator;
+    const cases = .{
+        .{ "{\"provider\":\"openai\",\"model\":\"gpt-4.1-mini\",\"api_key\":\"${secret:openai.api_key}\",\"schema\":{\"entities\":[\"person\"]}}", generating.Provider.openai, "gpt-4.1-mini" },
+        .{ "{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash\",\"api_key\":\"k\",\"schema\":{\"entities\":[\"person\"]}}", generating.Provider.gemini, "gemini-2.5-flash" },
+        .{ "{\"provider\":\"vertex\",\"model\":\"gemini-2.5-pro\",\"project_id\":\"proj\",\"location\":\"europe-west4\",\"credentials_path\":\"/run/sa.json\",\"schema\":{\"entities\":[\"person\"]}}", generating.Provider.vertex, "gemini-2.5-pro" },
+        .{ "{\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"bearer_token\":\"${secret:anthropic.api_key}\",\"schema\":{\"entities\":[\"person\"],\"relations\":[{\"type\":\"knows\"}]}}", generating.Provider.anthropic, "claude-sonnet-5-5" },
+        .{ "{\"provider\":\"bedrock\",\"model\":\"us.anthropic.claude-sonnet-4-5-20250929-v1:0\",\"region\":\"us-west-2\",\"schema\":{\"entities\":[\"person\"]}}", generating.Provider.bedrock, "us.anthropic.claude-sonnet-4-5-20250929-v1:0" },
+    };
+    inline for (cases) |case| {
+        try std.testing.expect(try isGenerated(a, case[0]));
+        var parsed = try parse(a, case[0]);
+        defer parsed.deinit();
+        const generator = parsed.value.generator;
+        try std.testing.expectEqual(case[1], generator.provider);
+        try std.testing.expectEqualStrings(case[2], generator.model);
+        // gpt-4.1 models report token log-probabilities; the others are verdict-only.
+        const expected: c.Probabilities = if (case[1] == .openai) .token_logprobs else .verdict_only;
+        try std.testing.expectEqual(expected, parsed.value.probabilities);
+    }
+    var vertex = try parse(a, cases[2][0]);
+    defer vertex.deinit();
+    try std.testing.expectEqualStrings("proj", vertex.value.generator.project_id.?);
+    try std.testing.expectEqualStrings("europe-west4", vertex.value.generator.location.?);
+    try std.testing.expectEqualStrings("/run/sa.json", vertex.value.generator.credentials_path.?);
+    var bedrock = try parse(a, cases[4][0]);
+    defer bedrock.deinit();
+    try std.testing.expectEqualStrings("us-west-2", bedrock.value.generator.region.?);
+    // Secret references are carried verbatim for resolution at execution.
+    var openai = try parse(a, cases[0][0]);
+    defer openai.deinit();
+    try std.testing.expectEqualStrings("${secret:openai.api_key}", openai.value.generator.api_key.?);
+    var anthropic = try parse(a, cases[3][0]);
+    defer anthropic.deinit();
+    try std.testing.expectEqualStrings("${secret:anthropic.api_key}", anthropic.value.generator.api_key.?);
+}
+
+test "provider short form keeps token probabilities where the model reports them" {
+    const a = std.testing.allocator;
+    var parsed = try parse(a, "{\"provider\":\"openai\",\"model\":\"gpt-4.1\",\"api_key\":\"k\",\"schema\":{\"entities\":[\"person\"]}}");
+    defer parsed.deinit();
+    try std.testing.expectEqual(c.Probabilities.token_logprobs, parsed.value.probabilities);
+    var gpt5 = try parse(a, "{\"provider\":\"openai\",\"model\":\"gpt-5\",\"api_key\":\"k\",\"schema\":{\"entities\":[\"person\"]}}");
+    defer gpt5.deinit();
+    try std.testing.expectEqual(c.Probabilities.verdict_only, gpt5.value.probabilities);
+}
+
+test "provider short form rejects unsupported models and unknown fields at admission" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"provider\":\"openai\",\"model\":\"gpt-4o-mini-transcribe\",\"schema\":{\"entities\":[\"person\"]}}",
+        "{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash-image\",\"schema\":{\"entities\":[\"person\"]}}",
+        "{\"provider\":\"anthropic\",\"model\":\"claude-2.1\",\"schema\":{\"entities\":[\"person\"]}}",
+        "{\"provider\":\"bedrock\",\"model\":\"amazon.nova-pro-v1:0\",\"schema\":{\"entities\":[\"person\"]}}",
+    }) |raw| try std.testing.expectError(error.UnsupportedConstrainedOutput, parse(a, raw));
+    for ([_][]const u8{
+        "{\"provider\":\"openai\",\"model\":\"gpt-4.1\",\"schema\":{\"entities\":[\"person\"]},\"account_id\":\"x\"}",
+        "{\"provider\":\"openai\",\"model\":\"gpt-4.1\",\"schema\":{\"entities\":[\"person\"]},\"url\":\"a\",\"api_url\":\"b\"}",
+        "{\"provider\":\"openai\",\"schema\":{\"entities\":[\"person\"]}}",
+        "{\"provider\":\"openai\",\"model\":\"gpt-4.1\"}",
+    }) |raw| try std.testing.expectError(error.InvalidGeneratedExtractorConfig, parse(a, raw));
+    try std.testing.expect(!try isGenerated(a, "{\"provider\":\"cloudflare\",\"model\":\"@cf/cloudflare/clairic\"}"));
+    try std.testing.expect(!try isGenerated(a, "{\"provider\":\"antfly\",\"model\":\"gliner\"}"));
+}
+
+test "provider short form and the generated form produce identical constrained requests" {
+    const a = std.testing.allocator;
+    var short = try parse(a, "{\"provider\":\"anthropic\",\"model\":\"claude-opus-5-5\",\"api_key\":\"k\",\"schema\":{\"entities\":[\"person\",\"company\"],\"relations\":[{\"type\":\"works_for\"}]}}");
+    defer short.deinit();
+    var long = try parse(a, "{\"method\":\"generated\",\"generator\":{\"provider\":\"anthropic\",\"model\":\"claude-opus-5-5\",\"api_key\":\"k\"},\"probabilities\":\"verdict_only\",\"schema\":{\"entities\":[\"person\",\"company\"],\"relations\":[{\"type\":\"works_for\"}]}}");
+    defer long.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const s = arena.allocator();
+    try std.testing.expectEqualStrings(
+        try std.json.Stringify.valueAlloc(s, try outputSchema(s, long.value), .{}),
+        try std.json.Stringify.valueAlloc(s, try outputSchema(s, short.value), .{}),
+    );
+    try std.testing.expectEqualStrings(
+        try std.json.Stringify.valueAlloc(s, long.value.generator, .{}),
+        try std.json.Stringify.valueAlloc(s, short.value.generator, .{}),
+    );
+    try std.testing.expectEqual(long.value.output, short.value.output);
+    try std.testing.expectEqual(long.value.probabilities, short.value.probabilities);
+    try std.testing.expectEqualStrings(long.value.instructions, short.value.instructions);
+    try std.testing.expect(std.meta.eql(long.value.batch, short.value.batch));
+    try std.testing.expect(std.meta.eql(long.value.options, short.value.options));
 }

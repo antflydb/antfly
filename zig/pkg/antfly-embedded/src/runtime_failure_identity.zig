@@ -30,6 +30,15 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .read_transient_failure, .err = error.ReadTransientFailure },
+    .{ .status = .read_request_failed, .err = error.ReadRequestFailed },
+    .{ .status = .invalid_gcs_url, .err = error.InvalidGcsUrl },
+    .{ .status = .gcs_connection_not_found_or_out_of_scope, .err = error.GcsConnectionNotFoundOrOutOfScope },
+    .{ .status = .ambiguous_gcs_connection, .err = error.AmbiguousGcsConnection },
+    .{ .status = .invalid_connection_credentials, .err = error.InvalidConnectionCredentials },
+    .{ .status = .hierarchy_cursor_stale, .err = error.HierarchyCursorStale },
+    .{ .status = .invalid_document_checkpoint, .err = error.InvalidDocumentCheckpoint },
+    .{ .status = .too_many_active_jobs, .err = error.TooManyActiveJobs },
     .{ .status = .grouped_source_owner_changed, .err = error.GroupedSourceOwnerChanged },
     .{ .status = .grouped_source_topology_unavailable, .err = error.GroupedSourceTopologyUnavailable },
     .{ .status = .apple_intelligence_provider_unavailable, .err = error.AppleIntelligenceProviderUnavailable },
@@ -335,6 +344,7 @@ const mappings = [_]Mapping{
     .{ .status = .identity_namespace_mismatch, .err = error.DocIdentityNamespaceMismatch },
     .{ .status = .invalid_query, .err = error.InvalidQueryRequest },
     .{ .status = .unsupported_query, .err = error.UnsupportedQueryRequest },
+    .{ .status = .unsupported_exact_sort, .err = error.UnsupportedExactSort },
     .{ .status = .index_not_found, .err = error.IndexNotFound },
     .{ .status = .index_rebuilding, .err = error.IndexRebuilding },
     .{ .status = .incomplete_published_snapshot, .err = error.IncompletePublishedSnapshot },
@@ -1080,6 +1090,15 @@ test "index readiness survives the local query and storage owner boundary" {
     }
 }
 
+test "hierarchy cursor conflicts survive local query and storage owner boundaries" {
+    for ([_]abi.FailureBoundary{ .local_query, .storage_owner }) |boundary| {
+        const failure = failureFromError(error.HierarchyCursorStale, boundary, abi.abi_version, 4);
+        try std.testing.expectEqual(abi.Status.hierarchy_cursor_stale, failure.status);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(error.HierarchyCursorStale, statusToError(failure.status));
+    }
+}
+
 test "committed visibility outcomes survive the storage owner boundary" {
     for ([_]anyerror{
         error.EnrichmentRetryInProgress,
@@ -1116,4 +1135,23 @@ test "graph start identity requirement survives the compiled query boundary" {
     try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
     try std.testing.expectError(error.GraphStartIdentityRequired, statusToError(failure.status));
     try std.testing.expectEqualStrings("GraphStartIdentityRequired", failure.errorName());
+}
+
+test "logical value exact sort rejection survives both compiled query boundaries" {
+    for ([_]abi.FailureBoundary{ .storage_owner, .local_query }) |boundary| {
+        const failure = failureFromError(error.UnsupportedExactSort, boundary, abi.abi_version, 4);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expect(failure.status != .internal);
+        try std.testing.expectError(error.UnsupportedExactSort, statusToError(failure.status));
+        try std.testing.expectEqualStrings("UnsupportedExactSort", failure.errorName());
+    }
+}
+
+test "reader failures and scoped GCS failures retain exact storage boundary identity" {
+    inline for (.{ error.ReadTransientFailure, error.ReadRequestFailed, error.InvalidGcsUrl, error.GcsConnectionNotFoundOrOutOfScope, error.AmbiguousGcsConnection, error.InvalidConnectionCredentials }) |expected| {
+        const failure = failureFromError(expected, .storage_owner, abi.abi_version, 4);
+        try std.testing.expect(failure.status != .internal);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(expected, statusToError(failure.status));
+    }
 }

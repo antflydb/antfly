@@ -20,6 +20,7 @@
 
 const audio = @import("src/mod.zig");
 const aac = @import("src/aac.zig");
+const aacplus_tns = @import("src/aacplus/tns_test.zig");
 const aiff = @import("src/aiff.zig");
 const alac = @import("src/alac.zig");
 const au = @import("src/au.zig");
@@ -49,6 +50,7 @@ const webm = @import("src/webm.zig");
 test {
     _ = audio;
     _ = aac;
+    _ = aacplus_tns;
     _ = aiff;
     _ = alac;
     _ = au;

@@ -1,0 +1,23 @@
+{
+  "name": "@antfly/example-nextjs-auth",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "next build",
+    "dev": "next dev",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@antfly/better-auth": "workspace:*",
+    "@antfly/sdk": "workspace:*",
+    "better-auth": "1.7.14",
+    "next": "^16.2.9",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3",
+    "@types/node": "^25.9.3",
+    "@types/react": "^19.2.14"
+  }
+}

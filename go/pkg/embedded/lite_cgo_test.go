@@ -1559,7 +1559,7 @@ func TestLiteNativeRemoteProviderSemanticSearchEmbedsQuery(t *testing.T) {
 }
 
 // TestLiteNativeRemoteProviderSemanticSearchMatchesDogfoodRequestShape uses
-// the exact public-query request shape examples/dogfood's query.go sends
+// the exact public-query request shape examples/antfly-docs-knowledge-base's query.go sends
 // (full_text_search + full_text_index + semantic_search + indexes +
 // merge_config + fields together). A default `libantfly` build links the
 // full storage internals into every Lite handle too (capi_build_options.
@@ -1632,12 +1632,12 @@ func TestLiteNativeRemoteProviderSemanticSearchMatchesDogfoodRequestShape(t *tes
 // same fixed two-entity, one-relation payload so the relation's rendered
 // graph target ("antfly-core", from entity_index 1) is not itself a document
 // key -- the shape dogfood's `knowledge` graph index (see
-// examples/dogfood/index_config.go's knowledgeGraphIndexJSON) produces
+// examples/antfly-docs-knowledge-base/index_config.go's knowledgeGraphIndexJSON) produces
 // against real GLiNER2.5 output. It also answers unrelated paths (the
 // GET capability probe) with 404, which the client tolerates.
 func newFakeAntflyExtractServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(fakeDocumentExtractHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/extract") {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -1686,7 +1686,7 @@ func newFakeAntflyExtractServer(t *testing.T) *httptest.Server {
 	return server
 }
 
-// knowledgeGraphIndexJSONForTest mirrors examples/dogfood/index_config.go's
+// knowledgeGraphIndexJSONForTest mirrors examples/antfly-docs-knowledge-base/index_config.go's
 // knowledgeGraphIndexJSON: a graph index fed by an extractor asset producer
 // (the "autograph" pattern) whose relation targets render arbitrary entity
 // text rather than existing document keys.
@@ -1761,7 +1761,7 @@ func knowledgeGraphIndexJSONForTest(indexName, artifactName, apiURL string) ([]b
 // handle.db.getEdges aborts the process with no panic message. This test
 // reproduces that setup without any real model, using a fake `/ai/v1/extract`
 // server standing in for GLiNER2.5, mirroring dogfood's `knowledge` graph
-// index (examples/dogfood/index_config.go's knowledgeGraphIndexJSON).
+// index (examples/antfly-docs-knowledge-base/index_config.go's knowledgeGraphIndexJSON).
 func TestLiteNativeGraphEdgesFromExtractionArtifact(t *testing.T) {
 	server := newFakeAntflyExtractServer(t)
 
@@ -1889,7 +1889,7 @@ func TestLiteNativeGraphEdgesFromExtractionArtifact(t *testing.T) {
 // enrichment_runtime.zig) rather than only its inline-text fallback.
 func newFakeAntflyExtractServerBoundaryV2(t *testing.T) *httptest.Server {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(fakeDocumentExtractHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/extract") {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -1979,7 +1979,7 @@ func newFakeAntflyExtractServerBoundaryV2(t *testing.T) *httptest.Server {
 // run against antflydb/gliner2-base-v1 (the plain schema_version-1 shape
 // TestLiteNativeGraphEdgesFromExtractionArtifact already covers) produced
 // edges. This asserts the same knowledge-graph mapping
-// (knowledgeGraphIndexJSONForTest, matching examples/dogfood/index_config.go)
+// (knowledgeGraphIndexJSONForTest, matching examples/antfly-docs-knowledge-base/index_config.go)
 // produces edges from the v2/boundary shape exactly as it does from the v1
 // shape: both the asset producer's stored artifact (the normalized `data[0]`
 // record, not the raw wire envelope -- see asset_producer_runtime.zig's
@@ -2258,7 +2258,7 @@ func assertHierarchyParentDocKey(t *testing.T, result []byte, wantParentKey stri
 // index that consumes a two-stage chunk-then-embed pipeline entirely through
 // its own nested `enrichments` (a `chunk` producer plus an `embedding`
 // producer referenced by the dense index's plural `sources` config, exactly
-// examples/dogfood/index_config.go's `chunk_vectors` shape) alongside a
+// examples/antfly-docs-knowledge-base/index_config.go's `chunk_vectors` shape) alongside a
 // `knowledge` graph index fed by an extractor asset producer never converged:
 // `RunUntilIdleStatus` spun forever because the durable dense-artifact target
 // counter never advanced (see storage/db/enrichment/enrichment_runtime.zig's

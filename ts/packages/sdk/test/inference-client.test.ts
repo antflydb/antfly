@@ -217,6 +217,77 @@ describe("InferenceClient with mock fetch", () => {
     vi.stubGlobal("fetch", originalFetch);
   });
 
+  it("forwards direct document reads and preserves source page identities", async () => {
+    const request = {
+      model: "antfly/document-balanced",
+      retain_artifact: true,
+      documents: [
+        {
+          id: "receipt",
+          media_type: "application/pdf" as const,
+          url: "data:application/pdf;base64,cGRm",
+          pages: [2],
+        },
+      ],
+    };
+    const result = {
+      object: "list",
+      model: request.model,
+      data: [
+        {
+          object: "read",
+          index: 0,
+          source_id: "receipt",
+          number: 2,
+          text: "Total 12.00",
+          status: "complete",
+        },
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      document: { artifact_id: "a".repeat(64), status: "complete" },
+    };
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } })
+    );
+    const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+    expect(await client.read(request)).toEqual(result);
+    expect(await lastFetchJSONBody()).toEqual(request);
+  });
+
+  it("extracts from documents or retained readings without inventing an empty input batch", async () => {
+    const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+    const response = {
+      object: "extraction",
+      model: "extractor",
+      schema_version: 2,
+      data: [{ id: "receipt", structures: {} }],
+    };
+    for (const source of [
+      {
+        documents: [
+          {
+            id: "receipt",
+            media_type: "application/pdf" as const,
+            url: "data:application/pdf;base64,cGRm",
+          },
+        ],
+      },
+      { read_artifact: "a".repeat(64) },
+    ]) {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify(response), { headers: { "Content-Type": "application/json" } })
+      );
+      const request = {
+        model: "extractor",
+        schema_version: 2 as const,
+        schema: { structures: { receipt: { fields: { total: "str" } } } },
+        ...source,
+      };
+      expect(await client.extractRaw(request)).toEqual(response);
+      expect(await lastFetchJSONBody()).toEqual(request);
+    }
+  });
+
   async function lastFetchJSONBody(): Promise<Record<string, unknown>> {
     const [input, init] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
     if (input instanceof Request) {
@@ -910,6 +981,66 @@ describe("InferenceClient with mock fetch", () => {
   });
 
   describe("embedDense (negotiated dense-vector helper)", () => {
+    it.each([
+      { failedIndexes: [0] },
+      { failedIndexes: [1] },
+      { failedIndexes: [2] },
+      { failedIndexes: [0, 1, 2] },
+    ])("rejects per-item failures at indexes $failedIndexes instead of shifting vectors", async ({
+      failedIndexes,
+    }) => {
+      const data = [0, 1, 2]
+        .filter((index) => !failedIndexes.includes(index))
+        .map((index) => ({ object: "embedding", index, embedding: [index, 0.5] }));
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            object: "list",
+            model: "model",
+            data,
+            errors: failedIndexes.map((index) => ({
+              index,
+              code: "INVALID_INPUT",
+              message: "Invalid input",
+              stage: "parse",
+              retryable: false,
+              status: 400,
+            })),
+            summary: { total: 3, succeeded: data.length, failed: failedIndexes.length },
+          }),
+          { headers: { "Content-Type": "application/json" } }
+        )
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(
+        client.embedDense("model", ["first", "second", "third"], { error_policy: "per_item" })
+      ).rejects.toThrow("use embed() to inspect indexed results and errors");
+    });
+
+    it("accepts per-item responses when every input succeeds", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            object: "list",
+            model: "model",
+            data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2] }],
+            errors: [],
+            summary: { total: 1, succeeded: 1, failed: 0 },
+          }),
+          { headers: { "Content-Type": "application/json" } }
+        )
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(
+        client.embedDense("model", ["text"], { error_policy: "per_item" })
+      ).resolves.toEqual([[0.1, 0.2]]);
+      expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1]?.body as string)).toMatchObject({
+        error_policy: "per_item",
+      });
+    });
+
     it("extracts dense vectors from the current OpenAI-compatible JSON response", async () => {
       vi.mocked(fetch).mockResolvedValueOnce(
         new Response(

@@ -1393,6 +1393,9 @@ pub const IndexManager = struct {
     source_payload_store: ?*source_payload_store_mod.Store = null,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     native_read_scratch: *native_read_scratch_pool.Pool,
+    analysis_contributions: ?*introducer_mod.AnalyzedContributionCache = null,
+    analysis_contributions_enabled: bool = true,
+    analysis_contributions_mutex: std.atomic.Mutex = .unlocked,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     bind_cache_resource_manager: bool,
     retained_vector_cache_enabled: ?bool,
@@ -1445,7 +1448,11 @@ pub const IndexManager = struct {
     vector_block_candidate_since_ns: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     resolver_namespace_lookup: ?ResolverNamespaceLookup = null,
     test_resolver_catalog_publications: u64 = 0,
+    test_resolver_lookup_builds: usize = 0,
+    test_resolver_query_proof_builds: usize = 0,
+    test_resolver_reservation_visits: usize = 0,
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
+    artifact_semantic_cache: @import("../artifact_inventory.zig").SemanticDigestCache = .{},
     /// Serialize local receipt counter preparation through its physical commit.
     /// Acquire after primary/graph/index guards; never acquire an index guard
     /// while holding this mutex. Provider execution happens before acquisition.
@@ -3148,6 +3155,23 @@ pub const IndexManager = struct {
         }
     };
 
+    fn analysisContributionCache(self: *IndexManager, docs: []const introducer_mod.TextDocument) ?*introducer_mod.AnalyzedContributionCache {
+        if (!self.analysis_contributions_enabled) return null;
+        const eligible = eligible: {
+            for (docs) |doc| for (doc.text_fields) |field| {
+                if (field.text.len >= @import("../../../search/analyzed_contribution_cache.zig").minimum_input) break :eligible true;
+            };
+            break :eligible false;
+        };
+        if (!eligible or !self.analysis_contributions_mutex.tryLock()) return null;
+        defer self.analysis_contributions_mutex.unlock();
+        if (self.analysis_contributions == null) {
+            const manager = self.resource_manager orelse return null;
+            self.analysis_contributions = introducer_mod.AnalyzedContributionCache.create(manager) catch return null;
+        }
+        return self.analysis_contributions;
+    }
+
     pub fn initWithOptions(alloc: Allocator, base_path: []const u8, opts: db_config.IndexBackendOptions) !IndexManager {
         var owned_resource_manager: ?*resource_manager_mod.ResourceManager = null;
         const resource_manager = opts.resource_manager orelse blk: {
@@ -3347,6 +3371,31 @@ pub const IndexManager = struct {
             .manager = self,
             .mutex = mutex,
         };
+    }
+
+    pub const ManagedIndexApplyPlan = struct {
+        guard: ManagedIndexApplyGuard,
+        snapshot: WritePlanSnapshotView,
+        pub fn unlock(self: *@This()) void {
+            self.guard.unlock();
+            self.snapshot.release();
+        }
+    };
+
+    /// Build/pin before entering catalog admission. A cold snapshot needs a
+    /// catalog reader and cannot be acquired recursively behind a writer.
+    pub fn lockManagedIndexApplyWithPlan(self: *IndexManager, index_ref: ManagedIndexRef) !ManagedIndexApplyPlan {
+        while (true) {
+            var snapshot = try self.acquireWritePlanSnapshot();
+            var guard = self.lockManagedIndexApply(index_ref) catch |err| {
+                snapshot.release();
+                return err;
+            };
+            if (snapshot.generation() == self.writePlanGeneration())
+                return .{ .guard = guard, .snapshot = snapshot };
+            guard.unlock();
+            snapshot.release();
+        }
     }
 
     pub fn lockVectorIndexApply(self: *IndexManager, index_name: []const u8) !ManagedIndexApplyGuard {
@@ -7130,6 +7179,7 @@ pub const IndexManager = struct {
         for (self.enrichments.items) |*entry| entry.deinit(self.alloc);
         for (self.resolvers.items) |*entry| entry.deinit(self.alloc);
         for (self.retired_resolvers.items) |*entry| entry.deinit(self.alloc);
+        if (self.analysis_contributions) |cache| cache.deinit();
         self.text_indexes.deinit(self.alloc);
         self.dense_indexes.deinit(self.alloc);
         self.sparse_indexes.deinit(self.alloc);
@@ -7271,7 +7321,8 @@ pub const IndexManager = struct {
     /// must never become permission to delete or replace an index root.
     pub fn loadFailureRecoveryAction(err_name: []const u8) IndexLoadRecoveryAction {
         if (std.mem.eql(u8, err_name, "IncompleteBulkPublish") or
-            std.mem.eql(u8, err_name, "MissingPostingCheckpoint"))
+            std.mem.eql(u8, err_name, "MissingPostingCheckpoint") or
+            std.mem.eql(u8, err_name, "TextProjectionUpgradeRequired"))
         {
             return .rebuild_from_artifacts;
         }
@@ -7287,10 +7338,18 @@ pub const IndexManager = struct {
         // the HBC dense implementation. Keep the queue classification as
         // narrow as the execution allowlist so an unfamiliar future producer
         // cannot create an endlessly runnable automatic-repair entry.
-        if (action == .rebuild_from_artifacts and cfg.kind != .dense_vector) {
+        if (action == .rebuild_from_artifacts and !automaticLoadRebuildSupported(cfg.kind, err_name)) {
             return .manual_intervention;
         }
         return action;
+    }
+
+    pub fn automaticLoadRebuildSupported(kind: types.IndexKind, err_name: []const u8) bool {
+        return switch (kind) {
+            .dense_vector => std.mem.eql(u8, err_name, "IncompleteBulkPublish") or std.mem.eql(u8, err_name, "MissingPostingCheckpoint"),
+            .full_text => std.mem.eql(u8, err_name, "TextProjectionUpgradeRequired"),
+            else => false,
+        };
     }
 
     fn failedIndexLoadActionQueue(self: *IndexManager, action: IndexLoadRecoveryAction) *FailedIndexLoadActionQueue {
@@ -12240,6 +12299,7 @@ pub const IndexManager = struct {
 
     pub fn requireResolverNotReplacing(self: *const IndexManager, name: []const u8) !void {
         for (self.resolvers.items) |cfg| {
+            if (comptime @import("builtin").is_test) @constCast(self).test_resolver_reservation_visits += 1;
             if (std.mem.eql(u8, cfg.replacement_resolver, name) or
                 (cfg.replacement_index.len > 0 and std.mem.eql(u8, cfg.name, name))) return error.IndexReplacementPending;
         }
@@ -12899,38 +12959,81 @@ pub const IndexManager = struct {
         if (kind != .string or !std.mem.eql(u8, kind.string, "extractor")) return;
         const config = producer.get("config") orelse return;
         if (config != .object) return;
-        const method = config.object.get("method") orelse return;
-        const policy = config.object.get("probabilities") orelse return;
-        if (method == .string and std.mem.eql(u8, method.string, "generated") and policy == .string and std.mem.eql(u8, policy.string, "verdict_only")) return error.InvalidResolverConfig;
+        // The provider short form normalizes to the generated form and may
+        // imply verdict-only probabilities.
+        const generated_extraction = @import("antfly_structured").extraction;
+        const config_json = try std.json.Stringify.valueAlloc(self.alloc, config, .{});
+        defer self.alloc.free(config_json);
+        if (!try generated_extraction.isGenerated(self.alloc, config_json)) return;
+        var generated = generated_extraction.parse(self.alloc, config_json) catch return;
+        defer generated.deinit();
+        if (generated.value.probabilities == .verdict_only) return error.InvalidResolverConfig;
     }
 
     /// Import immutable policy once into this owner's allocator. Transient
     /// metadata arenas never lend their lifetime to persistent catalog slots.
     const ResolverSlot = struct { retired: bool, index: usize };
-    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)) };
+    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)), names: std.StringHashMapUnmanaged(ResolverSlot), routing: std.StringHashMapUnmanaged(std.ArrayList(usize)), declarations: std.AutoHashMapUnmanaged(usize, *QueryDeclaration) = .empty, declaration_generation: u64 = 0, profiles: std.StringHashMapUnmanaged([]const u8) = .empty, query_proofs: std.AutoHashMapUnmanaged([32]u8, [32]u8) = .empty, query_proof_generation: u64 = 0, reserved: std.StringHashMapUnmanaged(void) };
     fn invalidateResolverNamespaceLookup(self: *IndexManager) void {
-        if (self.resolver_namespace_lookup) |*lookup| lookup.arena.deinit();
+        if (self.resolver_namespace_lookup) |*lookup| {
+            var owners = lookup.declarations.valueIterator();
+            while (owners.next()) |owner| owner.*.release();
+            lookup.arena.deinit();
+        }
         self.resolver_namespace_lookup = null;
     }
-    fn resolverNamespaceSlots(self: *IndexManager, table: []const u8, template: []const u8) ![]const ResolverSlot {
+    fn ensureResolverLookup(self: *IndexManager) !void {
         if (self.resolver_namespace_lookup == null) {
+            if (comptime @import("builtin").is_test) self.test_resolver_lookup_builds += 1;
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             errdefer arena.deinit();
             const a = arena.allocator();
             var slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)) = .empty;
+            var names: std.StringHashMapUnmanaged(ResolverSlot) = .empty;
+            var routing: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty;
+            var reserved: std.StringHashMapUnmanaged(void) = .empty;
             for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }, 0..) |definitions, retired| for (definitions, 0..) |cfg, index| {
+                try names.put(a, try a.dupe(u8, cfg.name), .{ .retired = retired != 0, .index = index });
+                if (retired == 0) {
+                    const route = try std.json.Stringify.valueAlloc(a, .{ cfg.source_artifact, cfg.replacement_index }, .{});
+                    const group = try routing.getOrPut(a, route);
+                    if (!group.found_existing) group.value_ptr.* = .empty;
+                    try group.value_ptr.append(a, index);
+                    if (cfg.replacement_resolver.len > 0) try reserved.put(a, try a.dupe(u8, cfg.replacement_resolver), {});
+                    if (cfg.replacement_index.len > 0) try reserved.put(a, try a.dupe(u8, cfg.name), {});
+                }
                 if (std.mem.startsWith(u8, cfg.name, "__antfly_replacement/")) continue;
                 const identity = try std.json.Stringify.valueAlloc(a, .{ cfg.table, cfg.key_template }, .{});
                 const entry = try slots.getOrPut(a, identity);
                 if (!entry.found_existing) entry.value_ptr.* = .empty;
                 try entry.value_ptr.append(a, .{ .retired = retired != 0, .index = index });
             };
-            self.resolver_namespace_lookup = .{ .arena = arena, .slots = slots };
+            self.resolver_namespace_lookup = .{ .arena = arena, .slots = slots, .names = names, .routing = routing, .reserved = reserved };
         }
+    }
+    fn resolverNamespaceSlots(self: *IndexManager, table: []const u8, template: []const u8) ![]const ResolverSlot {
+        try self.ensureResolverLookup();
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
         const identity = try std.json.Stringify.valueAlloc(scratch.allocator(), .{ table, template }, .{});
         return if (self.resolver_namespace_lookup.?.slots.get(identity)) |slots| slots.items else &.{};
+    }
+    pub fn resolverNamespaceAdmissionIdentities(self: *IndexManager, a: Allocator, table: []const u8, template: []const u8) ![]ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slots = try self.resolverNamespaceSlots(table, template);
+        var result: std.ArrayList(ResolverConfig) = .empty;
+        errdefer {
+            for (result.items) |*cfg| cfg.deinit(a);
+            result.deinit(a);
+        }
+        for (slots) |slot| {
+            if (slot.retired) continue;
+            var cfg = try self.cloneResolverAdmissionIdentity(a, self.resolvers.items[slot.index]);
+            errdefer cfg.deinit(a);
+            try result.append(a, cfg);
+        }
+        return result.toOwnedSlice(a);
     }
     pub fn resolverNamespaceObservation(self: *IndexManager, a: Allocator, table: []const u8, template: []const u8) !?resolver_catalog.ResolverObservation {
         self.catalog_mutex.lockExclusive();
@@ -13198,7 +13301,7 @@ pub const IndexManager = struct {
         };
         for (try self.resolverNamespaceSlots(table, namespace.key_template)) |slot| {
             const entry = if (slot.retired) &self.retired_resolvers.items[slot.index] else &self.resolvers.items[slot.index];
-            try self.requireResolverNotReplacing(entry.name);
+            if (self.resolver_namespace_lookup.?.reserved.contains(entry.name)) return error.IndexReplacementPending;
             if (entry.namespace_curation_table_id == table_id and entry.namespace_curation_generation == namespace.revision and entry.namespace_curation_missing == !namespace.record_store) continue;
             var next = entry.*;
             next.merges = namespace.merges;
@@ -13245,7 +13348,7 @@ pub const IndexManager = struct {
         try txn.put(try durable.key(arena.allocator(), table, namespace.key_template), try std.json.Stringify.valueAlloc(arena.allocator(), durable.Record{ .table = table, .table_id = table_id, .namespace = namespace, .bindings = bindings }, .{}));
         const epoch = if (txn.get(durable.epoch_key)) |raw| try std.fmt.parseInt(u64, raw, 10) else |err| if (err == error.NotFound) @as(u64, 0) else return err;
         try txn.put(durable.epoch_key, try std.fmt.allocPrint(arena.allocator(), "{d}", .{try std.math.add(u64, epoch, 1)}));
-        try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_delta_reader_version));
+        try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_pin_index_reader_version));
         try txn.put(resolver_catalog.reresolve_resume_key, "");
         try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
         if (completion) |work| {
@@ -13253,7 +13356,7 @@ pub const IndexManager = struct {
             try txn.put(@import("../../lite/resolver_consumers.zig").cursor_key, work.key);
         }
         try txn.commit();
-        self.minimum_reader_version.store(resolver_catalog.resolver_projection_delta_reader_version, .release);
+        self.minimum_reader_version.store(resolver_catalog.resolver_pin_index_reader_version, .release);
         self.invalidateWritePlanSnapshot();
         published = true;
         return true;
@@ -13288,6 +13391,12 @@ pub const IndexManager = struct {
     /// Admission needs static policy and generation identities, never a copy of
     /// every destination-owned correction or its receipts.
     pub fn listResolverStaticDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        return self.listResolverDescriptors(alloc, false);
+    }
+    pub fn listResolverAdmissionDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        return self.listResolverDescriptors(alloc, true);
+    }
+    fn listResolverDescriptors(self: *IndexManager, alloc: Allocator, admission_only: bool) ![]ResolverConfig {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         const definitions = try self.resolverDefinitionsAlloc(alloc);
@@ -13302,79 +13411,308 @@ pub const IndexManager = struct {
             var cfg = definition;
             cfg.merges = &.{};
             cfg.curation_json = "{}";
-            try result.append(alloc, try ResolverConfig.clone(alloc, cfg));
+            try result.append(alloc, if (admission_only) try resolver_catalog.ResolverAdmission.cloneConfig(alloc, cfg, true) else try ResolverConfig.clone(alloc, cfg));
         }
         return result.toOwnedSlice(alloc);
     }
 
-    /// One catalog pass for a batch of replay observations. Policy, providers,
-    /// aliases and extraction config never enter a wait-loop snapshot.
     pub fn resolverObservationDescriptors(self: *IndexManager, alloc: Allocator, names: []const []const u8) ![]resolver_catalog.ResolverObservation {
-        self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
-        var wanted: std.StringHashMapUnmanaged(void) = .empty;
-        defer wanted.deinit(alloc);
-        for (names) |name| try wanted.put(alloc, name, {});
+        return self.resolverScalarDescriptors(alloc, names, false);
+    }
+    /// null requests all public active identities; explicit names also acknowledge
+    /// retained retired identities. An empty set requests none.
+    pub fn resolverProgressDescriptors(self: *IndexManager, alloc: Allocator, names: ?[]const []const u8) ![]resolver_catalog.ResolverObservation {
+        return self.resolverScalarDescriptors(alloc, names, true);
+    }
+    fn resolverScalarDescriptors(self: *IndexManager, alloc: Allocator, names: ?[]const []const u8, public_only: bool) ![]resolver_catalog.ResolverObservation {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
         var result: std.ArrayList(resolver_catalog.ResolverObservation) = .empty;
         errdefer {
             for (result.items) |*cfg| cfg.deinit(alloc);
             result.deinit(alloc);
         }
-        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
-            if (!wanted.contains(definition.name)) continue;
-            const owned = try resolver_catalog.ResolverObservation.fromConfig(alloc, definition);
-            errdefer {
-                var cleanup = owned;
-                cleanup.deinit(alloc);
+        if (names) |selected| {
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen.deinit(alloc);
+            for (selected) |name| {
+                if ((try seen.getOrPut(alloc, name)).found_existing) continue;
+                const slot = self.resolver_namespace_lookup.?.names.get(name) orelse continue;
+                const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+                if (public_only and cfg.replacement_index.len > 0) continue;
+                var owned = try resolver_catalog.ResolverObservation.fromConfig(alloc, cfg);
+                errdefer owned.deinit(alloc);
+                try result.append(alloc, owned);
             }
-            try result.append(alloc, owned);
-        };
+        } else {
+            for (self.resolvers.items) |cfg| {
+                if (public_only and cfg.replacement_index.len > 0) continue;
+                var owned = try resolver_catalog.ResolverObservation.fromConfig(alloc, cfg);
+                errdefer owned.deinit(alloc);
+                try result.append(alloc, owned);
+            }
+        }
         return result.toOwnedSlice(alloc);
     }
 
-    /// Match listResolvers' active/staged routing selection without copying
-    /// destination-owned projected policy for unrelated resolver siblings.
-    pub fn listResolverRoutingDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+    /// A final query fence reads only a scalar proof on warm immutable
+    /// catalogs. The namespace lookup owns its lifetime and is invalidated
+    /// with structural catalog publication. No grant or model state is cached.
+    pub fn resolverQueryDeclarationsFingerprint(self: *IndexManager, selected: ResolverConfig) ![32]u8 {
+        const Hash = @import("antfly_hash").Sha256;
+        var buffer: [256]u8 = undefined;
+        var writer: std.Io.Writer.Hashing(Hash) = .init(&buffer);
+        try std.json.Stringify.value(.{ selected.name, selected.source_artifact, selected.source_artifact_kind, selected.retired, selected.replacement_index }, .{}, &writer.writer);
+        try writer.writer.flush();
+        var key: [32]u8 = undefined;
+        writer.hasher.final(&key);
         self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
-        const result = try alloc.alloc(ResolverConfig, self.resolvers.items.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (result[0..initialized]) |*cfg| cfg.deinit(alloc);
-            alloc.free(result);
+        if (self.resolver_namespace_lookup) |lookup| if (lookup.query_proof_generation == self.writePlanGeneration()) if (lookup.query_proofs.get(key)) |proof| {
+            self.catalog_mutex.unlockShared();
+            return proof;
+        };
+        self.catalog_mutex.unlockShared();
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const lookup = &self.resolver_namespace_lookup.?;
+        const generation = self.writePlanGeneration();
+        if (lookup.query_proof_generation != generation) {
+            lookup.query_proofs.clearRetainingCapacity();
+            lookup.query_proof_generation = generation;
         }
-        for (self.resolvers.items, result) |definition, *output| {
-            var cfg = definition;
-            cfg.merges = &.{};
-            cfg.curation_json = "{}";
-            output.* = try ResolverConfig.clone(alloc, cfg);
-            initialized += 1;
+        if (lookup.query_proofs.get(key)) |proof| return proof;
+        if (comptime @import("builtin").is_test) self.test_resolver_query_proof_builds += 1;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var hash = Hash.init(.{});
+        for (self.resolvers.items, 0..) |cfg, index| {
+            if (cfg.replacement_index.len != 0 and !std.mem.eql(u8, cfg.replacement_index, selected.replacement_index)) continue;
+            if (std.mem.eql(u8, cfg.name, selected.name) or (selected.sharesRoutingDomain(cfg) and std.mem.eql(u8, selected.source_artifact, cfg.source_artifact) and cfg.source_artifact_kind.overlaps(selected.source_artifact_kind))) {
+                if (lookup.declaration_generation == generation) if (lookup.declarations.get(index)) |owner| if (owner.prepared.load(.acquire)) {
+                    hash.update(&owner.fingerprint);
+                    continue;
+                };
+                hash.update(&try cfg.queryDefinitionFingerprint(arena.allocator()));
+            }
         }
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        // Only current named scopes are retained. Stale in-flight declarations
+        // still get an exact proof, without growing a history of cache keys.
+        if (lookup.names.get(selected.name)) |slot| if (!slot.retired) {
+            const cfg = self.resolvers.items[slot.index];
+            if (cfg.retired == selected.retired and cfg.source_artifact_kind == selected.source_artifact_kind and std.mem.eql(u8, cfg.source_artifact, selected.source_artifact) and std.mem.eql(u8, cfg.replacement_index, selected.replacement_index)) try lookup.query_proofs.put(lookup.arena.allocator(), key, result);
+        };
         return result;
     }
 
-    /// Legacy point reads need only the selected definition's policy, never
-    /// copies of every sibling's projected namespace.
-    pub fn resolverIdentityAlloc(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+    /// Declaration bodies belong to one catalog generation. Active admissions
+    /// retain their own references across DDL, inference and cache eviction.
+    const QueryDeclaration = struct {
+        alloc: Allocator,
+        references: std.atomic.Value(usize) = .init(1),
+        mutex: std.atomic.Mutex = .unlocked,
+        config: ResolverConfig,
+        prepared: std.atomic.Value(bool) = .init(false),
+        fingerprint: [32]u8 = undefined,
+        profile: [64]u8 = undefined,
+        fn release(self: *@This()) void {
+            if (self.references.fetchSub(1, .acq_rel) == 1) {
+                const alloc = self.alloc;
+                self.config.deinit(alloc);
+                alloc.destroy(self);
+            }
+        }
+        fn prepare(self: *@This()) !void {
+            if (self.prepared.load(.acquire)) return;
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.prepared.load(.acquire)) return;
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            self.fingerprint = try self.config.queryDefinitionFingerprint(a);
+            @memcpy(&self.profile, try (@import("../resolver_static_profiles.zig").Definition{ .key_template = self.config.key_template, .aliases = self.config.aliases, .suppress_json = self.config.suppress_json }).identity(a));
+            self.prepared.store(true, .release);
+        }
+    };
+    pub const QueryAdmission = struct {
+        alloc: Allocator,
+        configs: []ResolverConfig,
+        owners: []*QueryDeclaration,
+        fingerprint: [32]u8 = undefined,
+        pub fn deinit(self: @This()) void {
+            for (self.owners) |owner| owner.release();
+            self.alloc.free(self.owners);
+            self.alloc.free(self.configs);
+        }
+        fn prepare(self: *@This()) !void {
+            var hash = @import("antfly_hash").Sha256.init(.{});
+            for (self.owners) |owner| {
+                try owner.prepare();
+                hash.update(&owner.fingerprint);
+            }
+            hash.final(&self.fingerprint);
+        }
+        pub fn profile(self: @This(), index: usize) []const u8 {
+            return &self.owners[index].profile;
+        }
+    };
+    pub fn resolverQueryAdmission(self: *IndexManager, alloc: Allocator, name: []const u8, public_only: bool) !QueryAdmission {
         self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
-        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
-            if (std.mem.eql(u8, definition.name, name)) return try ResolverConfig.clone(alloc, definition);
+        const warm = self.acquireQueryAdmissionLocked(alloc, name, public_only, false) catch |err| {
+            self.catalog_mutex.unlockShared();
+            return err;
         };
-        return null;
+        self.catalog_mutex.unlockShared();
+        var result = warm orelse cold: {
+            self.catalog_mutex.lockExclusive();
+            defer self.catalog_mutex.unlockExclusive();
+            try self.ensureResolverLookup();
+            break :cold (try self.acquireQueryAdmissionLocked(alloc, name, public_only, true)).?;
+        };
+        errdefer result.deinit();
+        // Hashing happens once per declaration, outside the catalog lock.
+        try result.prepare();
+        return result;
+    }
+    fn acquireQueryAdmissionLocked(self: *IndexManager, alloc: Allocator, name: []const u8, public_only: bool, create: bool) !?QueryAdmission {
+        if (self.resolver_namespace_lookup == null) return null;
+        const lookup = &self.resolver_namespace_lookup.?;
+        if (lookup.declaration_generation != self.writePlanGeneration()) {
+            if (!create) return null;
+            var old = lookup.declarations.valueIterator();
+            while (old.next()) |owner| owner.*.release();
+            lookup.declarations.clearRetainingCapacity();
+            lookup.declaration_generation = self.writePlanGeneration();
+        }
+        var configs: std.ArrayList(ResolverConfig) = .empty;
+        var owners: std.ArrayList(*QueryDeclaration) = .empty;
+        var transferred = false;
+        defer if (!transferred) {
+            for (owners.items) |owner| owner.release();
+            owners.deinit(alloc);
+            configs.deinit(alloc);
+        };
+        const slot = lookup.names.get(name);
+        if (slot != null and !slot.?.retired) {
+            const selected = self.resolvers.items[slot.?.index];
+            if (!public_only or selected.replacement_index.len == 0) {
+                const route = try std.json.Stringify.valueAlloc(alloc, .{ selected.source_artifact, selected.replacement_index }, .{});
+                defer alloc.free(route);
+                const group = lookup.routing.get(route) orelse unreachable;
+                for (group.items) |index| {
+                    var cfg = self.resolvers.items[index];
+                    if (index != slot.?.index and (!selected.sharesRoutingDomain(cfg) or !cfg.source_artifact_kind.overlaps(selected.source_artifact_kind))) continue;
+                    var owner = lookup.declarations.get(index);
+                    if (owner == null) {
+                        if (!create) return null;
+                        cfg.merges = &.{};
+                        cfg.curation_json = "{}";
+                        const entry = try self.alloc.create(QueryDeclaration);
+                        errdefer self.alloc.destroy(entry);
+                        var owned = try ResolverConfig.clone(self.alloc, cfg);
+                        errdefer owned.deinit(self.alloc);
+                        entry.* = .{ .alloc = self.alloc, .config = owned };
+                        try lookup.declarations.put(lookup.arena.allocator(), index, entry);
+                        owner = entry;
+                    }
+                    try owners.ensureUnusedCapacity(alloc, 1);
+                    try configs.append(alloc, owner.?.config);
+                    _ = owner.?.references.fetchAdd(1, .monotonic);
+                    owners.appendAssumeCapacity(owner.?);
+                }
+            }
+        }
+        const owned_configs = try configs.toOwnedSlice(alloc);
+        errdefer alloc.free(owned_configs);
+        const owned_owners = try owners.toOwnedSlice(alloc);
+        transferred = true;
+        return .{ .alloc = alloc, .configs = owned_configs, .owners = owned_owners };
     }
 
-    pub fn resolverStaticDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
-        self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
-        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
-            if (!std.mem.eql(u8, definition.name, name)) continue;
-            var cfg = definition;
+    /// Caller-owned snapshot of one identity. Lookup is shared with namespace
+    /// routing and rebuilt only after structural catalog publication.
+    pub fn resolverDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8, static_only: bool) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        var cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+        if (static_only) {
             cfg.merges = &.{};
             cfg.curation_json = "{}";
-            return try ResolverConfig.clone(alloc, cfg);
-        };
-        return null;
+        }
+        return try ResolverConfig.clone(alloc, cfg);
+    }
+    pub fn resolverIdentityAlloc(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        return self.resolverDescriptor(alloc, name, false);
+    }
+    pub fn resolverAdmissionDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8, namespace_owned: bool) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+        return try resolver_catalog.ResolverAdmission.cloneConfig(alloc, cfg, namespace_owned);
+    }
+    /// Cold adoption/inspection reads only legacy curated state. Static
+    /// declarations come from the immutable profile directory independently.
+    pub fn resolverLegacyPolicyDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+        var descriptor = resolver_catalog.ResolverAdmission.fromConfig(cfg, false);
+        descriptor.aliases = &.{};
+        descriptor.suppress_json = "";
+        return try ResolverConfig.clone(alloc, descriptor.config());
+    }
+    /// Indexed consumers need source clocks and suppression, not the complete
+    /// alias universe. The physical static-profile directory supplies adjacency.
+    pub fn resolverAdmissionIdentity(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+        return try self.cloneResolverAdmissionIdentity(alloc, cfg);
+    }
+    fn cloneResolverAdmissionIdentity(self: *IndexManager, alloc: Allocator, cfg: ResolverConfig) !ResolverConfig {
+        var descriptor = resolver_catalog.ResolverAdmission.fromConfig(cfg, true);
+        // Namespace projection clocks advance independently of static source
+        // definitions. Cache content identity until catalog publication, never
+        // fence static adjacency on a projected resolution-generation clock.
+        const lookup = &self.resolver_namespace_lookup.?;
+        const profile = try lookup.profiles.getOrPut(lookup.arena.allocator(), cfg.name);
+        if (!profile.found_existing) {
+            errdefer _ = lookup.profiles.remove(cfg.name);
+            const definition: @import("../resolver_static_profiles.zig").Definition = .{ .key_template = cfg.key_template, .aliases = cfg.aliases, .suppress_json = cfg.suppress_json };
+            profile.key_ptr.* = try lookup.arena.allocator().dupe(u8, cfg.name);
+            profile.value_ptr.* = try definition.identity(lookup.arena.allocator());
+        }
+        descriptor.admission_profile = profile.value_ptr.*;
+        descriptor.aliases = &.{};
+        descriptor.suppress_json = "";
+        return try ResolverConfig.clone(alloc, descriptor.config());
+    }
+    /// One public active execution definition, with visibility checked before
+    /// cloning any policy. Reviews must never select a retired/private stream.
+    pub fn resolverPublicDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        if (slot.retired) return null;
+        const cfg = self.resolvers.items[slot.index];
+        if (cfg.replacement_index.len > 0) return null;
+        return try ResolverConfig.clone(alloc, cfg);
+    }
+    pub fn resolverStaticDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        return self.resolverDescriptor(alloc, name, true);
     }
 
     /// Trusted admission rollback restores ownership as well as configuration.
@@ -19524,6 +19862,7 @@ pub const IndexManager = struct {
                     entry.text_analysis,
                     .{
                         .scratch_allocator = introducer_mod.textBuildScratchAllocator(),
+                        .contribution_cache = self.analysisContributionCache(projection_batch.docs),
                         .postings_run_io = if (textBuildSpoolDirectory(entry) != null) entry.io else null,
                         .postings_run_directory = textBuildSpoolDirectory(entry) orelse ".",
                         .target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes()),
@@ -22344,7 +22683,13 @@ pub const IndexManager = struct {
                     cfg,
                     runtime_schema,
                 );
-                ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, read_only) catch |err| {
+                const historical_projection = [_]TextProjectionProvenance{
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 0),
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 1),
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 2),
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 3),
+                };
+                ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, historical_projection, read_only) catch |err| {
                     std.log.warn("full_text open failed step=projection_provenance name={s} err={s}", .{
                         cfg.name,
                         @errorName(err),
@@ -24649,7 +24994,7 @@ pub const IndexManager = struct {
         }
 
         const merged = merger_mod.mergeSegmentsBounded(task_alloc, task.snapshot, task.merge_indices, .{
-            .target_segment_bytes = @intCast(activeTextMergePolicy().max_segment_size),
+            .target_segment_bytes = activeTextMergePolicy().max_segment_size,
             .deleted_docs = deleted_docs,
             .source_map = &source_map,
         }) catch |err| {
@@ -37058,6 +37403,9 @@ const TextProjectionProvenance = struct {
     // Semantic revisions belong to durable generation identity, independently
     // of public schema versions and the metadata codec's envelope version.
     fn fromRuntimeSchemaRevision(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema, named_autocomplete_revision: u32) !TextProjectionProvenance {
+        return fromRuntimeSchemaSemantics(alloc, cfg, schema, named_autocomplete_revision, 4);
+    }
+    fn fromRuntimeSchemaSemantics(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema, named_autocomplete_revision: u32, exclusion_revision: u32) !TextProjectionProvenance {
         // Field-selective projection uses the second semantic witness. Give
         // only those generations a new durable witness so an
         // existing whole-document posting set cannot be interpreted as if it
@@ -37077,6 +37425,58 @@ const TextProjectionProvenance = struct {
             std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
             std.mem.writeInt(u32, witness[8..12], named_autocomplete_revision, .little);
             schema_fingerprint = std.hash.Wyhash.hash(0x4154414e414c595a, &witness);
+        }
+        if (exclusion_revision != 0 and !try textConfigSelectsField(alloc, cfg.config_json)) {
+            if (schema) |value| for (value.exact_fields) |root| {
+                if (root.mapping.do_index or !std.mem.eql(u8, root.field, root.source_field)) continue;
+                const source = for (value.full_text_documents) |document| {
+                    if (for (document.fields) |field| {
+                        if (std.mem.eql(u8, field.path, root.source_field)) break true;
+                    } else false) break true;
+                } else false;
+                const subfields = for (value.exact_fields) |field| {
+                    if (field.mapping.do_index and !std.mem.eql(u8, field.field, field.source_field) and std.mem.eql(u8, field.source_field, root.source_field)) break true;
+                } else false;
+                if (!source and !subfields) continue;
+                var witness: [12]u8 = undefined;
+                std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
+                std.mem.writeInt(u32, witness[8..12], 1, .little);
+                schema_fingerprint = std.hash.Wyhash.hash(0x4146444953580001, &witness);
+                break;
+            };
+        }
+        if (exclusion_revision >= 2 and !try textConfigSelectsField(alloc, cfg.config_json)) {
+            if (schema) |value| if (schema_mod.hasHistoricalDeclaredTextExclusions(value)) {
+                var witness: [12]u8 = undefined;
+                std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
+                std.mem.writeInt(u32, witness[8..12], 2, .little);
+                schema_fingerprint = std.hash.Wyhash.hash(0x4146444953580001, &witness);
+            };
+        }
+        if (exclusion_revision >= 3 and !try textConfigSelectsField(alloc, cfg.config_json)) {
+            if (schema) |value| if (schema_mod.hasCrossDocumentTextExclusions(value)) {
+                var witness: [12]u8 = undefined;
+                std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
+                std.mem.writeInt(u32, witness[8..12], 3, .little);
+                var policy = std.hash.Wyhash.init(0x4146444953580003);
+                policy.update(&witness);
+                for (value.full_text_documents) |document| {
+                    const bytes = try std.json.Stringify.valueAlloc(alloc, .{ .name = document.name, .rules = document.physical_exact_fields }, .{});
+                    defer alloc.free(bytes);
+                    policy.update(bytes);
+                }
+                schema_fingerprint = policy.final();
+            };
+        }
+        if (exclusion_revision >= 4) {
+            if (schema) |value| for (value.index_sort) |field| {
+                const mapping = schema_mod.resolveDeclaredFieldType(value, field.field) orelse continue;
+                if (mapping.missing_null_policy != .nulls_ordered) continue;
+                var witness: [8]u8 = undefined;
+                std.mem.writeInt(u64, &witness, schema_fingerprint, .little);
+                schema_fingerprint = std.hash.Wyhash.hash(0x41464e554c4c0002, &witness);
+                break;
+            };
         }
         return .{
             .coverage_generation = coverageGenerationForConfig(cfg),
@@ -37177,6 +37577,7 @@ fn ensureTextProjectionProvenance(
     alloc: Allocator,
     persistent: *persistent_mod.PersistentIndex,
     expected: TextProjectionProvenance,
+    historical: [4]TextProjectionProvenance,
     read_only: bool,
 ) !void {
     const encoded = try persistent.readGenerationMetadataAlloc(
@@ -37188,6 +37589,11 @@ fn ensureTextProjectionProvenance(
     if (persisted != null and persisted.?.eql(expected)) return;
 
     if (persistent.hasPhysicalSegments()) {
+        // Only the exact prior projection witness authorizes an automatic
+        // private replacement. Unknown drift remains manual repair debt.
+        if (persisted) |witness| for (historical) |prior| {
+            if (!prior.eql(expected) and witness.eql(prior)) return error.TextProjectionUpgradeRequired;
+        };
         // There is no trustworthy upgrade witness for legacy postings. Keep
         // the configured index visible through load status, but do not attach
         // analyzers that may interpret its postings under different semantics.
@@ -37323,6 +37729,7 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
                 const missing_null_policy: schema_mod.MissingNullPolicy = if (version >= 3) blk_policy: {
                     const value: schema_mod.MissingNullPolicy = switch (data[pos]) {
                         0 => .missing_rejected,
+                        1 => .nulls_ordered,
                         else => return error.InvalidIndexCatalog,
                     };
                     pos += 1;
@@ -39415,13 +39822,13 @@ test "asset registration validates document extraction OCR config" {
         .name = "document_units",
         .kind = .asset,
         .source_field = "url",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":20,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"render\":{\"dpi\":20},\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     }));
     try manager.validateEnrichmentConfig(.{
         .name = "document_units",
         .kind = .asset,
         .source_field = "url",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":150,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"render\":{\"dpi\":150},\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     });
 }
 
@@ -50007,6 +50414,119 @@ test "index_manager bounded native prepared text publication spills before admis
     std.debug.print("PREPARED_TEXT_SPILL documents={d} peak_bytes={d}\n", .{ documents, stats.peak_bytes });
 }
 
+test "logical query excluded source upgrade fences historical physical postings" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    const schema: schema_mod.TableSchema = .{
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "payload", .emitted_name = "payload", .analyzer = "standard" }} }},
+        .exact_fields = &.{.{ .field = "payload", .source_field = "payload", .mapping = .{ .field_type = .text, .do_index = false } }},
+    };
+    const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}", .coverage_generation = 3 };
+    const historical = try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, schema, 2, 0);
+    const current = try TextProjectionProvenance.fromRuntimeSchema(a, config, schema);
+    try std.testing.expect(!historical.eql(current));
+    // Released logical epochs include the source. Produce pre-upgrade postings
+    // with the old physical policy, then restore the unchanged logical schema.
+    _ = try schema_mod.saveSchema(&store, a, schema);
+    {
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{config});
+        const entry = manager.textIndexEntry(config.name).?;
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = true;
+        try manager.indexBatch(&store, &.{.{ .key = "old", .value = "{\"payload\":\"quasar\"}" }});
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = false;
+        var lease = try entry.persistent.snapshot().leaseSegment(0);
+        defer lease.deinit();
+        var inverted = (try lease.entry.reader.invertedIndexScoped(a, "payload")).?;
+        defer inverted.deinit();
+        try std.testing.expect(try inverted.lookup("quasar") != null);
+        try saveTextProjectionProvenance(&entry.persistent, a, historical);
+    }
+    {
+        var reopened = try IndexManager.init(a, path);
+        defer reopened.deinit();
+        reopened.updateRange(.{ .start = "", .end = "" });
+        try reopened.load(&store);
+        try std.testing.expect(reopened.textIndexEntry(config.name) == null);
+        try std.testing.expectEqualStrings("TextProjectionUpgradeRequired", reopened.loadFailure(config.name).?);
+    }
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionUpgradeRequired"));
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.manual_intervention, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionProvenanceMismatch"));
+    const rebuilt_path = try std.fmt.allocPrint(a, "{s}/rebuilt", .{path});
+    defer a.free(rebuilt_path);
+    var rebuilt = try IndexManager.init(a, rebuilt_path);
+    defer rebuilt.deinit();
+    rebuilt.updateRange(.{ .start = "", .end = "" });
+    try rebuilt.registerReplacementIndex(&store, config);
+    try rebuilt.indexBatch(&store, &.{.{ .key = "old", .value = "{\"payload\":\"quasar\"}" }});
+    var lease = try rebuilt.textIndexEntry(config.name).?.persistent.snapshot().leaseSegment(0);
+    defer lease.deinit();
+    try std.testing.expect((try lease.entry.reader.invertedIndex("payload")) == null);
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, null, 2, 0)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, null)));
+}
+
+test "logical query projection upgrade is discovered by the admitted owner turn" {
+    const a = std.testing.allocator;
+    const DB = @import("../selected_root.zig").db.DB;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/projection-owner", .{tmp.sub_path});
+    defer a.free(path);
+    const schema: schema_mod.TableSchema = .{
+        .version = 1,
+        .default_type = "doc",
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{
+            .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+            .{ .path = "payload", .emitted_name = "payload", .analyzer = "standard" },
+        } }},
+        .exact_fields = &.{.{ .field = "payload", .source_field = "payload", .mapping = .{ .field_type = .text, .do_index = false } }},
+    };
+    const cfg: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
+    const docs = &.{types.BatchWrite{ .key = "one", .value = "{\"body\":\"quasar\",\"payload\":\"secretpayload\"}" }};
+    {
+        var db = try DB.open(a, path, .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchema(schema);
+        try db.addIndex(cfg);
+        // Drain the live producer before manually simulating historical bytes.
+        try db.batch(.{ .writes = docs, .sync_level = .full_index });
+        const entry = db.core.index_manager.textIndexEntry(cfg.name).?;
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = true;
+        try db.core.index_manager.indexBatch(db.core.store, docs);
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = false;
+        try saveTextProjectionProvenance(&entry.persistent, a, try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, entry.config, schema, 2, 0));
+    }
+    var db = try DB.open(a, path, .{ .start_optional_runtimes = false });
+    defer db.close();
+    const owner = @import("antfly_source_root").antfly_sources.local_write;
+    const observed = try owner.repairStorageKernelOwnerDb(a, &db, null, false, .{});
+    try std.testing.expectEqual(@as(usize, 1), observed.repair_remaining);
+    try std.testing.expectEqual(@as(usize, 0), (try db.indexRepairIntentSummary(a)).runnable);
+    var completed = false;
+    for (0..64) |_| {
+        const result = try owner.repairStorageKernelOwnerDb(a, &db, null, true, .{});
+        if (result.state == .complete) {
+            completed = true;
+            break;
+        }
+    }
+    try std.testing.expect(completed);
+    const entry = db.core.index_manager.textIndexEntry(cfg.name).?;
+    var lease = try entry.persistent.snapshot().leaseSegment(0);
+    defer lease.deinit();
+    try std.testing.expect((try lease.entry.reader.invertedIndex("body")) != null);
+    try std.testing.expect((try lease.entry.reader.invertedIndex("payload")) == null);
+}
+
 test "model aware media generated dependencies order chunks vectors labels and transcript text" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -50099,4 +50619,166 @@ test "capi resolver reservation removal preserves independently raised native ep
     defer read.abort();
     try std.testing.expectEqual(required, try resolver_catalog.readMinimumReaderVersion(&read, required));
     try std.testing.expectEqual(required, try resolver_catalog.catalogReaderVersion(a, try read.get(resolver_catalog_key)));
+}
+
+test "resolver curation query admission retains large immutable declarations across generation changes" {
+    const a = std.testing.allocator;
+    var inputs = std.heap.ArenaAllocator.init(a);
+    defer inputs.deinit();
+    const aliases = try inputs.allocator().alloc(@import("antfly_resolver").KeyAlias, 100000);
+    for (aliases, 0..) |*edge, i| edge.* = .{ .key = try std.fmt.allocPrint(inputs.allocator(), "entity/alias-{d}", .{i}), .target = "entity/root" };
+    var manager: IndexManager = undefined;
+    manager.alloc = a;
+    manager.catalog_mutex = .{};
+    manager.resolvers = .empty;
+    defer manager.resolvers.deinit(a);
+    manager.retired_resolvers = .empty;
+    manager.resolver_namespace_lookup = null;
+    manager.test_resolver_lookup_builds = 0;
+    manager.test_resolver_query_proof_builds = 0;
+    manager.write_plan_generation = .init(1);
+    defer manager.invalidateResolverNamespaceLookup();
+    try manager.resolvers.append(a, .{ .name = "selected", .table = "entities", .key_template = "entity/{{_entity.text}}", .source_artifact = "kg", .resolution_artifact = "out", .aliases = aliases });
+    const captured = try manager.resolverQueryAdmission(a, "selected", true);
+    defer captured.deinit();
+    for (0..10) |_| {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const admission = try manager.resolverQueryAdmission(scratch.allocator(), "selected", true);
+        defer admission.deinit();
+        try std.testing.expectEqual(captured.configs[0].aliases.ptr, admission.configs[0].aliases.ptr);
+        try std.testing.expectEqualSlices(u8, &captured.fingerprint, &admission.fingerprint);
+        try std.testing.expectEqualStrings(captured.profile(0), admission.profile(0));
+        try std.testing.expect(scratch.queryCapacity() < 4096);
+    }
+    // Retiring the owner must leave in-flight snapshots valid, while the next
+    // admission and final declaration fence observe the replacement.
+    manager.resolvers.items[0].aliases = &.{.{ .key = "entity/alias-0", .target = "entity/new-root" }};
+    manager.invalidateWritePlanSnapshot();
+    manager.invalidateResolverNamespaceLookup();
+    const changed = try manager.resolverQueryAdmission(a, "selected", true);
+    defer changed.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &captured.fingerprint, &changed.fingerprint));
+    try std.testing.expectEqualStrings("entity/root", captured.configs[0].aliases[0].target);
+    try std.testing.expectEqualStrings("entity/new-root", changed.configs[0].aliases[0].target);
+    try std.testing.expectEqualSlices(u8, &changed.fingerprint, &try manager.resolverQueryDeclarationsFingerprint(changed.configs[0]));
+    std.debug.print("LEASED ADMISSION aliases=100000 warm_requests=10 arena_bytes_per_request<4096 copied_aliases=0\n", .{});
+}
+
+test "resolver curation query admission unwinds allocation failures" {
+    const Scenario = struct {
+        fn run(a: Allocator) !void {
+            var manager: IndexManager = undefined;
+            manager.alloc = a;
+            manager.catalog_mutex = .{};
+            manager.resolvers = .empty;
+            defer manager.resolvers.deinit(a);
+            manager.retired_resolvers = .empty;
+            manager.resolver_namespace_lookup = null;
+            manager.test_resolver_lookup_builds = 0;
+            manager.write_plan_generation = .init(1);
+            defer manager.invalidateResolverNamespaceLookup();
+            try manager.resolvers.append(a, .{ .name = "selected", .table = "entities", .key_template = "entity/{{_entity.text}}", .source_artifact = "kg", .resolution_artifact = "out", .aliases = &.{.{ .key = "a", .target = "b" }} });
+            const admission = try manager.resolverQueryAdmission(a, "selected", true);
+            defer admission.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}
+
+test "logical query dynamic template projection upgrades only exact affected witnesses" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    const fields = [_]schema_mod.FullTextField{
+        .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+        .{ .path = "payload", .emitted_name = "payload", .analyzer = "standard" },
+    };
+    const schema: schema_mod.TableSchema = .{
+        .full_text_documents = &.{.{ .name = "doc", .fields = &fields }},
+        .exact_fields = &.{.{ .field = "payload", .source_field = "payload", .mapping = .{ .field_type = .text, .do_index = false } }},
+        .dynamic_templates = &.{.{ .name = "numbers", .match_pattern = "*", .match_mapping_type = "number", .mapping = .{ .field_type = .numeric, .do_index = false } }},
+    };
+    const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
+    const prior = try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, schema, 2, 1);
+    const legacy = try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, schema, 2, 0);
+    const current = try TextProjectionProvenance.fromRuntimeSchema(a, config, schema);
+    try std.testing.expect(!prior.eql(current) and !legacy.eql(prior));
+    var unaffected = schema;
+    unaffected.dynamic_templates = &.{};
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, unaffected, 2, 1)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, unaffected)));
+    _ = try schema_mod.saveSchema(&store, a, schema);
+    {
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{config});
+        const entry = manager.textIndexEntry(config.name).?;
+        const document = &@constCast(entry.runtime_schema.?.full_text_documents)[0];
+        const original = document.fields;
+        document.fields = &.{};
+        try manager.indexBatch(&store, &.{.{ .key = "old", .value = "{\"body\":\"zebrafish\",\"payload\":\"stored-only\"}" }});
+        document.fields = original;
+        var lease = try entry.persistent.snapshot().leaseSegment(0);
+        defer lease.deinit();
+        try std.testing.expect((try lease.entry.reader.invertedIndex("body")) == null);
+        try saveTextProjectionProvenance(&entry.persistent, a, try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, entry.config, entry.runtime_schema, 2, 1));
+    }
+    var reopened = try IndexManager.init(a, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry(config.name) == null);
+    try std.testing.expectEqualStrings("TextProjectionUpgradeRequired", reopened.loadFailure(config.name).?);
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionUpgradeRequired"));
+}
+
+test "logical query nullable ordering projection upgrades only exact affected witnesses" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    const schema: schema_mod.TableSchema = .{
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "body", .emitted_name = "body", .analyzer = "standard" }} }},
+        .exact_fields = &.{.{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .keyword, .sortable = true, .missing_null_policy = .nulls_ordered } }},
+        .index_sort = &.{ .{ .field = "rank" }, .{ .field = "_id" } },
+    };
+    const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
+    const prior = try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, schema, 2, 3);
+    try std.testing.expect(!prior.eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, schema)));
+    var unaffected = schema;
+    unaffected.index_sort = &.{};
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, unaffected, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, unaffected)));
+    var selected = config;
+    selected.config_json = "{\"field\":\"body\"}";
+    try std.testing.expect(!(try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, selected, schema, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, selected, schema)));
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, selected, unaffected, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, selected, unaffected)));
+    _ = try schema_mod.saveSchema(&store, a, schema);
+    {
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{config});
+        try manager.indexBatch(&store, &.{.{ .key = "old", .value = "{\"body\":\"quasar\",\"rank\":[\"z\"]}" }});
+        const entry = manager.textIndexEntry(config.name).?;
+        try saveTextProjectionProvenance(&entry.persistent, a, try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, entry.config, entry.runtime_schema, 2, 3));
+    }
+    var reopened = try IndexManager.init(a, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry(config.name) == null);
+    try std.testing.expectEqualStrings("TextProjectionUpgradeRequired", reopened.loadFailure(config.name).?);
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionUpgradeRequired"));
 }

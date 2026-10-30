@@ -27,6 +27,23 @@ This file fits with the other architecture docs:
 
 ## Direction
 
+Portable fast paths use GPU capabilities, not device marketing names. The
+shared Apple SIMD-group policy checks inherited `MTLGPUFamilyApple7` support
+(M1 and later), following [Apple's feature tables](https://developer.apple.com/metal/capabilities/).
+Qwen, Gemma, Florence, embedding and LightOnOCR callers retain their model and
+shape contracts; dispatch still requires the compiled pipeline's SIMD width,
+thread count, memory limits and buffer layout. Optional Metal 4 pipelines can
+fail to compile without replacing a supported fallback with an invalid launch.
+Explicit feature overrides and rollback flags remain authoritative.
+
+LightOn local decode pipelines initialize once when the model enables its
+projection policy, rather than eagerly on one named GPU. Qualification checks
+live in `scripts/lightonocr3/check_metal_projections.m`: `--check-device-policy`
+tests inherited capabilities, unsupported families, missing pipelines and
+rollback without querying a device name; the default invocation runs numeric
+and fallback oracles on the actual GPU. Device-specific benchmark numbers
+elsewhere in this document describe the measured host, not an eligibility list.
+
 The durable architecture is: simplify upward, specialize downward.
 
 - `lib/ml/src/graph` owns the generic graph IR, passes, liveness, and graph

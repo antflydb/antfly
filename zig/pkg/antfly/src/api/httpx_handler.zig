@@ -1252,6 +1252,7 @@ pub const AntflyApiHandler = struct {
         if (!policy.failover_safe_mutations_only) return null;
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
         const mutation = classifyHotStandbyMutation(ctx.request.method, path) orelse return null;
+        if (@import("inference_route_policy.zig").isDocumentJobMutation(@tagName(ctx.request.method), path) and self.api_server.documentJobsFailoverSafe()) return null;
         // Backup and table restore are adapters over the same durable cohort
         // and staging authority; handlers reject uncertified historical cuts.
         if ((mutation.surface == .cluster_restore or mutation.surface == .restore_job or mutation.surface == .table_restore or mutation.surface == .backup) and
@@ -1360,6 +1361,18 @@ pub const AntflyApiHandler = struct {
         try root_server.postResponseStreaming("/ai/v1/chat/completions", httpx.Handler.bind(self, gatewayChat));
         try root_server.postResponseStreaming("/ai/v1/embeddings", httpx.Handler.bind(self, gatewayEmbeddings));
         try root_server.postResponseStreaming("/ai/v1/decisions", httpx.Handler.bind(self, gatewayDecisions));
+        try root_server.postResponseStreaming("/ai/v1/read/jobs", httpx.Handler.bind(self, documentReadCreate));
+        try root_server.get("/ai/v1/read/jobs/:job_id", httpx.Handler.bind(self, documentReadStatus));
+        try root_server.get("/ai/v1/read/jobs/:job_id/result", httpx.Handler.bind(self, documentReadResult));
+        try root_server.get("/ai/v1/read/jobs/:job_id/events", httpx.Handler.bind(self, documentReadEvents));
+        try root_server.postResponseStreaming("/ai/v1/read/jobs/:job_id/resume", httpx.Handler.bind(self, documentReadResume));
+        try root_server.postResponseStreaming("/ai/v1/read/jobs/:job_id/cancel", httpx.Handler.bind(self, documentReadCancel));
+        try root_server.postResponseStreaming("/ai/v1/extract/jobs", httpx.Handler.bind(self, documentExtractCreate));
+        try root_server.get("/ai/v1/extract/jobs/:job_id", httpx.Handler.bind(self, documentExtractStatus));
+        try root_server.get("/ai/v1/extract/jobs/:job_id/result", httpx.Handler.bind(self, documentExtractResult));
+        try root_server.get("/ai/v1/extract/jobs/:job_id/events", httpx.Handler.bind(self, documentExtractEvents));
+        try root_server.postResponseStreaming("/ai/v1/extract/jobs/:job_id/resume", httpx.Handler.bind(self, documentExtractResume));
+        try root_server.postResponseStreaming("/ai/v1/extract/jobs/:job_id/cancel", httpx.Handler.bind(self, documentExtractCancel));
         try root_server.postResponseStreaming("/ai/v1/read", httpx.Handler.bind(self, gatewayRead));
         try root_server.postResponseStreaming("/ai/v1/extract", httpx.Handler.bind(self, gatewayExtract));
         try root_server.postResponseStreaming("/ai/v1/rewrite", httpx.Handler.bind(self, gatewayRewrite));
@@ -1635,7 +1648,7 @@ pub const AntflyApiHandler = struct {
     fn respondRetrievalReadError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
         const payload = retrieval_agent.retryableReadFailure(err) orelse return null;
         try ctx.setHeader("Retry-After", "1");
-        return try ctx.status(if (err == error.StorageReadTemporarilyUnavailable) 503 else 409).json(payload);
+        return try ctx.status(if (err == error.StorageReadTemporarilyUnavailable or err == error.IndexRebuilding) 503 else 409).json(payload);
     }
 
     fn respondQueryOperationalError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
@@ -1790,7 +1803,10 @@ pub const AntflyApiHandler = struct {
         const raw_body = (try ctx.body()) orelse "{}";
         const Create = struct { space: []const u8, config: module.memory.types.Config = .{} };
         const creating = std.mem.eql(u8, ctx.request.uri.path, "/memory/v1/spaces");
-        const create = if (creating) std.json.parseFromSliceLeaky(Create, a, raw_body, .{}) catch |err| return memoryFailure(ctx, err) else null;
+        const create = if (creating) switch (try parseJsonBody(Create, a, raw_body, .{})) {
+            .value => |value| value,
+            .invalid => |problem| return memoryInvalidJson(ctx, problem),
+        } else null;
         const selected = if (create) |input| module.Route{ .space = input.space, .action = .create } else module.route(@tagName(ctx.request.method), ctx.request.uri.path) catch |err| return memoryFailure(ctx, err);
         const name = (try decodePathParamOrBadRequest(ctx, selected.space)) orelse return ctx.text("invalid memory space");
         defer ctx.allocator.free(name);
@@ -1810,6 +1826,10 @@ pub const AntflyApiHandler = struct {
             };
         }
         const body = if (create) |input| try std.json.Stringify.valueAlloc(a, input.config, .{}) else if (ctx.request.method == .GET) try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = query_body }, .{}) else raw_body;
+        const body_value = switch (try parseJsonBody(std.json.Value, a, body, .{ .parse_numbers = false })) {
+            .value => |value| value,
+            .invalid => |problem| return memoryInvalidJson(ctx, problem),
+        };
         const identifier = (try decodePathParamOrBadRequest(ctx, selected.id)) orelse return ctx.text("invalid memory id");
         defer ctx.allocator.free(identifier);
         var response = try self.api_server.executeMemoryService(name, .{
@@ -1818,16 +1838,61 @@ pub const AntflyApiHandler = struct {
             .namespace = ctx.header("x-antfly-namespace") orelse "public",
             .action = selected.action,
             .id = identifier,
-            .body = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{ .parse_numbers = false }),
+            .body = body_value,
             .idempotency_key = ctx.header("idempotency-key") orelse "",
         }, identity, tableMutationContext(ctx, &identity));
         defer response.deinit(self.api_server.alloc);
+        if (response.status == 503 or response.status == 429) try ctx.setHeader("Retry-After", "1");
         return jsonResponse(ctx, response.status, response.body);
+    }
+
+    const JsonBodyProblem = struct {
+        /// Stable identifier for clients: the JSON error name.
+        code: []const u8,
+        /// Human-readable description with the position in the body.
+        message: []const u8,
+    };
+
+    fn ParsedJsonBody(comptime T: type) type {
+        return union(enum) { value: T, invalid: JsonBodyProblem };
+    }
+
+    /// Parses a JSON request body. A body that is not valid JSON for `T`
+    /// is returned as a problem naming what is wrong and where; other errors
+    /// propagate unchanged. The message never echoes request content.
+    fn parseJsonBody(
+        comptime T: type,
+        a: std.mem.Allocator,
+        raw: []const u8,
+        options: std.json.ParseOptions,
+    ) !ParsedJsonBody(T) {
+        var diagnostics: std.json.Diagnostics = .{};
+        var scanner = std.json.Scanner.initCompleteInput(a, raw);
+        scanner.enableDiagnostics(&diagnostics);
+        const value = std.json.parseFromTokenSourceLeaky(T, a, &scanner, options) catch |err| {
+            const problem = jsonBodyProblem(err) orelse return err;
+            return .{ .invalid = .{
+                .code = @errorName(err),
+                .message = try std.fmt.allocPrint(a, "invalid JSON at line {d}, column {d}: {s}", .{
+                    diagnostics.getLine(), diagnostics.getColumn(), problem,
+                }),
+            } };
+        };
+        return .{ .value = value };
+    }
+
+    fn jsonBodyProblem(err: anyerror) ?[]const u8 {
+        return @import("memory.zig").jsonErrorDescription(err);
+    }
+
+    fn memoryInvalidJson(ctx: *httpx.Context, problem: JsonBodyProblem) !httpx.Response {
+        return ctx.status(400).json(.{ .code = problem.code, .retryable = false, .@"error" = problem.message });
     }
 
     fn memoryFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         const code = @import("memory.zig").status(err);
-        return jsonResponse(ctx, code, try std.json.Stringify.valueAlloc(ctx.allocator, .{ .code = @errorName(err), .retryable = code == 503 or code == 429, .@"error" = @errorName(err) }, .{}));
+        if (code == 503 or code == 429) try ctx.setHeader("Retry-After", "1");
+        return ctx.status(code).json(.{ .code = @errorName(err), .retryable = code == 503 or code == 429, .@"error" = @import("memory.zig").errorMessage(err) });
     }
 
     fn extensionRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -4308,6 +4373,48 @@ pub const AntflyApiHandler = struct {
     fn gatewayDecisions(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequest(ctx, .decide);
     }
+    fn documentReadCreate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .create);
+    }
+    fn documentReadStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .status);
+    }
+    fn documentReadResult(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .result);
+    }
+    fn documentReadEvents(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .events);
+    }
+    fn documentReadResume(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .@"resume");
+    }
+    fn documentReadCancel(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .cancel);
+    }
+    fn documentExtractCreate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .create);
+    }
+    fn documentExtractStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .status);
+    }
+    fn documentExtractResult(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .result);
+    }
+    fn documentExtractEvents(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .events);
+    }
+    fn documentExtractResume(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .@"resume");
+    }
+    fn documentExtractCancel(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .cancel);
+    }
+    fn documentJob(self: *AntflyApiHandler, ctx: *httpx.Context, operation: @import("document_jobs.zig").Operation, action: @import("document_jobs.zig").Action) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        return @import("document_jobs.zig").handle(self.api_server, ctx, if (identity) |value| value.credential_principal else "anonymous", operation, action) catch |err| gatewayFailure(ctx, err);
+    }
     fn gatewayExtract(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequest(ctx, .extract);
     }
@@ -4367,22 +4474,396 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const response = blk: {
             inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
-            break :blk inference_gateway.batch(self.api_server, ctx);
+            var sources: GatewaySources = .{ .server = self.api_server, .ctx = ctx, .identity = identity };
+            break :blk inference_gateway.batchWithSources(self.api_server, ctx, sources.port());
         };
         return response catch |err| gatewayFailure(ctx, err);
     }
 
-    fn gatewayRequest(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_provider_registry.gateway.Task) !httpx.Response {
+    const GatewaySources = struct {
+        server: *ApiHttpServer,
+        ctx: *httpx.Context,
+        identity: ?AuthenticatedIdentity,
+        fn port(self: *@This()) inference_gateway.source_media.Port {
+            return .{ .ptr = self, .lookup = lookup, .lookup_many = lookupMany };
+        }
+        fn at(value: std.json.Value, path: []const u8) ?std.json.Value {
+            var current = value;
+            var parts = std.mem.splitScalar(u8, path, '.');
+            while (parts.next()) |part| {
+                if (current != .object) return null;
+                current = current.object.get(part) orelse return null;
+            }
+            return current;
+        }
+        fn lookup(raw: *anyopaque, a: std.mem.Allocator, reference: inference_gateway.source_media.Reference) ![]const u8 {
+            return (try lookupMany(raw, a, &.{reference}))[0];
+        }
+        fn lookupMany(raw: *anyopaque, a: std.mem.Allocator, references: []const inference_gateway.source_media.Reference) ![]const []const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const now = @import("antfly_platform").time.monotonicNs();
+            // One shared deadline for the whole materialization, not per image.
+            const deadline = self.ctx.application_deadline_ns orelse (now + 120 * std.time.ns_per_s);
+            const output = try a.alloc([]const u8, references.len);
+            const groups = try inference_gateway.source_media.groups(a, references);
+            const runtime = self.server.agentConcurrencyIo();
+            var total_bytes: usize = 0;
+            for (references) |reference| total_bytes +|= std.base64.standard.Encoder.calcSize(reference.byte_length);
+            if (runtime == null or groups.len <= 1 or total_bytes < 64 * 1024) {
+                for (groups) |group| try self.lookupGroup(a, references, group, deadline, output);
+                return output;
+            }
+            const io = runtime.?;
+            const scheduler = @import("antfly_local_sources").sql_parallel_scheduler;
+            var backing: scheduler.LockedAllocator = .{ .backing = SQLMemoryBudget.reclaimingAllocator(a) };
+            // Rolling completions can overlap parent copies and child scratch.
+            // Both allocator paths serialize through the same quota lock.
+            var parent: scheduler.LockedAllocator = .{ .backing = a, .shared_mutex = &backing.mutex };
+            const parent_alloc = parent.allocator();
+            var ready: std.Io.Event = .unset;
+            var jobs: [4]MediaGroupJob = @splat(.{});
+            defer for (&jobs) |*job| if (job.active) {
+                if (job.task) |*task| task.cancel(io);
+                job.arena.deinit();
+            };
+            var next: usize = 0;
+            var completed: usize = 0;
+            var active_bytes: usize = 0;
+            const byte_limit = 8 * 1024 * 1024;
+            while (completed < groups.len) {
+                ready.reset();
+                for (&jobs) |*job| if (job.active and job.done.load(.acquire)) {
+                    if (job.task) |*task| task.await(io);
+                    job.task = null;
+                    if (job.failure) |err| return err;
+                    for (job.group.references.items) |slot| output[slot] = try parent_alloc.dupe(u8, job.output.?[slot]);
+                    job.arena.deinit();
+                    job.active = false;
+                    active_bytes -= job.estimated_bytes;
+                    completed += 1;
+                };
+                for (&jobs) |*job| {
+                    if (next == groups.len) break;
+                    if (job.active) continue;
+                    const group = groups[next];
+                    var estimate: usize = 64 * 1024;
+                    for (group.references.items) |slot| estimate +|= std.base64.standard.Encoder.calcSize(references[slot].byte_length) *| 2;
+                    if (estimate > byte_limit -| active_bytes and active_bytes != 0) break;
+                    job.* = .{ .active = true, .owner = self, .arena = .init(backing.allocator()), .references = references, .group = group, .deadline = deadline, .io = io, .ready = &ready, .estimated_bytes = estimate };
+                    active_bytes += estimate;
+                    next += 1;
+                    job.task = if (estimate <= byte_limit)
+                        scheduler.global().submitIoTransient(io, estimate, MediaGroupJob.run, .{job})
+                    else
+                        null;
+                    if (job.task == null) job.run();
+                }
+                if (completed == groups.len) break;
+                if (self.ctx.isCancellationRequested()) return error.Canceled;
+                if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
+                // Reset precedes the readiness scan; a racing completion sets
+                // the event before this wait, so no finished slot is lost.
+                var finished = false;
+                for (&jobs) |*job| if (job.active and job.done.load(.acquire)) {
+                    finished = true;
+                    break;
+                };
+                if (!finished) try ready.wait(io);
+            }
+            return output;
+        }
+        const MediaGroupJob = struct {
+            active: bool = false,
+            owner: *GatewaySources = undefined,
+            arena: std.heap.ArenaAllocator = undefined,
+            references: []const inference_gateway.source_media.Reference = &.{},
+            group: inference_gateway.source_media.Group = .{},
+            deadline: u64 = 0,
+            io: std.Io = undefined,
+            ready: *std.Io.Event = undefined,
+            estimated_bytes: usize = 0,
+            done: std.atomic.Value(bool) = .init(false),
+            task: ?@import("antfly_local_sources").sql_parallel_scheduler.Task(void) = null,
+            output: ?[][]const u8 = null,
+            failure: ?anyerror = null,
+            fn run(self: *@This()) void {
+                defer {
+                    self.done.store(true, .release);
+                    self.ready.set(self.io);
+                }
+                const a = self.arena.allocator();
+                self.output = a.alloc([]const u8, self.references.len) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                self.owner.lookupGroup(a, self.references, self.group, self.deadline, self.output.?) catch |err| {
+                    self.failure = err;
+                };
+            }
+        };
+        const MediaResult = struct {
+            ctx: ?*httpx.Context = null,
+            a: std.mem.Allocator,
+            references: []const inference_gateway.source_media.Reference,
+            group: inference_gateway.source_media.Group,
+            output: [][]const u8,
+            consumed: bool = false,
+            legacy: bool = false,
+            flat: bool = true,
+            projection_missing: bool = false,
+            failure: ?anyerror = null,
+            seen: u32 = 0,
+            retained: usize = 0,
+            encoded_bytes: usize = 0,
+            wire: std.ArrayList(u8),
+            fn start(raw: *anyopaque, length: usize) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (length > 32 * 1024 * 1024) return error.InferenceRequestTooLarge;
+                try self.wire.ensureTotalCapacity(self.a, length);
+            }
+            fn write(raw: *anyopaque, bytes: []const u8) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (bytes.len > 32 * 1024 * 1024 -| self.wire.items.len) return error.InferenceRequestTooLarge;
+                try self.wire.appendSlice(self.a, bytes);
+            }
+            fn consume(raw: *anyopaque, view: @import("antfly_local_sources").api_query_response.ResultView) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.consumeResult(view) catch |err| {
+                    self.failure = err;
+                    return error.QueryDeliveryFailed;
+                };
+            }
+            fn chargeEncoded(self: *@This(), size: usize) !void {
+                if (size > 32 * 1024 * 1024 -| self.encoded_bytes) return error.InferenceRequestTooLarge;
+                self.encoded_bytes += size;
+            }
+            fn consumeResult(self: *@This(), view: @import("antfly_local_sources").api_query_response.ResultView) !void {
+                const result = view.result;
+                try inference_gateway.source_media.checkStatus(result.status);
+                const hits = (result.hits orelse return error.InferenceUpstreamUnavailable).hits orelse return error.InferenceUpstreamUnavailable;
+                if (view.encoded_sources.len != 0 and view.encoded_sources.len != hits.len) return error.InferenceUpstreamUnavailable;
+                for (hits, 0..) |hit_, hit_index| {
+                    var scratch = std.heap.ArenaAllocator.init(SQLMemoryBudget.reclaimingAllocator(self.a));
+                    defer scratch.deinit();
+                    const computed: ?std.json.Value = if (!self.legacy and (self.flat or self.group.identity_images.items.len != 0)) value: {
+                        const bytes = (hit_._computed orelse {
+                            self.projection_missing = true;
+                            return error.QueryDeliveryFailed;
+                        }).bytes;
+                        try self.chargeEncoded(bytes.len);
+                        break :value try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), bytes, .{ .allocate = .alloc_if_needed });
+                    } else null;
+                    const values = if (!self.legacy and self.flat) computed.? else value: {
+                        if (view.encoded_sources.len != 0) if (view.encoded_sources[hit_index]) |source| {
+                            try self.chargeEncoded(source.bytes.len);
+                            break :value try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), source.bytes, .{ .allocate = .alloc_if_needed });
+                        };
+                        const source = hit_._source orelse return error.InferenceSourceUnavailable;
+                        break :value std.json.Value{ .object = source.map };
+                    };
+                    try self.hit(hit_._id, values, computed);
+                }
+                try self.finish();
+                self.consumed = true;
+            }
+            fn atPath(value: std.json.Value, path: []const u8) ?std.json.Value {
+                var current = value;
+                var parts = std.mem.splitScalar(u8, path, '.');
+                while (parts.next()) |part| current = switch (current) {
+                    .object => |object| object.get(part) orelse return null,
+                    .array => |array| element: {
+                        const index = std.fmt.parseInt(usize, part, 10) catch return null;
+                        if (index >= array.items.len) return null;
+                        break :element array.items[index];
+                    },
+                    else => return null,
+                };
+                return current;
+            }
+            fn selected(self: *@This(), values: std.json.Value, path: []const u8) !std.json.Value {
+                if (self.legacy or !self.flat) return atPath(values, path) orelse error.InferenceSourceMismatch;
+                for (self.group.fields.items, 0..) |field, i| if (std.mem.eql(u8, field, path)) {
+                    return at(values, try std.fmt.allocPrint(self.a, "v{d}", .{i})) orelse error.InferenceSourceMismatch;
+                };
+                return error.InferenceSourceMismatch;
+            }
+            fn hit(self: *@This(), id: []const u8, values: std.json.Value, identities: ?std.json.Value) !void {
+                if (values != .object) return error.InferenceSourceMismatch;
+                // Each selected field is copied once while the producer owns it.
+                var owned: [64]?[]const u8 = @splat(null);
+                for (self.group.references.items, 0..) |slot, group_slot| {
+                    const reference = self.references[slot];
+                    if (!std.mem.eql(u8, reference.document_id, id)) continue;
+                    const bit = @as(u32, 1) << @intCast(group_slot);
+                    if (self.seen & bit != 0) return error.InferenceSourceMismatch;
+                    self.seen |= bit;
+                    if (reference.identity) |expected| {
+                        const image_slot = for (self.group.identity_images.items, 0..) |field, i| {
+                            if (std.mem.eql(u8, field, reference.field)) break i;
+                        } else return error.InferenceSourceMismatch;
+                        const actual = at(identities orelse return error.InferenceSourceMismatch, try std.fmt.allocPrint(self.a, "i{d}", .{image_slot})) orelse return error.InferenceSourceMismatch;
+                        if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InferenceSourceMismatch;
+                    }
+                    const revision = try self.selected(values, reference.revision_field);
+                    if (revision != .string or !std.mem.eql(u8, revision.string, reference.revision)) return error.InferenceSourceMismatch;
+                    if (reference.permissions_field) |path| {
+                        const permission = try self.selected(values, path);
+                        const public = at(permission, "public");
+                        var allowed = if (public) |value| value == .bool and value.bool else false;
+                        if (at(permission, "readers")) |readers| if (readers == .array) {
+                            for (readers.array.items) |reader| if (reader == .string) for (reference.principals) |principal| {
+                                allowed = allowed or std.mem.eql(u8, reader.string, principal);
+                            };
+                        };
+                        if (!allowed) return error.Forbidden;
+                    }
+                    if (self.legacy or !self.flat) {
+                        if (atPath(values, reference.field) == null) return error.InferenceSourceUnavailable;
+                    } else {
+                        const image_slot = for (self.group.images.items, 0..) |field, i| {
+                            if (std.mem.eql(u8, field, reference.field)) break i;
+                        } else return error.InferenceSourceMismatch;
+                        const missing = at(values, try std.fmt.allocPrint(self.a, "m{d}", .{image_slot})) orelse return error.InferenceSourceMismatch;
+                        if (missing != .bool) return error.InferenceSourceMismatch;
+                        if (missing.bool) return error.InferenceSourceUnavailable;
+                    }
+                    const value = try self.selected(values, reference.field);
+                    if (value != .string) return error.InferenceSourceMismatch;
+                    if (self.ctx) |ctx| if (ctx.isCancellationRequested()) return error.Canceled;
+                    const field_slot = for (self.group.fields.items, 0..) |field, i| {
+                        if (std.mem.eql(u8, field, reference.field)) break i;
+                    } else unreachable;
+                    if (owned[field_slot] == null) {
+                        if (value.string.len > 32 * 1024 * 1024 -| self.retained) return error.InferenceRequestTooLarge;
+                        self.retained += value.string.len;
+                        owned[field_slot] = try self.a.dupe(u8, value.string);
+                    }
+                    self.output[slot] = owned[field_slot].?;
+                }
+            }
+            fn finish(self: *@This()) !void {
+                const expected = if (self.group.references.items.len == 32) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(self.group.references.items.len)) - 1;
+                if (self.seen != expected) return error.InferenceSourceUnavailable;
+            }
+        };
+        fn lookupGroup(self: *@This(), a: std.mem.Allocator, references: []const inference_gateway.source_media.Reference, group: inference_gateway.source_media.Group, deadline: u64, output: [][]const u8) !void {
+            if (self.ctx.isCancellationRequested()) return error.Canceled;
+            var legacy = false;
+            const flat = group.requiresFlatValues();
+            while (true) {
+                if (self.ctx.isCancellationRequested()) return error.Canceled;
+                const current = @import("antfly_platform").time.monotonicNs();
+                if (deadline <= current) return error.Timeout;
+                var roots: std.ArrayList([]const u8) = .empty;
+                if (legacy) for (group.fields.items) |field| {
+                    const root = field[0 .. std.mem.indexOfScalar(u8, field, '.') orelse field.len];
+                    var found = false;
+                    for (roots.items) |existing| if (std.mem.eql(u8, root, existing)) {
+                        found = true;
+                        break;
+                    };
+                    if (!found) try roots.append(a, root);
+                };
+                var selected: std.json.ObjectMap = .empty;
+                if (flat) for (group.fields.items, 0..) |field, i| {
+                    var expression: std.json.ObjectMap = .empty;
+                    try expression.put(a, "field", .{ .string = field });
+                    try selected.put(a, try std.fmt.allocPrint(a, "v{d}", .{i}), .{ .object = expression });
+                };
+                if (flat) for (group.images.items, 0..) |field, i| {
+                    const encoded = try std.json.Stringify.valueAlloc(a, .{ .call = "is_missing", .args = .{.{ .field = field }} }, .{});
+                    try selected.put(a, try std.fmt.allocPrint(a, "m{d}", .{i}), try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
+                };
+                for (group.identity_images.items, 0..) |field, i| {
+                    const encoded = try std.json.Stringify.valueAlloc(a, .{ .call = "value_identity", .args = .{.{ .field = field }} }, .{});
+                    try selected.put(a, try std.fmt.allocPrint(a, "i{d}", .{i}), try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
+                }
+                const first = references[group.references.items[0]];
+                const query = try std.json.Stringify.valueAlloc(a, .{
+                    .query = .{ .bool = .{ .filter = .{ .ids = group.ids.items } } },
+                    .fields = if (legacy) roots.items else if (flat) @as([]const []const u8, &.{}) else group.fields.items,
+                    .select = if (legacy or selected.count() == 0) @as(?std.json.Value, null) else std.json.Value{ .object = selected },
+                    .filter_query = first.filter_query,
+                    .limit = group.ids.items.len,
+                    .timeout_ms = @min(@as(u64, 120000), @max(@as(u64, 1), (deadline - current) / std.time.ns_per_ms)),
+                }, .{ .emit_null_optional_fields = false });
+                var cancellation: http_common.RequestCancellation = .{ .borrowed_context = self.ctx, .borrowed_is_cancelled = struct {
+                    fn cancelled(ptr: *const anyopaque) bool {
+                        const context: *const httpx.Context = @ptrCast(@alignCast(ptr));
+                        return context.isCancellationRequested();
+                    }
+                }.cancelled };
+                var collector: MediaResult = .{ .ctx = self.ctx, .a = a, .references = references, .group = group, .output = output, .wire = .empty, .legacy = legacy, .flat = flat };
+                // Representation choice only: small groups retain the cheaper
+                // owned-wire path. Declared sizes never authorize or validate
+                // content; actual wire/source and decoded limits apply in both.
+                var encoded_estimate: usize = 0;
+                for (group.references.items) |slot| encoded_estimate +|= std.base64.standard.Encoder.calcSize(@min(references[slot].byte_length, 64 * 1024));
+                const borrow_result = encoded_estimate >= 64 * 1024;
+                // Ordinary admission, catalog binding, policy and read-cut execution
+                // feed the in-process consumer; unsupported producers retain wire.
+                var response = try self.server.consumePublicTableQuery(first.table, query, self.identity, &cancellation, .{
+                    .ptr = &collector,
+                    .start_fn = MediaResult.start,
+                    .write_fn = MediaResult.write,
+                    .max_bytes = 32 * 1024 * 1024,
+                    .typed_result = if (borrow_result) .{ .ptr = &collector, .consume = MediaResult.consume } else null,
+                });
+                defer response.deinit(self.server.alloc);
+                if (collector.projection_missing and !legacy and group.identity_images.items.len == 0) {
+                    legacy = true;
+                    continue;
+                }
+                if (collector.failure) |err| return err;
+                try inference_gateway.source_media.checkStatus(response.status);
+                if (!collector.consumed) {
+                    const bytes = if (collector.wire.items.len != 0) collector.wire.items else response.body;
+                    if (bytes.len > 32 * 1024 * 1024) return error.InferenceRequestTooLarge;
+                    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+                    const responses = at(parsed, "responses") orelse return error.InferenceUpstreamUnavailable;
+                    if (responses != .array or responses.array.items.len != 1) return error.InferenceUpstreamUnavailable;
+                    const result = responses.array.items[0];
+                    const status = at(result, "status") orelse return error.InferenceUpstreamUnavailable;
+                    if (status != .integer) return error.InferenceUpstreamUnavailable;
+                    try inference_gateway.source_media.checkStatus(status.integer);
+                    const hits = at(result, "hits.hits") orelse return error.InferenceUpstreamUnavailable;
+                    if (hits != .array) return error.InferenceUpstreamUnavailable;
+                    for (hits.array.items) |hit| {
+                        const id = at(hit, "_id") orelse return error.InferenceUpstreamUnavailable;
+                        if (id != .string) return error.InferenceUpstreamUnavailable;
+                        const values = at(hit, if (legacy or !flat) "_source" else "_computed") orelse {
+                            if (!legacy) {
+                                collector.projection_missing = true;
+                                break;
+                            }
+                            return error.InferenceSourceUnavailable;
+                        };
+                        try collector.hit(id.string, values, at(hit, "_computed"));
+                    }
+                    if (collector.projection_missing and !legacy and group.identity_images.items.len == 0) {
+                        legacy = true;
+                        continue;
+                    }
+                    if (collector.projection_missing) return error.InferenceSourceMismatch;
+                    try collector.finish();
+                }
+                return;
+            }
+        }
+    };
+
+    fn gatewayRequest(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_inference_gateway.Task) !httpx.Response {
         return self.gatewayRequestOperation(ctx, task, null);
     }
 
-    fn gatewayRequestOperation(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_provider_registry.gateway.Task, operation: ?[]const u8) !httpx.Response {
+    fn gatewayRequestOperation(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_inference_gateway.Task, operation: ?[]const u8) !httpx.Response {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*value| value.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const response = blk: {
             inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
-            break :blk if (task) |selected| inference_gateway.executeOperation(self.api_server, ctx, selected, operation) else if (inference_gateway.isPredictorDiscoveryPath(ctx.request.uri.path)) inference_gateway.predictors(self.api_server, ctx) else inference_gateway.models(self.api_server, ctx);
+            var sources: GatewaySources = .{ .server = self.api_server, .ctx = ctx, .identity = identity };
+            break :blk if (task) |selected| inference_gateway.executeOperationWithSources(self.api_server, ctx, selected, operation, sources.port()) else if (inference_gateway.isPredictorDiscoveryPath(ctx.request.uri.path)) inference_gateway.predictors(self.api_server, ctx) else inference_gateway.models(self.api_server, ctx);
         };
         return response catch |err| gatewayFailure(ctx, err);
     }
@@ -4392,13 +4873,21 @@ pub const AntflyApiHandler = struct {
         if (err == error.Timeout) return inference_gateway.timeoutResponse(ctx);
         const status: u16 = switch (err) {
             error.InferenceRequestTooLarge, error.ConstrainedInputTooLarge => 413,
-            error.ConnectionCapabilityMissing, error.PublicInferenceDisabled => 403,
+            error.ConnectionCapabilityMissing, error.PublicInferenceDisabled, error.Forbidden => 403,
             error.ModelNotFound, error.ConnectionNotFound, error.InferenceSessionNotFound => 404,
             error.InferenceCapacityUnavailable, error.DecisionRateLimited, error.InferenceUpstreamRateLimited, error.RateLimit, error.AttemptLimitExceeded => 429,
             error.InferenceUpstreamUnavailable, error.ServiceUnavailable => 503,
             error.DecisionRefused => 422,
             error.Timeout => 504,
-            error.EmbeddingIdentityMismatch => 409,
+            error.EmbeddingIdentityMismatch, error.InferenceSourceMismatch => 409,
+            error.InferenceSourceUnavailable => 404,
+            error.InvalidInferenceSource, error.InferenceSourceUnsupported => 400,
+            error.DocumentRunNotFound => 404,
+            error.DocumentRunExpired => 410,
+            error.DocumentRunBusy, error.DocumentRunLeaseLost, error.DocumentRunTerminal => 409,
+            error.DocumentStorageNotConfigured, error.NotLeader => 503,
+            error.TooManyActiveJobs => 429,
+            error.InlineCredentialNotAllowed => 400,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.ProviderTokenBudgetExceeded, error.UnsupportedMediaTokenBudget, error.UnsupportedBedrockContentPart, error.UnsupportedBedrockGenerationOptions, error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
             else => 502,
@@ -4416,7 +4905,8 @@ pub const AntflyApiHandler = struct {
         if (std.mem.eql(u8, connection_id, common_config.named_inference_connection_id)) {
             const task = inference_gateway.taskForOperation(operation) orelse return gatewayFailure(ctx, error.UnsupportedInferenceFeature);
             inference_gateway.prepare(self.api_server, ctx) catch |err| return gatewayFailure(ctx, err);
-            return inference_gateway.executeOperation(self.api_server, ctx, task, operation) catch |err| gatewayFailure(ctx, err);
+            var sources: GatewaySources = .{ .server = self.api_server, .ctx = ctx, .identity = authenticated_identity };
+            return inference_gateway.executeOperationWithSources(self.api_server, ctx, task, operation, sources.port()) catch |err| gatewayFailure(ctx, err);
         }
         inference_gateway.prepare(self.api_server, ctx) catch |err| return gatewayFailure(ctx, err);
         comptime std.debug.assert(request_admission_policy.publicOperationClass("invokeInferenceConnection").? == .inference);
@@ -6225,7 +6715,7 @@ pub const AntflyApiHandler = struct {
             var buffer: [256]u8 = undefined;
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
         };
-        return ctx.status(200).json(.{});
+        return ctx.status(200).json(struct {}{});
     }
 
     fn executeSQLMode(self: *AntflyApiHandler, ctx: *httpx.Context, mode: SQLPreparedMode, resource_id: ?[]const u8) !httpx.Response {
@@ -9557,6 +10047,16 @@ pub const AntflyApiHandler = struct {
         _ = database_name;
         _ = namespace_name;
         return self.pinEntitiesDistinct(ctx, table_name, key);
+    }
+
+    pub fn listEntityResolverProgress(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, _: metadata_server_openapi.server.ListEntityResolverProgressParams) !httpx.Response {
+        return self.resolverRequest(ctx, .entity_progress, table_name, "", key);
+    }
+
+    pub fn namespaceListEntityResolverProgress(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, _: metadata_server_openapi.server.NamespaceListEntityResolverProgressParams) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.resolverRequest(ctx, .entity_progress, table_name, "", key);
     }
 
     pub fn listEntityResolverState(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
@@ -13161,9 +13661,9 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
 
     const alloc = std.testing.allocator;
     var reads = BlockingReads{};
-    defer reads.release.store(true, .release);
     var status_source = AuthStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), reads.source(), null);
+    defer api_server.deinit();
 
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.initWithLimits(alloc, &api_server, 8, 32) catch |err| switch (err) {
@@ -13171,6 +13671,8 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
         else => return err,
     };
     defer e2e_server.deinit();
+    // On an assertion failure, release callbacks before joining the server.
+    defer reads.release.store(true, .release);
 
     const address = e2e_server.server.boundAddress() orelse return error.AddressNotAvailable;
     const client_io = std.Io.Threaded.global_single_threaded.io();
@@ -13209,6 +13711,7 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
         for (0..wave_convergence_poll_attempts) |_| {
             const admission = api_server.queryAdmissionStats();
             if (admission.in_flight == 8 and
+                reads.started.load(.acquire) == 8 and
                 admission.rejected_total >= minimum_rejected and
                 e2e_server.server.runtimeStats().active_connections <= 8)
             {
@@ -13997,6 +14500,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var closed = try Route.call(alloc, &handler, alice_auth, .close, connection_id, null);
     defer closed.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), closed.status);
+    try std.testing.expectEqualStrings("{}", closed.body);
     var after_close = try Route.statement(alloc, &handler, alice_auth, connection_id, "SHOW app.limit");
     defer after_close.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), after_close.status);
@@ -14726,7 +15230,11 @@ fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []c
 }
 
 fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []const u8, comptime unique: bool, comptime index_owned: PostgresMutationOwner, comptime indexed_selectors: bool) !void {
-    const alloc = std.testing.allocator;
+    // Retain checked ownership for the full campaign without allocator-stack
+    // unwinding on every native relation and HTTP allocation.
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
+    const alloc = fixture_allocator.allocator();
     const parity = @import("sql_parity_reference.zig");
     const Source = @import("sql_parity_sources.zig").Tables(3);
     var completed_campaigns: usize = 0;
@@ -17233,7 +17741,9 @@ test "httpx antfly schema update owns self partial support and requires coordina
     defer e2e_server.deinit();
     var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
-    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    // Observe each deliberately unavailable publication response directly.
+    // The loop below already repeats the request; client backoff is tested in httpx.
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
     defer client.deinit();
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
@@ -18098,14 +18608,14 @@ test "SQL catalog NUMERIC HTTP delivery preserves exact cells descriptors and NU
 
 test "httpx retrieval read failures preserve retryable JSON and conflict status" {
     const alloc = std.testing.allocator;
-    for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged }) |failure| {
+    for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged, error.IndexRebuilding }) |failure| {
         var request = try httpx.Request.init(alloc, .POST, "http://localhost/db/v1/agents/retrieval");
         defer request.deinit();
         var ctx = httpx.Context.init(alloc, std.testing.io, &request);
         defer ctx.deinit();
         var response = (try AntflyApiHandler.respondRetrievalReadError(&ctx, failure)).?;
         defer response.deinit();
-        try std.testing.expectEqual(@as(u16, if (failure == error.StorageReadTemporarilyUnavailable) 503 else 409), response.status.code);
+        try std.testing.expectEqual(@as(u16, if (failure == error.StorageReadTemporarilyUnavailable or failure == error.IndexRebuilding) 503 else 409), response.status.code);
         try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
         var parsed = try std.json.parseFromSlice(retrieval_agent.RetryableReadFailure, alloc, response.body.?, .{});
         defer parsed.deinit();
@@ -18585,6 +19095,71 @@ test "native memory HTTP validates route and space without loading a model" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "InvalidMemoryId") != null);
     const selected = try @import("memory.zig").route("GET", "/memory/v1/spaces/team/memories/a/history");
     try std.testing.expectEqual(@import("memory.zig").memory.Action.history, selected.action);
+    for ([_]anyerror{ error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable }) |failure| {
+        var operation = try httpx.Request.init(a, .POST, "http://localhost/memory/v1/spaces/team/maintenance");
+        defer operation.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &operation);
+        defer ctx.deinit();
+        var busy = try AntflyApiHandler.memoryFailure(&ctx, failure);
+        defer busy.deinit();
+        try std.testing.expectEqual(@as(u16, 503), busy.status.code);
+        try std.testing.expectEqualStrings("1", busy.headers.get("Retry-After").?);
+        var payload = try std.json.parseFromSlice(std.json.Value, a, busy.body.?, .{});
+        defer payload.deinit();
+        try std.testing.expect(payload.value.object.get("retryable").?.bool);
+        try std.testing.expectEqualStrings(@errorName(failure), payload.value.object.get("code").?.string);
+    }
+}
+
+test "native memory HTTP names malformed JSON bodies and their position" {
+    const a = std.testing.allocator;
+    var source = SchemaUpdateStatusSource{};
+    defer source.deinit(a);
+    var api = ApiHttpServer.init(a, .{}, source.iface(), null, null);
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.initWithConfig(a, threaded.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const Case = struct { path: []const u8, body: []const u8, code: []const u8, message: []const u8 };
+    const cases = [_]Case{
+        .{ .path = "/memory/v1/spaces", .body = "{\"space\": \"team\", \"config\": {", .code = "UnexpectedEndOfInput", .message = "invalid JSON at line 1, column 30: request body ended unexpectedly" },
+        .{ .path = "/memory/v1/spaces", .body = "{\"config\": {}}", .code = "MissingField", .message = "a required field is missing" },
+        .{ .path = "/memory/v1/spaces", .body = "{\"space\": 7}", .code = "UnexpectedToken", .message = "a field has the wrong type" },
+        .{ .path = "/memory/v1/spaces/team/observations", .body = "{\n  \"evidence\": [}", .code = "SyntaxError", .message = "invalid JSON at line 2, column 16: syntax error" },
+    };
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    for (cases) |case| {
+        const url = try std.fmt.allocPrint(a, "{s}{s}", .{ base, case.path });
+        defer a.free(url);
+        var response = try requestWithRetry(&client, threaded.io(), .POST, url, case.body, &headers, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        var payload = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer payload.deinit();
+        try std.testing.expectEqualStrings(case.code, payload.value.object.get("code").?.string);
+        try std.testing.expect(!payload.value.object.get("retryable").?.bool);
+        const message = payload.value.object.get("error").?.string;
+        if (std.mem.indexOf(u8, message, case.message) == null) {
+            std.debug.print("unexpected message for {s}: {s}\n", .{ case.path, message });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "native memory error messages describe JSON shape failures and keep other names" {
+    const memory = @import("memory.zig");
+    try std.testing.expectEqualStrings("a field has the wrong type", memory.errorMessage(error.UnexpectedToken));
+    try std.testing.expectEqualStrings("a required field is missing", memory.errorMessage(error.MissingField));
+    try std.testing.expectEqualStrings("unknown field", memory.errorMessage(error.UnknownField));
+    // Non-JSON failures and ambiguous number errors keep their stable names.
+    try std.testing.expectEqualStrings("MemorySpaceNotFound", memory.errorMessage(error.MemorySpaceNotFound));
+    try std.testing.expectEqualStrings("Overflow", memory.errorMessage(error.Overflow));
 }
 
 test "native memory HTTP and MCP share persistent storage and private provenance" {
@@ -18815,6 +19390,22 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     var hidden = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, null, .{});
     defer hidden.deinit(a);
     try std.testing.expectEqual(@as(u16, 404), hidden.status);
+    const IngressClock = struct {
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = 0 };
+        }
+    };
+    var ingress_vtable = std.testing.io.vtable.*;
+    ingress_vtable.now = IngressClock.now;
+    const ingress_io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &ingress_vtable };
+    // List uses a native scan, which cannot interpret an arbitrary ingress
+    // clock origin. A live five-second ingress budget must stay live there.
+    var listed = try api.executeMemoryService("team", .{ .action = .list }, null, .{
+        .deadline_ns = 5 * std.time.ns_per_s,
+        .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&ingress_io),
+    });
+    defer listed.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), listed.status);
 }
 
 test "native memory catalog ownership denies generic and batched data admission" {
@@ -19982,7 +20573,7 @@ test "httpx inference gateway request errors remain client errors without reclas
     var server = ApiHttpServer.init(a, .{ .node_config = &config }, source.iface(), null, null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
-    const Task = @import("antfly_local_sources").common_provider_registry.gateway.Task;
+    const Task = @import("antfly_local_sources").common_inference_gateway.Task;
     const cases = .{
         .{ Task.embed, "/ai/v1/embeddings", "{\"model\":" },
         .{ Task.embed, "/ai/v1/embeddings", "" },
@@ -20174,6 +20765,54 @@ test "public execution composes every internal budget and validates combined hea
     try std.testing.expectEqual(@as(u64, 0), ctx.application_deadline_ns.?);
 }
 
+test "httpx inference gateway configured readers preserve documents artifacts status and exact values" {
+    const Target = struct {
+        calls: usize = 0,
+        const reply = "{\"object\":\"list\",\"model\":\"backend\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"receipt\",\"status\":\"unresolved\",\"fields\":{\"amount\":9007199254740993.01}}],\"document\":{\"artifact_id\":\"opaque\"},\"events\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}";
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            const a = context.allocator.asStd();
+            const parsed = std.json.parseFromSlice(std.json.Value, a, context.body.slice(), .{}) catch return inference_connection_abi.statusFromError(error.InvalidArgument);
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            if (!std.mem.eql(u8, context.operation.slice(), "read") or !std.mem.eql(u8, root.get("model").?.string, "backend") or !std.mem.eql(u8, root.get("prompt").?.string, "defaults") or root.get("max_tokens").?.integer != 99) return inference_connection_abi.statusFromError(error.InvalidArgument);
+            if (root.get("documents")) |documents| {
+                const doc = documents.array.items[0].object;
+                if (!std.mem.eql(u8, doc.get("id").?.string, "receipt") or doc.get("pages").?.array.items[0].integer != 2 or !root.get("retain_artifact").?.bool) return inference_connection_abi.statusFromError(error.InvalidArgument);
+            }
+            self.calls += 1;
+            const body = a.dupe(u8, reply) catch return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = body.ptr, .len = body.len } };
+            return .ok;
+        }
+    };
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer config.deinit();
+    try config.readers.registerConfig("agent", .{ .provider = .antfly, .model = "backend", .prompt = "defaults", .max_tokens = 99 });
+    var source = AuthStatusSource{};
+    var target = Target{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    for ([_][]const u8{
+        "{\"model\":\"readers/agent\",\"documents\":[{\"id\":\"receipt\",\"url\":\"https://example.invalid/r.pdf\",\"media_type\":\"application/pdf\",\"pages\":[2]}],\"retain_artifact\":true}",
+        "{\"model\":\"readers/agent\",\"images\":[\"data:image/png;base64,AQ==\"]}",
+    }) |body| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/read");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.gatewayRead(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expectEqualStrings(Target.reply, response.body.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), target.calls);
+    try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+}
+
 test "linear merge HTTP accepts scoped media and rejects an out of range mutation" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
     const Fixture = struct {
@@ -20234,4 +20873,205 @@ test "linear merge HTTP accepts scoped media and rejects an out of range mutatio
     defer bad.deinit();
     try std.testing.expectEqual(@as(u16, 400), bad.status.code);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.monotonic));
+}
+
+test "httpx inference gateway document jobs persist before dispatch and publish principal scoped atomic results" {
+    const readers = @import("antfly_readers");
+    const module = @import("document_jobs.zig");
+    const runs = readers.document_runs;
+    const Target = struct {
+        io: std.Io,
+        calls: std.atomic.Value(usize) = .init(0),
+        const reply = "{\"object\":\"list\",\"data\":[{\"text\":\"receipt\"}]}";
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            complete(self, context) catch |err| return inference_connection_abi.statusFromError(err);
+            return .ok;
+        }
+        fn complete(self: *@This(), call: *const inference_connection_abi.InvokeContext) !void {
+            const a = call.allocator.asStd();
+            var client = try readers.document_rpc.Client.initBound(a, call.document_store, self.io);
+            defer client.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const work = arena.allocator();
+            const store = client.store();
+            const record = try store.loadAt(work, client.id, client.owner, research_jobs.nowMillis());
+            try std.testing.expectEqual(@as(usize, 1), record.inputs.len);
+            const submitted = try store.read(work, record.inputs[0], 1024 * 1024);
+            try std.testing.expectEqualStrings(submitted, call.body.slice());
+            const lease: runs.Lease = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+            try store.prepare(work, lease, record.identity, record.limits, record.inputs, research_jobs.nowMillis());
+            const key: runs.Digest = @splat(17);
+            const events = "[{\"phase\":\"complete\"}]";
+            try std.testing.expect(try store.reserve(work, lease, key, .{ .calls = 1, .output_bytes = 1024 }, research_jobs.nowMillis()));
+            const final = try store.completeWithEvents(work, lease, key, .{ .calls = 1, .output_bytes = reply.len + events.len }, reply, events, research_jobs.nowMillis());
+            try store.finish(work, lease, final.payload, research_jobs.nowMillis());
+            const bytes = try a.dupe(u8, reply);
+            call.out_response.* = .{ .status = 200, .body = .{ .ptr = bytes.ptr, .len = bytes.len } };
+            _ = self.calls.fetchAdd(1, .release);
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/document-jobs", .{tmp.sub_path});
+    defer a.free(path);
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var target = Target{ .io = runtime.apiNetworkIo().? };
+    var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer config.deinit();
+    var source = AuthStatusSource{};
+    var server = try ApiHttpServer.initWithConfig(a, .{ .deployment_mode = .standalone, .backend_runtime = &runtime, .node_config = &config, .document_job_store_path = path, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var id: []u8 = undefined;
+    {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/read/jobs");
+        defer request.deinit();
+        request.body = "{\"request\":{\"model\":\"local/native-reader\",\"documents\":[{\"id\":\"receipt\",\"url\":\"https://example.invalid/receipt.pdf\",\"media_type\":\"application/pdf\"}]},\"retention_seconds\":60}";
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.documentReadCreate(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 202), response.status.code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        id = try a.dupe(u8, parsed.value.object.get("id").?.string);
+        try std.testing.expectEqual(@as(usize, 0), target.calls.load(.acquire));
+    } // Submitting HTTP context is gone before execution starts.
+    defer a.free(id);
+    var persistence = try module.context(&server);
+    const store = try persistence.interface();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    try std.testing.expectError(error.DocumentRunNotFound, store.load(work, id, "bob"));
+    try server.scheduleDocumentsOnce();
+    const until = research_jobs.nowMillis() + 5000;
+    while (target.calls.load(.acquire) == 0 and research_jobs.nowMillis() < until) try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+    try std.testing.expectEqual(@as(usize, 1), target.calls.load(.acquire));
+    const record = try store.loadAt(work, id, "anonymous", research_jobs.nowMillis());
+    try std.testing.expectEqual(.succeeded, record.state);
+    try std.testing.expectEqual(@as(u64, 1), record.used.calls);
+    var result_request = try httpx.Request.init(a, .GET, "http://localhost/ai/v1/read/jobs/placeholder/result");
+    defer result_request.deinit();
+    var result_ctx = httpx.Context.init(a, std.testing.io, &result_request);
+    defer result_ctx.deinit();
+    result_ctx.params = &.{.{ .name = "job_id", .value = id }};
+    var result = try handler.documentReadResult(&result_ctx);
+    defer result.deinit();
+    try std.testing.expectEqualStrings(Target.reply, result.body.?);
+    // Cross-operation lookup cannot expose even the status of the job.
+    var wrong_ctx = httpx.Context.init(a, std.testing.io, &result_request);
+    defer wrong_ctx.deinit();
+    wrong_ctx.params = result_ctx.params;
+    var wrong = try handler.documentExtractStatus(&wrong_ctx);
+    defer wrong.deinit();
+    try std.testing.expectEqual(@as(u16, 404), wrong.status.code);
+
+    // Opaque extraction schemas may use credential-shaped field names. Exercise
+    // the public submission boundary so provider-credential scans cannot be
+    // reintroduced after the operation-specific envelope validation.
+    var extract_request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/extract/jobs");
+    defer extract_request.deinit();
+    extract_request.body = "{\"request\":{\"model\":\"local/native-extractor\",\"schema_version\":2,\"schema\":{\"structures\":{\"record\":{\"fields\":{\"api_key\":\"str\"}}}},\"inputs\":[{\"content\":\"Find the key label\"}]}}";
+    var extract_ctx = httpx.Context.init(a, std.testing.io, &extract_request);
+    defer extract_ctx.deinit();
+    var submitted = try handler.documentExtractCreate(&extract_ctx);
+    defer submitted.deinit();
+    try std.testing.expectEqual(@as(u16, 202), submitted.status.code);
+    var submitted_json = try std.json.parseFromSlice(std.json.Value, a, submitted.body.?, .{});
+    defer submitted_json.deinit();
+    try store.cancel(work, submitted_json.value.object.get("id").?.string, "anonymous");
+}
+
+test "httpx inference gateway typed consumers retain errors and legacy original array positions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source_media = inference_gateway.source_media;
+    const reference: source_media.Reference = .{
+        .table = "docs",
+        .document_id = "a",
+        .field = "images.1",
+        .revision_field = "versions.1",
+        .revision = "r1",
+        .permissions_field = "policies.1",
+        .sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .mime_type = "image/png",
+        .byte_length = 68,
+    };
+    const references = [_]source_media.Reference{reference};
+    const groups = try source_media.groups(a, &references);
+    var output: [1][]const u8 = undefined;
+    const Consumer = AntflyApiHandler.GatewaySources.MediaResult;
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"images\":[\"wrong\",\"correct\"],\"versions\":[\"wrong\",\"r1\"],\"policies\":[{\"public\":false},{\"public\":true}]}", .{});
+    const hits = [_]@import("antfly_metadata_openapi").QueryHit{.{ ._id = "a", ._score = 0, ._source = .{ .map = root.object } }};
+    const result: @import("antfly_metadata_openapi").QueryResult = .{ .status = 200, .took = 0, .hits = .{ .hits = &hits } };
+    var consumer: Consumer = .{ .a = a, .references = &references, .group = groups[0], .output = &output, .wire = .empty };
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = result }));
+    try std.testing.expect(consumer.projection_missing);
+    consumer = .{ .a = a, .references = &references, .group = groups[0], .output = &output, .wire = .empty, .legacy = true };
+    try Consumer.consume(&consumer, .{ .result = result });
+    try std.testing.expectEqualStrings("correct", output[0]);
+    root.object.getPtr("versions").?.array.items[1] = .{ .string = "r2" };
+    consumer = .{ .a = a, .references = &references, .group = groups[0], .output = &output, .wire = .empty, .legacy = true };
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = result }));
+    try std.testing.expectEqual(error.InferenceSourceMismatch, consumer.failure.?);
+    try std.testing.expect(!consumer.projection_missing);
+
+    // Source projection is sufficient for object paths. Identity output remains
+    // separate, so source keys cannot spoof a scalar pin.
+    var object_reference = reference;
+    object_reference.field = "images.preview";
+    object_reference.revision_field = "version";
+    object_reference.permissions_field = "policy";
+    var object_references = [_]source_media.Reference{object_reference};
+    const object_groups = try source_media.groups(a, &object_references);
+    try std.testing.expect(!object_groups[0].requiresFlatValues());
+    try std.testing.expect(groups[0].requiresFlatValues());
+    const object_root = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"images\":{\"preview\":\"image\"},\"version\":\"r1\",\"policy\":{\"public\":true},\"i0\":\"pinned\"}", .{});
+    var object_hits = [_]@import("antfly_metadata_openapi").QueryHit{.{ ._id = "a", ._score = 0, ._source = .{ .map = object_root.object } }};
+    const object_result: @import("antfly_metadata_openapi").QueryResult = .{ .status = 200, .took = 0, .hits = .{ .hits = &object_hits } };
+    consumer = .{ .a = a, .references = &object_references, .group = object_groups[0], .output = &output, .wire = .empty, .flat = false };
+    try Consumer.consume(&consumer, .{ .result = object_result });
+    try std.testing.expectEqualStrings("image", output[0]);
+    object_references[0].identity = "pinned";
+    const pinned_groups = try source_media.groups(a, &object_references);
+    consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = object_result }));
+    try std.testing.expect(consumer.projection_missing);
+    consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
+    // The wire fallback also calls hit directly; a source key is not a pin.
+    try std.testing.expectError(error.InferenceSourceMismatch, consumer.hit("a", object_root, null));
+    object_hits[0]._computed = .{ .bytes = "{\"i0\":\"pinned\"}" };
+    consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
+    try Consumer.consume(&consumer, .{ .result = object_result });
+    try std.testing.expectEqualStrings("image", output[0]);
+    object_hits[0]._computed = .{ .bytes = "{\"i0\":\"wrong\"}" };
+    consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = object_result }));
+    try std.testing.expectEqual(error.InferenceSourceMismatch, consumer.failure.?);
+    // A finalized public JSON source can be consumed without constructing a
+    // second producer DOM. The pin still comes only from computed output.
+    const encoded_source = try std.json.Stringify.valueAlloc(a, object_root, .{});
+    const source_views = [_]?ant_json.RawObject{.{ .bytes = encoded_source }};
+    object_hits[0]._source = null;
+    object_hits[0]._computed = .{ .bytes = "{\"i0\":\"pinned\"}" };
+    consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
+    try Consumer.consume(&consumer, .{ .result = object_result, .encoded_sources = &source_views });
+    try std.testing.expectEqualStrings("image", output[0]);
+    object_hits[0]._computed = null;
+    consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = object_result, .encoded_sources = &source_views }));
+    try std.testing.expect(consumer.projection_missing);
+    object_hits[0]._computed = .{ .bytes = "{\"i0\":\"pinned\"}" };
+    consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false, .encoded_bytes = 32 * 1024 * 1024 };
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = object_result, .encoded_sources = &source_views }));
+    try std.testing.expectEqual(error.InferenceRequestTooLarge, consumer.failure.?);
+    consumer = .{ .a = a, .references = &object_references, .group = pinned_groups[0], .output = &output, .wire = .empty, .flat = false };
+    try std.testing.expectError(error.QueryDeliveryFailed, Consumer.consume(&consumer, .{ .result = object_result, .encoded_sources = &.{ source_views[0], source_views[0] } }));
+    try std.testing.expectEqual(error.InferenceUpstreamUnavailable, consumer.failure.?);
 }

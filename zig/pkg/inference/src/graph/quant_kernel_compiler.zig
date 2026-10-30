@@ -8039,8 +8039,14 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             const exported_symbol = try std.fmt.allocPrint(std.testing.allocator, "#define ANTFLY_FLASH_KERNEL {s}\n", .{plan.kernel_id});
             defer std.testing.allocator.free(exported_symbol);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, exported_symbol));
-            try std.testing.expect(artifact.production_enabled);
-            try std.testing.expect(artifact.runtime_default_enabled);
+            // E4B kernels are wired for explicit qualification, but have not
+            // been promoted to the production/default routes.
+            const promoted = switch (artifact.cuda_flash_prefill_kernel.?) {
+                .gqa_prefill_flash_sm89_hd256_swa512_f32, .gqa_prefill_flash_sm89_hd512_global_f32 => true,
+                .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32, .gqa_prefill_flash_sm89_e4b_hd512_global_f32 => false,
+            };
+            try std.testing.expectEqual(promoted, artifact.production_enabled);
+            try std.testing.expectEqual(promoted, artifact.runtime_default_enabled);
             const body = try cuda_renderer.renderFlashPrefillBodyAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
@@ -8160,7 +8166,7 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, body));
         }
     }
-    try std.testing.expectEqual(@as(usize, 12), runtime_cuda_attention_count);
+    try std.testing.expectEqual(@as(usize, 14), runtime_cuda_attention_count);
     try std.testing.expectEqual(@as(usize, 0), standalone_cuda_attention_count);
 }
 
@@ -10377,7 +10383,7 @@ test "quant kernel compiler names checked-in CUDA production route symbols" {
         .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .none, .symbol = "termite_linear_q6_k_f32_tile4" },
     };
 
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(1024 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(4 * 1024 * 1024));
     defer std.testing.allocator.free(contents);
     for (cases) |case| {
         const route = loweringFor(.cuda, case.format, case.row_bucket, case.epilogue);
@@ -12495,13 +12501,18 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, host_source, "termite_metal_decode_gqa_split_eligible("));
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, host_source, "termite_metal_encode_decode_gqa_split_dispatch("));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "dispatchThreadgroups:MTLSizeMake(params->q_len, params->num_kv_heads, launch->params.split_count)"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "constant termite_metal_decode_gqa_split_params &schedule [[buffer(7)]]"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "constant termite_metal_decode_gqa_split_params &schedule [[buffer(3)]]"));
+    // The generic and dedicated OCR stage/reducer pairs share the schedule ABI.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "constant termite_metal_decode_gqa_split_params &schedule [[buffer(7)]]"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "constant termite_metal_decode_gqa_split_params &schedule [[buffer(3)]]"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "_Static_assert(sizeof(termite_metal_decode_gqa_split_params) == 16"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "[encoder setBytes:&launch->params length:sizeof(launch->params) atIndex:7]"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "[encoder setBytes:&launch->params length:sizeof(launch->params) atIndex:3]"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "const bool use_decode_1x = !use_decode_gqa_split"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "split_launch.scratch_bytes"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "const bool use_decode_1x = !use_decode_gqa_split"));
+    // Cached decode also excludes explicit-position requests from the 1x path.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "const bool use_decode_1x = !has_explicit_positions && !use_decode_gqa_split"));
+    // Both encoders retain scratch; coalesced attention also bounds and
+    // advances its pooled scratch slice.
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, host_source, "split_launch.scratch_bytes"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "launch->scratch_bytes"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "if (needs_explicit_split_barrier) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "runtime->decode_gqa_split_calls += 1"));

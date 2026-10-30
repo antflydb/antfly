@@ -115,7 +115,8 @@ const InferenceRuntimeConfig = struct {
     embedded_enabled: bool = true,
     /// Environment forwarded only when a server host launches its worker.
     worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
-    max_concurrent_requests: ?usize = null,
+    resources: inference.platform.resource_policy.Resources = .{},
+    generation_batching: inference.platform.inference_settings.GenerationBatching = .{},
     kernel_jit: inference.graph.kernel_jit.Config = .{},
     prompt_cache: inference.server.PromptCacheConfig = .{},
 };
@@ -749,38 +750,7 @@ test "standalone preload bridge preserves A4B residency controls" {
     try std.testing.expectError(error.InvalidArguments, convertWarmModels(std.testing.allocator, &context));
 }
 
-pub fn parseKeepAliveMs(raw: []const u8) !u64 {
-    if (std.mem.eql(u8, raw, "0")) return 0;
-    if (raw.len == 0) return error.InvalidInferenceModelCacheConfig;
-    var i: usize = 0;
-    var total_ns: u64 = 0;
-    while (i < raw.len) {
-        const start = i;
-        while (i < raw.len and std.ascii.isDigit(raw[i])) : (i += 1) {}
-        if (i == start) return error.InvalidInferenceModelCacheConfig;
-        const value = std.fmt.parseUnsigned(u64, raw[start..i], 10) catch
-            return error.InvalidInferenceModelCacheConfig;
-        const unit_ns: u64 = if (std.mem.startsWith(u8, raw[i..], "ms")) blk: {
-            i += 2;
-            break :blk std.time.ns_per_ms;
-        } else if (i < raw.len and raw[i] == 's') blk: {
-            i += 1;
-            break :blk std.time.ns_per_s;
-        } else if (i < raw.len and raw[i] == 'm') blk: {
-            i += 1;
-            break :blk std.time.ns_per_min;
-        } else if (i < raw.len and raw[i] == 'h') blk: {
-            i += 1;
-            break :blk std.time.ns_per_hour;
-        } else return error.InvalidInferenceModelCacheConfig;
-        const part_ns = std.math.mul(u64, value, unit_ns) catch
-            return error.InvalidInferenceModelCacheConfig;
-        total_ns = std.math.add(u64, total_ns, part_ns) catch
-            return error.InvalidInferenceModelCacheConfig;
-    }
-    if (total_ns == 0) return 0;
-    return @max(@as(u64, 1), total_ns / std.time.ns_per_ms);
-}
+pub const parseKeepAliveMs = inference.platform.inference_settings.parseKeepAliveMs;
 
 test "standalone inference keep alive parses compound durations and zero" {
     try std.testing.expectEqual(@as(u64, 0), try parseKeepAliveMs("0"));
@@ -900,8 +870,19 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     if (context.has_max_loaded_models != 0)
         node_config.max_loaded_models = std.math.cast(usize, context.max_loaded_models) orelse
             return error.InvalidInferenceModelCacheConfig;
-    if (runtime_config.value.max_concurrent_requests) |limit|
-        node_config.max_concurrent_requests = limit;
+    try runtime_config.value.resources.validate();
+    const policy = runtime_config.value.resources.inference;
+    node_config.max_concurrent_requests = policy.admission.max_concurrent_requests;
+    node_config.max_work_units = policy.admission.workCapacity();
+    node_config.request_limits = policy.request_limits;
+    node_config.generation_batching = inference.server.GenerationBatchingConfig.fromSettings(runtime_config.value.generation_batching);
+    const configured_limits = policy.memory.limits(inference.runtime.tier.memory.Limits);
+    // CLI/bridge overrides take precedence field by field, while physical caps
+    // are applied by ModelManager after backend discovery.
+    inline for (comptime std.meta.fieldNames(inference.runtime.tier.memory.Limits)) |field| {
+        if (@field(node_config.generation_budget_overrides, field) == 0)
+            @field(node_config.generation_budget_overrides, field) = @field(configured_limits, field);
+    }
 
     state.* = .{
         .alloc = alloc,
@@ -1029,6 +1010,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
     };
     var progress_adapter = ProgressAdapter{ .view = context.progress };
     const execution_control = inference.InferenceExecutionControl{
+        .document_store = context.document_store,
         .deadline_ns = deadline_ns,
         // Give any model's current native call time to reach a safe boundary
         // before a cancelled request forces the supervisor to replace it.
@@ -1294,6 +1276,12 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             defer parsed.deinit();
             const result = try localModelCapabilities(&state.node, state.io, parsed.value.model, parsed.value.task);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .document_read, .document_extract => blk: {
+            break :blk if (operation == .document_read)
+                try state.node.readDocumentsJsonWithControl(alloc, request_json, execution_control)
+            else
+                try state.node.extractDocumentsJsonWithControl(alloc, request_json, execution_control);
         },
         .read_images => blk: {
             var parsed = try std.json.parseFromSlice(ReadImagesRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
@@ -1858,13 +1846,18 @@ pub fn linkedInferenceRegisterRoutesOnExcept(handle: *anyopaque, server: *httpx.
         try linkedInferenceRouteManifest(&.{ .abi_version = inference_bridge.abi_version, .handle = handle, .out_entries = &entries, .out_len = &length });
         for (state.route_manifest.items) |entry| {
             if (excludedRoute(entry.path.slice(), excluded)) continue;
-            try server.routeWithData(switch (entry.method) {
+            const method: httpx.Method = switch (entry.method) {
                 .get => .GET,
                 .post => .POST,
                 .put => .PUT,
                 .delete => .DELETE,
                 .patch => .PATCH,
-            }, entry.path.slice(), localInferenceHttpHandler, entry.route_handle);
+            };
+            if (entry.request_body == .streaming_raw) {
+                try server.routeStreamingRawWithData(method, entry.path.slice(), localInferenceHttpHandler, entry.route_handle);
+            } else {
+                try server.routeWithData(method, entry.path.slice(), localInferenceHttpHandler, entry.route_handle);
+            }
         }
         return;
     }
@@ -1963,6 +1956,7 @@ const RouteMetadata = struct {
 };
 
 fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
+    if (method == .post and (std.mem.endsWith(u8, path, "/read/execute") or std.mem.endsWith(u8, path, "/extract/execute"))) return .{ .request_body = .streaming_raw, .streaming_response = true };
     if (method == .post and std.mem.endsWith(u8, path, "/stream") and std.mem.indexOf(u8, path, "/transcription/sessions/") != null) return .{ .request_body = .streaming_raw, .streaming_response = true };
     const method_name = switch (method) {
         .get => "GET",
@@ -2016,6 +2010,14 @@ fn routeTemplateMatches(template: []const u8, registered: []const u8) bool {
     }
 }
 
+test "document execution manifests retain raw duplex body mode" {
+    for ([_][]const u8{ "/ai/v1/read/execute", "/ai/v1/extract/execute", "/api/v1/read/execute" }) |path| {
+        const metadata = routeMetadata(.post, path);
+        try std.testing.expectEqual(http_abi.RequestBodyMode.streaming_raw, metadata.request_body);
+        try std.testing.expect(metadata.streaming_response);
+    }
+}
+
 test "route templates match registered path-parameter patterns" {
     try std.testing.expect(routeTemplateMatches("/transcribe", "/transcribe"));
     try std.testing.expect(routeTemplateMatches("/transcription/sessions/{session_id}/audio", "/transcription/sessions/:session_id/audio"));
@@ -2048,13 +2050,18 @@ const DirectServer = struct {
         route.* = .{ .owner = self.owner, .handler = handler };
         try self.owner.routes.append(self.owner.alloc, route);
         errdefer _ = self.owner.routes.pop();
-        try self.server.routeWithData(switch (method) {
+        const http_method: httpx.Method = switch (method) {
             .get => .GET,
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
             .patch => .PATCH,
-        }, path, localInferenceHttpHandler, route);
+        };
+        if (routeMetadata(method, path).request_body == .streaming_raw) {
+            try self.server.routeStreamingRawWithData(http_method, path, localInferenceHttpHandler, route);
+        } else {
+            try self.server.routeWithData(http_method, path, localInferenceHttpHandler, route);
+        }
     }
 
     pub fn get(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
@@ -2160,6 +2167,7 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
     var http_context = httpx.Context.init(alloc, state.io, &http_request);
     defer http_context.deinit();
     http_context.params = params;
+    if (context.document_store.configured()) try http_context.setData("antfly.document_store", @ptrCast(@constCast(&context.document_store)), null);
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
     var response = if (state.worker) |worker| remote: {
         // Preserve admission-before-upload, including lazy streaming bodies.
@@ -3001,6 +3009,28 @@ fn localModelCapabilitiesInScope(
             .prompt_policy = .model_default,
             .borrowed_attachments = true,
         };
+    }
+    if (task == .read or task == .extract) {
+        if (try node.documentTaskLimits(node.allocator, model, task == .read)) |limits| {
+            const mimes = inference_work.MimeTypes{ .text_plain = task == .extract, .image_png = task == .read, .image_jpeg = task == .read, .image_webp = task == .read, .application_pdf = false };
+            return .{
+                .task = task,
+                .input_modalities = .{ .text = task == .extract, .image = task == .read, .document = false },
+                .accepted_mime_types = mimes,
+                .input_granularity = if (task == .read) .page else .item,
+                .batch = .{
+                    .mode = .serial_compatibility,
+                    .preferred_items = 1,
+                    .max_items = limits.max_sources,
+                    .max_encoded_media_bytes = limits.max_source_bytes,
+                    .max_decoded_pixels = @min(limits.max_total_pixels, inference.server.requestMediaMaxDecodedPixels(node, limits.max_sources)),
+                    .max_media_parts_per_item = 1,
+                },
+                .output = if (task == .read) .read_result else .extraction,
+                .prompt_policy = if (task == .read) .model_default else .structured_schema,
+                .borrowed_attachments = task == .read,
+            };
+        }
     }
     const scope = scope_override orelse switch (task) {
         .read => "readers",

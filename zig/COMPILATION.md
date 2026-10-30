@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-10-22
+Last updated: 2026-10-28
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -207,6 +207,46 @@ warm builds, then verifies these source changes:
 
 This expensive check runs with `zig-full / build-cache`. The lightweight
 configuration fixtures remain useful for option and generator dependencies.
+
+The native Linux audit has a separate scheduling envelope from production
+builds. [Run 40380791678](https://github.com/antflydb/antfly/actions/runs/40380791678)
+completed its cold build in 1,364.871 seconds (1,637.813 CPU seconds), with a
+7,656,402,944-byte peak summed process RSS. The preceding run timed out at
+1,800 seconds with a similar 7.47 GB peak. Both used the immutable Nix
+`3swwykg6la02jblm03z3s4fxhiqdmpsm-zig-0.17.0` compiler, linked to glibc.
+
+For that exact compiler on native x86_64 Linux, the audit tool explicitly
+selects baseline GNU Debug, stripped symbols, CPU inference, and Debug inference
+dependencies. Its overlay caps larger reservations at **9 GiB per compile**,
+retains smaller authored claims, and keeps the **20 GiB** aggregate admission
+budget and **two-job** limit. The cap is over 25% above the largest sampled
+whole-build process RSS. Two large claims leave **2 GiB** for ready auxiliary
+work, whose reservation can precede its actual execution. They also fit the
+host-aware fallback budget (80% of a 24 GiB pod).
+
+[Run 40395513767](https://github.com/antflydb/antfly/actions/runs/40395513767)
+qualified the compiler/profile selection and diagnostics but timed out at
+1,800 seconds. Its previous 10 GiB caps still spent most samples on one
+compiler; the final API archive completed just before the timeout, and the
+source-owner fixture had only started. Peak summed process RSS was
+7,477,886,976 bytes; sampled anonymous memory peaked at 6,827,483,136 bytes,
+file cache at 8,177,479,680 bytes, and total cgroup memory at 14.01 GiB.
+This was active compilation, not an OOM. The tighter 9 GiB envelope retains
+measured headroom while reserving space for auxiliary work; its paired timing
+and memory qualification is pending CI. It affects only the audit's transitive
+compilation graph, not production reservations. Other compiler derivations
+retain existing claims until measured. No runner capacity or timeout was
+increased.
+
+Audit reports retain periodic active-process CPU time, state, RSS, artifact
+name and source root (including Zig response files). A timeout captures this
+snapshot before killing the tree, because `wait4` cannot recover its child CPU
+accounting afterward. Full compiler command lines are not retained in these
+process snapshots. The successful job's cgroup peak was 21.07 GiB; cgroup
+usage also includes cached output pages and is not interchangeable with summed
+process RSS. Reports now sample anonymous, file, dirty-file, inactive-file,
+and kernel memory separately every 30 seconds so paired qualification can
+verify actual pressure within the unchanged 24 GiB pod limit.
 
 A matched native Darwin Debug experiment compared the test ownership split
 (`c50cc4b0c`) with its parent (`60ff56514`), before the subsequent main merge.
@@ -636,10 +676,11 @@ Phase 4y delta remains visible as architectural debt.
 
 For subsequent increments:
 
-- `libantfly` has a hard 80 MiB release gate (raised from 60 MiB on
-  2026-10-11 with explicit approval after a native stripped ReleaseFast
-  profile measured 65.97 MiB). Retained linker maps attribute storage and
-  inference code and support investigation of subsequent size growth.
+- `libantfly` has a hard 88 MiB release gate (approved on 2026-10-28 after
+  cleanup consolidation and final-link stripping measured 83.30 MiB). The
+  earlier 80 MiB gate was approved on 2026-10-11 after a 65.97 MiB profile.
+  Retained linker maps attribute storage and inference code and support
+  investigation of subsequent size growth.
 - No single experiment should grow the executable more than approximately 5%
   without an explicit, measured critical-path benefit and approval of the
   cumulative tradeoff.
@@ -1557,6 +1598,14 @@ are 20/14 GiB, each including at least 25% headroom and fitting that budget
 alone. The policy never lowers an authored claim and leaves other test roots
 and build modes unchanged.
 
+Main run 40624165216 measured the C API consumer test object at
+17,141,358,592 bytes with the pinned Nix/glibc compiler. Its native Linux
+x86_64 GNU Debug reservation is 18 GiB: at least 10% above that peak while
+leaving 2 GiB in the existing 20 GiB compiler budget. The separately compiled
+physical implementation retains its authored 7 GiB claim instead of inheriting
+the consumer's reservation. The Lite model workflow uses the same pinned
+Nix/glibc compiler; portable compiler measurements are a different profile.
+
 Main run 39957596246 subsequently exhausted the heavy runner's 24 GiB
 cgroup limit while three default 7 GiB compiler claims overlapped under the
 workflow's 22 GiB override. Kernel OOM records showed approximately 23.5 GiB
@@ -1764,3 +1813,242 @@ to that kernel high-water observation. Other profiles retain their authored
 reservations. The consumer and API storage-authority claims sum to 28.375 GiB
 and still fit the unchanged 28.8 GiB aggregate budget. The independently
 qualified CAPI physical partition retains its larger 17 GiB floor.
+
+### ARM64 Linux release API admission after document jobs
+
+Release run `40426894698` (source `9ace47d363`, the pinned glibc-linked Nix
+Zig 0.17.0, Linux x86-64 host, baseline ARM64 targets, stripped ReleaseFast)
+exceeded the API archive's 12 GiB scheduling reservation on both targets:
+
+| Target | Reported peak bytes | Reservation |
+| --- | ---: | ---: |
+| aarch64-linux-gnu.2.28 | 14,346,383,360 | 15 GiB |
+| aarch64-linux-musl | 13,929,717,760 | 15 GiB |
+
+The 15 GiB claim retains at least 10% headroom over both exact measurements.
+Together with the existing 4 GiB enrichment claim it still fits a 20 GiB
+compiler budget. Release builds retain their host/cgroup-aware aggregate budget. It applies only to the measured API configuration;
+native x86, Debug, unstripped, sanitized, Darwin and other runtime claims are
+unchanged. This avoids a full expensive API retry without serializing the
+entire build or increasing the runner's memory budget. The run also exposed
+missing compiled metadata job-state projections; those compilation errors are
+separate from memory admission.
+
+### Native Linux Debug auth admission (2026-10-27)
+
+Main run [40586926751](https://github.com/antflydb/antfly/actions/runs/40586926751)
+used Nix's glibc-linked Zig 0.17.0 on native x86_64 GNU Debug. Read-only
+2-second `/proc` sampling retained the compiler's `VmHWM` through completion:
+
+| Compilation owner | Observed high-water bytes | Old claim | New claim |
+|---|---:|---:|---:|
+| `api-auth-tests` | 15,804,899,328 | 7 GiB | 17 GiB |
+| `antfly-inference-core` | 9,540,190,208 | 12 GiB | unchanged |
+
+The auth object and inference compiler overlapped because their declared claims
+summed to 19 GiB under the 20 GiB admission budget. The 24 GiB pod's cgroup peak
+reached 25,769,779,200 bytes. Auth's new floor rounds its observed high-water
+mark plus 10% up to a whole GiB. The runner and aggregate budget are unchanged:
+auth can still overlap 3 GiB of smaller work, while its unsafe overlap with the
+12 GiB inference compiler is excluded. Other owners and optimization/target
+profiles retain their claims. This is an admission correction, not a reduction
+in the compiler's own memory use.
+
+The preceding main unit runner in run
+[40566906276](https://github.com/antflydb/antfly/actions/runs/40566906276)
+reported lost communication. GKE's retained pod deletion status identifies an
+`OOMKilled` termination (exit 137) at 19:41:11 UTC against the same 24 GiB
+container limit; this was not merely a GitHub runner connectivity failure.
+Sampling the next run identifies the auth underclaim directly, rather than
+attributing a vanished runner to a test assertion or increasing runner size.
+
+
+### Linux-to-Darwin release admission (2026-10-28)
+
+[Release run 40791025212](https://github.com/antflydb/antfly/actions/runs/40791025212/job/123177113959)
+compiled source `d35a1ef33e` on the Linux x86-64 ARC publish runner with the
+pinned Nix glibc-linked Zig 0.17.0, macOS SDK 26.1, baseline
+`aarch64-macos.15.0`, stripped ReleaseFast, Metal and Accelerate. Its completed
+server build reported these per-archive measurements:
+
+| Archive | Compile time | Rounded MaxRSS | Reservation |
+| --- | ---: | ---: | ---: |
+| Apache storage owner | 26 min | 13G | 16 GiB |
+| Apache inference owner | 17 min | 11G | 14 GiB |
+| API kernel | 23 min | 14G | 17 GiB |
+| Storage adapter | 14 min | 9G | 11 GiB |
+| Distributed | 12 min | 8G | 10 GiB |
+| Serverless | 6 min | 4G | 6 GiB |
+| CLI | 2 min | 2G | 4 GiB |
+| Enrichment | 45 s | 1G | 3 GiB |
+| Inference bridge | 48 s | 1G | Existing shared-owner claim: 4 GiB |
+
+Read-only runner inspection confirmed a 40 GiB cgroup and the unchanged
+32 GiB compiler budget. The broad fallback reserved 28 GiB for both API and
+storage adapter, 24 GiB for the Apache storage owner and 20 GiB for its
+inference owner. Each pair therefore compiled serially despite its measured
+working sets fitting together. The reservations above add a whole GiB to each
+rounded measurement, then 10% headroom, rounding up again to GiB. The shared
+inference bridge retains its existing 4 GiB claim.
+
+The new profile requires this compiler version, GNU Linux x86-64 host,
+baseline macOS ARM64 target, SDK 26.1, stripped ReleaseFast, shared owners,
+Metal/Accelerate and no CUDA, PJRT or thread sanitizer. Native macOS, other
+SDKs, CPUs, optimization modes and sanitizers retain their prior policies.
+Regression tests check both margins and rejection of unqualified profiles.
+Storage plus inference now reserves 30 GiB; API plus adapter reserves 28 GiB.
+No runner size, aggregate budget, optimization mode or coverage changes.
+A cold rerun is required to measure the resulting wall-time improvement;
+these observations establish admission, not a claimed speedup.
+
+
+### Base benchmark gate OOM (2026-10-28)
+
+PR run `40799072264`, job `123203194445`, lost its ARC runner during the
+Debug storage/graph benchmark compile. GKE recorded `TaskOOM` at 01:41:40 UTC
+and container exit 137. This was an unbounded `zig build`, using the static
+compiler, while the graph consumer also declared zero scheduler memory.
+
+The gate now uses pinned Nix/glibc Zig and the bounded runner under its existing
+20 GiB compiler / 24 GiB pod budget. The graph consumer inherits the conservative
+storage compilation envelope (20 GiB on Linux); the independent storage-boundary
+shim reserves 4 GiB in addition to its linked archives' own reservations. This
+accounts for source codegen instead of allowing it to overlap large owners for
+free. No forced single-job mode, larger runner or dropped benchmark contract
+is introduced. These consumer claims are conservative pending isolated peak
+measurements; they are not new measured reductions.
+
+### Relocated ownership caches and mutation cleanup (2026-10-28)
+
+The native Nix/glibc Zig 0.17 fixture reproduced a cold compiler-tool bootstrap
+of 146.45 seconds, exceeding the regression's 120-second limit before its
+relocation assertion. Snapshotting the phase's global compiler-tool cache into
+an independently owned fixture cache reduced the LLVM relocation lifecycle to
+2.65 seconds. Local target caches remain cold and private; the regression still
+checks source invalidation, baseline independence and operation after baseline
+removal. Timeouts terminate the complete compiler process group before cleanup.
+
+Adding authored C inputs reproduced a separate relocation miss with identical
+compiler arguments. Canonical paths for the unchanged C providers restored real
+compiler cache hits; a debug-compilation-directory flag did not. The audit now
+retains those shared authored identities, including batched C sources, while
+mutable Zig inputs and generated paths keep their private roots. Discovery and
+relocation tests with both C source forms pass on native Linux (4 tests, 5.95s)
+and Darwin (4 tests, 20.65s). The complete production audit remains the CI gate.
+
+A stripped baseline-CPU native Darwin storage profile found the mutation commit
+function occupying 2,218,824 bytes. Two typed ownership frames now centralize
+batch preparation and write-buffer cleanup, preserving reverse release order,
+allocator identities and borrowed/owned distinctions. Their non-inlined cleanup
+runs once per batch exit; row processing remains in the original loops. The
+function falls to 1,091,820 bytes, and the archive's text falls from 45,137,104 to
+44,012,264 bytes. Its unoptimized IR falls from about 756k lines/98k blocks to
+413k lines/57k blocks. The optimized archive compiled successfully in 745s with
+IR dumps; the baseline build reported 17 minutes. These runs shared a busy Mac
+and are not a controlled throughput or isolated compiler-time comparison.
+The row-preparation regression passes 12/12 with zero leaks. These measurements
+do not establish that the complete Darwin library meets its 80 MiB gate.
+
+The full tooling job also seeds its fixture from a PVC onto the runner's
+separate temporary filesystem. Immutable object snapshots now copy on `EXDEV`,
+while same-volume snapshots keep hard links and other errors remain fatal.
+Seven isolation regressions pass, including copied-byte/mtime preservation,
+private manifests and locks, and survival after the source cache is removed.
+
+The external Mach-O final linker previously ignored the product's strip flag,
+even when every input archive was stripped. It now drops local symbols with
+`-x` only for stripped products. Real Darwin links verify that private function
+names remain available when unstripped and disappear when stripped; both modes
+retain the public export inventory and executable/shared-library consumers.
+
+The complete baseline-CPU native Darwin library measured 87,473,728 bytes
+(83.42 MiB) after cleanup consolidation but before final-link stripping.
+Applying the strip policy measured 87,350,336 bytes (83.30 MiB); private symbol
+names accounted for only about 0.12 MiB, so this was not the main overage.
+With explicit approval, the complete-library gate is now 88 MiB, leaving
+4.70 MiB (5.6%) above that measured image. Compiler claims, runner resources,
+unwind data, exported features and optimization modes are unchanged. Archive
+failures now report actual bytes/MiB as well as the limit. The production cross
+Darwin gate remains required; this native measurement does not replace it.
+
+### API cache relocation and Better Auth qualification
+
+The stripped Debug ownership audit must preserve canonical identities for
+immutable authored inputs outside the Zig build root as well as C inputs.
+Anonymous schema imports such as `../openapi.yaml` otherwise hash the overlay's
+absolute path and rebuild the API archive and four consumers after cloning.
+The bounded native regression includes an external schema and proves relocated
+cache hits, schema invalidation in both checkouts, private source mutation, and
+survival after deleting the original workspace.
+
+Better Auth run 40820082669 measured the Nix/glibc x86_64 baseline CPU stripped
+ReleaseFast API archive at 6,698,409,984 bytes against a 5 GiB reservation. Its
+retry consumed the remainder of the two-hour job. The exact Zig 0.17.0 native
+Linux GNU profile now reserves 8 GiB (at least 25% headroom); other profiles keep
+their claims. API and storage compilation still fit together in the existing
+20 GiB aggregate budget. An always-uploaded build report retains progress,
+compiler identities, CPU time and sampled memory even when the job is canceled.
+
+Full inference E2E lanes select collected tests by primary model affinity, so
+compound speech/generation tests share the generator lane. Ordinary servers
+retain models subject to the existing process/host byte budgets; only the
+explicit eviction regression uses a separate server with a one-model cap.
+The lanes share the locked, atomically published model download directory.
+
+Focused failure qualification can use `zig build storage-batch-contract-test`
+for collector allocation-failure and bounded embedding regressions, or
+`zig build capi-contract-test -Dtest-filter="..."` for public C API contracts.
+They reuse the normal test bodies and dependencies; the full storage and C API
+entrypoints retain their existing coverage. These targets avoid compiling HTTP
+discovery anchors and unrelated resolver replay suites for a focused regression.
+
+For a regression owned by the physical C API implementation, use
+`zig build capi-contract-owner-test-build -Dtest-filter="..."` and run
+`zig-out/bin/capi-contract-owner-tests`. It installs the same implementation
+partition used by the ordinary C API gate, avoiding an expensive consumer
+compilation solely to discover that the selected tests belong to the owner.
+The ordinary gate continues to audit the complete consumer/owner union.
+
+Better Auth follow-up run 40908943772 removed the API retry, but still reached
+its unchanged two-hour deadline. Persisted sampling shows API emission finished
+in about 37 minutes (6,906,523,648 sampled bytes), inference in 28 minutes,
+the storage adapter in 27 minutes, and the physical storage engine was still
+actively compiling after 39 minutes. Peak sampled compiler-tree RSS was
+11,704,987,648 bytes; this was compiler work, not a hung test or another
+reservation retry. Incomplete engine measurements do not justify lowering its
+reservation.
+
+Better Auth does not own a native build. Its reusable compatibility workflow
+consumes the server and installed C ABI library from the same run's successful
+`e2e-base-build` or `e2e-full-build`. The caller checks out the same candidate
+SHA and both E2E aggregate gates require supported-version auth success. Daily
+Zig qualification also exercises latest/beta candidates without weakening the
+supported-version gate. Embedded, remote, installed-package and persistent
+container checks are retained. SDK/auth-only changes select E2E coverage.
+
+Npm publication requires a successful main Zig qualification for the exact
+peeled tag commit, including full E2E and supported Better Auth jobs from its
+latest attempt. It does not start a compiler or reuse results from another
+commit. Release optimization and its independent qualification are unchanged.
+
+### Full API E2E and allocator admission follow-up (2026-10-29)
+
+Main run 40895786941's unpartitioned full API lane reached only 78% after
+roughly 140 minutes and was canceled at the unchanged 150-minute job limit.
+Individual passing cases were still progressing; this was not one hung test.
+Full API E2E now consumes the same six fixture-preserving ordinary/recovery
+lanes and common measured planner as base E2E. The full collection includes
+lake/Iceberg dependencies and no base marker exclusion. Actual collection
+verified all 1,268 cases are assigned and selected exactly once. The existing
+two-job matrix limit, process admission, runner sizes and deadlines are retained.
+Healthy full lanes feed their measurements back to the common duration history.
+
+Main Python SDK run 40824291080 also returned `WouldBlock` from a write with
+a configured busy timeout. Detached allocator verification released its writer
+lease and reacquired it through a raw nonblocking lock. Foreground proof
+completion now uses the requesting connection's existing admission policy;
+background and shutdown proofs remain nonblocking. No mutation has begun at
+this point, so the wait never replays partially committed work. A deterministic
+real-lock regression covers a competing writer, immediate failure and background
+yield; it and both resolver concurrency cases pass 20/20 seeded Debug runs
+(25 physical tests per run, zero failures/skips/leaks).

@@ -50,7 +50,6 @@ const test_png_3x3 = [_]u8{
 };
 const max_asset_provider_timeout_ms: u64 = 300_000;
 const default_asset_provider_response_bytes: usize = 64 << 20;
-const max_asset_http_response_bytes: usize = 64 << 20;
 const invocation_response_resident_multiplier: usize = 4;
 // This is an enforced allocator budget for request construction and parsing,
 // not an estimate of what a particular JSON implementation happens to use.
@@ -410,10 +409,12 @@ pub const Runtime = struct {
     capability_cache: remote_capabilities.Cache,
     execution: execution_context.Context = .{},
     request_progress: ?execution_context.ProgressSink = null,
-    owned_http: ?*httpx.Client = null,
+    owned_provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     owned_default_endpoint: ?[]u8 = null,
     owned_source_table: ?[]u8 = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
+    document_checkpoints: ?readers.document_rpc.Factory = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
     owns_inference_api_url: bool = false,
@@ -429,6 +430,7 @@ pub const Runtime = struct {
 
     pub const Options = struct {
         limits: *provider_limits.Registry = &provider_limits.process_registry,
+        provider_runtime: ?*managed_embedder.ProviderRuntime = null,
         antfly_provider: ?managed_embedder.AntflyProvider = null,
         /// Process-isolated Antfly inference endpoint. When no local provider
         /// is installed, Antfly asset configs without their own URL inherit
@@ -459,7 +461,8 @@ pub const Runtime = struct {
                 .io = http.io,
                 .routing = .{ .source_table = options.source_table },
             },
-            .limits = options.limits,
+            .limits = if (options.provider_runtime) |shared| shared.limits else options.limits,
+            .provider_runtime = options.provider_runtime,
             .antfly_provider = options.antfly_provider,
             .inference_api_url = options.inference_api_url,
             .secret_store = options.secret_store,
@@ -473,31 +476,22 @@ pub const Runtime = struct {
         const runtime = try alloc.create(Runtime);
         errdefer alloc.destroy(runtime);
 
-        const client = try alloc.create(httpx.Client);
-        errdefer alloc.destroy(client);
-        // This runtime is the ownership boundary for remote inference
-        // transport, so its pool lives exactly as long as the producer and is
-        // reused across document windows. The httpx pools are internally
-        // synchronized; disable ambient cookies because model credentials are
-        // supplied explicitly per request.
-        var client_config = httpx.ClientConfig{
-            .keep_alive = true,
-            .cookies_enabled = false,
-            .cache_resolved_addresses = true,
+        // Standalone producers own one stable provider runtime; server callers
+        // borrow the service runtime. Both share clients and credential caches
+        // across every batch and dependency instead of constructing row pools.
+        var effective = options;
+        const owned_provider = if (options.provider_runtime == null) owned: {
+            const provider = try alloc.create(managed_embedder.ProviderRuntime);
+            provider.* = managed_embedder.ProviderRuntime.init(alloc, io);
+            provider.limits = options.limits;
+            effective.provider_runtime = provider;
+            break :owned provider;
+        } else null;
+        errdefer if (owned_provider) |provider| {
+            provider.deinit();
+            alloc.destroy(provider);
         };
-        // Operation-specific ceilings are applied on provider requests. This
-        // client-wide value is only an outer safety maximum and must not turn a
-        // catalog or a configured large extraction into an unrelated 4 MiB
-        // failure.
-        client_config.max_response_size = max_asset_http_response_bytes;
-        client_config.timeouts = httpx.Timeouts.uniform(max_asset_provider_timeout_ms);
-        client_config.timeouts.request_ms = max_asset_provider_timeout_ms;
-        // Compatibility waves and independent document workers share this
-        // transport concurrently. httpx uses its client allocator for
-        // request-local headers, URLs, and responses, so keep those allocations
-        // off a possibly arena-backed runtime owner.
-        client.* = httpx.Client.initWithConfig(std.heap.smp_allocator, io, client_config);
-        errdefer client.deinit();
+        const client = try effective.provider_runtime.?.assetHttpClient();
 
         const owned_default_endpoint = if (options.inference_api_url) |endpoint|
             try normalizeAntflyInferenceBaseUrl(alloc, endpoint)
@@ -510,8 +504,8 @@ pub const Runtime = struct {
             null;
         errdefer if (owned_source_table) |source_table| alloc.free(source_table);
 
-        runtime.* = Runtime.initWithOptions(alloc, client, options);
-        runtime.owned_http = client;
+        runtime.* = Runtime.initWithOptions(alloc, client, effective);
+        runtime.owned_provider_runtime = owned_provider;
         runtime.owned_default_endpoint = owned_default_endpoint;
         runtime.owned_source_table = owned_source_table;
         runtime.execution.default_endpoint = owned_default_endpoint;
@@ -529,10 +523,11 @@ pub const Runtime = struct {
             self.inference_api_url = null;
             self.owns_inference_api_url = false;
         }
-        if (self.owned_http) |client| {
-            client.deinit();
-            self.alloc.destroy(client);
-            self.owned_http = null;
+        if (self.owned_provider_runtime) |provider| {
+            provider.deinit();
+            self.alloc.destroy(provider);
+            self.owned_provider_runtime = null;
+            self.provider_runtime = null;
         }
         self.* = undefined;
     }
@@ -628,6 +623,17 @@ pub const Runtime = struct {
     }
 
     fn routeExtractorConfig(self: *const Runtime, alloc: Allocator, cfg: *extracting.Config) !void {
+        if (cfg.provider == .cloudflare or cfg.provider == .pioneer) {
+            const env_name = if (cfg.provider == .cloudflare) "CLOUDFLARE_API_TOKEN" else extracting.pioneer.credential_env;
+            var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.bearer_token orelse cfg.api_key, env_name);
+            defer secret.deinit(alloc);
+            const token = (try secret.resolveOwned(alloc, self.secret_store)) orelse return if (cfg.provider == .cloudflare) error.CloudflareCredentialMissing else error.PioneerCredentialMissing;
+            if (cfg.api_key) |value| alloc.free(value);
+            if (cfg.bearer_token) |value| alloc.free(value);
+            cfg.api_key = token;
+            cfg.bearer_token = null;
+            return;
+        }
         if (cfg.provider != .antfly or cfg.resolvedUrl() != null or self.linkedExtractorAvailable()) return;
         const endpoint = self.execution.resolveAntflyEndpoint(null, false) orelse return;
         cfg.url = try alloc.dupe(u8, endpoint);
@@ -726,6 +732,7 @@ pub const Runtime = struct {
         var remote = false;
         var allocator_owner: inference_work.InvocationAllocatorOwner = .caller;
         var native_workspace_bytes: usize = 0;
+        var caller_workspace_bytes: usize = 0;
         const transport: inference_work.AttachmentTransport = switch (requests[0].producer_type) {
             .copy, .document_extraction, .vector_labels, .media_output => .borrowed_binary,
             .decision => blk: {
@@ -733,7 +740,19 @@ pub const Runtime = struct {
                 defer parsed.deinit();
                 const cfg = parsed.value.decider;
                 remote = true;
-                if (cfg.decision_method == .generated) {
+                if (cfg.embedder) |name| {
+                    const materialization = @import("functions/materialization.zig");
+                    var dependencies = try materialization.registry(alloc, parsed.value);
+                    defer dependencies.deinit();
+                    const embedder = try dependencies.getEmbedderConfig(name);
+                    remote = embedder.provider != .antfly or managed_embedder.hasRemoteAntflyEndpoint(embedder, self.inference_api_url) or self.antfly_provider == null;
+                    var arena = std.heap.ArenaAllocator.init(alloc);
+                    defer arena.deinit();
+                    const a = arena.allocator();
+                    const inputs = try a.alloc(@import("functions/decisions.zig").Request, requests.len);
+                    for (requests, inputs) |request, *input| input.* = .{ .decider = "materialized", .questions = parsed.value.questions, .input = .{ .text = request.source_text } };
+                    caller_workspace_bytes = try @import("functions/embedding_decisions.zig").workingBytes(a, cfg, embedder, inputs);
+                } else if (cfg.decision_method == .generated) {
                     try self.routeGeneratorConfig(alloc, &parsed.value.decider.generator.?);
                     var engine = self.constrainedRuntime();
                     const capabilities = try engine.capabilities(alloc, &parsed.value.decider.generator.?);
@@ -765,10 +784,11 @@ pub const Runtime = struct {
                         local.read_encoded_images_reported_with_context != null or
                         local.read_raster_images_reported != null or
                         local.read_raster_images_reported_with_context != null;
-                    if (!binary and local.read_images == null and local.read_images_with_context == null)
+                    if (!binary and local.read_images == null and local.read_images_with_context == null and !(self.document_checkpoints != null and local.document_json != null))
                         return error.InferenceInvocationMemoryUnavailable;
                     break :blk if (binary) .borrowed_binary else .data_uri;
                 }
+                if (self.document_checkpoints != null) break :blk .borrowed_binary;
                 break :blk remoteAttachmentTransport(try self.readerCapabilities(alloc, cfg), .data_uri);
             },
             .generator => blk: {
@@ -822,9 +842,10 @@ pub const Runtime = struct {
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
                     allocator_owner = try localInvocationAllocatorOwner(local);
-                    if (local.extract == null and local.extract_with_context == null)
+                    if (local.extract == null and local.extract_with_context == null and !(self.document_checkpoints != null and local.document_json != null))
                         return error.InferenceInvocationMemoryUnavailable;
                 }
+                if (self.document_checkpoints != null) break :blk .borrowed_binary;
                 break :blk if (remote) remoteAttachmentTransport(try self.extractorCapabilities(alloc, parsed), extractorAttachmentTransport(parsed)) else extractorAttachmentTransport(parsed);
             },
             .transcriber => blk: {
@@ -867,6 +888,11 @@ pub const Runtime = struct {
             return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, control) catch return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, native_workspace_bytes) catch return error.InferenceEncodedBytesExceeded;
+        // A duplex snapshot reply can be a full raw source, independently of
+        // the URI-sized request or text-sized final result. Bound that transport
+        // workspace explicitly rather than charging it as model output.
+        if (remote and self.document_checkpoints != null) fixed = std.math.add(usize, fixed, 128 * 1024 * 1024) catch return error.InferenceEncodedBytesExceeded;
+        fixed = std.math.add(usize, fixed, caller_workspace_bytes) catch return error.InferenceEncodedBytesExceeded;
         const configured_results = try self.configuredResultLimit(requests[0].producer_type, requests.len);
         const results = if (remote)
             self.remoteLogicalResultLimit(requests[0].producer_type, requests.len)
@@ -978,7 +1004,26 @@ pub const Runtime = struct {
         return switch (request.producer_type) {
             // These routes never enter an external callback. Unsupported
             // document extraction also fails synchronously in produceOne.
-            .copy, .document_extraction, .decision, .vector_labels, .media_output => true,
+            .copy, .document_extraction, .vector_labels, .media_output => true,
+            .decision => blk: {
+                var spec = try @import("functions/materialization.zig").parse(alloc, request.config_json);
+                defer spec.deinit();
+                if (spec.value.decider.embedder) |name| {
+                    var dependencies = try @import("functions/materialization.zig").registry(alloc, spec.value);
+                    defer dependencies.deinit();
+                    const embedder = try dependencies.getEmbedderConfig(name);
+                    if (embedder.provider != .antfly or managed_embedder.hasRemoteAntflyEndpoint(embedder, self.inference_api_url)) break :blk true;
+                    const local = self.antfly_provider orelse break :blk true;
+                    break :blk local.embed_dense_texts_with_context != null;
+                }
+                if (spec.value.decider.generator) |generator| {
+                    if (generator.provider == .apple) break :blk false;
+                    if (generator.provider != .antfly or generator.url.len != 0) break :blk true;
+                    const local = self.antfly_provider orelse break :blk true;
+                    break :blk local.generate_json != null;
+                }
+                break :blk true;
+            },
             .generator => blk: {
                 var parsed = try parseGeneratorProducerConfig(alloc, request.config_json);
                 defer parsed.deinit(alloc);
@@ -1083,6 +1128,7 @@ pub const Runtime = struct {
         else
             self.execution.max_response_bytes;
         scoped.request_progress = context.progress orelse self.request_progress;
+        scoped.document_checkpoints = context.document_checkpoints orelse self.document_checkpoints;
         return scoped;
     }
 
@@ -1150,6 +1196,7 @@ pub const Runtime = struct {
     }
 
     fn batchModeWithContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request, context: asset_producer.InvocationContext) !inference_work.BatchMode {
+        if (context.document_checkpoints != null) return .none;
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
         try scoped.execution.check(platform.time.monotonicNs());
@@ -1232,6 +1279,11 @@ pub const Runtime = struct {
             .copy => .native,
             .document_extraction, .vector_labels, .media_output => .none,
             .decision => blk: {
+                if (requestsShareRoute(requests)) {
+                    var spec = try @import("functions/materialization.zig").parse(alloc, first.config_json);
+                    defer spec.deinit();
+                    if (spec.value.decider.embedder != null) break :blk .native;
+                }
                 const capabilities = (try capabilitiesForRequests(ptr, alloc, requests)) orelse break :blk .none;
                 break :blk capabilities.batch.mode;
             },
@@ -1646,13 +1698,12 @@ pub const Runtime = struct {
         const materialization = @import("functions/materialization.zig");
         var parsed = try materialization.parse(alloc, requests[0].config_json);
         defer parsed.deinit();
-        if (parsed.value.decider.decision_method != .generated) return error.BatchIncompatible;
+        if (parsed.value.decider.decision_method != .generated and parsed.value.decider.embedder == null) return error.BatchIncompatible;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        var registry = @import("common/provider_registry.zig").Registry.init(a);
+        var registry = try materialization.registry(a, parsed.value);
         defer registry.deinit();
-        try registry.registerDeciderConfig("materialized", parsed.value.decider);
         const inputs = try a.alloc(d.Request, requests.len);
         for (inputs, requests) |*input, request| {
             try validateDecisionInput(a, request);
@@ -1660,6 +1711,7 @@ pub const Runtime = struct {
         }
         var execution: @import("functions/runtime.zig").Runtime = .{
             .registry = &registry,
+            .provider_runtime = self.provider_runtime,
             .http = self.http,
             .io = self.http.io,
             .limits = self.limits,
@@ -1670,7 +1722,12 @@ pub const Runtime = struct {
             .source_table = self.execution.routing.source_table,
         };
         defer execution.deinit();
-        const results = try execution.evaluateGeneratedPartial(a, "materialized", inputs);
+        var report = inference_work.ExecutionReport{ .requested_items = requests.len, .serial_items = requests.len };
+        const results: @import("functions/runtime.zig").Runtime.PartialBatch = if (parsed.value.decider.decision_method == .generated) generated: {
+            const generated = try execution.evaluateGeneratedPartial(a, "materialized", inputs);
+            report = constrainedExecution(generated.execution, requests.len);
+            break :generated .{ .values = generated.values, .failures = generated.failures };
+        } else try execution.evaluatePartial(a, inputs);
         const items = try alloc.alloc(asset_producer.ProducedItem, requests.len);
         var initialized: usize = 0;
         errdefer {
@@ -1687,7 +1744,7 @@ pub const Runtime = struct {
             item.* = .{ .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number }, .result = if (response) |answer| .{ .value = try std.json.Stringify.valueAlloc(alloc, answer, .{}) } else .{ .item_error = .{ .cause = failure orelse error.InvalidDecisionOutput, .code = .generation_failed } } };
             initialized += 1;
         }
-        return .{ .items = items, .execution = constrainedExecution(results.execution, requests.len) };
+        return .{ .items = items, .execution = report };
     }
 
     fn decide(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
@@ -1696,13 +1753,13 @@ pub const Runtime = struct {
         const parsed = try materialization.parse(alloc, request.config_json);
         defer parsed.deinit();
         try validateDecisionInput(alloc, request);
-        var registry = @import("common/provider_registry.zig").Registry.init(alloc);
+        var registry = try materialization.registry(alloc, parsed.value);
         defer registry.deinit();
-        try registry.registerDeciderConfig("materialized", parsed.value.decider);
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         var execution: @import("functions/runtime.zig").Runtime = .{
             .registry = &registry,
+            .provider_runtime = self.provider_runtime,
             .http = self.http,
             .io = self.http.io,
             .limits = self.limits,
@@ -2762,6 +2819,7 @@ pub const Runtime = struct {
             .source_table = self.execution.routing.source_table,
             .execution = self.execution,
             .request_context = self.requestContext(),
+            .provider_runtime = self.provider_runtime,
             .limits = self.limits,
         } };
     }
@@ -2896,6 +2954,7 @@ pub const Runtime = struct {
             .source_table = self.execution.routing.source_table,
             .execution = self.execution,
             .request_context = self.requestContext(),
+            .provider_runtime = self.provider_runtime,
             .limits = self.limits,
         }, &messages) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
@@ -2909,7 +2968,158 @@ pub const Runtime = struct {
         return try alloc.dupe(u8, result.content);
     }
 
+    fn documentCall(self: *Runtime, a: Allocator, model: []const u8, endpoint: ?[]const u8, api_key: ?[]const u8, bytes: []const u8, is_extract: bool) ![]u8 {
+        const binding = try self.document_checkpoints.?.bind(a, bytes, is_extract);
+        defer binding.view().release();
+        var client = try readers.document_rpc.Client.initBound(a, binding.view(), self.execution.io orelse self.http.io);
+        defer client.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const record = try client.store().load(arena.allocator(), client.id, client.owner);
+        if (record.state == .succeeded) return client.store().read(a, record.result orelse return error.InvalidDocumentCheckpoint, self.responseLimitForTask(if (is_extract) .extractor else .reader, 1));
+        var context = self.requestContext();
+        context.document_store = binding.view();
+        const local = self.antfly_provider;
+        const resolved = self.execution.resolveAntflyEndpoint(endpoint, local != null and local.?.document_json != null);
+        if (resolved == null) {
+            const provider = local orelse return error.UnsupportedReadProvider;
+            const invoke = provider.document_json orelse return error.UnsupportedVersion;
+            return managed_embedder.AntflyProviderBoundary.call("document_json", provider.boundary_dispatch, invoke, .{ provider.ptr, a, bytes, is_extract, context });
+        }
+        const protocol = readers.document_stream;
+        const url = try documentExecuteUrl(a, resolved.?, is_extract);
+        defer a.free(url);
+        const budget = std.fmt.allocPrint(a, "{d}", .{record.limits.tokens -| record.used.tokens}) catch return error.OutOfMemory;
+        defer a.free(budget);
+        var headers: [8][2][]const u8 = undefined;
+        headers[0] = .{ "Content-Type", protocol.content_type };
+        headers[1] = .{ "X-Antfly-Document-Model", model };
+        headers[2] = .{ "X-Antfly-Document-Token-Budget", budget };
+        var count: usize = 3;
+        count = try self.execution.routing.appendHeaders(&headers, count);
+        var secret = try common_secrets.SecretValue.initConfigOrEnv(a, api_key, "ANTFLY_API_KEY");
+        defer secret.deinit(a);
+        const resolved_key = try secret.resolveOwned(a, self.secret_store);
+        defer if (resolved_key) |key| a.free(key);
+        const authorization = if (resolved_key) |key| try std.fmt.allocPrint(a, "Bearer {s}", .{key}) else null;
+        defer if (authorization) |value| a.free(value);
+        if (authorization) |value| {
+            headers[count] = .{ "Authorization", value };
+            count += 1;
+        }
+        var transport = try protocol.Owner.init(a, self.http.io, binding.view(), bytes);
+        defer transport.deinit();
+        var response = try self.http.requestToWriter(.POST, url, .{
+            .headers = headers[0..count],
+            .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
+            .body_stream = .{ .context = &transport.upload, .read = protocol.Queue.read },
+            .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+            .cancellation = httpx.CancellationToken.fromCallback(self.execution.cancellation.ptr, self.execution.cancellation.is_cancelled_fn),
+            .max_retries = 0,
+            .follow_redirects = false,
+            .cookies_enabled = false,
+        }, &transport, null, null);
+        defer response.deinit();
+        const final = transport.final orelse return error.InferenceTransportUnavailable;
+        if (!transport.parser.complete()) return error.InvalidDocumentCheckpoint;
+        if (final.header.code < 200 or final.header.code >= 300) return documentRemoteError(a, final.header.code, final.body());
+        if (final.body().len > self.responseLimitForTask(if (is_extract) .extractor else .reader, 1)) return error.ResponseTooLarge;
+        return a.dupe(u8, final.body());
+    }
+    fn readDocumentDurably(self: *Runtime, a: Allocator, request: asset_producer.Request) !?[]u8 {
+        var parsed = try std.json.parseFromSlice(readers.Config, a, request.config_json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const cfg = parsed.value;
+        if (cfg.provider != .antfly or request.media.len != 0) return null;
+        // Explicit document inputs preserve format, page selection and provenance.
+        // Otherwise retain the established image-source parser and wire form.
+        const body = try self.documentReadBody(a, request, cfg);
+        defer a.free(body);
+        const result = try self.documentCall(a, cfg.model orelse return error.InvalidReaderConfig, cfg.resolvedUrl(), cfg.api_key, body, false);
+        defer a.free(result);
+        const items = try readers.documentResults(a, result);
+        defer {
+            for (items) |*item| readers.deinitResult(a, item);
+            a.free(items);
+        }
+        return try encodeReaderResults(a, request.content_type, items);
+    }
+    fn documentReadBody(self: *Runtime, a: Allocator, request: asset_producer.Request, cfg: readers.Config) ![]u8 {
+        if (request.source_parts_json) |parts| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, parts, .{ .parse_numbers = false });
+            defer parsed.deinit();
+            const value = parsed.value;
+            if (value == .object) if (value.object.get("documents")) |documents| return std.json.Stringify.valueAlloc(a, .{ .model = cfg.model, .documents = documents, .prompt = cfg.prompt, .max_tokens = cfg.max_tokens }, .{ .emit_null_optional_fields = false });
+            if (try @import("reader_source.zig").parsePartsValue(a, value, false)) |selected| {
+                var source = selected;
+                defer source.deinit(a);
+                return self.documentImageBody(a, source, cfg);
+            }
+        }
+        const input = std.mem.trim(u8, request.source_text, " \t\r\n");
+        if (std.mem.startsWith(u8, input, "{")) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, input, .{ .parse_numbers = false });
+            defer parsed.deinit();
+            if (parsed.value == .object) if (parsed.value.object.get("documents")) |documents| return std.json.Stringify.valueAlloc(a, .{ .model = cfg.model, .documents = documents, .prompt = cfg.prompt, .max_tokens = cfg.max_tokens }, .{ .emit_null_optional_fields = false });
+        }
+        if (documentSourceMediaType(input, request.content_type)) |media_type| {
+            return std.json.Stringify.valueAlloc(a, .{ .model = cfg.model, .documents = [_]readers.DocumentSource{.{ .id = "source", .url = input, .media_type = media_type }}, .prompt = cfg.prompt, .max_tokens = cfg.max_tokens }, .{ .emit_null_optional_fields = false });
+        }
+        var source = try @import("reader_source.zig").parseText(a, request.source_text);
+        defer source.deinit(a);
+        return self.documentImageBody(a, source, cfg);
+    }
+    fn documentImageBody(_: *Runtime, a: Allocator, source: @import("reader_source.zig").Source, cfg: readers.Config) ![]u8 {
+        const Image = struct { url: []const u8 };
+        const images = try a.alloc(Image, source.images.len);
+        defer a.free(images);
+        for (images, source.images) |*image, url| image.* = .{ .url = url };
+        return std.json.Stringify.valueAlloc(a, .{ .model = cfg.model, .images = images, .prompt = source.prompt orelse cfg.prompt, .max_tokens = cfg.max_tokens }, .{ .emit_null_optional_fields = false });
+    }
+    fn extractDocumentDurably(self: *Runtime, a: Allocator, request: asset_producer.Request) !?[]u8 {
+        if (try generated_extractor.isGenerated(a, request.config_json)) return null;
+        var cfg = try extracting.parseConfigFromSlice(a, request.config_json);
+        defer cfg.deinit(a);
+        if (cfg.provider != .antfly or request.media.len != 0) return null;
+        const content = try extractionContentJsonAlloc(a, request.source_text, request.source_parts_json);
+        defer a.free(content);
+        const initial = try extracting.requestJsonAlloc(a, cfg, .{ .inputs = &.{.{ .content_json = content }}, .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null, .schema_json = cfg.schema_json, .options_json = cfg.options_json });
+        defer a.free(initial);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var body = try std.json.parseFromSliceLeaky(std.json.Value, scratch, initial, .{ .parse_numbers = false });
+        const input = std.mem.trim(u8, request.source_text, " \t\r\n");
+        const raw = request.source_parts_json orelse input;
+        var source_id: ?[]const u8 = null;
+        var documents: ?std.json.Value = null;
+        if (std.mem.startsWith(u8, raw, "{")) {
+            const source = try std.json.parseFromSliceLeaky(std.json.Value, scratch, raw, .{ .parse_numbers = false });
+            if (source == .object) documents = source.object.get("documents");
+        }
+        if (documents == null) if (documentSourceMediaType(input, request.content_type)) |mime| {
+            const encoded = try std.json.Stringify.valueAlloc(scratch, [_]readers.DocumentSource{.{ .id = "source", .url = input, .media_type = mime }}, .{});
+            documents = try std.json.parseFromSliceLeaky(std.json.Value, scratch, encoded, .{});
+        };
+        if (documents) |value| {
+            if (value != .array or value.array.items.len != 1) return error.InvalidDocumentSource;
+            const source = value.array.items[0];
+            if (source != .object) return error.InvalidDocumentSource;
+            const id = source.object.get("id") orelse return error.InvalidDocumentSource;
+            if (id != .string) return error.InvalidDocumentSource;
+            source_id = id.string;
+            _ = body.object.swapRemove("inputs");
+            try body.object.put(scratch, "documents", value);
+        }
+        const bytes = try std.json.Stringify.valueAlloc(a, body, .{});
+        defer a.free(bytes);
+        const response = try self.documentCall(a, cfg.model, cfg.resolvedUrl(), cfg.api_key, bytes, true);
+        defer a.free(response);
+        return try extractionResultJsonAlloc(a, response, .{ .model = cfg.model, .item_count = 1, .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null, .max_response_bytes = self.responseLimitForTask(.extractor, 1) }, source_id, !(isJsonContentType(request.content_type) or request.content_type.len == 0));
+    }
+
     pub fn read(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+        if (self.document_checkpoints != null) if (try self.readDocumentDurably(alloc, request)) |output| return output;
         var cfg_parsed = try std.json.parseFromSlice(readers.Config, alloc, request.config_json, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
@@ -2972,6 +3182,15 @@ pub const Runtime = struct {
         var resolved_reader = try self.resolveReaderConfig(alloc, cfg);
         defer resolved_reader.deinit(alloc);
         var execution_cfg = resolved_reader.config;
+        var cloudflare_token: ?[]u8 = null;
+        defer if (cloudflare_token) |token| alloc.free(token);
+        if (execution_cfg.provider == .cloudflare) {
+            var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, execution_cfg.bearer_token orelse execution_cfg.api_key, "CLOUDFLARE_API_TOKEN");
+            defer secret.deinit(alloc);
+            cloudflare_token = (try secret.resolveOwned(alloc, self.secret_store)) orelse return error.CloudflareCredentialMissing;
+            execution_cfg.api_key = cloudflare_token;
+            execution_cfg.bearer_token = null;
+        }
         try execution_cfg.validate();
         const local_reader = isLocalReaderProvider(execution_cfg.provider, execution_cfg.resolvedUrl());
         var capability_lease_fields = CapabilityLeaseFields{};
@@ -3361,7 +3580,7 @@ pub const Runtime = struct {
         cfg_parsed.value.max_response_bytes = self.responseLimitForTask(.transcriber, 1);
         if (request.media.len > 0) {
             if (!request.inline_media_trusted) return error.UntrustedInlineMedia;
-            if (cfg_parsed.value.provider != .apple or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
+            if ((cfg_parsed.value.provider != .apple and cfg_parsed.value.provider != .cloudflare) or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
         }
         const antfly_model = if (cfg_parsed.value.provider == .antfly)
             try requiredAntflyTranscriberModel(cfg_parsed.value)
@@ -3440,10 +3659,20 @@ pub const Runtime = struct {
             capability_lease_fields.apply(&cfg_parsed.value);
         }
 
+        var cloudflare_token: ?[]u8 = null;
+        defer if (cloudflare_token) |token| alloc.free(token);
+        var execution_cfg = cfg_parsed.value;
+        if (execution_cfg.provider == .cloudflare) {
+            var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, execution_cfg.bearer_token orelse execution_cfg.api_key, "CLOUDFLARE_API_TOKEN");
+            defer secret.deinit(alloc);
+            cloudflare_token = (try secret.resolveOwned(alloc, self.secret_store)) orelse return error.CloudflareCredentialMissing;
+            execution_cfg.api_key = cloudflare_token;
+            execution_cfg.bearer_token = null;
+        }
         var result = transcribing.transcribeWithConfig(
             alloc,
             self.http,
-            cfg_parsed.value,
+            execution_cfg,
             .{
                 .url = request.source_text,
                 .timestamps = cfg_parsed.value.timestamps orelse true,
@@ -3529,6 +3758,7 @@ pub const Runtime = struct {
     }
 
     pub fn extract(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+        if (self.document_checkpoints != null) if (try self.extractDocumentDurably(alloc, request)) |output| return output;
         if (try generated_extractor.isGenerated(alloc, request.config_json)) {
             var batch = try self.extractGenerated(alloc, &.{request});
             defer batch.deinit(alloc);
@@ -3628,7 +3858,7 @@ pub const Runtime = struct {
             // plain, schema-version-less wire request to v2 on the provider
             // side (see zig/pkg/inference's extractWithAdmission); a caller
             // that left schema_version unset -- as
-            // examples/dogfood/index_config.go's knowledgeGraphIndexJSON and
+            // examples/antfly-docs-knowledge-base/index_config.go's knowledgeGraphIndexJSON and
             // GRAPH.md's shorthand extractor config both do -- has no basis
             // to reject that upgraded response as a schema_version mismatch.
             // parseExtractionResponse still derives the actual `v2` parsing
@@ -4987,6 +5217,7 @@ fn parseReaderSource(alloc: Allocator, source_text: []const u8, source_parts_jso
 }
 
 fn encodeReaderResults(alloc: Allocator, content_type: []const u8, results: []readers.Result) ![]u8 {
+    try readers.requireComplete(results);
     if (isJsonContentType(content_type)) {
         return try std.json.Stringify.valueAlloc(alloc, results, .{});
     }
@@ -5116,14 +5347,39 @@ fn validateExtractionAttribute(item: std.json.Value) !void {
 }
 
 fn validateExtractionField(alloc: Allocator, item: std.json.Value) !void {
-    _ = try extractionString(item, "value");
+    if (item != .object) return error.InvalidExtractorResponse;
+    const value = item.object.get("value") orelse return error.InvalidExtractorResponse;
+    if (value != .string) {
+        // Typed hosted fields must explicitly distinguish a derivation or an
+        // estimate from literal source evidence. Legacy span fields stay text.
+        try extractionStringChoice(item, "origin", &.{ "transcription", "derived", "estimated" });
+        switch (value) {
+            .null => if (item.object.get("score")) |score| if (score != .null) return error.InvalidExtractorResponse,
+            .integer, .float, .number_string => _ = try extractionNumber(value, false),
+            .bool => {},
+            .array => |values| for (values.items) |element| if (element != .string) return error.InvalidExtractorResponse,
+            else => return error.InvalidExtractorResponse,
+        }
+        if (item.object.get("start")) |start| if (start != .null) return error.InvalidExtractorResponse;
+        if (item.object.get("end")) |end| if (end != .null) return error.InvalidExtractorResponse;
+        if (item.object.get("spans")) |spans| {
+            if (value != .array or spans != .array or value.array.items.len != spans.array.items.len) return error.InvalidExtractorResponse;
+            for (spans.array.items) |span| {
+                if (span == .null) continue;
+                if (span != .array or span.array.items.len != 2) return error.InvalidExtractorResponse;
+                const start = try extractionInteger(alloc, span.array.items[0]);
+                const end = try extractionInteger(alloc, span.array.items[1]);
+                if (start < 0 or end < start) return error.InvalidExtractorResponse;
+            }
+        }
+    }
     try extractionOptionalNumber(item, "score", true);
     try extractionOffsets(alloc, item, true, false);
     if (item.object.get("source")) |source| if (source != .null) {
         try extractionStringChoice(item, "source", &.{ "document", "schema" });
         if (std.mem.eql(u8, source.string, "schema")) {
-            if (item.object.get("start")) |value| if (value != .null) return error.InvalidExtractorResponse;
-            if (item.object.get("end")) |value| if (value != .null) return error.InvalidExtractorResponse;
+            if (item.object.get("start")) |start_value| if (start_value != .null) return error.InvalidExtractorResponse;
+            if (item.object.get("end")) |end_value| if (end_value != .null) return error.InvalidExtractorResponse;
         }
     };
 }
@@ -5545,7 +5801,7 @@ test "asset producer runtime single extractor response preserves legacy optional
 // and zig/pkg/inference's extractWithAdmission) auto-upgrades a plain,
 // schema-version-less wire request to a schema_version=2 response. A
 // producer config that never asked for a specific schema_version -- as
-// examples/dogfood/index_config.go's knowledgeGraphIndexJSON and GRAPH.md's
+// examples/antfly-docs-knowledge-base/index_config.go's knowledgeGraphIndexJSON and GRAPH.md's
 // shorthand extractor config both do -- has no basis to reject that upgrade
 // as a mismatch: before Config.schema_version_explicit existed, `extract()`
 // (asset_producer_runtime.zig) pinned `expected.schema_version` to
@@ -5566,7 +5822,7 @@ test "asset producer runtime accepts an unrequested boundary-model schema_versio
     const response = "{\"object\":\"extraction\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema_version\":2,\"data\":[{\"entities\":[{\"label\":\"component\",\"text\":\"VOPR\",\"start\":0,\"end\":4}],\"relations\":[{\"type\":\"depends_on\",\"source\":{\"entity_index\":0},\"target\":{\"text\":\"antfly-core\",\"start\":10,\"end\":21}}]}]}";
 
     // Config JSON with no "schema_version" field, matching dogfood's real
-    // producer config shape exactly (examples/dogfood/index_config.go's
+    // producer config shape exactly (examples/antfly-docs-knowledge-base/index_config.go's
     // knowledgeGraphIndexJSON never sets one).
     var implicit_cfg = try extracting.parseConfigFromSlice(
         a,
@@ -8045,4 +8301,457 @@ test "decision functions materialized enrichment records version model and sourc
     try std.testing.expectEqualStrings("resolved-model", provenance.get("model").?.string);
     try std.testing.expectEqualStrings("revision-2", provenance.get("source_fingerprint").?.string);
     try std.testing.expect(provenance.get("specification_hash").?.string.len > 0);
+}
+
+test "decision functions Cloudflare extraction resolves secret references before transport" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "secrets.json", .data =
+        \\{"secrets":[{"key":"cloudflare.api_token","value":"fixture-token","created_at_ns":1,"updated_at_ns":1}]}
+    });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "secrets.json", a);
+    defer a.free(path);
+    var store = try common_secrets.FileStore.initWithIo(a, std.testing.io, path);
+    defer store.deinit();
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(a, &client, .{ .secret_store = &store });
+    defer runtime.deinit();
+    var cfg = try extracting.parseConfigFromSlice(a,
+        \\{"provider":"cloudflare","account_id":"account","model":"@cf/cloudflare/clairic","api_key":"${secret:cloudflare.api_token}"}
+    );
+    defer cfg.deinit(a);
+    try runtime.routeExtractorConfig(a, &cfg);
+    try std.testing.expectEqualStrings("fixture-token", cfg.api_key.?);
+    try std.testing.expect(cfg.bearer_token == null);
+    var missing = try extracting.parseConfigFromSlice(a,
+        \\{"provider":"cloudflare","account_id":"account","model":"@cf/cloudflare/clairic","api_key":"${secret:cloudflare.missing}"}
+    );
+    defer missing.deinit(a);
+    try std.testing.expectError(error.SecretNotFound, runtime.routeExtractorConfig(a, &missing));
+}
+
+test "asset producer runtime borrowed pools survive producer teardown and accept bounded large responses" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var shared = managed_embedder.ProviderRuntime.init(a, io);
+    defer shared.deinit();
+    const first = try Runtime.createOwned(a, io, .{ .provider_runtime = &shared });
+    first.deinit();
+    a.destroy(first);
+    const next = try Runtime.createOwned(a, io, .{ .provider_runtime = &shared });
+    defer {
+        next.deinit();
+        a.destroy(next);
+    }
+    // The service generation pool has a smaller envelope. Asset operations
+    // with a larger explicit budget must not silently inherit that ceiling.
+    const body = try a.alloc(u8, (4 << 20) + 16);
+    defer a.free(body);
+    @memset(body, 'x');
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .GET, .path = "/", .respond = .{ .body = body, .content_type = "application/octet-stream" } }});
+    defer server.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(http: *httpx.Client, url: []const u8, expected: usize, out: *?anyerror) std.Io.Cancelable!void {
+            var response = http.get(url, .{ .max_response_size = 5 << 20, .timeout_ms = 10000 }) catch |err| {
+                out.* = err;
+                return;
+            };
+            defer response.deinit();
+            std.testing.expectEqual(expected, response.body.?.len) catch |err| {
+                out.* = err;
+            };
+        }
+    };
+    try group.concurrent(io, Fiber.run, .{ next.http, server.baseUrl(), body.len, &failure });
+    try server.handleOne();
+    group.await(io) catch {};
+    if (failure) |err| return err;
+}
+
+test "asset producer runtime provider ownership unwinds every allocation failure" {
+    const Check = struct {
+        fn run(a: Allocator) !void {
+            const owned = try Runtime.createOwned(a, std.testing.io, .{ .inference_api_url = "http://worker" });
+            defer {
+                owned.deinit();
+                a.destroy(owned);
+            }
+            var shared = managed_embedder.ProviderRuntime.init(a, std.testing.io);
+            defer shared.deinit();
+            const borrowed = try Runtime.createOwned(a, std.testing.io, .{ .provider_runtime = &shared });
+            borrowed.deinit();
+            a.destroy(borrowed);
+            _ = try shared.assetHttpClient();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "decision provider plain reader materialization rejects incomplete text before transfer" {
+    const a = std.testing.allocator;
+    var results = [_]readers.Result{.{ .text = try a.dupe(u8, "partial receipt"), .completion = .length }};
+    const result = &results[0];
+    defer readers.deinitResult(a, result);
+    try std.testing.expectError(error.ReadOutputTruncated, encodeReaderResults(a, "text/plain", &results));
+    try std.testing.expectEqualStrings("partial receipt", result.text);
+    result.completion = .unresolved;
+    try std.testing.expectError(error.DocumentUnresolved, encodeReaderResults(a, "application/json", &results));
+}
+
+fn documentExecuteUrl(a: Allocator, endpoint: []const u8, extract: bool) ![]u8 {
+    const base = std.mem.trimEnd(u8, endpoint, "/");
+    if (std.mem.endsWith(u8, base, if (extract) "/extract/execute" else "/read/execute")) return a.dupe(u8, base);
+    const root = if (std.mem.endsWith(u8, base, "/ai/v1")) base[0 .. base.len - 6] else if (std.mem.endsWith(u8, base, "/read") or std.mem.endsWith(u8, base, "/extract")) base[0 .. base.len - (if (std.mem.endsWith(u8, base, "/read")) @as(usize, 5) else 8)] else base;
+    if (std.mem.endsWith(u8, root, "/ai/v1")) return std.fmt.allocPrint(a, "{s}/{s}/execute", .{ root, if (extract) "extract" else "read" });
+    return std.fmt.allocPrint(a, "{s}/ai/v1/{s}/execute", .{ root, if (extract) "extract" else "read" });
+}
+
+fn documentSourceMediaType(url: []const u8, supplied: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, supplied, "application/pdf") or std.mem.eql(u8, supplied, "application/vnd.openxmlformats-officedocument.presentationml.presentation")) return supplied;
+    if (std.mem.indexOf(u8, url, "://") == null and !std.ascii.startsWithIgnoreCase(url, "data:")) return null;
+    const path = url[0 .. std.mem.indexOfAny(u8, url, "?#") orelse url.len];
+    if (std.ascii.endsWithIgnoreCase(path, ".pdf") or std.ascii.startsWithIgnoreCase(url, "data:application/pdf;")) return "application/pdf";
+    if (std.ascii.endsWithIgnoreCase(path, ".pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    return null;
+}
+
+test "index document checkpoint producer replays accepted work and completed output through native callback" {
+    const checkpoint = @import("storage/db/enrichment/document_checkpoints.zig");
+    const runs = readers.document_runs;
+    const a = std.testing.allocator;
+    var backend = checkpoint.TestBackend.init(a);
+    defer backend.deinit();
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var owner = checkpoint.Owner{ .allocator = a, .backend = backend.backend(), .binding = .{ .document = "doc", .producer = "read", .source_key = "doc", .source_digest = @splat(1), .producer_digest = @splat(2) }, .io = io };
+    defer owner.drain();
+    const Local = struct {
+        calls: usize = 0,
+        physical: usize = 0,
+        fn dense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.UnsupportedOperation;
+        }
+        fn sparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]managed_embedder.SparseEmbedding {
+            return error.UnsupportedOperation;
+        }
+        fn now(_: ?*anyopaque) u64 {
+            return checkpoint.now();
+        }
+        fn invoke(raw: *anyopaque, alloc: Allocator, bytes: []const u8, is_extract: bool, context: RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(!is_extract);
+            try std.testing.expect(std.mem.indexOf(u8, bytes, "documents") != null);
+            var client = try readers.document_rpc.Client.initBound(alloc, context.document_store, context.io);
+            defer client.deinit();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const store = client.store();
+            const record = try store.load(scratch, client.id, client.owner);
+            try std.testing.expectEqual(checkpoint.hash(bytes), record.identity.request);
+            const lease: runs.Lease = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+            if (!record.prepared) try store.prepare(scratch, lease, record.identity, record.limits, record.inputs, checkpoint.now());
+            var session = try runs.Session.init(alloc, store, lease, record.identity, .{ .now_fn = now }, 512, 32 * 1024 * 1024);
+            defer session.deinit();
+            const key = session.key("accepted-page");
+            if (try session.replay(scratch, key, 1024)) |_| {} else {
+                self.physical += 1;
+                _ = try session.publish(scratch, key, "accepted page", "");
+            }
+            if (self.calls == 1) return error.InferenceTransportUnavailable;
+            const result = "{\"data\":[{\"source_id\":\"source\",\"number\":1,\"text\":\"accepted page\",\"status\":\"complete\"}]}";
+            const output = try session.publish(scratch, session.key("final"), result, "");
+            try store.finish(scratch, lease, output, checkpoint.now());
+            return alloc.dupe(u8, result);
+        }
+    };
+    var local: Local = .{};
+    var client = httpx.Client.initWithConfig(a, io, .{});
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = &local, .owns_invocation_admission = true, .embed_dense_texts = Local.dense, .embed_sparse_texts = Local.sparse, .document_json = Local.invoke } });
+    defer runtime.deinit();
+    const producer = runtime.producer().withInvocationContext(.{ .io = io, .document_checkpoints = owner.factory() });
+    const request: asset_producer.Request = .{ .producer_type = .reader, .config_json = "{\"provider\":\"antfly\",\"model\":\"agent\"}", .source_text = "https://documents.example/deck.PDF?revision=1", .content_type = "text/plain" };
+    try std.testing.expectError(error.InferenceTransportUnavailable, producer.produce(a, request));
+    const second = try producer.produce(a, request);
+    defer a.free(second);
+    try std.testing.expectEqualStrings("accepted page", second);
+    const third = try producer.produce(a, request);
+    defer a.free(third);
+    try std.testing.expectEqualStrings("accepted page", third);
+    try std.testing.expectEqual(@as(usize, 1), local.physical);
+    try std.testing.expectEqual(@as(usize, 2), local.calls);
+}
+
+fn documentRemoteError(a: Allocator, status: i32, body: []const u8) anyerror {
+    if (readers.document_failure.recognized(a, body)) |failure| return failure.cause.?;
+    return documentRemoteStatus(status);
+}
+fn documentRemoteStatus(status: i32) anyerror {
+    return switch (status) {
+        401, 403 => error.InferenceEndpointAccessDenied,
+        404 => error.ModelNotFound,
+        400, 415, 422 => error.InvalidDocumentSource,
+        413 => error.ResourceLimitExceeded,
+        408, 504 => error.Timeout,
+        429 => error.InferenceUpstreamRateLimited,
+        else => error.InferenceTransportUnavailable,
+    };
+}
+
+test "index document checkpoint producer extracts explicit documents and replays the normalized result" {
+    const checkpoint = @import("storage/db/enrichment/document_checkpoints.zig");
+    const runs = readers.document_runs;
+    const a = std.testing.allocator;
+    var backend = checkpoint.TestBackend.init(a);
+    defer backend.deinit();
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var owner = checkpoint.Owner{ .allocator = a, .backend = backend.backend(), .binding = .{ .document = "receipt", .producer = "extract", .source_key = "receipt", .source_digest = @splat(1), .producer_digest = @splat(2) }, .io = io };
+    defer owner.drain();
+    const Local = struct {
+        calls: usize = 0,
+        fn dense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.UnsupportedOperation;
+        }
+        fn sparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]managed_embedder.SparseEmbedding {
+            return error.UnsupportedOperation;
+        }
+        fn now(_: ?*anyopaque) u64 {
+            return checkpoint.now();
+        }
+        fn invoke(raw: *anyopaque, alloc: Allocator, bytes: []const u8, is_extract: bool, context: RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(is_extract);
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const body = try std.json.parseFromSliceLeaky(std.json.Value, scratch, bytes, .{});
+            try std.testing.expect(body.object.get("inputs") == null);
+            const doc = body.object.get("documents").?.array.items[0];
+            try std.testing.expectEqualStrings("receipt-1", doc.object.get("id").?.string);
+            try std.testing.expectEqual(@as(i64, 2), doc.object.get("pages").?.array.items[0].integer);
+            try std.testing.expect(body.object.get("schema") != null);
+            var client = try readers.document_rpc.Client.initBound(alloc, context.document_store, context.io);
+            defer client.deinit();
+            const store = client.store();
+            const record = try store.load(scratch, client.id, client.owner);
+            try std.testing.expect(record.operation == .extract);
+            const lease: runs.Lease = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+            try store.prepare(scratch, lease, record.identity, record.limits, record.inputs, checkpoint.now());
+            var session = try runs.Session.init(alloc, store, lease, record.identity, .{ .now_fn = now }, 512, 32 * 1024 * 1024);
+            defer session.deinit();
+            const result = "{\"object\":\"extraction\",\"model\":\"agent\",\"data\":[{\"id\":\"receipt-1\",\"entities\":[{\"label\":\"person\",\"text\":\"Ada\"}],\"relations\":[]}]}";
+            const output = try session.publish(scratch, session.key("final"), result, "");
+            try store.finish(scratch, lease, output, checkpoint.now());
+            return alloc.dupe(u8, result);
+        }
+    };
+    var local: Local = .{};
+    var client = httpx.Client.initWithConfig(a, io, .{});
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = &local, .owns_invocation_admission = true, .embed_dense_texts = Local.dense, .embed_sparse_texts = Local.sparse, .document_json = Local.invoke } });
+    defer runtime.deinit();
+    const producer = runtime.producer().withInvocationContext(.{ .io = io, .document_checkpoints = owner.factory() });
+    const request: asset_producer.Request = .{ .producer_type = .extractor, .config_json = "{\"provider\":\"antfly\",\"model\":\"agent\",\"schema\":{\"entities\":[\"person\"]}}", .source_text = "", .source_parts_json = "{\"documents\":[{\"id\":\"receipt-1\",\"url\":\"https://documents.example/receipts.pdf\",\"pages\":[2]}]}", .content_type = "application/json" };
+    const first = try producer.produce(a, request);
+    defer a.free(first);
+    const replay = try producer.produce(a, request);
+    defer a.free(replay);
+    try std.testing.expectEqualStrings(first, replay);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"id\":\"receipt-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"Ada\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"object\"") == null);
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+}
+
+test "index document checkpoint producer uses duplex remote execution with table routing and persisted final replay" {
+    const checkpoint = @import("storage/db/enrichment/document_checkpoints.zig");
+    const protocol = readers.document_stream;
+    const runs = readers.document_runs;
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var backend = checkpoint.TestBackend.init(a);
+    defer backend.deinit();
+    var owner = checkpoint.Owner{ .allocator = a, .backend = backend.backend(), .binding = .{ .document = "doc", .producer = "reading", .source_key = "doc", .source_digest = @splat(1), .producer_digest = @splat(2) }, .io = io };
+    defer owner.drain();
+    const Peer = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        const Exchange = struct {
+            writer: *httpx.Context.StreamWriter,
+            reader: *httpx.Context.RequestBodyReader,
+            remote: *protocol.Remote,
+            fn send(raw: *anyopaque, supplied: protocol.Header, metadata: []const u8, bytes: []const u8) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                var header = supplied;
+                header.metadata_len = @intCast(metadata.len);
+                header.body_len = @intCast(bytes.len);
+                const encoded = try header.encode();
+                try self.writer.write(&encoded);
+                if (metadata.len > 0) try self.writer.write(metadata);
+                if (bytes.len > 0) try self.writer.write(bytes);
+            }
+            fn receive(self: *@This()) std.Io.Cancelable!void {
+                defer self.remote.close();
+                while (true) {
+                    const frame = protocol.readFrame(self.remote.a, self.reader) catch return;
+                    self.remote.receive(frame) catch return;
+                }
+            }
+        };
+        fn run(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+            _ = self.calls.fetchAdd(1, .monotonic);
+            try std.testing.expectEqualStrings("source_table", ctx.header("X-Antfly-Source-Table").?);
+            try std.testing.expectEqualStrings("agent", ctx.header("X-Antfly-Document-Model").?);
+            try std.testing.expectEqualStrings("1000000", ctx.header("X-Antfly-Document-Token-Budget").?);
+            var reader = ctx.requestBodyReader();
+            const opening = try protocol.readFrame(ctx.allocator, &reader);
+            defer opening.deinit(ctx.allocator);
+            try std.testing.expectEqual(.start, opening.header.kind);
+            var writer = try ctx.streamResponseWithContentType(200, protocol.content_type);
+            var remote: protocol.Remote = .{ .a = ctx.allocator, .io = ctx.io, .context = undefined, .send_fn = Exchange.send };
+            defer remote.deinit();
+            var exchange = Exchange{ .writer = &writer, .reader = &reader, .remote = &remote };
+            remote.context = &exchange;
+            var group: std.Io.Group = .init;
+            defer group.cancel(ctx.io);
+            try group.concurrent(ctx.io, Exchange.receive, .{&exchange});
+            var client = try readers.document_rpc.Client.initBound(ctx.allocator, remote.view(), ctx.io);
+            defer client.deinit();
+            var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const store = client.store();
+            const record = try store.load(scratch, client.id, client.owner);
+            try std.testing.expectEqual(checkpoint.hash(opening.body()), record.identity.request);
+            const lease: runs.Lease = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+            try store.prepare(scratch, lease, record.identity, record.limits, record.inputs, checkpoint.now());
+            const payload = "{\"data\":[{\"text\":\"remote page\",\"status\":\"complete\"}]}";
+            const key = checkpoint.hash("remote-final");
+            try std.testing.expect(try store.reserve(scratch, lease, key, .{ .output_bytes = payload.len }, checkpoint.now()));
+            const ref = try store.complete(scratch, lease, key, .{ .output_bytes = payload.len }, payload, checkpoint.now());
+            try store.finish(scratch, lease, ref, checkpoint.now());
+            try remote.send(.{ .kind = .result, .code = 200 }, "{\"version\":1,\"usage_known\":true,\"total_tokens\":0}", payload);
+            try writer.close();
+            return ctx.response.build();
+        }
+    };
+    var peer: Peer = .{};
+    var server = httpx.Server.initWithConfig(a, io, .{ .host = "127.0.0.1", .port = 0, .max_body_size = 64 });
+    defer server.deinit();
+    try server.postStreamingRaw("/ai/v1/read/execute", httpx.Handler.bind(&peer, Peer.run));
+    try server.bind();
+    var listener = try std.testing.io.concurrent(struct {
+        fn serve(http_server: *httpx.Server) void {
+            http_server.listen() catch {};
+        }
+    }.serve, .{&server});
+    defer {
+        server.stop();
+        listener.await(std.testing.io);
+    }
+    while (!server.listen_started.load(.acquire)) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{server.wake_port.load(.acquire)});
+    defer a.free(url);
+    var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false, .max_response_size = 64 * 1024 * 1024 });
+    defer http.deinit();
+    var runtime = Runtime.initWithOptions(a, &http, .{ .inference_api_url = url, .source_table = "source_table" });
+    defer runtime.deinit();
+    const producer = runtime.producer().withInvocationContext(.{ .io = io, .document_checkpoints = owner.factory() });
+    const request: asset_producer.Request = .{ .producer_type = .reader, .config_json = "{\"provider\":\"antfly\",\"model\":\"agent\"}", .source_text = "https://example.test/source.pdf", .content_type = "text/plain" };
+    const output = try producer.produce(a, request);
+    defer a.free(output);
+    try std.testing.expectEqualStrings("remote page", output);
+    const replay = try producer.produce(a, request);
+    defer a.free(replay);
+    try std.testing.expectEqualStrings("remote page", replay);
+    try std.testing.expectEqual(@as(usize, 1), peer.calls.load(.acquire));
+}
+
+test "index document checkpoint producer preserves source part prompt and locator precedence" {
+    const a = std.testing.allocator;
+    var runtime: Runtime = undefined;
+    const Case = struct { parts: ?[]const u8, prompt: []const u8, document: bool };
+    for ([_]Case{
+        .{ .parts = "[{\"type\":\"text\",\"text\":\"Return only the total\"},{\"type\":\"media\",\"url\":\"https://example.test/receipt.png\"}]", .prompt = "Return only the total", .document = false },
+        .{ .parts = "[{\"type\":\"media\",\"url\":\"https://example.test/receipt.png\"}]", .prompt = "Describe image", .document = false },
+        .{ .parts = "[{\"type\":\"text\",\"text\":\"No media means fallback\"}]", .prompt = "Describe image", .document = true },
+        .{ .parts = null, .prompt = "Describe image", .document = true },
+    }) |case| {
+        const body = try runtime.documentReadBody(a, .{ .producer_type = .reader, .config_json = "{}", .source_text = "https://example.test/fallback.pdf", .source_parts_json = case.parts }, .{ .provider = .antfly, .model = "reader", .prompt = "Describe image" });
+        defer a.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.prompt, parsed.value.object.get("prompt").?.string);
+        if (case.document) {
+            try std.testing.expectEqualStrings("https://example.test/fallback.pdf", parsed.value.object.get("documents").?.array.items[0].object.get("url").?.string);
+            try std.testing.expect(parsed.value.object.get("images") == null);
+        } else {
+            try std.testing.expectEqualStrings("https://example.test/receipt.png", parsed.value.object.get("images").?.array.items[0].object.get("url").?.string);
+            try std.testing.expect(parsed.value.object.get("documents") == null);
+        }
+    }
+}
+
+test "index document checkpoint producer allocator atomically admits duplex work within its ceiling" {
+    const a = std.testing.allocator;
+    var io = std.Io.Threaded.init(a, .{});
+    defer io.deinit();
+    const SlowBacking = struct {
+        io: std.Io,
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.io.sleep(.fromMilliseconds(5), .awake) catch return null;
+            return std.testing.allocator.rawAlloc(len, alignment, address);
+        }
+        fn resize(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, address: usize) bool {
+            return std.testing.allocator.rawResize(bytes, alignment, len, address);
+        }
+        fn remap(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, address: usize) ?[*]u8 {
+            return std.testing.allocator.rawRemap(bytes, alignment, len, address);
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, address: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, address);
+        }
+    };
+    var backing = SlowBacking{ .io = io.io() };
+    for (0..16) |_| {
+        var budget = inference_work.BoundedInvocationAllocator.init(backing.allocator(), 8);
+        const Task = struct {
+            allocator: Allocator,
+            ready: *std.atomic.Value(u32),
+            bytes: ?[]u8 = null,
+            fn run(self: *@This()) void {
+                _ = self.ready.fetchAdd(1, .acq_rel);
+                while (self.ready.load(.acquire) < 2) std.atomic.spinLoopHint();
+                self.bytes = self.allocator.alloc(u8, 8) catch null;
+            }
+        };
+        var ready: std.atomic.Value(u32) = .init(0);
+        var tasks = [_]Task{ .{ .allocator = budget.allocator(), .ready = &ready }, .{ .allocator = budget.allocator(), .ready = &ready } };
+        var group: std.Io.Group = .init;
+        defer group.cancel(io.io());
+        for (&tasks) |*task| try group.concurrent(io.io(), Task.run, .{task});
+        try group.await(io.io());
+        try std.testing.expect((tasks[0].bytes == null) != (tasks[1].bytes == null));
+        try std.testing.expectEqual(@as(usize, 8), budget.live_bytes);
+        try std.testing.expectEqual(@as(usize, 8), budget.peak_live_bytes);
+        for (tasks) |task| if (task.bytes) |bytes| budget.allocator().free(bytes);
+        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+    }
 }

@@ -604,7 +604,7 @@ proof. Metadata persists one immutable verifier per node/store/root identity.
 Signed retirement paging and ACKs bind the cluster, store, root, ticket and
 request cut. Hosted child provision/release receipts carry a root attestation
 checked against enrollment, the plan and current placement. See
-[store-root enrollment](../../store-root-enrollment.md).
+[store-root enrollment](../../operations/store-root-enrollment.md).
 
 The worker verifies an exact cold owner bootstrap and persists a checksummed
 local intent before quiescing the owner, Raft, readers, writers and snapshots.
@@ -740,7 +740,7 @@ Schema and identity:
   explicit). Nested, binary and unsupported logical types fail explicitly.
   Missing optional columns become SQL NULL; incompatible types and missing
   required columns fail scans; new fields do not silently expand the catalog.
-- Credential references use `external_io` connections with `lake_read`
+- Credential references use `external_io` connections with `lake.read`
   capability and enforce bucket/prefix scope. Snapshot selectors can pin an
   Iceberg snapshot ID or a Parquet object-version digest. Filesystem sources use
   the object-store layout under its `antfly` bucket.

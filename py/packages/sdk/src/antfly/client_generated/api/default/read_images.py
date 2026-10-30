@@ -103,16 +103,18 @@ def sync_detailed(
 ) -> Response[InferenceError | InferenceReadResponse | InferenceTransientCapacityError]:
     """Read text from images (OCR/document understanding)
 
-     Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+     Reads text from images and documents with a local reader model. OCR and document-reading tasks can
+    also run on a vision-capable generator or a connected provider.
 
     ## Models
 
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **TrOCR**: Pure OCR for printed/handwritten text
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+    - **PaddleOCR**: Text detection and recognition with page-space regions
     - **Donut**: Document understanding with structured output (receipts, forms)
-    - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
     fields
@@ -132,12 +134,13 @@ def sync_detailed(
     weighted capacity unit and at least one unit per two declared images. The effective
     ceiling is the minimum of the configured per-image limit times image count, the
     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-    `admission.inference.max_concurrent_requests`. Admission happens before model resolution or
+    `resources.inference.admission.max_work_units`. Admission happens before model resolution or
     download.
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
+    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+    capacity
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -148,7 +151,8 @@ def sync_detailed(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest):
+        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
+            absent or simultaneous input forms before inference.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -176,16 +180,18 @@ def sync(
 ) -> InferenceError | InferenceReadResponse | InferenceTransientCapacityError | None:
     """Read text from images (OCR/document understanding)
 
-     Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+     Reads text from images and documents with a local reader model. OCR and document-reading tasks can
+    also run on a vision-capable generator or a connected provider.
 
     ## Models
 
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **TrOCR**: Pure OCR for printed/handwritten text
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+    - **PaddleOCR**: Text detection and recognition with page-space regions
     - **Donut**: Document understanding with structured output (receipts, forms)
-    - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
     fields
@@ -205,12 +211,13 @@ def sync(
     weighted capacity unit and at least one unit per two declared images. The effective
     ceiling is the minimum of the configured per-image limit times image count, the
     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-    `admission.inference.max_concurrent_requests`. Admission happens before model resolution or
+    `resources.inference.admission.max_work_units`. Admission happens before model resolution or
     download.
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
+    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+    capacity
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -221,7 +228,8 @@ def sync(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest):
+        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
+            absent or simultaneous input forms before inference.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -244,16 +252,18 @@ async def asyncio_detailed(
 ) -> Response[InferenceError | InferenceReadResponse | InferenceTransientCapacityError]:
     """Read text from images (OCR/document understanding)
 
-     Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+     Reads text from images and documents with a local reader model. OCR and document-reading tasks can
+    also run on a vision-capable generator or a connected provider.
 
     ## Models
 
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **TrOCR**: Pure OCR for printed/handwritten text
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+    - **PaddleOCR**: Text detection and recognition with page-space regions
     - **Donut**: Document understanding with structured output (receipts, forms)
-    - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
     fields
@@ -273,12 +283,13 @@ async def asyncio_detailed(
     weighted capacity unit and at least one unit per two declared images. The effective
     ceiling is the minimum of the configured per-image limit times image count, the
     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-    `admission.inference.max_concurrent_requests`. Admission happens before model resolution or
+    `resources.inference.admission.max_work_units`. Admission happens before model resolution or
     download.
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
+    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+    capacity
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -289,7 +300,8 @@ async def asyncio_detailed(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest):
+        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
+            absent or simultaneous input forms before inference.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -315,16 +327,18 @@ async def asyncio(
 ) -> InferenceError | InferenceReadResponse | InferenceTransientCapacityError | None:
     """Read text from images (OCR/document understanding)
 
-     Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+     Reads text from images and documents with a local reader model. OCR and document-reading tasks can
+    also run on a vision-capable generator or a connected provider.
 
     ## Models
 
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **TrOCR**: Pure OCR for printed/handwritten text
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+    - **PaddleOCR**: Text detection and recognition with page-space regions
     - **Donut**: Document understanding with structured output (receipts, forms)
-    - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
     fields
@@ -344,12 +358,13 @@ async def asyncio(
     weighted capacity unit and at least one unit per two declared images. The effective
     ceiling is the minimum of the configured per-image limit times image count, the
     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-    `admission.inference.max_concurrent_requests`. Admission happens before model resolution or
+    `resources.inference.admission.max_work_units`. Admission happens before model resolution or
     download.
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
+    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+    capacity
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -360,7 +375,8 @@ async def asyncio(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest):
+        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
+            absent or simultaneous input forms before inference.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

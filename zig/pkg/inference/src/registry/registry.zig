@@ -16,6 +16,7 @@
 // Model registry: discovers local models and downloads from HuggingFace Hub.
 
 const std = @import("std");
+const lightonocr3 = @import("../readers/lightonocr3.zig");
 const ascii_compat = @import("../util/ascii_compat.zig");
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -87,6 +88,8 @@ pub const bge_m3_pinned_ref = "BAAI/bge-m3:safetensors@" ++ bge_m3_pinned_revisi
 pub const embeddinggemma2_pinned_ref = "google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b";
 
 pub const friendly_aliases = [_]FriendlyAlias{
+    .{ .alias = "lightonocr3-0.8b", .ref = lightonocr3.pinned_ref },
+    .{ .alias = "lightonocr3-4b", .ref = lightonocr3.pinned_ref_4b },
     .{ .alias = "bge-m3", .ref = "BAAI/bge-m3" },
     .{ .alias = "gemma4-e2b", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma-4-e2b", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
@@ -693,6 +696,12 @@ pub const ModelRegistry = struct {
                 progress_sink,
             );
         }
+        // Only the canonical safetensors source receives this trained OCR
+        // profile. Never infer executable prompt behavior from a path name.
+        const variant_revision = try download.parseVariantRevision(ref.variant);
+        if (lightonocr3.isHubSource(ref.owner, ref.name, variant_revision.variant)) {
+            try download.writeManagedArtifactAndUpdatePlan(self.allocator, io, transaction.staging, "model_manifest.json", lightonocr3.manifest_json);
+        }
         try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
         try download.validateManagedDownloadLimits(self.allocator, io, transaction.staging, hub_config);
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
@@ -1195,7 +1204,7 @@ fn boundaryIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.
     return boundary_bundle.Identity{
         .backbone = config.backbone,
         .precision = .fp32,
-        .weight = boundary_bundle.Digest.of(reader.file_bytes),
+        .weight = boundary_bundle.Digest.ofMapped(reader.file_bytes),
         .sidecars = sidecars,
     };
 }
@@ -1301,7 +1310,7 @@ fn decideIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.Mo
             all_f32 = false;
             break;
         };
-        weight = decide_qualification.Digest.of(reader.file_bytes);
+        weight = decide_qualification.Digest.ofMapped(reader.file_bytes);
         inventory = .{ .count = reader.header.tensors.count(), .all_f32 = all_f32 };
     }
     const identity = decide_qualification.Identity{
@@ -1952,7 +1961,16 @@ fn synthesizePulledModelManifestJsonInternal(
     }
     if (qualified_boundary_decide) try appendUniqueOwnedString(allocator, &tasks, "decide");
 
-    const manifest_type = manifestTypeFromTasks(tasks.items, manifest.model_type);
+    // A read-only LightOnOCR installation still loads the integrated decoder.
+    // Tasks select public routes; they must not replace its runtime identity.
+    const lighton_profile = manifest.isLightOnOcr3();
+    if (lighton_profile) {
+        for (tasks.items) |task| {
+            if (!std.mem.eql(u8, task, "generate") and !std.mem.eql(u8, task, "read"))
+                return error.InvalidModelManifest;
+        }
+    }
+    const manifest_type = if (lighton_profile) .generator else manifestTypeFromTasks(tasks.items, manifest.model_type);
 
     var inputs = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -2051,7 +2069,7 @@ fn isModelDir(io: Io, path: []const u8) bool {
             return !download.managedDownloadPublicationBlocked(alloc, check_io, model_path);
         }
     }.check;
-    const indicators = [_][]const u8{ "config.json", "tokenizer.json", "genai_config.json", "antfly_metadata.json" };
+    const indicators = [_][]const u8{ "config.json", "tokenizer.json", "genai_config.json", "antfly_metadata.json", "document_agent.json" };
     for (indicators) |filename| {
         const file_path = std.fs.path.join(allocator, &.{ path, filename }) catch continue;
         defer allocator.free(file_path);
@@ -2935,6 +2953,37 @@ test "pull progress reports carry the model they belong to" {
     // A caller without a callback gets none.
     var bare = ModelRegistry.ProgressLabeler{ .inner = .{}, .model = "owner/model" };
     try std.testing.expect(bare.sink().callback == null);
+}
+
+test "LightOnOCR3 pulled manifest preserves OCR identity when tasks are overridden" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("../models/testdata/lightonocr3/config.json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "" });
+    const model_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(model_dir);
+    for ([_]struct { csv: []const u8, read: bool, generate: bool }{
+        .{ .csv = "generate,read", .read = true, .generate = true },
+        .{ .csv = "read", .read = true, .generate = false },
+        .{ .csv = "generate", .read = false, .generate = true },
+    }) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = lightonocr3.manifest_json });
+        const json = try synthesizePulledModelManifestJson(allocator, model_dir, case.csv, null);
+        defer allocator.free(json);
+        try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = json });
+        var installed = try manifest_mod.loadFromDir(allocator, model_dir);
+        defer installed.deinit();
+        try std.testing.expect(installed.isLightOnOcr3());
+        try std.testing.expectEqual(manifest_mod.ModelType.generator, installed.model_type);
+        try std.testing.expectEqual(case.read, installed.hasTask("read"));
+        try std.testing.expectEqual(case.generate, installed.hasTask("generate"));
+        try std.testing.expectEqual(@import("../models/compatibility.zig").Level.compatible, @import("../models/compatibility.zig").assess(&installed, "qwen3_5").level);
+    }
+    try std.testing.expectError(error.InvalidModelManifest, synthesizePulledModelManifestJson(allocator, model_dir, "embed", null));
+    try std.testing.expectEqualStrings(lightonocr3.pinned_ref, resolveFriendlyRef("LightOnOCR3-0.8B").?);
+    try std.testing.expectEqualStrings(lightonocr3.pinned_ref_4b, resolveFriendlyRef("LightOnOCR3-4B").?);
 }
 
 test "native Moondream2 manifests declare image input for reader and generator roles" {

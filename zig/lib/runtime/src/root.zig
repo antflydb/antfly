@@ -15,6 +15,7 @@
 
 pub const callback_abi = @import("runtime_callback_abi.zig");
 pub const error_abi = @import("runtime_error_abi.zig");
+pub const document_abi = @import("runtime_document_abi.zig");
 pub const http_abi = @import("runtime_http_abi.zig");
 pub const native_abi = @import("runtime_native_abi.zig");
 pub const io_abi = @import("runtime_io_abi.zig");

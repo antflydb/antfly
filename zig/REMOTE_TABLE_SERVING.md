@@ -1300,9 +1300,9 @@ validation. Inline retained root formats continue using their existing walkers.
 
 Native execution now includes sparse ordinal intersection, narrowed vector
 residuals, compatible ordered-index top-N, bulk bitmap counts, and normalized
-temporal predicates. [Native lake performance follow-up](NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md)
-describes their contracts, differential and E2E validation, fallback shapes,
-and remaining large-archive measurements.
+temporal predicates. [Native index execution contracts](LAKES.md#native-index-execution-contracts)
+describe them; validation history is in the
+[native lake performance log](../docs/design/sql/history/native-lake-performance-log.md).
 
 
 Native sparse recipe v5 stores transactionally maintained physical ordinal maps
@@ -1400,8 +1400,8 @@ Direct ordered-index builds exceeding eight definitions share one union-projecti
 replay across bounded cohorts; its changed-file union preserves incremental seed
 reuse and avoids decoding unchanged files. Publication continues sharing its
 existing replay across native builders. See the
-[performance contracts](NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md) for validation and
-remaining archive measurements.
+[native index execution contracts](LAKES.md#native-index-execution-contracts) and
+the [performance log](../docs/design/sql/history/native-lake-performance-log.md).
 
 Paged sparse roots also carry conservative authenticated native ordinal bounds.
 Positive selections reject disjoint segments before opening posting streams,
@@ -1429,3 +1429,131 @@ is active. Complete-key search cursors seek within the boundary file/row and
 stop within large equal-key groups; older or partially ordered indexes retain
 the existing native collector fallback. Public request and cursor formats stay
 the same, and normal publication/rebuild upgrades older index artifacts.
+
+
+### Optional ordering reuse and early field-sort admission
+
+Reader protocol 85 and native text metadata v14 add authenticated typed routing
+bounds and an optional per-row ordering-key tree. Bounds can reject strictly
+worse primary ranges before opening segment descriptors or lineage. Equal
+primary ranges stay live for public-ID ties, and pruned searches report a
+lower-bound total. Existing v13 text publications may still be reused; absent
+bounds choose ordinary execution rather than requiring a full archive rebuild.
+Newly processed segments capture bounds while their encoder reader is available.
+Unsorted segments incur no additional artifact reads for this metadata.
+
+Incremental fragment sorting validates retained keys against the current
+ordering cohort and each row's exact input digest, gathering source ordering
+columns only for missing or changed rows. This tree belongs to the publication's
+existing identity dependency closure. See [the row identity decision](../docs/plans/lake-row-identity.md#incremental-ordering-key-state-reader-protocol-85)
+for ownership, historical fallback and retention rules. Lineage pages load in
+joined waves of at most eight shared I/O lanes after complete logical byte
+admission, with ordered decoding and caller execution under saturation.
+
+Whole-document physical text projection also scopes detailed exclusions and
+named subfields to the selected document type. Runtime rules are rebound from
+its authenticated public validator without changing deployed ASCH epoch bytes.
+The projection witness binds these rules; exact historical witnesses authorize
+the admitted leader-owned shadow rebuild. Unknown provenance drift still fails
+closed. Explicit field-selective projections keep their existing contract.
+
+### Predicate-aware native sort seeks and small-archive ordered admission
+
+An archive fitting one text admission window can still contain millions of rows.
+For an order not covered by its declared physical primary order, try the existing
+publication-bound global ordered row-index coordinator before collecting that
+window. Its cursor opens only candidate packs, shares bounded text membership,
+and stops at the winning prefix. This avoids replaying a global index prefix in
+each window. Small archives whose physical primary order already matches retain
+the native segment path; every segment still validates actual physical ordering
+and typed coverage before using that hint. Unsupported or unavailable indexes
+retain the existing exact collector and bounded fallback. Search can reverse an
+ordered index only when all primary-key directions agree on that reversal;
+public-ID tie direction remains independent. A difference between SQL index and
+search NULL placement is admissible only for a nonnullable column or a required
+scalar predicate proving NULLs absent. Otherwise the ordered plan declines.
+The generic native sorter also admits lazy Boolean membership for an independent
+ordered provider, even when the physical segment order differs. Winning-prefix
+probes stay bounded; a declined provider or exhausted ordered walk resumes the
+complete compressed membership iterator and exact collector.
+Published row-index cursors decline mixed archive/WAL and recent-only snapshots:
+their coverage proof cannot enumerate accepted rows. Those visibility cuts retain
+the native collector and the existing archive/recent window merge.
+For logical IDs or extra nonconstant index keys, the global coordinator can
+still use a primary-ordered cursor. It retains one extra matching hit and consumes
+the complete winning primary tie before stopping. A strictly worse primary value
+proves that boundary crossed; public IDs never supply that proof. Forward and
+backward cursors retain an inclusive boundary row. If the fixed probe/read quota
+ends before boundary completeness is proved, the plan declines and ordinary
+native windows finish the exact page.
+Early stopping reports a lower-bound total; explicit exact counts still enumerate complete membership.
+The identity-only ordered cursor may also attest the complete compiled filter:
+every normalized condition must be enforced by its authenticated tuple bounds,
+with no unsupported Boolean clause or residual. The proof is bound to the exact
+filter expression and the cursor's publication lease. A child restricted to those
+physical rows can omit that already-proved filter, avoiding a whole-archive
+membership conversion for a tiny page. Kind-sensitive numeric/datetime equality
+and incomplete condition proofs retain their checks; text membership, scoring,
+exclusions and final source authorization retain their existing ownership.
+
+Native primary streams independently intersect pagination seeks with necessary
+predicate ranges. Bounds come from required conjunctions and Boolean `must`
+clauses in the authoritative compiled row filter. Optional disjunctions,
+exclusions, transformed subfields and unproven scalar domains cannot establish
+these bounds. Numeric and timestamp endpoints retain exact signed scalar order;
+nullable columns retain the producer's semantic NULL proof. Each sort key is
+monotone only within a constant preceding-key group. Equality predicates narrow
+that group, or equal native endpoint values prove it constant, before the next
+key can be binary-searched. A nonconstant unconstrained leading key stops further
+seek derivation. Per-segment intervals open lazily under the existing snapshot
+lease, planning memory is capped at 1 MiB, and deadline/cancellation checks apply
+to every binary probe. A typed gap on a deleted row withdraws the complete
+optional interval, preserving ordinary live-row iteration. Filter intervals
+remain separate from pagination cursors:
+the latter retain complete primary ties for public-ID filtering. Membership still
+evaluates the complete predicate before admitting a winner; scan and conversion
+budgets remain enforced when the optional seek cannot help.
+
+Append compaction preserves physical ordering and semantic NULL completeness as
+separate proofs. Matching monotone endpoint bounds establish concatenation order,
+not the meaning of missing typed values. Each output field keeps NULL completeness
+only if every live input attests it. A complete validated sorted merge may mint a
+new completeness witness; append cannot upgrade unproven historical or projected
+input gaps into semantic NULLs.
+
+## Cloud generations and retention evidence
+
+Cloud publications pin exact provider object versions. An immutable hash-radix
+generation map records the S3 version or GCS generation of every payload, and
+every map edge, including the publication root, pins the map page's own
+generation. Pages hold at most 128 records and 1 MiB; incremental updates rewrite
+only changed radix paths. Maps travel with builder checkpoints, accepted recent
+vector jobs and retained text/vector/SQL cuts, so restarts never depend on mutable
+live names. Readers share authenticated pages through a data-only process pool
+(eight backend/credential scopes, 64 MiB); clients, permissions, deadlines and
+reader leases stay operation-owned. R2 and unversioned backends keep ordinary
+content-verified reads and cannot issue certificates. A backend identity or
+namespace change starts a fresh map.
+
+A retained-closure certificate lets a refresh skip the complete closure audit.
+It binds the reader protocol, backend and credential identity, namespace,
+publication, source inventory, generation-map root and a conservative expiry.
+Reuse requires fresh provider time with a 60-second margin; missing, unsupported
+or expired evidence keeps the complete audit. The filesystem backend supplies
+namespace witnesses from directory inode, ctime and mtime plus a durable
+destructive-mutation epoch. Proofs cap at 4,096 namespaces, 1 MiB of metadata and
+64 pending roots.
+
+Certificate-based audit bypass for cloud stores is off by default
+(`lake_indexes.cloud_generations.qualified_retention: false`). Exact version reads
+and durable maps work without it. Enabling it requires S3 objects with non-null
+versions under COMPLIANCE retention, or GCS objects with positive generations
+under Locked retention; governance mode, revocable holds and plain versioning are
+insufficient. Operators must qualify actual provider retention enforcement before
+enabling it. Antfly never creates or changes bucket policies.
+
+Cloud GC enumerates historical versions, including names hidden by newer versions
+or delete markers, and deletes only exact versions absent from every live closure.
+Map pages are reachability roots. Completed collections persist a paged mark set,
+and vacuum then removes unmarked map records, visiting at most four radix leaves
+per pass with a durable cursor.

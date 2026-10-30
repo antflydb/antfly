@@ -40,6 +40,14 @@ def test_proposals_and_absorbed_suppression_use_scoped_typed_resources() -> None
         EntitySuppressRequestAbsorbed,
     )
 
+    outcomes = [
+        {
+            "key_template": "concept/{{_entity.text}}",
+            "revision": 3,
+            "changed": True,
+            "absorbed": [{"key": "concept/notes", "disposition": "suppress"}],
+        }
+    ]
     client = AntflyClient("https://antfly.test")
     client._request = MagicMock(
         return_value={
@@ -47,12 +55,18 @@ def test_proposals_and_absorbed_suppression_use_scoped_typed_resources() -> None
             "key": "concept/noise",
             "complete": True,
             "atomicity": "namespace",
-            "results": [],
+            "namespaces": outcomes,
+            "results": [
+                {"source_table": "notes", "resolver": "concepts", "key_template": outcomes[0]["key_template"]},
+                {"source_table": "history", "resolver": "concepts", "key_template": outcomes[0]["key_template"]},
+            ],
         }
     )
-    client.entities.suppress(
+    suppressed = client.entities.suppress(
         "entities", "concept/noise", EntitySuppressRequest(absorbed=EntitySuppressRequestAbsorbed.SUPPRESS)
     )
+    assert [item.key for namespace in suppressed.namespaces for item in namespace.absorbed] == ["concept/notes"]
+    assert all("absorbed" not in row.to_dict() for row in suppressed.results)
     client._request.assert_called_once_with(
         "POST",
         "/db/v1/tables/entities/entities/concept%2Fnoise:suppress",
@@ -69,6 +83,7 @@ def test_proposals_and_absorbed_suppression_use_scoped_typed_resources() -> None
         },
         "complete": True,
         "applied": False,
+        "namespaces": outcomes,
         "results": [],
     }
     result = client.curation_proposals.in_namespace("app", "private").accept(
@@ -77,8 +92,32 @@ def test_proposals_and_absorbed_suppression_use_scoped_typed_resources() -> None
         CurationProposalDecisionRequest(actor="curator"),
     )
     assert result.applied is False
+    assert [item.key for namespace in result.namespaces for item in namespace.absorbed] == ["concept/notes"]
     client._request.assert_called_once_with(
         "POST",
         "/db/v1/databases/app/namespaces/private/tables/entities/curation/proposals/proposal%2Fone:accept",
         json={"actor": "curator", "pin_distinct": False},
+    )
+
+
+def test_entity_progress_pages_keep_scope_cursor_and_encoded_keys() -> None:
+    client = AntflyClient("https://antfly.test")
+    client._request = MagicMock(
+        return_value={
+            "entity_table": "notes",
+            "key": "concept/alpha",
+            "catalog_revision": 7,
+            "complete": False,
+            "results": [],
+            "next_cursor": "page-two",
+        }
+    )
+    page = client.entities.in_namespace("app", "private").progress(
+        "notes", "concept/alpha", cursor="opaque-next", limit=7
+    )
+    assert page.next_cursor == "page-two"
+    client._request.assert_called_once_with(
+        "GET",
+        "/db/v1/databases/app/namespaces/private/tables/notes/entities/concept%2Falpha/progress",
+        params={"limit": 7, "cursor": "opaque-next"},
     )

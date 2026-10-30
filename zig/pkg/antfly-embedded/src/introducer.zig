@@ -26,6 +26,8 @@ const segment_mod = @import("segment.zig");
 const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
 const analysis_mod = @import("search/analysis.zig");
+pub const AnalyzedContributionCache = @import("search/analyzed_contribution_cache.zig").Cache;
+const contribution_cache_mod = @import("search/analyzed_contribution_cache.zig");
 const geo_mod = @import("search/geo.zig");
 const platform_time = @import("antfly_platform").time;
 const process_memory = @import("antfly_platform").process_memory;
@@ -514,7 +516,12 @@ pub const TypedFieldValue = struct {
 };
 
 /// A document with raw text fields that will be analyzed before indexing.
+pub const NamedSortValue = struct { field_name: []const u8, value: segment_mod.SegmentIndexSortBoundValue };
 pub const TextDocument = struct {
+    /// Native navigation tuples may include nulls without inventing typed column values.
+    index_sort_values: []const NamedSortValue = &.{},
+    /// A mapped projection may reject a non-null scalar or multivalued key.
+    index_sort_projection_valid: bool = true,
     id: []const u8,
     stored_data: []const u8,
     text_fields: []const TextField,
@@ -537,10 +544,14 @@ pub const TextField = struct {
 };
 
 pub const BuildTextOptions = struct {
+    contribution_cache: ?*AnalyzedContributionCache = null,
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
     unindexed_paths: []const []const u8 = &.{},
     index_sort: []const segment_mod.SegmentIndexSortField = &.{},
+    /// Attest an existing physical order instead of reordering source rows.
+    /// A non-monotone or missing key keeps the segment unordered.
+    attest_index_sort_in_place: bool = false,
     profile: ?*BuildTextProfile = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     build_memory_target_bytes: usize = default_build_memory_target_bytes,
@@ -561,7 +572,22 @@ pub const BuildTextOptions = struct {
     store_document_source: bool = true,
 };
 
+const ContributionSpan = struct {
+    ptr: usize,
+    len: usize,
+    analyzer: usize,
+    fn init(text: []const u8, analyzer: *const analysis_mod.Analyzer) @This() {
+        return .{ .ptr = @intFromPtr(text.ptr), .len = text.len, .analyzer = @intFromPtr(analyzer) };
+    }
+};
+const ContributionUses = std.AutoHashMapUnmanaged(ContributionSpan, u8);
+fn repeatedContribution(uses: *const ContributionUses, field: TextField, analyzer: *const analysis_mod.Analyzer) bool {
+    return (uses.get(ContributionSpan.init(field.text, analyzer)) orelse 0) >= 2;
+}
+
 pub const BuildTextProfile = struct {
+    contribution_cache_hits: u64 = 0,
+    contribution_tokens_reused: u64 = 0,
     typed_staging_checks: u64 = 0,
     postings_spill_checks: u64 = 0,
     doc_count: u64 = 0,
@@ -990,6 +1016,8 @@ fn writeTextSegmentWithScratch(
 
     var analyzer_cache = std.StringHashMapUnmanaged(?*const analysis_mod.Analyzer).empty;
     defer analyzer_cache.deinit(alloc);
+    var contribution_uses: ContributionUses = .empty;
+    defer contribution_uses.deinit(alloc);
 
     var doc_ordinals = std.ArrayListUnmanaged(u32).empty;
     defer doc_ordinals.deinit(alloc);
@@ -1015,16 +1043,45 @@ fn writeTextSegmentWithScratch(
     var scratch = TextBuildScratch{};
     defer scratch.deinit(alloc);
 
+    const attested = options.attest_index_sort_in_place and options.index_sort.len != 0 and
+        (textDocumentsAreIndexSorted(alloc, docs, text_analysis, options.index_sort) catch |err| switch (err) {
+            error.OutOfMemory => false,
+            else => return err,
+        });
+    var index_sort: []const segment_mod.SegmentIndexSortField = if (options.attest_index_sort_in_place and !attested) &.{} else options.index_sort;
+    const sort_docs: []const TextDocument = if (attested and docs.len > 1) &.{ docs[0], docs[docs.len - 1] } else docs;
     var empty_doc_order: [0]TextIndexSortEntry = .{};
-    const doc_order: []TextIndexSortEntry = if (options.index_sort.len > 0)
-        try buildTextDocumentOrderAlloc(alloc, docs, text_analysis, options.index_sort)
+    const doc_order: []TextIndexSortEntry = if (index_sort.len > 0)
+        buildTextDocumentOrderAlloc(alloc, sort_docs, text_analysis, index_sort) catch |err| switch (err) {
+            error.InvalidSegment, error.UnsupportedTypedDocValues => declined: {
+                index_sort = &.{};
+                break :declined empty_doc_order[0..];
+            },
+            else => return err,
+        }
     else
         empty_doc_order[0..];
     defer freeTextDocumentOrder(alloc, doc_order);
 
     for (0..docs.len) |doc_idx| {
-        const source_doc_idx = if (options.index_sort.len > 0) doc_order[doc_idx].doc_index else doc_idx;
+        const source_doc_idx = if (index_sort.len > 0 and !attested) doc_order[doc_idx].doc_index else doc_idx;
         const text_doc = docs[source_doc_idx];
+        contribution_uses.clearRetainingCapacity();
+        if (options.contribution_cache != null) {
+            // Bounded prediction admits the first analysis only when another
+            // actual, unskipped consumer will use these same bytes/pipeline.
+            for (text_doc.text_fields) |field| {
+                if (field.text.len < contribution_cache_mod.minimum_input) continue;
+                if (contribution_uses.count() >= 256) break;
+                const analyzer = try cachedFieldAnalyzer(alloc, &analyzer_cache, field, default_analyzer, text_analysis);
+                const use = contribution_uses.getOrPut(alloc, ContributionSpan.init(field.text, analyzer)) catch {
+                    contribution_uses.clearRetainingCapacity();
+                    break;
+                };
+                if (!use.found_existing) use.value_ptr.* = 0;
+                use.value_ptr.* = @min(2, use.value_ptr.* + 1);
+            }
+        }
         _ = doc_arena_state.reset(.{ .retain_with_limit = options.doc_scratch_retained_bytes });
         scratch.reset(alloc, options.doc_scratch_retained_bytes);
         const doc_alloc = doc_arena_state.allocator();
@@ -1051,6 +1108,7 @@ fn writeTextSegmentWithScratch(
 
         if (!try orderTextFields(alloc, &scratch.field_order, text_doc.text_fields)) {
             for (text_doc.text_fields) |tf| {
+
                 // Unique contributions do not share token ownership. Release
                 // copied term keys between physical representations, rather
                 // than retaining every representation until the row finishes.
@@ -1069,6 +1127,8 @@ fn writeTextSegmentWithScratch(
                     profile,
                     profile_timings,
                     &scratch,
+                    options.contribution_cache,
+                    &contribution_uses,
                 );
                 scratch.hits.clearRetainingCapacity();
                 try spillPendingFields(alloc, &field_builders, options, @intCast(doc_idx + 1), &postings_spool);
@@ -1084,7 +1144,7 @@ fn writeTextSegmentWithScratch(
                 while (end < scratch.field_order.items.len and std.mem.eql(u8, field_name, text_doc.text_fields[scratch.field_order.items[end]].field_name)) : (end += 1) {}
                 _ = doc_arena_state.reset(.{ .retain_with_limit = options.doc_scratch_retained_bytes });
                 if (end == start + 1) {
-                    try addSingleTextFieldToBuilders(alloc, doc_alloc, &field_builders, &field_indices, &seg_writer, &analyzer_cache, @intCast(doc_idx), text_doc.text_fields[scratch.field_order.items[start]], default_analyzer, text_analysis, profile, profile_timings, &scratch);
+                    try addSingleTextFieldToBuilders(alloc, doc_alloc, &field_builders, &field_indices, &seg_writer, &analyzer_cache, @intCast(doc_idx), text_doc.text_fields[scratch.field_order.items[start]], default_analyzer, text_analysis, profile, profile_timings, &scratch, options.contribution_cache, &contribution_uses);
                     scratch.hits.clearRetainingCapacity();
                 } else {
                     var field_maps = std.StringHashMapUnmanaged(FieldAcc).empty;
@@ -1096,7 +1156,7 @@ fn writeTextSegmentWithScratch(
                         const tf = text_doc.text_fields[index];
                         if (profile) |p| p.text_field_count +|= 1;
                         const analyzer = try cachedFieldAnalyzer(alloc, &analyzer_cache, tf, default_analyzer, text_analysis);
-                        try accumulateAnalyzedField(doc_alloc, alloc, &field_maps, tf.field_name, analyzer, tf.text, profile, profile_timings);
+                        try accumulateAnalyzedField(doc_alloc, alloc, &field_maps, tf.field_name, analyzer, tf.text, profile, profile_timings, options.contribution_cache, repeatedContribution(&contribution_uses, tf, analyzer));
                     }
                     const hit_materialize_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
                     scratch.hits.clearRetainingCapacity();
@@ -1209,13 +1269,16 @@ fn writeTextSegmentWithScratch(
     if (!options.store_documents) {
         try seg_writer.addDocKeyRange(min_doc_key orelse return error.InvalidSegment, max_doc_key orelse return error.InvalidSegment);
     }
-    if (options.index_sort.len > 0) {
+    if (index_sort.len > 0) {
+        const complete_fields = try alloc.dupe(segment_mod.SegmentIndexSortField, index_sort);
+        defer alloc.free(complete_fields);
+        for (complete_fields) |*field| field.nulls_complete = true;
         if (doc_order.len > 0) {
             var bounds = try textIndexSortBoundsAlloc(alloc, doc_order[0].keys, doc_order[doc_order.len - 1].keys);
             defer bounds.deinit(alloc);
-            try seg_writer.addIndexSortMetadataWithBounds(options.index_sort, bounds);
+            try seg_writer.addIndexSortMetadataWithBounds(complete_fields, bounds);
         } else {
-            try seg_writer.addIndexSortMetadata(options.index_sort);
+            try seg_writer.addIndexSortMetadata(complete_fields);
         }
     }
 
@@ -1281,6 +1344,47 @@ const TermAcc = struct {
             self.positions = .{ .heap = values };
         } else try self.positions.heap.append(a, position);
         self.freq = next;
+    }
+    fn appendShifted(self: *@This(), a: Allocator, positions: []const u32, base: u32) !void {
+        if (positions.len == 0) return;
+        const total = try std.math.add(u32, self.freq, std.math.cast(u32, positions.len) orelse return error.Overflow);
+        // Check every position before mutating the accumulator (custom token
+        // filters may emit non-monotonic/duplicate positions).
+        for (positions) |position| _ = try std.math.add(u32, base, position);
+        if (total <= 2) {
+            for (positions, self.freq..) |position, index| self.positions.small[index] = base + position;
+        } else {
+            if (self.freq <= 2) {
+                var values: std.ArrayListUnmanaged(u32) = .empty;
+                errdefer values.deinit(a);
+                try values.ensureTotalCapacity(a, total);
+                values.appendSliceAssumeCapacity(self.positions.small[0..self.freq]);
+                self.positions = .{ .heap = values };
+            } else try self.positions.heap.ensureTotalCapacity(a, total);
+            for (positions) |position| self.positions.heap.appendAssumeCapacity(base + position);
+        }
+        self.freq = total;
+    }
+    fn appendEncodedShifted(self: *@This(), a: Allocator, hit: contribution_cache_mod.EncodedHit, base: u32) !void {
+        const total = try std.math.add(u32, self.freq, hit.count);
+        _ = try std.math.add(u32, base, hit.maximum_position);
+        if (total > 2) {
+            if (self.freq <= 2) {
+                var values: std.ArrayListUnmanaged(u32) = .empty;
+                errdefer values.deinit(a);
+                try values.ensureTotalCapacity(a, total);
+                values.appendSliceAssumeCapacity(self.positions.small[0..self.freq]);
+                self.positions = .{ .heap = values };
+            } else try self.positions.heap.ensureTotalCapacity(a, total);
+        }
+        var iterator = hit.iterator();
+        var index = self.freq;
+        var position: u32 = undefined;
+        while (iterator.read(&position)) {
+            if (total <= 2) self.positions.small[index] = base + position else self.positions.heap.appendAssumeCapacity(base + position);
+            index += 1;
+        }
+        self.freq = total;
     }
     fn positionSlice(self: *const @This()) []const u32 {
         return if (self.freq <= 2) self.positions.small[0..self.freq] else self.positions.heap.items;
@@ -1351,6 +1455,7 @@ const TextIndexSortEntry = struct {
 };
 
 const TextIndexSortValue = union(enum) {
+    null_value,
     datetime_ns: i128,
     u64_val: u64,
     i64_val: i64,
@@ -1378,6 +1483,50 @@ fn textIndexSortEntryLessThan(index_sort: []const segment_mod.SegmentIndexSortFi
         return if (field.desc) order == .gt else order == .lt;
     }
     return a.doc_index < b.doc_index;
+}
+
+/// Prove existing physical order without changing document/source ordinals.
+/// Only two tuples are resident. Missing/null or incompatible scalar values
+/// conservatively leave the segment unordered; ordinary encoding still runs.
+pub fn textDocumentsAreIndexSorted(alloc: Allocator, docs: []const TextDocument, analysis: TextAnalysisConfig, fields: []const segment_mod.SegmentIndexSortField) !bool {
+    if (fields.len == 0 or docs.len == 0) return false;
+    var regions = [_]std.heap.ArenaAllocator{ .init(alloc), .init(alloc) };
+    defer for (&regions) |*region| region.deinit();
+    const domains = try alloc.alloc(?TextIndexSortValueTag, fields.len);
+    defer alloc.free(domains);
+    @memset(domains, null);
+    var previous: ?TextIndexSortEntry = null;
+    for (docs, 0..) |doc, index| {
+        const region = &regions[index % 2];
+        _ = region.reset(.retain_capacity);
+        const scratch = region.allocator();
+        const next: TextIndexSortEntry = .{ .doc_index = index, .keys = try scratch.alloc(TextIndexSortValue, fields.len) };
+        for (fields, next.keys) |field, *key| {
+            key.* = textDocumentSortValueAlloc(scratch, doc, field.field, analysis) catch |err| switch (err) {
+                error.InvalidSegment, error.UnsupportedTypedDocValues => {
+                    return false;
+                },
+                else => return err,
+            };
+        }
+        for (next.keys, domains) |key, *domain| {
+            if (key == .null_value) continue;
+            const tag = std.meta.activeTag(key);
+            if (domain.*) |held| {
+                if (held != tag) return false;
+            } else domain.* = tag;
+        }
+        if (previous) |entry| {
+            for (entry.keys, next.keys) |left, right| if (left != .null_value and right != .null_value and std.meta.activeTag(left) != std.meta.activeTag(right)) {
+                return false;
+            };
+            if (textIndexSortEntryLessThan(fields, next, entry)) {
+                return false;
+            }
+        }
+        previous = next;
+    }
+    return true;
 }
 
 fn buildTextDocumentOrderAlloc(
@@ -1409,10 +1558,10 @@ fn buildTextDocumentOrderAlloc(
             var key = try textDocumentSortValueAlloc(alloc, docs[i], field.field, text_analysis);
             errdefer key.deinit(alloc);
             const key_tag = std.meta.activeTag(key);
-            if (expected_key_tags[keys_initialized]) |expected| {
-                if (expected != key_tag) return error.InvalidSegment;
-            } else {
-                expected_key_tags[keys_initialized] = key_tag;
+            if (key != .null_value) {
+                if (expected_key_tags[keys_initialized]) |expected| {
+                    if (expected != key_tag) return error.InvalidSegment;
+                } else expected_key_tags[keys_initialized] = key_tag;
             }
             entry.keys[keys_initialized] = key;
             keys_initialized += 1;
@@ -1421,6 +1570,15 @@ fn buildTextDocumentOrderAlloc(
     }
     std.sort.pdq(TextIndexSortEntry, order, index_sort, textIndexSortEntryLessThan);
     return order;
+}
+
+/// Sort only bounded navigation keys; payloads retain their capture ownership.
+pub fn sortedTextDocumentIndicesAlloc(a: Allocator, docs: []const TextDocument, fields: []const segment_mod.SegmentIndexSortField) ![]u32 {
+    const order = try buildTextDocumentOrderAlloc(a, docs, .{}, fields);
+    defer freeTextDocumentOrder(a, order);
+    const indices = try a.alloc(u32, order.len);
+    for (order, indices) |entry, *index| index.* = @intCast(entry.doc_index);
+    return indices;
 }
 
 fn freeTextDocumentOrder(alloc: Allocator, order: []TextIndexSortEntry) void {
@@ -1464,6 +1622,7 @@ fn textIndexSortBoundValuesAlloc(
 
 fn textIndexSortBoundValueAlloc(alloc: Allocator, value: TextIndexSortValue) !segment_mod.SegmentIndexSortBoundValue {
     return switch (value) {
+        .null_value => .null_value,
         .datetime_ns => |v| .{ .datetime_ns = v },
         .u64_val => |v| .{ .u64_val = v },
         .i64_val => |v| .{ .i64_val = v },
@@ -1485,15 +1644,36 @@ fn textDocumentSortValueAlloc(
     field: []const u8,
     text_analysis: TextAnalysisConfig,
 ) !TextIndexSortValue {
+    if (!doc.index_sort_projection_valid) return error.UnsupportedTypedDocValues;
     if (std.mem.eql(u8, field, "_id")) return .{ .id = doc.id };
+    for (doc.index_sort_values) |key| if (std.mem.eql(u8, key.field_name, field)) return switch (key.value) {
+        .null_value => .null_value,
+        .bytes_val => |v| .{ .bytes_val = try alloc.dupe(u8, v) },
+        .id => |v| .{ .id = v },
+        inline .u64_val, .i64_val, .f64_val => |v, tag| .{ .numeric_val = @unionInit(typed_dv.NumericValue, @tagName(tag), v) },
+        inline else => |v, tag| @unionInit(TextIndexSortValue, @tagName(tag), v),
+    };
     if (doc.typed_fields) |typed_fields| {
         var found: ?typed_dv.TypedValue = null;
         for (typed_fields) |typed_field| {
             if (!std.mem.eql(u8, typed_field.field_name, field)) continue;
+            if (typed_field.conflicted) return error.UnsupportedTypedDocValues;
             if (found != null) return error.InvalidSegment;
             found = typed_field.value;
         }
         if (found) |value| return try textIndexSortValueFromTypedValueAlloc(alloc, value);
+        // Explicit projections must not attest omitted non-null source values
+        // as null coverage. The encoder consumes this same typed projection.
+        if (doc.typed_source) |source| {
+            if (jsonPathValue(source, field)) |value| if (value != .null) return error.UnsupportedTypedDocValues;
+            return .null_value;
+        }
+        if (doc.stored_data.len != 0) {
+            var source = try std.json.parseFromSlice(std.json.Value, alloc, doc.stored_data, .{});
+            defer source.deinit();
+            if (jsonPathValue(source.value, field)) |value| if (value != .null) return error.UnsupportedTypedDocValues;
+        }
+        return .null_value;
     }
     if (doc.typed_source) |source| {
         if (jsonPathValue(source, field)) |value| {
@@ -1502,7 +1682,7 @@ fn textDocumentSortValueAlloc(
     }
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc.stored_data, .{});
     defer parsed.deinit();
-    const value = jsonPathValue(parsed.value, field) orelse return error.InvalidSegment;
+    const value = jsonPathValue(parsed.value, field) orelse return .null_value;
     return try textIndexSortValueFromJsonAlloc(alloc, field, value, text_analysis);
 }
 
@@ -1512,6 +1692,7 @@ fn textIndexSortValueFromJsonAlloc(
     value: std.json.Value,
     text_analysis: TextAnalysisConfig,
 ) !TextIndexSortValue {
+    if (value == .null) return .null_value;
     const detected = detectTypedValue(field, value, text_analysis) orelse return error.InvalidSegment;
     return try textIndexSortValueFromTypedValueAlloc(alloc, detected.value);
 }
@@ -1540,7 +1721,9 @@ fn jsonPathValue(value: std.json.Value, path: []const u8) ?std.json.Value {
 }
 
 fn compareTextIndexSortValues(a: TextIndexSortValue, b: TextIndexSortValue) std.math.Order {
+    if (b == .null_value) return if (a == .null_value) .eq else .gt;
     return switch (a) {
+        .null_value => .lt,
         .datetime_ns => |av| if (b == .datetime_ns) std.math.order(av, b.datetime_ns) else .lt,
         .u64_val => |av| switch (b) {
             .u64_val => |bv| std.math.order(av, bv),
@@ -1618,12 +1801,16 @@ fn addSingleTextFieldToBuilders(
     profile: ?*BuildTextProfile,
     profile_timings: bool,
     scratch: *TextBuildScratch,
+    contribution_cache: ?*AnalyzedContributionCache,
+    contribution_uses: *const ContributionUses,
 ) !void {
     if (profile) |p| p.text_field_count +|= 1;
     const analyzer = try cachedFieldAnalyzer(alloc, analyzer_cache, field, default_analyzer, text_analysis);
     var field_acc = FieldAcc.init(alloc);
     defer field_acc.deinit();
-    if (if (field.text.len >= 128) analyzer.tokenStream(field.text) else null) |producer| {
+    if (try accumulateCachedContribution(doc_alloc, &field_acc, analyzer, field.text, profile, contribution_cache, repeatedContribution(contribution_uses, field, analyzer))) {
+        // The cached term contribution already has exact norms and positions.
+    } else if (if (field.text.len >= 128) analyzer.tokenStream(field.text) else null) |producer| {
         const started = if (profile_timings) platform_time.monotonicNs() else 0;
         const count = try accumulateTokenStream(doc_alloc, &field_acc, producer);
         if (profile) |p| {
@@ -1720,7 +1907,20 @@ fn accumulateTokenStream(a: Allocator, field: *FieldAcc, input: analysis_mod.Tok
     field.token_offset = try std.math.add(u32, base, count);
     return count;
 }
-fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, timings: bool) !void {
+fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, timings: bool, contribution_cache: ?*AnalyzedContributionCache, known_reuse: bool) !void {
+    if (contribution_cache != null and text.len >= contribution_cache_mod.minimum_input) {
+        const existing = fields.getPtr(name);
+        var fresh = FieldAcc.init(scratch);
+        var transferred = false;
+        defer if (existing == null and !transferred) fresh.deinit();
+        if (try accumulateCachedContribution(a, existing orelse &fresh, analyzer, text, profile, contribution_cache, known_reuse)) {
+            if (existing == null and fresh.token_offset != 0) {
+                try fields.put(a, name, fresh);
+                transferred = true;
+            }
+            return;
+        }
+    }
     if (if (text.len >= 128) analyzer.tokenStream(text) else null) |stream| {
         const started = if (timings) platform_time.monotonicNs() else 0;
         const existing = fields.getPtr(name);
@@ -1760,6 +1960,93 @@ fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.String
     if (timings) {
         if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - accum_started;
     }
+}
+
+// Merge a compiled contribution once per distinct term, rather than looking
+// up and allocating every token again. Copied keys have the document arena's
+// lifetime; the cache lease ends before the postings builder is invoked.
+fn mergeContribution(a: Allocator, target: *FieldAcc, source: *const FieldAcc) !void {
+    const next = try std.math.add(u32, target.token_offset, source.token_offset);
+    var entries = source.term_map.iterator();
+    while (entries.next()) |entry| {
+        const term = entry.key_ptr.*;
+        const slot = try target.term_map.getOrPut(target.scratch, term);
+        if (!slot.found_existing) {
+            slot.value_ptr.* = .{};
+            slot.key_ptr.* = target.intern(a, term) catch |err| {
+                _ = target.term_map.remove(term);
+                return err;
+            };
+        }
+        try slot.value_ptr.appendShifted(target.scratch, entry.value_ptr.positionSlice(), target.token_offset);
+    }
+    target.token_offset = next;
+}
+
+fn mergeEncodedContribution(a: Allocator, target: *FieldAcc, lease: *const AnalyzedContributionCache.Lease, count: u32) !void {
+    const next = try std.math.add(u32, target.token_offset, count);
+    for (0..lease.hitCount()) |index| {
+        const hit = lease.hitAt(index);
+        const slot = try target.term_map.getOrPut(target.scratch, hit.term);
+        if (!slot.found_existing) {
+            slot.value_ptr.* = .{};
+            slot.key_ptr.* = target.intern(a, hit.term) catch |err| {
+                _ = target.term_map.remove(hit.term);
+                return err;
+            };
+        }
+        try slot.value_ptr.appendEncodedShifted(target.scratch, hit, target.token_offset);
+    }
+    target.token_offset = next;
+}
+
+fn accumulateCachedContribution(a: Allocator, target: *FieldAcc, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, optional_cache: ?*AnalyzedContributionCache, known_reuse: bool) !bool {
+    const cache = optional_cache orelse return false;
+    if (text.len < contribution_cache_mod.minimum_input) return false;
+    const digest = try AnalyzedContributionCache.key(analyzer, text);
+    if (cache.borrow(digest)) |borrowed| {
+        var lease = borrowed;
+        defer lease.deinit();
+        try mergeEncodedContribution(a, target, &lease, lease.tokens);
+        if (profile) |p| {
+            p.contribution_cache_hits +|= 1;
+            p.contribution_tokens_reused +|= lease.tokens;
+            p.token_count +|= lease.tokens;
+        }
+        return true;
+    }
+    if (!cache.observe(digest, known_reuse)) return false;
+    // Build a contribution independent of the aggregate's token offset. This
+    // permits the same body to participate in body/_all and reordered batches.
+    var local = FieldAcc.init(target.scratch);
+    defer local.deinit();
+    if (analyzer.tokenStream(text)) |stream| {
+        _ = try accumulateTokenStream(a, &local, stream);
+    } else {
+        const tokens = try analyzer.analyze(a, text);
+        for (tokens) |token| try accumulateToken(a, &local, token, 0, false);
+        local.token_offset = std.math.cast(u32, tokens.len) orelse return error.Overflow;
+    }
+    if (local.term_map.count() >= AnalyzedContributionCache.maximumTerms(text.len)) {
+        // Reject obvious high-entropy dictionaries before allocating a second
+        // hit vector. Their ordinary compiler state is already the fallback.
+        cache.reject(digest);
+    } else {
+        var hits: std.ArrayListUnmanaged(contribution_cache_mod.Hit) = .empty;
+        defer hits.deinit(target.scratch);
+        try hits.ensureTotalCapacity(target.scratch, local.term_map.count());
+        var it = local.term_map.iterator();
+        while (it.next()) |entry| hits.appendAssumeCapacity(.{ .term = entry.key_ptr.*, .positions = entry.value_ptr.positionSlice() });
+        cache.put(digest, hits.items, local.token_offset, text.len);
+    }
+    const tokens = local.token_offset;
+    if (target.term_map.count() == 0 and target.token_offset == 0) {
+        target.deinit();
+        target.* = local;
+        local = FieldAcc.init(target.scratch);
+    } else try mergeContribution(a, target, &local);
+    if (profile) |p| p.token_count +|= tokens;
+    return true;
 }
 
 fn tokenTermsAreUnique(tokens: []const analysis_mod.Token) bool {
@@ -3572,7 +3859,7 @@ test "buildSegmentFromText omits multi-valued typed doc values" {
     try std.testing.expect((try reader.getSection("scores", .typed_doc_values)) == null);
 }
 
-test "buildSegmentFromText rejects multi-valued projected index sort field" {
+test "buildSegmentFromText declines sort metadata for multi-valued projected fields" {
     const alloc = std.testing.allocator;
 
     const typed_fields = [_]TypedFieldValue{
@@ -3592,7 +3879,7 @@ test "buildSegmentFromText rejects multi-valued projected index sort field" {
         .{ .field = "_id" },
     };
 
-    try std.testing.expectError(error.InvalidSegment, buildSegmentFromTextWithAnalysisOptions(alloc, &.{
+    const bytes = try buildSegmentFromTextWithAnalysisOptions(alloc, &.{
         .{
             .id = "doc1",
             .stored_data = "{\"price\":10}",
@@ -3601,10 +3888,18 @@ test "buildSegmentFromText rejects multi-valued projected index sort field" {
         },
     }, &analysis_mod.default_analyzer, .{}, .{
         .index_sort = &index_sort,
-    }));
+    });
+    defer alloc.free(bytes);
+    var reader = try segment_mod.SegmentReader.init(alloc, bytes);
+    defer reader.deinit();
+    const sort_fields = try reader.indexSortFieldsAlloc(alloc);
+    defer if (sort_fields) |fields| segment_mod.freeIndexSortFields(alloc, fields);
+    try std.testing.expect(sort_fields == null);
+    try std.testing.expect((try reader.getSection("price", .typed_doc_values)) == null);
+    try std.testing.expectEqualStrings("doc1", (try reader.storedDoc(0)).?.id);
 }
 
-test "buildSegmentFromText rejects non-finite projected index sort field" {
+test "buildSegmentFromText rejects non-finite projected typed values" {
     const alloc = std.testing.allocator;
 
     const typed_fields = [_]TypedFieldValue{.{
@@ -3617,7 +3912,7 @@ test "buildSegmentFromText rejects non-finite projected index sort field" {
         .{ .field = "_id" },
     };
 
-    try std.testing.expectError(error.InvalidSegment, buildSegmentFromTextWithAnalysisOptions(alloc, &.{
+    try std.testing.expectError(error.InvalidData, buildSegmentFromTextWithAnalysisOptions(alloc, &.{
         .{
             .id = "doc1",
             .stored_data = "{\"price\":10}",
@@ -4647,13 +4942,13 @@ test "introducer.substring stream admits only nonempty field contributions" {
         while (entries.next()) |entry| entry.deinit();
     }
     for ([_]*const analysis_mod.Analyzer{ &analysis_mod.substring_analyzer, &analysis_mod.default_analyzer }) |analyzer| {
-        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "empty", analyzer, "", null, false);
-        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "punctuation", analyzer, "...", null, false);
+        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "empty", analyzer, "", null, false, null, false);
+        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "punctuation", analyzer, "...", null, false, null, false);
         try std.testing.expectEqual(@as(u32, 0), fields.count());
     }
-    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "NEEDLE", null, false);
+    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "NEEDLE", null, false, null, false);
     const before = fields.get("source").?.token_offset;
-    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "", null, false);
+    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "", null, false, null, false);
     try std.testing.expectEqual(before, fields.get("source").?.token_offset);
     try std.testing.expectEqual(@as(u32, 1), fields.count());
 }
@@ -4958,4 +5253,58 @@ test "postings spill policy retains small-node bounds and adapts to live headroo
     defer held.release();
     try std.testing.expectEqual(@as(u64, 10 * MiB), postingsRunTarget(.{ .resource_manager = &large }, 8 * MiB));
     try std.testing.expectEqual(@as(u64, 1024), postingsRunTarget(.{ .resource_manager = &large, .postings_run_target_bytes = 1024 }, 8 * MiB));
+}
+
+test "observed physical ordering proves directions ties and native nulls" {
+    const a = std.testing.allocator;
+    const docs = [_]TextDocument{
+        .{ .id = "a", .stored_data = "{\"rank\":1}", .text_fields = &.{} },
+        .{ .id = "b", .stored_data = "{\"rank\":1}", .text_fields = &.{} },
+        .{ .id = "c", .stored_data = "{\"rank\":2}", .text_fields = &.{} },
+    };
+    const fields = [_]segment_mod.SegmentIndexSortField{ .{ .field = "rank" }, .{ .field = "_id" } };
+    try std.testing.expect(try textDocumentsAreIndexSorted(a, &docs, .{}, &fields));
+    try std.testing.expect(!try textDocumentsAreIndexSorted(a, &.{ docs[1], docs[0] }, .{}, &fields));
+    try std.testing.expect(!try textDocumentsAreIndexSorted(a, &.{ docs[2], docs[0] }, .{}, &fields));
+    try std.testing.expect(try textDocumentsAreIndexSorted(a, &.{ docs[2], docs[0], docs[1] }, .{}, &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } }));
+    try std.testing.expect(try textDocumentsAreIndexSorted(a, &.{ .{ .id = "z", .stored_data = "{\"rank\":null}", .text_fields = &.{} }, docs[0] }, .{}, &fields));
+}
+
+test "observed physical ordering encoder keeps all source ordinals and declines unsorted input" {
+    const a = std.testing.allocator;
+    const docs = [_]TextDocument{
+        .{ .id = "a", .stored_data = "{\"rank\":1}", .text_fields = &.{} },
+        .{ .id = "b", .stored_data = "{\"rank\":2}", .text_fields = &.{} },
+        .{ .id = "c", .stored_data = "{\"rank\":3}", .text_fields = &.{} },
+    };
+    for (0..2) |unordered| {
+        const input = if (unordered == 0) docs else [_]TextDocument{ docs[2], docs[0], docs[1] };
+        const bytes = try buildSegmentFromTextWithAnalysisOptions(a, &input, &analysis_mod.default_analyzer, .{}, .{ .index_sort = &.{ .{ .field = "rank" }, .{ .field = "_id" } }, .attest_index_sort_in_place = true });
+        defer a.free(bytes);
+        var reader = try segment_mod.SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        try std.testing.expectEqual(@as(u32, 3), reader.doc_count);
+        for (input, 0..) |doc, i| try std.testing.expectEqualStrings(doc.id, (try reader.storedDoc(@intCast(i))).?.id);
+        const order = try reader.indexSortFieldsAlloc(a);
+        defer if (order) |fields| segment_mod.freeIndexSortFields(a, fields);
+        try std.testing.expectEqual(unordered == 0, order != null);
+    }
+}
+
+test "observed physical ordering uses signed timestamp keys and releases failed scratch" {
+    const Check = struct {
+        fn run(a: Allocator) !void {
+            const values = [_]TypedFieldValue{
+                .{ .field_name = "at", .value_type = .datetime_ns, .value = .{ .datetime_ns = -1 } },
+                .{ .field_name = "at", .value_type = .datetime_ns, .value = .{ .datetime_ns = 1 } },
+            };
+            const docs = [_]TextDocument{
+                .{ .id = "a", .stored_data = "{}", .text_fields = &.{}, .typed_fields = values[0..1] },
+                .{ .id = "b", .stored_data = "{}", .text_fields = &.{}, .typed_fields = values[1..2] },
+            };
+            try std.testing.expect(try textDocumentsAreIndexSorted(a, &docs, .{}, &.{ .{ .field = "at" }, .{ .field = "_id" } }));
+            try std.testing.expect(!try textDocumentsAreIndexSorted(a, &docs, .{}, &.{ .{ .field = "at", .desc = true }, .{ .field = "_id" } }));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

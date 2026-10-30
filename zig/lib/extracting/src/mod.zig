@@ -15,21 +15,35 @@
 
 const std = @import("std");
 const httpx = @import("httpx");
+pub const cloudflare = @import("antfly_cloudflare");
 
 const Allocator = std.mem.Allocator;
 pub const text_processing = @import("text.zig");
+pub const pioneer = @import("pioneer.zig");
 
 pub const Provider = enum {
     antfly,
     pioneer,
+    cloudflare,
+    /// Hosted generators: configs with these providers are rewritten to
+    /// generated extraction (antfly_structured) before any extractor runs.
     openai,
+    gemini,
+    vertex,
+    anthropic,
+    bedrock,
     mock,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.write(switch (self) {
             .antfly => "antfly",
             .pioneer => "pioneer",
+            .cloudflare => "cloudflare",
             .openai => "openai",
+            .gemini => "gemini",
+            .vertex => "vertex",
+            .anthropic => "anthropic",
+            .bedrock => "bedrock",
             .mock => "mock",
         });
     }
@@ -41,7 +55,8 @@ pub const Provider = enum {
         };
         if (std.mem.eql(u8, raw, "antfly")) return .antfly;
         if (std.mem.eql(u8, raw, "pioneer")) return .pioneer;
-        if (std.mem.eql(u8, raw, "openai")) return .openai;
+        if (std.mem.eql(u8, raw, "cloudflare")) return .cloudflare;
+        inline for (.{ "openai", "gemini", "vertex", "anthropic", "bedrock" }) |name| if (std.mem.eql(u8, raw, name)) return @field(@This(), name);
         if (std.mem.eql(u8, raw, "mock")) return .mock;
         return error.UnexpectedToken;
     }
@@ -53,6 +68,8 @@ pub const Config = struct {
     url: []const u8 = "",
     api_key: ?[]const u8 = null,
     bearer_token: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
     capability_token: ?[]const u8 = null,
     capability_revision: ?[]const u8 = null,
     /// Runtime-resolved Antfly transport capability. This is deliberately not
@@ -77,6 +94,8 @@ pub const Config = struct {
     pub fn deinit(self: *Config, alloc: Allocator) void {
         if (self.model.len > 0) alloc.free(@constCast(self.model));
         if (self.url.len > 0) alloc.free(@constCast(self.url));
+        if (self.account_id) |v| alloc.free(@constCast(v));
+        if (self.gateway_id) |v| alloc.free(@constCast(v));
         if (self.api_key) |api_key| alloc.free(@constCast(api_key));
         if (self.bearer_token) |bearer_token| alloc.free(@constCast(bearer_token));
         if (self.capability_token) |capability_token| alloc.free(@constCast(capability_token));
@@ -87,9 +106,14 @@ pub const Config = struct {
     }
 
     pub fn validate(self: Config) !void {
-        if (self.schema_version != 1 and self.schema_version != 2) return error.UnsupportedExtractionSchemaVersion;
+        if (self.provider == .cloudflare) {
+            var buffer: [1024]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+            _ = try cloudflare.endpoint(fixed.allocator(), self.account_id orelse return error.InvalidExtractionConfig, self.model);
+            if (!std.mem.eql(u8, self.model, "@cf/cloudflare/clairic")) return error.InvalidExtractionConfig;
+        } else if (self.account_id != null or self.gateway_id != null) return error.InvalidExtractionConfig;
+        _ = try validateSchemaVersion(self.schema_version);
         if (self.provider != .mock and self.model.len == 0) return error.InvalidExtractionConfig;
-        if ((self.provider == .pioneer or self.provider == .openai) and self.url.len == 0) return error.InvalidExtractionConfig;
     }
 
     pub fn resolvedUrl(self: Config) ?[]const u8 {
@@ -272,6 +296,10 @@ pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
     const api_key = if (stringField(parsed.value, "api_key")) |value| try alloc.dupe(u8, value) else null;
     errdefer if (api_key) |value| alloc.free(value);
 
+    const account_id = if (stringField(parsed.value, "account_id")) |v| try alloc.dupe(u8, v) else null;
+    errdefer if (account_id) |v| alloc.free(v);
+    const gateway_id = if (stringField(parsed.value, "gateway_id")) |v| try alloc.dupe(u8, v) else null;
+    errdefer if (gateway_id) |v| alloc.free(v);
     const bearer_token = if (stringField(parsed.value, "bearer_token")) |value| try alloc.dupe(u8, value) else null;
     errdefer if (bearer_token) |value| alloc.free(value);
 
@@ -293,6 +321,8 @@ pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
         .url = url,
         .api_key = api_key,
         .bearer_token = bearer_token,
+        .account_id = account_id,
+        .gateway_id = gateway_id,
         .capability_token = null,
         .capability_revision = null,
         .framed_attachments = false,
@@ -315,6 +345,8 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
     errdefer owned.deinit(alloc);
     if (cfg.model.len > 0) owned.model = try alloc.dupe(u8, cfg.model);
     if (cfg.url.len > 0) owned.url = try alloc.dupe(u8, cfg.url);
+    if (cfg.account_id) |value| owned.account_id = try alloc.dupe(u8, value);
+    if (cfg.gateway_id) |value| owned.gateway_id = try alloc.dupe(u8, value);
     if (cfg.api_key) |value| owned.api_key = try alloc.dupe(u8, value);
     if (cfg.bearer_token) |value| owned.bearer_token = try alloc.dupe(u8, value);
     if (cfg.capability_token) |value| owned.capability_token = try alloc.dupe(u8, value);
@@ -330,14 +362,47 @@ pub const RemoteOptions = struct {
     cancellation: ?httpx.CancellationToken = null,
 };
 
+fn validateSchemaVersion(version: u32) !u32 {
+    return if (version == 1 or version == 2) version else error.UnsupportedExtractionSchemaVersion;
+}
+
+/// A logical extraction owns one deadline, including preflight and every
+/// serial upstream call. Use the transport's clock and inherited defaults.
+const ExtractionControl = struct {
+    io: std.Io,
+    deadline_ns: ?i96,
+    cancellation: ?httpx.CancellationToken,
+
+    fn init(client: *httpx.Client, options: RemoteOptions) ExtractionControl {
+        const timeout = options.timeout_ms orelse client.config.timeouts.request_ms;
+        return .{
+            .io = client.io,
+            .deadline_ns = if (timeout == 0) null else std.Io.Clock.awake.now(client.io).nanoseconds +| @as(i96, timeout) * std.time.ns_per_ms,
+            .cancellation = options.cancellation orelse client.config.request_cancellation,
+        };
+    }
+    fn remainingAt(self: ExtractionControl, now_ns: i96) !?u64 {
+        if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        const deadline = self.deadline_ns orelse return 0;
+        if (now_ns >= deadline) return error.Timeout;
+        return @intCast(@divFloor(deadline - now_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+    }
+    fn remaining(self: ExtractionControl) !?u64 {
+        return self.remainingAt(std.Io.Clock.awake.now(self.io).nanoseconds);
+    }
+};
+
 pub fn initExtractor(alloc: Allocator, http: *httpx.Client, cfg: Config) !Extractor {
     return initExtractorWithOptions(alloc, http, cfg, .{});
 }
 
 fn initExtractorWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Extractor {
     return switch (cfg.provider) {
-        .antfly, .pioneer, .openai => try HttpExtractorState.init(alloc, http, cfg, options),
-        .mock => error.UnsupportedExtractionProvider,
+        .antfly => try HttpExtractorState.init(alloc, http, cfg, options),
+        .pioneer => try PioneerExtractor.init(alloc, http, cfg, options),
+        .cloudflare => try CloudflareExtractor.init(alloc, http, cfg, options),
+        // Hosted generator providers run as generated extraction.
+        .openai, .gemini, .vertex, .anthropic, .bedrock, .mock => error.UnsupportedExtractionProvider,
     };
 }
 
@@ -439,6 +504,185 @@ pub fn firstResultJsonAlloc(alloc: Allocator, response_json: []const u8) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, parsed.value.object.get("data").?.array.items[0], .{});
 }
 
+const CloudflareExtractor = struct {
+    allocator: Allocator,
+    http: *httpx.Client,
+    config: Config,
+    options: RemoteOptions,
+
+    fn init(a: Allocator, http: *httpx.Client, config: Config, options: RemoteOptions) !Extractor {
+        try config.validate();
+        const self = try a.create(CloudflareExtractor);
+        errdefer a.destroy(self);
+        self.* = .{ .allocator = a, .http = http, .config = try cloneConfig(a, config), .options = options };
+        return .{ .ptr = self, .vtable = &.{ .extract = extract, .deinit = deinit } };
+    }
+    fn deinit(raw: *anyopaque) void {
+        const self: *CloudflareExtractor = @ptrCast(@alignCast(raw));
+        const a = self.allocator;
+        self.config.deinit(a);
+        a.destroy(self);
+    }
+    fn extract(raw: *anyopaque, backing: Allocator, req: Request) !Response {
+        const self: *CloudflareExtractor = @ptrCast(@alignCast(raw));
+        const control = ExtractionControl.init(self.http, self.options);
+        _ = try control.remaining();
+        const version = try validateSchemaVersion(req.schema_version orelse self.config.schema_version);
+        var arena = std.heap.ArenaAllocator.init(backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const cfg = self.config;
+        if (req.inputs.len == 0 or req.inputs.len > 128 or req.attachments.len > 512) return error.UnsupportedCloudflareSchema;
+        const schema_json = if (req.schema_json.len > 0) req.schema_json else cfg.schema_json;
+        const schema = try std.json.parseFromSliceLeaky(std.json.Value, a, schema_json, .{ .duplicate_field_behavior = .@"error" });
+        const plan = try cloudflare.extractionSchema(a, schema);
+        const states = try a.alloc(cloudflare.Evidence, req.inputs.len);
+        const Inspect = struct {
+            fn image(bytes: []const u8) !void {
+                const info = try @import("antfly_image").inspectEncoded(bytes);
+                if (try info.pixels() > 16_000_000) return error.CloudflareInputLimitExceeded;
+            }
+        };
+        for (req.attachments) |attachment| if (attachment.input_index >= req.inputs.len) return error.InvalidExtractionAttachment;
+        // Atomic preflight: unsupported schema/input/options in the last row
+        // must fail before the first upstream invocation.
+        for (req.inputs, states, 0..) |input, *state, i| {
+            _ = try control.remaining();
+            if (input.schema_json != null or input.options_json != null or input.tokens_json != null) return error.UnsupportedCloudflareSchema;
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, input.content_json, .{});
+            state.* = try cloudflare.evidence(a, parsed, req.attachments, i, Inspect.image);
+            _ = try cloudflare.evidenceRequest(a, cfg.model, state.*, plan.fields);
+        }
+        const options_json = if (req.options_json.len > 0) req.options_json else if (cfg.options_json.len > 0) cfg.options_json else "{}";
+        const options = try std.json.parseFromSliceLeaky(std.json.Value, a, options_json, .{});
+        if (options != .object or options.object.count() != 0) return error.UnsupportedCloudflareSchema;
+        var rows: std.array_list.Managed(std.json.Value) = .init(a);
+        var input_tokens: i64 = 0;
+        var output_tokens: i64 = 0;
+        for (req.inputs, states) |input, state| {
+            const result = try cloudflare.invoke(self.http, a, cloudflare.Config{
+                .account_id = cfg.account_id.?,
+                .model = cfg.model,
+                .api_key = cfg.bearer_token orelse cfg.api_key orelse return error.CloudflareCredentialMissing,
+                .gateway_id = cfg.gateway_id,
+                .url = cfg.resolvedUrl(),
+            }, try cloudflare.evidenceRequest(a, cfg.model, state, plan.fields), .{
+                .timeout_ms = try control.remaining(),
+                .cancellation = control.cancellation,
+                .max_response_bytes = req.max_response_bytes orelse 16 * 1024 * 1024,
+            });
+            _ = try control.remaining();
+            var row = try cloudflare.extractionResult(a, plan, result, state.state);
+            if (input.id) |id| try cloudflare.put(a, &row, "id", cloudflare.string(id));
+            try rows.append(row);
+            const usage = try cloudflare.nativeUsage(result);
+            input_tokens = std.math.add(i64, input_tokens, std.math.cast(i64, usage.input_tokens) orelse return error.InvalidCloudflareResponse) catch return error.InvalidCloudflareResponse;
+            output_tokens = std.math.add(i64, output_tokens, std.math.cast(i64, usage.output_tokens) orelse return error.InvalidCloudflareResponse) catch return error.InvalidCloudflareResponse;
+        }
+        const json = try std.json.Stringify.valueAlloc(backing, .{
+            .object = "extraction",
+            .model = cfg.model,
+            .schema_version = version,
+            .data = rows.items,
+            .usage = .{ .input_tokens = input_tokens, .output_tokens = output_tokens },
+        }, .{});
+        errdefer backing.free(json);
+        _ = try control.remaining();
+        if (json.len > (req.max_response_bytes orelse 16 * 1024 * 1024)) return error.ResponseTooLarge;
+        return .{ .allocator = backing, .json = json };
+    }
+};
+
+/// Fastino's hosted GLiNER API. One chat completion per input carries the
+/// selected model and the unified GLiNER schema; see pioneer.zig.
+const PioneerExtractor = struct {
+    allocator: Allocator,
+    http: *httpx.Client,
+    config: Config,
+    options: RemoteOptions,
+
+    fn init(a: Allocator, http: *httpx.Client, config: Config, options: RemoteOptions) !Extractor {
+        try config.validate();
+        const self = try a.create(PioneerExtractor);
+        errdefer a.destroy(self);
+        self.* = .{ .allocator = a, .http = http, .config = try cloneConfig(a, config), .options = options };
+        return .{ .ptr = self, .vtable = &.{ .extract = extract, .deinit = deinit } };
+    }
+    fn deinit(raw: *anyopaque) void {
+        const self: *PioneerExtractor = @ptrCast(@alignCast(raw));
+        const a = self.allocator;
+        self.config.deinit(a);
+        a.destroy(self);
+    }
+    fn extract(raw: *anyopaque, backing: Allocator, req: Request) !Response {
+        const self: *PioneerExtractor = @ptrCast(@alignCast(raw));
+        const control = ExtractionControl.init(self.http, self.options);
+        _ = try control.remaining();
+        const cfg = self.config;
+        if (try validateSchemaVersion(req.schema_version orelse cfg.schema_version) != 1) return error.UnsupportedPioneerSchema;
+        if (req.inputs.len == 0 or req.inputs.len > 128) return error.UnsupportedPioneerInput;
+        if (req.attachments.len != 0) return error.UnsupportedPioneerInput;
+        var arena = std.heap.ArenaAllocator.init(backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const schema_json = if (req.schema_json.len > 0) req.schema_json else cfg.schema_json;
+        if (schema_json.len == 0) return error.UnsupportedPioneerSchema;
+        const schema = try std.json.parseFromSliceLeaky(std.json.Value, a, schema_json, .{ .duplicate_field_behavior = .@"error" });
+        const options_json = if (req.options_json.len > 0) req.options_json else cfg.options_json;
+        const options: ?std.json.Value = if (options_json.len > 0)
+            try std.json.parseFromSliceLeaky(std.json.Value, a, options_json, .{ .duplicate_field_behavior = .@"error" })
+        else
+            null;
+        const plan = try pioneer.compile(a, schema, options);
+        // Atomic preflight: an unsupported input fails before the first call.
+        const sources = try a.alloc([]const u8, req.inputs.len);
+        for (req.inputs, sources) |input, *source| {
+            if (input.schema_json != null or input.options_json != null or input.tokens_json != null) return error.UnsupportedPioneerSchema;
+            source.* = try pioneer.contentText(a, try std.json.parseFromSliceLeaky(std.json.Value, a, input.content_json, .{}));
+        }
+        const key = cfg.bearer_token orelse cfg.api_key orelse return error.PioneerCredentialMissing;
+        const authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{key});
+        const base = std.mem.trimEnd(u8, cfg.resolvedUrl() orelse pioneer.default_url, "/");
+        const url = try std.fmt.allocPrint(a, "{s}{s}", .{ base, pioneer.completions_path });
+        const max_response_bytes = req.max_response_bytes orelse 16 * 1024 * 1024;
+
+        var rows = std.json.Array.init(a);
+        var usage = pioneer.Usage{};
+        for (req.inputs, sources) |input, source| {
+            var response = try self.http.post(url, .{
+                .json = try pioneer.requestBody(a, cfg.model, plan, source),
+                .headers = &.{.{ "Authorization", authorization }},
+                .max_retries = 0,
+                .cookies_enabled = false,
+                .follow_redirects = false,
+                .max_response_size = max_response_bytes,
+                .timeout_ms = try control.remaining(),
+                .cancellation = control.cancellation,
+            });
+            defer response.deinit();
+            if (!response.ok()) {
+                logHttpFailure(a, cfg, response);
+                return extractionHttpStatusError(response.status.code, false);
+            }
+            const decoded = try pioneer.decode(a, response.body orelse return error.EmptyExtractionResponse, plan, source, input.id);
+            try rows.append(decoded.row);
+            usage.input_tokens = std.math.add(i64, usage.input_tokens, decoded.usage.input_tokens) catch return error.InvalidExtractionResponse;
+            usage.output_tokens = std.math.add(i64, usage.output_tokens, decoded.usage.output_tokens) catch return error.InvalidExtractionResponse;
+            _ = try control.remaining();
+        }
+        const json = try std.json.Stringify.valueAlloc(backing, .{
+            .object = "extraction",
+            .model = cfg.model,
+            .schema_version = @as(u32, 1),
+            .data = rows.items,
+            .usage = .{ .input_tokens = usage.input_tokens, .output_tokens = usage.output_tokens },
+        }, .{});
+        errdefer backing.free(json);
+        if (json.len > max_response_bytes) return error.ResponseTooLarge;
+        return .{ .allocator = backing, .json = json };
+    }
+};
+
 const HttpExtractorState = struct {
     alloc: Allocator,
     http: *httpx.Client,
@@ -505,10 +749,7 @@ const HttpExtractorState = struct {
             .antfly => "http://127.0.0.1:8080",
             else => return error.InvalidExtractionConfig,
         };
-        const path = switch (self.cfg.provider) {
-            .pioneer => "/inference",
-            else => "/extract",
-        };
+        const path = "/extract";
         // A configured antfly extractor `url`/`api_url` is commonly a bare
         // `scheme://host:port` (the same value a caller reuses for the
         // embedder and chunker on the same inference service), which must
@@ -561,7 +802,7 @@ const HttpExtractorState = struct {
         // schema-version-less wire request to v2 on the provider side (see
         // zig/pkg/inference's extractWithAdmission); a caller that left
         // schema_version unset everywhere -- as
-        // examples/dogfood/index_config.go's knowledgeGraphIndexJSON and
+        // examples/antfly-docs-knowledge-base/index_config.go's knowledgeGraphIndexJSON and
         // GRAPH.md's shorthand extractor config both do -- has no basis to
         // reject that upgrade as a mismatch. Before this, `req.schema_version
         // orelse self.cfg.schema_version` always produced a concrete value
@@ -611,7 +852,7 @@ const HttpFailureDetails = struct {
             value;
         return .{
             .code = boundedDiagnostic(stringField(fields, "code") orelse stringField(fields, "error") orelse ""),
-            .message = boundedDiagnostic(stringField(fields, "message") orelse ""),
+            .message = boundedDiagnostic(stringField(fields, "message") orelse stringField(fields, "detail") orelse ""),
             .hint = boundedDiagnostic(stringField(fields, "hint") orelse ""),
         };
     }
@@ -750,8 +991,7 @@ const RequestByteCount = struct {
 };
 
 fn requestJsonAllocCapacity(alloc: Allocator, cfg: Config, req: Request, capacity: ?usize) ![]u8 {
-    const schema_version = req.schema_version orelse cfg.schema_version;
-    if (schema_version != 1 and schema_version != 2) return error.UnsupportedExtractionSchemaVersion;
+    const schema_version = try validateSchemaVersion(req.schema_version orelse cfg.schema_version);
     for (req.inputs) |input| if (schema_version == 1 and (input.schema_json != null or input.options_json != null))
         return error.AdvancedExtractionSchemaRequiresVersion2;
     try validateAttachments(req);
@@ -937,7 +1177,8 @@ fn normalizedAntflyExtractionBaseAlloc(alloc: Allocator, raw: []const u8) ![]u8 
 fn parseProvider(raw: []const u8) !Provider {
     if (std.mem.eql(u8, raw, "antfly")) return .antfly;
     if (std.mem.eql(u8, raw, "pioneer")) return .pioneer;
-    if (std.mem.eql(u8, raw, "openai")) return .openai;
+    if (std.mem.eql(u8, raw, "cloudflare")) return .cloudflare;
+    inline for (.{ "openai", "gemini", "vertex", "anthropic", "bedrock" }) |name| if (std.mem.eql(u8, raw, name)) return @field(Provider, name);
     if (std.mem.eql(u8, raw, "mock")) return .mock;
     return error.InvalidExtractionConfig;
 }
@@ -1282,4 +1523,273 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
 test {
     _ = text_processing.windows;
     _ = text_processing.alignment;
+    _ = pioneer;
+}
+
+test "pioneer extraction posts one chat completion per input with bearer auth" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Fixture = struct {
+        fn check(request: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer fixture-key", request.header("Authorization").?);
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), request.body, .{});
+            try std.testing.expectEqualStrings("fastino/gliner2.5-multi-v1", root.object.get("model").?.string);
+            try std.testing.expectEqualStrings("person", root.object.get("schema").?.object.get("entities").?.array.items[0].string);
+            try std.testing.expectEqual(false, root.object.get("store").?.bool);
+            try std.testing.expectEqual(@as(usize, 1), root.object.get("messages").?.array.items.len);
+        }
+        fn run(alloc: Allocator, client: *httpx.Client, config: Config, result: *?Response, failure: *?anyerror) std.Io.Cancelable!void {
+            result.* = extractWithConfig(alloc, client, config, .{ .inputs = &.{
+                .{ .id = "a", .content_json = "\"Ada wrote code.\"" },
+                .{ .id = "b", .content_json = "[{\"type\":\"text\",\"text\":\"Bob\"}]" },
+            } }) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    const answer =
+        \\{"id":"x","object":"chat.completion","model":"fastino/gliner2.5-multi-v1","choices":[{"index":0,"message":{"role":"assistant","content":"{\"entities\":{\"person\":[{\"text\":\"Ada\",\"confidence\":0.9,\"start\":0,\"end\":3}]}}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":0,"total_tokens":5}}
+    ;
+    var server = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/v1/chat/completions", .assert_request = Fixture.check, .respond = .{ .body = answer } },
+    });
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    const cfg = Config{ .provider = .pioneer, .model = "fastino/gliner2.5-multi-v1", .api_key = "fixture-key", .url = server.baseUrl(), .schema_json = "{\"entities\":[\"person\"]}" };
+    var result: ?Response = null;
+    defer if (result) |*response| response.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    try group.concurrent(io, Fixture.run, .{ a, &client, cfg, &result, &failure });
+    try server.handleOne();
+    try server.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
+    var parsed = try parseResponse(a, result.?.json, .{ .model = cfg.model, .item_count = 2, .schema_version = 1 });
+    defer parsed.deinit();
+    const data = parsed.value.object.get("data").?.array.items;
+    try std.testing.expectEqualStrings("a", data[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("Ada", data[0].object.get("entities").?.array.items[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("b", data[1].object.get("id").?.string);
+    // The fixture span does not match the second input, so only its text is kept.
+    try std.testing.expect(!data[1].object.get("entities").?.array.items[0].object.contains("start"));
+    try std.testing.expectEqualStrings("10", parsed.value.object.get("usage").?.object.get("input_tokens").?.number_string);
+}
+
+test "pioneer extraction maps HTTP failures and requires a credential" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const cases = .{
+        .{ @as(u16, 401), error.ExtractionUnauthorized },
+        .{ @as(u16, 422), error.ExtractionInvalidRequest },
+        .{ @as(u16, 429), error.ExtractionRateLimited },
+        .{ @as(u16, 503), error.ExtractionTransientFailure },
+    };
+    inline for (cases) |case| {
+        var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/v1/chat/completions", .respond = .{
+            .status = case[0],
+            .body = "{\"detail\":\"fixture failure\"}",
+        } }});
+        defer server.deinit();
+        var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var result: ?Response = null;
+        defer if (result) |*response| response.deinit();
+        var run_err: ?anyerror = null;
+        var group = std.Io.Group.init;
+        const Fiber = struct {
+            fn run(alloc: Allocator, http: *httpx.Client, url: []const u8, out: *?Response, err_out: *?anyerror) std.Io.Cancelable!void {
+                out.* = extractWithConfig(alloc, http, .{ .provider = .pioneer, .model = "fastino/gliner2-base-v1", .api_key = "k", .url = url, .schema_json = "{\"entities\":[\"person\"]}" }, .{
+                    .inputs = &.{.{ .content_json = "\"Ada\"" }},
+                }) catch |err| {
+                    err_out.* = err;
+                    return;
+                };
+            }
+        };
+        try group.concurrent(io, Fiber.run, .{ a, &client, server.baseUrl(), &result, &run_err });
+        try server.handleOne();
+        try group.await(io);
+        try std.testing.expect(result == null);
+        try std.testing.expect(run_err.? == case[1]);
+    }
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    try std.testing.expectError(error.PioneerCredentialMissing, extractWithConfig(a, &client, .{ .provider = .pioneer, .model = "fastino/gliner2-base-v1", .schema_json = "{\"entities\":[\"person\"]}" }, .{
+        .inputs = &.{.{ .content_json = "\"Ada\"" }},
+    }));
+    try std.testing.expectError(error.InvalidExtractionConfig, extractWithConfig(a, &client, .{ .provider = .pioneer, .api_key = "k" }, .{
+        .inputs = &.{.{ .content_json = "\"Ada\"" }},
+    }));
+}
+
+test "cloudflare extraction validates request versions before transport" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.init(a, threaded.io());
+    defer client.deinit();
+    const cfg = Config{ .provider = .cloudflare, .account_id = "account", .model = "@cf/cloudflare/clairic", .api_key = "fixture", .url = "http://127.0.0.1:1" };
+    for ([_]u32{ 0, 3, std.math.maxInt(u32) }) |version| {
+        // No valid schema or live endpoint: version admission must happen first.
+        try std.testing.expectError(error.UnsupportedExtractionSchemaVersion, extractWithConfig(a, &client, cfg, .{ .schema_version = version, .inputs = &.{.{ .content_json = "\"receipt\"" }} }));
+    }
+}
+
+test "cloudflare extraction shares deadline and cancellation across serial calls" {
+    const control = ExtractionControl{ .io = undefined, .deadline_ns = 500 * std.time.ns_per_ms, .cancellation = null };
+    try std.testing.expectEqual(@as(?u64, 500), try control.remainingAt(0));
+    try std.testing.expectEqual(@as(?u64, 200), try control.remainingAt(300 * std.time.ns_per_ms));
+    try std.testing.expectEqual(@as(?u64, 1), try control.remainingAt(500 * std.time.ns_per_ms - 1));
+    try std.testing.expectError(error.Timeout, control.remainingAt(500 * std.time.ns_per_ms));
+    const cancelled = ExtractionControl{ .io = undefined, .deadline_ns = null, .cancellation = .{ .ptr = &control, .is_cancelled_fn = struct {
+        fn check(_: *const anyopaque) bool {
+            return true;
+        }
+    }.check } };
+    try std.testing.expectError(error.Cancelled, cancelled.remainingAt(0));
+
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const body =
+        \\{"success":true,"result":{"answers":{"total":{"value":12.5}},"usage":{"input_tokens":1,"output_tokens":1}}}
+    ;
+    var server = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/run", .respond = .{ .body = body, .delay_ns = 300 * std.time.ns_per_ms } },
+        .{ .method = .POST, .path = "/run", .respond = .{ .body = body, .delay_ns = 300 * std.time.ns_per_ms } },
+    });
+    defer server.deinit();
+    const Serve = struct {
+        fn run(srv: *httpx.TestServer) void {
+            srv.handleOne() catch return;
+            srv.handleOne() catch return;
+        }
+    };
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Serve.run, .{&server});
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/run", .{server.baseUrl()});
+    defer a.free(url);
+    if (extractWithConfigAndOptions(a, &client, .{
+        .provider = .cloudflare,
+        .account_id = "account",
+        .model = "@cf/cloudflare/clairic",
+        .api_key = "fixture",
+        .url = url,
+        .schema_json = "{\"structures\":{\"receipt\":{\"fields\":{\"total\":\"number\"}}}}",
+    }, .{ .inputs = &.{ .{ .content_json = "\"12.50\"" }, .{ .content_json = "\"12.50\"" } } }, .{ .timeout_ms = 500 })) |response| {
+        var unexpected = response;
+        unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(error.Timeout, err);
+}
+
+test "cloudflare extraction provider uses native typed protocol with optional gateway routing" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Fixture = struct {
+        fn check(request: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer fixture-token", request.header("Authorization").?);
+            if (request.header("cf-aig-gateway-id")) |id| try std.testing.expectEqualStrings("documents", id);
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), request.body, .{});
+            try std.testing.expectEqualStrings("clairic", root.object.get("model").?.string);
+            try std.testing.expect(root.object.contains("fields"));
+            try std.testing.expect(!root.object.contains("messages"));
+        }
+        fn run(alloc: Allocator, client: *httpx.Client, config: Config, result: *?Response, failure: *?anyerror) std.Io.Cancelable!void {
+            result.* = extractWithConfig(alloc, client, config, .{ .schema_version = 2, .inputs = &.{.{ .id = "receipt", .content_json = "\"Total 12.50 USD\"" }} }) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    for ([_]?[]const u8{ null, "documents" }) |gateway| {
+        var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/client/v4/accounts/account/ai/run/@cf/cloudflare/clairic", .assert_request = Fixture.check, .respond = .{
+            .body = "{\"success\":true,\"result\":{\"answers\":{\"total\":{\"type\":\"number\",\"value\":12.5,\"confidence\":0.95}},\"truncated\":false,\"usage\":{\"input_tokens\":20,\"output_tokens\":0}}}",
+        } }});
+        defer server.deinit();
+        var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer client.deinit();
+        const url = try std.fmt.allocPrint(a, "{s}/client/v4/accounts/account/ai/run/@cf/cloudflare/clairic", .{server.baseUrl()});
+        defer a.free(url);
+        const cfg = Config{ .provider = .cloudflare, .account_id = "account", .model = "@cf/cloudflare/clairic", .api_key = "fixture-token", .gateway_id = gateway, .url = url, .schema_json = "{\"structures\":{\"receipt\":{\"fields\":{\"total\":{\"type\":\"number\",\"decimals\":2,\"unit\":\"USD\"}}}}}" };
+        var result: ?Response = null;
+        defer if (result) |*response| response.deinit();
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        try group.concurrent(io, Fixture.run, .{ a, &client, cfg, &result, &failure });
+        try server.handleOne();
+        try group.await(io);
+        if (failure) |err| return err;
+        var parsed = try parseResponse(a, result.?.json, .{ .model = cfg.model, .item_count = 1, .schema_version = 2 });
+        defer parsed.deinit();
+        const entry = parsed.value.object.get("data").?.array.items[0].object.get("structures").?.object.get("receipt").?.array.items[0].object.get("total").?;
+        try std.testing.expectEqualStrings("12.5", entry.object.get("value").?.number_string);
+        try std.testing.expectEqualStrings("derived", entry.object.get("origin").?.string);
+        try std.testing.expect(!entry.object.contains("start"));
+    }
+}
+
+pub fn testCloudflareExtraction() !void {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/", .respond = .{ .body =
+        \\{"success":true,"result":{"model":"clairic","truncated":false,"answers":{"total":{"value":9007199254740993.1}},"usage":{"input_tokens":7,"output_tokens":2}}}
+    } }});
+    defer server.deinit();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(alloc: Allocator, http: *httpx.Client, url: []const u8, out: *?anyerror) std.Io.Cancelable!void {
+            var response = extractWithConfig(alloc, http, .{ .provider = .cloudflare, .account_id = "account", .model = "@cf/cloudflare/clairic", .api_key = "fixture", .url = url }, .{
+                .schema_version = 2,
+                .schema_json = "{\"structures\":{\"invoice\":{\"fields\":{\"total\":\"number\"}}}}",
+                .inputs = &.{.{ .content_json = "\"9007199254740993.1\"" }},
+            }) catch |err| {
+                out.* = err;
+                return;
+            };
+            defer response.deinit();
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, response.json, .{ .parse_numbers = false }) catch |err| {
+                out.* = err;
+                return;
+            };
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            std.testing.expectEqualStrings("7", root.get("usage").?.object.get("input_tokens").?.number_string) catch |err| {
+                out.* = err;
+            };
+            std.testing.expectEqualStrings("2", root.get("usage").?.object.get("output_tokens").?.number_string) catch |err| {
+                out.* = err;
+            };
+            const value = root.get("data").?.array.items[0].object.get("structures").?.object.get("invoice").?.array.items[0].object.get("total").?.object.get("value").?;
+            std.testing.expectEqualStrings("9007199254740993.1", value.number_string) catch |err| {
+                out.* = err;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ a, &client, server.baseUrl(), &failure }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (failure) |err| return err;
 }

@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.document_source import DocumentSource
     from ..models.inference_image_url import InferenceImageURL
 
 
@@ -17,15 +18,19 @@ T = TypeVar("T", bound="InferenceReadRequest")
 
 @_attrs_define
 class InferenceReadRequest:
-    """
+    """Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
+
     Attributes:
-        model (str): Name of reader model from models_dir/readers/ Example: microsoft/trocr-base-printed.
-        images (list[InferenceImageURL]): Images to read text from. Supports:
+        model (str): Name of reader model from models_dir/readers/ Example: lightonai/LightOnOCR-3-0.8B.
+        retain_artifact (bool | Unset): Request an opaque, process-local reading handle for extraction reuse. Retention
+            is best effort; inspect document.artifact_id and artifact_ttl_ms. Default: False.
+        documents (list[DocumentSource] | Unset): Complete documents, mutually exclusive with images. Each source is
+            independent; selected pages are read in original source order.
+        images (list[InferenceImageURL] | Unset): Images to read text from. Supports:
             - Data URIs: `data:image/png;base64,...`
             - URLs (if content_security allows)
              Example: [{'url': 'data:image/png;base64,iVBORw0KGgo...'}].
         prompt (str | Unset): Optional task prompt for document understanding models.
-            - TrOCR: Not used (pure OCR)
             - Donut CORD: "<s_cord-v2>" for receipt parsing
             - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>"
             - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
@@ -36,7 +41,9 @@ class InferenceReadRequest:
     """
 
     model: str
-    images: list[InferenceImageURL]
+    retain_artifact: bool | Unset = False
+    documents: list[DocumentSource] | Unset = UNSET
+    images: list[InferenceImageURL] | Unset = UNSET
     prompt: str | Unset = UNSET
     max_tokens: int | Unset = 256
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -44,10 +51,21 @@ class InferenceReadRequest:
     def to_dict(self) -> dict[str, Any]:
         model = self.model
 
-        images = []
-        for images_item_data in self.images:
-            images_item = images_item_data.to_dict()
-            images.append(images_item)
+        retain_artifact = self.retain_artifact
+
+        documents: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.documents, Unset):
+            documents = []
+            for documents_item_data in self.documents:
+                documents_item = documents_item_data.to_dict()
+                documents.append(documents_item)
+
+        images: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.images, Unset):
+            images = []
+            for images_item_data in self.images:
+                images_item = images_item_data.to_dict()
+                images.append(images_item)
 
         prompt = self.prompt
 
@@ -58,9 +76,14 @@ class InferenceReadRequest:
         field_dict.update(
             {
                 "model": model,
-                "images": images,
             }
         )
+        if retain_artifact is not UNSET:
+            field_dict["retain_artifact"] = retain_artifact
+        if documents is not UNSET:
+            field_dict["documents"] = documents
+        if images is not UNSET:
+            field_dict["images"] = images
         if prompt is not UNSET:
             field_dict["prompt"] = prompt
         if max_tokens is not UNSET:
@@ -70,17 +93,31 @@ class InferenceReadRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.document_source import DocumentSource
         from ..models.inference_image_url import InferenceImageURL
 
         d = dict(src_dict)
         model = d.pop("model")
 
-        images = []
-        _images = d.pop("images")
-        for images_item_data in _images:
-            images_item = InferenceImageURL.from_dict(images_item_data)
+        retain_artifact = d.pop("retain_artifact", UNSET)
 
-            images.append(images_item)
+        _documents = d.pop("documents", UNSET)
+        documents: list[DocumentSource] | Unset = UNSET
+        if _documents is not UNSET:
+            documents = []
+            for documents_item_data in _documents:
+                documents_item = DocumentSource.from_dict(documents_item_data)
+
+                documents.append(documents_item)
+
+        _images = d.pop("images", UNSET)
+        images: list[InferenceImageURL] | Unset = UNSET
+        if _images is not UNSET:
+            images = []
+            for images_item_data in _images:
+                images_item = InferenceImageURL.from_dict(images_item_data)
+
+                images.append(images_item)
 
         prompt = d.pop("prompt", UNSET)
 
@@ -88,6 +125,8 @@ class InferenceReadRequest:
 
         inference_read_request = cls(
             model=model,
+            retain_artifact=retain_artifact,
+            documents=documents,
             images=images,
             prompt=prompt,
             max_tokens=max_tokens,

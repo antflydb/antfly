@@ -21,11 +21,10 @@ const reranking = @import("antfly_reranking");
 const decisions = @import("../functions/decisions.zig");
 
 const Allocator = std.mem.Allocator;
-pub const tasks = @import("inference_tasks.zig");
-pub const gateway = @import("inference_gateway.zig");
+const capabilities = @import("inference_capabilities.zig");
 
 test {
-    _ = gateway;
+    _ = @import("inference_gateway.zig");
     _ = @import("inference_telemetry.zig");
     _ = @import("inference_stream.zig");
 }
@@ -33,7 +32,9 @@ test {
 /// Tasks without an inline vendor adapter bind a runtime model to an existing
 /// physical connection. Credentials stay owned by that connection.
 pub const RuntimeBinding = struct {
-    model: []const u8,
+    generator: ?[]const u8 = null,
+    instructions: []const u8 = "",
+    model: []const u8 = "",
     connection: []const u8 = "local-inference",
 };
 
@@ -89,7 +90,7 @@ pub const Registry = struct {
     extractor_configs: std.StringArrayHashMapUnmanaged(RuntimeBinding) = .{},
     rewriter_configs: std.StringArrayHashMapUnmanaged(RuntimeBinding) = .{},
     predictor_configs: std.StringArrayHashMapUnmanaged(RuntimeBinding) = .{},
-    inference_capabilities: std.StringArrayHashMapUnmanaged(gateway.Capabilities) = .{},
+    inference_capabilities: std.StringArrayHashMapUnmanaged(capabilities.Capabilities) = .{},
 
     pub fn init(alloc: Allocator) Registry {
         return .{ .allocator = alloc };
@@ -144,6 +145,8 @@ pub const Registry = struct {
                 self.allocator.free(entry.key_ptr.*);
                 self.allocator.free(entry.value_ptr.model);
                 self.allocator.free(entry.value_ptr.connection);
+                if (entry.value_ptr.generator) |name| self.allocator.free(name);
+                self.allocator.free(entry.value_ptr.instructions);
             }
             @field(self, field).deinit(self.allocator);
         }
@@ -171,14 +174,21 @@ pub const Registry = struct {
                 while (it.next()) |entry| {
                     const parsed = try std.json.parseFromValue(RuntimeBinding, alloc, entry.value_ptr.*, .{ .allocate = .alloc_always });
                     defer parsed.deinit();
-                    if (entry.key_ptr.*.len == 0 or parsed.value.model.len == 0 or parsed.value.connection.len == 0) return error.InvalidRegistryConfig;
+                    if (entry.key_ptr.*.len == 0 or parsed.value.connection.len == 0 or parsed.value.instructions.len > 65536) return error.InvalidRegistryConfig;
+                    if (parsed.value.generator) |name| {
+                        if (!std.mem.eql(u8, field[0], "rewriters") or name.len == 0 or parsed.value.model.len != 0 or !std.mem.eql(u8, parsed.value.connection, "local-inference")) return error.InvalidRegistryConfig;
+                    } else if (parsed.value.model.len == 0 or parsed.value.instructions.len != 0) return error.InvalidRegistryConfig;
                     const key = try alloc.dupe(u8, entry.key_ptr.*);
                     errdefer alloc.free(key);
                     const model = try alloc.dupe(u8, parsed.value.model);
                     errdefer alloc.free(model);
                     const connection = try alloc.dupe(u8, parsed.value.connection);
                     errdefer alloc.free(connection);
-                    try @field(registry, field[1]).put(alloc, key, .{ .model = model, .connection = connection });
+                    const generator = if (parsed.value.generator) |name| try alloc.dupe(u8, name) else null;
+                    errdefer if (generator) |name| alloc.free(name);
+                    const instructions = try alloc.dupe(u8, parsed.value.instructions);
+                    errdefer alloc.free(instructions);
+                    try @field(registry, field[1]).put(alloc, key, .{ .model = model, .connection = connection, .generator = generator, .instructions = instructions });
                 }
             }
         }
@@ -186,7 +196,7 @@ pub const Registry = struct {
             if (configs != .object) return error.InvalidRegistryConfig;
             var it = configs.object.iterator();
             while (it.next()) |entry| {
-                const parsed = try std.json.parseFromValue(gateway.Capabilities, alloc, entry.value_ptr.*, .{});
+                const parsed = try std.json.parseFromValue(capabilities.Capabilities, alloc, entry.value_ptr.*, .{});
                 defer parsed.deinit();
                 const key = try alloc.dupe(u8, entry.key_ptr.*);
                 errdefer alloc.free(key);
@@ -218,6 +228,12 @@ pub const Registry = struct {
             try parseChunkers(&registry, chunkers_value);
         }
 
+        for (registry.decider_configs.values()) |decider| if (decider.embedder) |name| {
+            if (!registry.embedder_configs.contains(name)) return error.UnknownEmbedder;
+        };
+        for (registry.rewriter_configs.values()) |rewriter| if (rewriter.generator) |name| {
+            if (!registry.generator_configs.contains(name)) return error.UnknownGenerator;
+        };
         return registry;
     }
 
@@ -643,4 +659,70 @@ test "provider registry rejects invalid chain link sources" {
 
 fn stripNamespace(name: []const u8, prefix: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, name, prefix)) name[prefix.len..] else name;
+}
+
+test "provider registry gateway generated rewriting shares task execution and preserves batch order" {
+    const Check = struct {
+        calls: usize = 0,
+        truncate: bool = false,
+
+        fn generate(raw: *anyopaque, a: Allocator, body: []const u8, context: ?@import("antfly_inference_execution_context").RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.?.check();
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+            defer parsed.deinit();
+            const messages = parsed.value.object.get("messages").?.array.items;
+            try std.testing.expectEqualStrings("Preserve meaning.", messages[0].object.get("content").?.string);
+            const text = messages[1].object.get("content").?.string;
+            self.calls += 1;
+            return std.json.Stringify.valueAlloc(a, .{
+                .choices = .{.{ .message = .{ .content = text }, .finish_reason = if (self.truncate) @as([]const u8, "length") else "stop" }},
+                .usage = .{ .prompt_tokens = @as(u64, 2), .completion_tokens = @as(u64, 1), .total_tokens = @as(u64, 3) },
+            }, .{});
+        }
+    };
+    const a = std.testing.allocator;
+    var registry = try Registry.parseFromSlice(a,
+        \\{"generators":{"chat":{"provider":"antfly","model":"local"}},"rewriters":{"clean":{"generator":"chat","instructions":"Preserve meaning."}}}
+    );
+    defer registry.deinit();
+    var client = @import("httpx").Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    var state = Check{};
+    const executor = @import("inference_tasks.zig").Executor{
+        .view = .{ .providers = &registry },
+        .http = &client,
+        .context = .{ .io = std.testing.io, .deadline_ns = null },
+        .antfly_provider = .{ .ptr = &state, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Check.generate },
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = try executor.rewrite(arena.allocator(), "clean", "rewriters/clean", &.{ "first", "second" });
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+    try std.testing.expectEqualStrings("first", result.data[0].texts[0]);
+    try std.testing.expectEqualStrings("second", result.data[1].texts[0]);
+    try std.testing.expectEqual(@as(usize, 1), result.data[1].index);
+    try std.testing.expectEqual(@as(u64, 4), result.usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u64, 2), result.usage.completion_tokens);
+    try std.testing.expectEqual(@as(u64, 6), result.usage.total_tokens);
+    state.truncate = true;
+    try std.testing.expectError(error.InferenceOutputIncomplete, executor.rewrite(a, "clean", "rewriters/clean", &.{"too long"}));
+    try std.testing.expectError(error.InvalidInferenceRequest, executor.rewrite(a, "clean", "rewriters/clean", &.{}));
+}
+
+test "provider registry generated rewriters reject missing generators and incompatible bindings" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.UnknownGenerator, Registry.parseFromSlice(a,
+        \\{"rewriters":{"clean":{"generator":"missing"}}}
+    ));
+    for ([_][]const u8{
+        \\{"extractors":{"clean":{"generator":"chat"}}}
+        ,
+        \\{"rewriters":{"clean":{"generator":"chat","model":"ambiguous"}}}
+        ,
+        \\{"rewriters":{"clean":{"generator":"chat","connection":"remote"}}}
+        ,
+        \\{"rewriters":{"clean":{"model":"legacy","instructions":"unused"}}}
+        ,
+    }) |raw| try std.testing.expectError(error.InvalidRegistryConfig, Registry.parseFromSlice(a, raw));
 }

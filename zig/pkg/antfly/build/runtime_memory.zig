@@ -42,11 +42,34 @@ pub const CompileMemoryProfile = struct {
     // Opt-in only after the builder verifies SDK and all backend settings.
     macos_metal_blas_release: bool = false,
     macos_shared_storage_sdk27: bool = false,
+    linux_macos_sdk26_release: bool = false,
 };
 
 pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProfile) usize {
     const target = profile.target;
     const baseline_cpu = std.Target.Cpu.baseline(target.cpu.arch, target.os);
+    if (profile.linux_macos_sdk26_release and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and profile.host.abi == .gnu and
+        target.os.tag == .macos and target.cpu.arch == .aarch64 and
+        target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
+        profile.optimize == .fast and profile.strip and !profile.cpu_inference and !profile.sanitize_thread)
+    {
+        // Run 40791025212, Nix glibc Zig 0.17.0, SDK 26.1, Metal/BLAS.
+        // Round each reported MaxRSS up by another GiB, add 10%, then round
+        // up to GiB. API/adapter claims now overlap within 32 GiB instead of
+        // reserving 28 GiB each. See COMPILATION.md for the complete sample.
+        const gib: usize = switch (unit) {
+            .api_kernel => 17,
+            .distributed => 10,
+            .storage_kernel => 11,
+            .enrichment_compute => 3,
+            .serverless => 6,
+            .inference => 3,
+            .cli => 4,
+        };
+        return gib * 1024 * 1024 * 1024;
+    }
     if (profile.macos_metal_blas_release and
         std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
         profile.host.os.tag == .macos and profile.host.cpu.arch == .aarch64 and
@@ -99,6 +122,18 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         };
         return gib * 1024 * 1024 * 1024;
     }
+    if (unit == .api_kernel and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and profile.host.abi == .gnu and
+        target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
+        target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
+        profile.optimize == .fast and profile.strip and profile.cpu_inference and !profile.sanitize_thread)
+    {
+        // Better Auth run 40820082669: Nix/glibc LLVM API peaked at
+        // 6,698,409,984 bytes against the old 5 GiB claim, forcing a retry.
+        // 8 GiB retains >=25% headroom and overlaps storage within 20 GiB.
+        return 8 * 1024 * 1024 * 1024;
+    }
     if (profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and
         target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
         target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
@@ -132,6 +167,22 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
             .cli => 2,
         };
         return gib * 1024 * 1024 * 1024;
+    }
+    if (unit == .api_kernel and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and
+        target.os.tag == .linux and target.cpu.arch == .aarch64 and
+        (target.abi == .gnu or target.abi == .musl) and
+        target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
+        profile.optimize == .fast and profile.strip and !profile.sanitize_thread)
+    {
+        // Run 40426894698, glibc-linked Zig 0.17.0: ARM64 GNU/musl
+        // API archives peaked at 14,346,383,360/13,929,717,760 bytes.
+        // 15 GiB covers the larger peak plus 10% while still admitting
+        // the 4 GiB enrichment owner within a 20 GiB scheduler budget.
+        // Do not transfer these cross-target measurements to native x86,
+        // Debug, sanitizers or other runtime units.
+        return 15 * 1024 * 1024 * 1024;
     }
     return switch (unit) {
         // Claims conservatively cover clean production ReleaseFast
@@ -207,9 +258,11 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
         const measured = [_]struct { name: []const u8, mib: usize }{
             .{ .name = test_owner_names.root_unit, .mib = 18_816 },
             .{ .name = test_owner_names.api_storage_authority, .mib = 12_672 },
-            // Observed kernel high-water footprint under memory compression:
-            // 15,545,119,176 bytes, plus 10% rounded up to 128 MiB.
-            .{ .name = test_owner_names.capi_contract, .mib = 16_384 },
+            // Native SDK 26.6.2 cold contracts reached 19,145,900,032 bytes
+            // locally and 18,984,730,624 bytes in the consumer. Reserve the
+            // larger peak plus 10%, rounded up to 128 MiB. Qualified local
+            // SDK profiles retain their independent claims below.
+            .{ .name = test_owner_names.capi_contract, .mib = 20_096 },
             .{ .name = "data-runtime-tests", .mib = 15_616 },
             .{ .name = "data-runtime-implementation-tests", .mib = 19_584 },
         };
@@ -247,12 +300,20 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
     // Round each peak + 10% to whole GiB rather than applying a blanket bump
     // that would suppress unrelated compilation parallelism. See COMPILATION.md.
     const floors = [_]struct { name: []const u8, gib: usize }{
+        // Run 40624165216: native Nix glibc Zig 0.17.0 GNU Debug CAPI
+        // consumer object peaked at 17,141,358,592 bytes. Peak + 10%,
+        // rounded to whole GiB, fits the 20 GiB scheduler with room for
+        // small compilers instead of forcing a failed-claim recompilation.
+        .{ .name = test_owner_names.capi_contract, .gib = 18 },
         .{ .name = "public-api-parity", .gib = 20 },
         .{ .name = "data-runtime-tests", .gib = 14 },
         .{ .name = "standalone-runtime-owner-tests", .gib = 16 },
         .{ .name = "data-runtime-implementation-tests", .gib = 18 },
         .{ .name = "antfly-hosted-initial-fk-recovery", .gib = 14 },
         .{ .name = "sql-tests-local", .gib = 9 },
+        // Run 40586926751: native Nix Zig 0.17.0 GNU Debug auth compiler
+        // reached 15,804,899,328 bytes. Peak + 10%, rounded to whole GiB.
+        .{ .name = "api-auth-tests", .gib = 17 },
     };
     const gib: usize = for (floors) |floor| {
         if (std.mem.eql(u8, name, floor.name)) break floor.gib;
@@ -412,6 +473,45 @@ test "opt-in Darwin claims retain margins and reject unmeasured profiles" {
     try std.testing.expect(runtimeCompileMaxRss(.storage_kernel, profile) + runtimeCompileMaxRss(.distributed, profile) <= 28 * gib);
 }
 
+test "Linux cross Darwin release claims cover peaks and preserve useful overlap" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos, .cpu_model = .baseline });
+    const profile: CompileMemoryProfile = .{ .host = linux, .target = macos, .optimize = .fast, .strip = true, .cpu_inference = false, .linux_macos_sdk26_release = true };
+    const gib = 1024 * 1024 * 1024;
+    const upper_bounds = [_]usize{ 15, 9, 10, 2, 5, 2, 3 };
+    for (std.meta.tags(RuntimeLibraryUnit), upper_bounds) |unit, upper| {
+        const claim = runtimeCompileMaxRss(unit, profile);
+        try std.testing.expect(claim >= upper * gib + upper * gib / 10);
+        var fallback = profile;
+        fallback.linux_macos_sdk26_release = false;
+        const conservative = runtimeCompileMaxRss(unit, fallback);
+        try std.testing.expect(claim <= conservative);
+        inline for (.{ .debug, .safe, .small }) |mode| {
+            var unmeasured = profile;
+            unmeasured.optimize = mode;
+            try std.testing.expectEqual(conservative, runtimeCompileMaxRss(unit, unmeasured));
+        }
+        var other = profile;
+        other.strip = false;
+        try std.testing.expectEqual(conservative, runtimeCompileMaxRss(unit, other));
+        other = profile;
+        other.sanitize_thread = true;
+        try std.testing.expectEqual(conservative, runtimeCompileMaxRss(unit, other));
+        other = profile;
+        other.cpu_inference = true;
+        try std.testing.expectEqual(conservative, runtimeCompileMaxRss(unit, other));
+        other = profile;
+        other.host = macos;
+        try std.testing.expectEqual(conservative, runtimeCompileMaxRss(unit, other));
+        other = profile;
+        other.target.cpu.features.removeFeature(@backingInt(std.Target.aarch64.Feature.neon));
+        try std.testing.expectEqual(conservative, runtimeCompileMaxRss(unit, other));
+    }
+    const api = runtimeCompileMaxRss(.api_kernel, profile);
+    try std.testing.expect(api + runtimeCompileMaxRss(.storage_kernel, profile) <= 32 * gib);
+    try std.testing.expect(api + runtimeCompileMaxRss(.distributed, profile) <= 32 * gib);
+}
+
 test "default Linux CPU enrichment fits a three GiB build budget" {
     const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .cpu_model = .baseline, .os_tag = .linux, .abi = .gnu });
     const gib = 1024 * 1024 * 1024;
@@ -488,6 +588,26 @@ test "linked LLVM Debug test reservations cover native peaks without lowering au
     try std.testing.expectEqual(7 * gib, testCompileMaxRss("unmeasured", linux, linux, .debug, 7 * gib));
 }
 
+test "native Linux Debug auth admission covers measured peak and retains small-owner overlap" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const musl = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const gib = 1024 * 1024 * 1024;
+    const peak: usize = 15_804_899_328;
+    const claim = testCompileMaxRss("api-auth-tests", linux, linux, .debug, 7 * gib);
+    const required = peak + (peak + 9) / 10;
+    try std.testing.expect(claim >= required and claim < required + gib);
+    // Auth cannot safely overlap the 12 GiB inference owner under CI's
+    // unchanged 20 GiB budget; small compiles still use the remaining space.
+    try std.testing.expect(claim + 12 * gib > 20 * gib);
+    try std.testing.expect(claim + 3 * gib <= 20 * gib);
+    try std.testing.expectEqual(24 * gib, testCompileMaxRss("api-auth-tests", linux, linux, .debug, 24 * gib));
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-auth-tests", linux, linux, .safe, 7 * gib));
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-auth-tests", linux, musl, .debug, 7 * gib));
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-auth-tests", macos, linux, .debug, 7 * gib));
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-derived-coverage-tests", linux, linux, .debug, 7 * gib));
+}
+
 test "native Darwin Debug test reservations cover measured peaks without unsafe overlap" {
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
     const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
@@ -525,7 +645,7 @@ test "native Darwin Debug test reservations cover measured peaks without unsafe 
         try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, macos, linux, .debug, 12 * gib));
         try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, linux, macos, .debug, 12 * gib));
         // Some implementation closures now have independent Linux evidence.
-        const linux_floor: usize = if (std.mem.eql(u8, name, "data-runtime-implementation-tests")) 18 else if (std.mem.eql(u8, name, "antfly-hosted-initial-fk-recovery")) 14 else 7;
+        const linux_floor: usize = if (std.mem.eql(u8, name, "data-runtime-implementation-tests")) 18 else if (std.mem.eql(u8, name, "antfly-hosted-initial-fk-recovery")) 14 else if (std.mem.eql(u8, name, "api-auth-tests")) 17 else 7;
         try std.testing.expectEqual(linux_floor * gib, testCompileMaxRss(name, linux, linux, .debug, 7 * gib));
     }
 }
@@ -537,10 +657,20 @@ test "Linux release API reservations cover ARM64 GNU and musl peaks within the r
         const target = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = abi });
         const profile: CompileMemoryProfile = .{ .host = host, .target = target, .optimize = .fast, .strip = true, .cpu_inference = abi == .musl };
         const claim = runtimeCompileMaxRss(.api_kernel, profile);
-        const peak: usize = if (abi == .gnu) 10_983_571_456 else 10_788_933_632;
-        try std.testing.expectEqual(12 * gib, claim);
-        try std.testing.expect(claim >= peak + peak / 6);
+        const peak: usize = if (abi == .gnu) 14_346_383_360 else 13_929_717_760;
+        try std.testing.expectEqual(15 * gib, claim);
+        try std.testing.expect(claim >= peak + peak / 10);
         try std.testing.expect(claim + runtimeCompileMaxRss(.enrichment_compute, profile) <= 20 * gib);
+        var unmeasured = profile;
+        unmeasured.optimize = .debug;
+        try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, unmeasured));
+        unmeasured = profile;
+        unmeasured.strip = false;
+        try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, unmeasured));
+        unmeasured = profile;
+        unmeasured.sanitize_thread = true;
+        try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, unmeasured));
+        try std.testing.expectEqual(20 * gib, runtimeCompileMaxRss(.storage_kernel, profile));
     }
 }
 
@@ -575,7 +705,7 @@ test "expanded Darwin Debug claims cover complete peaks with bounded headroom" {
     for ([_]struct { name: []const u8, peak: usize }{
         .{ .name = test_owner_names.root_unit, .peak = 17_932_107_776 },
         .{ .name = test_owner_names.api_storage_authority, .peak = 12_037_652_480 },
-        .{ .name = test_owner_names.capi_contract, .peak = 15_545_119_176 },
+        .{ .name = test_owner_names.capi_contract, .peak = 19_145_900_032 },
         .{ .name = "data-runtime-tests", .peak = 14_813_134_848 },
         .{ .name = "data-runtime-implementation-tests", .peak = 18_559_696_896 },
     }) |sample| {
@@ -591,7 +721,8 @@ test "expanded Darwin Debug claims cover complete peaks with bounded headroom" {
     const budget = 36 * gib * 4 / 5;
     try std.testing.expect(testCompileMaxRss("root-unit-tests", macos, macos, .debug, 0) + 10 * gib <= budget);
     try std.testing.expect(testCompileMaxRss("data-runtime-implementation-tests", macos, macos, .debug, 0) + 9 * gib <= budget);
-    try std.testing.expect(testCompileMaxRss(test_owner_names.capi_contract, macos, macos, .debug, 0) + testCompileMaxRss(test_owner_names.api_storage_authority, macos, macos, .debug, 0) <= budget);
+    // These newly measured consumers must serialize on a 36 GiB host.
+    try std.testing.expect(testCompileMaxRss(test_owner_names.capi_contract, macos, macos, .debug, 0) + testCompileMaxRss(test_owner_names.api_storage_authority, macos, macos, .debug, 0) > budget);
 }
 
 test "qualified local claims are independent of consumers and preserve three compiler overlap" {
@@ -627,4 +758,32 @@ test "qualified local claims are independent of consumers and preserve three com
     // 28.75 GiB fits this host's 28.8 GiB compiler budget. Rounding each
     // claim to a whole GiB, or inheriting the consumer claim, prevents it.
     try std.testing.expect(consumer + root_local + data_local <= 36 * gib * 4 / 5);
+}
+
+test "native Linux CAPI test reservation covers the measured compiler without consuming the whole budget" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const peak: usize = 17_141_358_592;
+    const claim = testCompileMaxRss(test_owner_names.capi_contract, linux, linux, .debug, 7 * 1024 * 1024 * 1024);
+    try std.testing.expect(claim >= peak + peak / 10);
+    try std.testing.expect(claim + 2 * 1024 * 1024 * 1024 <= 20 * 1024 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 7 * 1024 * 1024 * 1024), testCompileMaxRss(test_owner_names.capi_contract, linux, linux, .fast, 7 * 1024 * 1024 * 1024));
+}
+
+test "native Linux LLVM fast API covers measured peak and preserves overlap" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .cpu_model = .baseline, .os_tag = .linux, .abi = .gnu });
+    const gib = 1024 * 1024 * 1024;
+    var profile: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .fast, .strip = true, .cpu_inference = true };
+    const peak: usize = 6_698_409_984;
+    const claim = runtimeCompileMaxRss(.api_kernel, profile);
+    try std.testing.expectEqual(8 * gib, claim);
+    try std.testing.expect(claim >= peak + peak / 4);
+    try std.testing.expect(claim + runtimeCompileMaxRss(.storage_kernel, profile) + 2 * gib <= 20 * gib);
+    profile.optimize = .safe;
+    try std.testing.expectEqual(7 * gib, runtimeCompileMaxRss(.api_kernel, profile));
+    profile.optimize = .fast;
+    profile.strip = false;
+    try std.testing.expect(runtimeCompileMaxRss(.api_kernel, profile) > claim);
+    profile.strip = true;
+    profile.sanitize_thread = true;
+    try std.testing.expect(runtimeCompileMaxRss(.api_kernel, profile) > claim);
 }

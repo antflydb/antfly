@@ -58,7 +58,9 @@ BUILD = {"cwd": "zig", "command": COMMAND, "target": "inference-test-context", "
          "optimize": "ReleaseFast", "metal": True, "cuda": False, "onnx": False}
 LIMITS = {"timeout": 3600, "max_rss_mib": 8192, "min_free_percent": 15,
           "max_swap_growth_mib": 512, "min_disk_free_mib": 4096}
-MAX_FILES = 8192
+# Bound archive metadata separately from the total source byte limit. The
+# complete runtime tree includes more than 8192 Git-visible source inputs.
+MAX_FILES = 16384
 MAX_UNCOMPRESSED = 768 * 1024 * 1024
 EXPECTED_STRIPPED_COMPILER_PROFILE = {"strip_debug_info": True, "have_error_return_tracing": False}
 COMPILER_PROFILE_PREFIX = "context_compiler_profile: "

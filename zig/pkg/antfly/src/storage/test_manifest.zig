@@ -22,6 +22,8 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("antfly_local_sources").storage_db_field_projection_source;
+    _ = @import("antfly_local_sources").storage_source_value_identity;
     _ = @import("antfly_local_sources").storage_engine;
     _ = @import("antfly_local_sources").storage_logical_source;
     _ = @import("antfly_local_sources").storage_document_projection;
@@ -47,6 +49,8 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_group_sources;
     _ = @import("antfly_local_sources").storage_db_resolver_authority;
     _ = @import("antfly_local_sources").storage_db_resolver_curation;
+    _ = @import("antfly_local_sources").storage_db_resolver_query_context;
+    _ = @import("antfly_local_sources").storage_db_resolver_static_profiles;
     _ = @import("antfly_local_sources").storage_db_native_query_reuse;
     _ = @import("antfly_local_sources").storage_db_runtime_callbacks;
     _ = @import("antfly_local_sources").storage_db_replay_vector_collectors;
@@ -229,6 +233,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_enrichment_chunker;
     _ = @import("antfly_local_sources").storage_db_enrichment_chunker_stub;
     _ = @import("antfly_local_sources").storage_db_enrichment_config_validation;
+    _ = @import("antfly_local_sources").storage_db_enrichment_document_checkpoints;
     _ = @import("antfly_local_sources").storage_db_enrichment_vector_label_cache;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_extraction;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_unit_fingerprint;

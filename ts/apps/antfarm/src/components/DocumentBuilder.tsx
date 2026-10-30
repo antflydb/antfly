@@ -8,13 +8,13 @@ import {
   CardHeader,
   CardTitle,
   Input,
+  Spinner,
   Textarea,
 } from "@antfly/design-system";
 import type { BatchRequest } from "@antfly/sdk";
 import { CircleAlert, CircleCheck } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useState } from "react";
-import { Spinner } from "@/components/spinner";
 import { api, type JSONSchemaProperty, type TableSchema } from "../api";
 
 interface DocumentBuilderProps {
@@ -24,11 +24,14 @@ interface DocumentBuilderProps {
 
 const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) => {
   const [documentValues, setDocumentValues] = useState<Record<string, unknown>>({});
+  const [documentJson, setDocumentJson] = useState("{}");
   const [selectedSchemaType, setSelectedSchemaType] = useState<string>("");
   const [documentId, setDocumentId] = useState<string>("");
   const [builderLoading, setBuilderLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const schemaProperties = schema?.document_schemas?.[selectedSchemaType]?.schema.properties;
+  const useJsonEntry = Object.keys(schemaProperties ?? {}).length === 0;
 
   // Helper function to generate default values for a schema property
   const generateDefaultValue = useCallback((property: JSONSchemaProperty): unknown => {
@@ -58,15 +61,16 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
 
   // Initialize document values when schema type changes
   useEffect(() => {
-    if (selectedSchemaType && schema?.document_schemas?.[selectedSchemaType]?.schema.properties) {
-      const properties = schema.document_schemas[selectedSchemaType].schema.properties;
-      const defaultValues: Record<string, unknown> = {};
-      Object.entries(properties).forEach(([key, property]) => {
-        defaultValues[key] = generateDefaultValue(property);
-      });
-      setDocumentValues(defaultValues);
-      setDocumentId(""); // Reset document ID when schema type changes
-    }
+    const properties = schema?.document_schemas?.[selectedSchemaType]?.schema.properties;
+    const defaultValues: Record<string, unknown> = {};
+    Object.entries(properties ?? {}).forEach(([key, property]) => {
+      defaultValues[key] = generateDefaultValue(property);
+    });
+    setDocumentValues(defaultValues);
+    setDocumentJson("{}");
+    setDocumentId("");
+    setError(null);
+    setSuccess(null);
   }, [selectedSchemaType, schema, generateDefaultValue]);
 
   // Set default schema type on schema change
@@ -96,9 +100,23 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
         throw new Error("Document ID is required.");
       }
 
+      let document = documentValues;
+      if (useJsonEntry) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(documentJson);
+        } catch {
+          throw new Error("Enter a valid JSON object for the document.");
+        }
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("Enter a valid JSON object for the document.");
+        }
+        document = parsed as Record<string, unknown>;
+      }
+
       const batchRequest: BatchRequest = {
         inserts: {
-          [documentId]: documentValues,
+          [documentId]: document,
         },
       };
 
@@ -107,6 +125,7 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
 
       // Reset document ID and values to defaults
       setDocumentId("");
+      setDocumentJson("{}");
 
       // Reset document values to defaults
       const properties = schema.document_schemas?.[selectedSchemaType]?.schema.properties;
@@ -127,7 +146,16 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
     } finally {
       setBuilderLoading(false);
     }
-  }, [tableName, selectedSchemaType, schema, documentValues, documentId, generateDefaultValue]);
+  }, [
+    tableName,
+    selectedSchemaType,
+    schema,
+    documentValues,
+    documentJson,
+    useJsonEntry,
+    documentId,
+    generateDefaultValue,
+  ]);
 
   const renderFormField = (fieldName: string, property: JSONSchemaProperty, value: unknown) => {
     const updateValue = (newValue: unknown) => {
@@ -250,7 +278,7 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
               <select
                 value={selectedSchemaType}
                 onChange={(e) => setSelectedSchemaType(e.target.value)}
-                className="rounded-none border border-input bg-background px-3 py-2 text-sm"
+                className="rounded-md border border-input bg-background px-3 py-2 text-sm"
               >
                 <option value="">Select a document type</option>
                 {Object.keys(schema.document_schemas).map((schemaName) => (
@@ -273,10 +301,25 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
                   />
                 </label>
 
-                <h4 className="font-semibold">Document Fields</h4>
-                {Object.entries(schema.document_schemas[selectedSchemaType].schema.properties).map(
-                  ([fieldName, property]) =>
-                    renderFormField(fieldName, property, documentValues[fieldName])
+                {useJsonEntry ? (
+                  <label htmlFor="document-json" className="block space-y-2">
+                    <span className="text-sm font-medium">Document JSON</span>
+                    <Textarea
+                      id="document-json"
+                      value={documentJson}
+                      onChange={(e) => setDocumentJson(e.target.value)}
+                      rows={8}
+                      className="font-mono"
+                      spellCheck={false}
+                    />
+                  </label>
+                ) : (
+                  <>
+                    <h4 className="font-semibold">Document Fields</h4>
+                    {Object.entries(schemaProperties ?? {}).map(([fieldName, property]) =>
+                      renderFormField(fieldName, property, documentValues[fieldName])
+                    )}
+                  </>
                 )}
 
                 <Button

@@ -1,0 +1,34 @@
+---
+title: OpenRouter
+description: Route embeddings and generation through OpenRouter
+order: 10
+---
+
+The `openrouter` provider calls OpenRouter's OpenAI-compatible API, which routes
+to many hosted models under one key.
+
+## What It Provides
+
+| Component | Inputs | Notes |
+|---|---|---|
+| Embedder | Text | For example `openai/text-embedding-3-small` |
+| Generator | Text, images | Images need a vision model; streaming and function tools where the model supports them |
+
+## Credentials
+
+`api_key`, defaulting to `OPENROUTER_API_KEY`. The endpoint defaults to
+`https://openrouter.ai/api/v1`.
+
+## Example
+
+```json
+{
+  "generators": {
+    "router": {
+      "provider": "openrouter",
+      "model": "openai/gpt-4o-mini",
+      "api_key": "${secret:openrouter.api_key}"
+    }
+  }
+}
+```

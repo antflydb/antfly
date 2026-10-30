@@ -32,6 +32,54 @@ spec.loader.exec_module(deps)
 
 
 class DependencyTests(unittest.TestCase):
+    def test_release_qualification_prefetches_with_the_actual_archive_cache(self):
+        root = Path(__file__).resolve().parents[2]
+
+        def job(workflow, name):
+            text = (root / ".github/workflows" / workflow).read_text()
+            match = re.search(rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  \S|\Z)", text)
+            self.assertIsNotNone(match, (workflow, name))
+            return match.group(1)
+
+        for workflow, name, policy_ref in (
+            ("qualify-release-archives.yml", "archives", "github.workflow_sha"),
+        ):
+            with self.subTest(workflow=workflow):
+                body = job(workflow, name)
+                cache = re.search(
+                    r"^      ANTFLY_ZIG_CACHE_ROOT: (.+)$", body, re.M
+                ).group(1)
+                packages = re.search(
+                    r"^      ZIG_GLOBAL_CACHE_DIR: (.+)$", body, re.M
+                ).group(1)
+                self.assertEqual(packages, cache + "/global")
+                self.assertIn(
+                    "    permissions:\n      contents: read\n      id-token: write\n",
+                    body,
+                )
+                policy = body.index("- name: Check out executing dependency policy")
+                prepare = body.index(
+                    "uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies"
+                )
+                build = body.index("- name: Build source-declared runtime archives")
+                self.assertLess(policy, prepare)
+                self.assertLess(prepare, build)
+                self.assertIn("ref: ${{ " + policy_ref + " }}", body[policy:prepare])
+                self.assertIn("persist-credentials: false", body[policy:prepare])
+                self.assertIn("mirror-only: 'true'", body[prepare:build])
+
+        # GitHub refuses OIDC in a nested reusable workflow unless each caller
+        # explicitly delegates it. Admission retains its read-only permissions.
+        for workflow, name in (
+            ("antfly-release-build-controller.yml", "build"),
+            ("qualify-linux-release.yml", "archives"),
+            ("diagnose-zig-arm64-bad-alloc.yml", "archives"),
+            ("pr-ci.yml", "linux-release"),
+            ("pr-ci.yml", "darwin"),
+        ):
+            with self.subTest(workflow=workflow, job=name):
+                self.assertIn("      id-token: write", job(workflow, name))
+
     def test_workflow_action_bootstraps_an_older_checkout_and_validates_its_sources(
         self,
     ):

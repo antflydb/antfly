@@ -261,9 +261,12 @@ fn routeErrorStatus(err: anyerror) ?u16 {
         error.BodyCapacityExceeded => 429,
         error.EndOfStream,
         error.SyntaxError,
+        error.UnexpectedEndOfInput,
         error.UnexpectedToken,
         error.MissingField,
         error.UnknownField,
+        error.DuplicateField,
+        error.InvalidEnumTag,
         error.InvalidRequest,
         => 400,
         else => 500,
@@ -280,6 +283,23 @@ fn h2BodyAdmissionErrorStatus(err: anyerror) ?u16 {
 
 fn parserErrorStatus(reason: ParserErrorReason) u16 {
     return if (reason == .body_too_large) 413 else 400;
+}
+
+/// A handler error that reaches the server names the problem when the error
+/// identifies one. These are static strings: the error path never allocates
+/// and never echoes request content.
+fn routeErrorBodyFor(code: u16, err: ?anyerror) []const u8 {
+    if (code == 400) if (err) |e| switch (e) {
+        error.SyntaxError => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: syntax error in request body\"}",
+        error.EndOfStream, error.UnexpectedEndOfInput => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: request body ended unexpectedly\"}",
+        error.UnexpectedToken => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: a field has the wrong type\"}",
+        error.MissingField => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: a required field is missing\"}",
+        error.UnknownField => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: unknown field in request body\"}",
+        error.DuplicateField => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: a field appears more than once\"}",
+        error.InvalidEnumTag => return "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: a field has an unsupported value\"}",
+        else => {},
+    };
+    return routeErrorBody(code);
 }
 
 fn routeErrorBody(code: u16) []const u8 {
@@ -2497,7 +2517,7 @@ pub const Server = struct {
                 // response would corrupt the connection. Closing the
                 // connection is the only valid terminal action.
                 if (ctx.h1_stream_sent) return;
-                return self.sendError(&sock, status);
+                return self.sendErrorBody(&sock, status, routeErrorBodyFor(status, err));
             };
             if (application.status) |status| return self.sendError(&sock, status);
             var response = application.response.?;
@@ -3216,7 +3236,7 @@ pub const Server = struct {
                     cancelH2Stream(h2, sock, stream_id);
                     return;
                 };
-                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                if (!ctx.h2_stream_sent) try self.sendH2RouteErrorLocked(h2, sock, stream_id, status, err);
                 return;
             };
         }
@@ -3242,7 +3262,7 @@ pub const Server = struct {
                     cancelH2Stream(h2, sock, stream_id);
                     return;
                 };
-                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                if (!ctx.h2_stream_sent) try self.sendH2RouteErrorLocked(h2, sock, stream_id, status, err);
                 return;
             };
         } else {
@@ -3256,7 +3276,7 @@ pub const Server = struct {
                         cancelH2Stream(h2, sock, stream_id);
                         return;
                     };
-                    if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                    if (!ctx.h2_stream_sent) try self.sendH2RouteErrorLocked(h2, sock, stream_id, status, err);
                     return;
                 };
             } else if (self.global_handler) |global_handler| {
@@ -3265,7 +3285,7 @@ pub const Server = struct {
                         cancelH2Stream(h2, sock, stream_id);
                         return;
                     };
-                    if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                    if (!ctx.h2_stream_sent) try self.sendH2RouteErrorLocked(h2, sock, stream_id, status, err);
                     return;
                 };
             } else {
@@ -3324,7 +3344,10 @@ pub const Server = struct {
 
     /// Sends the same safe JSON error envelope used by HTTP/1.
     fn sendH2Error(self: *Self, h2: *H2Connection, writer: anytype, stream_id: u31, code: u16) !void {
-        const body = routeErrorBody(code);
+        return self.sendH2ErrorBody(h2, writer, stream_id, code, routeErrorBody(code));
+    }
+
+    fn sendH2ErrorBody(self: *Self, h2: *H2Connection, writer: anytype, stream_id: u31, code: u16, body: []const u8) !void {
         var length_buf: [32]u8 = undefined;
         const length = try std.fmt.bufPrint(&length_buf, "{d}", .{body.len});
         var extra = [_]hpack.HeaderEntry{
@@ -3345,6 +3368,13 @@ pub const Server = struct {
         h2.write_mutex.lockUncancelable(h2.io);
         defer h2.write_mutex.unlock(h2.io);
         try self.sendH2Error(h2, writer, stream_id, code);
+    }
+
+    /// Route-error variant: the body names the handler error when it can.
+    fn sendH2RouteErrorLocked(self: *Self, h2: *H2Connection, writer: anytype, stream_id: u31, code: u16, err: anyerror) !void {
+        h2.write_mutex.lockUncancelable(h2.io);
+        defer h2.write_mutex.unlock(h2.io);
+        try self.sendH2ErrorBody(h2, writer, stream_id, code, routeErrorBodyFor(code, err));
     }
 
     /// StreamManager stores Stream allocations separately from its hash map.
@@ -3388,7 +3418,7 @@ pub const Server = struct {
             h2.stream_manager.removeStream(stream_id);
             return false;
         }
-        if (self.router.hasBodyLimits()) {
+        {
             var method: ?types.Method = null;
             var request_target: ?[]const u8 = null;
             if (stream.request_headers) |headers| for (headers) |header| {
@@ -3451,10 +3481,14 @@ pub const Server = struct {
 
     /// Sends an error response.
     fn sendError(self: *Self, socket: *Socket, code: u16) !void {
+        return self.sendErrorBody(socket, code, routeErrorBody(code));
+    }
+
+    fn sendErrorBody(self: *Self, socket: *Socket, code: u16, body: []const u8) !void {
         var resp = Response.init(self.allocator, code);
         defer resp.deinit();
 
-        resp.body = routeErrorBody(code);
+        resp.body = body;
         try resp.headers.set(HeaderName.CONTENT_TYPE, "application/json");
         // Every sendError caller terminates the HTTP/1 connection. Make that
         // lifecycle explicit so clients do not return the socket to a pool.
@@ -3955,6 +3989,23 @@ test "routeErrorStatus maps oversized route errors to payload too large" {
         "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid request\"}",
         routeErrorBody(400),
     );
+    try std.testing.expectEqual(@as(?u16, 400), routeErrorStatus(error.UnexpectedEndOfInput));
+    try std.testing.expectEqual(@as(?u16, 400), routeErrorStatus(error.InvalidEnumTag));
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: syntax error in request body\"}",
+        routeErrorBodyFor(400, error.SyntaxError),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: a required field is missing\"}",
+        routeErrorBodyFor(400, error.MissingField),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid JSON: a field has the wrong type\"}",
+        routeErrorBodyFor(400, error.UnexpectedToken),
+    );
+    // Errors without a specific description keep the generic envelope.
+    try std.testing.expectEqualStrings(routeErrorBody(400), routeErrorBodyFor(400, error.InvalidRequest));
+    try std.testing.expectEqualStrings(routeErrorBody(500), routeErrorBodyFor(500, error.SyntaxError));
     try std.testing.expectEqualStrings(
         "{\"error\":\"NOT_FOUND\",\"message\":\"resource not found\"}",
         routeErrorBody(404),
@@ -4047,6 +4098,9 @@ test "route body limits resolve before transport body admission" {
     }.h;
     try server.postWithBodyLimit("/bounded/:id", 64, handler);
     try server.post("/global", handler);
+    server.config.max_streamed_body_size = 1024 * 1024 * 1024;
+    try server.routeStreamingRawWithBodyLimit(.POST, "/duplex", 1024 * 1024 * 1024, handler);
+    try std.testing.expectEqual(@as(?usize, 1024 * 1024 * 1024), Server.resolveRequestBodyLimit(&server, .POST, "/duplex"));
 
     try std.testing.expectEqual(@as(?usize, 64), Server.resolveRequestBodyLimit(&server, .POST, "/bounded/7?x=1"));
     try std.testing.expectEqual(@as(?usize, null), Server.resolveRequestBodyLimit(&server, .POST, "/global"));

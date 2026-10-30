@@ -115,6 +115,10 @@ components:
         changed: {type: boolean}
         atomicity: {type: string, enum: [namespace, resolver]}
         applied: {type: boolean}
+        progress_url: {type: string, format: uri-reference, description: Relative native consumer-progress resource; resolve against the decision request URI.}
+        namespaces:
+          type: array
+          items: {$ref: '#/components/schemas/EntityNamespaceOutcome'}
         results: {type: array, items: {type: object, additionalProperties: true}}
     ResolverRedirect:
       type: object
@@ -422,7 +426,13 @@ components:
         atomicity:
           type: string
           enum: [namespace, source_table, resolver]
-          description: Server entity corrections commit once on the destination table, atomically across matching namespaces. Source replay remains asynchronous. Lite retains resolver atomicity.
+          description: Entity corrections commit atomically across matching namespaces on the destination table; replay is asynchronous. Other atomicity values identify the scope guaranteed by the responding adapter.
+        applied: {type: boolean, description: "True only when replay completion was observed for all consumers, or no consumers exist. Admission without wait is conservative."}
+        progress_url: {type: string, format: uri-reference, description: "Native HTTP mutations return this progress resource relative to the request URI. Follow its bounded pages for individual consumer proofs."}
+        namespaces:
+          type: array
+          description: Mutation outcomes, stored once per namespace. Read absorbed keys and dispositions here; consumer progress rows reference these by key_template. The results array is reserved for inspection and embedded consumer summaries.
+          items: {$ref: '#/components/schemas/EntityNamespaceOutcome'}
         results:
           type: array
           items:
@@ -435,14 +445,6 @@ components:
               canonical_key: {type: string}
               curation: {type: object, additionalProperties: true}
               revision: {type: integer, format: uint64}
-              absorbed:
-                type: array
-                items:
-                  type: object
-                  required: [key, disposition]
-                  properties:
-                    key: {type: string}
-                    disposition: {type: string, enum: [release, suppress]}
               changed: {type: boolean}
               replay_sequence: {type: integer, format: uint64}
               applied: {type: boolean}
@@ -452,3 +454,41 @@ components:
               distinct: {type: array, items: {$ref: '#/components/schemas/ResolverDistinctPair'}}
               configured_suppressed: {type: boolean}
               runtime_suppressed: {type: boolean}
+
+    EntityNamespaceOutcome:
+      type: object
+      required: [key_template, revision, changed, absorbed]
+      properties:
+        key_template: {type: string}
+        revision: {type: integer, format: uint64}
+        changed: {type: boolean}
+        absorbed:
+          type: array
+          items:
+            type: object
+            required: [key, disposition]
+            properties:
+              key: {type: string}
+              disposition: {type: string, enum: [release, suppress]}
+    EntityConsumerProgressPage:
+      type: object
+      required: [entity_table, key, catalog_revision, complete, results]
+      properties:
+        entity_table: {type: string}
+        key: {type: string}
+        catalog_revision: {type: integer, format: uint64}
+        complete: {type: boolean, description: True when enumeration has no further pages; it does not certify replay completion.}
+        next_cursor: {type: string, nullable: true}
+        results:
+          type: array
+          maxItems: 256
+          items:
+            type: object
+            required: [source_table, resolver, key_template, revision, applied, progress]
+            properties:
+              source_table: {type: string}
+              resolver: {type: string}
+              key_template: {type: string}
+              revision: {type: integer, format: uint64}
+              applied: {type: boolean}
+              progress: {$ref: '#/components/schemas/ResolverReplayProgress'}

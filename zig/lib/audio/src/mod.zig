@@ -145,6 +145,8 @@ const Complex = struct { re: f64, im: f64 };
 
 pub const NormalizationType = enum { whisper, simple };
 
+pub const MelScale = enum { htk, slaney };
+
 pub const AudioConfig = struct {
     sample_rate: u32,
     n_fft: u32,
@@ -152,6 +154,8 @@ pub const AudioConfig = struct {
     n_mels: u32,
     chunk_length_s: u32,
     normalization: NormalizationType,
+    mel_scale: MelScale = .htk,
+    center: bool = false,
 };
 
 pub const Audio = struct {
@@ -308,7 +312,9 @@ pub const DecodeOptions = struct {
     file_name_hint: ?[]const u8 = null,
 };
 
-fn detectFormatWithOptions(audio_bytes: []const u8, options: DecodeOptions) ?EncodedFormat {
+/// Resolve the encoded format using the same hint precedence as decoding.
+/// Header-only admission must use this before interpreting format-specific data.
+pub fn detectFormatWithOptions(audio_bytes: []const u8, options: DecodeOptions) ?EncodedFormat {
     if (options.format_hint) |format| return format;
     if (options.mime_hint) |mime| {
         if (detectFormatFromMime(mime)) |format| return format;
@@ -1086,12 +1092,20 @@ pub fn logMelSpectrogramWithConfig(
 
     const min_samples = config.chunk_length_s * config.sample_rate;
     const padded_len = @max(samples.len, min_samples);
-    const padded = try allocator.alloc(f32, padded_len);
+    const padding = if (config.center) n_fft / 2 else 0;
+    const padded = try allocator.alloc(f32, padded_len + 2 * padding);
     defer allocator.free(padded);
-    @memcpy(padded[0..samples.len], samples);
-    @memset(padded[samples.len..], 0);
+    @memcpy(padded[padding..][0..samples.len], samples);
+    @memset(padded[padding + samples.len .. padding + padded_len], 0);
+    if (config.center) {
+        const body = padded[padding..][0..padded_len];
+        for (0..padding) |i| {
+            padded[i] = body[reflectSampleIndex(@as(isize, @intCast(i)) - @as(isize, @intCast(padding)), padded_len)];
+            padded[padding + padded_len + i] = body[reflectSampleIndex(@intCast(padded_len + i), padded_len)];
+        }
+    }
 
-    const filters = try melFilterbank(allocator, n_mels, n_fft, config.sample_rate);
+    const filters = try melFilterbankWithScale(allocator, n_mels, n_fft, config.sample_rate, 0, 0, config.mel_scale);
     defer allocator.free(filters);
 
     const window = try allocator.alloc(f32, n_fft);
@@ -1107,7 +1121,8 @@ pub fn logMelSpectrogramWithConfig(
     const output = try allocator.alloc(f32, n_mels * max_frames);
     @memset(output, 0);
 
-    const actual_frames = @min((padded_len - n_fft) / hop + 1, max_frames);
+    // Centered STFT has one extra end frame; Whisper drops that frame.
+    const actual_frames = if (config.center) @min(padded_len / hop, max_frames) else @min((padded_len - n_fft) / hop + 1, max_frames);
     const magnitudes = try allocator.alloc(f32, n_freq);
     defer allocator.free(magnitudes);
 
@@ -1148,22 +1163,36 @@ pub fn melFilterbankWithRange(
     min_hz: f32,
     max_hz: f32,
 ) ![]f32 {
+    return melFilterbankWithScale(allocator, n_mels, n_fft, sample_rate, min_hz, max_hz, .htk);
+}
+
+pub fn melFilterbankWithScale(
+    allocator: std.mem.Allocator,
+    n_mels: u32,
+    n_fft: u32,
+    sample_rate: u32,
+    min_hz: f32,
+    max_hz: f32,
+    scale: MelScale,
+) ![]f32 {
     const n_freq = n_fft / 2 + 1;
     const filters = try allocator.alloc(f32, n_mels * n_freq);
+    errdefer allocator.free(filters);
     @memset(filters, 0);
 
     const sr_f: f32 = @floatFromInt(sample_rate);
     const fft_f: f32 = @floatFromInt(n_fft);
 
-    const mel_low = hzToMel(min_hz);
-    const mel_high = hzToMel(if (max_hz > 0) @min(max_hz, sr_f / 2.0) else sr_f / 2.0);
+    const mel_low = if (scale == .slaney) hzToSlaneyMel(min_hz) else hzToMel(min_hz);
+    const high_hz = if (max_hz > 0) @min(max_hz, sr_f / 2.0) else sr_f / 2.0;
+    const mel_high = if (scale == .slaney) hzToSlaneyMel(high_hz) else hzToMel(high_hz);
 
     const n_points = n_mels + 2;
     const mel_points = try allocator.alloc(f32, n_points);
     defer allocator.free(mel_points);
     for (0..n_points) |i| {
         const mel = mel_low + @as(f32, @floatFromInt(i)) * (mel_high - mel_low) / @as(f32, @floatFromInt(n_points - 1));
-        mel_points[i] = melToHz(mel);
+        mel_points[i] = if (scale == .slaney) slaneyMelToHz(mel) else melToHz(mel);
     }
 
     const bin_points = try allocator.alloc(f32, n_points);
@@ -1197,6 +1226,23 @@ pub fn melFilterbankWithRange(
 
 fn melFilterbank(allocator: std.mem.Allocator, n_mels: u32, n_fft: u32, sample_rate: u32) ![]f32 {
     return melFilterbankWithRange(allocator, n_mels, n_fft, sample_rate, 0, 0);
+}
+
+/// Reflect padding excludes the endpoint, as in torch.stft(center=true).
+pub fn reflectSampleIndex(index: isize, len: usize) usize {
+    if (len <= 1) return 0;
+    if (index >= 0 and index < len) return @intCast(index);
+    const period: isize = @intCast(2 * (len - 1));
+    const wrapped = @mod(index, period);
+    return @intCast(if (wrapped < len) wrapped else period - wrapped);
+}
+
+fn hzToSlaneyMel(hz: f32) f32 {
+    return if (hz < 1000) hz / (200.0 / 3.0) else 15.0 + @log(hz / 1000.0) * (27.0 / @log(6.4));
+}
+
+fn slaneyMelToHz(mel: f32) f32 {
+    return if (mel < 15) mel * (200.0 / 3.0) else 1000.0 * @exp((mel - 15.0) * (@log(6.4) / 27.0));
 }
 
 fn hzToMel(hz: f32) f32 {
@@ -1652,7 +1698,7 @@ fn maxValueSimd(values: []const f32) f32 {
 
 fn clampScaleWhisper(values: []f32, max_val: f32) void {
     const floor_val = max_val - 8.0;
-    const offset_val = max_val - 4.0;
+    const offset_val: f32 = -4.0;
     const floor_vec: F32xN = @splat(floor_val);
     const offset_vec: F32xN = @splat(offset_val);
     const scale_vec: F32xN = @splat(0.25);
@@ -1893,6 +1939,22 @@ test "file name hint overrides ambiguous sync-word sniffing for flac" {
     try std.testing.expectEqual(EncodedFormat.flac, detectFormatWithOptions(ambiguous_sync[0..], .{
         .file_name_hint = "raw-frame.flac",
     }).?);
+}
+
+test "hinted MP3 with leading padding keeps inspection and bounded decoding consistent" {
+    const bytes = "\x00" ++ tone_mp3_bytes;
+    try std.testing.expectEqual(@as(?EncodedFormat, null), detectFormat(bytes));
+    const hints = [_]DecodeOptions{
+        .{ .format_hint = .mp3 },
+        .{ .mime_hint = "audio/mpeg" },
+        .{ .file_name_hint = "padded.mp3" },
+    };
+    for (hints) |options| {
+        try std.testing.expectEqual(EncodedFormat.mp3, detectFormatWithOptions(bytes, options).?);
+        var decoded = try decodeBounded(std.testing.allocator, bytes, options, default_decode_working_bytes);
+        defer decoded.deinit();
+        try std.testing.expect(decoded.samples.len > 0);
+    }
 }
 
 test "decode dispatch handles wav fixture" {
@@ -3472,4 +3534,43 @@ test "streaming audio Ogg chains reset codecs and preserve independent segment c
         compare.stop = true;
         try std.testing.expectError(error.Cancelled, streaming.visit(a, bytes, .{}, .{ .context = &compare, .write = Compare.write }));
     }
+}
+
+/// Shared independent reference check for FFT and system BLAS implementations.
+/// Only instantiated by test builds.
+pub const whisper_reference_test = @import("whisper_reference_test.zig");
+
+test "Whisper FFT features match independent centered Slaney reference at two amplitudes" {
+    const Extract = struct {
+        fn run(alloc: std.mem.Allocator, samples: []const f32, bins: u32) ![]f32 {
+            return logMelSpectrogramWithConfig(alloc, samples, .{
+                .sample_rate = 16000,
+                .n_fft = 400,
+                .hop_length = 160,
+                .n_mels = bins,
+                .chunk_length_s = 1,
+                .normalization = .whisper,
+                .mel_scale = .slaney,
+                .center = true,
+            });
+        }
+    };
+    try whisper_reference_test.check(Extract.run);
+}
+
+test "Whisper silence has the reference floor and complete 30 second shape" {
+    const alloc = std.testing.allocator;
+    const output = try logMelSpectrogramWithConfig(alloc, &.{}, .{
+        .sample_rate = 16000,
+        .n_fft = 400,
+        .hop_length = 160,
+        .n_mels = 80,
+        .chunk_length_s = 30,
+        .normalization = .whisper,
+        .mel_scale = .slaney,
+        .center = true,
+    });
+    defer alloc.free(output);
+    try std.testing.expectEqual(@as(usize, 80 * 3000), output.len);
+    for (output) |value| try std.testing.expectApproxEqAbs(@as(f32, -1.5), value, 1e-6);
 }

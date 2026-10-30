@@ -16,6 +16,7 @@ from antfly.client_generated.models.inference_generate_batch_error import Infere
 from antfly.client_generated.models.inference_generate_batch_response import InferenceGenerateBatchResponse
 from antfly.client_generated.models.inference_generate_request import InferenceGenerateRequest
 from antfly.client_generated.models.inference_generate_response import InferenceGenerateResponse
+from antfly.client_generated.models.inference_generate_usage import InferenceGenerateUsage
 from antfly.client_generated.models.prepare_native_kv_checkpoint_x_antfly_kv_encoding import (
     PrepareNativeKvCheckpointXAntflyKVEncoding,
 )
@@ -67,6 +68,7 @@ def test_generated_resume_sends_original_mime_and_unmodified_binary_body() -> No
     with Client(base_url="http://antfly.invalid", httpx_args={"transport": httpx.MockTransport(handle)}) as client:
         result = resume_native_kv_checkpoint.sync_detailed(client=client, body=File(payload=BytesIO(payload)))
     assert isinstance(result.parsed, InferenceGenerateResponse)
+    assert isinstance(result.parsed.usage, InferenceGenerateUsage)
     assert result.parsed.usage.cached_prompt_tokens == 12
 
 

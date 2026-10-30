@@ -646,7 +646,7 @@ pub const RetryableReadFailure = struct {
 
 pub fn retryableReadFailure(err: anyerror) ?RetryableReadFailure {
     return switch (err) {
-        error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged => .{},
+        error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged, error.IndexRebuilding => .{},
         else => null,
     };
 }
@@ -6454,7 +6454,7 @@ fn decisionApproved(
     for (decisions) |decision| {
         if (!std.mem.eql(u8, decision.question_id, question_id)) continue;
         if (decision.approved != null) return decision.approved.?;
-        if (decision.answer) |answer| return isAffirmativeAnswer(answer);
+        if (decision.answer.valueOrNull()) |answer| return isAffirmativeAnswer(answer);
         return false;
     }
     return false;
@@ -6519,7 +6519,7 @@ fn resolveAgenticDecisionSelection(
 ) !?usize {
     for (decisions) |decision| {
         if (!std.mem.eql(u8, decision.question_id, "select_query")) continue;
-        if (decision.answer) |answer| {
+        if (decision.answer.valueOrNull()) |answer| {
             switch (answer) {
                 .integer => |value| {
                     if (value < 0) return error.InvalidRetrievalAgentRequest;
@@ -12742,7 +12742,7 @@ test "retrieval agent live pipeline fails with stable retryable read error" {
     const tree_body =
         \\{"query":"find alpha","stream":true,"queries":[{"table":"docs"}],"steps":{"retrieval":{"navigation":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2,"query_index":0,"strategy":"tree","selection":"ranked"}}}}
     ;
-    for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged }) |failure| {
+    for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged, error.IndexRebuilding }) |failure| {
         for ([_][]const u8{ body, tree_body }, 0..) |request_body, phase| {
             var fixture: Fixture = .{ .failure = failure };
             const runner: QueryRunner = .{ .ptr = &fixture, .vtable = &.{ .run_query = Fixture.query, .scan_key_page = Fixture.scan } };

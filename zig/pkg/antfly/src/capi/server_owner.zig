@@ -902,7 +902,7 @@ pub fn storageOwnerContextConfigureRemoteContentSource(
     source: *const kernel_runtime_services.RemoteContentSource,
 ) callconv(.c) kernel_owner_abi.Status {
     const owner = asStorageOwnerContext(context) orelse return .invalid_argument;
-    if (source.version != 1 or source._reserved != 0) return .invalid_argument;
+    if ((source.version != 1 and source.version != 2) or source._reserved != 0) return .invalid_argument;
     owner.lock();
     defer owner.mutex.unlock();
     if (owner.active_owners != 0) return .busy;
@@ -915,10 +915,11 @@ pub fn storageOwnerContextConfigureRemoteContentSource(
 }
 
 const RemoteContentSnapshot = struct {
-    parsed: std.json.Parsed(scraping.ContentSecurityConfig),
+    parsed: std.json.Parsed(scraping.RemoteContentSnapshotData),
     config: scraping.RemoteContentConfig,
     fn release(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        self.config.gcs_connections.deinit(std.heap.smp_allocator);
         self.parsed.deinit();
         std.heap.smp_allocator.destroy(self);
     }
@@ -948,11 +949,16 @@ fn acquireRemoteContentImpl(raw: *anyopaque) !scraping.RemoteContentConfig.Snaps
     defer source.release(source.context, bytes);
     const alloc = std.heap.smp_allocator;
     const snapshot = try alloc.create(RemoteContentSnapshot);
-    const parsed = std.json.parseFromSlice(scraping.ContentSecurityConfig, alloc, bytes.slice(), .{ .allocate = .alloc_always }) catch |err| {
-        alloc.destroy(snapshot);
-        return if (err == error.OutOfMemory) error.OutOfMemory else error.ResourceTemporarilyUnavailable;
-    };
-    snapshot.* = .{ .parsed = parsed, .config = .{ .security = parsed.value } };
+    errdefer alloc.destroy(snapshot);
+    var parsed = if (source.version == 1) blk: {
+        const legacy = try std.json.parseFromSlice(scraping.ContentSecurityConfig, alloc, bytes.slice(), .{ .allocate = .alloc_always });
+        break :blk std.json.Parsed(scraping.RemoteContentSnapshotData){
+            .arena = legacy.arena,
+            .value = .{ .security = legacy.value },
+        };
+    } else try std.json.parseFromSlice(scraping.RemoteContentSnapshotData, alloc, bytes.slice(), .{ .allocate = .alloc_always });
+    errdefer parsed.deinit();
+    snapshot.* = .{ .parsed = parsed, .config = try parsed.value.configAlloc(alloc) };
     return .{ .config = &snapshot.config, .context = snapshot, .release_fn = RemoteContentSnapshot.release };
 }
 
@@ -1769,6 +1775,21 @@ pub fn metadataApplyStoreProjection(
             handle.store.migrateStandaloneRestoreJobs(rows.value) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
         },
+        .job_owner_count => blk: {
+            const count = handle.store.getJobOwnerCount(alloc, request.group_id, request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, count);
+        },
+        .job_state => blk: {
+            const value = handle.store.getJobState(alloc, request.group_id, request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer if (value) |bytes| alloc.free(bytes);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .job_state_scan => blk: {
+            if (request.arg1 > 1) break :blk .invalid_argument;
+            const value = handle.store.scanJobState(alloc, request.group_id, if (request.arg1 == 0) null else request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer alloc.free(value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .backup_cohort => blk: {
             const value = handle.store.getBackupCohort(alloc, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
             defer if (value) |bytes| alloc.free(bytes);
@@ -2160,6 +2181,12 @@ pub fn metadataApplyStoreProjection(
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
         .resolver_namespace_work => blk: {
+            if (request.arg0 == 3) {
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                const value = handle.store.pendingResolverNamespaceWork(arena.allocator(), request.group_id, request.arg1 != 0) catch |err| break :blk storageOwnerStatusFromError(err);
+                break :blk metadataProjectionJson(alloc, out_json, value);
+            }
             if (request.arg0 == 2) {
                 const value = handle.store.pendingResolverNamespaceDrop(alloc, request.group_id) catch |err| break :blk storageOwnerStatusFromError(err);
                 break :blk metadataProjectionJson(alloc, out_json, value);

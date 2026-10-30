@@ -331,6 +331,23 @@ can use verified free capacity. Lease publication remains durable and the marker
 lock continues to distinguish live readers from crash leftovers. No format or
 reader-compatibility change is needed.
 
+Orphan-alias removal and owner-controlled retirement use the same deferred-proof
+policy. Otherwise the first maintenance turn could merely move an open's full
+graph scan into its foreground publication fence. Unverified housekeeping appends
+metadata, while verified owners keep reusing pages. Authored writes, explicit
+reclamation, and hard-budget admission retain their existing validation policy.
+
+Externally owned DB opens also defer synchronous derived replay. Durable index
+watermarks admit cooperative replay, with one startup index/LSM service per
+namespace incarnation; opening
+tables for SQL recovery does not itself drain their indexes. Before a detached
+turn authors new data, an independent inode-fenced reader verifies its allocator
+outside the foreground gate. Writer admission then requires a proof for the
+current inode and both checkpoints. A rebase may inherit the foreground writer's
+matching proof; otherwise the detached work retries verification outside the
+gate. Closing the connection cancels the graph walk. This keeps the first query
+from inheriting an open's deferred scan while retaining validation before reuse.
+
 ## Shrinking
 
 Page reuse is the routine mechanism. Optional automatic shrinking retains the
@@ -418,3 +435,34 @@ previously published partial roots remain durable and resumable. Cancellation
 is not injected into the final durability boundary, whose existing uncertainty
 fencing remains authoritative. Cooperative maintenance calls have independent
 cancellation from the owner's worker shutdown token.
+
+
+### Reuse during detached native turns
+
+A detached runtime used to hold shared locks on the entire inode through replay
+and provider work. Those locks correctly protected snapshots but also disabled
+reuse of pages already free before capture. Rapid native writes could append
+throughout the lifetime of a worker turn, including in short-lived processes.
+
+The connection now coordinates its data-reader fences. While holding the same
+cross-process path-writer lease used for publication, a verified writer accounts
+for their oldest checkpoint, suspends only its own shared inode locks, and tries
+the normal exclusive inode lock. Retirement retains the captured reader frontier
+for the entire allocation window. Remaining external readers still deny exclusive
+reuse. Shared locks are restored before releasing the path-writer lease. Reader
+registration and close remain serialized without retaining the registry mutex
+through allocator callbacks, so reclaiming an idle source can release its fence.
+
+An unrecognized checkpoint publication permanently disqualifies existing readers
+from coordinated suspension: an external writer may have promoted retirement
+without knowing their local frontier. Their ordinary shared locks remain until
+close. The next reader generation can coordinate again. Allocator verification
+and integrity readers retain their original whole-inode locks; the coordinated
+frontier applies to data readers, which do not inspect historical allocator pages.
+This changes no file format and requires no cooperation from older processes.
+
+Allocator ownership validation reads packed tree records through one bounded
+physical-page reader. It verifies each loaded bundle and each requested record
+without reconstructing a synthetic checksummed page per inline record. The
+reachable-root and ownership-count checks remain unchanged, including both
+recovery checkpoints and the cancellation fence.

@@ -15,16 +15,23 @@
 
 """Test measurement accounting without invoking a compiler."""
 
+import errno
 import importlib.util
 import json
 import os
 import shutil
-import subprocess
 import unittest
 import sys
 import tempfile
+import threading
 from unittest import mock
 from pathlib import Path
+
+try:
+    from .fixture_process import run_fixture_build
+except ImportError:
+    from fixture_process import run_fixture_build
+
 
 SPEC = importlib.util.spec_from_file_location(
     "check_storage_compilation",
@@ -74,6 +81,21 @@ class LiteralSourceOwnership(unittest.TestCase):
             self.assertNotIn("pub const db", rendered)
             self.assertNotIn("\n\n\n", rendered)
             self.assertIn("\n\ncomptime {}\n", rendered)
+
+    def test_control_catalog_rejects_duplicate_source_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "pkg/antfly-embedded/src"
+            local.mkdir(parents=True)
+            (local / "source_catalog.zig").write_text(
+                'pub const same = @import("leaf.zig");\n' * 2
+            )
+            (local / "leaf.zig").write_text("")
+            with mock.patch.object(measurement, "ZIG_ROOT", root):
+                with self.assertRaisesRegex(
+                    ValueError, "duplicate source catalog entry: same"
+                ):
+                    measurement.control_catalog_contents()
 
     def test_control_catalog_is_current_and_has_no_physical_imports(self):
         local = measurement.ZIG_ROOT / "pkg/antfly-embedded/src"
@@ -187,10 +209,16 @@ class BuildFailureEvidence(unittest.TestCase):
     def test_contract_reuses_both_caches_when_disk_has_headroom(self):
         self.exercise_contract_cache(low_disk=False)
 
+    def test_measured_audit_selects_only_its_qualified_profile(self):
+        with mock.patch.object(
+            measurement, "qualified_audit_memory", return_value=True
+        ):
+            self.exercise_contract_cache(low_disk=False, measured_memory=True)
+
     def test_disk_pressure_rollover_discards_both_caches_and_keeps_mutations(self):
         self.exercise_contract_cache(low_disk=True)
 
-    def exercise_contract_cache(self, *, low_disk):
+    def exercise_contract_cache(self, *, low_disk, measured_memory=False):
         expected = (
             ("cold", set()),
             ("warm", set()),
@@ -224,20 +252,31 @@ class BuildFailureEvidence(unittest.TestCase):
         first_cache = None
         first_global = None
 
-        def fake_build(command, cwd, *, progress, env):
+        def fake_build(
+            command, cwd, *, progress, env, timeout_seconds, compiler_timeout_seconds
+        ):
             nonlocal first_cache, first_global
             label, rebuilt = expected[len(seen)]
-            local_cache = Path(command[command.index("--cache-dir") + 1])
+            self.assertEqual(timeout_seconds, 3600 if label.endswith("cold") else 1800)
+            self.assertEqual(compiler_timeout_seconds, 1800)
+            local_cache = cwd / command[command.index("--cache-dir") + 1]
+            self.assertEqual(command[command.index("--build-file") + 1], "./build.zig")
             self.assertNotIn("--global-cache-dir", command)
+            self.assertEqual(env["ZIG_LOCAL_CACHE_DIR"], ".zig-cache")
             self.assertIn("-Dstrip=true", command)
-            global_cache = Path(env["ZIG_GLOBAL_CACHE_DIR"])
+            if measured_memory:
+                self.assertIn("-Dnative-linux-ownership-memory=true", command)
+                self.assertIn("-Dcpu=baseline", command)
+                self.assertIn("-Dcuda=false", command)
+                self.assertIn("-Dinference-optimize=debug", command)
+            global_cache = cwd / env["ZIG_GLOBAL_CACHE_DIR"]
             self.assertEqual(
                 (global_cache / "p" / archive_name).read_bytes(), b"pinned source"
             )
             self.assertFalse((global_cache / "o").exists())
             self.assertFalse((global_cache / "p/unrelated.tar.gz").exists())
-            self.assertEqual(local_cache.parent, cwd.parent.parent)
-            self.assertEqual(global_cache.parent, cwd.parent.parent)
+            self.assertEqual(local_cache.parent, cwd)
+            self.assertEqual(global_cache.parent, cwd)
             if first_cache is None:
                 first_cache, first_global = local_cache, global_cache
             else:
@@ -303,7 +342,13 @@ class BuildFailureEvidence(unittest.TestCase):
                 mock.patch.object(
                     sys,
                     "argv",
-                    ["check_storage_compilation.py", "--report", str(report)],
+                    [
+                        "check_storage_compilation.py",
+                        "--report",
+                        str(report),
+                        "--case-workers",
+                        "1",
+                    ],
                 ),
                 mock.patch.object(
                     measurement, "measured_build", side_effect=fake_build
@@ -323,10 +368,92 @@ class BuildFailureEvidence(unittest.TestCase):
             self.assertFalse(first_global.exists())
             self.assertEqual(len(json.loads(report.read_text())), len(expected))
 
+    def test_active_process_diagnostics_exclude_other_builds(self):
+        snapshot = """100 1 20 30:00 0:00 S python measure.py
+101 100 30 29:59 0:01 S maker build
+102 101 7000 28:00 27:40 R zig build-lib --name antfly-storage-kernel -Mroot=storage.zig
+200 1 90000 40:00 39:50 R zig build-lib --name unrelated
+"""
+        rows = measurement.process_diagnostics(snapshot, 100)
+        self.assertEqual([row["pid"] for row in rows], [100, 101, 102])
+        compiler = rows[-1]
+        self.assertEqual(compiler["artifact"], "antfly-storage-kernel")
+        self.assertEqual(compiler["cpu_time"], "27:40")
+        self.assertEqual(compiler["rss_bytes"], 7000 * 1024)
+        self.assertNotIn("command", compiler)
+        self.assertEqual(measurement.process_diagnostics("", 100), [])
+
+    def test_active_compiler_response_file_identifies_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "args.rsp").write_text('"--name" "api-tests" "-Mroot=pkg/api.zig"')
+            rows = measurement.process_diagnostics(
+                "100 1 7000 28:00 27:40 R /bin/zig test @args.rsp", 100, root
+            )
+            self.assertEqual(rows[0]["artifact"], "api-tests")
+            self.assertEqual(rows[0]["source_root"], "pkg/api.zig")
+            self.assertNotIn("command", rows[0])
+            (root / "args.rsp").unlink()
+            rows = measurement.process_diagnostics(
+                "100 1 7000 28:00 27:40 R /bin/zig test @args.rsp", 100, root
+            )
+            self.assertIsNone(rows[0]["artifact"])
+
+    def test_audit_memory_profile_requires_the_measured_compiler(self):
+        with (
+            mock.patch.object(measurement.sys, "platform", "linux"),
+            mock.patch.object(measurement.platform, "machine", return_value="x86_64"),
+            mock.patch.object(
+                measurement.shutil,
+                "which",
+                return_value=str(measurement.QUALIFIED_AUDIT_COMPILER),
+            ),
+        ):
+            self.assertTrue(measurement.qualified_audit_memory("zig"))
+            self.assertFalse(measurement.qualified_audit_memory("zig", jobs=3))
+            with mock.patch.object(
+                measurement.shutil, "which", return_value="/opt/zig/zig"
+            ):
+                self.assertFalse(measurement.qualified_audit_memory("zig"))
+            with mock.patch.object(measurement.sys, "platform", "darwin"):
+                self.assertFalse(measurement.qualified_audit_memory("zig"))
+            with mock.patch.object(
+                measurement.platform, "machine", return_value="aarch64"
+            ):
+                self.assertFalse(measurement.qualified_audit_memory("zig"))
+
+    def test_cgroup_measurement_distinguishes_anonymous_and_file_memory(self):
+        with (
+            mock.patch.object(measurement.sys, "platform", "linux"),
+            mock.patch.object(
+                measurement.Path,
+                "read_text",
+                return_value="anon 100\nfile 900\nfile_dirty 50\ninactive_file 700\n",
+            ),
+        ):
+            self.assertEqual(
+                measurement.cgroup_memory_stat(),
+                {
+                    "anon": 100,
+                    "file": 900,
+                    "file_dirty": 50,
+                    "inactive_file": 700,
+                },
+            )
+            with mock.patch.object(
+                measurement.Path, "read_text", side_effect=FileNotFoundError
+            ):
+                self.assertEqual(measurement.cgroup_memory_stat(), {})
+
     def test_timeout_preserves_output_and_measurements(self):
         with (
             tempfile.TemporaryDirectory() as directory,
             mock.patch.object(measurement.subprocess, "check_output", return_value=""),
+            mock.patch.object(
+                measurement,
+                "active_build_processes",
+                return_value=[{"artifact": "storage", "cpu_time": "29:59"}],
+            ) as diagnostics,
         ):
             code, output, measured = measurement.measured_build(
                 [
@@ -342,7 +469,32 @@ class BuildFailureEvidence(unittest.TestCase):
         self.assertIn("compiler diagnostic", output)
         self.assertTrue(measured["timed_out"])
         self.assertFalse(measured["cpu_accounting_complete"])
+        diagnostics.assert_called_once()
+        self.assertEqual(measured["active_processes"][0]["cpu_time"], "29:59")
         self.assertGreater(measured["wall_seconds"], 0)
+
+    def test_compiler_watchdog_allows_a_later_unit_without_extending_a_stuck_one(self):
+        watchdog = measurement.CompilerWatchdog(1800, 0)
+        first = {"pid": 1, "executable": "zig", "elapsed": "29:59"}
+        self.assertFalse(watchdog.expired(1799, [first]))
+        later = {"pid": 2, "executable": "zig", "elapsed": "00:14"}
+        self.assertFalse(watchdog.expired(1814, [later]))
+        # Another compiler's progress cannot hide an overlong concurrent unit.
+        first["elapsed"] = "30:01"
+        self.assertTrue(watchdog.expired(1815, [first, later]))
+
+    def test_compiler_watchdog_bounds_idle_orchestration_and_unknown_clocks(self):
+        watchdog = measurement.CompilerWatchdog(10, 0)
+        self.assertFalse(watchdog.expired(9, [{"executable": "maker"}]))
+        self.assertTrue(watchdog.expired(10, [{"executable": "maker"}]))
+        unknown = {"pid": 1, "executable": "zig", "elapsed": "unknown"}
+        self.assertFalse(watchdog.expired(11, [unknown]))
+        self.assertTrue(watchdog.expired(21, [unknown]))
+        self.assertTrue(
+            watchdog.expired(
+                22, [{"pid": 2, "executable": "zig", "elapsed": "1-00:00:01"}]
+            )
+        )
 
     def test_report_replaces_previous_running_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -365,6 +517,281 @@ class BuildFailureEvidence(unittest.TestCase):
         self.assertEqual(command[2:], ["--zig", "pinned-zig", "--", *arguments])
 
 
+class ParallelAuditIsolation(unittest.TestCase):
+    def test_workspace_clone_preserves_source_metadata_and_private_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = measurement.AuditWorkspace(root / "baseline", 2)
+            cloned = measurement.AuditWorkspace(root / "worker", 1)
+            source.cwd.mkdir(parents=True)
+            owned = source.cwd / "owned.zig"
+            owned.write_text("original")
+            owned.chmod(0o640)
+            os.utime(owned, ns=(1_600_000_000_000_000_000,) * 2)
+            (source.cwd / "internal").symlink_to(owned)
+            external = root / "immutable.zig"
+            external.write_text("external")
+            (source.cwd / "external").symlink_to(external)
+            for cache in (source.local_cache, source.global_cache):
+                (cache / "o/hash").mkdir(parents=True)
+                (cache / "o/hash/bytes").write_text("cached")
+            measurement.clone_audit_workspace(source, cloned)
+            copied = cloned.cwd / "owned.zig"
+            self.assertEqual(copied.stat().st_mtime_ns, owned.stat().st_mtime_ns)
+            self.assertEqual(copied.stat().st_mode, owned.stat().st_mode)
+            self.assertNotEqual(copied.stat().st_ino, owned.stat().st_ino)
+            copied.write_text("worker edit")
+            self.assertEqual(owned.read_text(), "original")
+            shutil.rmtree(source.root)
+            self.assertEqual((cloned.cwd / "internal").read_text(), "worker edit")
+            self.assertEqual((cloned.cwd / "external").read_text(), "external")
+
+    def test_cache_seed_crosses_filesystems_without_aliasing_mutable_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, target = root / "phase", root / "fixture"
+            entries = (
+                "o/hash/maker",
+                "h/input",
+                "o/hash/input.lock",
+                "p/source.tar.gz",
+            )
+            for relative in entries:
+                path = source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(relative)
+                os.utime(path, ns=(1_600_000_000_000_000_000,) * 2)
+            with mock.patch.object(
+                measurement.os,
+                "link",
+                side_effect=OSError(errno.EXDEV, "different device"),
+            ) as link:
+                measurement.clone_audit_cache(source, target)
+            self.assertEqual(link.call_count, 2)
+            for relative in entries:
+                original, cloned = source / relative, target / relative
+                self.assertEqual(cloned.read_bytes(), original.read_bytes())
+                self.assertEqual(cloned.stat().st_mtime_ns, original.stat().st_mtime_ns)
+                self.assertNotEqual(cloned.stat().st_ino, original.stat().st_ino)
+            (target / "h/input").write_text("worker revision")
+            shutil.rmtree(source)
+            self.assertEqual((target / "o/hash/maker").read_text(), "o/hash/maker")
+            self.assertEqual((target / "h/input").read_text(), "worker revision")
+
+    def test_cache_clones_share_immutable_objects_and_keep_manifests_private(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "baseline"
+            for relative in (
+                "o/hash/library.a",
+                "h/input.txt",
+                "o/hash/cache.lock",
+                "p/package/source.zig",
+            ):
+                path = source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(relative)
+            (source / "o/hash/absolute").symlink_to(source / "o/hash/library.a")
+            (source / "o/hash/relative").symlink_to("library.a")
+            left, right = root / "left", root / "right"
+            measurement.clone_audit_cache(source, left)
+            measurement.clone_audit_cache(source, right)
+            for relative in ("o/hash/library.a", "p/package/source.zig"):
+                self.assertEqual(
+                    (left / relative).stat().st_ino, (right / relative).stat().st_ino
+                )
+            for relative in ("h/input.txt", "o/hash/cache.lock"):
+                self.assertNotEqual(
+                    (left / relative).stat().st_ino, (right / relative).stat().st_ino
+                )
+                (left / relative).write_text("worker edit")
+                self.assertEqual((right / relative).read_text(), relative)
+            (left / "o/new").mkdir()
+            (left / "o/new/output").write_text("new compiler output")
+            self.assertFalse((right / "o/new").exists())
+            shutil.rmtree(left)
+            shutil.rmtree(source)
+            self.assertEqual(
+                (right / "o/hash/absolute").read_text(), "o/hash/library.a"
+            )
+            self.assertEqual(
+                (right / "o/hash/relative").read_text(), "o/hash/library.a"
+            )
+            self.assertEqual(
+                (right / "o/hash/library.a").read_text(), "o/hash/library.a"
+            )
+
+    def test_unqualified_compilers_cannot_enable_two_workers(self):
+        with (
+            mock.patch.object(
+                measurement, "qualified_audit_memory", return_value=False
+            ),
+            mock.patch.object(sys, "argv", ["audit", "--case-workers", "2"]),
+            mock.patch.object(measurement, "clone_audit_cache") as clone,
+            mock.patch("sys.stderr"),
+            self.assertRaises(SystemExit) as failure,
+        ):
+            measurement.main()
+        self.assertEqual(failure.exception.code, 2)
+        clone.assert_not_called()
+
+    def test_parallel_workers_preserve_all_probes_and_overlap_single_compilers(self):
+        self.exercise_parallel()
+
+    def test_relocated_cache_misses_fail_before_mutation_workers_start(self):
+        self.exercise_parallel(dirty_clone=True)
+
+    def test_a_failed_worker_interrupts_its_peer_and_retains_a_valid_report(self):
+        self.exercise_parallel(fail_probe="read coordination")
+
+    def exercise_parallel(self, *, dirty_clone=False, fail_probe=None):
+        sources = {
+            "api/table_reads.zig": (
+                "read coordination",
+                {"antfly-runtime-distributed", "antfly-storage-kernel"},
+            ),
+            "api/table_writes.zig": (
+                "write coordination",
+                {"antfly-runtime-distributed"},
+            ),
+            "storage/db/db.zig": ("physical DB", {"antfly-storage-kernel"}),
+            "storage/query.zig": ("physical local query", {"antfly-storage-kernel"}),
+            "storage/kernel_owner_test.zig": (
+                "owner integration test",
+                {"storage-owner-tests"},
+            ),
+            "api_table_reads_test_root.zig": (
+                "consumer test root",
+                {"api-table-read-tests"},
+            ),
+            "storage/kernel_owner_abi.zig": (
+                "storage contract",
+                {
+                    "antfly-storage-kernel",
+                    "antfly-runtime-distributed",
+                    "storage-owner-tests",
+                },
+            ),
+        }
+        prior, seen, first_mutation = {}, [], set()
+        barrier = threading.Barrier(2)
+        lock = threading.Lock()
+        names = (
+            measurement.ARCHIVES
+            | measurement.CONSUMERS
+            | {
+                "storage-owner-tests",
+                "storage-owner-source-tests",
+                "storage-owner-enrichment-tests",
+            }
+        )
+
+        def fake_build(command, cwd, *, progress, env, **kwargs):
+            self.assertEqual(command[command.index("--build-file") + 1], "./build.zig")
+            current = {
+                source
+                for source in sources
+                if (cwd.parent / measurement.source_owner_path(source))
+                .read_bytes()
+                .endswith(b"// storage compilation ownership regression\n")
+            }
+            with lock:
+                initial = cwd not in prior
+                changed = current - prior.get(cwd, set())
+                cold = not prior
+                prior[cwd] = current
+            rebuilt = names if cold else set()
+            if changed:
+                self.assertEqual(len(changed), 1)
+                label, rebuilt = sources[changed.pop()]
+                self.assertIn("-j1", command)
+                if cwd not in first_mutation:
+                    first_mutation.add(cwd)
+                    barrier.wait(timeout=5)
+                with lock:
+                    seen.append(label)
+            else:
+                label = "cold" if cold else "warm"
+                self.assertTrue(initial or not current)
+            local_cache = cwd / command[command.index("--cache-dir") + 1]
+            local_cache.mkdir(exist_ok=True)
+            (local_cache / "marker").write_text(label)
+            output = [
+                f"compile {'test_obj' if name in measurement.CONSUMERS else 'lib'} {name} debug native {'success' if name in rebuilt else 'cached'}"
+                for name in names
+            ]
+            if label in {"physical DB", "physical local query"}:
+                output.extend(
+                    f"compile exe {name} debug native success"
+                    for name in measurement.CONSUMERS
+                )
+            if dirty_clone and initial and not cold:
+                # Private variants are not in the required root set. Repeated
+                # names must not hide a rebuild behind a later cached result.
+                output.extend(
+                    [
+                        "compile lib antfly-storage-engine debug native success",
+                        "compile lib antfly-storage-engine debug native cached",
+                    ]
+                )
+            progress({"wall_seconds": 0.0})
+            return (
+                (1 if label == fail_probe else 0),
+                "\n".join(output),
+                {"wall_seconds": 0.0, "timed_out": False},
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with (
+                mock.patch.object(
+                    measurement, "qualified_audit_memory", return_value=True
+                ),
+                mock.patch.object(
+                    measurement,
+                    "seed_global_cache",
+                    side_effect=lambda path: path.mkdir(parents=True, exist_ok=True),
+                ),
+                mock.patch.object(
+                    measurement, "measured_build", side_effect=fake_build
+                ),
+                mock.patch.object(
+                    measurement.shutil,
+                    "disk_usage",
+                    return_value=mock.Mock(free=100 * (1 << 30)),
+                ),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["check_storage_compilation.py", "--report", str(report)],
+                ),
+            ):
+                if dirty_clone:
+                    with self.assertRaises(AssertionError):
+                        measurement.main()
+                elif fail_probe:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "read coordination|another storage audit worker failed",
+                    ):
+                        measurement.main()
+                else:
+                    measurement.main()
+            rows = json.loads(report.read_text())
+            if dirty_clone:
+                self.assertEqual(seen, [])
+                return
+            if fail_probe:
+                self.assertIn(fail_probe, seen)
+                self.assertLess(len(seen), len(sources))
+                self.assertTrue(any(row["status"] == "failed" for row in rows))
+                return
+            self.assertEqual(len(rows), 11)
+            self.assertTrue(all(row["status"] == "completed" for row in rows))
+            self.assertCountEqual(seen, [label for label, _ in sources.values()])
+            self.assertEqual(len(first_mutation), 2)
+
+
 class StorageCompilationDiscovery(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -373,27 +800,62 @@ class StorageCompilationDiscovery(unittest.TestCase):
             raise unittest.SkipTest("Zig is required for build-graph regression tests")
         cls.temp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.temp.cleanup)
-        cls.root = Path(cls.temp.name)
+        cls.root = Path(cls.temp.name) / "zig"
+        cls.root.mkdir()
         fixtures = cls.root / "tools/fixtures"
         fixtures.mkdir(parents=True)
         source = Path(__file__).parent / "fixtures"
         shutil.copyfile(source / "storage_compilation.zig", cls.root / "build.zig")
         shutil.copyfile(source / "build_profiles.zig", fixtures / "build_profiles.zig")
+        (cls.root / "consumer.zig").write_text(
+            "pub export fn _start() void {}\n"
+            "pub export fn wWinMainCRTStartup() void {}\n"
+            "pub export fn fixtureValue() u32 { return 1; }\n"
+            'pub export fn specLength() usize { return @embedFile("external.yaml").len; }\n'
+        )
+        shared_c = cls.root / "shared-c"
+        shared_c.mkdir()
+        (shared_c / "api.yaml").write_text("openapi: 3.1.0\n")
+        (cls.root.parent / "public.yaml").symlink_to(shared_c / "api.yaml")
+        (shared_c / "native.h").write_text("#define FIXTURE_VALUE 9\n")
+        (shared_c / "native.c").write_text(
+            '#include "native.h"\nint fixture_native(void) { return FIXTURE_VALUE; }\n'
+        )
+        (shared_c / "native_batch.c").write_text(
+            "int fixture_native_batch(void) { return 3; }\n"
+        )
+        for name in ("native.c", "native_batch.c"):
+            (cls.root / name).symlink_to(shared_c / name)
         (cls.root / "project_build.zig").write_text(r"""
 const std = @import("std");
 pub fn create(b: *std.Build) ?void {
     const omit = b.option([]const u8, "omit", "Omit a required consumer");
     const target = b.standardTargetOptions(.{});
     const files = b.addWriteFiles();
-    const root = files.add("main.zig", "pub fn main() void {}\n");
+    // These artifacts are inspected, never executed. Keep native compilation
+    // and generated-source cache inputs without compiling startup, compiler-rt
+    // or UBSan once per synthetic consumer in every isolated cold cache.
+    const root = files.addCopyFile(b.path("consumer.zig"), "main.zig");
+    const native = b.addLibrary(.{
+        .name = "fixture-native", .linkage = .static, .use_llvm = true,
+        .root_module = b.createModule(.{ .target = target, .optimize = .debug, .strip = true }),
+    });
+    native.root_module.addCSourceFile(.{ .file = b.path("native.c") });
+    native.root_module.addCSourceFiles(.{ .root = b.path("."), .files = &.{"native_batch.c"} });
     inline for (.{
         "storage-owner-tests", "storage-owner-source-tests", "storage-owner-enrichment-tests",
         "api-table-read-tests", "api-table-write-tests", "api-table-write-lifecycle-tests", "data-runtime-tests",
     }) |name| {
         if (omit == null or !std.mem.eql(u8, omit.?, name)) {
             const exe = b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
-                .root_source_file = root, .target = target, .optimize = .debug,
+                .root_source_file = root, .target = target, .optimize = .debug, .strip = true,
             }) });
+            exe.root_module.addAnonymousImport("external.yaml", .{ .root_source_file = b.path("../public.yaml") });
+            exe.use_llvm = true;
+            exe.root_module.linkLibrary(native);
+            exe.entry = .disabled;
+            exe.bundle_compiler_rt = false;
+            exe.bundle_ubsan_rt = false;
             b.step(name, name).dependOn(&exe.step);
         }
     }
@@ -414,16 +876,129 @@ pub fn create(b: *std.Build) ?void {
 """)
 
     def build(self, *args):
-        return subprocess.run(
-            [self.zig, "build", "check-storage-compilation", "-j2", *args],
+        return run_fixture_build(
+            [
+                self.zig,
+                "build",
+                "--build-file",
+                "./build.zig",
+                "check-storage-compilation",
+                "-j2",
+                *args,
+            ],
             cwd=self.root,
             # Fixture-generated sources belong to its own lifetime, even when
             # the caller configures a disposable phase cache for other builds.
             env={**os.environ, "ZIG_LOCAL_CACHE_DIR": str(self.root / ".zig-cache")},
-            text=True,
-            capture_output=True,
             timeout=120,
         )
+
+    def test_cloned_compiler_caches_relocate_without_rebuilding_generated_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline" / "zig"
+            shutil.copytree(
+                self.root,
+                baseline,
+                ignore=shutil.ignore_patterns(".zig-cache", ".zig-global-cache"),
+                # Immutable authored providers retain the real checkout's
+                # identity; the mutation input below remains a private copy.
+                symlinks=True,
+            )
+
+            # API archives embed schemas outside the Zig build root. Keep
+            # those immutable authored inputs visible in both source overlays.
+            (baseline.parent / "public.yaml").symlink_to(
+                self.root.parent / "public.yaml"
+            )
+
+            # This regression owns a cold local target cache, not a second
+            # compiler bootstrap. Reuse the phase's immutable host toolchain
+            # objects through a private global-cache snapshot. Both checkouts
+            # still own their manifests and survive deletion of the baseline.
+            inherited_global = os.environ.get("ZIG_GLOBAL_CACHE_DIR")
+            if inherited_global and Path(inherited_global).is_dir():
+                measurement.clone_audit_cache(
+                    Path(inherited_global).resolve(), baseline / ".zig-global-cache"
+                )
+
+            def build_at(checkout):
+                # Discovery/missing-owner cases below still cover all seven
+                # consumers. One native generated-source consumer exercises
+                # the complete relocation/invalidation lifecycle here.
+                result = run_fixture_build(
+                    [
+                        self.zig,
+                        "build",
+                        "--build-file",
+                        "./build.zig",
+                        "storage-owner-tests",
+                        "-j1",
+                        "--cache-dir",
+                        ".zig-cache",
+                        "--summary",
+                        "all",
+                        "--color",
+                        "off",
+                    ],
+                    cwd=checkout,
+                    env={
+                        **os.environ,
+                        "ZIG_LOCAL_CACHE_DIR": ".zig-cache",
+                        "ZIG_GLOBAL_CACHE_DIR": ".zig-global-cache",
+                    },
+                    timeout=120,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stderr
+
+            build_at(baseline)
+            clone = root / "clone" / "zig"
+            measurement.clone_audit_workspace(
+                measurement.AuditWorkspace(baseline.parent, 1),
+                measurement.AuditWorkspace(clone.parent, 1),
+            )
+            output = build_at(clone)
+            self.assertIn("cached", output)
+            self.assertNotRegex(output, r"compile (?:exe|lib) .* success")
+            # Canonicalizing external schema identities must retain content
+            # invalidation in both workspaces, not just hide relocation misses.
+            schema = self.root / "shared-c/api.yaml"
+            schema.write_text(schema.read_text() + "# schema revision\n")
+            for checkout in (clone, baseline):
+                self.assertRegex(build_at(checkout), r"compile exe .* success")
+                self.assertNotRegex(
+                    build_at(checkout), r"compile (?:exe|lib) .* success"
+                )
+            # The clone's new source revision and manifests are private. The
+            # original still gets real compiler hits after that revision.
+            # Change the tracked generator input, preserving a real source
+            # invalidation without recompiling the host build runner itself.
+            consumer = measurement.own(clone.parent, "zig/consumer.zig")
+            consumer.write_text(
+                consumer.read_text().replace(
+                    "pub export fn fixtureValue() u32 { return 1; }",
+                    "pub export fn fixtureValue() u32 { return 2; }",
+                )
+            )
+            output = build_at(clone)
+            self.assertRegex(output, r"compile exe .* success")
+            output = build_at(baseline)
+            self.assertNotRegex(output, r"compile (?:exe|lib) .* success")
+            shutil.rmtree(baseline.parent)
+            output = build_at(clone)
+            self.assertNotRegex(output, r"compile (?:exe|lib) .* success")
+            # Canonical authored identities must still track a worker taking
+            # private ownership of a provider and changing its actual bytes.
+            native = measurement.own(clone.parent, "zig/native.c")
+            native.write_text(
+                native.read_text().replace("FIXTURE_VALUE;", "FIXTURE_VALUE + 1;")
+            )
+            (clone / "native.h").write_text("#define FIXTURE_VALUE 9\n")
+            output = build_at(clone)
+            self.assertRegex(output, r"compile lib fixture-native .* success")
+            output = build_at(clone)
+            self.assertNotRegex(output, r"compile (?:exe|lib) .* success")
 
     def test_extra_owner_fixture_does_not_expand_audit(self):
         result = self.build()

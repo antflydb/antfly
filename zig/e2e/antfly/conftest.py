@@ -1142,13 +1142,23 @@ def _legacy_stateful_command(
 
 
 def _standalone_stateful_command(
-    binary: str, *, host: str, port: int, root: Path, pgwire_port: int | None = None
+    binary: str,
+    *,
+    host: str,
+    port: int,
+    root: Path,
+    pgwire_port: int | None = None,
+    health_port: int | None = None,
+    config_path: Path | None = None,
 ) -> list[str]:
     return [
         binary,
         "standalone",
         "--config",
-        str(_write_remote_content_e2e_config(root, pgwire_port=pgwire_port)),
+        str(
+            config_path
+            or _write_remote_content_e2e_config(root, pgwire_port=pgwire_port)
+        ),
         "--host",
         host,
         "--port",
@@ -1158,7 +1168,8 @@ def _standalone_stateful_command(
         "--control-tick-ms",
         "5",
         "--health",
-        "false",
+        "true" if health_port is not None else "false",
+        *(["--health-port", str(health_port)] if health_port is not None else []),
         "--replica-root-dir",
         str(root / "replicas"),
         "--replica-catalog-path",
@@ -1451,11 +1462,15 @@ class StandaloneAntflyServer:
         port: int,
         *,
         pgwire: bool = False,
+        metrics: bool = False,
+        api_root: str | None = None,
+        config_path: Path | None = None,
         storage_engine: str | None = None,
         inference_host_budget_mb: int | None = None,
     ):
-        self.binary = binary
+        self.binary = resolve_binary_path(binary)
         self.host = host
+        self.config_path = config_path
         self.storage_engine = storage_engine
         self.inference_host_budget_mb = inference_host_budget_mb
         with ExitStack() as setup:
@@ -1464,8 +1479,12 @@ class StandaloneAntflyServer:
             port = self.port_reservations.reserve_requested(port)
             self.port = port
             self.pgwire_port = self.port_reservations.reserve() if pgwire else None
+            self.health_port = self.port_reservations.reserve() if metrics else None
+            self.health_url = f"http://{host}:{self.health_port}" if metrics else None
             self.url = f"http://{host}:{port}"
-            self.api_url = antfly_public_api_url(self.url, binary=binary)
+            self.api_url = antfly_public_api_url(
+                self.url, binary=self.binary, root=api_root
+            )
             self.tempdir = tempfile.TemporaryDirectory(
                 prefix="antfly-zig-standalone-e2e-"
             )
@@ -1494,6 +1513,8 @@ class StandaloneAntflyServer:
             port=self.port,
             root=self.root,
             pgwire_port=self.pgwire_port,
+            health_port=self.health_port,
+            config_path=self.config_path,
         )
         if self.inference_host_budget_mb is not None:
             command.extend(
@@ -1506,7 +1527,11 @@ class StandaloneAntflyServer:
         if self.pgwire_port is not None:
             command.extend(["--auth", "true"])
         self.proc = self.port_reservations.handoff_to(
-            (self.port,) if self.pgwire_port is None else (self.port, self.pgwire_port),
+            tuple(
+                p
+                for p in (self.port, self.pgwire_port, self.health_port)
+                if p is not None
+            ),
             lambda: subprocess.Popen(
                 command,
                 env=(
@@ -1579,6 +1604,8 @@ class StandaloneAntflyServer:
         self.port_reservations.ensure_reserved(self.port)
         if self.pgwire_port is not None:
             self.port_reservations.ensure_reserved(self.pgwire_port)
+        if self.health_port is not None:
+            self.port_reservations.ensure_reserved(self.health_port)
 
     def resume(self) -> None:
         self._start_process(truncate_logs=False)

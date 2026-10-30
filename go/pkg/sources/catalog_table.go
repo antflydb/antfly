@@ -52,7 +52,7 @@ func NewCatalogRecord(binding Binding, provider, revision string, permissions Pe
 }
 func (r CatalogRecord) Validate() error {
 	switch r.Provider {
-	case ProviderS3, ProviderGCS, ProviderGoogleDrive, ProviderGitHub:
+	case ProviderS3, ProviderGCS, ProviderGoogleDrive, ProviderGitHub, ProviderSlack, ProviderDiscord, ProviderGoogleWorkspace:
 	default:
 		return fmt.Errorf("unsupported catalog provider")
 	}
@@ -144,7 +144,7 @@ func (s CatalogStore) Read(ctx context.Context, ids []string) (map[string]Catalo
 	totalBytes := 0
 	for start := 0; start < len(ids); start += 100 {
 		keys := ids[start:min(start+100, len(ids))]
-		query, _ := json.Marshal(map[string]any{"query": map[string]any{"ids": keys}, "limit": len(keys), "fields": []string{"version", "doc_type", "source", "provider", "document_version", "published_revision", "permissions"}, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+		query, _ := json.Marshal(map[string]any{"query": documentIDsQuery(keys), "limit": len(keys), "fields": []string{"version", "doc_type", "source", "provider", "document_version", "published_revision", "permissions"}, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
 		data, err := s.Client.Query(ctx, s.table(), query)
 		if err != nil {
 			return nil, err
@@ -192,7 +192,7 @@ func (s CatalogStore) Read(ctx context.Context, ids []string) (map[string]Catalo
 	return out, nil
 }
 func (p *Publisher) Query(ctx context.Context, table string, body []byte) ([]byte, error) {
-	return p.call(ctx, "POST", tablePath(table)+"/query", json.RawMessage(body))
+	return p.callRead(ctx, "POST", tablePath(table)+"/query", json.RawMessage(body))
 }
 
 // Retire hides only catalog entries owned by the caller's durable source profile;

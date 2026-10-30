@@ -34042,15 +34042,12 @@ fn consumerTests() type {
         test "provisioning detects document extraction OCR as model backed" {
             const alloc = std.testing.allocator;
             try std.testing.expect(try indexesJsonNeedsAssetProducer(alloc,
-                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}"}]}]
+                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}"}]}]
             ));
-            // PDF OCR fallback is enabled by default, so an otherwise-empty document
-            // extraction config still needs the model-backed asset producer.
-            try std.testing.expect(try indexesJsonNeedsAssetProducer(alloc,
-                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}]}]
-            ));
+            // Without an ocr or transcription block, extraction is native text
+            // only and needs no model-backed producer.
             try std.testing.expect(!(try indexesJsonNeedsAssetProducer(alloc,
-                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr_fallback\":false}}"}]}]
+                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}]}]
             )));
         }
 
@@ -51234,6 +51231,12 @@ fn implementationTests() type {
             defer status_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             defer source.deinit();
+            // DB workers borrow the source and status cache through visibility
+            // callbacks. Drain them before either callback target is destroyed.
+            defer {
+                source.quiesce();
+                write_cache.closeAllDbsLocked() catch @panic("activation fixture retained DB leases");
+            }
             source.write_cache = &write_cache;
             source.runtime_status_cache = &status_cache;
 
@@ -51337,6 +51340,7 @@ fn implementationTests() type {
             var outer_cache = ProvisionedTableWriteCache.init(alloc);
             defer outer_cache.deinit();
             var outer_source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+            defer outer_source.deinit();
             outer_source.write_cache = &outer_cache;
             _ = outer_source.withLocalWriteOwner(&source);
 
@@ -59184,6 +59188,11 @@ fn implementationTests() type {
             defer status_cache.deinit();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             defer source.deinit();
+            // Keep both callback targets alive until the DB workers drain.
+            defer {
+                source.quiesce();
+                write_cache.closeAllDbsLocked() catch @panic("create fixture retained DB leases");
+            }
             source.write_cache = &write_cache;
             source.runtime_status_cache = &status_cache;
 

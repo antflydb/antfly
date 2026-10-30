@@ -18,6 +18,15 @@ const onnx_build = @import("onnx_graph").support;
 pub const OnnxModules = onnx_build.Modules;
 const jit_identity = @import("jit_identity.zig");
 
+/// Inline `pdf_standard_fonts` module for the generated write-files directory;
+/// mirrors `inline_source` in zig/build_support/antfly/fonts.zig.
+const pdf_standard_fonts_source =
+    \\pub const regular = @embedFile("lib/pdf/fonts/roboto/Roboto-Regular.ttf");
+    \\pub const bold = @embedFile("lib/pdf/fonts/roboto/Roboto-Bold.ttf");
+    \\pub const glyphCodepoints = @import("lib/pdf/src/agl_lookup.zig").codepoints;
+    \\
+;
+
 pub const BackendOptions = struct {
     allow_downloads: bool = true,
     enable_metal: bool = false,
@@ -75,6 +84,7 @@ pub const SharedModules = struct {
     onnx: ?OnnxModules = null,
     pjrt: ?*std.Build.Module = null,
     inference_api: ?*std.Build.Module = null,
+    inference_config_openapi: ?*std.Build.Module = null,
     inference_api_source: ?std.Build.LazyPath = null,
     audio_openapi: ?*std.Build.Module = null,
     s3_openapi: ?*std.Build.Module = null,
@@ -98,6 +108,7 @@ pub const Config = struct {
 };
 
 pub const Graph = struct {
+    document_runs_mod: *std.Build.Module,
     runtime_abi_mod: *std.Build.Module,
     build_info_mod: *std.Build.Module,
     build_info_object: *std.Build.Step.Compile,
@@ -199,6 +210,8 @@ pub fn create(config: Config) Graph {
     };
     const scraping_mod = shared.scraping orelse blk: {
         const mod = createSharedModule(config, "lib/scraping/src/mod.zig");
+        mod.addImport("antfly_data_uri", createSharedModule(config, "lib/scraping/src/data_uri.zig"));
+        mod.addImport("antfly_platform", platform_mod);
         mod.addImport("antfly_source_reference", createSharedModule(config, "lib/scraping/src/source_reference.zig"));
         mod.addImport("objectstore", objectstore_mod);
         mod.addImport("httpx", httpx_mod);
@@ -279,11 +292,13 @@ pub fn create(config: Config) Graph {
         });
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
+        mod.addAnonymousImport("fastino_api", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/fastino_api/root.zig")) });
         break :blk mod;
     };
     const reader_config_mod = shared.reader_config orelse createSharedModule(config, "lib/readers/src/config.zig");
-    const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared_with_generating);
     const s3_openapi_mod = shared.s3_openapi orelse createSharedModule(config, "pkg/antfly-embedded/src/openapi/generated/antfly_s3_openapi/root.zig");
+    shared_with_generating.s3_openapi = s3_openapi_mod;
+    const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared_with_generating);
     const audio_openapi_mod = shared.audio_openapi orelse blk: {
         const mod = createSharedModule(config, "pkg/antfly-embedded/src/openapi/generated/antfly_audio_openapi/root.zig");
         mod.addImport("antfly_s3_openapi", s3_openapi_mod);
@@ -293,10 +308,12 @@ pub fn create(config: Config) Graph {
         const module = createSharedModule(config, "lib/generating/src/mod.zig");
         module.addImport("antfly-json", json_mod);
         module.addImport("antfly_generating_openapi", generating_openapi_mod);
+        module.addAnonymousImport("anthropic_api", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/anthropic_api/root.zig")) });
         break :blk module;
     };
     structured_mod.addImport("antfly_generating", generating_mod);
     structured_mod.addImport("antfly_extracting", extracting_mod);
+    structured_mod.addImport("antfly_image", image_mod);
     const transcribing_mod = b.createModule(.{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/transcribing/src/mod.zig")),
         .target = target,
@@ -318,6 +335,18 @@ pub fn create(config: Config) Graph {
     apple_native_mod.addImport("httpx", httpx_mod);
     transcribing_mod.addImport("antfly_apple_native", apple_native_mod);
     if (shared.generating == null) generating_mod.addImport("antfly_apple_native", apple_native_mod);
+    const document_runs_mod = createSharedModule(config, "lib/readers/src/document_runs.zig");
+    const readers_mod = createSharedModule(config, "lib/readers/src/mod.zig");
+    readers_mod.addImport("antfly_document_runs", document_runs_mod);
+    readers_mod.addImport("httpx", httpx_mod);
+    readers_mod.addImport("inference_api", inference_api_mod);
+    readers_mod.addImport("antfly_google", google_mod);
+    readers_mod.addImport("antfly_reader_config", reader_config_mod);
+    readers_mod.addImport("antfly_scraping", scraping_mod);
+    readers_mod.addImport("antfly_image", image_mod);
+    readers_mod.addImport("antfly_platform", platform_mod);
+    readers_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
+    readers_mod.addImport("apple_reader_options", apple_native_mod.import_table.get("apple_native_options").?);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
             .root_source_file = b.path(pathJoin(b, paths.inference_root, "../inference-client/src/root.zig")),
@@ -379,20 +408,7 @@ pub fn create(config: Config) Graph {
     });
     inference_work_mod.addImport("antfly_scraping", scraping_mod);
     inference_work_mod.addImport("antfly_image", image_mod);
-    const readers_mod = b.createModule(.{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/readers/src/mod.zig")),
-        .target = target,
-        .optimize = optimize,
-    });
-    readers_mod.addImport("httpx", httpx_mod);
-    readers_mod.addImport("inference_api", inference_api_mod);
-    readers_mod.addImport("antfly_google", google_mod);
-    readers_mod.addImport("antfly_reader_config", reader_config_mod);
-    readers_mod.addImport("antfly_scraping", scraping_mod);
-    readers_mod.addImport("antfly_image", image_mod);
-    readers_mod.addImport("apple_reader_options", apple_native_options_mod);
     readers_mod.addImport("antfly_inference_work", inference_work_mod);
-    readers_mod.addImport("antfly_platform", platform_mod);
 
     const inference_mod = b.createModule(.{
         .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/inference.zig")),
@@ -404,9 +420,26 @@ pub fn create(config: Config) Graph {
     const decisions_mod = b.modules.get("antfly_decisions") orelse b.addModule("antfly_decisions", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/decisions/root.zig")),
     });
+    const cloudflare_mod = b.modules.get("antfly_cloudflare") orelse b.addModule("antfly_cloudflare", .{
+        .root_source_file = b.path(b.pathJoin(&.{ paths.shared_lib_root, "lib/cloudflare/root.zig" })),
+        .target = target,
+        .optimize = optimize,
+    });
+    cloudflare_mod.addImport("httpx", httpx_mod);
+    const cloudflare_config_mod = b.modules.get("antfly_cloudflare_config") orelse b.addModule("antfly_cloudflare_config", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/cloudflare/routing.zig")) });
+    cloudflare_config_mod.addAnonymousImport("cloudflare_api", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig")) });
+    cloudflare_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    generating_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    reader_config_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    readers_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    transcribing_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    transcribing_mod.addImport("antfly_cloudflare", cloudflare_mod);
+    extracting_mod.addImport("antfly_cloudflare", cloudflare_mod);
+    extracting_mod.addImport("antfly_image", image_mod);
+    decisions_mod.addImport("antfly_cloudflare", cloudflare_mod);
+    inference_mod.addImport("antfly_cloudflare", cloudflare_mod);
     inference_mod.addImport("antfly_decisions", decisions_mod);
     inference_mod.addImport("antfly_structured", structured_mod);
-    inference_mod.addImport("antfly_readers", readers_mod);
     decisions_mod.addImport("antfly_structured", structured_mod);
     inference_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     addInferenceRootImports(inference_mod, .{
@@ -443,7 +476,7 @@ pub fn create(config: Config) Graph {
         _ = files.addCopyFile(b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/fonts/roboto/Roboto-Bold.ttf")), "lib/pdf/fonts/roboto/Roboto-Bold.ttf");
         _ = files.addCopyFile(b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/agl_lookup.zig")), "lib/pdf/src/agl_lookup.zig");
         _ = files.addCopyFile(b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/agl_data.zig")), "lib/pdf/src/agl_data.zig");
-        const fonts = b.createModule(.{ .root_source_file = files.addCopyFile(b.path(pathJoin(b, paths.shared_lib_root, "pdf_standard_fonts.zig")), "pdf_standard_fonts.zig"), .target = target, .optimize = optimize });
+        const fonts = b.createModule(.{ .root_source_file = files.add("pdf_standard_fonts.zig", pdf_standard_fonts_source), .target = target, .optimize = optimize });
         const font = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/font/src/mod.zig")), .target = target, .optimize = optimize });
         const pdf = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/mod.zig")), .target = target, .optimize = optimize });
         pdf.addImport("antfly_image", image_mod);
@@ -458,6 +491,15 @@ pub fn create(config: Config) Graph {
         }
         break :blk pdf;
     };
+    const documents_mod = b.modules.get("antfly_documents") orelse b.addModule("antfly_documents", .{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/documents/src/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+    documents_mod.addImport("antfly_hash", hash_mod);
+    documents_mod.addImport("antfly_image", image_mod);
+    documents_mod.addImport("antfly_pdf", pdf_mod);
+    inference_mod.addImport("antfly_documents", documents_mod);
     inference_mod.addImport("antfly_pdf", pdf_mod);
     const media_mod = inference_audio_mod.import_table.get("antfly_media").?;
     inference_mod.addImport("antfly_media", media_mod);
@@ -465,6 +507,8 @@ pub fn create(config: Config) Graph {
     inference_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     inference_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     inference_mod.addImport("antfly_extracting", extracting_mod);
+    inference_mod.addImport("antfly_readers", readers_mod);
+    inference_mod.addImport("antfly_document_runs", document_runs_mod);
     inference_mod.addImport("antfly_transcribing", transcribing_mod);
     configureRuntimeLinks(b, inference_mod, target, backend, paths);
     inference_mod.link_libc = backend.link_libc;
@@ -487,6 +531,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     inference_internal_mod.addImport("antfly_image", image_mod);
     inference_internal_mod.addImport("antfly_pdf", pdf_mod);
+    inference_internal_mod.addImport("antfly_documents", documents_mod);
     inference_internal_mod.addImport("inference_chunker", inference_chunker_mod);
     inference_internal_mod.addImport("inference_audio", inference_audio_mod);
     inference_internal_mod.addImport("antfly_media", media_mod);
@@ -504,9 +549,16 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.link_libc = backend.link_libc;
 
     inference_mod.addImport("inference_internal", inference_mod);
+    // Native task CLIs share document ingestion and composition with HTTP.
+    // Reuse every dependency's source identity in the internal CLI owner.
+    var shared_imports = inference_mod.import_table.iterator();
+    while (shared_imports.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "inference_internal")) inference_internal_mod.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    }
     inference_internal_mod.addImport("inference_internal", inference_internal_mod);
 
     return .{
+        .document_runs_mod = document_runs_mod,
         .runtime_abi_mod = runtime_abi_mod,
         .build_info_mod = shared.build_info_mod,
         .build_info_object = shared.build_info_object,
@@ -715,6 +767,7 @@ pub fn addInferenceApiOverride(
         .package_name = "inference_api",
         .generate = "types,server,client",
         .import_mappings = &.{
+            .{ "./config.yaml", "antfly_inference_config_openapi" },
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
             .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
             .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
@@ -745,6 +798,25 @@ fn addInferenceApiModule(
     }));
     const chunking_api_openapi_mod = shared.chunking_api_openapi orelse addChunkingApiOpenApiModule(b, target, optimize, paths, generating_openapi_mod);
 
+    const config_openapi_mod = shared.inference_config_openapi orelse blk: {
+        const module = b.createModule(.{
+            .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_inference_config_openapi/root.zig")),
+            .target = target,
+            .optimize = optimize,
+        });
+        module.addImport("antfly_generating_openapi", generating_openapi_mod);
+        module.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
+        module.addImport("antfly_s3_openapi", shared.s3_openapi.?);
+        inline for (.{ "scraping", "logging", "resources" }) |name| {
+            module.addImport("antfly_" ++ name ++ "_openapi", b.createModule(.{
+                .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_" ++ name ++ "_openapi/root.zig")),
+                .target = target,
+                .optimize = optimize,
+            }));
+        }
+        break :blk module;
+    };
+
     if (skip_openapi) {
         const empty_wf = b.addWriteFiles();
         const empty_root = empty_wf.add("inference_api_stub.zig",
@@ -760,6 +832,7 @@ fn addInferenceApiModule(
         });
         mod.addImport("antfly_decision_openapi", addDecisionOpenApiModule(b, target, optimize, paths, generating_openapi_mod));
         mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_inference_config_openapi", config_openapi_mod);
         mod.addImport("antfly_generating_openapi", generating_openapi_mod);
         mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
         return mod;
@@ -773,6 +846,7 @@ fn addInferenceApiModule(
         });
         mod.addImport("antfly_decision_openapi", addDecisionOpenApiModule(b, target, optimize, paths, generating_openapi_mod));
         mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_inference_config_openapi", config_openapi_mod);
         mod.addImport("antfly_generating_openapi", generating_openapi_mod);
         mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
         mod.addImport("antfly_extraction_openapi", shared.extraction_openapi orelse addExtractionOpenApiModule(b, target, optimize, paths, generating_openapi_mod));
@@ -787,6 +861,7 @@ fn addInferenceApiModule(
     });
     mod.addImport("antfly_decision_openapi", addDecisionOpenApiModule(b, target, optimize, paths, generating_openapi_mod));
     mod.addImport("httpx", httpx_mod);
+    mod.addImport("antfly_inference_config_openapi", config_openapi_mod);
     mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
     mod.addImport("antfly_extraction_openapi", shared.extraction_openapi orelse addExtractionOpenApiModule(b, target, optimize, paths, generating_openapi_mod));

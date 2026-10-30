@@ -53,6 +53,7 @@ pub const AntflyRootImports = struct {
     shared_inference_core: bool = false,
     darwin_release_memory: bool = false,
     darwin_shared_storage_sdk27: bool = false,
+    darwin_cross_release_memory: bool = false,
     sanitize_thread: bool = false,
     boundary_profile: @import("../embedded/storage_boundary.zig").Profile = .all,
     build_info: @import("../../lib/build_info/build_support.zig").BuildInfo,
@@ -312,6 +313,7 @@ pub const AntflyRootImports = struct {
     // keep owner-specific dependencies in their constructors below.
     fn configureDatabase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
         self.configureBase(mod, link_libc);
+        self.addImport(mod, "chunking_api_openapi");
         inline for (.{
             "bloom",            "chunking",           "common_openapi",    "credentials",
             "embeddings",       "embeddings_openapi", "extracting",        "generating",

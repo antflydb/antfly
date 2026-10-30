@@ -60,32 +60,15 @@ pub fn taskForCategory(category: []const u8) ?Task {
     return null;
 }
 
-pub const Support = enum { unknown, unsupported, supported };
-pub const Capabilities = struct {
-    streaming: Support = .unknown,
-    tools: Support = .unknown,
-    structured_output: Support = .unknown,
-    images: Support = .unknown,
-    audio: Support = .unknown,
+const capability_contract = @import("inference_capabilities.zig");
+pub const Support = capability_contract.Support;
+pub const Capabilities = capability_contract.Capabilities;
 
-    pub fn require(self: Capabilities, request: Requirements) !void {
-        inline for (.{ "streaming", "tools", "structured_output", "images", "audio" }) |field| {
-            if (@field(request, field) and @field(self, field) != .supported)
-                return error.UnsupportedInferenceFeature;
-        }
-    }
-};
 fn typedDecisionCapabilities(images: bool) Capabilities {
     return .{ .images = if (images) .supported else .unsupported, .audio = .unsupported, .streaming = .unsupported, .tools = .unsupported };
 }
 
-pub const Requirements = struct {
-    streaming: bool = false,
-    tools: bool = false,
-    structured_output: bool = false,
-    images: bool = false,
-    audio: bool = false,
-};
+pub const Requirements = capability_contract.Requirements;
 
 pub const Target = union(enum) {
     configured: struct { task: Task, name: []const u8, chain: bool = false },
@@ -213,8 +196,14 @@ pub const View = struct {
                             .rewrite => self.providers.rewriter_configs.get(value.name).?,
                             else => self.providers.predictor_configs.get(value.name).?,
                         };
-                        out.backend_model = cfg.model;
-                        out.connection = cfg.connection;
+                        if (cfg.generator) |name| {
+                            const generator = try self.providers.getGeneratorConfig(name);
+                            out.backend_model = generator.model;
+                            out.executor = @tagName(generator.provider);
+                        } else {
+                            out.backend_model = cfg.model;
+                            out.connection = cfg.connection;
+                        }
                     },
                 }
             },

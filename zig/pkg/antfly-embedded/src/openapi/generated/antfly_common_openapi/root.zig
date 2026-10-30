@@ -3,7 +3,6 @@
 
 pub const types = @import("types.zig");
 
-pub const AdmissionConfig = types.AdmissionConfig;
 pub const AwsCredentialConfig = types.AwsCredentialConfig;
 pub const BackupConfig = types.BackupConfig;
 pub const CdcConnectionConfig = types.CdcConnectionConfig;
@@ -18,7 +17,6 @@ pub const ExternalIoProtocol = types.ExternalIoProtocol;
 pub const FilesystemExternalIoConfig = types.FilesystemExternalIoConfig;
 pub const GcsCredentialConfig = types.GcsCredentialConfig;
 pub const GcsExternalIoConfig = types.GcsExternalIoConfig;
-pub const GraphExecutionConfig = types.GraphExecutionConfig;
 pub const HotStandbyAdminConfig = types.HotStandbyAdminConfig;
 pub const HotStandbyConfig = types.HotStandbyConfig;
 pub const HotStandbyIdentityConfig = types.HotStandbyIdentityConfig;
@@ -27,7 +25,6 @@ pub const HotStandbyRetentionConfig = types.HotStandbyRetentionConfig;
 pub const HotStandbyStandbyConfig = types.HotStandbyStandbyConfig;
 pub const HotStandbySyncConfig = types.HotStandbySyncConfig;
 pub const HttpExternalIoConfig = types.HttpExternalIoConfig;
-pub const InferenceAdmissionConfig = types.InferenceAdmissionConfig;
 pub const InferenceConnectionConfig = types.InferenceConnectionConfig;
 pub const InferenceConnectionVariant = types.InferenceConnectionVariant;
 pub const InferenceTaskCapabilities = types.InferenceTaskCapabilities;
@@ -42,7 +39,7 @@ pub const ObjectStorageConfig = types.ObjectStorageConfig;
 pub const ObjectStorageLanes = types.ObjectStorageLanes;
 pub const ObjectStorageLocation = types.ObjectStorageLocation;
 pub const PgwireConfig = types.PgwireConfig;
-pub const QueryAdmissionConfig = types.QueryAdmissionConfig;
+pub const RewriterConfig = types.RewriterConfig;
 pub const RuntimeTaskBinding = types.RuntimeTaskBinding;
 pub const S3ExternalIoConfig = types.S3ExternalIoConfig;
 pub const SecretSourceConfig = types.SecretSourceConfig;
@@ -53,4 +50,3 @@ pub const TLSInfo = types.TLSInfo;
 pub const TransactionSessionConfig = types.TransactionSessionConfig;
 pub const WebSearchConnectionConfig = types.WebSearchConnectionConfig;
 pub const WebSearchConnectionVariant = types.WebSearchConnectionVariant;
-pub const WriteAdmissionConfig = types.WriteAdmissionConfig;

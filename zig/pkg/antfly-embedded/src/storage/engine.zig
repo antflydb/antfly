@@ -36,11 +36,7 @@ pub const ReplayBoundary = @import("named_callback.zig").Boundary(ReplayCallback
 pub const BackupPlan = struct { value: @import("../api/backup_contract.zig").TableBackupPlan, io: ?native.IoBorrow };
 /// Restore owns a disposable generation; keep its record loops and errors in
 /// the physical storage unit. Callbacks here return no Zig error values.
-pub const PortableRestoreImportOptions = struct {
-    identity_namespace: ?@import("db/doc_identity.zig").Namespace = null,
-    embedding_source_fields: []const @import("portable_backup.zig").ImportOptions.EmbeddingSourceField = &.{},
-    cancellation: types.CancellationToken = .none,
-};
+pub const PortableRestoreImportOptions = @import("portable_backup.zig").RestoreImportOptions;
 pub const WriterBorrow = @import("native_writer.zig").Borrow;
 pub const PortableExportOptions = struct {
     value: @import("portable_backup.zig").ExportOptions,
@@ -221,6 +217,7 @@ pub const VTable = struct {
     listResolverIdentities: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]@import("db/catalog/resolver_catalog.zig").ResolverConfig),
     listResolverStaticDescriptors: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]@import("db/catalog/resolver_catalog.zig").ResolverConfig),
     consumeResolverMetadataDrop: *const fn (self: *DB, alloc: std.mem.Allocator, identity: @import("db/resolver_curation.zig").MetadataIdentity) Outcome(void),
+    resolverReplayObservation: *const fn (self: *DB, alloc: Allocator) Outcome(types.ResolverReplayObservation),
     pendingWorkStats: *const fn (self: *DB) Outcome(@import("db/core.zig").PendingWorkStats),
     runArtifactRepairMetadataMaintenanceUntilIdle: *const fn (self: *DB) Outcome(void),
     publishVectorBlockBasesOnline: *const fn (self: *DB, options: @import("db/catalog/index_manager.zig").IndexManager.OnlineVectorBlockPublicationOptions) Outcome(usize),

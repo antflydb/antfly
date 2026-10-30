@@ -403,7 +403,7 @@ metadata only through its proved retention interval. Bounded, resource-accounted
 memos hold copied identities and declarations; every query still validates source
 coverage, permissions and reader authority. See the protocol-44 implementation
 and qualification details in
-[`NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md`](../../zig/NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md).
+the [native lake performance log](../design/sql/history/native-lake-performance-log.md).
 
 Filesystem object-store prefix listings descend only through the prefix's
 complete path components. The final partial component remains a string filter,
@@ -559,9 +559,12 @@ cutover guarantee before its underlying protocol is qualified.
 
 The native row ingress is `POST /db/v1/tables/{tableName}/lake/changes`.
 It is available for a current-snapshot Iceberg binding with `iceberg_writer`
-and either managed or REST catalog authority. It requires table admin permission
-and independent Antfly artifact storage with `storage.primary`; lake read
+and either managed or REST catalog authority. It requires table write permission
+without a row filter, plus independent Antfly artifact storage with `storage.primary`; lake read
 credentials alone cannot authorize ingestion or publication writes.
+Catalog initialization, file commits and maintenance still require table admin
+permission. CDC admission does not evaluate per-row write policies, so a filtered
+writer or administrator cannot use this endpoint to bypass those policies.
 
 A transaction supplies `batch_id`, `source`, `epoch`, `checkpoint`, optional
 `expected_checkpoint`, `key_fields`, and an ordered `changes` array. Each change
@@ -3871,3 +3874,79 @@ admission requires observed offset reuse and remains bounded by the existing
 request budget. Matched flags stay fresh, saved matches retain coordinates, and
 borrowed pages keep independent ownership. Publication, reader protocol 81 and
 reclamation semantics remain unchanged.
+
+
+[Archive qualification](../../zig/bench/lake/README.md) now exercises broad refresh
+through immutable generated Parquet files and one atomic manifest-head commit.
+It separates fixture encoding/commit time from readiness/verification, checks
+new publication revisions and exact changed-row results, and reports sampled
+memory, scoped cache counters, and newly retained artifact volume. Retained-file
+ratios exclude temporary spills and reclaimed files; real provider write traces
+remain necessary for cloud amplification claims.
+
+Archive qualification now pins executable/configuration/collector identity across
+restarts and closes its managed server/session on initialization, interruption
+and finalization errors. Publication readiness covers the complete embedded,
+additional and schema-relational index set. Custom logical identity fields drive
+the exact result oracle without altering physical source coordinates. Declared
+native text ordering uses [authenticated coordinate layouts and native merge provenance](lake-row-identity.md#qualification-integrity-and-native-physical-ordering).
+Producer and compactor lineage, exact answers and bounded admission are qualified
+before accepting performance claims.
+
+### Bounded interval summaries and candidate-local metadata probes (protocol 89)
+
+Native text metadata v17 / ordered-directory format 2 replace inline cohort lists
+with interval witnesses bounded by the existing 256-byte page aggregate limit.
+Layout cohorts are discovered by prefix seeks in the authenticated endpoint tree.
+A bounded fan-in serves up to 32 cohorts; greater diversity preserves publication
+and uses ordinary exact routing. Historical directories remain readable and migrate
+from segment descriptors without rebuilding unrelated payloads.
+
+Homogeneous child pages retain the farthest opposite endpoint, with an exact
+compact typed tuple and normalized comparison key. Mixed layouts and oversized
+witnesses withdraw subtree pruning. Both cursor directions skip a child only when
+its entire primary interval is strictly outside the requested cursor. Equal
+primary groups and overlapping intervals stay eligible for public-ID ties. The
+cursor performs the same conservative check at leaves, before segment admission.
+
+Exact metadata predicate producers can expose candidate-local membership to the
+bounded Boolean probe program. Ordered Top-K checks metadata only for reached
+candidates and shares the producer's existing adaptive work budget. Once probing
+loses, the producer materializes complete compressed membership; exact counts,
+unsupported leaves and unproved visibility retain the existing bitmap executor.
+Candidate-local answers never become complete coverage metadata.
+
+Deferred lineage is a compact representation, not an empty row set. When the
+adaptive planner selects complete compressed membership, block translation and
+residual physical selections resolve the admitted window's authenticated inverse
+map through the existing bounded cache. Point probes retain their paged path.
+Segment membership receives its already computed document base, avoiding a prefix
+walk for every newly opened probe in a fragmented snapshot.
+
+## Deferred native lake qualification
+
+These items remain open from the native lake execution work (see
+[native index execution contracts](../../zig/LAKES.md#native-index-execution-contracts)):
+
+- **Real-provider retention enforcement.** Certificate-based cloud audit bypass
+  stays off (`lake_indexes.cloud_generations.qualified_retention: false`) until
+  actual S3 COMPLIANCE and GCS Locked retention behavior is qualified against live
+  buckets. As of 2026-10-13, GCS and R2 were available and a credentialed AWS S3
+  target had not been selected. R2 is not assumed to enforce S3 Object Lock.
+- **Representative archive benchmarks.** Measure the merged baseline before
+  claiming speedups or changing strategy thresholds, envelope sizes or bucket
+  sizes. Cover many-small-file and many-segment-in-one-file layouts, selective and
+  broad terms, conjunctions and phrases, top-K and exact counts, metadata filters,
+  typed cursor pages, and small appends/replacements. Report result equivalence,
+  latency distributions, peak RSS, provider requests and bytes, admitted
+  inventories and readers, spill bytes, publication reads/writes and GC work.
+  Separate genuinely empty-cache execution, restart after readiness warming, and
+  repeated warm queries, and record the commit, build mode, dataset shape, cache
+  policy and resource limits with each measurement. Deterministic work-count
+  regressions remain required even when wall-clock results improve.
+- **Remaining execution gaps.** A fully virtual snapshot for profiled, overlay,
+  multi-source and early-source request shapes; cross-query fairness beyond
+  bounded admission; latency-adaptive queue sizing; typed nested Parquet/JSON
+  paths; source-native incremental inventory proofs (the proof census and
+  canonical coverage hash remain linear in file count); and the cause of the
+  complete-membership fallback still observed for limit-20 metadata probes.

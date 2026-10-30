@@ -66,6 +66,7 @@ pub fn configureBrowserModule(
     mod.addImport("httpx", httpx_mod);
     mod.addImport("antfly_platform", platform_mod);
     mod.addImport("antfly_chunking", chunking_mod);
+    mod.addImport("antfly_chunking_api_openapi", chunking_mod.import_table.get("antfly_chunking_api_openapi").?);
     mod.addImport("bloom", bloom_mod);
     mod.addImport("antfly_vector", vector_mod);
     mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -81,8 +82,7 @@ pub fn configureBrowserModule(
 }
 const addMacosSdkPaths = @import("antfly_platform").addMacosSdkPaths;
 const addFilteredTestRunArtifact = @import("../antfly/test_support.zig").addFilteredTestRunArtifact;
-const addFilteredTestRunArtifactWithRuntimeFilters = @import("../antfly/test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters;
-const addCuratedTestRunArtifact = @import("../antfly/test_support.zig").addCuratedTestRunArtifact;
+const linked_tests = @import("../../pkg/antfly/build/linked_tests.zig");
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 const selectTestFilters = @import("../antfly/test_support.zig").selectTestFilters;
 
@@ -120,7 +120,6 @@ pub const AddEmbeddedResult = struct {
     run_lite_rs_tests: *std.Build.Step.Run,
     run_lite_ts_tests: *std.Build.Step.Run,
     run_lite_go_example: *std.Build.Step.Run,
-    run_lite_go_retrieval_template: *std.Build.Step.Run,
     run_cabi_packaging_tests: *std.Build.Step.Run,
     run_capi_tests: *std.Build.Step.Run,
 };
@@ -278,7 +277,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         b,
         native_inference_mod,
         "antfly-inference-core",
-        @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory),
+        @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory),
     );
     native_inference.link_function_sections = true;
     native_inference.link_data_sections = true;
@@ -294,14 +293,14 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         b,
         native_enrichment_mod,
         if (options.server_integration_tests) "antfly-runtime-enrichment_compute" else "antfly-embedded-enrichment",
-        @as(u64, if (antfly_imports.darwin_release_memory) 3 else 8) * 1024 * 1024 * 1024,
+        @as(u64, if (antfly_imports.darwin_release_memory or antfly_imports.darwin_cross_release_memory) 3 else 8) * 1024 * 1024 * 1024,
     );
     const native_storage = if (antfly_imports.storage_boundary.shared_core) blk: {
         const owner_options = b.addOptions();
         owner_options.addOption(bool, "shared_storage_core", true);
         owner_options.addOption(bool, "storage_engine_owner", true);
         capi_mod.addOptions("storage_engine_options", owner_options);
-        const owner = @import("shared_library.zig").addProviderArchive(b, capi_mod, "antfly-storage-engine", @as(u64, if (antfly_imports.darwin_shared_storage_sdk27) 14 else if (target.result.os.tag == .macos and !antfly_imports.darwin_release_memory) 24 else 16) * 1024 * 1024 * 1024);
+        const owner = @import("shared_library.zig").addProviderArchive(b, capi_mod, "antfly-storage-engine", @import("shared_library.zig").storageCompileMaxRss(target.result.os.tag, antfly_imports.darwin_shared_storage_sdk27, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory));
         owner.link_function_sections = true;
         owner.link_data_sections = true;
         @import("source_owner.zig").registerStorageProvider(owner, b.allocator.dupe(*std.Build.Step.Compile, &.{ native_inference, native_enrichment }) catch @panic("OOM"));
@@ -383,7 +382,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_smoke_mod.link_libc = true;
     capi_smoke_mod.addIncludePath(b.path("pkg/antfly-embedded/include"));
     capi_smoke_mod.addCSourceFile(.{
-        .file = b.path("examples/antfly_c_smoke.c"),
+        .file = b.path("pkg/antfly-embedded/tests/capi_smoke.c"),
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     const capi_smoke = b.addExecutable(.{
@@ -499,37 +498,19 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "go",
         "run",
         ".",
-        "--reset",
-        "--db",
-        "../../zig/.zig-cache/antfly-lite-go-example.aflite",
-        "--backup",
-        "../../zig/.zig-cache/antfly-lite-go-example.afb",
+        "smoke",
+        "-reset",
+        "-db",
+        "../../zig/.zig-cache/antfly-docs-knowledge-base-smoke.aflite",
+        "-backup",
+        "../../zig/.zig-cache/antfly-docs-knowledge-base-smoke.afb",
     });
     run_lite_go_example.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
-    run_lite_go_example.setCwd(b.path("../examples/antfly-lite-go"));
+    run_lite_go_example.setCwd(b.path("../examples/antfly-docs-knowledge-base"));
     run_lite_go_example.step.dependOn(install_libantfly);
     run_lite_go_example.step.dependOn(&install_capi_header.step);
-    const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go Antfly Lite example app");
+    const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go knowledge-base example's model-free smoke check");
     lite_go_example_step.dependOn(&run_lite_go_example.step);
-
-    const run_lite_go_retrieval_template = b.addSystemCommand(&.{
-        "env",
-        "GOWORK=off",
-        "go",
-        "run",
-        ".",
-        "--reset",
-        "--db",
-        "../../zig/.zig-cache/antfly-lite-retrieval-go.aflite",
-        "--backup",
-        "../../zig/.zig-cache/antfly-lite-retrieval-go.afb",
-    });
-    run_lite_go_retrieval_template.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
-    run_lite_go_retrieval_template.setCwd(b.path("../examples/antfly-lite-retrieval-go"));
-    run_lite_go_retrieval_template.step.dependOn(install_libantfly);
-    run_lite_go_retrieval_template.step.dependOn(&install_capi_header.step);
-    const lite_go_retrieval_template_step = b.step("lite-go-retrieval-template", "Run the embedded Go Antfly Lite retrieval template");
-    lite_go_retrieval_template_step.dependOn(&run_lite_go_retrieval_template.step);
 
     const run_cabi_packaging_tests = b.addSystemCommand(&.{
         "env",
@@ -589,8 +570,14 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inference streaming reports request errors without a model",
         "capi get edges json does not double free a non-empty edge slice",
         "capi native memory",
+        "capi native short lived writers",
+        "capi native marker sweep",
+        "capi native unbounded writer admits reusable pool before a large request",
+        "capi native allocator proof",
+        "capi native close bounds proof work",
         "capi native text queries",
         "capi native replacement wait",
+        "capi graph replacement retains indexed serving edges",
         "capi native resolver maintenance retries",
         "capi native idle maintenance",
         "SQL overlay native pages retain typed cells",
@@ -609,12 +596,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "inline resolver replacement",
         "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index",
     };
-    const memory_capi_check = b.addTest(.{ .name = "memory-capi-check", .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
-    b.step("memory-capi-check", "Compile native memory C ABI persistence tests").dependOn(&memory_capi_check.step);
-    const memory_capi_tests = b.addTest(.{ .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
-    b.step("memory-capi-test", "Verify native memory persistence through the public C ABI").dependOn(&addFilteredTestRunArtifact(b, memory_capi_tests).step);
+    const memory_capi_check = linked_tests.add(b, .{ .name = "memory-capi-check", .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("memory-capi-check", "Compile native memory C ABI persistence tests").dependOn(&memory_capi_check.object.step);
+    const memory_capi_tests = linked_tests.add(b, .{ .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("memory-capi-test", "Verify native memory persistence through the public C ABI").dependOn(&capiTestRun(b, memory_capi_tests, &.{"capi native memory"}, false).step);
     const capi_compile_filters = capi_default_filters ++ capi_model_filters;
-    const capi_tests = b.addTest(.{
+    const capi_tests = linked_tests.add(b, .{
         .name = @import("../../pkg/antfly/build/test_owner_names.zig").capi_contract,
         .root_module = capi_root_mod,
         // Keep this consumer's measured native floor separate from its
@@ -629,14 +616,22 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // Share compilation and its memory admission between hermetic API contracts
     // and explicit model qualification. Installed models must not silently
     // change the cost or selection of the ordinary unit gate.
-    const run_capi_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, capi_tests, selectTestFilters(b, &capi_default_filters));
+    const run_capi_tests = capiTestRun(b, capi_tests, &capi_default_filters, false);
+    if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .x86_64 and
+        target.result.os.tag == .linux and target.result.cpu.arch == .x86_64 and
+        target.result.abi == .gnu and optimize == .debug)
+    {
+        // Main's GNU Debug implementation completed under its existing 7 GiB
+        // claim. The 17.14 GB overrun was the separate consumer test object.
+        @import("../antfly/test_partitions.zig").setAuthoredMaxRss(b, capi_tests.object, 7 * 1024 * 1024 * 1024);
+    }
     run_capi_tests.addArgs(&.{ "--skip-test-filter", "capi local model " });
     // The remote-content boundary fixture shares this C API compilation.
     // Its focused target remains independently selectable; the unit gate runs
     // it once through capi_default_filters.
     b.step("antfly-remote-content-owner-test", "Verify live remote-content policy snapshots across the storage owner boundary")
-        .dependOn(&addCuratedTestRunArtifact(b, capi_tests, &.{"storage owner remote content source"}).step);
-    const run_capi_models = addCuratedTestRunArtifact(b, capi_tests, &capi_model_filters);
+        .dependOn(&capiTestRun(b, capi_tests, &.{"storage owner remote content source"}, true).step);
+    const run_capi_models = capiTestRun(b, capi_tests, &capi_model_filters, true);
     run_capi_models.addArg("--require-no-skips");
     b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")
         .dependOn(&run_capi_models.step);
@@ -659,6 +654,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     const capi_test_step = b.step("capi-test", "Run C API tests");
     capi_test_step.dependOn(&run_capi_tests.step);
+    // Share the exact contract executable while allowing focused API
+    // regressions to avoid compiling unrelated resolver replay fixtures.
+    b.step("capi-contract-test", "Run hermetic C API contracts without resolver replay suites")
+        .dependOn(&run_capi_tests.step);
+    // Physical C API regressions can build their existing implementation owner
+    // directly. The ordinary gate still audits and runs both partitions.
+    @import("../antfly/test_partitions.zig").installLocalArtifact(b, capi_tests.executable, "capi-contract-owner-test-build", "Build physical C API contract tests without consumer discovery", "capi-contract-owner-tests");
 
     // Resolver and scorer are owned by embedded storage. Run their pure tests
     // in embedded CI as well as the compatibility lib-* test targets.
@@ -705,8 +707,19 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .run_lite_rs_tests = run_lite_rs_tests,
         .run_lite_ts_tests = run_lite_ts_tests,
         .run_lite_go_example = run_lite_go_example,
-        .run_lite_go_retrieval_template = run_lite_go_retrieval_template,
         .run_cabi_packaging_tests = run_cabi_packaging_tests,
         .run_capi_tests = run_capi_tests,
     };
+}
+
+// C ABI consumers use the same independently emitted test objects and native
+// final links as other runtime-owner tests. In particular, large Mach-O Debug
+// images must not send C/ObjC provider relocations through Zig's direct linker.
+fn capiTestRun(b: *std.Build, artifact: linked_tests.Artifact, filters: []const []const u8, curated: bool) *std.Build.Step.Run {
+    const support = @import("../antfly/test_support.zig");
+    const run = b.addRunArtifact(artifact.executable);
+    support.configureTestRun(run);
+    if (curated) for (filters) |filter| run.addArgs(&.{ "--suite-filter", filter });
+    support.addRuntimeTestFilters(b, run, support.selectTestFilters(b, filters));
+    return run;
 }

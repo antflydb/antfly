@@ -52,7 +52,7 @@ ENTRYPOINTS = (
 PACKAGE_ENTRYPOINTS = (
     "zig/pkg/antfly-embedded/src/root.zig",
     "zig/pkg/antfly-embedded/src/engine/root.zig",
-    "zig/examples/antfly_wasm.zig",
+    "zig/pkg/antfly-embedded/src/wasm_root.zig",
     "zig/pkg/inference/src/main.zig",
     "zig/pkg/inference/src/wasm_entry_wasm32.zig",
     "zig/pkg/inference/src/wasm_entry_wasm64.zig",
@@ -62,6 +62,7 @@ PACKAGE_ENTRYPOINTS = (
 # Generated data modules resolve to their producers. Only Zig's standard library
 # and build-generated configuration constants terminate traversal.
 SOURCE_MODULES = {
+    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_media": ("zig/lib/media/src/mod.zig",),
     "antfly_video": ("zig/lib/video/src/mod.zig",),
     "storage_ordinals": ("zig/pkg/antfly-embedded/src/storage/ordinals/root.zig",),
@@ -154,10 +155,26 @@ SOURCE_MODULES = {
     "antfly_decision_evidence": ("zig/lib/decisions/evidence.zig",),
     "antfly_source_evidence": ("zig/lib/source_evidence/root.zig",),
     "antfly_decisions": ("zig/lib/decisions/root.zig",),
+    "antfly_cloudflare": ("zig/lib/cloudflare/root.zig",),
+    "antfly_cloudflare_config": ("zig/lib/cloudflare/routing.zig",),
+    "cloudflare_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig",
+    ),
+    "bedrock_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/bedrock_api/root.zig",
+    ),
+    "anthropic_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/anthropic_api/root.zig",
+    ),
+    "fastino_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/fastino_api/root.zig",
+    ),
     "antfly_structured": ("zig/lib/structured/root.zig",),
     "antfly_decision_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig",
     ),
+    "antfly_documents": ("zig/lib/documents/src/root.zig",),
+    "antfly_document_runs": ("zig/lib/readers/src/document_runs.zig",),
     "antfly_embeddings_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_embeddings_openapi/root.zig",
     ),
@@ -177,6 +194,9 @@ SOURCE_MODULES = {
     "antfly_video_media": ("zig/lib/media/src/inference.zig",),
     "antfly_indexes_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_indexes_openapi/root.zig",
+    ),
+    "antfly_resources_openapi": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_resources_openapi/root.zig",
     ),
     "antfly_inference_config_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_inference_config_openapi/root.zig",
@@ -241,6 +261,7 @@ SOURCE_MODULES = {
     "antfly_query_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_query_openapi/root.zig",
     ),
+    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_reader_config": ("zig/lib/readers/src/config.zig",),
     "antfly_readers": ("zig/lib/readers/src/mod.zig",),
     "antfly_regex": ("zig/lib/regex/src/mod.zig",),
@@ -326,7 +347,7 @@ SOURCE_MODULES = {
     "openai_api": (
         "zig/pkg/antfly-embedded/src/openapi/generated/openai_api/root.zig",
     ),
-    "pdf_standard_fonts": ("zig/pdf_standard_fonts.zig",),
+    "pdf_standard_fonts": ("zig/lib/pdf/src/agl_lookup.zig",),
     "pjrt": ("zig/lib/pjrt/src/root.zig",),
     "prometheus": ("zig/lib/prometheus/src/root.zig",),
     "protobuf": ("zig/lib/protobuf/src/root.zig",),

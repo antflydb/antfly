@@ -19,6 +19,7 @@ const types = @import("../storage/db/types.zig");
 const expr = @import("expressions.zig");
 const d = @import("decisions.zig");
 const runtime = @import("runtime.zig");
+const managed = @import("../inference/managed_embedder.zig");
 const Json = std.json.Value;
 
 /// Expression fields have the same visibility as public stored documents.
@@ -52,19 +53,35 @@ fn applyBounded(a: std.mem.Allocator, req: types.SearchRequest, result: *types.S
     const source_relation = result.total_hits_relation;
     if (plan.scope == .matches and (source_relation != .exact or result.hits.len != source_total)) return error.DecisionLimitExceeded;
     const count = @min(result.hits.len, plan.candidate_count);
+    const shared: ?*managed.ProviderRuntime = if (@hasField(@TypeOf(options), "provider_runtime")) options.provider_runtime else @as(?*managed.ProviderRuntime, null);
+    const supplied: ?*managed.ProviderRuntime = shared orelse if (options.reranker_runtime) |service| &service.providers else null;
     var fallback_io: ?std.Io.Threaded = null;
     defer if (fallback_io) |*io| io.deinit();
-    const io = if (options.reranker_runtime) |service| service.io else if (options.backend_runtime) |backend| backend.io() orelse return error.QueryRuntimeUnavailable else blk: {
+    const io = if (supplied) |service| service.io else if (options.backend_runtime) |backend| backend.io() orelse return error.QueryRuntimeUnavailable else owned: {
         fallback_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        break :blk fallback_io.?.io();
+        break :owned fallback_io.?.io();
     };
-    var fallback_http: ?httpx.Client = null;
-    defer if (fallback_http) |*http| http.deinit();
-    const http = if (options.reranker_runtime) |service| &service.http else blk: {
-        fallback_http = httpx.Client.initWithConfig(std.heap.smp_allocator, io, .{ .keep_alive = true, .cookies_enabled = false, .max_response_size = 1024 * 1024 });
-        break :blk &fallback_http.?;
+    var fallback_providers: ?managed.ProviderRuntime = null;
+    defer if (fallback_providers) |*service| service.deinit();
+    const providers = supplied orelse owned: {
+        fallback_providers = managed.ProviderRuntime.init(std.heap.smp_allocator, io);
+        break :owned &fallback_providers.?;
     };
-    var execution: runtime.Runtime = .{ .profile_allocator = scratch, .registry = registry, .http = http, .io = io, .context = .{ .io = io, .deadline_ns = req.execution_deadline_ns, .cancellation = req.cancellation }, .source_table = options.source_table, .secret_store = options.secret_store, .antfly_provider = options.antfly_provider, .antfly_api_key = if (@hasField(@TypeOf(options), "inference_api_key")) options.inference_api_key else null, .antfly_url = options.inference_api_url };
+    var execution: runtime.Runtime = .{
+        .profile_allocator = scratch,
+        .registry = registry,
+        .provider_runtime = providers,
+        .limits = providers.limits,
+        .http = try providers.assetHttpClient(),
+        .io = io,
+        .context = .{ .io = io, .deadline_ns = req.execution_deadline_ns, .cancellation = req.cancellation },
+        .source_table = options.source_table,
+        .secret_store = options.secret_store,
+        .antfly_provider = options.antfly_provider,
+        .antfly_api_key = if (@hasField(@TypeOf(options), "inference_api_key")) options.inference_api_key else null,
+        .antfly_url = options.inference_api_url,
+    };
+    defer execution.deinit();
     const provider = execution.provider();
     try expr.validatePlanProviders(scratch, plan, provider);
     const documents = try scratch.alloc(Json, count);
@@ -128,6 +145,8 @@ fn applyBounded(a: std.mem.Allocator, req: types.SearchRequest, result: *types.S
         initialized += 1;
         if (hit.computed_json) |bytes| a.free(bytes);
         hit.computed_json = null;
+        if (hit.computed_receipt) |receipt| a.destroy(receipt);
+        hit.computed_receipt = null;
         hit.computed_json = try std.json.Stringify.valueAlloc(a, evaluations[index].computed, .{});
     }
     const summary = try std.json.Stringify.valueAlloc(a, .{
@@ -303,7 +322,7 @@ test "decision functions candidate filtering sorting and aggregates reuse a name
     defer if (meta.evaluation_json) |bytes| a.free(bytes);
     const options = struct {
         decision_registry: ?*const @import("../common/provider_registry.zig").Registry,
-        reranker_runtime: ?*struct { io: std.Io, http: httpx.Client } = null,
+        reranker_runtime: ?*struct { io: std.Io, http: httpx.Client, providers: managed.ProviderRuntime } = null,
         backend_runtime: ?*@import("../storage/background_runtime.zig").BackendRuntime = null,
         secret_store: ?*@import("../common/secrets.zig").FileStore = null,
         antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider,
@@ -413,4 +432,67 @@ test "decision functions expression documents hide storage revision markers" {
     try std.testing.expect(rows[0].computed.object.get("artifact").? == .null);
     try std.testing.expect(rows[0].computed.object.get("revision").? == .null);
     try std.testing.expectEqualStrings("public", rows[0].computed.object.get("public").?.string);
+}
+
+test "decision functions query evaluations reuse the supplied provider transport for named embeddings" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var providers = managed.ProviderRuntime.init(a, io);
+    defer providers.deinit();
+    const response = "{\"data\":[{\"index\":0,\"embedding\":[1,0]},{\"index\":1,\"embedding\":[0,1]},{\"index\":2,\"embedding\":[1,0]}]}";
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/v1/embeddings", .respond = .{ .body = response } }});
+    defer server.deinit();
+    const Fixture = struct {
+        fn serve(s: *httpx.TestServer) void {
+            while (true) s.handleOne() catch return;
+        }
+    };
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fixture.serve, .{&server});
+    const url = try a.dupe(u8, server.baseUrl());
+    defer a.free(url);
+    var registry = @import("../common/provider_registry.zig").Registry.init(a);
+    defer registry.deinit();
+    try registry.registerEmbedderConfig("dense", .{ .provider = .openai, .url = url, .api_key = "fixture", .model = "test", .dimensions = 2 });
+    try registry.registerDeciderConfig("routing", .{ .decision_method = .embedding_similarity, .embedder = "dense", .embedding_options = .{ .dimensions = 2 } });
+    const definition =
+        \\{"scope":"candidates","candidate_count":1,"compute":{"route":{"call":"ai_choice","input":{"field":"body"},"instructions":"Route","criteria":{"a":"account","b":"billing"},"decider":"routing"}}}
+    ;
+    const options = .{
+        .provider_runtime = &providers,
+        .reranker_runtime = @as(?*struct { providers: managed.ProviderRuntime }, null),
+        .backend_runtime = @as(?*@import("../storage/background_runtime.zig").BackendRuntime, null),
+        .decision_registry = @as(?*const @import("../common/provider_registry.zig").Registry, &registry),
+        .source_table = "docs",
+        .secret_store = null,
+        .antfly_provider = null,
+        .inference_api_url = null,
+    };
+    var shared_client: ?*httpx.Client = null;
+    for (0..3) |iteration| {
+        const hits = try a.alloc(types.SearchHit, 1);
+        hits[0] = .{ .id = try a.dupe(u8, "row"), .stored_data = try a.dupe(u8, "{\"body\":\"account\"}") };
+        var result: types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = 1 };
+        defer result.deinit();
+        var meta = struct { evaluation_json: ?[]u8 = null }{};
+        defer if (meta.evaluation_json) |bytes| a.free(bytes);
+        const request: types.SearchRequest = .{ .evaluation_json = definition, .evaluation_limit = 1, .limit = 1 };
+        if (iteration == 2) {
+            // A per-query ManagedEmbedder with its own pool would ignore this
+            // service policy and incorrectly accept the third response.
+            shared_client.?.config.max_response_size = 1;
+            try std.testing.expectError(error.ResponseTooLarge, apply(a, request, &result, &meta, options));
+            continue;
+        }
+        try apply(a, request, &result, &meta, options);
+        const computed = try std.json.parseFromSlice(Json, a, result.hits[0].computed_json.?, .{});
+        defer computed.deinit();
+        try std.testing.expectEqualStrings("a", computed.value.object.get("route").?.string);
+        const client = providers.http_client.load(.acquire) orelse return error.TestUnexpectedResult;
+        if (shared_client) |previous| try std.testing.expect(previous == client);
+        shared_client = client;
+    }
 }

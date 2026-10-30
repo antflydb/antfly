@@ -89,6 +89,17 @@ pub const Registry = struct {
         const waiting = self.callbacks != 0;
         self.mutex.unlock(runtime);
         if (waiting) self.callbacks_done.waitUncancelable(runtime);
+        // Cached descriptors may outlive their DB wrapper. Once publication
+        // callbacks have drained, retire their weak resources immediately.
+        // Explicit readers and active uses retain their independent lifetime.
+        self.mutex.lockUncancelable(runtime);
+        defer self.mutex.unlock(runtime);
+        var it = self.first;
+        while (it) |state| : (it = state.next) state.retire();
+        it = self.first;
+        while (it) |state| : (it = state.next) {
+            if (state.resources_closed.load(.acquire)) self.releaseClosedClaimAssumeLocked(state);
+        }
     }
 
     pub fn releaseOwner(self: *Registry) void {
@@ -191,6 +202,10 @@ pub const Registry = struct {
         const runtime = self.io();
         self.mutex.lockUncancelable(runtime);
         defer self.mutex.unlock(runtime);
+        self.releaseClosedClaimAssumeLocked(state);
+    }
+
+    fn releaseClosedClaimAssumeLocked(self: *Registry, state: *State) void {
         if (state.retired_claim == 0) return;
         var it = self.first;
         while (it) |other| : (it = other.next) {
@@ -245,7 +260,7 @@ pub const Registry = struct {
         // Writable roots are protected by the catalog reference. Read-only
         // sources use the established external-reader lock, since they cannot
         // publish a lease and external writers must not reuse their pages.
-        var reader = try native.NativeFile.openWithIo(a, runtime, self.path, .{ .read_only = true, .internal_reader = !reader_fenced, .no_sync = true });
+        var reader = try native.NativeFile.openWithIo(a, runtime, self.path, .{ .read_only = true, .internal_reader = !reader_fenced, .reader_coordinator = owner.file.reader_coordinator, .no_sync = true });
         errdefer reader.close();
         reader.page_cache_enabled.store(false, .monotonic);
         var capture = Capture{ .allocator = a, .key = key, .lease_key = lease_key };
@@ -512,7 +527,11 @@ pub fn cleanupOrphans(file: *native.NativeFile, sweep: *SweepCursor) !usize {
     // Cursor navigation is finished before publication/reclamation can run.
     var mutations: [64]native.CatalogMutation = undefined;
     for (keys[0..count], 0..) |key, i| mutations[i] = .{ .key = key, .is_delete = true };
+    const owns_transaction = file.transaction_header == null;
+    if (owns_transaction) try file.beginArtifactLeaseTransaction();
+    errdefer if (owns_transaction) file.abortTransaction();
     try file.putCatalogBatch(mutations[0..count]);
+    if (owns_transaction) try file.commitTransaction();
     return count;
 }
 

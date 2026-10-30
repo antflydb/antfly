@@ -4,6 +4,68 @@
 const std = @import("std");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 
+pub const DocumentSource = struct {
+    /// Image-only perspective correction. Four clockwise corners in original image-edge pixels, ordered top-left, top-right, bottom-right, bottom-left. OCR evidence remains in original source coordinates.
+    quadrilateral: ?[]const []const f64 = null,
+    /// Unique source identity within the request. Separate sources are never implicitly merged.
+    id: []const u8,
+    /// Inline data URI or location allowed by the deployment content security policy.
+    url: []const u8,
+    media_type: []const u8,
+    /// Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide.
+    pages: ?[]const i64 = null,
+    /// Include slide speaker notes as separate evidence, never silently as visible slide text.
+    include_notes: ?bool = null,
+    /// Include hidden slides.
+    include_hidden: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "quadrilateral", "quadrilateral", true },
+        .{ "id", "id", false },
+        .{ "url", "url", false },
+        .{ "media_type", "media_type", false },
+        .{ "pages", "pages", true },
+        .{ "include_notes", "include_notes", true },
+        .{ "include_hidden", "include_hidden", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.quadrilateral) |value| {
+            try jw.objectField("quadrilateral");
+            try jw.write(value);
+        }
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("url");
+        try jw.write(self.url);
+        try jw.objectField("media_type");
+        try jw.write(self.media_type);
+        if (self.pages) |value| {
+            try jw.objectField("pages");
+            try jw.write(value);
+        }
+        if (self.include_notes) |value| {
+            try jw.objectField("include_notes");
+            try jw.write(value);
+        }
+        if (self.include_hidden) |value| {
+            try jw.objectField("include_hidden");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Version 2 attributes are scored on retained entity spans using shared encoded states. Omitted applies_to selects all entities; [] selects none. Raw labels must be unique across groups, including when qualify_labels is true. Group names text,confidence,start,end are reserved.
 pub const ExtractionAttributeGroup = struct {
     labels: []const []const u8,
@@ -247,6 +309,18 @@ pub const ExtractionConfig = struct {
     schema_version: ?std.json.Value = null,
     url: ?[]const u8 = null,
     api_url: ?[]const u8 = null,
+    /// Google Cloud project for the vertex provider.
+    project_id: ?[]const u8 = null,
+    /// Vertex AI location.
+    location: ?[]const u8 = null,
+    /// AWS region for the bedrock provider.
+    region: ?[]const u8 = null,
+    /// Path to Google service account credentials for the vertex provider.
+    credentials_path: ?[]const u8 = null,
+    /// Cloudflare Workers AI account identifier.
+    account_id: ?[]const u8 = null,
+    /// Optional Cloudflare AI Gateway identifier.
+    gateway_id: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     bearer_token: ?[]const u8 = null,
     schema: ?ExtractionSchema = null,
@@ -259,6 +333,12 @@ pub const ExtractionConfig = struct {
         .{ "schema_version", "schema_version", true },
         .{ "url", "url", true },
         .{ "api_url", "api_url", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "region", "region", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
         .{ "api_key", "api_key", true },
         .{ "bearer_token", "bearer_token", true },
         .{ "schema", "schema", true },
@@ -291,6 +371,30 @@ pub const ExtractionConfig = struct {
         }
         if (self.api_url) |value| {
             try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
             try jw.write(value);
         }
         if (self.api_key) |value| {
@@ -593,7 +697,15 @@ pub const ExtractionEntityDefinition = struct {
 };
 
 pub const ExtractionFieldValue = struct {
-    value: []const u8,
+    /// Source text for span models, or a native typed value for compatible hosted extraction providers.
+    value: ?std.json.Value,
+    /// Provenance of hosted extraction values; never treat a derivation or estimate as verbatim source evidence.
+    origin: ?[]const u8 = null,
+    estimate: ?std.json.ArrayHashMap(f64) = null,
+    /// Per-item UTF-8 byte ranges for list values, rebased against the exact submitted source. Null entries have no literal span.
+    spans: ?std.json.Value = null,
+    /// Literal text ranges mapped back to the original document pages or explicitly included speaker notes. Derived and estimated values have no fabricated literal references.
+    evidence: ?[]const std.json.Value = null,
     score: ?std.json.Value = null,
     start: ?i64 = null,
     end: ?i64 = null,
@@ -603,6 +715,10 @@ pub const ExtractionFieldValue = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "value", "value", false },
+        .{ "origin", "origin", true },
+        .{ "estimate", "estimate", true },
+        .{ "spans", "spans", true },
+        .{ "evidence", "evidence", true },
         .{ "score", "score", true },
         .{ "start", "start", true },
         .{ "end", "end", true },
@@ -621,6 +737,22 @@ pub const ExtractionFieldValue = struct {
         try jw.beginObject();
         try jw.objectField("value");
         try jw.write(self.value);
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
+        if (self.estimate) |value| {
+            try jw.objectField("estimate");
+            try jw.write(value);
+        }
+        if (self.spans) |value| {
+            try jw.objectField("spans");
+            try jw.write(value);
+        }
+        if (self.evidence) |value| {
+            try jw.objectField("evidence");
+            try jw.write(value);
+        }
         if (self.score) |value| {
             try jw.objectField("score");
             try jw.write(value);
@@ -750,6 +882,8 @@ pub const ExtractionInputRequest = union(enum) {
         if (objectHasAnyKey(source.object, &.{
             "model",
             "schema_version",
+            "read_artifact",
+            "documents",
             "inputs",
             "schema",
             "options",
@@ -1587,14 +1721,24 @@ pub const ExtractionProbability = f64;
 pub const ExtractionProvider = enum {
     antfly,
     pioneer,
+    cloudflare,
     openai,
+    gemini,
+    vertex,
+    anthropic,
+    bedrock,
     mock,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .antfly => "antfly",
             .pioneer => "pioneer",
+            .cloudflare => "cloudflare",
             .openai => "openai",
+            .gemini => "gemini",
+            .vertex => "vertex",
+            .anthropic => "anthropic",
+            .bedrock => "bedrock",
             .mock => "mock",
         };
         try jw.write(s);
@@ -1608,7 +1752,12 @@ pub const ExtractionProvider = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "antfly", .antfly },
             .{ "pioneer", .pioneer },
+            .{ "cloudflare", .cloudflare },
             .{ "openai", .openai },
+            .{ "gemini", .gemini },
+            .{ "vertex", .vertex },
+            .{ "anthropic", .anthropic },
+            .{ "bedrock", .bedrock },
             .{ "mock", .mock },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -1903,11 +2052,15 @@ pub const ExtractionRelationSchema = struct {
     }
 };
 
-/// Atomic extraction request. Every input is validated before inference; failures return no partial data.
+/// Atomic extraction request. Supply exactly one of inputs, documents or read_artifact. Every input is validated before inference; failures return no partial data.
 pub const ExtractionRequest = struct {
     model: []const u8,
     schema_version: ?std.json.Value = null,
-    inputs: []const ExtractionInput,
+    /// Opaque handle returned by read with retain_artifact. Mutually exclusive with inputs and documents. Reuses the immutable complete reading without downloading or running OCR again. Handles expire and are local to the serving process.
+    read_artifact: ?[]const u8 = null,
+    /// Complete PDF/PPTX/image sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping.
+    documents: ?[]const DocumentSource = null,
+    inputs: ?[]const ExtractionInput = null,
     schema: ExtractionSchema,
     options: ?ExtractionOptions = null,
 
@@ -1915,7 +2068,9 @@ pub const ExtractionRequest = struct {
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "schema_version", "schema_version", true },
-        .{ "inputs", "inputs", false },
+        .{ "read_artifact", "read_artifact", true },
+        .{ "documents", "documents", true },
+        .{ "inputs", "inputs", true },
         .{ "schema", "schema", false },
         .{ "options", "options", true },
     };
@@ -1936,8 +2091,18 @@ pub const ExtractionRequest = struct {
             try jw.objectField("schema_version");
             try jw.write(value);
         }
-        try jw.objectField("inputs");
-        try jw.write(self.inputs);
+        if (self.read_artifact) |value| {
+            try jw.objectField("read_artifact");
+            try jw.write(value);
+        }
+        if (self.documents) |value| {
+            try jw.objectField("documents");
+            try jw.write(value);
+        }
+        if (self.inputs) |value| {
+            try jw.objectField("inputs");
+            try jw.write(value);
+        }
         try jw.objectField("schema");
         try jw.write(self.schema);
         if (self.options) |value| {

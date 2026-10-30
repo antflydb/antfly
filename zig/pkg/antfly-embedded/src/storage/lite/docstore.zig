@@ -92,6 +92,63 @@ test "lite detached writer admission fences documents and index catalogs" {
     try std.testing.expectEqual(@as(usize, 0), admission.active);
 }
 
+test "lite empty write commits preserve checkpoints and release writer admission" {
+    const Admission = struct {
+        entered: usize = 0,
+        active: usize = 0,
+        fn enter(ptr: *anyopaque, _: PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered += 1;
+            self.active += 1;
+        }
+        fn leave(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.active -= 1;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "empty-write.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("retained", "value");
+        try write.commit();
+    }
+    var admission: Admission = .{};
+    store.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer store.writer_admission = null;
+    const checkpoint = store.file.activeCheckpoint();
+    const header = store.file.header;
+    for (0..16) |_| {
+        var empty = try store.beginWrite();
+        var empty_live = true;
+        defer if (empty_live) empty.abort();
+        try std.testing.expectEqualStrings("value", try empty.get("retained"));
+        const entered = admission.entered;
+        try empty.commit();
+        empty_live = false;
+        try std.testing.expectEqual(entered, admission.entered);
+        try std.testing.expectEqual(@as(usize, 0), admission.active);
+        try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
+        try std.testing.expectEqualDeep(header, store.file.header);
+    }
+    {
+        var next = try store.beginWrite();
+        errdefer next.abort();
+        try next.put("after", "progress");
+        try next.commit();
+    }
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("progress", try read.get("after"));
+}
+
 test "lite reclamation stale quota estimates expire after roots shrink" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1309,7 +1366,7 @@ var next_score_cache_owner: std.atomic.Value(u64) = .init(1);
 /// Optional owner admission around every document/index publication.
 /// Detached computation can retain this Store without retaining a file
 /// writer lease; admission must validate its checkpoint before mutation.
-pub const PublicationScope = enum { primary, index, reclamation };
+pub const PublicationScope = enum { primary, index, reclamation, artifact_lease };
 
 pub const WriterAdmission = struct {
     ptr: *anyopaque,
@@ -1405,10 +1462,10 @@ pub const Store = struct {
     secret_store_uncertain: bool = false,
     mutex: PublicationMutex = .{},
     writer_mutex: std.Io.Mutex = .init,
-    writer_ready: std.Io.Condition = .init,
+    writer_ready: platform_sync.BroadcastCondition = .init,
     generation_lock: std.Io.RwLock = .init,
     commit_mutex: std.Io.Mutex = .init,
-    commit_ready: std.Io.Condition = .init,
+    commit_ready: platform_sync.BroadcastCondition = .init,
     commit_head: ?*MutationRequest = null,
     commit_tail: ?*MutationRequest = null,
     commit_draining: bool = false,
@@ -1419,7 +1476,7 @@ pub const Store = struct {
     serving_writer_ticket: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
-    pub const MaintenancePhase = enum { assessment, copy };
+    pub const MaintenancePhase = enum { assessment, copy, verification };
     pub const MaintenanceTestHook = struct {
         ptr: *anyopaque,
         notify: *const fn (*anyopaque, MaintenancePhase) anyerror!void,
@@ -1692,7 +1749,7 @@ pub const Store = struct {
         if (self.read_generation != null) return;
         const generation = try self.allocator.create(ReadGeneration);
         errdefer self.allocator.destroy(generation);
-        generation.* = .{ .owner_generation = self.assessment_generation, .checkpoint = self.file.activeCheckpoint(), .scoped_reader_lock = self.file.externally_locked, .file = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .internal_reader = self.file.header.indexed_reclamation or self.file.externally_locked, .resource_manager = self.resource_manager }) };
+        generation.* = .{ .owner_generation = self.assessment_generation, .checkpoint = self.file.activeCheckpoint(), .scoped_reader_lock = self.file.externally_locked, .file = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .internal_reader = self.file.header.indexed_reclamation or self.file.externally_locked, .reader_coordinator = self.file.reader_coordinator, .resource_manager = self.resource_manager }) };
         self.read_generation = generation;
         self.file.secondary_page_cache = &generation.file.page_cache;
         self.file.reader_frontier = &self.reader_frontier;
@@ -1729,7 +1786,7 @@ pub const Store = struct {
                 // inode fence until exec/close, even after its parent closed
                 // the descriptor. Wait for that fence instead of failing an
                 // otherwise uncontended same-owner read.
-                try generation.file.file.lock(generation.file.runtime(), .shared);
+                try generation.file.acquireReaderFence(pin.sequence, &self.file);
             }
             generation.kernel_readers += 1;
         }
@@ -1787,7 +1844,7 @@ pub const Store = struct {
         if (pin.next) |next| next.previous = pin.previous else generation.last_pin = pin.previous;
         if (generation.scoped_reader_lock and pin.kernel_reader) {
             generation.kernel_readers -= 1;
-            if (generation.kernel_readers == 0) generation.file.file.unlock(generation.file.runtime());
+            if (generation.kernel_readers == 0) generation.file.releaseReaderFence();
         }
         generation.references -= 1;
         if (generation.first_pin) |first| generation.pinned_at = first.pinned_at;
@@ -1947,6 +2004,25 @@ pub const Store = struct {
         return self.maintainOnceWithCancel(force, null);
     }
 
+    /// The detached connection owner calls this before provider/index work,
+    /// while no foreground gate or writer path lease is held.
+    pub fn prepareAllocatorVerification(self: *Store, cancel: ?*const maintenance.CancelToken) !void {
+        if (self.file.free_pages_verified) return;
+        if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .verification);
+        const reader = try self.file.allocatorVerificationSnapshot(cancel);
+        defer {
+            reader.close();
+            self.file.allocator.destroy(reader);
+        }
+        // Publish the completed proof under the same short owner fence as
+        // lease metadata. Foreground readers may inherit this flag, so the
+        // detached scan must never mutate it concurrently outside that fence.
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, .artifact_lease);
+        defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+        try self.file.inheritAllocatorVerification(reader);
+        if (!self.file.free_pages_verified) return error.EnrichmentWaitCanceled;
+    }
+
     fn maintainOnceWithCancel(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken) !void {
         if (self.read_only) return;
         // External owners also defer requested allocator-format conversion to
@@ -1971,7 +2047,7 @@ pub const Store = struct {
             try self.artifact_marker_sweep.run(&self.file);
             if (try self.file.retirementNeedsService()) {
                 try self.refreshAdmissionAssumeLocked();
-                _ = try self.file.reclaimPagesWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel);
+                _ = try self.file.reclaimPagesForMaintenanceWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel);
                 self.maintenance_policy.status.state = if (self.maintenance_policy.options.enabled) .idle else .disabled;
                 self.maintenance_policy.status.reason = if (self.maintenance_policy.options.enabled) .none else .disabled;
                 self.maintenance_policy.status.last_error = null;
@@ -2725,7 +2801,7 @@ pub const Store = struct {
             index_only = index_only and item.index_only;
             artifact_lease_only = artifact_lease_only and item.artifact_lease;
         }
-        if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (index_only) .index else .primary);
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease_only) .artifact_lease else if (index_only) .index else .primary);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
         defer self.mutex.unlock();
@@ -3150,6 +3226,13 @@ pub const Txn = struct {
     pub fn commit(self: *Txn) !void {
         if (self.read_only) return error.ReadOnly;
         const store = self.store orelse return error.ReadOnly;
+        // Metadata probes may use a write transaction without staging changes.
+        // Release their admission and snapshot directly: entering publication
+        // would unnecessarily run retirement pressure and allocator proof work.
+        if (self.pending_count == 0) {
+            self.abort();
+            return;
+        }
         const allocator = self.allocator;
         var mutations = try allocator.alloc(native.DocumentMutation, self.pending_count);
         defer allocator.free(mutations);
@@ -3706,6 +3789,15 @@ pub const Txn = struct {
     pub fn openReadScope(self: *Txn, allocator: Allocator) !ReadScope {
         const workspace = if (self.store) |store| try store.checkoutWorkspace(allocator) else null;
         return .{ .parent = self, .workspace = workspace, .scratch = @import("result_scratch.zig").Scratch.init(allocator, 256 * 1024) };
+    }
+
+    /// The caller must retain this read transaction while comparing identities
+    /// against a later checkpoint, so record-page reuse cannot create ABA.
+    pub fn valueIdentity(self: *Txn, key: []const u8) !?u64 {
+        if (!self.read_only or self.pending_count != 0) return error.InvalidArgument;
+        const lookup_key = try self.prefixedKey(key);
+        defer if (self.prefix.len > 0) self.allocator.free(lookup_key);
+        return (try self.readFile()).documentReferenceAtCheckpoint(self.checkpoint, lookup_key);
     }
 
     pub fn get(self: *Txn, key: []const u8) ![]const u8 {
@@ -4727,6 +4819,48 @@ test "lite native docstore runtime scans ordered snapshot" {
     try std.testing.expectEqualStrings("doc:c", seek.key);
 }
 
+test "lite resolver consumer bootstrap discards stale projections without reading external values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "resolver-bootstrap.aflite");
+    defer allocator.free(path);
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    const consumers = @import("resolver_consumers.zig");
+    const stale = consumers.profiles_prefix ++ "stale";
+    const neighbor = "\x00antfly/embedded/resolver-consumers/v7/static0";
+    const large = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(large);
+    @memset(large, 'x');
+    {
+        var seed = try Txn.openWrite(&store);
+        errdefer seed.abort();
+        try seed.put(stale, large);
+        try seed.put(neighbor, large);
+        try seed.commit();
+    }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    {
+        var write = try Txn.openWrite(&store);
+        errdefer write.abort();
+        const before = store.file.test_page_reads.load(.monotonic);
+        try consumers.bootstrap(arena.allocator(), &write);
+        // Two MiB of discarded/adjacent values must not be read to migrate
+        // one stale key. Count logical reads so the assertion ignores caches.
+        try std.testing.expect(store.file.test_page_reads.load(.monotonic) - before < 64);
+        try std.testing.expectError(error.NotFound, write.get(stale));
+        try std.testing.expectEqualStrings("1", try write.get(consumers.marker));
+        try write.commit();
+    }
+    var read = try Txn.openRead(&store);
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(stale));
+    try std.testing.expectEqualStrings(large, try read.get(neighbor));
+    try std.testing.expectEqualStrings("1", try read.get(consumers.marker));
+}
+
 test "lite native write cursors merge pending writes and deletes in order" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4938,6 +5072,8 @@ test "lite artifact leases defer allocator proof until an authored write" {
     var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .externally_locked = true });
     defer store.close();
     try store.file.putIndexCatalogRecord("index/run", "contents");
+    const orphan_key = native.NativeFile.artifact_lease_key_prefix ++ "00000000000000000000000000000001";
+    try store.file.putCatalogRecord(orphan_key, "abandoned");
     store.close();
     store = try Store.openWithOptions(a, path, options);
     try std.testing.expect(!store.file.free_pages_verified);
@@ -4950,6 +5086,14 @@ test "lite artifact leases defer allocator proof until an authored write" {
         try std.testing.expect(!store.file.free_pages_verified);
     }
     try std.testing.expect(!store.file.free_pages_verified);
+    // Read-generated retirement must not move the deferred whole-file proof
+    // into a later foreground-gate-held maintenance publication.
+    store.maintenance_policy.options.enabled = false;
+    try store.maintainOnce(false);
+    try std.testing.expect(!store.file.free_pages_verified);
+    const orphan = try store.file.getCatalogRecordAlloc(a, orphan_key);
+    defer if (orphan) |bytes| a.free(bytes);
+    try std.testing.expect(orphan == null);
     var write = try store.beginWrite();
     errdefer write.abort();
     try write.put("doc", "authored");

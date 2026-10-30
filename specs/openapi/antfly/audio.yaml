@@ -9,6 +9,7 @@ components:
     TTSProvider:
       type: string
       enum:
+        - cloudflare
         - openai
         - vertex
         - elevenlabs
@@ -18,6 +19,7 @@ components:
     STTProvider:
       type: string
       enum:
+        - cloudflare
         - openai
         - vertex
         - antfly
@@ -39,6 +41,29 @@ components:
       description: "Audio encoding format."
 
     # OpenAI TTS Configuration
+    CloudflareTTSConfig:
+      type: object
+      description: Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
+      required: [account_id, model]
+      properties:
+        account_id:
+          type: string
+        gateway_id:
+          type: string
+        model:
+          type: string
+          default: "@cf/deepgram/aura-2-en"
+        api_key:
+          type: string
+          writeOnly: true
+        base_url:
+          type: string
+          description: Optional deployment-owned full native endpoint override.
+        language_code:
+          type: string
+        voice:
+          type: string
+
     OpenAITTSConfig:
       type: object
       description: |-
@@ -157,6 +182,32 @@ components:
         similarity_boost: 0.75
 
     # OpenAI STT Configuration
+    CloudflareSTTConfig:
+      type: object
+      description: Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
+      required: [provider, account_id, model]
+      properties:
+        provider:
+          type: string
+          enum: [cloudflare]
+        account_id:
+          type: string
+        gateway_id:
+          type: string
+        model:
+          type: string
+          default: "@cf/openai/whisper-large-v3-turbo"
+        api_key:
+          type: string
+          writeOnly: true
+        base_url:
+          type: string
+          description: Optional deployment-owned full native endpoint override.
+        language_code:
+          type: string
+        voice:
+          type: string
+
     OpenAISTTConfig:
       type: object
       description: |-
@@ -274,6 +325,7 @@ components:
         ```
       allOf:
         - oneOf:
+            - $ref: '#/components/schemas/CloudflareTTSConfig'
             - $ref: '#/components/schemas/OpenAITTSConfig'
             - $ref: '#/components/schemas/VertexTTSConfig'
             - $ref: '#/components/schemas/ElevenLabsTTSConfig'
@@ -298,6 +350,7 @@ components:
           description: "Supported Speech locale; Apple transcription does not infer a language."
         timestamps:
           type: boolean
+          x-go-type-skip-optional-pointer: false
           default: true
         download_assets:
           type: boolean
@@ -323,6 +376,7 @@ components:
         ```
       allOf:
         - oneOf:
+            - $ref: '#/components/schemas/CloudflareSTTConfig'
             - $ref: '#/components/schemas/OpenAISTTConfig'
             - $ref: '#/components/schemas/VertexSTTConfig'
             - $ref: '#/components/schemas/AntflySTTConfig'

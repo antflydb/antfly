@@ -170,7 +170,8 @@ fn imageFromRgbaNoFree(allocator: std.mem.Allocator, rgba: []const u8, width: u3
     };
 }
 
-fn decodeRgba(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
+/// Decode once into owned RGBA, preserving alpha for borrowed crop views.
+pub fn decodeRgba(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
     try validateEncodedImageDimensions(image_bytes);
     switch (antfly_image.detectFormat(image_bytes)) {
         .png => {
@@ -1239,6 +1240,40 @@ pub fn preprocessDecodedWithResampleInto(
     resample: Resample,
 ) !void {
     return shared.preprocessDecodedWithResampleInto(allocator, toSharedImage(img), output, target_size, mean, std_dev, resample);
+}
+
+/// Resize a decoded RGB/RGBA crop with admitted, bounded temporary storage.
+/// Failed attempts unwind all resampler allocations before growing the slab.
+pub fn preprocessDecodedWithResampleIntoBounded(
+    allocator: std.mem.Allocator,
+    img: Image,
+    output: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    resample: Resample,
+    options: BatchPreprocessOptions,
+) !void {
+    if (options.max_workers == 0 or options.max_inflight_decoded_bytes == 0 or options.item_errors != null)
+        return error.InvalidBatchPreprocessOptions;
+    var budget = try SharedPreprocessBudget.initResizableAdmittedWithBacking(allocator, preprocessSlabBytesForWave(0, 1, options.max_inflight_decoded_bytes), options.max_inflight_decoded_bytes, options.scratch_admission);
+    defer budget.deinit();
+    const scope = antfly_image.work_control.Scope.enter(options.control);
+    defer scope.deinit();
+    while (true) {
+        try options.control.check();
+        budget.limit_exceeded.store(false, .release);
+        preprocessDecodedWithResampleInto(budget.allocator(), img, output, target_size, mean, std_dev, resample) catch |err| {
+            std.debug.assert(budget.live_bytes.load(.acquire) == 0);
+            if (err == error.OutOfMemory and budget.limit_exceeded.load(.acquire)) {
+                if (try budget.growAfterExhaustion()) continue;
+                return error.ImagePreprocessDecodedBytesExceeded;
+            }
+            return err;
+        };
+        std.debug.assert(budget.live_bytes.load(.acquire) == 0);
+        return;
+    }
 }
 
 /// Preprocess an already-decoded image to an explicit width/height target.
@@ -2579,4 +2614,32 @@ test "embeddinggemma2 raster rectangular bicubic matches decoded RGB and release
     };
     try Runner.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "Florence bounded decoded RGB resize matches existing resamplers and caps scratch" {
+    var rgb = [_]u8{ 255, 12, 31, 45, 90, 180, 10, 200, 255, 0, 89, 2, 33, 60, 99, 4, 5, 6 };
+    const decoded = Image{ .data = &rgb, .width = 2, .height = 3, .channels = 3 };
+    for ([_]Resample{ .nearest, .bilinear, .pillow_bicubic }) |resample| {
+        var expected: [3 * 5 * 5]f32 = undefined;
+        var actual: [3 * 5 * 5]f32 = undefined;
+        try preprocessDecodedWithResampleInto(std.testing.allocator, decoded, &expected, 5, .{ 0.5, 0.5, 0.5 }, .{ 0.5, 0.5, 0.5 }, resample);
+        try preprocessDecodedWithResampleIntoBounded(std.testing.allocator, decoded, &actual, 5, .{ 0.5, 0.5, 0.5 }, .{ 0.5, 0.5, 0.5 }, resample, .{});
+        try std.testing.expectEqualSlices(f32, &expected, &actual);
+    }
+    var output: [3 * 64 * 64]f32 = undefined;
+    try std.testing.expectError(error.ImagePreprocessDecodedBytesExceeded, preprocessDecodedWithResampleIntoBounded(std.testing.allocator, decoded, &output, 64, .{ 0, 0, 0 }, .{ 1, 1, 1 }, .pillow_bicubic, .{ .max_inflight_decoded_bytes = 256 }));
+}
+
+test "Florence decoded scratch admission denial precedes backing allocation" {
+    const Deny = struct {
+        fn grow(_: *anyopaque, _: usize, _: usize) anyerror!void {
+            return error.ResourceTemporarilyUnavailable;
+        }
+    };
+    var context: usize = 0;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var rgb = [_]u8{ 1, 2, 3 };
+    var output: [12]f32 = undefined;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, preprocessDecodedWithResampleIntoBounded(failing.allocator(), .{ .data = &rgb, .width = 1, .height = 1, .channels = 3 }, &output, 2, .{ 0, 0, 0 }, .{ 1, 1, 1 }, .pillow_bicubic, .{ .scratch_admission = .{ .context = &context, .grow = Deny.grow } }));
+    try std.testing.expect(!failing.has_induced_failure);
 }

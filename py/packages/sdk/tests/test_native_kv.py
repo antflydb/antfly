@@ -8,8 +8,10 @@ from pathlib import Path
 
 import httpx
 import pytest
+
 from antfly import AntflyClient, AntflyException, NativeKvCheckpoint
 from antfly.client_generated.models import InferenceGenerateRequest
+from antfly.client_generated.models.inference_generate_usage import InferenceGenerateUsage
 from antfly.native_kv import (
     CHECKPOINT_MIME,
     CHUNK_BYTES,
@@ -242,7 +244,9 @@ def test_resume_json_and_early_closed_sse_use_bounded_upload(tmp_path):
 
     client = client_with_transport(handle)
     request = InferenceGenerateRequest(model="gemma", messages=[])
-    assert client.resume_native_kv_checkpoint(request, path).usage.cached_prompt_tokens == 12
+    response = client.resume_native_kv_checkpoint(request, path)
+    assert isinstance(response.usage, InferenceGenerateUsage)
+    assert response.usage.cached_prompt_tokens == 12
     with client.resume_native_kv_checkpoint_stream(request, path) as chunks:
         assert next(chunks).choices[0].delta.content == "ok"
     assert stream.closed

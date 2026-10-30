@@ -216,6 +216,7 @@ pub const BackendFactory = struct {
     limits: *provider_limits.Registry = &provider_limits.process_registry,
     usage_observer: ?provider_limits.UsageObserver = null,
     provider_runtime: ?*managed_embedder.ProviderRuntime = null,
+    require_completion: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -244,6 +245,7 @@ pub const BackendFactory = struct {
         limits: *provider_limits.Registry = &provider_limits.process_registry,
         usage_observer: ?provider_limits.UsageObserver = null,
         provider_runtime: ?*managed_embedder.ProviderRuntime = null,
+        require_completion: bool = false,
     };
 
     pub fn initWithOptions(
@@ -271,6 +273,7 @@ pub const BackendFactory = struct {
             .limits = options.limits,
             .usage_observer = options.usage_observer,
             .provider_runtime = options.provider_runtime,
+            .require_completion = options.require_completion,
         };
     }
 
@@ -291,7 +294,7 @@ pub const BackendFactory = struct {
             state.* = .{ .alloc = alloc, .provider = .{ .http = self.http, .failure = self.chatgpt_failure, .pin = self.chatgpt_pin, .registrations = manager, .owner = owner, .connection_id = cfg.connection_id.?, .tools_json = cfg.tools_json, .tool_choice_json = cfg.tool_choice_json, .reasoning_effort = if (cfg.reasoning_effort) |effort| @tagName(effort) else null, .max_response_bytes = self.max_response_bytes orelse 16 * 1024 * 1024 }, .context = self.request_context };
             return .{ .ptr = state, .vtable = &.{ .generate = ChatGPTBackend.generate, .deinit = ChatGPTBackend.deinit } };
         }
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits, self.usage_observer, self.provider_runtime);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits, self.usage_observer, self.provider_runtime, self.require_completion);
     }
 };
 
@@ -329,6 +332,7 @@ const BackendState = struct {
     max_response_bytes: ?usize = null,
     execution: execution_context.Context = .{},
     request_context: ?RequestContext = null,
+    require_completion: bool = false,
     provider: union(enum) {
         openai: openai_provider.Provider,
         remote_antfly: antfly_provider.Provider,
@@ -353,12 +357,15 @@ const BackendState = struct {
         limits: *provider_limits.Registry,
         usage_observer: ?provider_limits.UsageObserver,
         provider_runtime: ?*managed_embedder.ProviderRuntime,
+        require_completion: bool,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
 
         try cfg.validate();
         if (cfg.provider == .apple) try lib.apple_native.checkAvailable();
+        state.require_completion = require_completion;
+        if (require_completion and cfg.provider == .apple) return error.UnsupportedInferenceFeature;
         state.limits = limits;
         state.usage_observer = usage_observer;
         _ = try provider_limits.Policy.fromConfig(cfg.rate_limit);
@@ -374,11 +381,13 @@ const BackendState = struct {
         else
             null;
         errdefer if (state.owned_base_url) |endpoint| alloc.free(endpoint);
+        if (cfg.provider == .cloudflare and cfg.url.len == 0) state.owned_base_url = try lib.cloudflare.baseUrl(alloc, cfg.account_id, null);
         if (cfg.provider == .bedrock and cfg.url.len == 0) {
             state.owned_base_url = try std.fmt.allocPrint(alloc, "https://bedrock-runtime.{s}.amazonaws.com", .{cfg.region orelse @import("antfly_platform").env.getenv("AWS_REGION") orelse @import("antfly_platform").env.getenv("AWS_DEFAULT_REGION") orelse "us-east-1"});
         }
         state.api_key = switch (cfg.provider) {
             .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key orelse (if (cfg.url.len == 0) inference_api_key else null), "ANTFLY_INFERENCE_API_KEY"),
+            .cloudflare => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "CLOUDFLARE_API_TOKEN"),
             .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENAI_API_KEY"),
             .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENROUTER_API_KEY"),
             .anthropic => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "ANTHROPIC_API_KEY"),
@@ -395,8 +404,9 @@ const BackendState = struct {
         state.execution = execution;
         state.request_context = request_context;
         state.provider = switch (cfg.provider) {
-            .openai, .openrouter, .ollama => blk: {
-                const provider = openai_provider.Provider.init(alloc, http, cfg.url);
+            .cloudflare, .openai, .openrouter, .ollama => blk: {
+                var provider = openai_provider.Provider.init(alloc, http, state.owned_base_url orelse cfg.url);
+                provider.gateway_id = cfg.gateway_id;
                 break :blk .{ .openai = provider };
             },
             .gemini => blk: {
@@ -534,6 +544,7 @@ const BackendState = struct {
                 .endpoint = endpoint,
                 .model = model,
                 .credentials = source,
+                .gateway_id = self.cfg.gateway_id orelse "",
                 .project = if (self.provider == .vertex) self.provider.vertex.project_id else if (self.provider == .anthropic) self.cfg.workspace_id orelse @import("antfly_platform").env.getenv("ANTHROPIC_WORKSPACE_ID") orelse "" else "",
                 .location = if (self.provider == .vertex) self.provider.vertex.location else if (self.provider == .bedrock) self.provider.bedrock.options.region else "",
             },
@@ -693,7 +704,8 @@ const BackendState = struct {
                 const has_tool_history = for (messages) |message| {
                     if (message.tool_calls != null or message.tool_call_id != null or message.role == .tool) break true;
                 } else false;
-                if (local.generate_json != null and (self.cfg.tools_json != null or self.cfg.tool_choice_json != null or self.cfg.response_format_json != null or has_tool_history)) {
+                if (self.require_completion and local.generate_json == null) return error.UnsupportedInferenceFeature;
+                if (local.generate_json != null and (self.require_completion or self.cfg.tools_json != null or self.cfg.tool_choice_json != null or self.cfg.response_format_json != null or has_tool_history)) {
                     const body = try inference.types.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .termite_native, .{
                         .response_format_json = self.cfg.response_format_json,
                         .logprobs = self.cfg.logprobs,
@@ -783,6 +795,7 @@ const BackendState = struct {
             },
         };
         defer result.deinit();
+        if (self.require_completion and result.finish_reason != .stop) return error.InferenceOutputIncomplete;
         if (self.request_context) |context| try context.check();
 
         const content = try alloc.dupe(u8, result.content);
@@ -1850,7 +1863,7 @@ fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request
     defer alloc.free(url);
     const authorization = if (state.api_key) |*key| try optionalBearerAuthHeaderOwned(state, alloc, key) else null;
     defer if (authorization) |value| alloc.free(value);
-    var headers: [3][2][]const u8 = undefined;
+    var headers: [4][2][]const u8 = undefined;
     var header_count: usize = 0;
     if (authorization) |value| {
         headers[header_count] = .{ "Authorization", value };
@@ -1859,6 +1872,10 @@ fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request
     const timeout_ms = if (state.request_context) |context| try context.remainingTimeoutMs() else @as(?u64, 120_000);
     const timeout_header = try std.fmt.allocPrint(alloc, "{d}", .{timeout_ms orelse 120_000});
     defer alloc.free(timeout_header);
+    if (cfg.gateway_id) |id| {
+        headers[header_count] = .{ "cf-aig-gateway-id", id };
+        header_count += 1;
+    }
     if (cfg.provider == .antfly) {
         headers[header_count] = .{ "X-Antfly-Inference-Attempts-Remaining", "1" };
         header_count += 1;
@@ -2009,6 +2026,63 @@ test "generating remote-only default endpoint is shared with named gateway execu
     try std.testing.expectEqualStrings("http://runtime.internal:8080/ai/v1", state.quotaIdentity("configured").endpoint.endpoint);
 }
 
+test "generating backend Anthropic constrained extraction uses supported wire modes and schemas" {
+    try @import("../inference/providers/anthropic_constrained_test.zig").run();
+}
+
 test "generating backend Anthropic native wire preserves images signed replay and stream lifecycle" {
     try @import("../inference/providers/anthropic_test.zig").run();
+}
+
+test "generating backend Cloudflare uses ordinary chat transport and Gateway headers" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer fixture", req.header("authorization").?);
+            try std.testing.expectEqualStrings("gateway", req.header("cf-aig-gateway-id").?);
+        }
+    };
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/chat/completions", .assert_request = Check.request, .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}" } }});
+    defer server.deinit();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(alloc: std.mem.Allocator, http: *httpx.Client, url: []const u8, out: *?anyerror) std.Io.Cancelable!void {
+            var result = executeChain(alloc, http, &.{.{ .generator = .{ .provider = .cloudflare, .account_id = "account", .gateway_id = "gateway", .model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast", .url = url, .api_key = "fixture" } }}, &.{.{ .role = .user, .content = .{ .text = "hello" } }}) catch |err| {
+                out.* = err;
+                return;
+            };
+            defer result.deinit();
+            std.testing.expectEqualStrings("done", result.content) catch |err| {
+                out.* = err;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ a, &client, server.baseUrl(), &failure }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (failure) |err| return err;
+}
+
+test "generating backend Cloudflare configuration owns routing through parse clone and allocation failures" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var cfg = try lib.parseConfigFromSlice(a,
+                \\{"provider":"cloudflare","account_id":"account","gateway_id":"gateway","model":"@cf/meta/llama-3.3-70b-instruct-fp8-fast","api_key":"fixture"}
+            );
+            defer cfg.deinit(a);
+            var copy = try cfg.clone(a);
+            defer copy.deinit(a);
+            try std.testing.expectEqualStrings("account", copy.account_id.?);
+            try std.testing.expectEqualStrings("gateway", copy.gateway_id.?);
+            try std.testing.expect(copy.account_id.?.ptr != cfg.account_id.?.ptr);
+            try std.testing.expect(copy.gateway_id.?.ptr != cfg.gateway_id.?.ptr);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

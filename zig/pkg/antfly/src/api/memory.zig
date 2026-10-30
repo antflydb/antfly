@@ -139,6 +139,34 @@ pub fn route(method: []const u8, path: []const u8) !Route {
     return error.MemoryRouteNotFound;
 }
 
+/// Describes a request-body JSON error without echoing request content.
+/// Returns null for errors that are not JSON shape or syntax failures.
+pub fn jsonErrorDescription(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.SyntaxError => "syntax error",
+        error.UnexpectedEndOfInput => "request body ended unexpectedly",
+        error.UnexpectedToken => "a field has the wrong type",
+        error.MissingField => "a required field is missing",
+        error.UnknownField => "unknown field",
+        error.DuplicateField => "a field appears more than once",
+        error.InvalidEnumTag => "a field has an unsupported value",
+        error.InvalidNumber, error.Overflow, error.InvalidCharacter => "invalid number",
+        error.LengthMismatch => "an array has the wrong length",
+        else => null,
+    };
+}
+
+/// Human-readable `error` text for a MemoryError response; `code` keeps the
+/// stable error name.
+pub fn errorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        // Number errors can come from non-JSON code paths; only name them
+        // when they are unambiguous JSON shape failures.
+        error.Overflow, error.InvalidCharacter, error.InvalidNumber => @errorName(err),
+        else => if (jsonErrorDescription(err)) |description| description else @errorName(err),
+    };
+}
+
 pub fn status(err: anyerror) u16 {
     return switch (err) {
         error.MemoryNotFound, error.MemoryEntitySuppressed, error.MemorySpaceNotFound, error.MemoryRouteNotFound, error.TableNotFound => 404,
@@ -149,7 +177,7 @@ pub fn status(err: anyerror) u16 {
         error.MemoryInputTooLarge, error.MemoryWorkLimit, error.ResolverCurationLimitExceeded => 413,
         error.MemoryModelRequired, error.MemoryCapabilityUnavailable, error.MemoryExecutionIdentityRequired, error.MemoryModelRevisionUnavailable, error.MemoryModelRevisionMismatch, error.MemoryEmbeddingDimensionsRequired, error.MemoryEmbeddingDimensionsUnsupported => 422,
         error.MemoryRetryNotReady, error.MemoryRetryExhausted, error.MemoryOverloaded => 429,
-        error.MemoryCommitPending, error.NotLeader, error.Unavailable, error.StorageUnavailable, error.GroupLeaderUnavailable => 503,
+        error.MemoryCommitPending, error.NotLeader, error.Unavailable, error.StorageUnavailable, error.GroupLeaderUnavailable, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable => 503,
         error.Canceled => 408,
         error.Timeout, error.DeadlineExceeded => 504,
         error.OutOfMemory, error.MemoryCorruptState => 500,

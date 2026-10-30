@@ -1114,17 +1114,10 @@ pub const Store = struct {
 };
 
 const running_lease_timeout_ms: u64 = 300_000;
-const retry_base_ms: u64 = 250;
-const retry_max_ms: u64 = 30 * std.time.ms_per_s;
 const pending_maintenance_scan_limit: usize = 64;
 
 fn retryDelayMs(job_id: u64, attempt_id: u64) u64 {
-    const shift: u6 = @intCast(@min(attempt_id, 16));
-    const exponential = @min(retry_max_ms, retry_base_ms *| (@as(u64, 1) << shift));
-    var hasher = std.hash.Wyhash.init(job_id);
-    hasher.update(std.mem.asBytes(&attempt_id));
-    const jitter_span = @max(@as(u64, 1), exponential / 4);
-    return @min(retry_max_ms, exponential +| (hasher.final() % jitter_span));
+    return @import("job_retry.zig").retryDelayMs(job_id, attempt_id);
 }
 
 fn jobStateTransitionTokenMatches(current: JobState, expected: JobState) bool {

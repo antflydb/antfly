@@ -287,12 +287,17 @@ def create_current_table(call, current):
                                     },
                                     **{
                                         name: {"type": "string"}
-                                        for name in (
-                                            "body",
-                                            "title",
-                                            "author",
-                                            "item_type",
-                                        )
+                                        for name in ("body", "title")
+                                    },
+                                    **{
+                                        name: {
+                                            "type": "string",
+                                            "x-antfly-field": {
+                                                "type": "keyword",
+                                                "sortable": True,
+                                            },
+                                        }
+                                        for name in ("author", "item_type")
                                     },
                                 },
                             }
@@ -530,7 +535,7 @@ def main():
         if args.filesystem_source:
             root = (
                 local_source_root
-                if capability == "lake_read"
+                if capability == "lake.read"
                 else args.state.resolve() / "artifacts"
             )
             return {
@@ -564,7 +569,7 @@ def main():
             },
         },
         "connections": {
-            "hn-gcs-source": connection("lake_read", args.prefix + "/archive"),
+            "hn-gcs-source": connection("lake.read", args.prefix + "/archive"),
             "hn-gcs-artifacts": connection(
                 "storage.primary", artifact_prefix + "/indexes"
             ),

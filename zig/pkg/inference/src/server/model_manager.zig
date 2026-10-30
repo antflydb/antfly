@@ -19,6 +19,7 @@
 // and backend session, and returns a pipeline ready for inference.
 
 const std = @import("std");
+const lightonocr3_reader = @import("../readers/lightonocr3.zig");
 const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
 const HardCancellationWatchdog = @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog;
@@ -2869,6 +2870,10 @@ pub const LoadedModel = struct {
     embedding_identity_mutex: std.atomic.Mutex = .unlocked,
     chunk_planning_lane: execution_control_mod.ExecutionLane = .{},
     embedding_execution_lane: execution_control_mod.ExecutionLane = .{},
+    /// Queue OCR cohorts before taking their memory leases. Waiting groups
+    /// must not reserve decoder state that only one GPU cohort can use.
+    native_reader_execution_lane: execution_control_mod.ExecutionLane = .{},
+    native_reader_stream: @import("reader_execution_pool.zig").Pool = .{},
     manifest: manifest_mod.ModelManifest,
     hf_tok: ?*hf_tokenizer.HfTokenizer,
     sp_tok: ?*sentencepiece.Processor,
@@ -4017,6 +4022,7 @@ pub const LoadedModel = struct {
     }
 
     pub fn deinit(self: *LoadedModel) void {
+        std.debug.assert(self.native_reader_stream.context == null and self.native_reader_stream.users == 0);
         if (self.embedding_prototype_cache) |cache| self.allocator.destroy(cache);
         if (self.embedding_prototype_cache_lease) |*lease| lease.release();
         if (self.projector_store) |store| {
@@ -4686,7 +4692,7 @@ fn attachSessionRunAdmission(
         resident.backend_weight_bytes,
     ) catch std.math.maxInt(usize);
     const qwen_cfg = if (backend_runtime.backend == .metal and
-        metal_runtime.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
+        metal_runtime.appleSimdgroupFeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
         session_factory.getGptConfig(session.*)
     else
         null;
@@ -6463,13 +6469,25 @@ pub const ModelManager = struct {
         return self.reclaimOneActiveCacheForAdmission(pressure);
     }
 
+    fn tightenUnifiedDeviceAdmission(self: *const ModelManager) void {
+        if (backends.cudaUsesUnifiedMemory())
+            self.admissionController().tightenUnifiedLimit(unifiedDeviceAdmissionLimit(self.process_memory_limit_bytes, self.admission_limit_overrides.combined_limit_bytes));
+    }
+
+    fn physicalRunLimits(self: *const ModelManager, backend_class: runtime.tier.memory.BackendClass, limits: runtime.tier.memory.Limits) runtime.tier.memory.Limits {
+        if (backend_class != .gpu) return limits;
+        return backends.clampPhysicalMemoryLimits(.cuda, limits, self.process_memory_limit_bytes);
+    }
+
     fn acquireAmountsWithEviction(
         self: *ModelManager,
         backend_class: runtime.tier.memory.BackendClass,
-        limits: runtime.tier.memory.Limits,
+        requested_limits: runtime.tier.memory.Limits,
         amounts: runtime.tier.memory.AdmissionAmounts,
     ) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
+        const limits = self.physicalRunLimits(backend_class, requested_limits);
+        self.tightenUnifiedDeviceAdmission();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
         return self.admissionController().tryAcquireWithPressure(
             backend_class,
@@ -6511,9 +6529,13 @@ pub const ModelManager = struct {
 
     fn acquireRequestsWithEviction(
         self: *ModelManager,
-        requests: []const runtime.tier.memory.AdmissionRequest,
+        requested: []const runtime.tier.memory.AdmissionRequest,
     ) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
+        const requests = try self.allocator.dupe(runtime.tier.memory.AdmissionRequest, requested);
+        defer self.allocator.free(requests);
+        for (requests) |*request| request.limits = self.physicalRunLimits(request.backend_class, request.limits);
+        self.tightenUnifiedDeviceAdmission();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
         return self.admissionController().tryAcquireRequestsWithPressure(
             requests,
@@ -7017,12 +7039,12 @@ pub const ModelManager = struct {
         self: *const ModelManager,
         backend_runtime: backends.BackendRuntime,
     ) runtime.tier.memory.Limits {
-        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
-            admissionBackendClassForRuntime(backend_runtime),
+        var limits = backends.defaultMemoryLimits(
+            backend_runtime.backend,
             self.process_memory_limit_bytes,
         );
         limits = runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
-        return limits;
+        return backends.clampPhysicalMemoryLimits(backend_runtime.backend, limits, self.process_memory_limit_bytes);
     }
 
     /// Apply architecture/artifact residency floors before attaching the hard
@@ -7035,8 +7057,8 @@ pub const ModelManager = struct {
         backend_runtime: backends.BackendRuntime,
         load_plan_floor: runtime.tier.memory.Limits,
     ) !runtime.tier.memory.Limits {
-        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
-            admissionBackendClassForRuntime(backend_runtime),
+        var limits = backends.defaultMemoryLimits(
+            backend_runtime.backend,
             self.process_memory_limit_bytes,
         );
         limits = try session_factory.widenBudgetLimitsForModelPath(
@@ -7046,7 +7068,13 @@ pub const ModelManager = struct {
             backend_runtime.backend,
         );
         limits = runtime.tier.memory.maxCompositeLimits(limits, load_plan_floor);
-        return runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
+        const resolved = backends.clampPhysicalMemoryLimits(backend_runtime.backend, runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides), self.process_memory_limit_bytes);
+        std.log.info("inference memory policy backend={s} requested={any} resolved={any} process_max_bytes={d} cuda_device_bytes={d} unified={} automatic_fallback={}", .{
+            @tagName(backend_runtime.backend),                                               self.admission_limit_overrides,                          resolved,
+            self.process_memory_limit_bytes,                                                 backends.cudaDeviceMemoryBytes(backend_runtime.backend), backends.cudaUsesUnifiedMemory(),
+            backend_runtime.backend == .cuda and backends.cudaDeviceMemoryBytes(.cuda) == 0,
+        });
+        return resolved;
     }
 
     /// Architecture sessions may carry a minimum safe cache/workspace floor
@@ -7058,12 +7086,12 @@ pub const ModelManager = struct {
         backend_runtime: backends.BackendRuntime,
         session: backends.Session,
     ) runtime.tier.memory.Limits {
-        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
-            admissionBackendClassForRuntime(backend_runtime),
+        var limits = backends.defaultMemoryLimits(
+            backend_runtime.backend,
             self.process_memory_limit_bytes,
         );
         limits = session_factory.widenBudgetLimitsForSession(session, limits);
-        return runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
+        return backends.clampPhysicalMemoryLimits(backend_runtime.backend, runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides), self.process_memory_limit_bytes);
     }
 
     /// Lazily loaded composite-model components participate in the same
@@ -9258,7 +9286,11 @@ pub const ModelManager = struct {
         var chat_template_failed = false;
         const needs_chat_template = man.model_type != .embedder and
             !man.isQwen3TextReranker() and !man.isQwen3VlReranker();
-        var chat_tmpl: ?*ChatTemplate = if (if (needs_chat_template) man.chat_template else null) |ct_source| blk2: {
+        const chat_template_source: ?[]const u8 = if (man.isLightOnOcr3())
+            lightonocr3_reader.chat_template
+        else
+            man.chat_template;
+        var chat_tmpl: ?*ChatTemplate = if (if (needs_chat_template) chat_template_source else null) |ct_source| blk2: {
             const ct = self.allocator.create(ChatTemplate) catch {
                 chat_template_failed = true;
                 break :blk2 null;
@@ -10940,16 +10972,17 @@ fn estimateModelArtifactBytes(man: manifest_mod.ModelManifest) !usize {
 /// A multimodal projector is opened, mapped, and consumed by an individual
 /// generation request; it is not part of the decoder session's retained
 /// residency. Charge its mapped artifact to the request that owns that mapping.
+/// Integrated vision weights are already resident, but their request scratch
+/// must still be reserved even when there is no separate projector artifact.
 pub fn projectorRunAdmissionAmounts(
     man: manifest_mod.ModelManifest,
     backend: runtime.kv.pool.BackendKind,
     media: generation.NativeGenerationMediaAdmission,
 ) !runtime.tier.memory.AdmissionAmounts {
-    const path = man.gguf_projector_path orelse return .{};
-    const bytes = std.math.cast(
+    const bytes = if (man.gguf_projector_path) |path| std.math.cast(
         usize,
         try c_file.fileSize(man.allocator, path),
-    ) orelse return error.ResourceLimitExceeded;
+    ) orelse return error.ResourceLimitExceeded else 0;
     return switch (backend) {
         .native => .{
             .host_weight_bytes = bytes,
@@ -11378,6 +11411,14 @@ fn loadSessionForPreferredBackends(
             rememberPreferredLoadError(&first_err, err);
             continue;
         };
+        var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
+            if (err == error.ProcessIsolationRequired) {
+                rememberPreferredLoadError(&first_err, err);
+                continue;
+            }
+            return err;
+        };
+        defer hard_cancellation.deinit();
         var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
         // This attempt owns admission until the successful result explicitly
         // takes it. Includes cancellation, guard-arm failure, and fallback.
@@ -11429,14 +11470,6 @@ fn loadSessionForPreferredBackends(
                 continue;
             };
         }
-        var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
-            if (err == error.ProcessIsolationRequired) {
-                rememberPreferredLoadError(&first_err, err);
-                continue;
-            }
-            return err;
-        };
-        defer hard_cancellation.deinit();
         var close_protection = manager.prepareSessionClose(backend_runtime) catch |err| {
             if (err == error.ProcessIsolationRequired) {
                 rememberPreferredLoadError(&first_err, err);
@@ -13722,6 +13755,47 @@ test "projector residency follows its request-scoped lifecycle" {
     try std.testing.expectEqual(@as(usize, 64), metal_request.backend_scratch_bytes);
 }
 
+test "LightOnOCR3 integrated vision scratch is admitted without charging resident weights again" {
+    const allocator = std.testing.allocator;
+    const memory = runtime.tier.memory;
+    const cfg = try @import("../models/gpt.zig").parseConfig(allocator, @embedFile("../models/testdata/lightonocr3/config.json"));
+    const estimate = try @import("../architectures/qwen3vl_projector.zig").estimateAdmission(
+        &.{@embedFile("../models/testdata/lightonocr3/invoice.png")},
+        cfg,
+        .{},
+    );
+    try std.testing.expect(estimate.host_scratch_bytes > 0 and estimate.backend_scratch_bytes > 0);
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .safetensors_path = try allocator.dupe(u8, "model.safetensors"),
+    };
+    defer man.deinit();
+    const media = generation.NativeGenerationMediaAdmission{
+        .host_scratch_bytes = estimate.host_scratch_bytes,
+        .backend_scratch_bytes = estimate.backend_scratch_bytes,
+    };
+    const scratch = try std.math.add(usize, media.host_scratch_bytes, media.backend_scratch_bytes);
+    inline for (.{ runtime.kv.pool.BackendKind.native, .metal, .cuda }) |backend| {
+        const amounts = try projectorRunAdmissionAmounts(man, backend, media);
+        try std.testing.expectEqual(@as(usize, 0), amounts.host_weight_bytes);
+        try std.testing.expectEqual(@as(usize, 0), amounts.backend_weight_bytes);
+        try std.testing.expectEqual(if (backend == .native) scratch else media.host_scratch_bytes, amounts.host_scratch_bytes);
+        try std.testing.expectEqual(if (backend == .native) @as(usize, 0) else media.backend_scratch_bytes, amounts.backend_scratch_bytes);
+        const backend_class: memory.BackendClass = if (backend == .native) .cpu else .gpu;
+        var controller = memory.AdmissionController{};
+        defer controller.deinit();
+        // A one-byte-short operator cap must reject the actual image work;
+        // the exact envelope admits it and releases every byte afterwards.
+        try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(backend_class, .{ .scratch_limit_bytes = scratch - 1 }, amounts, false));
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+        var lease = try controller.tryAcquire(backend_class, .{ .scratch_limit_bytes = scratch }, amounts, false);
+        try std.testing.expectEqualDeep(amounts, controller.snapshot());
+        lease.release();
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+    }
+}
+
 test "onnx admission separates encoded staging from completed residency" {
     const weights: usize = 1024 * 1024;
     const cpu = try onnxModelLoadAdmission(weights, .{ .backend = .native });
@@ -15743,11 +15817,19 @@ test "GGUF chunk planning verifies embedded tokenizer bytes while preserving unc
     try std.Io.Dir.rename(tmp.dir, "replacement.gguf", tmp.dir, "model.gguf", io);
     try std.testing.expectError(error.ModelArtifactsChanging, model.chunkPlanningIdentity());
     try std.testing.expectEqualDeep(before_change, model.chunk_planning.?);
-    // The same guarantee applies to in-place writes, without an inode change.
+    // The same guarantee applies to observable in-place generations. Coarse
+    // filesystem timestamps can otherwise collapse both same-size writes into
+    // one metadata signature. Advance from a fixed base, without sleeping or
+    // requiring warm planning calls to hash the entire model.
+    var changed = try tmp.dir.openFile(io, "model.gguf", .{ .mode = .read_write });
+    defer changed.close(io);
+    const base_mtime = (try changed.stat(io)).mtime.toNanoseconds();
     try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "original" });
+    try changed.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(base_mtime + std.time.ns_per_s) } });
     try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
     const before_write = model.chunk_planning.?;
     try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "changed!" });
+    try changed.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(base_mtime + 2 * std.time.ns_per_s) } });
     try std.testing.expectError(error.ModelArtifactsChanging, model.chunkPlanningIdentity());
     try std.testing.expectEqualDeep(before_write, model.chunk_planning.?);
 }
@@ -15871,4 +15953,19 @@ test "model aware media host index cache pressure releases idle leases before pr
     try std.testing.expectEqual(@as(usize, 3), cache.calls);
     try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
     try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
+}
+
+fn unifiedDeviceAdmissionLimit(process_limit: usize, combined_override: usize) usize {
+    const physical = runtime.tier.memory.defaultSharedAdmissionLimitsWithProcessLimit(process_limit).host_limit_bytes;
+    return if (combined_override == 0) physical else @min(physical, combined_override);
+}
+
+test "integrated CUDA combined override constrains simultaneous CPU and GPU leases" {
+    const limit = unifiedDeviceAdmissionLimit(16 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
+    try std.testing.expect(limit <= 8 * 1024 * 1024 * 1024);
+    var controller: runtime.tier.memory.AdmissionController = .{};
+    controller.tightenUnifiedLimit(limit);
+    var cpu = try controller.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = limit / 2 + 1 }, false);
+    defer cpu.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.gpu, .{}, .{ .backend_weight_bytes = limit / 2 + 1 }, false));
 }

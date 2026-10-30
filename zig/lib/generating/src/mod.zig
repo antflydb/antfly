@@ -14,6 +14,8 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const anthropic_api = @import("anthropic_api");
+pub const cloudflare = @import("antfly_cloudflare_config");
 pub const localGenerationStatusError = @import("local_failure.zig").localGenerationStatusError;
 const json = @import("antfly-json");
 const openapi = @import("antfly_generating_openapi");
@@ -363,6 +365,7 @@ pub const Provider = enum {
     openai,
     chatgpt,
     openrouter,
+    cloudflare,
     ollama,
     antfly,
     apple,
@@ -371,7 +374,7 @@ pub const Provider = enum {
     /// Adapter capability; the selected model must also support function calling.
     pub fn supportsTools(self: Provider) bool {
         return switch (self) {
-            .antfly, .openai, .chatgpt, .openrouter, .ollama, .gemini, .vertex, .bedrock, .anthropic => true,
+            .cloudflare, .antfly, .openai, .chatgpt, .openrouter, .ollama, .gemini, .vertex, .bedrock, .anthropic => true,
             .mock, .apple => false,
         };
     }
@@ -380,7 +383,7 @@ pub const Provider = enum {
     /// complete wire responses, including streaming and opaque tool metadata.
     pub fn usesChatCompletionsProtocol(self: Provider) bool {
         return switch (self) {
-            .openai, .openrouter, .ollama, .antfly, .gemini, .vertex => true,
+            .cloudflare, .openai, .openrouter, .ollama, .antfly, .gemini, .vertex => true,
             .bedrock, .anthropic, .chatgpt, .apple, .mock => false,
         };
     }
@@ -415,6 +418,7 @@ pub const OpenAIConfig = struct {
 
 pub fn defaultUrl(provider: Provider) []const u8 {
     return switch (provider) {
+        .cloudflare => "",
         .openai => openai_default_url,
         .openrouter => openrouter_default_url,
         .ollama => ollama_default_url,
@@ -439,6 +443,8 @@ pub const AntflyConfig = struct {
 };
 
 pub const GeneratorConfig = struct {
+    account_id: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
     /// Conservative per-image token reservation from public generator
     /// configuration or supplied by the request-owned decision adapter.
     image_input_token_bound: ?u64 = null,
@@ -494,20 +500,25 @@ pub const GeneratorConfig = struct {
 
     pub fn clone(self: GeneratorConfig, alloc: std.mem.Allocator) !GeneratorConfig {
         var result = self;
-        result.model = "";
-        result.url = "";
-        const strings = .{ "connection_id", "api_key", "capability_token", "capability_revision", "project_id", "location", "region", "workspace_id", "credentials_path", "tools_json", "tool_choice_json", "response_format_json" };
-        inline for (strings) |field| @field(result, field) = null;
+        inline for (@typeInfo(GeneratorConfig).@"struct".field_names, @typeInfo(GeneratorConfig).@"struct".field_types) |name, T| {
+            if (T == []const u8) @field(result, name) = "";
+            if (T == ?[]const u8) @field(result, name) = null;
+        }
         errdefer result.deinit(alloc);
-        if (self.model.len > 0) result.model = try alloc.dupe(u8, self.model);
-        if (self.url.len > 0) result.url = try alloc.dupe(u8, self.url);
-        inline for (strings) |field| if (@field(self, field)) |value| {
-            @field(result, field) = try alloc.dupe(u8, value);
-        };
+        inline for (@typeInfo(GeneratorConfig).@"struct".field_names, @typeInfo(GeneratorConfig).@"struct".field_types) |name, T| {
+            if (T == []const u8) {
+                if (@field(self, name).len > 0) @field(result, name) = try alloc.dupe(u8, @field(self, name));
+            }
+            if (T == ?[]const u8) if (@field(self, name)) |value| {
+                @field(result, name) = try alloc.dupe(u8, value);
+            };
+        }
         return result;
     }
 
     pub fn deinit(self: *GeneratorConfig, alloc: std.mem.Allocator) void {
+        if (self.account_id) |v| alloc.free(v);
+        if (self.gateway_id) |v| alloc.free(v);
         if (self.model.len > 0) alloc.free(self.model);
         if (self.url.len > 0) alloc.free(self.url);
         if (self.connection_id) |id| alloc.free(id);
@@ -551,6 +562,11 @@ pub const GeneratorConfig = struct {
     }
 
     pub fn validate(self: GeneratorConfig) !void {
+        if (self.provider == .cloudflare) {
+            try cloudflare.identifier(self.account_id orelse return error.InvalidCloudflareConfig);
+            try cloudflare.modelId(self.model);
+            if (self.gateway_id) |id| try cloudflare.identifier(id);
+        } else if (self.account_id != null or self.gateway_id != null) return error.InvalidCloudflareConfig;
         try self.provider.validate();
         if (self.provider == .chatgpt) {
             if (self.rate_limit != null) return error.ChatGPTUnsupportedRateLimit;
@@ -683,27 +699,38 @@ pub fn stringifyChainLinkAlloc(alloc: std.mem.Allocator, link: ChainLink) ![]u8 
 
 pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorConfig) !GeneratorConfig {
     const provider = try providerFromOpenApi(generated.provider);
+    if (provider == .cloudflare) {
+        try cloudflare.identifier(generated.account_id orelse return error.InvalidCloudflareConfig);
+        try cloudflare.modelId(generated.model orelse return error.InvalidGeneratorConfig);
+        if (generated.gateway_id) |id| try cloudflare.identifier(id);
+    }
     if (provider == .chatgpt and (generated.max_tokens != null or generated.max_completion_tokens != null or generated.api_url != null)) return error.InvalidGeneratorConfig;
     if (provider == .apple and generated.model != null) return error.UnsupportedAppleGenerationOptions;
     if (generated.max_tokens != null and generated.max_completion_tokens != null) return error.InvalidGeneratorConfig;
-    var cfg = GeneratorConfig{
+    const cloudflare_url = if (provider == .cloudflare) try cloudflare.baseUrl(alloc, generated.account_id, generated.url) else null;
+    defer if (cloudflare_url) |url| alloc.free(url);
+    const cfg = GeneratorConfig{
         .rate_limit = generated.rate_limit,
         .image_input_token_bound = if (generated.max_image_input_tokens) |bound| std.math.cast(u64, bound) orelse return error.InvalidGeneratorConfig else null,
         .provider = provider,
-        .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
-        .url = if (generated.url) |url|
-            try alloc.dupe(u8, url)
+        .account_id = if (generated.account_id) |v| v else null,
+        .gateway_id = if (generated.gateway_id) |v| v else null,
+        .model = if (generated.model) |model| model else "",
+        .url = if (cloudflare_url) |url|
+            url
+        else if (generated.url) |url|
+            url
         else if (generated.api_url) |api_url|
-            try alloc.dupe(u8, api_url)
+            api_url
         else
-            try alloc.dupe(u8, defaultUrl(provider)),
-        .connection_id = if (generated.connection_id) |id| try alloc.dupe(u8, id) else null,
-        .api_key = if (generated.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
-        .project_id = if (generated.project_id) |project_id| try alloc.dupe(u8, project_id) else null,
-        .location = if (generated.location) |location| try alloc.dupe(u8, location) else null,
-        .region = if (generated.region) |region| try alloc.dupe(u8, region) else null,
-        .workspace_id = if (generated.workspace_id) |workspace| try alloc.dupe(u8, workspace) else null,
-        .credentials_path = if (generated.credentials_path) |credentials_path| try alloc.dupe(u8, credentials_path) else null,
+            defaultUrl(provider),
+        .connection_id = if (generated.connection_id) |id| id else null,
+        .api_key = if (generated.api_key) |api_key| api_key else null,
+        .project_id = if (generated.project_id) |project_id| project_id else null,
+        .location = if (generated.location) |location| location else null,
+        .region = if (generated.region) |region| region else null,
+        .workspace_id = if (generated.workspace_id) |workspace| workspace else null,
+        .credentials_path = if (generated.credentials_path) |credentials_path| credentials_path else null,
         .max_tokens = generated.max_tokens orelse default_max_tokens,
         .max_completion_tokens = generated.max_completion_tokens,
         .reasoning_effort = generated.reasoning_effort,
@@ -713,19 +740,20 @@ pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorC
         .frequency_penalty = generated.frequency_penalty,
         .presence_penalty = generated.presence_penalty,
     };
-    errdefer cfg.deinit(alloc);
     try cfg.validate();
-    return cfg;
+    return cfg.clone(alloc);
 }
 
 pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
     return .{
         .rate_limit = cfg.rate_limit,
+        .account_id = cfg.account_id,
+        .gateway_id = cfg.gateway_id,
         .max_image_input_tokens = if (cfg.image_input_token_bound) |bound| std.math.cast(i64, bound) else null,
         .provider = providerToOpenApi(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,
         .url = switch (cfg.provider) {
-            .openai, .openrouter, .ollama, .gemini, .vertex, .bedrock, .anthropic, .mock => if (cfg.url.len > 0) cfg.url else null,
+            .cloudflare, .openai, .openrouter, .ollama, .gemini, .vertex, .bedrock, .anthropic, .mock => if (cfg.url.len > 0) cfg.url else null,
             .antfly, .chatgpt, .apple => null,
         },
         .api_url = switch (cfg.provider) {
@@ -1097,6 +1125,7 @@ fn providerFromOpenApi(provider: ?[]const u8) !Provider {
     if (std.mem.eql(u8, name, "vertex")) return .vertex;
     if (std.mem.eql(u8, name, "bedrock")) return .bedrock;
     if (std.mem.eql(u8, name, "anthropic")) return .anthropic;
+    if (std.mem.eql(u8, name, "cloudflare")) return .cloudflare;
     if (std.mem.eql(u8, name, "openai")) return .openai;
     if (std.mem.eql(u8, name, "chatgpt")) return .chatgpt;
     if (std.mem.eql(u8, name, "openrouter")) return .openrouter;

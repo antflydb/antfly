@@ -244,6 +244,9 @@ pub const CurationProposalDecisionResult = struct {
     changed: ?bool = null,
     atomicity: ?[]const u8 = null,
     applied: ?bool = null,
+    /// Relative native consumer-progress resource; resolve against the decision request URI.
+    progress_url: ?[]const u8 = null,
+    namespaces: ?[]const EntityNamespaceOutcome = null,
     results: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -253,6 +256,8 @@ pub const CurationProposalDecisionResult = struct {
         .{ "changed", "changed", true },
         .{ "atomicity", "atomicity", true },
         .{ "applied", "applied", true },
+        .{ "progress_url", "progress_url", true },
+        .{ "namespaces", "namespaces", true },
         .{ "results", "results", true },
     };
 
@@ -284,6 +289,14 @@ pub const CurationProposalDecisionResult = struct {
         }
         if (self.applied) |value| {
             try jw.objectField("applied");
+            try jw.write(value);
+        }
+        if (self.progress_url) |value| {
+            try jw.objectField("progress_url");
+            try jw.write(value);
+        }
+        if (self.namespaces) |value| {
+            try jw.objectField("namespaces");
             try jw.write(value);
         }
         if (self.results) |value| {
@@ -446,13 +459,102 @@ pub const CurationSuppressionEntry = struct {
     origin: CurationOrigin,
 };
 
+pub const EntityConsumerProgressPage = struct {
+    entity_table: []const u8,
+    key: []const u8,
+    catalog_revision: u64,
+    /// True when enumeration has no further pages; it does not certify replay completion.
+    complete: bool,
+    next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
+    results: []const std.json.Value,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("entity_table");
+        try jw.write(self.entity_table);
+        try jw.objectField("key");
+        try jw.write(self.key);
+        try jw.objectField("catalog_revision");
+        try jw.write(self.catalog_revision);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        switch (self.next_cursor) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("next_cursor");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("next_cursor");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("results");
+        try jw.write(self.results);
+        try jw.endObject();
+    }
+};
+
 pub const EntityCurationResult = struct {
     entity_table: []const u8,
     key: []const u8,
     complete: bool,
-    /// Server entity corrections commit once on the destination table, atomically across matching namespaces. Source replay remains asynchronous. Lite retains resolver atomicity.
+    /// Entity corrections commit atomically across matching namespaces on the destination table; replay is asynchronous. Other atomicity values identify the scope guaranteed by the responding adapter.
     atomicity: []const u8,
+    /// True only when replay completion was observed for all consumers, or no consumers exist. Admission without wait is conservative.
+    applied: ?bool = null,
+    /// Native HTTP mutations return this progress resource relative to the request URI. Follow its bounded pages for individual consumer proofs.
+    progress_url: ?[]const u8 = null,
+    /// Mutation outcomes, stored once per namespace. Read absorbed keys and dispositions here; consumer progress rows reference these by key_template. The results array is reserved for inspection and embedded consumer summaries.
+    namespaces: ?[]const EntityNamespaceOutcome = null,
     results: []const std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "entity_table", "entity_table", false },
+        .{ "key", "key", false },
+        .{ "complete", "complete", false },
+        .{ "atomicity", "atomicity", false },
+        .{ "applied", "applied", true },
+        .{ "progress_url", "progress_url", true },
+        .{ "namespaces", "namespaces", true },
+        .{ "results", "results", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("entity_table");
+        try jw.write(self.entity_table);
+        try jw.objectField("key");
+        try jw.write(self.key);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        try jw.objectField("atomicity");
+        try jw.write(self.atomicity);
+        if (self.applied) |value| {
+            try jw.objectField("applied");
+            try jw.write(value);
+        }
+        if (self.progress_url) |value| {
+            try jw.objectField("progress_url");
+            try jw.write(value);
+        }
+        if (self.namespaces) |value| {
+            try jw.objectField("namespaces");
+            try jw.write(value);
+        }
+        try jw.objectField("results");
+        try jw.write(self.results);
+        try jw.endObject();
+    }
 };
 
 pub const EntityDistinctRequest = struct {
@@ -561,6 +663,13 @@ pub const EntityMergeRequest = struct {
         }
         try jw.endObject();
     }
+};
+
+pub const EntityNamespaceOutcome = struct {
+    key_template: []const u8,
+    revision: u64,
+    changed: bool,
+    absorbed: []const std.json.Value,
 };
 
 pub const EntitySuppressRequest = struct {

@@ -139,11 +139,11 @@ const CliConfig = struct {
     ard_public_catalog_enabled: bool = false,
     inference_models_dir: ?[]const u8 = null,
     inference_ml_dir: ?[]const u8 = null,
-    inference_host_budget_mb: usize = 0,
-    inference_backend_budget_mb: usize = 0,
-    inference_combined_budget_mb: usize = 0,
-    inference_kv_budget_mb: usize = 0,
-    inference_scratch_budget_mb: usize = 0,
+    inference_host_budget_mb: ?usize = null,
+    inference_backend_budget_mb: ?usize = null,
+    inference_combined_budget_mb: ?usize = null,
+    inference_kv_budget_mb: ?usize = null,
+    inference_scratch_budget_mb: ?usize = null,
     inference_process_memory_budget_mb: ?usize = null,
     inference_kernel_jit_mode: ?antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode = null,
     inference_preload_models: std.ArrayListUnmanaged(inference_bridge.WarmModel) = .empty,
@@ -233,7 +233,8 @@ const InferenceRuntimeConfigWire = struct {
 
     embedded_enabled: bool = true,
     worker_environment: []const struct { name: []const u8, value: []const u8 } = &.{},
-    max_concurrent_requests: ?usize = null,
+    resources: platform.resource_policy.Resources = .{},
+    generation_batching: platform.inference_settings.GenerationBatching = .{},
     kernel_jit: KernelJit = .{},
     prompt_cache: PromptCache = .{},
 };
@@ -1324,7 +1325,36 @@ const LocalStandaloneMetadata = struct {
 
     const RestorePersistence = antfly.public_api.restore_jobs.ReplicatedPersistence;
     fn restorePersistence(self: *LocalStandaloneMetadata) RestorePersistence {
-        return RestorePersistence.fromLocal(self, .{ .load = restoreJobsLoad, .get = restoreJobsGet, .put = restoreJobsPut, .create = restoreJobsCreate, .create_with_staging = restoreJobsCreateWithStaging, .delete = restoreJobsDelete, .delete_many = restoreJobsDeleteMany, .delete_matching = restoreJobsDeleteMatching });
+        return RestorePersistence.fromLocal(self, .{ .job_state = .{ .get = jobStateGet, .scan = jobStateScan, .cas = jobStateCas }, .load = restoreJobsLoad, .get = restoreJobsGet, .put = restoreJobsPut, .create = restoreJobsCreate, .create_with_staging = restoreJobsCreateWithStaging, .delete = restoreJobsDelete, .delete_many = restoreJobsDeleteMany, .delete_matching = restoreJobsDeleteMatching });
+    }
+    fn jobStateGet(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8) !?[]u8 {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return (self.lifecycle_store orelse return error.UnsupportedOperation).getJobState(a, group_ids.main_metadata_group_id, key);
+    }
+    fn jobStateScan(ptr: *anyopaque, a: std.mem.Allocator, after: ?[]const u8) ![]u8 {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return (self.lifecycle_store orelse return error.UnsupportedOperation).scanJobState(a, group_ids.main_metadata_group_id, after);
+    }
+    fn jobStateCas(ptr: *anyopaque, key: []const u8, expected: ?[]const u8, value: []const u8, term: u64) !bool {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        var locked = try self.lockMutation();
+        defer locked.deinit();
+        try self.requireRestoreJobTermLocked(term);
+        if (expected == null and std.mem.startsWith(u8, key, "documents/")) {
+            var parsed = try std.json.parseFromSlice(struct { owner: []const u8, state: enum { queued, running, succeeded, failed, cancelled } }, self.alloc, value, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const existing = try self.lifecycle_store.?.getJobState(self.alloc, group_ids.main_metadata_group_id, key);
+            defer if (existing) |bytes| self.alloc.free(bytes);
+            if (existing == null and (parsed.value.state == .queued or parsed.value.state == .running) and try self.lifecycle_store.?.getJobOwnerCount(self.alloc, group_ids.main_metadata_group_id, parsed.value.owner) >= 16) return error.TooManyActiveJobs;
+        }
+        try self.applyJobCommandLocked(.{ .compare_and_set_job_state = .{ .key = key, .expected_hash = expected orelse "", .value = value } });
+        const current = (try self.lifecycle_store.?.getJobState(self.alloc, group_ids.main_metadata_group_id, key)) orelse return false;
+        defer self.alloc.free(current);
+        return std.mem.eql(u8, current, value);
     }
     fn migrateRestoreJobs(self: *LocalStandaloneMetadata, legacy: *antfly.storage_backend_erased.Store) !void {
         const store = self.lifecycle_store orelse return;
@@ -1978,6 +2008,12 @@ const LocalStandaloneMetadata = struct {
             if (table) |value| {
                 tables[0] = try antfly.metadata.table_manager.cloneTable(self.alloc, value.*);
                 copied_table = true;
+                if (std.mem.indexOf(u8, value.indexes_json, "\"projection_only\"") != null) {
+                    const store = self.lifecycle_store orelse return error.MissingMetadataStore;
+                    const indexes = try @import("../metadata/resolver_catalog_read.zig").executionIndexesAlloc(store, self.alloc, group_ids.main_metadata_group_id, value.name, self.durable_revision, true);
+                    self.alloc.free(tables[0].indexes_json);
+                    tables[0].indexes_json = indexes;
+                }
             }
             const refs = if (table) |value| generation.indexed.table_range_refs.get(value.table_id) orelse &.{} else &.{};
             const ranges = try self.alloc.alloc(antfly.metadata.RangeRecord, refs.len);
@@ -2651,20 +2687,22 @@ const LocalStandaloneMetadata = struct {
                 try context.ensureActive();
                 const previous = self.durable_revision;
                 try self.lifecycle_store.?.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_resolver_authority = body });
-                const current = (try self.lifecycle_store.?.getTable(alloc, group_ids.main_metadata_group_id, write.table_id)) orelse return error.TableNotFound;
-                defer antfly.metadata.table_manager.freeTable(alloc, current);
-                const revision = try self.lifecycle_store.?.standaloneRevision();
-                if (previous != 0 and previous != std.math.maxInt(u64) and revision == previous + 1) {
-                    try self.manager.upsertTable(current);
-                    self.epoch = revision;
-                    self.durable_revision = revision;
-                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                 const receipt_id = try write.receipt(alloc);
                 defer alloc.free(receipt_id);
                 const result = try self.lifecycle_store.?.resolverCatalogRead(alloc, group_ids.main_metadata_group_id, .{ .table_name = "native", .table_id = write.table_id, .mode = .authority, .authority = .{ .mode = .receipt, .id = receipt_id }, .standalone = true });
                 errdefer alloc.free(result);
                 const view = try std.json.parseFromSlice(@import("../metadata/resolver_authority.zig").View, alloc, result, .{});
                 defer view.deinit();
+                const revision = try self.lifecycle_store.?.standaloneRevision();
+                if (previous != 0 and previous != std.math.maxInt(u64) and revision == previous + 1) {
+                    if (view.value.definition_changed orelse true) {
+                        const current = (try self.lifecycle_store.?.getTable(alloc, group_ids.main_metadata_group_id, write.table_id)) orelse return error.TableNotFound;
+                        defer antfly.metadata.table_manager.freeTable(alloc, current);
+                        try self.manager.upsertTable(current);
+                    }
+                    self.epoch = revision;
+                    self.durable_revision = revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                 if (!view.value.receipt) return error.ResolverCurationConflict;
                 return result;
             },
@@ -3686,22 +3724,26 @@ const LocalStandaloneMetadata = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const group = group_ids.main_metadata_group_id;
-        const job = (try store.pendingResolverNamespaceTable(a, group)) orelse {
+        if (try store.standaloneRevision() != self.durable_revision) try self.reloadLifecycleProjectionLocked();
+        const work = (try store.pendingResolverNamespaceWork(a, group, true)) orelse {
             const id = (try store.pendingResolverNamespaceDrop(a, group)) orelse return;
             const fence = try store.getTableTransitionFence(group, id);
             try self.applyJobCommandLocked(.{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
             return;
         };
-        const sources = try store.pendingResolverNamespaceSources(a, group);
-        try store.updateStandaloneCatalog(group, self.durable_revision, .{ .table_replacements = &.{.{ .expected = job, .replacement = job }} });
-        // Certify the new projection only after each touched table is refreshed.
         self.durable_revision = 0;
-        for (sources) |source| {
-            const actual = (try store.getTable(a, group, source.table_id)) orelse continue;
+        try store.applyStandaloneCommand(group, .{ .advance_resolver_namespace = work.advance });
+        // Scoped publication changes execution bindings, never source DDL.
+        // Only lifecycle/bootstrap passes need to refresh the table manager.
+        self.durable_revision = 0;
+        for (work.refresh_sources) |source_id| {
+            const actual = (try store.getTable(a, group, source_id)) orelse continue;
             try self.manager.upsertTable(actual);
         }
-        self.durable_revision = try store.standaloneRevision();
-        self.epoch = self.durable_revision;
+        const after = try store.standaloneRevision();
+        if (after != work.advance.catalog_revision + 1) return error.CatalogGenerationChanged;
+        self.durable_revision = after;
+        self.epoch = after;
     }
 
     fn reconcileRelations(self: *LocalStandaloneMetadata) !void {
@@ -4922,11 +4964,20 @@ pub fn runFromIterator(
     try ensureDirPath(setup_io.io(), resolved.auth_store_root_dir);
 
     const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
+    const trusted_principal_secret = try resolveRuntimeSecretValue(alloc, &secret_store, "antfly.trusted_principal.secret");
+    defer if (trusted_principal_secret) |value| alloc.free(value);
+    const trusted_principal_issuer = try resolveRuntimeSecretValue(alloc, &secret_store, "antfly.trusted_principal.issuer");
+    defer if (trusted_principal_issuer) |value| alloc.free(value);
+    // A hosted verifier secures public requests without creating a local
+    // password authority. Local user-store bootstrap still follows auth_enabled.
+    const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
     // The storage kernel sizes its ResourceManager when its context is
     // created, so the operator's process envelope must be resolved first.
-    const process_memory_resolution = resolveProcessMemoryBudget(
-        cli,
-        init.environ_map,
+    const process_memory_resolution = process_memory_budget.resolveSystemWithConfig(
+        cli.inference_process_memory_budget_mb,
+        init.environ_map.get(process_memory_budget.canonical_env),
+        init.environ_map.get(process_memory_budget.inference_compat_env),
+        if (loaded_config) |cfg| cfg.resources.memory.max_bytes else 0,
     ) catch |err| {
         std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
         return err;
@@ -5126,10 +5177,17 @@ pub fn runFromIterator(
     while (environment_iterator.next()) |entry| {
         try worker_environment.append(alloc, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
     }
+    var inference_resource_policy = if (loaded_cfg) |cfg| cfg.resources else platform.resource_policy.Resources{};
+    if (cli.inference_host_budget_mb) |value| inference_resource_policy.inference.memory.max_host_bytes = try mibToBytes(value);
+    if (cli.inference_backend_budget_mb) |value| inference_resource_policy.inference.memory.max_device_bytes = try mibToBytes(value);
+    if (cli.inference_combined_budget_mb) |value| inference_resource_policy.inference.memory.max_combined_bytes = try mibToBytes(value);
+    if (cli.inference_kv_budget_mb) |value| inference_resource_policy.inference.memory.max_kv_bytes = try mibToBytes(value);
+    if (cli.inference_scratch_budget_mb) |value| inference_resource_policy.inference.memory.max_scratch_bytes = try mibToBytes(value);
     const inference_runtime_config_json = try std.json.Stringify.valueAlloc(alloc, InferenceRuntimeConfigWire{
         .embedded_enabled = embedded_inference_enabled,
         .worker_environment = worker_environment.items,
-        .max_concurrent_requests = resolveInferenceMaxConcurrentRequests(loaded_cfg),
+        .resources = inference_resource_policy,
+        .generation_batching = configured_inference.generation_batching,
         .kernel_jit = .{
             .mode = effective_kernel_jit_mode,
             .cache_dir = configured_inference.kernel_jit.cache_dir,
@@ -5153,11 +5211,11 @@ pub fn runFromIterator(
         .data_dir_len = data_dir.len,
         .models_dir = inference_bridge.OptionalString.init(cli.inference_models_dir orelse if (loaded_cfg) |cfg| cfg.inference.models_dir else null),
         .ml_dir = inference_bridge.OptionalString.init(cli.inference_ml_dir orelse if (loaded_cfg) |cfg| cfg.inference.ml_dir else null),
-        .host_limit_bytes = try mibToBytes(cli.inference_host_budget_mb),
-        .backend_limit_bytes = try mibToBytes(cli.inference_backend_budget_mb),
-        .combined_limit_bytes = try mibToBytes(cli.inference_combined_budget_mb),
-        .kv_limit_bytes = try mibToBytes(cli.inference_kv_budget_mb),
-        .scratch_limit_bytes = try mibToBytes(cli.inference_scratch_budget_mb),
+        .host_limit_bytes = try mibToBytes(cli.inference_host_budget_mb orelse 0),
+        .backend_limit_bytes = try mibToBytes(cli.inference_backend_budget_mb orelse 0),
+        .combined_limit_bytes = try mibToBytes(cli.inference_combined_budget_mb orelse 0),
+        .kv_limit_bytes = try mibToBytes(cli.inference_kv_budget_mb orelse 0),
+        .scratch_limit_bytes = try mibToBytes(cli.inference_scratch_budget_mb orelse 0),
         .process_memory_limit_bytes = process_memory_limit_bytes,
         .process_memory_limit_provenance = inferenceMemoryLimitProvenance(
             process_memory_resolution.effective_source,
@@ -5233,6 +5291,7 @@ pub fn runFromIterator(
             return err;
         };
     }
+    try internal_service_auth.validateCredentialIsolation(internal_service_secret, trusted_principal_secret);
 
     var auth_backend: ?LegacyAuthBackend = null;
     defer if (comptime !control_only_storage_sources) if (auth_backend) |*backend| backend.close();
@@ -5293,7 +5352,7 @@ pub fn runFromIterator(
     }
 
     const public_listener = resolvePublicListener(cli);
-    antfly.common.listener_security.warnIfUnauthenticated("public", public_listener.bind_host, public_listener.bind_port, auth_enabled);
+    antfly.common.listener_security.warnIfUnauthenticated("public", public_listener.bind_host, public_listener.bind_port, effective_auth_enabled);
     const local_node_id = cli.local_node_id orelse 1;
     const public_api_url = try std.fmt.allocPrint(
         alloc,
@@ -5568,15 +5627,17 @@ pub fn runFromIterator(
             .hot_standby_failover_safe_mutations_only = hot_standby_mutation_guard_enabled,
             .hot_standby_remote_apply_mutations_enabled = hotStandbyRemoteApplyMutationsEnabled(hot_standby_sync_policy.policy),
             .hot_standby_catalog_create_enabled = hot_standby_role_requested and cli.hot_standby_table_id == 0 and cli.hot_standby_shard_id == 0,
-            .auth_enabled = auth_enabled,
+            .auth_enabled = effective_auth_enabled,
+            .trusted_principal_secret = trusted_principal_secret,
+            .trusted_principal_issuer = trusted_principal_issuer,
             .chatgpt = if (chatgpt) |*manager| manager else null,
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
-            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
-            .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
-            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
-            .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
+            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.resources.query.admission.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .graph_execution_limits = if (loaded_config) |*cfg| cfg.resources.query.request_limits.graph else .{},
+            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.resources.write.admission.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
+            .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.resources.inference.admission.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .backup_operation_timeout_ms = if (loaded_config) |*cfg| cfg.backup.operation_timeout_ms else antfly.common.config.default_backup_operation_timeout_ms,
             .inference_request_admission_source = if (embedded_inference_enabled) .{
                 .ptr = antfly_node,
@@ -8242,6 +8303,13 @@ fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) 
     return false;
 }
 
+fn resolveRuntimeSecretValue(alloc: std.mem.Allocator, store: *antfly.common.secrets.FileStore, key: []const u8) !?[]u8 {
+    const value = (try store.getOwned(alloc, key)) orelse return null;
+    if (std.mem.trim(u8, value, " \t\r\n").len != 0) return value;
+    alloc.free(value);
+    return null;
+}
+
 fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
     if (cli.inference_models_dir) |value| return value;
     if (cfg) |loaded| return loaded.inference.models_dir;
@@ -8250,7 +8318,7 @@ fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.C
 
 fn resolveInferenceMaxConcurrentRequests(cfg: ?*const antfly.common.config.Config) u32 {
     return if (cfg) |config|
-        config.admission.inference.max_concurrent_requests
+        config.resources.inference.admission.max_concurrent_requests
     else
         antfly.common.config.default_inference_max_concurrent_requests;
 }
@@ -8271,11 +8339,11 @@ const InferenceBudgetOverrides = struct {
 
 fn resolveInferenceBudgetOverrides(cli: CliConfig) !InferenceBudgetOverrides {
     return .{
-        .host_limit_bytes = try mibToBytes(cli.inference_host_budget_mb),
-        .backend_limit_bytes = try mibToBytes(cli.inference_backend_budget_mb),
-        .combined_limit_bytes = try mibToBytes(cli.inference_combined_budget_mb),
-        .kv_limit_bytes = try mibToBytes(cli.inference_kv_budget_mb),
-        .scratch_limit_bytes = try mibToBytes(cli.inference_scratch_budget_mb),
+        .host_limit_bytes = try mibToBytes(cli.inference_host_budget_mb orelse 0),
+        .backend_limit_bytes = try mibToBytes(cli.inference_backend_budget_mb orelse 0),
+        .combined_limit_bytes = try mibToBytes(cli.inference_combined_budget_mb orelse 0),
+        .kv_limit_bytes = try mibToBytes(cli.inference_kv_budget_mb orelse 0),
+        .scratch_limit_bytes = try mibToBytes(cli.inference_scratch_budget_mb orelse 0),
     };
 }
 
@@ -11420,11 +11488,11 @@ test "parse cli accepts inference budget overrides" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 4096), cfg.inference_host_budget_mb);
-    try std.testing.expectEqual(@as(usize, 12288), cfg.inference_backend_budget_mb);
-    try std.testing.expectEqual(@as(usize, 16384), cfg.inference_combined_budget_mb);
-    try std.testing.expectEqual(@as(usize, 2048), cfg.inference_kv_budget_mb);
-    try std.testing.expectEqual(@as(usize, 1024), cfg.inference_scratch_budget_mb);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.inference_host_budget_mb.?);
+    try std.testing.expectEqual(@as(usize, 12288), cfg.inference_backend_budget_mb.?);
+    try std.testing.expectEqual(@as(usize, 16384), cfg.inference_combined_budget_mb.?);
+    try std.testing.expectEqual(@as(usize, 2048), cfg.inference_kv_budget_mb.?);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.inference_scratch_budget_mb.?);
     try std.testing.expectEqual(@as(?usize, 14000), cfg.inference_process_memory_budget_mb);
     try std.testing.expectEqual(antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode.required, cfg.inference_kernel_jit_mode.?);
 }
@@ -11462,9 +11530,7 @@ test "inference config falls back to common config" {
         .transcribers = antfly.transcribing.Registry.init(alloc),
         .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
-        .admission = .{
-            .inference = .{ .max_concurrent_requests = 0 },
-        },
+        .resources = .{ .inference = .{ .admission = .{ .max_concurrent_requests = 0 } } },
         .inference = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:8089"),
             .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),
@@ -15485,4 +15551,129 @@ test "system catalog native memory ownership provisions privately and survives s
     try std.testing.expectEqual(system_catalog.ServiceOwner.memory, definitions.value.tables[0].?.query_definition.?.native_service.?);
     try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve_many = .{ .targets = &.{.{ .table = "memory_team" }}, .include_query_definitions = true } }));
     try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .table, .name = "memory_team", .new_name = "public_copy" } } }));
+}
+
+test "system catalog resolver curation standalone record commits retain large destination definitions" {
+    if (comptime !control_only_storage_sources) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/resolver-owner", .{tmp.sub_path});
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    var server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = root,
+        .replica_catalog_path = path,
+        .backend_runtime = backend.ptr(),
+        .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://localhost", .role = "data" },
+        .api_server_cfg = .{ .deployment_mode = .standalone },
+    }, metadata.catalogSource(), metadata.statusSource());
+    defer server.deinit();
+    metadata.data_server = &server;
+    _ = try metadata.ensureNativeOwnerBindingLocked();
+    const group = group_ids.main_metadata_group_id;
+    const store = metadata.lifecycle_store.?;
+    const domain = @import("../metadata/resolver_authority.zig");
+    const padding = try a.alloc(u8, 1024 * 1024);
+    @memset(padding, 'x');
+    const table: antfly.metadata.TableRecord = .{ .table_id = 7, .name = "entities", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .unrelated = padding }, .{}) };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const template = "entity/{{_key}}";
+    var namespace: @import("antfly_local_sources").storage_db_resolver_curation.Namespace = .{ .key_template = template, .revision = 1 };
+    var write: domain.Write = .{ .table_id = 7, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, table), .bootstrap = .{ .expected_indexes = try @import("antfly_resolver").fingerprint(a, table.indexes_json) }, .patches = &.{try domain.records.difference(a, .{ .key_template = template }, namespace)} };
+    const source = metadata.statusSource();
+    _ = try source.systemCatalog(a, .{}, .{ .resolver_authority_mutate = write });
+    const definition = metadata.manager.tables.get(7).?.indexes_json;
+    const before = namespace;
+    namespace.revision = 2;
+    namespace.state.suppress.keys = &.{"entity/noise"};
+    write.bootstrap = null;
+    write.catalog_revision = try store.standaloneRevision();
+    write.patches = &.{try domain.records.difference(a, before, namespace)};
+    var buffer: [64 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    const result = try source.systemCatalog(bounded.allocator(), .{}, .{ .resolver_authority_mutate = write });
+    const receipt = try std.json.parseFromSliceLeaky(domain.View, a, result, .{});
+    try std.testing.expect(receipt.receipt);
+    try std.testing.expectEqual(@as(?bool, false), receipt.definition_changed);
+    try std.testing.expectEqual(definition.ptr, metadata.manager.tables.get(7).?.indexes_json.ptr);
+    try std.testing.expectEqual(try store.standaloneRevision(), metadata.durable_revision);
+    // Receipt replay also certifies the immutable definition without reloading it.
+    bounded.reset();
+    _ = try source.systemCatalog(bounded.allocator(), .{}, .{ .resolver_authority_mutate = write });
+    try std.testing.expectEqual(definition.ptr, metadata.manager.tables.get(7).?.indexes_json.ptr);
+}
+
+test "standalone shared document state follows metadata HA replay and fenced ownership" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    defer a.free(path);
+    const checkpoint = try std.fmt.allocPrint(a, "{s}/metadata.checkpoint", .{root});
+    defer a.free(checkpoint);
+    const log = try std.fmt.allocPrintSentinel(a, "{s}/primary-log", .{root}, 0);
+    defer a.free(log);
+    const slots = try std.fmt.allocPrintSentinel(a, "{s}/primary-slots", .{root}, 0);
+    defer a.free(slots);
+    var primary = try antfly.hot_standby.primary.Primary.open(a, log, slots, .{ .cluster_id = 77, .timeline_id = 1, .epoch = 1 }, .{});
+    defer primary.close();
+    var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer runtime.deinit();
+    var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
+    defer metadata.deinit();
+    const baseline = try metadata.lifecycle_store.?.exportHotStandbyCheckpoint(std.testing.io, checkpoint);
+    var barrier: antfly.db.MutationBarrier = .{};
+    var transition_mutex: std.atomic.Mutex = .unlocked;
+    try LocalStandaloneMetadata.bindHotStandbyMetadata(&metadata, .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .mutation_barrier = &barrier, .transition_mutex = &transition_mutex }));
+    const capability = metadata.restorePersistence().job_state;
+    const queued = "{\"owner\":\"alice\",\"state\":\"queued\",\"checkpoint\":\"immutable-source\"}";
+    const running = "{\"owner\":\"alice\",\"state\":\"running\",\"checkpoint\":\"accepted-page\"}";
+    try std.testing.expect(try capability.compareExchange("documents/ha-run", null, queued, 1));
+    var queued_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(queued, &queued_hash, .{});
+    try std.testing.expect(try capability.compareExchange("documents/ha-run", &queued_hash, running, 1));
+    try std.testing.expectError(error.NotLeader, capability.compareExchange("documents/ha-run", null, queued, 2));
+    const standby_root = try std.fmt.allocPrint(a, "{s}/standby", .{root});
+    defer a.free(standby_root);
+    var standby = try antfly.metadata.RaftApplyStore.init(a, .{ .root_dir = standby_root });
+    defer standby.deinit();
+    try standby.importHotStandbyCheckpoint(std.testing.io, checkpoint, baseline.size_bytes);
+    const entries = try primary.log.iterateFrom(a, 1);
+    defer antfly.hot_standby.replication_log.freeEntries(a, entries);
+    var count: usize = 0;
+    for (entries) |entry| if (entry.record.kind == .metadata_mutation and entry.record.table_id == 0 and entry.record.shard_id == 0) {
+        try standby.applyHotStandbyRecord(entry.record);
+        count += 1;
+    };
+    try std.testing.expect(count >= 2);
+    const mirrored = (try standby.getJobState(a, group_ids.main_metadata_group_id, "documents/ha-run")).?;
+    defer a.free(mirrored);
+    try std.testing.expectEqualStrings(running, mirrored);
+    try std.testing.expectEqual(@as(u64, 1), try standby.getJobOwnerCount(a, group_ids.main_metadata_group_id, "alice"));
+    // Migrating terminal history must remain possible at the active-job limit.
+    for (0..15) |index| {
+        var key: [64]u8 = undefined;
+        try std.testing.expect(try capability.compareExchange(try std.fmt.bufPrint(&key, "documents/quota-{d}", .{index}), null, queued, 1));
+    }
+    try std.testing.expectError(error.TooManyActiveJobs, capability.compareExchange("documents/over-quota", null, queued, 1));
+    try std.testing.expect(try capability.compareExchange("documents/terminal-history", null, "{\"owner\":\"alice\",\"state\":\"succeeded\"}", 1));
+    try std.testing.expectEqual(@as(u64, 16), try metadata.lifecycle_store.?.getJobOwnerCount(a, group_ids.main_metadata_group_id, "alice"));
+    // The existing HA write gate is the external fencing authority. Once it
+    // denies the old primary, even a previously retained job capability fails.
+    const Denied = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.NotLeader;
+        }
+    };
+    metadata.hot_standby_gate = .{ .borrowed = .{ .ptr = &metadata, .check_fn = Denied.check } };
+    try std.testing.expectError(error.NotLeader, capability.compareExchange("documents/ha-run", &queued_hash, queued, 1));
 }

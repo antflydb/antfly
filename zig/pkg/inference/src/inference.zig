@@ -200,6 +200,7 @@ test {
     _ = @import("extractors/gliner_decide_1b_parity_test.zig");
     _ = @import("extractors/gliner_window_parity_test.zig");
     _ = @import("models/gliner_boundary_qualification.zig");
+    _ = @import("models/gliner_decide_qualification.zig");
     _ = @import("extractors/gliner_graph_qualification_fixtures.zig");
     _ = @import("architectures/gliner/boundary_request_device_test.zig");
     _ = @import("extractors/gliner_boundary_long_tasks_test.zig");
@@ -270,6 +271,7 @@ test {
     _ = native_read;
     _ = @import("metal_generated_quant_stats.zig");
     _ = @import("readers/reader.zig");
+    _ = @import("readers/lightonocr3.zig");
     _ = @import("readers/multistage_reader.zig");
     _ = @import("readers/moondream_reader.zig");
     _ = @import("pipelines/moondream.zig");

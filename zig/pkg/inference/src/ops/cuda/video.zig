@@ -29,7 +29,7 @@ const Callback = *const fn (*anyopaque, u64, u32, u32, u32, i64, u32, u32) callc
 extern fn antfly_nvdec_open(*?*anyopaque, ?*anyopaque, *anyopaque, Callback) c_int;
 extern fn antfly_nvdec_packet(*anyopaque, ?[*]const u8, u32, i64, c_int) c_int;
 extern fn antfly_nvdec_close(*anyopaque) void;
-extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int) c_int;
+extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int, c_int) c_int;
 extern fn antfly_nvdec_finish(*anyopaque) void;
 
 extern fn antfly_nvdec_set_budget(*anyopaque, *anyopaque, *const fn (*anyopaque, u32, u32, u32) callconv(.c) c_int, *const fn (*anyopaque) callconv(.c) void) void;
@@ -96,6 +96,154 @@ pub const Sampler = struct {
 };
 
 pub const Sampling = enum { presentation_seconds, embedding_gemma2 };
+
+fn mp4Limits(extended: bool) media.mp4.Limits {
+    return .{ .max_samples = 18_000, .max_dimension = 4096, .codecs = if (extended) std.EnumSet(media.mp4.Codec).initMany(&.{ .avc, .hevc, .av1 }) else std.EnumSet(media.mp4.Codec).initOne(.avc) };
+}
+
+test "embeddinggemma2 video HEVC AV1 and AVC NVDEC pixels match independent FFmpeg samples across codec changes" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Receipt = struct { videos: []const struct { path: []const u8, frames: usize, selected_yuv420_sha256: []const []const u8 } };
+    const parsed = try std.json.parseFromSlice(Receipt, a, @embedFile("../../testdata/video/codecs/receipt.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    var admission = @import("../../runtime/tier/memory.zig").AdmissionController{};
+    defer {
+        std.testing.expectEqual(@as(usize, 0), admission.snapshot().backend_scratch_bytes) catch @panic("NVDEC cache retained admission after context teardown");
+        admission.deinit();
+    }
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    // The decoder cache outlives each request but must retain exactly its own
+    // lease, including when the next same-geometry clip uses another codec.
+    compute.ctx.video_cache_budget.admission = .{ .controller = &admission, .limits = .{ .backend_limit_bytes = 256 * 1024 * 1024 }, .check_live_memory = false };
+    const ConsumerState = struct {
+        ctx: *context.CudaContext,
+        expected: []const []const u8,
+        count: usize = 0,
+        cancel: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cancel and self.count != 0) return error.Cancelled;
+        }
+        fn consume(raw: *anyopaque, frame: Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.count >= self.expected.len) return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(i64, @intCast(self.count * 1_000_000)), frame.timestamp_us);
+            const w: usize = frame.width;
+            const h: usize = frame.height;
+            const pitch: usize = frame.pitch;
+            const surface = try std.testing.allocator.alloc(u8, pitch * h * 3 / 2);
+            defer std.testing.allocator.free(surface);
+            try self.ctx.driver.check(self.ctx.driver.fns.cuMemcpyDtoHAsync(surface.ptr, frame.device, surface.len, self.ctx.stream));
+            try self.ctx.synchronize();
+            const planar = try std.testing.allocator.alloc(u8, w * h * 3 / 2);
+            defer std.testing.allocator.free(planar);
+            for (0..h) |y| @memcpy(planar[y * w ..][0..w], surface[y * pitch ..][0..w]);
+            for (0..h / 2) |y| for (0..w / 2) |x| {
+                planar[w * h + y * (w / 2) + x] = surface[pitch * h + y * pitch + x * 2];
+                planar[w * h * 5 / 4 + y * (w / 2) + x] = surface[pitch * h + y * pitch + x * 2 + 1];
+            };
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(planar, &hash, .{});
+            try std.testing.expectEqualStrings(self.expected[self.count], &std.fmt.bytesToHex(hash, .lower));
+            self.count += 1;
+        }
+    };
+    for (0..2) |_| inline for (.{ "h264.mp4", "hevc-hvc1.mp4", "av1.mp4", "hevc-hev1.mp4", "hevc-hev1-inband.mp4", "hevc-avc-tracks.mp4", "hevc-aac.mp4", "h264.mp4" }) |name| {
+        const expected = for (parsed.value.videos) |entry| {
+            if (std.mem.eql(u8, entry.path, name)) break entry;
+        } else return error.TestUnexpectedResult;
+        var state = ConsumerState{ .ctx = &compute.ctx, .expected = expected.selected_yuv420_sha256 };
+        const bytes = @embedFile("../../testdata/video/codecs/" ++ name);
+        const plan = try inspectEmbedding(a, bytes, .{});
+        try std.testing.expectEqual(expected.selected_yuv420_sha256.len, plan.frames);
+        const stats = try decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &state, .consume = ConsumerState.consume, .check = ConsumerState.check }, .embedding_gemma2);
+        try std.testing.expectEqual(expected.frames, stats.decoded_frames);
+        try std.testing.expectEqual(plan.frames, state.count);
+        try std.testing.expectEqual(compute.ctx.video_cache_budget.bytes, admission.snapshot().backend_scratch_bytes);
+        // Cancellation after the first selected surface must discard both the
+        // decoder and its retained admission, then permit the next codec.
+        if (!std.mem.eql(u8, name, "h264.mp4")) {
+            state.count = 0;
+            state.cancel = true;
+            try std.testing.expectError(error.Cancelled, decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &state, .consume = ConsumerState.consume, .check = ConsumerState.check }, .embedding_gemma2));
+            try std.testing.expect(compute.ctx.video_decoder_cache == null);
+            try std.testing.expectEqual(@as(usize, 0), admission.snapshot().backend_scratch_bytes);
+        }
+    };
+    inline for (.{ "hevc-10bit.mp4", "av1-10bit.mp4" }) |name| {
+        try std.testing.expectError(error.UnsupportedVideoFormat, inspectEmbedding(a, @embedFile("../../testdata/video/codecs/" ++ name), .{}));
+    }
+}
+
+pub const EmbeddingInspection = struct { width: u32, height: u32, frames: usize, codec: media.mp4.Codec = .avc };
+
+test "embeddinggemma2 video container preflight shares six second sampling and cancellation" {
+    const bytes = @embedFile("../../testdata/video/closed.mp4");
+    const clip = try inspectEmbedding(std.testing.allocator, bytes, .{});
+    try std.testing.expectEqual(@as(usize, 6), clip.frames);
+    try std.testing.expect(clip.width > 0 and clip.height > 0);
+    const Cancel = struct {
+        fn check(_: ?*const anyopaque) anyerror!void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, inspectEmbedding(std.testing.allocator, bytes, .{ .check_fn = Cancel.check }));
+    if (inspectEmbedding(std.testing.allocator, bytes[0..32], .{})) |_| return error.TestUnexpectedResult else |_| {}
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: std.mem.Allocator, source: []const u8) !void {
+            _ = try inspectEmbedding(a, source, .{});
+        }
+    }.run, .{bytes});
+}
+
+/// Container-only inspection under the caller's host preprocessing permit.
+/// Uses the decoder's validation and sampler, without opening NVDEC.
+pub fn inspectEmbedding(allocator: std.mem.Allocator, bytes: []const u8, control: media.source.Control) !EmbeddingInspection {
+    if (bytes.len > 256 * 1024 * 1024) return error.VideoInputTooLarge;
+    var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = control };
+    var reader = try media.mp4.Reader.init(allocator, &source, mp4Limits(true));
+    defer reader.deinit();
+    try validateTrack(reader.track);
+    const end_us = try validateTimeline(reader.track, reader.packets);
+    const sampler = try embeddingSamplerForReader(&reader, end_us);
+    return .{ .width = reader.track.width, .height = reader.track.height, .frames = sampler.length, .codec = reader.track.codec };
+}
+
+fn validateTrack(track: anytype) !void {
+    switch (track.codec) {
+        .avc => if (track.inband_parameter_sets) return error.UnsupportedVideoFormat,
+        .hevc => {
+            const c = track.codec_config;
+            if (c.len < 23 or c[1] & 0x1f != 1 or c[16] & 3 != 1 or c[17] & 7 != 0 or c[18] & 7 != 0) return error.UnsupportedVideoFormat;
+        },
+        .av1 => {
+            const c = track.codec_config;
+            if (c.len < 4 or c[1] >> 5 != 0 or c[2] & 0x70 != 0 or c[2] & 0x0c != 0x0c or c[2] & 3 == 3) return error.UnsupportedVideoFormat;
+        },
+        .mjpeg => return error.UnsupportedVideoFormat,
+    }
+    if (track.pixel_aspect.horizontal != track.pixel_aspect.vertical or
+        !std.mem.eql(i32, &track.display_matrix, &.{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 })) return error.UnsupportedVideoFormat;
+    _ = try containerColor(track.color_info);
+}
+
+fn embeddingSamplerForReader(reader: *const media.mp4.Reader, end_us: i64) !EmbeddingSampler {
+    const track = reader.track;
+    var frames: usize = 0;
+    var duration_us: i64 = 0;
+    for (reader.packets) |packet| {
+        const pts = try timestampUs(packet.pts, track.timescale);
+        if (pts < 0 or pts >= end_us) continue;
+        frames += 1;
+        const end = std.math.cast(i64, @as(i128, packet.pts) + packet.duration) orelse return error.InvalidVideoTimestamp;
+        duration_us = @max(duration_us, @min(end_us, try timestampUs(end, track.timescale)));
+    }
+    // An empty edit shifts presentation time without adding content samples.
+    const content_duration_us = try embeddingContentDurationUs(track, duration_us);
+    return EmbeddingSampler.init(frames, content_duration_us, end_us);
+}
 
 /// EmbeddingGemma2: floor(duration * 1 FPS) samples, capped uniformly to 32.
 /// Frame indices use the container's average frame rate, as the upstream processor does.
@@ -203,29 +351,15 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     ctx.video_cache_budget.failure = null;
     var state = DecodeState{ .ctx = ctx, .consumer = consumer };
     var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = .{ .context = &state, .check_fn = sourceCheck } };
-    var reader = try media.mp4.Reader.init(allocator, &source, .{ .max_samples = 18_000, .max_dimension = 4096 });
+    var reader = try media.mp4.Reader.init(allocator, &source, mp4Limits(sampling == .embedding_gemma2));
     defer reader.deinit();
     const track = reader.track;
-    if (track.codec != .avc or track.inband_parameter_sets or track.pixel_aspect.horizontal != track.pixel_aspect.vertical or
-        !std.mem.eql(i32, &track.display_matrix, &.{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 })) return error.UnsupportedVideoFormat;
+    try validateTrack(track);
     const color = try containerColor(track.color_info);
     if (reader.packets.len == 0) return error.EmptyVideo;
     state.sampler.end_us = try validateTimeline(track, reader.packets);
     if (sampling == .embedding_gemma2) {
-        var frames: usize = 0;
-        var duration_us: i64 = 0;
-        for (reader.packets) |packet| {
-            const pts = try timestampUs(packet.pts, track.timescale);
-            if (pts < 0 or pts >= state.sampler.end_us) continue;
-            frames += 1;
-            const end = std.math.cast(i64, @as(i128, packet.pts) + packet.duration) orelse return error.InvalidVideoTimestamp;
-            duration_us = @max(duration_us, @min(state.sampler.end_us, try timestampUs(end, track.timescale)));
-        }
-        // PyAV exposes an edit's media duration to the upstream processor. A
-        // leading empty edit shifts presentation timestamps but must not add
-        // samples or change the frame indices selected from the media itself.
-        const content_duration_us = try embeddingContentDurationUs(track, duration_us);
-        state.embedding_sampler = try EmbeddingSampler.init(frames, content_duration_us, state.sampler.end_us);
+        state.embedding_sampler = try embeddingSamplerForReader(&reader, state.sampler.end_us);
     }
     try ctx.makeCurrent();
     if (ctx.video_decoder_cache == null) {
@@ -241,17 +375,28 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
             ctx.video_decoder_cache = null;
         }
     }
-    try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, &state, DecodeState.callback, track.width, track.height, color.matrix, color.range));
+    const codec: c_int = switch (track.codec) {
+        .avc => 4,
+        .hevc => 8,
+        .av1 => 11,
+        .mjpeg => return error.UnsupportedVideoFormat,
+    };
+    try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, &state, DecodeState.callback, track.width, track.height, codec, color.matrix, color.range));
     var annex: std.ArrayList(u8) = .empty;
     defer annex.deinit(allocator);
-    try avccHeaders(allocator, &annex, track.avcc);
-    try state.checkStatus(antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), 0, 0));
+    switch (track.codec) {
+        .avc => try avccHeaders(allocator, &annex, track.avcc),
+        .hevc => try hvccHeaders(allocator, &annex, track.codec_config),
+        .av1 => try annex.appendSlice(allocator, track.codec_config[4..]),
+        .mjpeg => unreachable,
+    }
+    if (annex.items.len != 0) try state.checkStatus(antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), 0, 0));
     for (reader.packets, 0..) |packet, index| {
         try source.control.check();
         var lease = try reader.readPacket(index);
         defer lease.deinit();
         annex.clearRetainingCapacity();
-        try annexPacket(allocator, &annex, lease.bytes, track.nal_length_bytes);
+        if (track.codec == .av1) try annex.appendSlice(allocator, lease.bytes) else try annexPacket(allocator, &annex, lease.bytes, track.nal_length_bytes);
         const pts = try timestampUs(packet.pts, track.timescale);
         const result = antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), pts, 0);
         if (state.failure) |err| return err;
@@ -414,6 +559,25 @@ fn avccHeaders(a: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8)
         }
     }
 }
+fn hvccHeaders(a: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8) !void {
+    if (bytes.len < 23 or bytes[0] != 1) return error.InvalidVideoConfiguration;
+    var cursor: usize = 23;
+    for (0..bytes[22]) |_| {
+        if (bytes.len - cursor < 3) return error.InvalidVideoConfiguration;
+        const count = std.mem.readInt(u16, bytes[cursor + 1 ..][0..2], .big);
+        cursor += 3;
+        for (0..count) |_| {
+            if (bytes.len - cursor < 2) return error.InvalidVideoConfiguration;
+            const len = std.mem.readInt(u16, bytes[cursor..][0..2], .big);
+            cursor += 2;
+            if (len < 2 or len > bytes.len - cursor) return error.InvalidVideoConfiguration;
+            try appendNal(a, out, bytes[cursor..][0..len]);
+            cursor += len;
+        }
+    }
+    if (cursor != bytes.len) return error.InvalidVideoConfiguration;
+}
+
 fn annexPacket(a: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8, length_bytes: u3) !void {
     if (length_bytes != 1 and length_bytes != 2 and length_bytes != 4) return error.InvalidVideoPacket;
     var cursor: usize = 0;

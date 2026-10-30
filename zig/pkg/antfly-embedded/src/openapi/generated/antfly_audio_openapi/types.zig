@@ -122,6 +122,130 @@ pub const AudioFormat = enum {
     }
 };
 
+/// Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
+pub const CloudflareSTTConfig = struct {
+    provider: []const u8,
+    account_id: []const u8,
+    gateway_id: ?[]const u8 = null,
+    model: []const u8,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned full native endpoint override.
+    base_url: ?[]const u8 = null,
+    language_code: ?[]const u8 = null,
+    voice: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "account_id", "account_id", false },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "model", "model", false },
+        .{ "api_key", "api_key", true },
+        .{ "base_url", "base_url", true },
+        .{ "language_code", "language_code", true },
+        .{ "voice", "voice", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("account_id");
+        try jw.write(self.account_id);
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.voice) |value| {
+            try jw.objectField("voice");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
+pub const CloudflareTTSConfig = struct {
+    account_id: []const u8,
+    gateway_id: ?[]const u8 = null,
+    model: []const u8,
+    api_key: ?[]const u8 = null,
+    /// Optional deployment-owned full native endpoint override.
+    base_url: ?[]const u8 = null,
+    language_code: ?[]const u8 = null,
+    voice: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "account_id", "account_id", false },
+        .{ "gateway_id", "gateway_id", true },
+        .{ "model", "model", false },
+        .{ "api_key", "api_key", true },
+        .{ "base_url", "base_url", true },
+        .{ "language_code", "language_code", true },
+        .{ "voice", "voice", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("account_id");
+        try jw.write(self.account_id);
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.voice) |value| {
+            try jw.objectField("voice");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Configuration for ElevenLabs TTS provider. API key via `api_key` field or `ELEVENLABS_API_KEY` environment variable. **Models:** eleven_monolingual_v1, eleven_multilingual_v2, eleven_turbo_v2_5 (fastest) **Docs:** https://elevenlabs.io/docs/api-reference
 pub const ElevenLabsTTSConfig = struct {
     /// ElevenLabs API key. Falls back to ELEVENLABS_API_KEY environment variable.
@@ -276,20 +400,21 @@ pub const OpenAITTSConfig = struct {
 
 /// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base ```
 pub const STTConfig = struct {
-    /// Whisper model to use.
+    provider: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
     model: ?[]const u8 = null,
-    /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
     api_key: ?[]const u8 = null,
-    /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
+    /// Optional deployment-owned full native endpoint override.
     base_url: ?[]const u8 = null,
+    language_code: ?[]const u8 = null,
+    voice: ?[]const u8 = null,
     /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
     /// Google Cloud location.
     location: ?[]const u8 = null,
     /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain.
     credentials_path: ?[]const u8 = null,
-    /// Default language code (e.g., 'en-US', 'es-ES').
-    language_code: ?[]const u8 = null,
     /// Enable automatic punctuation.
     enable_automatic_punctuation: ?bool = null,
     /// Use enhanced models for better accuracy (costs more).
@@ -299,23 +424,25 @@ pub const STTConfig = struct {
     timestamps: ?bool = null,
     /// Explicitly permit preparing and installing the selected Speech assets.
     download_assets: ?bool = null,
-    provider: STTProvider,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
         .{ "model", "model", true },
         .{ "api_key", "api_key", true },
         .{ "base_url", "base_url", true },
+        .{ "language_code", "language_code", true },
+        .{ "voice", "voice", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
         .{ "credentials_path", "credentials_path", true },
-        .{ "language_code", "language_code", true },
         .{ "enable_automatic_punctuation", "enable_automatic_punctuation", true },
         .{ "use_enhanced", "use_enhanced", true },
         .{ "api_url", "api_url", true },
         .{ "timestamps", "timestamps", true },
         .{ "download_assets", "download_assets", true },
-        .{ "provider", "provider", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -328,6 +455,18 @@ pub const STTConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.provider) |value| {
+            try jw.objectField("provider");
+            try jw.write(value);
+        }
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
         if (self.model) |value| {
             try jw.objectField("model");
             try jw.write(value);
@@ -340,6 +479,14 @@ pub const STTConfig = struct {
             try jw.objectField("base_url");
             try jw.write(value);
         }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.voice) |value| {
+            try jw.objectField("voice");
+            try jw.write(value);
+        }
         if (self.project_id) |value| {
             try jw.objectField("project_id");
             try jw.write(value);
@@ -350,10 +497,6 @@ pub const STTConfig = struct {
         }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
-            try jw.write(value);
-        }
-        if (self.language_code) |value| {
-            try jw.objectField("language_code");
             try jw.write(value);
         }
         if (self.enable_automatic_punctuation) |value| {
@@ -376,14 +519,13 @@ pub const STTConfig = struct {
             try jw.objectField("download_assets");
             try jw.write(value);
         }
-        try jw.objectField("provider");
-        try jw.write(self.provider);
         try jw.endObject();
     }
 };
 
 /// The STT provider to use.
 pub const STTProvider = enum {
+    cloudflare,
     openai,
     vertex,
     antfly,
@@ -391,6 +533,7 @@ pub const STTProvider = enum {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
+            .cloudflare => "cloudflare",
             .openai => "openai",
             .vertex => "vertex",
             .antfly => "antfly",
@@ -405,6 +548,7 @@ pub const STTProvider = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "cloudflare", .cloudflare },
             .{ "openai", .openai },
             .{ "vertex", .vertex },
             .{ "antfly", .antfly },
@@ -565,22 +709,20 @@ pub const Speaker = struct {
 
 /// Unified configuration for a TTS provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI TTS (tts-1, tts-1-hd) - `vertex` - Google Cloud Text-to-Speech (Vertex AI) - `elevenlabs` - ElevenLabs premium voices **Example:** ```yaml provider: openai model: tts-1-hd voice: nova ```
 pub const TTSConfig = struct {
-    /// TTS model to use. tts-1 is faster, tts-1-hd has higher quality.
+    account_id: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
     model: ?[]const u8 = null,
-    /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
     api_key: ?[]const u8 = null,
-    /// Default voice to use.
-    voice: ?[]const u8 = null,
-    /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
+    /// Optional deployment-owned full native endpoint override.
     base_url: ?[]const u8 = null,
+    language_code: ?[]const u8 = null,
+    voice: ?[]const u8 = null,
     /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
     /// Google Cloud location.
     location: ?[]const u8 = null,
     /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain.
     credentials_path: ?[]const u8 = null,
-    /// Default language code (e.g., 'en-US', 'es-ES').
-    language_code: ?[]const u8 = null,
     /// Default voice name (e.g., 'en-US-Neural2-A').
     voice_name: ?[]const u8 = null,
     /// Default ElevenLabs voice ID.
@@ -597,14 +739,16 @@ pub const TTSConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
         .{ "model", "model", true },
         .{ "api_key", "api_key", true },
-        .{ "voice", "voice", true },
         .{ "base_url", "base_url", true },
+        .{ "language_code", "language_code", true },
+        .{ "voice", "voice", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
         .{ "credentials_path", "credentials_path", true },
-        .{ "language_code", "language_code", true },
         .{ "voice_name", "voice_name", true },
         .{ "voice_id", "voice_id", true },
         .{ "model_id", "model_id", true },
@@ -624,6 +768,14 @@ pub const TTSConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
+            try jw.write(value);
+        }
         if (self.model) |value| {
             try jw.objectField("model");
             try jw.write(value);
@@ -632,12 +784,16 @@ pub const TTSConfig = struct {
             try jw.objectField("api_key");
             try jw.write(value);
         }
-        if (self.voice) |value| {
-            try jw.objectField("voice");
-            try jw.write(value);
-        }
         if (self.base_url) |value| {
             try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.voice) |value| {
+            try jw.objectField("voice");
             try jw.write(value);
         }
         if (self.project_id) |value| {
@@ -650,10 +806,6 @@ pub const TTSConfig = struct {
         }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
-            try jw.write(value);
-        }
-        if (self.language_code) |value| {
-            try jw.objectField("language_code");
             try jw.write(value);
         }
         if (self.voice_name) |value| {
@@ -688,12 +840,14 @@ pub const TTSConfig = struct {
 
 /// The TTS provider to use.
 pub const TTSProvider = enum {
+    cloudflare,
     openai,
     vertex,
     elevenlabs,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
+            .cloudflare => "cloudflare",
             .openai => "openai",
             .vertex => "vertex",
             .elevenlabs => "elevenlabs",
@@ -707,6 +861,7 @@ pub const TTSProvider = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "cloudflare", .cloudflare },
             .{ "openai", .openai },
             .{ "vertex", .vertex },
             .{ "elevenlabs", .elevenlabs },

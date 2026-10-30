@@ -74,10 +74,36 @@ const std = @import("std");
 /// Version 39 decodes native per-record resolver authority and its atomic heads.
 /// Version 40 carries compact physical namespace bindings and projection reads.
 /// Version 41 carries shared content-addressed namespace execution attachments.
-pub const current_version: u16 = 42;
-pub const resolver_records_version: u16 = 42;
+/// Version 43 maintains shared namespace-scoped consumer routes and readiness.
+/// Version 44 maintains content-addressed static resolver profile adjacency.
+/// Version 46 adds indexed static suppression, scoped binding deltas, and
+/// compact proposal lifecycle headers with separately retained evidence.
+/// Version 47 adds sparse profile witnesses and digest-fenced native replay.
+/// Version 48 carries batched query-policy reads and typed native mutation receipts.
+/// Version 49 maintains sparse pin branches and query dependency stamps.
+/// Version 50 adds bounded per-resolver consumer progress and head-only reads.
+/// Version 51 adds membership-only authority reads and backfilled v8 per-resolver progress rows.
+/// Version 52 adds indexed query declarations and revision-fenced ownership backfill.
+/// Version 53 maintains ordinary destination query proofs through v10 backfill.
+/// Version 54 accepts immutable query-profile references on policy pages.
+/// Version 55 returns complete bounded configured/native query paths.
+/// Version 57 projects configured negatives with qualified profile identities.
+/// Version 58 fences render and resolve with distinct execution dependency scopes.
+/// Version 59 combines replicated document jobs with resolver advancement tag 80.
+/// Version 60 backfills and maintains root-scoped resolver pin projections.
+/// Version 61 resumes bounded pin paths and backfills static root membership.
+/// Version 62 incrementally repairs graph-fenced pin membership from edit journals.
+/// Version 63 adds dependency-scoped pin repair and indexed invalidation proofs.
+/// Version 64 adds deletable dependency summaries and forward-only pin repair.
+/// Version 65 scopes native paths and adds paged fingerprint dependency summaries.
+/// Version 66 indexes routing sources for dependency-validated canonical proofs.
+/// Version 67 qualifies legacy resolver content before native cache admission.
+/// Version 68 tracks bounded edits during resumable resolver qualification.
+pub const current_version: u16 = 68;
+pub const job_state_version: u16 = 59;
+pub const resolver_records_version: u16 = 58;
 pub const native_service_tables_version: u16 = 38;
-pub const resolver_namespaces_version: u16 = 37;
+pub const resolver_namespaces_version: u16 = 68;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {

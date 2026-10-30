@@ -86,7 +86,7 @@ func TestHostedCorpusProfilesKeepModelsDimensionsAndRoutingAligned(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexes, err := corpusIndexes("unused", DefaultAutographModel, "https://inference.example", "florence-reader.example.json", true, true, corpusIndexOptions{Embedder: config, InferenceSecret: "hosted.inference.key"})
+	indexes, err := corpusIndexes("unused", DefaultAutographModel, "https://inference.example", "lightonocr-reader.example.json", true, true, corpusIndexOptions{Embedder: config, InferenceSecret: "hosted.inference.key"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,8 +107,8 @@ func TestHostedCorpusProfilesKeepModelsDimensionsAndRoutingAligned(t *testing.T)
 		t.Fatal(err)
 	}
 	ocr := producer["config"].(map[string]any)["ocr"].(map[string]any)
-	reader := ocr["config"].(map[string]any)
-	if ocr["enabled"] != true || ocr["executor"] != "reader" || reader["model"] != DefaultOCRModel || reader["api_url"] != "https://inference.example/ai/v1" {
+	reader := ocr["reader"].(map[string]any)
+	if reader["max_tokens"] != float64(512) || reader["model"] != DefaultOCRModel || reader["api_url"] != "https://inference.example/ai/v1" {
 		t.Fatal(ocr)
 	}
 	graphBytes, err := json.Marshal(indexes[DefaultAutographIndex])

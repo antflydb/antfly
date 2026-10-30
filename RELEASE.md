@@ -5,6 +5,58 @@ image, and SDKs from tags. The intended long-term shape is that each supported
 OS, architecture, and libc ABI is built once and every downstream channel
 consumes those same archives.
 
+## Independent grep releases
+
+`antfly-grep` uses its own tags, versions and GitHub Releases:
+`antfly-grep/vX.Y.Z` for stable versions and
+`antfly-grep/vX.Y.Z-{alpha,beta,rc}.N` for prereleases. It is not built or bundled
+by Antfly server or embedded-library releases. Historical source commits retain
+their original packaging behavior.
+
+To request a release after these workflows have merged to `main`:
+
+```sh
+git fetch origin main
+git tag -a antfly-grep/v0.1.0-rc.1 origin/main -m 'Antfly Grep 0.1.0-rc.1'
+git push origin refs/tags/antfly-grep/v0.1.0-rc.1
+```
+
+The read-only `grep-release-request.yml` workflow emits a tag request. The
+`grep-release.yml` controller runs from the default branch, validates the actual
+tag event and source ancestry on `main`, and pins all release tools to its own
+commit. Archive builds have only repository read permission and the existing
+bucket-scoped dependency reader; they fetch verified Zig sources from GCS.
+Only the final publication job has repository write permission, behind the
+existing `release-promotion` environment approval.
+
+Each release builds five standalone archives, named
+`antfly-grep_<version>_<OS>_<arch>[_gnu].tar.gz`: Linux x86-64/ARM64 in portable
+musl and glibc 2.28+ variants, plus macOS 15+ ARM64. Every archive is installed
+and executed on its native architecture before publication. Qualification checks
+its independent version, help output, a matching search, a nonmatching search's
+exit status, and installed manpage/completion/schema files. GNU builds support
+optional dynamically loaded local inference; portable musl builds do not.
+
+A complete release contains those five archives, `grep-release.json` (source,
+controller, build identity and per-platform digests), and `SHA256SUMS`. Publication
+requires the exact platform set and verified checksums. Existing release assets
+are verified and never overwritten. Publication reconciles server state after
+upload errors and retries transient failures up to three times, uploading only
+missing files. Only empty, unfinished `starter` assets on a validated draft are
+removed before retry; uploaded assets and published releases are never deleted.
+Permission failures and conflicting digests fail immediately. After retry
+exhaustion, use Re-run failed jobs on the same workflow run. A moved tag, changed
+control policy or different release bytes fail closed. Grep releases explicitly disable GitHub's repository-wide Latest marker,
+so Antfly's existing stable install channel is unaffected. Grep publication does
+not publish Antfly npm/PyPI packages, containers, Homebrew formulas or docs.
+
+Users download from the corresponding namespaced GitHub Release, verify their
+archive's matching entry in `SHA256SUMS` with `sha256sum --check` (or
+`shasum -a 256 --check`; see the grep README for a single-archive example), extract their
+platform archive, and run `./install.sh --prefix "$HOME/.local"`. The installer
+copies only grep and its supporting assets; no Antfly server or libantfly is
+required. Add the selected prefix's `bin` directory to `PATH`.
+
 ## Release Artifacts
 
 The canonical Zig runtime artifacts are tarballs named:
@@ -104,6 +156,14 @@ native Linux architectures; portable musl arm64 and macOS arm64 cross-compile
 from the amd64 Linux runner. The macOS build uses the pinned cross-compilation
 SDK and enables Metal and Accelerate.
 
+Release archive jobs prepare pinned Zig source dependencies from the private
+GCS mirror using the controller's authenticated preparation action. Preparation
+and the server/embedded builds share `.zig-cache/release-dependencies/global`;
+release preparation requires the mirror and never falls back to upstream. Every
+package is verified against the source inventory's Zig content hash. The
+short-lived, bucket-scoped reader token is limited to preparation and is not
+passed to the compiler.
+
 ## Pipeline Ownership
 
 Release is split into an untrusted request plane, a default-branch artifact
@@ -126,7 +186,8 @@ credentials.
    the versioned builder inputs.
    The controller first requires that source to declare the supported
    `scripts/release/build-contract.json` schema and all required build paths.
-   With only read permission, it builds the canonical Zig archives,
+   With read-only repository permission and keyless source-mirror read access
+   limited to archive jobs, it builds the canonical Zig archives,
    calls `.github/workflows/cli-package.yml`, extracts `install.sh` and
    `openapi.yaml` directly from the selected Git commit, and uploads the native
    archives, CLI snapshot, commit-bound source snapshot, and
@@ -391,6 +452,9 @@ exist on `main` before a newly introduced label can be used. The suites share
 every product declared by `build-contract.json` through the production archive
 script with the pinned Nix Zig. Linux includes x86-64 and ARM64, GNU and musl;
 Darwin cross-compiles on the Linux x86-64 release runner with the pinned SDK.
+The macOS SDK is pinned to 26.1 (including Metal 4 declarations), while the
+Darwin deployment target remains macOS 15.0. Optional newer Metal paths retain
+runtime OS and device availability checks.
 Both entry workflows can also be dispatched on `main` without publishing.
 Embedded package snapshots record their source policy's wheel platform tags;
 verification preserves historical schema-1 snapshots and does not reinterpret

@@ -35,61 +35,69 @@ pub fn parse(
     source_parts_json: ?[]const u8,
     allow_metadata_only: bool,
 ) !Source {
-    if (source_parts_json) |raw_parts| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_parts, .{});
-        defer parsed.deinit();
-        if (parsed.value == .array) {
-            var images = std.ArrayListUnmanaged([]const u8).empty;
-            errdefer {
-                for (images.items) |image| alloc.free(@constCast(image));
-                images.deinit(alloc);
-            }
-            var prompt = std.ArrayListUnmanaged(u8).empty;
-            errdefer prompt.deinit(alloc);
+    if (source_parts_json) |raw| if (try parseParts(alloc, raw, allow_metadata_only)) |source| return source;
+    return try parseText(alloc, source_text);
+}
 
-            for (parsed.value.array.items) |part| {
-                if (part != .object) continue;
-                const type_value = part.object.get("type") orelse continue;
-                if (type_value != .string) continue;
-                if (std.mem.eql(u8, type_value.string, "text")) {
-                    const text = part.object.get("text") orelse continue;
-                    if (text != .string) continue;
-                    if (prompt.items.len > 0) try prompt.append(alloc, '\n');
-                    try prompt.appendSlice(alloc, text.string);
-                } else if (std.mem.eql(u8, type_value.string, "media")) {
-                    if (part.object.get("url")) |url| {
-                        if (url == .string) try appendOwnedImage(alloc, &images, try alloc.dupe(u8, url.string));
-                    } else if (part.object.get("mime_type")) |mime| {
-                        const data = part.object.get("data") orelse continue;
-                        if (mime == .string and data == .string) {
-                            try appendOwnedImage(alloc, &images, try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ mime.string, data.string }));
-                        }
+/// Resolve authored text/media parts before considering a fallback locator.
+/// A null result preserves the established source_text fallback behavior.
+pub fn parseParts(alloc: Allocator, raw_parts: []const u8, allow_metadata_only: bool) !?Source {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_parts, .{});
+    defer parsed.deinit();
+    return parsePartsValue(alloc, parsed.value, allow_metadata_only);
+}
+
+pub fn parsePartsValue(alloc: Allocator, value: std.json.Value, allow_metadata_only: bool) !?Source {
+    if (value == .array) {
+        var images = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (images.items) |image| alloc.free(@constCast(image));
+            images.deinit(alloc);
+        }
+        var prompt = std.ArrayListUnmanaged(u8).empty;
+        errdefer prompt.deinit(alloc);
+
+        for (value.array.items) |part| {
+            if (part != .object) continue;
+            const type_value = part.object.get("type") orelse continue;
+            if (type_value != .string) continue;
+            if (std.mem.eql(u8, type_value.string, "text")) {
+                const text = part.object.get("text") orelse continue;
+                if (text != .string) continue;
+                if (prompt.items.len > 0) try prompt.append(alloc, '\n');
+                try prompt.appendSlice(alloc, text.string);
+            } else if (std.mem.eql(u8, type_value.string, "media")) {
+                if (part.object.get("url")) |url| {
+                    if (url == .string) try appendOwnedImage(alloc, &images, try alloc.dupe(u8, url.string));
+                } else if (part.object.get("mime_type")) |mime| {
+                    const data = part.object.get("data") orelse continue;
+                    if (mime == .string and data == .string) {
+                        try appendOwnedImage(alloc, &images, try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ mime.string, data.string }));
                     }
                 }
             }
-
-            if (images.items.len > 0 or allow_metadata_only) {
-                const owned_images = try images.toOwnedSlice(alloc);
-                errdefer {
-                    for (owned_images) |image| alloc.free(@constCast(image));
-                    alloc.free(owned_images);
-                }
-                return .{
-                    .images = owned_images,
-                    .prompt = if (prompt.items.len > 0) try prompt.toOwnedSlice(alloc) else null,
-                };
-            }
-            // Preserve the established source_text fallback for ordinary URL
-            // readers. Reset both lists after deinit so their errdefers remain
-            // harmless if parsing source_text subsequently fails.
-            prompt.deinit(alloc);
-            prompt = .empty;
-            images.deinit(alloc);
-            images = .empty;
         }
-    }
 
-    return try parseText(alloc, source_text);
+        if (images.items.len > 0 or allow_metadata_only) {
+            const owned_images = try images.toOwnedSlice(alloc);
+            errdefer {
+                for (owned_images) |image| alloc.free(@constCast(image));
+                alloc.free(owned_images);
+            }
+            return .{
+                .images = owned_images,
+                .prompt = if (prompt.items.len > 0) try prompt.toOwnedSlice(alloc) else null,
+            };
+        }
+        // Preserve the established source_text fallback for ordinary URL
+        // readers. Reset both lists after deinit so their errdefers remain
+        // harmless if parsing source_text subsequently fails.
+        prompt.deinit(alloc);
+        prompt = .empty;
+        images.deinit(alloc);
+        images = .empty;
+    }
+    return null;
 }
 
 pub fn parseText(alloc: Allocator, source_text: []const u8) !Source {
@@ -231,7 +239,11 @@ test "backup preflight reader sources release allocations at every failure point
             defer result.deinit(a);
         }
     };
-    const a = std.testing.allocator;
+    // JSON arenas can grow/remap in place depending on neighboring heap
+    // allocations. Enumerate the allocate/copy fallback consistently so every
+    // owned image/prompt allocation is faulted, independent of heap placement.
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    const a = backing.allocator();
     for ([_][]const u8{
         "https://example.org/image",
         "\"https://example.org/image\"",

@@ -2354,3 +2354,411 @@ serialize or rebuild previously visited components. Membership, canonical lookup
 and distinct checks explicitly select the appropriate scope; a changed authority
 head or rollback discards the cache. Scale coverage includes hundreds of distinct
 scopes in one operation, alongside single-scope reads in a large space.
+
+
+Canonical execution additionally memoizes each visited identity's canonical
+endpoint, redirect distance and endpoint suppression within the operation. New
+paths stop at cached tails, and path compression stores one result per identity;
+long chains and converging paths share work and storage. Full components remain
+separate for membership and distinct checks. Authority changes and rollback
+invalidate both caches, preserving the same revision fence and traversal budget.
+
+
+### Resolver admission and progress cost
+
+The ordinary `/resolvers` entity APIs share the native identity authority.
+Entity mutation admission checks destination-table authority before reading
+policy, then revalidates the complete, deduplicated seed/absorbed-key mutation
+set in one batch before publication. Absorbed aliases never cause individual
+catalog authorization RPCs, including aliases repeated across namespaces.
+
+Progress pages seek existing namespace route buckets and individual resolver
+rows. Their opaque continuation binds the catalog revision, destination identity,
+query key, literal-prefix bucket, route key, active template and last consumer
+row. Pages do not reload or sort all matching namespaces. An old offset-based
+progress cursor requires restarting pagination; no durable index rebuild is
+needed. A 1,000-namespace traversal at limit 37 visits exactly 1,000 route rows
+across 28 pages, including transitions between literal-prefix buckets.
+
+Embedded proposal creation uses the enrolled namespace directory and adopted
+native heads as its membership proof. It opens source consumers only for cold
+namespaces that still require legacy folding. Warm membership captures directory
+epoch and namespace revision/fingerprint fences outside the writer lease and
+rechecks them at publication. Duplicate proposal receipts remain point reads;
+review operations still gather the policy and observations their decisions need.
+The mixed warm/cold regression proves that only the cold binding is decoded.
+
+
+### Indexed resolver query declarations and historical ownership
+
+Metadata publishes a versioned per-source query header, per-resolver execution
+records, lightweight routing-group declarations and raw producer declarations
+atomically with source DDL. The header pins source identity, schema and the
+existing durable source-definition stamp. Query admission reads the selected
+resolver and its routing group; unrelated definitions, alias lists, schema JSON
+and opaque index values are not decoded. Resolve hydrates every executed sibling
+because identity templates may depend on sibling resolution. Render needs the
+selected execution record and sibling labels only. Text extraction retains raw
+producer declarations so provider defaults and secret references resolve through
+the normal runtime providers at execution time.
+
+Final verification reads declaration headers and live destination schema,
+incarnation and namespace head proofs. It does not rebuild source JSON or hash
+the source definition again. Legacy policy revisions remain dependencies when
+no native head exists. Removing or retiring declarations updates their group and
+producer rows in the same transaction; a source edit cannot leave stale query
+execution records visible. The source-definition stamp also detects an older
+writer that did not update the new declaration projection.
+
+Historical proposal-key ownership has forward and reverse compressed radix
+indexes. Physical keys use fixed-size digests; labels encode key bytes, including
+Unicode, independently of the physical key size. Compressed paths use at most
+two nodes per distinct key in each direction. An ownership check seeks the
+literal prefix and suffix and examines the smaller matching subtree, applying
+the exact namespace predicate before returning true. Exact-key and absent-prefix
+queries do not scan historical receipts. Terminal decisions preserve ownership.
+
+Index readiness carries the queue revision and a portable backfill watermark.
+New writers index new keys immediately and advance that revision atomically;
+an older writer changing only the queue revision invalidates readiness. Owner
+maintenance backfills at most 128 historical keys per turn. Old read-only
+snapshots remain conservative until the complete index is published. Lite uses
+its ordinary fenced maintenance writer; metadata uses digest-fenced leader work.
+Polling and rebuilding this optional index preserve the file's existing reader
+floor and do not bootstrap an unrelated consumer directory.
+Topology protocol 53 and the v10 bootstrap generation cover query declarations,
+ownership backfill and ordinary destination query proofs. The v10 marker is
+published only after all source descriptors, destination proofs and ownership
+indexes are complete; earlier progress rows remain usable during repair.
+
+HTTP duplicate proposal creation checks its point receipt before enumerating
+namespace heads or consumer routes. It retains destination authorization and
+normal duplicate-intent validation. Membership discovery is needed only when a
+new proposal must be admitted.
+
+Scored policy reads use an immutable prepared index keyed by static profile
+identity, namespace template and a separate graph fingerprint.
+It indexes distinct pairs by their effective canonical endpoints, after native
+overrides and removal tombstones are applied. A query looks up only its canonical
+components and loads their forward policy paths; unrelated pinned aliases never
+become query seeds. Each immutable profile has one leased base containing static maps and node
+postings. Native graph versions retain that base and compile only native changes,
+pins and the affected static predecessor frontier. Unchanged components resolve
+through the base; no profile-sized map is copied for a new graph generation.
+
+The shared cache has 48 MiB for profile bases and graph overlays plus 16 MiB
+for component routing and effective-root pin membership, including charged entry
+overhead, with
+byte-budgeted access-based eviction rather than a fixed entry count. Sixty-four
+yielding build-lock stripes coalesce identical cold misses; directory locks cover
+only lookup/publication and eviction reclamation runs outside them. Conservative
+compilation reservations account for concurrent builds before profile or graph I/O.
+A base miss reserves its conservative static estimate before invoking the loader.
+When that reservation is denied, an available persistent node adapter serves the
+query without decoding or indexing the profile. Admission
+reclaims idle LRU entries before denying a reservation. Retention and live payload
+charges are separate: evicted contexts remain charged until their final lease
+releases them, and their accounting object survives cache teardown. Payload
+reclamation remains outside the directory lock. Dependent overlays keep their
+base discoverable and alive; its payload is charged once. Reclaiming idle
+overlays makes an otherwise unused base eligible for reclamation.
+Preparation reads only redirect, removed-alias and distinct records in bounded sequential pages,
+inside a read snapshot and outside writer leases. This cold compilation costs
+O(static aliases) once per retained profile, then O(native graph + pins +
+affected static predecessors) per retained graph version; warm
+pages do not rescan or recompile that state. Reference-counted leases keep active
+pages valid through eviction; response data is copied out before releasing the
+lease. Zero-fingerprint legacy heads cannot qualify a shared composed entry.
+No transactions, execution grants, candidate documents or model results are
+cached. An atomic derived graph stamp includes a proof of the complete head and
+changes its fingerprint only for redirect, removed-alias or distinct edits.
+Text suppression, provenance and other non-graph edits retain the compiled index;
+every query still captures and validates the complete publication head. Missing
+or mismatched stamps after an older writer or restore use conservative full
+lineage. No primary record/reader format changes are needed for these optional
+derived rows; portable backups validate their typed envelope.
+
+Oversized declarations, uncertain legacy admission hints and unavailable build
+budget select pin-directed indexed reads before native graph compilation. Source
+enrollment atomically publishes immutable profile-node postings both by node hash
+and by static canonical component, with an explicit readiness marker. Native
+redirect/removal postings identify which static components can feed a requested
+root. A root absent from the static domain and native incoming directory cannot
+have other identities feeding it; it skips global edit discovery while still
+reading its own pins. A bounded immutable root-to-component routing projection
+reuses the edit intersection across pages. Its SHA-256 key includes the profile
+and a direction-only native signature, so pin/provenance edits preserve routing.
+The optional `query-routing` record is qualified by the complete head; stale or
+missing records use full lineage. Routing compilation reserves 12 MiB, uses
+8 MiB bounded scratch, and caps raw frozen route data at 1 MiB. Admission or
+scratch exhaustion selects the exact indexed join instead of partial routing.
+Ordered seeks intersect only those component nodes with propagated native
+pin counts. A separate bounded per-static-component projection groups pin-bearing
+nodes by their effective roots. Its key includes the profile and qualified graph
+fingerprint (redirects, removals and pins); the direction-only routing signature
+is insufficient for membership. Warm pages read only their roots' membership,
+then use native pin-child postings to discover incident distinct pairs. Projection
+builds reuse a 2 MiB cursor/path frame and retain owned canonical memo/membership
+entries in the remaining 6 MiB of scratch; frozen data uses the same 1 MiB cap.
+Text/provenance edits preserve membership; pin or direction changes invalidate
+it. Unavailable capacity uses the exact ordered join, never partial membership.
+Unpinned reverse alias branches never become query seeds. Effective forward
+qualification preserves native override/removal precedence and handles edges
+crossing static components. Only requested and incident forward paths consume the
+same traversal allowance as the compiled path, independent of cache state.
+
+Regression qualification retains 5,000 aliases across ten graph versions with
+one profile load and 60,584 bytes of combined overlay arenas (the earlier full
+context builds used 78,581,860 bytes). A root with its own pin and no incoming
+identity takes 31 reads and four seeks at both 100 and 1,000 unrelated edits.
+Warm routing takes 12 reads and two seeks at both sizes. Redirect changes
+invalidate routing immediately, pin-only changes reuse it, and stale optional
+stamps fall back to the complete head. Two hundred randomized valid forests
+with 800 compiled/indexed comparisons return identical pin facts.
+
+A dense static component split by a native redirect returns one pair with 42
+reads and six seeks at 100, 1,000 and 10,000 pins (the 10k probe uses an
+ordered in-memory adapter); the previous warm path used
+243/2,043 reads and 107/1,007 seeks. Three pages under 44,040,230 bytes of leased
+base pressure load a new 5,000-alias profile zero times instead of three times.
+
+Both adapters share this operation. Routed queries use persistent profile-node
+postings. Lite phases capture their active immutable profile-node directory in
+a physical read snapshot, retain it only through the phase, and independently
+recheck native heads on every page plus source/schema fences before returning.
+Older
+profiles without the new optional projection use the same in-memory index until
+enrollment publishes it. Alias loading verifies the canonical stored definition
+hash while skipping unrelated policy fields. A released namespace without a
+propagated pin directory streams distinct records and qualifies endpoints until
+an authorized writer adopts that directory; it never expands reverse aliases.
+Rendering and namespaces without pins retain forward-only reads.
+
+Routed policy pages carry an immutable profile reference when the existing v10
+directory is ready. Every page checks the active profile and live logical target;
+only cache misses load and verify the full declaration. Protocol 54 qualifies
+this private reference contract; older snapshots retain inline compatibility.
+Embedded queries prepare once per resolver phase and retain the lease across
+pages. Source/schema/incarnation and namespace-head fences remain unchanged.
+Text-only pages omit alias/profile inputs and perform only native text policy
+lookups, independent of alias and pin population.
+
+The resolver consumer does not rebuild the complete static alias/suppression
+indexes after these reads. Both adapters lease the immutable configured profile,
+compose requested and incident forward paths with live native facts, and build
+only that bounded execution slice. Configured negatives stay borrowed under the
+lease; runtime suppression, pins and tombstones remain live. Query phases and
+stage restoration explicitly transfer/release their leases. Legacy source-owned
+policy retains its full cached semantics, and augmenting callbacks keep their
+configured baseline. The execution policy
+cache retains 32 MiB with byte-based LRU eviction and coalesced misses, without a
+32-profile cutoff. Ten warm phases with 10,000 aliases use 4,640 bytes of request
+arenas versus at least 35,984,100 bytes before this attachment shape.
+
+Lite final source verification uses a cached scalar declaration proof scoped to
+the selected resolver and overlapping routing siblings. It checks the live
+catalog generation under the shared catalog lock; stale proofs rebuild from
+matching declarations and structural publication discards their owning lookup.
+Warm verification copies no resolver descriptors or unrelated aliases. A 1,000
+resolver fixture with 999,000 unrelated aliases performs 1,000 warm checks with
+one proof build, replacing 59,848,688 bytes of scratch copies per fence. Only
+explicitly tracked legacy names load legacy policy. Independent source/schema,
+incarnation, authorization and native-head fences remain in force.
+
+The dense regression has 1,000 configured aliases and 1,000 unrelated pins.
+An admitted cold preparation reads those pin records in ten bounded sequential
+pages. One hundred prepared negative queries then use 400 point reads and no scans or
+unrelated rows. A text-only query uses two reads and no scans. Ten unrelated
+text edits then require zero graph rows/scans while old complete heads still
+fail validation. Thirty-three tiny profiles across 66 round-robin requests build
+33 contexts, rather than 66. The oversized native graph regression performs no primary distinct-record scans
+among 4,000 unrelated pairs. The high-degree fixture has 17,000 unpinned aliases
+and an unrelated distinct pair: fallback discovery succeeds with ten point reads
+and five seeks, instead of failing after 115,922 reads and 32,768 seeks. Embedded
+and persistent-node adapters return equal facts through redirects and removals.
+Estimated admission reclaims idle entries under a full budget and still denies
+builds whose room is occupied by active leases.
+
+Metadata maintains query fingerprints for ordinary destination tables together
+with DDL, before native curation is adopted. Their proof explicitly carries
+`native: false`; it cannot authorize a native mutation or namespace replay.
+Admission and final query verification read these small proofs plus the live
+logical binding and incarnation. Older snapshots without a proof retain the
+conservative definition hash until digest-fenced leader backfill repairs them.
+Schema and index edits update the proof atomically and invalidate older queries.
+
+Query producer projections are serialized once per distinct source artifact,
+independent of the number of referring resolvers. Declaration removal retires
+unused producer rows in the same transaction. A 1,000-resolver regression shares
+one 256 KiB producer within a bounded 64 MiB writer arena.
+
+Native resolver execution now uses topology protocol 55's opt-in complete alias
+projection. The owner composes only requested and incident paths through ready
+persistent profile nodes, so an oversized alias profile never requires a full
+compiled execution index. HTTP and Lite attach the same bounded projection;
+Lite key rendering uses the same preparation and final fences. Immutable Lite
+declaration leases retain catalog-owned bodies and precomputed SHA-256 identities
+across inference and catalog retirement. Warm admission uses 2,296 bytes at
+100,000 selected aliases, and the oversized projection regression performs ten
+phases without loading the full profile. Existing native-head, schema, binding,
+incarnation and authorization checks remain independent of these immutable
+lifetimes. See `RESOLUTION.md` for the execution and compatibility contract.
+
+HTTP resolver admission uses protocol 56 and the v11 bootstrap generation to
+return compact execution descriptors with owner-qualified static profile IDs.
+Ready queries transfer no configured alias body and perform no alias identity
+hash in the API layer. Missing native heads, enrollment or node readiness retain
+the selected descriptor fallback. Null and explicitly empty profile lists retain
+distinct legacy and qualified-inline semantics. In-flight older bootstrap jobs
+restart their cursors before v11 readiness can be published. Lite also reuses a
+single physical-owner schema digest across requests, qualified by instance,
+namespace, core, catalog and schema epochs. These optimizations do not cache
+authorization or weaken native-head and binding revalidation.
+
+Resolver query policy uses indexed configured negatives alongside bounded
+forward alias paths (see `RESOLUTION.md`). Profile-scoped key and normalized
+text lookups replace whole suppression lists in warm HTTP/Lite execution.
+Derived readiness is fenced before compact admission; inline declarations
+remain the fallback during upgrade. Publication of detached Lite work compares
+pinned native metadata-record identities, with exact content checks only for
+rewritten records, rather than rebuilding catalog hashes under writer locks.
+
+Supersession candidate byte limits select a maximal ranked prefix before output
+allocation. The renderer counts the seed/envelope and each candidate through
+the first excluded item with the same JSON writer used for emission, including
+escaping and the truncation flag. It emits one exact-size buffer, retaining no
+serialized copies of discarded suffixes. Existing retrieval truncation remains
+visible; an oversized seed is refused, and cancellation is checked while sizing
+and before emission. The 64-candidate, 64 KiB-statement regression fits into a
+256 KiB output allocator instead of retaining roughly 191 MB of JSON buffers.
+
+Ready native resolver projections use the same preparation policy in routed and
+embedded execution: complete node/seek lookups bypass full-profile graph builds,
+independent of cache residency or size estimates. Returned paths and incident
+pins remain bounded and head-fenced. Legacy source loading is confined to missing
+native readiness or explicit bulk use without a complete lookup; front-door
+queries cannot repeatedly rebuild whole alias profiles under cache pressure.
+
+Identity curation collects affected belief groups once per canonical subject,
+predicate, scope, environment, task, visibility and private owner. It deduplicates
+that group identity before scanning member claims, including when dependency
+pages repeat the same subject/object references across aliases. Suppression does
+not exclude a group from rebuilding, and private owners remain separate. The
+206-claim regression covers 412 dependency entries and seven canonical groups:
+14 raw group scans (two identity members per group), followed by the existing
+atomic belief rebuild and reconciliation. Collection no longer performs one
+whole-group traversal for every dependency. Pairwise belief reconciliation retains
+its existing semantics and work limits.
+
+Native resolver candidate-policy reads scope distinct-pin discovery by requested
+root. Owner-materialized static and curated profiles use graph-fenced durable
+membership postings. Component seeks remain an exact fallback during backfill. The shared reader does not
+rebuild a global pin projection when a cache entry exceeds its budget. Native
+owner turns bound both posting work and individual path hops. Durable walk
+cursors and canonical shortcuts avoid retaining or repeating whole configured
+paths. They publish and retire bounded pages, and a changed graph immediately
+excludes its previous postings. Metadata replay and Lite maintenance finish that
+work before marking the source binding applied. Existing full-path, visibility,
+head and final-grant fences remain independent. Legacy profiles keep exact
+fallback results while their owner generation is incomplete.
+
+Pin membership maintenance consumes bounded native edit journals. Pin edits repair
+only changed boundaries; routing edits repair affected root membership and path
+shortcuts. New edits coalesce into persistent repair queues. Unaffected roots can
+retain indexed serving under a bounded current-head proof while affected roots
+use exact fallback. A single new pair with 6,000 unrelated pins requires 13
+owner writes, rather than clearing and rebuilding the entire profile. The shared
+metadata/Lite contracts retain source, head, visibility and final grant fences.
+
+Resolver dependency projection follow-up: static consumers use shared projection
+format 5. Reverse-parent dependencies scope a leaf correction to its affected
+paths. The bounded journal maintains deduplicated key invalidations; compact
+full-SHA digests are deduplicated once and sorted before unaffected-root proofs.
+Adaptive summaries store small roots inline and larger roots in bounded sorted
+fingerprint leaves, with full-SHA verification after every positive. Reference
+counts preserve collisions during deletion. Durable ingestion and next-work
+queues preserve active repair/walk progress under unrelated edits, with one
+scratch decode per event. Configured parent guards cover masked-edge unmerge.
+Owner-built coverage includes all configured nodes and only their reachable
+native paths. A shared latest-version native-tail index fences newly incoming
+paths without copying an entire native namespace into every profile. Unreferenced
+native paths are pruned even if native declarations survive. Native memory
+identities without static consumers create neither this projection nor its
+journal. Membership backfill merge-seeks configured nodes and native pin counts,
+with resumable cursors for either sparse direction. Event and per-item lookup
+scratch have separate lifetimes, so large canonical keys do not accumulate
+throughout an event. Exact native-tail terminals reuse the shared bounded routing
+cache under profile, journal-origin and source keys. Edited routing sources are
+intersected with published and in-flight profile coverage before walking; all
+routing edits remain journaled so later connections through previously flat
+edges cannot evade the fence. Cached results retain full-SHA path dependencies
+and survive unrelated routing edits after bounded ancestry and changed-key
+validation. Actual dependency changes invalidate reuse immediately. Small-root
+summaries search the sorted change set instead of probing every changed digest
+per root, and every fingerprint hit still requires full-SHA verification.
+Fallback canonicalization decodes each hop in resettable scratch and keeps only
+bounded digest history, so valid long-key paths work with cached membership or
+streaming fallback. Source and final grant fences remain independent. These
+changes preserve projection format 5; the new journal contract advances Lite to
+reader 29, topology to 68, metadata bootstrap to v21 and Lite enrollment to v9.
+See `RESOLUTION.md` for bounded maintenance, measurements and fallback rules.
+
+Recent routing-source discovery intersects a frozen sorted digest set from the
+bounded recent journal with profile coverage. It never walks old retained source
+versions merely because a small new burst exceeds a point-lookup threshold.
+Canonical cache hits can provide validated suffix dependencies to a bounded local
+memo; membership probes binary-search the borrowed sorted dependencies without
+materializing whole cached paths, including repeated multi-entry pages.
+Accepted canonical proofs advance synchronized, compare-checked sequence/graph/
+routing checkpoints, so unrelated heads validate the new history suffix without
+replaying the entry's lifetime. The immutable paths and dependencies retain their
+existing cache ownership and accounting. No root-set, source or grant decision
+enters the shared certificate. Failed dependency/ancestry checks and barriers
+still force fallback, and older snapshots cannot overwrite newer checkpoints.
+The operation-count regressions and concurrency contracts are in `RESOLUTION.md`.
+
+Legacy native namespaces must qualify their complete base content before sharing
+native graph data. A bounded owner migration hashes stable record pages, fences
+publication on the exact head, and publishes a qualified lineage without changing
+the logical curation revision. Ordinary edits preserve an unqualified state;
+read-only queries remain exact and perform no migration writes. This also covers
+older nonzero fingerprints derived from unknown zero-fingerprint bases. The
+qualification marker and resumable work use Lite reader 29, topology 68, metadata
+bootstrap v21 and Lite enrollment v9; projection format remains 5.
+
+Immutable invalidation preparation is shared across candidate pages at the same
+qualified baseline/current head pair. It uses the existing decoded cache budget
+and lease accounting, and keeps root decisions, native masks and grants outside
+the cache. Denied admission retains exact streaming behavior. Together with
+borrowed sorted suffix dependencies, this removes repeated journal preparation
+and path-length memo fills while preserving final source and authorization fences.
+
+
+Shared resolver routing proofs also reuse immutable sorted full-SHA routing-change
+plans, including each source's latest mutation sequence, under the existing
+48-MiB decoded-profile budget. Plans are qualified by namespace ancestry and the
+exact sequence window. Recent-source discovery borrows them directly; extension
+for older terminal checkpoints uses private scratch. Root verdicts, source
+coverage, native masks and authorization remain fresh. Cache denial preserves
+bounded streaming fallback; no additional cache budget or durable format is added.
+
+
+Fresh resolver coverage uses adaptive, byte-bounded request-local pages. Dense
+intersections reuse up to 128 rows within 1 MiB of existing scratch; sparse gaps
+retain galloping seeks. Allocation exhaustion shrinks the page width rather than
+truncating matches. Pages are independent of frozen history and event I/O and do
+not survive the request. Both native point reads and scan calls are measured:
+the 128-event/20-query fixture retains 380 point reads while scans drop from
+6,480 to 280, with coverage seeks dropping from 6,340 to 140.
+
+
+Legacy qualification now preserves progress during continuous edits. A version-2
+control row tracks processed records through a bounded Antfly SHA-256 transcript;
+mutations behind the cursor fold in full old/new values and exact byte deltas,
+while later records are read at their current values. The cursor and fence update
+atomically with each native edit, without a foreground namespace scan or an
+unbounded catch-up queue. Final publication still fences the exact current head.
+Untracked cuts restart safely; historical v1 work is retired rather than trusted.
+The 256-record upgrade fixture qualifies in three owner turns under ongoing edits,
+instead of repeatedly hashing the same prefix. The durable gates are reader 29,
+topology 68, metadata bootstrap v21 and Lite enrollment v9.

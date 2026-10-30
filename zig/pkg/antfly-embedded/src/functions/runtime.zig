@@ -61,6 +61,7 @@ fn requestPayload(a: std.mem.Allocator, io: std.Io, cfg: decisions.DeciderConfig
         return .{ .body = try std.json.Stringify.valueAlloc(a, .{ .input = request.input.jsonValue(a), .questions = request.questions, .instructions = cfg.instructions }, .{}), .image_bytes = request.input.inlineImageBytes() };
     }
     if (cfg.provider == .openai) return .{ .body = try openai.requestBody(a, cfg.modelName(), request.input, request.questions), .image_bytes = request.input.inlineImageBytes() };
+    if (cfg.provider == .cloudflare) return @import("cloudflare.zig").request(a, cfg, request.input, request.questions);
     if (cfg.provider == .jev) return jev.request(a, io, cfg, request.input, request.questions);
     return .{ .body = try decisions.wireRequest(a, cfg, try request.input.requireText(), request.questions) };
 }
@@ -109,6 +110,7 @@ pub const Runtime = struct {
     context: ?execution.RequestContext = null,
     secret_store: ?*secrets.FileStore = null,
     antfly_provider: ?managed.AntflyProvider = null,
+    provider_runtime: ?*managed.ProviderRuntime = null,
     antfly_url: ?[]const u8 = null,
     antfly_api_key: ?[]const u8 = null,
     source_table: []const u8 = "",
@@ -230,6 +232,7 @@ pub const Runtime = struct {
     fn constrainedRuntime(self: *Runtime, cache: *remote_capabilities.Cache) constrained_runtime.Runtime {
         return .{ .http = self.http, .cache = cache, .options = .{
             .antfly_provider = self.antfly_provider,
+            .provider_runtime = self.provider_runtime,
             .secret_store = self.secret_store,
             .inference_api_key = self.antfly_api_key,
             .max_response_bytes = max_response_bytes,
@@ -357,25 +360,33 @@ pub const Runtime = struct {
                 self.usage = .{ .input_tokens = result.input_tokens, .output_tokens = result.output_tokens };
                 return result.values[0] orelse return result.failures[0] orelse error.InvalidDecisionOutput;
             }
+            if (cfg.embedder != null) {
+                const result = try @import("embedding_decisions.zig").batchPartial(a, self.runtime, cfg, &.{self.request});
+                self.usage = .{ .input_tokens = result.input_tokens };
+                return result.values[0] orelse return result.failures[0] orelse error.InvalidDecisionOutput;
+            }
             const payload = try requestPayload(a, self.runtime.io, cfg, self.request);
             const body = payload.body;
-            const base = if (cfg.provider == .antfly and cfg.url.len == 0) if (self.runtime.antfly_url) |endpoint| try registry_mod.gateway.apiBaseAlloc(a, endpoint) else cfg.baseUrl() else cfg.baseUrl();
-            const url = try std.fmt.allocPrint(a, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), switch (cfg.provider) {
+            const base = if (cfg.provider == .antfly and cfg.url.len == 0) if (self.runtime.antfly_url) |endpoint| try @import("../common/inference_gateway.zig").apiBaseAlloc(a, endpoint) else cfg.baseUrl() else cfg.baseUrl();
+            const url = if (cfg.provider == .cloudflare) (if (cfg.url.len != 0) cfg.url else try @import("antfly_decisions").cloudflare.endpoint(a, cfg.account_id.?, cfg.modelName())) else try std.fmt.allocPrint(a, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), switch (cfg.provider) {
                 .antfly => "/decisions",
                 .jev => "/v1/systemone",
                 .openai => "/decisions",
+                .cloudflare => unreachable,
             } });
             var key_source = try secrets.SecretValue.initConfigOrEnv(a, cfg.api_key orelse (if (cfg.provider == .antfly and cfg.url.len == 0) self.runtime.antfly_api_key else null), switch (cfg.provider) {
                 .antfly => "ANTFLY_INFERENCE_API_KEY",
                 .jev => "TYPESAFE_API_KEY",
                 .openai => "OPENAI_API_KEY",
+                .cloudflare => "CLOUDFLARE_API_TOKEN",
             });
             defer key_source.deinit(a);
             var quota = try self.runtime.limits.acquire(.{ .operation = .decision, .endpoint = .{
                 .provider = std.meta.stringToEnum(quotas.Provider, @tagName(cfg.provider)).?,
-                .endpoint = base,
+                .endpoint = if (cfg.provider == .cloudflare) url else base,
                 .model = cfg.modelName(),
                 .credentials = @import("../common/credential_source_identity.zig").fromSecretValue(key_source),
+                .gateway_id = cfg.gateway_id orelse "",
             } }, try quotas.Policy.fromConfig(cfg.rate_limit));
             defer quota.release();
             var reservation: quotas.TokenReservation = .{ .limiter = quota.limiter(), .input_tokens = try estimateInputTokens(cfg, self.request.input, payload) };
@@ -405,7 +416,7 @@ pub const Runtime = struct {
             };
             const key = key_source.resolveOwned(a, self.runtime.secret_store) catch |err| return operationalError(err);
             if (cfg.provider != .antfly and key == null) return error.MissingDecisionApiKey;
-            const headers = try a.alloc([2][]const u8, payload.headers.len + 3);
+            const headers = try a.alloc([2][]const u8, payload.headers.len + 4);
             var count: usize = 0;
             if (key) |value| {
                 headers[count] = .{ "Authorization", try std.fmt.allocPrint(a, "Bearer {s}", .{value}) };
@@ -417,6 +428,10 @@ pub const Runtime = struct {
                 headers[count] = header;
                 count += 1;
             }
+            if (cfg.provider == .cloudflare) if (cfg.gateway_id) |id| {
+                headers[count] = .{ "cf-aig-gateway-id", id };
+                count += 1;
+            };
             const source_table = if (self.request.source_table.len > 0) self.request.source_table else self.runtime.source_table;
             if (cfg.provider == .antfly and source_table.len > 0) {
                 headers[count] = .{ execution.source_table_header, source_table };
@@ -438,13 +453,15 @@ pub const Runtime = struct {
             const parsed = parseResponse(a, bytes) catch |err| return if (response.ok()) err else upstreamFailure(response.status.code);
             // Account usage before semantic output validation, including refused
             // or invalid answers for which the provider has already spent tokens.
-            self.observeUsage(&reservation, parsed);
+            const measured = if (cfg.provider == .cloudflare and parsed == .object) parsed.object.get("result") orelse parsed else parsed;
+            self.observeUsage(&reservation, measured);
             if (!response.ok()) return upstreamFailure(response.status.code);
             if (cfg.provider == .antfly) {
                 const root = try decisions.object(parsed);
                 const answers = root.get("answers") orelse return error.InvalidDecisionOutput;
                 if (answers != .array) return error.InvalidDecisionOutput;
             }
+            if (cfg.provider == .cloudflare) return @import("antfly_decisions").cloudflare.unwrap(parsed);
             return if (cfg.provider == .openai) openai.response(a, self.request.questions, parsed) else parsed;
         }
     };
@@ -496,13 +513,30 @@ pub const Runtime = struct {
         self.reserved_rows += requests.len;
         if (requests.len > 0) {
             const first = try self.registry.getDeciderConfig(requests[0].decider);
-            var compatible = first.decision_method == .generated;
+            var compatible = first.decision_method == .generated or first.embedder != null;
             const question_bytes = try std.json.Stringify.valueAlloc(a, requests[0].questions, .{});
             defer a.free(question_bytes);
             for (requests[1..]) |request| {
                 const bytes = try std.json.Stringify.valueAlloc(a, request.questions, .{});
                 defer a.free(bytes);
                 compatible = compatible and std.mem.eql(u8, request.decider, requests[0].decider) and std.mem.eql(u8, request.source_table, requests[0].source_table) and std.mem.eql(u8, bytes, question_bytes);
+            }
+            if (compatible and first.embedder != null) {
+                const partial = try @import("embedding_decisions.zig").batchPartial(a, self, first, requests);
+                self.input_tokens +|= partial.input_tokens;
+                self.batches += 1;
+                for (partial.values, partial.failures, out, failures, requests) |value, failure, *dest, *failed, request| {
+                    if (value) |response| {
+                        dest.* = response;
+                        self.rows += 1;
+                        try self.recordProvenance(request.decider, first, response);
+                    } else {
+                        const err = failure orelse error.InvalidDecisionOutput;
+                        if (!preserve_failures or fatalItemFailure(err)) return err;
+                        failed.* = err;
+                    }
+                }
+                return .{ .values = out, .failures = failures };
             }
             if (compatible) {
                 const partial = try self.generateBatchPartial(a, first, requests);
@@ -1994,4 +2028,381 @@ test "decision functions late stale responses preserve a renewed execution lease
         servers.cancel(io);
         if (server_failure) |err| return err;
     }
+}
+
+test "decision functions Cloudflare native run transport supports gateway routing and preserves measured usage" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Fixture = struct {
+        fn check(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer fixture-token", req.header("Authorization").?);
+            try std.testing.expect(req.header(execution.source_table_header) == null);
+            if (req.header("cf-aig-gateway-id")) |id| try std.testing.expectEqualStrings("gateway", id);
+            var parsed = try std.json.parseFromSlice(decisions.Json, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("clef", parsed.value.object.get("model").?.string);
+            try std.testing.expectEqualStrings("Refund?", parsed.value.object.get("questions").?.object.get("answer").?.object.get("instructions").?.string);
+            try std.testing.expect(parsed.value.object.contains("state"));
+            try std.testing.expect(!parsed.value.object.contains("messages"));
+        }
+        fn run(runtime: *Runtime, alloc: std.mem.Allocator, questions: decisions.Json, failure: *?anyerror) void {
+            const values = runtime.provider().withSourceTable("private-source").evaluateBatch(alloc, &.{.{ .input = .{ .text = "refund" }, .decider = "cloudflare", .questions = questions }}) catch |err| {
+                failure.* = err;
+                return;
+            };
+            const probability = decisions.selectResult(.ai_probability, values[0]) catch |err| {
+                failure.* = err;
+                return;
+            };
+            std.testing.expectApproxEqAbs(@as(f64, 0.9), probability.float, 1e-9) catch |err| {
+                failure.* = err;
+            };
+        }
+    };
+    for ([_]?[]const u8{ null, "gateway" }) |gateway| {
+        var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/client/v4/accounts/account/ai/run/@cf/cloudflare/clef", .assert_request = Fixture.check, .respond = .{ .body = "{\"success\":true,\"result\":{\"model\":\"clef\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}" } }});
+        defer server.deinit();
+        var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var registry = registry_mod.Registry.init(a);
+        defer registry.deinit();
+        const url = try std.fmt.allocPrint(a, "{s}/client/v4/accounts/account/ai/run/@cf/cloudflare/clef", .{server.baseUrl()});
+        defer a.free(url);
+        try registry.registerDeciderConfig("cloudflare", .{ .provider = .cloudflare, .account_id = "account", .model = "@cf/cloudflare/clef", .url = url, .api_key = "fixture-token", .gateway_id = gateway });
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var runtime = Runtime{ .registry = &registry, .http = &client, .io = io };
+        defer runtime.deinit();
+        const questions = try decisions.questionsFor(alloc, .ai_probability, &.{ .{ .string = "refund" }, .{ .string = "Refund?" }, .{ .string = "cloudflare" } });
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Fixture.run, .{ &runtime, alloc, questions, &failure });
+        try server.handleOne();
+        try group.await(io);
+        if (failure) |err| return err;
+        try std.testing.expectEqual(@as(u64, 7), runtime.input_tokens);
+        try std.testing.expectEqual(@as(u64, 1), runtime.rows);
+    }
+}
+
+test "decision provider embedding similarity batches and deduplicates named embedder prototypes" {
+    const Fake = struct {
+        calls: usize = 0,
+        texts: usize = 0,
+        tasks: [2]usize = .{ 0, 0 },
+        fn dense(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8, context: managed.EmbeddingRequestContext) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.tasks[
+                switch (context.task_type) {
+                    .clustering => @as(usize, 0),
+                    .classification => @as(usize, 1),
+                    else => return error.UnsupportedEmbeddingTaskType,
+                }
+            ] += 1;
+            self.calls += 1;
+            self.texts += texts.len;
+            const vectors = try a.alloc([]f32, texts.len);
+            for (texts, vectors) |text, *vector| vector.* = try a.dupe(f32, if (std.mem.indexOf(u8, text, "billing") != null) &.{ 0, 1 } else &.{ 1, 0 });
+            return vectors;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]managed.SparseEmbedding {
+            return error.UnexpectedCall;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake = Fake{};
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerEmbedderConfig("dense", .{ .provider = .antfly, .model = "test", .dimensions = 2 });
+    try registry.registerDeciderConfig("routing", .{ .decision_method = .embedding_similarity, .embedder = "dense", .embedding_options = .{ .dimensions = 2 } });
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.init(a, io_impl.io());
+    defer client.deinit();
+    var runtime = Runtime{ .registry = &registry, .http = &client, .io = io_impl.io(), .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = undefined, .embed_dense_texts_with_context = Fake.dense, .embed_sparse_texts = Fake.sparse } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, a,
+        \\{"route":{"type":"choice","instructions":"Choose category","criteria":{"account":"account","billing":"billing"}}}
+    , .{});
+    const request = decisions.Request{ .decider = "routing", .input = .{ .text = "account" }, .questions = questions };
+    const results = try runtime.provider().evaluateBatch(a, &.{ request, request });
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 3), fake.texts);
+    for (results) |result| {
+        const answer = result.object.get("answers").?.array.items[0];
+        try std.testing.expectEqualStrings("account", answer.object.get("choice").?.string);
+        try std.testing.expect(!answer.object.contains("probabilities"));
+    }
+    try registry.registerDeciderConfig("classification", .{ .decision_method = .embedding_similarity, .embedder = "dense", .embedding_options = .{ .dimensions = 2, .task_type = .CLASSIFICATION } });
+    const classification = decisions.Request{ .decider = "classification", .input = .{ .text = "account" }, .questions = questions };
+    const classified = try runtime.provider().evaluateBatch(a, &.{ classification, classification });
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 6), fake.texts);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1 }, &fake.tasks);
+    const classified_answer = classified[0].object.get("answers").?.array.items[0];
+    try std.testing.expectEqualStrings("account", classified_answer.object.get("choice").?.string);
+    try std.testing.expect(!std.mem.eql(u8, results[0].object.get("answers").?.array.items[0].object.get("prototype_set_hash").?.string, classified_answer.object.get("prototype_set_hash").?.string));
+    runtime.antfly_provider.?.embed_dense_texts_with_context = null;
+    try std.testing.expectError(error.UnsupportedEmbeddingTaskType, runtime.provider().evaluateBatch(a, &.{request}));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
+test "decision provider embedding similarity partial batches isolate invalid query vectors and retain usage" {
+    const Fake = struct {
+        calls: usize = 0,
+        texts: usize = 0,
+        invalid_prototypes: bool = false,
+        fn dense(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8, context: managed.EmbeddingRequestContext) ![][]f32 {
+            try std.testing.expectEqual(managed.EmbeddingTaskType.clustering, context.task_type);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.texts += texts.len;
+            const vectors = try a.alloc([]f32, texts.len);
+            for (texts, vectors) |text, *vector| vector.* = try a.dupe(f32, if ((self.invalid_prototypes and std.mem.indexOf(u8, text, "Category:") != null) or std.mem.indexOf(u8, text, "BAD_QUERY") != null) &.{ 0, 0 } else if (std.mem.indexOf(u8, text, "billing") != null) &.{ 0, 1 } else &.{ 1, 0 });
+            return vectors;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]managed.SparseEmbedding {
+            return error.UnexpectedCall;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake = Fake{};
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerEmbedderConfig("dense", .{ .provider = .antfly, .model = "test", .dimensions = 2 });
+    try registry.registerDeciderConfig("routing", .{ .decision_method = .embedding_similarity, .embedder = "dense", .embedding_options = .{ .dimensions = 2 } });
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.init(a, io_impl.io());
+    defer client.deinit();
+    var runtime = Runtime{ .registry = &registry, .http = &client, .io = io_impl.io(), .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = undefined, .embed_dense_texts_with_context = Fake.dense, .embed_sparse_texts = Fake.sparse } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, a,
+        \\{"route":{"type":"choice","instructions":"Choose category","criteria":{"account":"account","billing":"billing"}}}
+    , .{});
+    const good = decisions.Request{ .decider = "routing", .input = .{ .text = "account" }, .questions = questions };
+    const bad = decisions.Request{ .decider = "routing", .input = .{ .text = "BAD_QUERY" }, .questions = questions };
+    const result = try runtime.evaluatePartial(a, &.{ good, bad });
+    try std.testing.expect(result.values[0] != null);
+    try std.testing.expect(result.failures[0] == null);
+    try std.testing.expect(result.values[1] == null);
+    try std.testing.expectEqual(error.InvalidEmbeddingDecisionOutput, result.failures[1].?);
+    try std.testing.expectEqualStrings("account", result.values[0].?.object.get("answers").?.array.items[0].object.get("choice").?.string);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(runtime.input_tokens > 0);
+    try std.testing.expectEqual(@as(u64, 1), runtime.rows);
+    try std.testing.expectEqual(@as(u64, 1), runtime.batches);
+    const charged_before = runtime.input_tokens;
+    const reversed = try runtime.evaluatePartial(a, &.{ bad, good });
+    try std.testing.expect(reversed.values[0] == null);
+    try std.testing.expectEqual(error.InvalidEmbeddingDecisionOutput, reversed.failures[0].?);
+    try std.testing.expect(reversed.failures[1] == null);
+    const charged = reversed.values[1].?.object.get("usage").?.object.get("input_tokens").?.integer;
+    try std.testing.expectEqual(runtime.input_tokens - charged_before, @as(u64, @intCast(charged)));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    fake.invalid_prototypes = true;
+    const before_shared_failure = runtime.input_tokens;
+    const failed = try runtime.evaluatePartial(a, &.{ good, good });
+    for (failed.values, failed.failures) |value, failure| {
+        try std.testing.expect(value == null);
+        try std.testing.expectEqual(error.InvalidEmbeddingDecisionOutput, failure.?);
+    }
+    try std.testing.expect(runtime.input_tokens > before_shared_failure);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "decision provider rewriting requires completion aware local generation without altering model configuration" {
+    const Native = @import("antfly_inference_types");
+    const Fake = struct {
+        native_calls: usize = 0,
+        json_calls: usize = 0,
+        fn text(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const Native.ChatMessage, opts: Native.GenerationOptions, _: execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.native_calls += 1;
+            try std.testing.expectEqual(@as(i32, 1), opts.max_tokens);
+            return a.dupe(u8, "partial");
+        }
+        fn json(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.json_calls += 1;
+            return a.dupe(u8, "{\"choices\":[{\"message\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}");
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var registry = try registry_mod.Registry.parseFromSlice(a,
+        \\{"generators":{"chat":{"provider":"antfly","model":"local","max_tokens":1}},"rewriters":{"clean":{"generator":"chat"}}}
+    );
+    defer registry.deinit();
+    var fake = Fake{};
+    var http = httpx.Client.init(a, std.testing.io);
+    defer http.deinit();
+    const executor = @import("../common/inference_tasks.zig").Executor{
+        .view = .{ .providers = &registry },
+        .http = &http,
+        .context = .{ .io = std.testing.io, .deadline_ns = null },
+        .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_messages_with_context = Fake.text, .generate_json = Fake.json },
+    };
+    try std.testing.expectError(error.InferenceOutputIncomplete, executor.rewrite(a, "clean", "rewriters/clean", &.{"a long input"}));
+    try std.testing.expectEqual(@as(usize, 0), fake.native_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.json_calls);
+    var legacy = executor;
+    legacy.antfly_provider.?.generate_json = null;
+    try std.testing.expectError(error.UnsupportedInferenceFeature, legacy.rewrite(a, "clean", "rewriters/clean", &.{"a long input"}));
+    try std.testing.expectEqual(@as(usize, 0), fake.native_calls);
+}
+
+test "decision provider materialized named embedders use frozen dependencies and preserve batch failures" {
+    const Fake = struct {
+        calls: usize = 0,
+        texts: usize = 0,
+        fn dense(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8, context: managed.EmbeddingRequestContext) ![][]f32 {
+            try std.testing.expectEqual(managed.EmbeddingTaskType.clustering, context.task_type);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.texts += texts.len;
+            const vectors = try a.alloc([]f32, texts.len);
+            for (texts, vectors) |text, *vector| vector.* = try a.dupe(f32, if (std.mem.indexOf(u8, text, "BAD_QUERY") != null) &.{ 0, 0 } else if (std.mem.indexOf(u8, text, "billing") != null) &.{ 0, 1 } else &.{ 1, 0 });
+            return vectors;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]managed.SparseEmbedding {
+            return error.UnexpectedCall;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake = Fake{};
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.init(a, io_impl.io());
+    defer client.deinit();
+    const Assets = @import("../asset_producer_runtime.zig").Runtime;
+    var assets = Assets.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = &fake, .owns_invocation_admission = true, .embed_dense_texts = undefined, .embed_dense_texts_with_context = Fake.dense, .embed_sparse_texts = Fake.sparse } });
+    defer assets.deinit();
+    const spec =
+        \\{"version":"v1","decider":{"decision_method":"embedding_similarity","embedder":"dense","embedding_options":{"dimensions":2}},"embedders":{"dense":{"provider":"antfly","model":"test","dimensions":2}},"questions":[{"name":"route","type":"choice","instructions":"Choose category","choices":[{"value":"account","description":"account"},{"value":"billing","description":"billing"}]}]}
+    ;
+    const Request = @import("../storage/db/enrichment/asset_producer.zig").Request;
+    const good = Request{ .producer_type = .decision, .config_json = spec, .source_text = "account", .item_id = "good" };
+    const bad = Request{ .producer_type = .decision, .config_json = spec, .source_text = "BAD_QUERY", .item_id = "bad" };
+    var result = try assets.producer().produceBatchReported(a, &.{ good, bad });
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 4), fake.texts);
+    const valid = try std.json.parseFromSliceLeaky(decisions.Json, a, result.items[0].result.value, .{});
+    try std.testing.expectEqualStrings("account", valid.object.get("answers").?.array.items[0].object.get("choice").?.string);
+    try std.testing.expectEqual(error.InvalidEmbeddingDecisionOutput, result.items[1].result.item_error.cause);
+    const provenance = valid.object.get("provenance").?.object;
+    const first_hash = provenance.get("specification_hash").?.string;
+    const snapshot = try @import("materialization.zig").parse(a, spec);
+    defer snapshot.deinit();
+    try snapshot.value.embedders.object.getPtr("dense").?.object.put(a, "model", .{ .string = "new-model" });
+    const changed = try @import("materialization.zig").provenance(a, snapshot.value, null);
+    try std.testing.expect(!std.mem.eql(u8, first_hash, changed.object.get("specification_hash").?.string));
+    const missing =
+        \\{"version":"v1","decider":{"decision_method":"embedding_similarity","embedder":"dense","embedding_options":{"dimensions":2}},"questions":[{"name":"route","type":"choice","instructions":"Route","choices":[{"value":"a"},{"value":"b"}]}]}
+    ;
+    try std.testing.expectError(error.UnknownEmbedder, @import("materialization.zig").parse(a, missing));
+}
+
+test "decision provider asset pool preserves the whole request ceiling" {
+    const a = std.testing.allocator;
+    const Assets = @import("../asset_producer_runtime.zig").Runtime;
+    const owned = try Assets.createOwned(a, std.testing.io, .{});
+    defer {
+        owned.deinit();
+        a.destroy(owned);
+    }
+    try std.testing.expectEqual(@as(u64, 300000), owned.http.config.timeouts.request_ms);
+    try std.testing.expectEqual(@as(u64, 300000), owned.http.config.timeouts.read_ms);
+    const request = @import("../storage/db/enrichment/asset_producer.zig").Request{
+        .producer_type = .decision,
+        .source_text = "hello",
+        .config_json = "{\"version\":\"v1\",\"decider\":{\"provider\":\"openai\",\"model\":\"m\"},\"questions\":[{\"name\":\"p\",\"type\":\"predicate\",\"instructions\":\"Yes?\"}]}",
+    };
+    try std.testing.expect(try owned.ownedProducer().foregroundBoundedForRequests(a, &.{request}));
+}
+
+test "decision provider remote frozen embedder ignores unrelated native admission" {
+    const a = std.testing.allocator;
+    const Assets = @import("../asset_producer_runtime.zig").Runtime;
+    const Fake = struct {
+        fn decide(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?execution.RequestContext) ![]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var http = httpx.Client.init(a, std.testing.io);
+    defer http.deinit();
+    var linked = Assets.initWithOptions(a, &http, .{ .antfly_provider = .{
+        .ptr = undefined,
+        .embed_dense_texts = undefined,
+        .embed_sparse_texts = undefined,
+        .decide_json = Fake.decide,
+    } });
+    defer linked.deinit();
+    const specification =
+        \\{"version":"v1","decider":{"decision_method":"embedding_similarity","embedder":"cf-text","embedding_options":{"dimensions":768}},"embedders":{"cf-text":{"provider":"cloudflare","account_id":"account","model":"@cf/baai/bge-base-en-v1.5","dimensions":768}},"questions":[{"name":"route","type":"choice","instructions":"Route","choices":[{"value":"a"},{"value":"b"}]}]}
+    ;
+    const request = @import("../storage/db/enrichment/asset_producer.zig").Request{
+        .producer_type = .decision,
+        .source_text = "hello",
+        .config_json = specification,
+    };
+    const linked_plan = try linked.producer().invocationMemoryForRequests(a, &.{request});
+    try std.testing.expectEqual(@import("antfly_inference_work").InvocationAllocatorOwner.caller, linked_plan.allocator_owner);
+    try std.testing.expect(try linked.ownedProducer().foregroundBoundedForRequests(a, &.{request}));
+    var remote = Assets.init(a, &http);
+    defer remote.deinit();
+    const plan = try remote.producer().invocationMemoryForRequests(a, &.{request});
+    try std.testing.expectEqual(@import("antfly_inference_work").InvocationAllocatorOwner.caller, plan.allocator_owner);
+    try std.testing.expectEqual(plan, linked_plan);
+    const native_specification = try std.mem.replaceOwned(u8, a, specification, "\"provider\":\"cloudflare\",\"account_id\":\"account\"", "\"provider\":\"antfly\"");
+    defer a.free(native_specification);
+    var native_request = request;
+    native_request.config_json = native_specification;
+    try std.testing.expectError(error.InferenceInvocationMemoryUnavailable, linked.producer().invocationMemoryForRequests(a, &.{native_request}));
+    try std.testing.expect(!try linked.ownedProducer().foregroundBoundedForRequests(a, &.{native_request}));
+    linked.inference_api_url = "https://remote-inference.example";
+    const routed_plan = try linked.producer().invocationMemoryForRequests(a, &.{native_request});
+    try std.testing.expectEqual(@import("antfly_inference_work").InvocationAllocatorOwner.caller, routed_plan.allocator_owner);
+    try std.testing.expect(try linked.ownedProducer().foregroundBoundedForRequests(a, &.{native_request}));
+}
+
+test "decision provider asset transport enforces default request timeout without a caller deadline" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const owned = try @import("../asset_producer_runtime.zig").Runtime.createOwned(a, io, .{});
+    defer {
+        owned.deinit();
+        a.destroy(owned);
+    }
+    // Shorten the production ceiling for the fixture; a missing ceiling stays
+    // disabled and this test receives a successful response instead of Timeout.
+    owned.http.config.timeouts.request_ms = @min(owned.http.config.timeouts.request_ms, 50);
+    owned.http.config.retry_policy.max_retries = 0;
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .GET, .path = "/slow", .respond = .{ .body = "ok", .delay_ns = 250 * std.time.ns_per_ms } }});
+    defer server.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/slow", .{server.baseUrl()});
+    defer a.free(url);
+    const Fixture = struct {
+        fn serve(s: *httpx.TestServer) void {
+            s.handleOne() catch {};
+        }
+    };
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fixture.serve, .{&server});
+    try std.testing.expectError(error.Timeout, owned.http.get(url, .{}));
 }

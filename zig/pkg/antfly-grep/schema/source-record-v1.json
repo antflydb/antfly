@@ -34,7 +34,7 @@
     "provider": {
       "enum": [
         "github",
-        "google_drive",
+        "google_drive", "google_workspace", "slack", "discord",
         "gcs",
         "s3"
       ]

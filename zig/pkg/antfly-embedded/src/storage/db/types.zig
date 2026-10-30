@@ -1955,6 +1955,14 @@ pub const SearchRequest = struct {
     /// Immutable local projection borrowed until synchronous search completion.
     /// Never serialized or populated by a public request.
     document_projection_plan: ?@import("document_query.zig").BorrowedSpanProjection = null,
+    /// Normalized final projection, owning selected source paths, expressions
+    /// and data parameters. Pure output does not affect retrieval membership.
+    field_projection_json: []const u8 = "",
+    /// Request-owned immutable IR, borrowed only while its exact input remains
+    /// live. Never serialized; created locally after expression validation.
+    field_projection_plan: ?@import("../../api/field_projection.zig").BorrowedPlan = null,
+    /// Trusted private worker delivery, never accepted at public ingress.
+    field_projection_transport: bool = false,
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
@@ -1994,6 +2002,10 @@ pub const SearchRequest = struct {
     /// Strict score pruning only: equal scores retain their global tie chance.
     /// Never populated from public JSON or forwarded to count-only execution.
     minimum_competitive_score: ?f32 = null,
+    /// Borrowed coordinator winners in this request's sort domain. Native
+    /// ordered producers prune strictly worse primary tuples, retaining public
+    /// identity ties and exact bitmap totals. Never accepted from public JSON.
+    competitive_sort_boundary: []const std.json.Value = &.{},
     lake_read: ?struct {
         visibility: enum { accepted, published } = .accepted,
         through: ?struct { table_id: u64, object_generation: u64, wal_lsn: u64 } = null,
@@ -2135,6 +2147,10 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    // Conditional delivery runs after child authorization and retrieval.
+    "field_projection_json",
+    "field_projection_plan",
+    "field_projection_transport",
     "value_search_work",
     "value_search_scope",
     "document_authority_mode",
@@ -2226,6 +2242,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "require_algebraic_filter_resolution",
     "distributed_text_stats",
     "minimum_competitive_score",
+    "competitive_sort_boundary",
     "text_navigation_plan",
     "text_pattern_programs",
     "text_pattern_membership",
@@ -2660,10 +2677,21 @@ pub const GraphMetricRerankScoreDetails = struct {
 pub const ColumnSource = @import("column_source.zig").Row;
 pub const ColumnSourcePage = @import("column_source.zig").Page;
 
+/// Producer receipt for normalized, publicly projected JSON. This is local
+/// execution evidence, never a document-access grant or a wire input. Its bytes
+/// remain owned by SearchHit; replacement or transport serialization retires it.
+pub const FinalizedSource = struct {
+    bytes: []const u8,
+    pub fn matches(self: @This(), bytes: []const u8) bool {
+        return self.bytes.ptr == bytes.ptr and self.bytes.len == bytes.len;
+    }
+};
+
 pub const SearchHit = struct {
     /// Owned internal selection proof; absent on ordinary/public results.
     document_authority: ?*const @import("query/document_authority.zig").Authority = null,
     computed_json: ?[]u8 = null,
+    computed_receipt: ?*@import("../../api/field_projection.zig").Receipt = null,
     id: []u8,
     /// Internal graph-hydration namespace. Null means the query's source
     /// table. This is not serialized as part of the public search-hit shape.
@@ -2679,6 +2707,8 @@ pub const SearchHit = struct {
     index_scores: []fusion_mod.IndexScore = &.{},
     sort_values: []std.json.Value = &.{},
     stored_data: ?[]u8 = null,
+    /// Storage-certified final source extent; owned and never caller metadata.
+    finalized_source: ?FinalizedSource = null,
     /// Owned typed source for providers that hydrate after source-dependent
     /// ranking/filtering. Highlighting and public projection consume this
     /// directly; encoding happens once at the response boundary. Providers
@@ -2700,6 +2730,7 @@ pub const SearchHit = struct {
             alloc.free(cloned.id);
             if (cloned.document_authority) |proof| alloc.destroy(proof);
             if (cloned.computed_json) |data| alloc.free(data);
+            if (cloned.computed_receipt) |receipt| alloc.destroy(receipt);
             if (cloned.source_table) |table| alloc.free(table);
             if (cloned.score_details) |*details| details.deinit(alloc);
             freeIndexScores(alloc, cloned.index_scores);
@@ -2718,6 +2749,13 @@ pub const SearchHit = struct {
             cloned.document_authority = owned;
         }
         cloned.computed_json = if (self.computed_json) |data| try alloc.dupe(u8, data) else null;
+        if (self.computed_receipt) |receipt| if (self.computed_json) |previous| {
+            if (cloned.computed_json) |bytes| if (receipt.afterCopy(previous, bytes)) |value| {
+                const owned = try alloc.create(@import("../../api/field_projection.zig").Receipt);
+                owned.* = value;
+                cloned.computed_receipt = owned;
+            };
+        };
         cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
         cloned.doc_ordinal = self.doc_ordinal;
         cloned.native_text_doc_id = self.native_text_doc_id;
@@ -2727,6 +2765,11 @@ pub const SearchHit = struct {
         cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
         cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
+        if (self.finalized_source) |receipt| if (self.stored_data) |previous| {
+            if (receipt.matches(previous)) {
+                if (cloned.stored_data) |bytes| cloned.finalized_source = .{ .bytes = bytes };
+            }
+        };
         cloned.source_value = if (self.source_value) |value| try cloneJsonValue(alloc, value) else null;
         cloned.column_source = if (self.column_source) |source| try source.cloneInto(alloc) else null;
         cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
@@ -2750,10 +2793,21 @@ pub const SearchHit = struct {
         return cloned;
     }
 
+    pub fn clearSource(self: *SearchHit, alloc: Allocator) void {
+        if (self.stored_data) |data| alloc.free(data);
+        if (self.source_value) |*value| deinitJsonValue(alloc, value);
+        if (self.column_source) |source| source.deinit();
+        self.stored_data = null;
+        self.finalized_source = null;
+        self.source_value = null;
+        self.column_source = null;
+    }
+
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.document_authority) |proof| alloc.destroy(proof);
         if (self.computed_json) |data| alloc.free(data);
+        if (self.computed_receipt) |receipt| alloc.destroy(receipt);
         if (self.source_table) |table| alloc.free(table);
         if (self.score_details) |*details| details.deinit(alloc);
         freeIndexScores(alloc, self.index_scores);
@@ -3537,6 +3591,22 @@ pub const ReplayStageStats = struct {
     blocked: bool = false,
     blocked_reason: []const u8 = "",
     error_count: u64 = 0,
+};
+
+/// Selective replay proof; no unrelated index or maintenance health is read.
+pub const ResolverReplayObservation = struct {
+    backfill_pending: bool = false,
+    empty: bool = false,
+    resolution: ReplayStageStats = .{},
+    promotion: ReplayStageStats = .{},
+    pub fn applied(self: @This(), promote: bool) bool {
+        const curation = @import("resolver_curation.zig");
+        return !self.backfill_pending and curation.stageApplied(self.resolution, self.empty) and (!promote or curation.stageApplied(self.promotion, self.empty));
+    }
+    pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        a.free(self.resolution.blocked_reason);
+        a.free(self.promotion.blocked_reason);
+    }
 };
 
 pub const ResolverReplayDiagnostic = struct {

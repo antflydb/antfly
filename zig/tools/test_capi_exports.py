@@ -22,7 +22,6 @@ import os
 from pathlib import Path
 import platform
 import shutil
-import signal
 import subprocess
 import tempfile
 import sys
@@ -37,31 +36,10 @@ exports = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(exports)
 
 
-def run_fixture_build(command, cwd, timeout=300):
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        env={**os.environ, "ZIG_LOCAL_CACHE_DIR": str(cwd / ".zig-cache")},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=os.name == "posix",
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except BaseException:
-        # Stop the owned compiler group before fixture cleanup removes files
-        # its children still use. Killing only the runner leaves those alive.
-        if os.name == "posix":
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        elif process.poll() is None:
-            process.kill()
-        process.communicate()
-        raise
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+try:
+    from .fixture_process import run_fixture_build
+except ImportError:
+    from fixture_process import run_fixture_build
 
 
 class ExportPolicyTests(unittest.TestCase):
@@ -584,7 +562,9 @@ antfly_error_code antfly_open_options_init(antfly_open_options *);
         source = self.root / "api.c"
         source.write_text("""
 #include "antfly.h"
-uint32_t antfly_abi_version(void) { return 1; }
+extern uint32_t release_value(void);
+static __attribute__((noinline)) uint32_t private_api_root(void) { return release_value(); }
+uint32_t antfly_abi_version(void) { return private_api_root(); }
 int antfly_open_options_init(antfly_open_options *options) { options->size = sizeof(*options); return 0; }
 int antfly_private(void) { return 7; }
 int termite_metal_buffer_alloc(void) { return 8; }
@@ -593,6 +573,16 @@ int termite_metal_buffer_alloc(void) { return 8; }
         cc = shutil.which("clang") or shutil.which("cc")
         subprocess.run(
             [cc, "-fPIC", "-c", str(source), "-o", str(object_file)], check=True
+        )
+        # This final-image object is absent from the provider archive.
+        metadata_source = self.root / "metadata.c"
+        metadata_source.write_text(
+            "#include <stdint.h>\nuint32_t release_value(void) { return 1; }\n"
+        )
+        metadata_object = self.root / "metadata.o"
+        subprocess.run(
+            [cc, "-fPIC", "-c", str(metadata_source), "-o", str(metadata_object)],
+            check=True,
         )
         macho = platform.system() == "Darwin"
         fmt = "macho" if macho else "elf"
@@ -609,19 +599,25 @@ int termite_metal_buffer_alloc(void) { return 8; }
             subprocess.run(
                 ["xcrun", "ar", "rcs", str(archive), str(object_file)], check=True
             )
-            exports.link_macho(
-                argparse.Namespace(
-                    sdk=sdk,
-                    linker="/usr/bin/ld",
-                    arch="arm64" if platform.machine() == "arm64" else "x86_64",
-                    deployment="11.0",
-                    exports=manifest,
-                    output=library,
-                    map=self.root / "library.map",
-                    archive=archive,
-                    link_args=[str(object_file)],
+            for strip in (False, True):
+                exports.link_macho(
+                    argparse.Namespace(
+                        strip=strip,
+                        sdk=sdk,
+                        linker="/usr/bin/ld",
+                        arch="arm64" if platform.machine() == "arm64" else "x86_64",
+                        deployment="11.0",
+                        exports=manifest,
+                        output=library,
+                        map=self.root / "library.map",
+                        archive=archive,
+                        objects=[metadata_object],
+                        link_args=[str(object_file), str(metadata_object)],
+                    )
                 )
-            )
+                symbols = subprocess.check_output(["nm", str(library)], text=True)
+                self.assertEqual("_private_api_root" in symbols, not strip)
+                exports.check(self.header, library, fmt)
             self.assertIn(
                 "_antfly_abi_version",
                 (self.root / "library.map").read_text(errors="replace"),
@@ -632,6 +628,7 @@ int termite_metal_buffer_alloc(void) { return 8; }
                     cc,
                     "-shared",
                     str(object_file),
+                    str(metadata_object),
                     "-Xlinker",
                     "--version-script",
                     "-Xlinker",
