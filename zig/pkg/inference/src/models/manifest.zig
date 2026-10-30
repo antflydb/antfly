@@ -1663,18 +1663,30 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
         defer allocator.free(at_bytes);
         try ignoreNonResourceMetadataError(parseAddedTokens(&manifest, at_bytes));
     }
-    // Small tokenizer metadata may declare marker IDs. Ettin lists strings
-    // only, so discovery falls back to tokenizer.json when IDs are missing.
     if (manifest.gliner_classification_head == .label_marker_mlp or manifest.gliner_specialty_profile != null) {
+        // Preserve small-sidecar token metadata and its validation; only the
+        // vocabulary-sized fallback is unnecessary for exact specialty profiles.
         if (try catalog.readOptional("tokenizer_config.json")) |tokenizer_config_bytes| {
             defer allocator.free(tokenizer_config_bytes);
             try parseTokenizerConfig(&manifest, allocator, tokenizer_config_bytes);
         }
-        // TokenizersBackend checkpoints (including Decide-1B) list marker
-        // names in tokenizer_config.json without their numeric IDs. Listing
-        // validation still needs the exact [L]/[SEP_STRUCT] contract, so scan
-        // tokenizer.json only when the small sidecar could not supply it.
-        if (manifest.gliner_token_l == 0 or manifest.gliner_token_sep_struct == 0) {
+        if (manifest.gliner_specialty_profile) |profile| {
+            // Discovery uses tokenizer-derived markers sealed in the exact
+            // config profile. Do not read a 16MB/8MB vocabulary merely to recover
+            // seven IDs on each request. No consumed tokenizer digest is set:
+            // full loading still reads actual bytes/markers and live admission
+            // authenticates the complete identity before execution.
+            const markers = specialty_qualification.artifacts[@backingInt(profile)].markers;
+            manifest.gliner_token_p = markers.p;
+            manifest.gliner_token_c = markers.c;
+            manifest.gliner_token_e = markers.e;
+            manifest.gliner_token_r = markers.r;
+            manifest.gliner_token_l = markers.l;
+            manifest.gliner_token_sep_struct = markers.sep_struct;
+            manifest.gliner_token_sep_text = markers.sep_text;
+        } else if (manifest.gliner_token_l == 0 or manifest.gliner_token_sep_struct == 0) {
+            // Modern span checkpoints still derive discovery markers from
+            // tokenizer metadata; they have no specialty compatibility profile.
             const tokenizer_bytes = try catalog.readOptional("tokenizer.json") orelse return error.InvalidModelManifest;
             defer allocator.free(tokenizer_bytes);
             try parseTokenizerJsonSpecialTokens(&manifest, allocator, tokenizer_bytes);
@@ -8661,6 +8673,67 @@ test "specialty canonical managed declarations pass extraction dispatch without 
         defer loaded_manifest.deinit();
         try std.testing.expectEqual(profile, loaded_manifest.gliner_specialty_profile.?);
         try std.testing.expect(!loaded_manifest.isGlinerDecisionModel());
+    }
+}
+
+test "specialty listing avoids full tokenizer reads without authenticating execution" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    inline for (.{ specialty_qualification.Profile.pii, specialty_qualification.Profile.gliguard }) |profile| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "encoder_config");
+        inline for (.{ "config.json", "encoder_config/config.json", "tokenizer_config.json" }) |name| {
+            const bytes = try fixtures.fixtureBytes(a, "specialty/" ++ @tagName(profile) ++ "/" ++ name);
+            defer a.free(bytes);
+            try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+        }
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "" });
+        const artifact = specialty_qualification.artifacts[@backingInt(profile)];
+        // A sparse, non-JSON vocabulary at the original artifact size makes
+        // accidental vocabulary reading/parsing observable without allocating
+        // or writing a real model-sized fixture. All listing allocations must
+        // fit well below either tokenizer's size.
+        const tokenizer_file = try tmp.dir.createFile(io, "tokenizer.json", .{});
+        try tokenizer_file.setLength(io, artifact.tokenizer.size_bytes);
+        tokenizer_file.close(io);
+        const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(path);
+        var storage: [512 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&storage);
+        var listing = try loadListingFromDir(bounded.allocator(), path);
+        defer listing.deinit();
+        try std.testing.expectEqual(profile, listing.gliner_specialty_profile.?);
+        inline for (.{ "p", "c", "e", "r", "l", "sep_struct", "sep_text" }) |name| {
+            try std.testing.expectEqual(@field(artifact.markers, name), @field(listing, "gliner_token_" ++ name));
+        }
+        try std.testing.expect(listing.gliner_span_tokenizer_digest == null);
+        try std.testing.expect(!listing.gliner_span_declared);
+        try std.testing.expect(!listing.isGlinerDecisionModel());
+
+        // Listing constants must never replace the actual consumed tokenizer
+        // in the full loader or live artifact-identity gate.
+        const changed_tokenizer = "{\"added_tokens\":[{\"id\":17,\"content\":\"[L]\"}]}";
+        try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = changed_tokenizer });
+        var full = try loadFromDir(a, path);
+        defer full.deinit();
+        try std.testing.expectEqual(@as(i32, 17), full.gliner_token_l);
+        try std.testing.expectEqualDeep(boundary_bundle.Digest.of(changed_tokenizer), full.gliner_span_tokenizer_digest.?);
+        var identity = specialty_qualification.pinnedIdentity(profile);
+        identity.sidecars.tokenizer = full.gliner_span_tokenizer_digest.?;
+        try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, specialty_qualification.require(identity));
+
+        // Recognition is content-based on every listing, never a pathname
+        // cache that survives changing the config under the same directory.
+        const changed_config = try fixtures.fixtureBytes(a, "specialty/" ++ @tagName(profile) ++ "/config.json");
+        defer a.free(changed_config);
+        changed_config[std.mem.indexOf(u8, changed_config, "5.").?] = '6';
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = changed_config });
+        var drifted = try loadListingFromDir(a, path);
+        defer drifted.deinit();
+        try std.testing.expect(drifted.gliner_specialty_profile == null);
+        try std.testing.expectEqual(@as(i32, 0), drifted.gliner_token_l);
     }
 }
 

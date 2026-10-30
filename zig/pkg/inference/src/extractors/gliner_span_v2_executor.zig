@@ -41,6 +41,7 @@ const decide = decision_api.legacy;
 const observation = @import("extraction_observer.zig");
 const CT = compute.CT;
 const document = @import("../pipelines/gliner_boundary_long_document.zig");
+const specialty_qualification = @import("../models/gliner_specialty_qualification.zig");
 
 pub const Options = struct {
     modern_span_extraction: bool = false,
@@ -436,7 +437,12 @@ pub fn prepareItem(allocator: Allocator, tokenizer: Tokenizer, item: *const wire
     }
     if (item.options.long_document.mode == .window) return @import("gliner_span_long_executor.zig").prepare(allocator, tokenizer, item, processor_options, options);
     const classifications = item.compiled.schema.classifications;
-    if (item.compiled.schema.entities.len != 0 or item.compiled.schema.relations.len != 0) {
+    const split_budget = if (options.specialty_profile != null) 0 else options.max_prompt_tokens;
+    // Disabled splitting needs only the final composed prompt. Measuring every
+    // task separately would repeat tokenization without affecting its range.
+    if (item.compiled.schema.entities.len != 0 or item.compiled.schema.relations.len != 0 or
+        (classifications.len != 0 and split_budget == 0))
+    {
         const batches = try allocator.alloc(processor.PreparedBatch, 1);
         errdefer allocator.free(batches);
         batches[0] = try processor.prepare(allocator, tokenizer, &.{.{ .text = item.text, .schema = &item.compiled }}, bounded_processor_options);
@@ -447,7 +453,7 @@ pub fn prepareItem(allocator: Allocator, tokenizer: Tokenizer, item: *const wire
     }
     var lengths = try PromptLengths.init(allocator, tokenizer, item, processor_options);
     defer lengths.deinit(allocator);
-    const ranges = try planTaskRanges(allocator, classifications.len, if (options.specialty_profile != null) 0 else options.max_prompt_tokens, &lengths, PromptLengths.measure);
+    const ranges = try planTaskRanges(allocator, classifications.len, split_budget, &lengths, PromptLengths.measure);
     errdefer allocator.free(ranges);
     if (ranges.len > options.max_sequences_per_item) return error.ExtractionSchemaLimitExceeded;
     const batches = try allocator.alloc(processor.PreparedBatch, ranges.len);
@@ -583,7 +589,10 @@ pub fn plannedDeviceScratchUpperBound(config: EncoderConfig, request: *const wir
             head_peak = @max(head_peak, try std.math.mul(usize, 2 * @sizeOf(f32), elements));
         }
     }
-    return std.math.add(usize, encoder, try std.math.mul(usize, head_peak, classificationBatchItems(request, request_plan, options)));
+    const activations = try std.math.add(usize, encoder, try std.math.mul(usize, head_peak, classificationBatchItems(request, request_plan, options)));
+    // All GEMMs and physical chunks share one workspace under the model's
+    // execution lock. Reserve it once, rather than multiplying by batch size.
+    return std.math.add(usize, activations, if (options.specialty_profile != null) specialty_qualification.cuda_matmul_workspace_bytes else 0);
 }
 
 /// DeBERTa span checkpoints retain their established request ceiling. A
@@ -1406,6 +1415,95 @@ test "gliner specialty profiles restrict tasks and preserve overlap omission" {
     try std.testing.expectError(error.UnsupportedGlinerSpanV2Task, preflight(&guard, .{ .specialty_profile = .pii }));
 }
 
+test "gliner span v2 disabled task splitting prepares only the composed prompt" {
+    const CountingTokenizer = struct {
+        preparations: usize = 0,
+        invalid_marker: bool = false,
+        const names = [_][]const u8{ "[P]", "[C]", "[E]", "[R]", "[L]", "[SEP_STRUCT]", "[SEP_TEXT]", "[DESCRIPTION]", "[EXAMPLE]", "[OUTPUT]" };
+        fn tokenizer(self: *@This()) Tokenizer {
+            return .{ .ptr = self, .vtable = &.{
+                .encode = encode,
+                .encodeInto = encodeInto,
+                .encodeForModel = undefined,
+                .encodeGeneration = undefined,
+                .decode = undefined,
+                .specialTokens = specialTokens,
+                .allSpecialTokenIds = specialIds,
+                .vocabSize = vocabSize,
+                .deinit = undefined,
+            } };
+        }
+        fn encode(raw: *anyopaque, allocator: Allocator, text: []const u8) ![]i32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, text, names[0])) self.preparations += 1;
+            for (names, 0..) |name, i| if (std.mem.eql(u8, text, name)) {
+                const ids = try allocator.alloc(i32, 1);
+                ids[0] = if (self.invalid_marker) 1 else @intCast(300 + i);
+                return ids;
+            };
+            const ids = try allocator.alloc(i32, text.len);
+            for (text, ids) |byte, *id| id.* = @as(i32, byte) + 10;
+            return ids;
+        }
+        fn encodeInto(raw: *anyopaque, allocator: Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) !void {
+            const ids = try encode(raw, allocator, text);
+            defer allocator.free(ids);
+            try out.appendSlice(allocator, ids);
+        }
+        fn specialTokens(_: *anyopaque) @import("inference_tokenizer").SpecialTokens {
+            return .{ .unk_id = 1 };
+        }
+        fn specialIds(_: *anyopaque, allocator: Allocator) ![]u32 {
+            const ids = try allocator.alloc(u32, names.len);
+            for (ids, 0..) |*id, i| id.* = @intCast(300 + i);
+            return ids;
+        }
+        fn vocabSize(_: *anyopaque) usize {
+            return 512;
+        }
+    };
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"guard","schema":{"classifications":[{"name":"one","labels":["yes","no"]},{"name":"two","labels":["yes","no"]},{"name":"three","labels":["yes","no"]},{"name":"four","labels":["yes","no"]},{"name":"five","labels":["yes","no"]},{"name":"six","labels":["yes","no"]}]},"inputs":[{"content":"hello world"}]}
+    , .{});
+    defer request.deinit();
+    const item = &request.items[0];
+    var tokenizer = CountingTokenizer{};
+    var direct = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = item.text, .schema = &item.compiled }}, .{});
+    defer direct.deinit();
+    const expected = direct.samples[0];
+    inline for (.{ Options{ .max_prompt_tokens = 0 }, Options{ .specialty_profile = .gliguard } }) |options| {
+        tokenizer.preparations = 0;
+        var prepared = try prepareItem(a, tokenizer.tokenizer(), item, .{}, options);
+        defer prepared.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), tokenizer.preparations);
+        try std.testing.expectEqual(@as(usize, 1), prepared.ranges.len);
+        try std.testing.expectEqual(TaskRange{ .start = 0, .end = 6 }, prepared.ranges[0]);
+        try std.testing.expectEqualSlices(i64, expected.input_ids, prepared.batches[0].samples[0].input_ids);
+        const actual = prepared.batches[0].samples[0];
+        try std.testing.expectEqual(expected.classification_labels.len, actual.classification_labels.len);
+        for (expected.classification_labels, actual.classification_labels) |want, got| {
+            try std.testing.expectEqual(want.marker_index, got.marker_index);
+            try std.testing.expectEqual(want.group_index, got.group_index);
+            try std.testing.expectEqual(want.schema_index, got.schema_index);
+            try std.testing.expectEqual(want.label_index, got.label_index);
+            try std.testing.expectEqualStrings(want.name, got.name);
+        }
+        var limited: processor.Options = .{};
+        limited.max_sequence_tokens = expected.input_ids.len - 1;
+        try std.testing.expectError(error.BoundarySequenceLimitExceeded, prepareItem(a, tokenizer.tokenizer(), item, limited, options));
+        tokenizer.invalid_marker = true;
+        try std.testing.expectError(error.InvalidGlinerBoundaryTokenizer, prepareItem(a, tokenizer.tokenizer(), item, .{}, options));
+        tokenizer.invalid_marker = false;
+    }
+    // Enabled splitting retains its measured-length path.
+    tokenizer.preparations = 0;
+    var measured = try prepareItem(a, tokenizer.tokenizer(), item, .{}, .{ .max_prompt_tokens = 512 });
+    defer measured.deinit(a);
+    try std.testing.expectEqual(@as(usize, 9), tokenizer.preparations);
+    try std.testing.expectEqualSlices(i64, expected.input_ids, measured.batches[0].samples[0].input_ids);
+}
+
 test "gliner specialty scratch reserves prepared span geometry and every physical classification row" {
     const a = std.testing.allocator;
     var pii = try wire.parseJson(a,
@@ -1445,5 +1543,7 @@ test "gliner specialty scratch reserves prepared span geometry and every physica
     ranges[0].end = 1;
     const serial = try plannedDeviceScratchUpperBound(config, &guard, &request_plan, .{ .specialty_profile = .gliguard });
     const batched = try plannedDeviceScratchUpperBound(config, &guard, &request_plan, .{ .specialty_profile = .gliguard, .classification_batch_items = 8 });
-    try std.testing.expectEqual(2 * serial, batched);
+    try std.testing.expectEqual(2 * serial - specialty_qualification.cuda_matmul_workspace_bytes, batched);
+    const generic = try plannedDeviceScratchUpperBound(config, &guard, &request_plan, .{});
+    try std.testing.expectEqual(generic + specialty_qualification.cuda_matmul_workspace_bytes, serial);
 }

@@ -11101,7 +11101,10 @@ pub const Node = struct {
         defer lease.release();
         var budget = runtime.tier.memory.RunBudget.init(limits);
         try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = working_bytes, .scratch_tier = .host });
-        var bounded = BoundedRequestAllocator{ .backing = std.heap.smp_allocator, .limit = working_bytes };
+        // SMP retains small-allocation slabs across cross-thread request
+        // teardown. Use the process allocator while preserving this request's
+        // bounded heap and its shared admission reservation.
+        var bounded = BoundedRequestAllocator{ .backing = platform.allocator.processAllocator(std.heap.smp_allocator), .limit = working_bytes };
         defer observer.emit(.{ .host_peak = bounded.peak });
         var allocation_failure = ExtractionAllocationFailure{};
         const scratch = allocation_failure.allocator(&bounded);
@@ -22839,7 +22842,7 @@ pub const Node = struct {
     fn resolvesToNativeExtractionV2(self: *Node, io: std.Io, model_name: []const u8, specialty: *bool) bool {
         specialty.* = false;
         if (model_name.len == 0) return false;
-        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        var arena = std.heap.ArenaAllocator.init(platform.allocator.processAllocator(std.heap.smp_allocator));
         defer arena.deinit();
         const scratch = arena.allocator();
         const model_path = self.resolveRequestModelPath(scratch, io, model_name, "extractors") catch return false;
@@ -22856,7 +22859,7 @@ pub const Node = struct {
     /// not the checkpoint's classification semantics.
     fn resolvesToSpanClassification(self: *Node, io: std.Io, model_name: []const u8, schema: std.json.Value, qualified_only: bool) bool {
         if (model_name.len == 0 or !schemaIsClassificationOnly(schema)) return false;
-        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        var arena = std.heap.ArenaAllocator.init(platform.allocator.processAllocator(std.heap.smp_allocator));
         defer arena.deinit();
         const scratch = arena.allocator();
         const model_path = self.resolveRequestModelPath(scratch, io, model_name, "extractors") catch return false;
@@ -22895,7 +22898,7 @@ pub const Node = struct {
         max_request_bytes: usize,
     ) !?UpgradedExtractionRequest {
         if (request_json.len == 0 or request_json.len > max_request_bytes) return null;
-        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        var arena = std.heap.ArenaAllocator.init(platform.allocator.processAllocator(std.heap.smp_allocator));
         defer arena.deinit();
         const scratch = arena.allocator();
         var parsed = std.json.parseFromSlice(std.json.Value, scratch, request_json, .{}) catch return null;
@@ -25864,7 +25867,7 @@ const ExtractionPreflightMemory = struct {
         if (limits.host_limit_bytes != 0) bytes = @min(bytes, limits.host_limit_bytes);
         if (limits.scratch_limit_bytes != 0) bytes = @min(bytes, limits.scratch_limit_bytes);
         const lease = try node.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = bytes });
-        return .{ .lease = lease, .bounded = .{ .backing = std.heap.smp_allocator, .limit = bytes } };
+        return .{ .lease = lease, .bounded = .{ .backing = platform.allocator.processAllocator(std.heap.smp_allocator), .limit = bytes } };
     }
 
     pub fn deinit(self: *ExtractionPreflightMemory) void {

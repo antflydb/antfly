@@ -12,6 +12,9 @@ pub const FilePin = shared.FilePin;
 pub const Profile = enum { pii, gliguard };
 pub const max_sequence_tokens: usize = 512;
 pub const classification_batch_items: usize = 8;
+/// Shared by strict FP32 CUDA projections and the request admission bound.
+/// One workspace serves all sequential GEMMs, including physical batches.
+pub const cuda_matmul_workspace_bytes: usize = 32 * 1024 * 1024;
 
 pub const Artifact = struct {
     profile: Profile,

@@ -165,8 +165,8 @@ fn qualify(comptime profile: qualification.Profile, comptime backend: Backend) !
     const initial_stats = factory.getCudaRuntimeStats(loaded.session);
     const initial_memory = factory.getCudaAllocationStats(loaded.session);
     var max_reservation: usize = 0;
-    // Eight concurrent metadata reads include the original 16MB tokenizer.
-    // The 128x512-token request also exceeds the older fixture's 64KiB body.
+    // Exercise concurrent metadata discovery with bounded transport storage.
+    // The 128x512-token request exceeds the older fixture's 64KiB body.
     const transport = try Loopback.initWithLimits(a, &node, 8, .{
         .transport_memory_limit_bytes = 256 * 1024 * 1024,
         .max_request_body_bytes = 1024 * 1024,

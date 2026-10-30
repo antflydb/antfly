@@ -290545,11 +290545,12 @@ $L__BB377_28:
 
 $L__BB377_30:
 	bar.sync 	0;
+	ld.shared.f32 	%f9, [_ZZ35termite_deberta_attention_fused_f32E10reductions];
+	bar.sync 	0;
 	mov.f32 	%f142, 0f00000000;
 	@%p17 bra 	$L__BB377_36;
 
 	mov.f32 	%f142, 0f00000000;
-	ld.shared.f32 	%f9, [_ZZ35termite_deberta_attention_fused_f32E10reductions];
 	mov.u32 	%r83, _ZZ35termite_deberta_attention_fused_f32E13probabilities;
 	mov.u32 	%r106, %r5;
 

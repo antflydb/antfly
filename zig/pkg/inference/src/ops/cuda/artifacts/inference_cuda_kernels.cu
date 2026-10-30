@@ -23773,6 +23773,10 @@ extern "C" __global__ void termite_deberta_attention_fused_f32(
         __syncthreads();
     }
     const float max_score = reductions[0];
+    // Every warp must consume the maximum before thread 0 reuses this
+    // shared location for its denominator partial. Ragged/long rows can
+    // otherwise observe the partial sum as their maximum.
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += kThreads) {

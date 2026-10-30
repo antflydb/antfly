@@ -490,3 +490,109 @@ implementation, exact test identity and numerical error, and pinned Q8 model.
 It permits only that one out-of-scope baseline; leaks, additional failures or
 missing FP32 specialty coverage remain failures. The report preserves the raw
 failed regression result and explicitly marks native Q8 unqualified.
+
+## Compare CUDA performance
+
+The checked-in
+[GB10 performance comparison](../../../testdata/gliner25/specialty/gb10-performance-comparison.json)
+contains all 46 matched cases: every frozen case at request sizes one and
+eight, including eight-item PII requests with serial physical execution. All
+46 medians passed the strict speedup gate, ranging from 1.316× to 2.189×.
+The original production report for CLI `079ca98a…` remains the initial baseline;
+the corrected performance candidate, CLI `c96c022a…`, uses process-backed extraction scratch
+heaps while retaining all admission limits. Its unchanged five-minute soak
+passed 11,277 requests / 56,419 items at concurrency eight, with 176 KiB of
+late-window host PSS growth against the 64 MiB gate. The
+[completed follow-up qualification receipt](../../../testdata/gliner25/specialty/gb10-performance-qualification.json)
+binds that candidate to its passing regression, artifact, service and sanitizer
+gates. Metal qualification remains unexecuted. The initial production report
+is preserved separately.
+
+Run that allocator and serving regression against the same candidate before
+collecting performance receipts; use the existing functional and sanitizer
+commands above as well:
+
+```bash
+python3 zig/pkg/inference/scripts/gliner25/specialty/qualify_soak.py \
+  --server zig/pkg/inference/zig-out/bin/antfly-inference-dev \
+  --models-root .specialty-artifacts/production-managed \
+  --output .specialty-artifacts/performance/soak.json \
+  --duration 300 --concurrency 8 --max-pss-growth-mb 64
+```
+
+Reproduce the full set with the pinned PyTorch `2.9.1+cu128` environment from
+the comparison receipt, and the optimized CLI. Run these GPU commands
+sequentially with no other GPU work. Each case uses 10 warmups and 50 measured
+iterations. No `--case` selection is used:
+
+```bash
+export PYTHONDONTWRITEBYTECODE=1
+export PYTORCH_JIT=0
+export CUDA_VISIBLE_DEVICES=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export XDG_CACHE_HOME="$PWD/.specialty-artifacts/performance/cache"
+export HF_HOME="$XDG_CACHE_HOME/huggingface"
+export TORCH_HOME="$XDG_CACHE_HOME/torch"
+export TRITON_CACHE_DIR="$XDG_CACHE_HOME/triton"
+export TORCHINDUCTOR_CACHE_DIR="$XDG_CACHE_HOME/inductor"
+export CUDA_CACHE_PATH="$XDG_CACHE_HOME/cuda"
+unset USE_FLASHDEBERTA TORCH_ALLOW_TF32_CUBLAS_OVERRIDE NVIDIA_TF32_OVERRIDE ANTFLY_CUDA_DEBERTA_FUSED_ATTENTION
+mkdir -p "$CUDA_CACHE_PATH"
+SPECIALTY_PYTHON="$PWD/.specialty-artifacts/oracle-venv/bin/python"
+
+for batch in 1 8; do
+  python3 zig/pkg/inference/scripts/gliner25/specialty/qualify_http.py \
+    --server zig/pkg/inference/zig-out/bin/antfly-inference-dev \
+    --warmups 10 --iterations 50 --batch-size "$batch" \
+    --output ".specialty-artifacts/performance/antfly-b$batch.json"
+  "$SPECIALTY_PYTHON" zig/pkg/inference/scripts/gliner25/specialty/benchmark_oracle.py \
+    --source-root .specialty-artifacts/GLiNER2-3c913c7369301133d3b7699252074c4303ada50e \
+    --profile pii --model-dir .specialty-artifacts/pii \
+    --device cuda --threads 4 --warmups 10 --iterations 50 --batch-size "$batch" \
+    --profile-counters --output ".specialty-artifacts/performance/pytorch-pii-b$batch.json"
+  "$SPECIALTY_PYTHON" zig/pkg/inference/scripts/gliner25/specialty/benchmark_oracle.py \
+    --source-root .specialty-artifacts/GLiNER2-3c913c7369301133d3b7699252074c4303ada50e \
+    --profile gliguard --model-dir .specialty-artifacts/gliguard \
+    --device cuda --threads 4 --warmups 10 --iterations 50 --batch-size "$batch" \
+    --profile-counters --output ".specialty-artifacts/performance/pytorch-guard-b$batch.json"
+done
+```
+
+Then validate and compare those existing receipts without running a model:
+
+```bash
+python3 zig/pkg/inference/scripts/gliner25/specialty/compare_performance.py \
+  --http .specialty-artifacts/performance/antfly-b1.json \
+  --http .specialty-artifacts/performance/antfly-b8.json \
+  --pytorch .specialty-artifacts/performance/pytorch-pii-b1.json \
+  --pytorch .specialty-artifacts/performance/pytorch-guard-b1.json \
+  --pytorch .specialty-artifacts/performance/pytorch-pii-b8.json \
+  --pytorch .specialty-artifacts/performance/pytorch-guard-b8.json \
+  --output .specialty-artifacts/performance/comparison.json
+```
+
+Every supplied timing row must have exactly one counterpart with matching
+profile, case, request size, physical batch size and prepared token count. The
+tool validates frozen artifact/source/runtime pins, FP32 settings, HTTP policy
+logs and oracle outputs, hardware identity where recorded, and raw samples. It
+recomputes median and p95 latency and requires the Antfly median to be strictly
+lower for every case. A slower or tied case writes a failed JSON report and
+returns a nonzero exit code. The report retains all samples, case coverage,
+receipt hashes, binary hash and timing scopes; it makes no claim about cases
+absent from the supplied receipts. Do not omit slower cases from the campaign.
+It also records its own script SHA-256. To regenerate the checked-in report,
+set `--output zig/pkg/inference/testdata/gliner25/specialty/gb10-performance-comparison.json`.
+
+Antfly timings include loopback HTTP transport and response serialization;
+upstream timings use the in-process public API. Both include preprocessing,
+model execution, decoding and formatting, and exclude model loading. This is a
+conservative comparison of public serving latency. PyTorch receipts record the
+GB10 device name and platform; UUID/driver equality can only be checked when a
+receipt also supplies that hardware identity.
+
+`--minimum-warmups` and `--minimum-iterations` explicitly lower or raise the
+defaults for diagnostic or legacy receipts. The chosen minimums remain in the
+output. This performance gate does not replace the separate numerical,
+sanitizer, serving lifecycle or memory qualification gates.

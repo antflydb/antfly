@@ -1371,7 +1371,21 @@ pub const CublasLt = struct {
     ) Error!void {
         // Reuse the bounded, alignment-aware plan cache used by F16/BF16.
         // FP32 is part of the key, and the compute mode remains strict FP32.
-        _ = try self.matmulWeightOut(ctx, dst, input_f32, weight_f32, .{}, rows, in_dim, out_dim, CUDA_R_32F, CUDA_R_32F, .{}, .dense, null);
+        try self.matmulF32WeightF32OutWithWorkspace(ctx, dst, input_f32, weight_f32, .{}, rows, in_dim, out_dim);
+    }
+
+    pub fn matmulF32WeightF32OutWithWorkspace(
+        self: *CublasLt,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_f32: buffer_mod.DeviceBuffer,
+        weight_f32: buffer_mod.DeviceBuffer,
+        workspace: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) Error!void {
+        _ = try self.matmulWeightOut(ctx, dst, input_f32, weight_f32, workspace, rows, in_dim, out_dim, CUDA_R_32F, CUDA_R_32F, .{}, .dense, null);
     }
 
     pub fn matmulF32BiasF32Out(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) Error!void {
