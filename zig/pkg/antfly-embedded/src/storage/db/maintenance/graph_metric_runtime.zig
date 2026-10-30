@@ -3777,7 +3777,7 @@ test "db graph metric runtime background open-configured split owners publish de
 
             const tick = try coordinator.indexes.graph.metrics.runtime.?.runOnceDetailed();
             coordinator_total.add(tick);
-            const stats = coordinator.graphMetricRuntimeStats();
+            const stats = coordinator.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "open-configured-coordinator"), stats.runtime_id_hash);
@@ -3812,9 +3812,9 @@ test "db graph metric runtime background open-configured split owners publish de
             });
             defer worker_pool.close();
 
-            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
+            const tick = try worker_pool.indexes.graph.metrics.runtime.?.runOnceDetailed();
             worker_total.add(tick);
-            const stats = worker_pool.graphMetricRuntimeStats();
+            const stats = worker_pool.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "open-configured-worker-pool"), stats.runtime_id_hash);
@@ -3850,7 +3850,7 @@ test "db graph metric runtime background open-configured split owners publish de
             });
             defer coordinator.close();
 
-            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
+            const tick = try coordinator.indexes.graph.metrics.runtime.?.runOnceDetailed();
             coordinator_total.add(tick);
             const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
             var status = try graph_entry.index.graphMetricStatus("degree");
@@ -5100,7 +5100,7 @@ test "db graph metric runtime background open-configured pagerank worker pool su
             defer worker_pool.close();
 
             const tick = try worker_pool.indexes.graph.metrics.runtime.?.runOnceDetailed();
-            const stats = worker_pool.graphMetricRuntimeStats();
+            const stats = worker_pool.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-worker-owner"), stats.runtime_id_hash);
@@ -5175,8 +5175,8 @@ test "db graph metric runtime background open-configured pagerank worker pool su
             });
             defer coordinator.close();
 
-            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
-            const stats = coordinator.graphMetricRuntimeStats();
+            const tick = try coordinator.indexes.graph.metrics.runtime.?.runOnceDetailed();
+            const stats = coordinator.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-coordinator-owner"), stats.runtime_id_hash);
@@ -5323,7 +5323,7 @@ test "db graph metric runtime background open-configured eigenvector worker pool
             defer worker_pool.close();
 
             const tick = try worker_pool.indexes.graph.metrics.runtime.?.runOnceDetailed();
-            const stats = worker_pool.graphMetricRuntimeStats();
+            const stats = worker_pool.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-worker-owner"), stats.runtime_id_hash);
@@ -5398,8 +5398,8 @@ test "db graph metric runtime background open-configured eigenvector worker pool
             });
             defer coordinator.close();
 
-            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
-            const stats = coordinator.graphMetricRuntimeStats();
+            const tick = try coordinator.indexes.graph.metrics.runtime.?.runOnceDetailed();
+            const stats = coordinator.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-coordinator-owner"), stats.runtime_id_hash);
@@ -5543,7 +5543,7 @@ test "db graph metric runtime background open-configured hits worker pool surviv
             defer worker_pool.close();
 
             const tick = try worker_pool.indexes.graph.metrics.runtime.?.runOnceDetailed();
-            const stats = worker_pool.graphMetricRuntimeStats();
+            const stats = worker_pool.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-worker-owner"), stats.runtime_id_hash);
@@ -5618,8 +5618,8 @@ test "db graph metric runtime background open-configured hits worker pool surviv
             });
             defer coordinator.close();
 
-            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
-            const stats = coordinator.graphMetricRuntimeStats();
+            const tick = try coordinator.indexes.graph.metrics.runtime.?.runOnceDetailed();
+            const stats = coordinator.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-coordinator-owner"), stats.runtime_id_hash);
@@ -7959,7 +7959,7 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
 
-        const initial_tick = try coordinator.runGraphMetricPlannedCoordinatorSweep(.{
+        const initial_tick = try coordinator.indexes.graph.runMetricPlannedCoordinatorSweep(.{
             .max_metrics = 8,
             .start_background_builds = false,
         });
@@ -7981,7 +7981,7 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
                 worker_db.close();
                 profile.mark(.close);
             }
-            const sweep = try worker_db.runGraphMetricPlannedWorkerSweep(.{
+            const sweep = try worker_db.indexes.graph.runMetricPlannedWorkerSweep(.{
                 .worker_id = workers[step_index % workers.len],
                 .max_pages = 1,
             });
@@ -7999,7 +7999,7 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
                 coordinator_db.close();
                 profile.mark(.close);
             }
-            const sweep = try coordinator_db.runGraphMetricPlannedCoordinatorSweep(.{
+            const sweep = try coordinator_db.indexes.graph.runMetricPlannedCoordinatorSweep(.{
                 .max_metrics = 8,
                 .start_background_builds = false,
             });
@@ -8116,7 +8116,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
                 .ttl_cleanup = .{ .enabled = false },
             });
             defer worker_db.close();
-            break :blk try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "pagerank", workers[step_index % workers.len]);
+            break :blk try worker_db.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "pagerank", workers[step_index % workers.len]);
         };
 
         {
@@ -8327,7 +8327,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
                 .ttl_cleanup = .{ .enabled = false },
             });
             defer worker_db.close();
-            break :blk try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "eigenvector", workers[step_index % workers.len]);
+            break :blk try worker_db.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "eigenvector", workers[step_index % workers.len]);
         };
 
         {
@@ -8537,7 +8537,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
                 .ttl_cleanup = .{ .enabled = false },
             });
             defer worker_db.close();
-            break :blk try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "hits_authority", workers[step_index % workers.len]);
+            break :blk try worker_db.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "hits_authority", workers[step_index % workers.len]);
         };
 
         {
@@ -9447,7 +9447,7 @@ test "db graph metric runtime planned hits production budget matches local oracl
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    const first_tick = try planned_db.runGraphMetricPlannedMaintenanceForIdle(.{
+    const first_tick = try planned_db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
         .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
         .max_rounds = 1,
         .max_metrics_per_round = 8,
@@ -9462,7 +9462,7 @@ test "db graph metric runtime planned hits production budget matches local oracl
     var saw_budget_exhausted = first_tick.budget_exhausted;
     var tick_index: usize = 0;
     while (tick_index < 800) : (tick_index += 1) {
-        const tick = try planned_db.runGraphMetricPlannedMaintenanceForIdle(.{
+        const tick = try planned_db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
             .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
             .max_rounds = 1,
             .max_metrics_per_round = 8,

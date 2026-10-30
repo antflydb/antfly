@@ -1268,7 +1268,7 @@ pub const GraphIndexes = struct {
         return try DB.cloneGraphMetricStatusFromGraph(alloc, status);
     }
 
-    fn runMetricPlannedWorkerPageStep(self: *GraphIndexes, index_name: []const u8, metric_name: []const u8, worker_id: []const u8) !db_mod.graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+    pub fn runMetricPlannedWorkerPageStep(self: *GraphIndexes, index_name: []const u8, metric_name: []const u8, worker_id: []const u8) !db_mod.graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
         const db = self.dbPtr();
         if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
         db_mod.lockApply(db);
