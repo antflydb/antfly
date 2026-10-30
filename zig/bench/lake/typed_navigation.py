@@ -37,7 +37,9 @@ spec = importlib.util.spec_from_file_location(
 bench = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = bench
 spec.loader.exec_module(bench)
-label, executable, source = sys.argv[1:]
+label, executable, source = sys.argv[1:4]
+assert sys.argv[4:] in ([], ["--baseline-missing-identity"])
+baseline_missing_identity = bool(sys.argv[4:])
 binary = Path(executable).resolve()
 base = root / ".benchmark-results/lake/typed-navigation-v1"
 shared = base / "input"
@@ -115,6 +117,7 @@ def sha(path):
 binary_hash = sha(binary)
 samples = []
 oracles = {}
+physical_oracles = {}
 with bench.managed_server(
     harness.StandaloneAntflyServer,
     binary,
@@ -145,11 +148,49 @@ with bench.managed_server(
                         field: hit["_id"] if field == "_id" else columns[field][i]
                         for field in queries[name]["fields"]
                     }
-                    assert hit["_source"] == expected, (name, i)
+                    if baseline_missing_identity and "_id" in expected:
+                        # Explicitly characterize the old correctness defect;
+                        # the refined executable must pass the full contract.
+                        expected.pop("_id")
+                    assert hit["_source"] == expected, (
+                        name,
+                        i,
+                        sorted(hit["_source"]),
+                        [
+                            (
+                                field,
+                                str(expected_value)[:80],
+                                str(hit["_source"].get(field))[:80],
+                            )
+                            for field, expected_value in expected.items()
+                            if hit["_source"].get(field) != expected_value
+                        ],
+                    )
                 complete = {"hits": hits, "total": response["hits"]["total"]}
                 encoded = json.dumps(complete, sort_keys=True, separators=(",", ":"))
                 digest = hashlib.sha256(encoded.encode()).hexdigest()
                 assert oracles.setdefault(name, digest) == digest
+                physical = {
+                    "hits": [
+                        {
+                            **hit,
+                            "_source": {
+                                key: value
+                                for key, value in hit["_source"].items()
+                                if key != "_id"
+                            },
+                        }
+                        for hit in hits
+                    ],
+                    "total": response["hits"]["total"],
+                }
+                physical_digest = hashlib.sha256(
+                    json.dumps(physical, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+                assert (
+                    physical_oracles.setdefault(name, physical_digest)
+                    == physical_digest
+                )
                 samples.append(
                     {
                         "sample": sample,
@@ -175,13 +216,17 @@ report = {
     "publication_ns": publication_ns,
     "samples": samples,
     "oracles": oracles,
+    "physical_oracles": physical_oracles,
+    "identity_contract": "known baseline omits explicitly requested _id"
+    if baseline_missing_identity
+    else "every requested field, including explicit _id, matches exactly",
     "summary": {
         name: statistics.median(
             row["elapsed_ns"] for row in samples if row["case"] == name
         )
         for name in queries
     },
-    "qualification": "Warm shared-host local Debug; seven samples per case; strict source assertions verify UTF-8, escapes, nulls and every integer above 2^53. Complete hit and total hashes must agree across binaries and both orders. No task-owned build/E2E/cleanup overlap; no Release, cloud, empty-cache, archive-scale or full-query memory claim.",
+    "qualification": "Warm shared-host local Debug; seven samples per case; strict source assertions verify UTF-8, escapes, nulls and every integer above 2^53. Native cases require complete hit/total hashes across binaries and both orders. Mixed identity cases retain the baseline omission separately; complete hits excluding only source._id must agree, and refined results must include exact source._id. No task-owned build/E2E/cleanup overlap; no Release, cloud, empty-cache, archive-scale or full-query memory claim.",
 }
 (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
 print(json.dumps(report["summary"], indent=2), flush=True)
