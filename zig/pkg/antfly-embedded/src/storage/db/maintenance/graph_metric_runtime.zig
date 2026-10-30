@@ -8140,7 +8140,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
                 .ttl_cleanup = .{ .enabled = false },
             });
             defer coordinator_db.close();
-            break :blk try coordinator_db.runGraphMetricPlannedCoordinatorStep("graph_idx", "pagerank");
+            break :blk try coordinator_db.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "pagerank");
         };
 
         {
@@ -8351,7 +8351,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
                 .ttl_cleanup = .{ .enabled = false },
             });
             defer coordinator_db.close();
-            break :blk try coordinator_db.runGraphMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
+            break :blk try coordinator_db.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
         };
 
         {
@@ -8561,7 +8561,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
                 .ttl_cleanup = .{ .enabled = false },
             });
             defer coordinator_db.close();
-            break :blk try coordinator_db.runGraphMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
+            break :blk try coordinator_db.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
         };
 
         {
