@@ -44,12 +44,12 @@ spec.loader.exec_module(bench)
 label, executable, source, mode = sys.argv[1:]
 assert mode in ("wide", "ascii", "escaped", "statistics")
 binary = Path(executable).resolve()
-base = root / ".benchmark-results/lake/live-admission-v1" / mode
+base = root / ".benchmark-results/lake/live-admission-v1-qualified" / mode
 shared = base / "input"
 shared.mkdir(parents=True, exist_ok=True)
 out = base / label
 out.mkdir(exist_ok=True)
-count = 128 if mode == "wide" else 32 if mode == "statistics" else 12
+count = 128 if mode == "wide" else 128 if mode == "statistics" else 12
 body = {
     "wide": "needle small UTF-8 🙂",
     "ascii": ("needle " + "x" * 65520) * 4,
@@ -71,7 +71,7 @@ for ordinal in range(64 if mode == "wide" else 4 if mode != "statistics" else 0)
 archives = []
 for shard in range(2 if mode == "statistics" else 1):
     archive = shared / f"archive-{shard}.parquet"
-    begin, end = (shard * 16, shard * 16 + 16) if mode == "statistics" else (0, count)
+    begin, end = (shard * 64, shard * 64 + 64) if mode == "statistics" else (0, count)
     part = {name: values[begin:end] for name, values in columns.items()}
     if not archive.exists():
         pq.write_table(
@@ -156,6 +156,8 @@ cfg = json.loads(config.read_text())
 cfg.setdefault("lake_indexes", {}).setdefault("text_cache", {}).update(
     admission_window_segments=1
 )
+if mode == "statistics":
+    cfg["lake_indexes"]["text_cache"]["admission_window_bytes"] = 1
 config.write_text(json.dumps(cfg, sort_keys=True))
 
 
@@ -181,7 +183,14 @@ with bench.managed_server(
         client.ready(bench.readiness_indexes({"definition": definition}))
         publication_ns = time.perf_counter_ns() - started
         for request in queries.values():
-            client.query(request if "statement" in request else {"request": request})
+            warm = client.query(
+                request if "statement" in request else {"request": request}
+            )
+            if mode == "statistics":
+                assert (
+                    warm["profile"]["sort"]["selection_reason"]
+                    == "bounded_global_text_frontier"
+                ), warm.get("profile")
         for sample in range(7):
             names = list(queries)
             if sample % 2:
@@ -300,7 +309,7 @@ report = {
         )
         for name in queries
     },
-    "qualification": "Warm local Debug; seven samples per case; strict complete source, hit and total equivalence across same-main binaries in both orders. The statistics fixture sets admission_window_segments=1 over two immutable files; profiles are retained, not assumed to prove use of a particular function. No task-owned build/E2E/cleanup overlap; no Release, cloud, empty-cache, archive-scale or full-query memory claim.",
+    "qualification": "Warm local Debug; seven samples per case; strict complete source, hit and total equivalence across same-main binaries in both orders. The 128-term statistics fixture sets both admission_window_segments and admission_window_bytes to 1 over two immutable files, and asserts the bounded_global_text_frontier plan. Profiles are retained; the tree-visit unit probe separately isolates term-frequency lookup work. No task-owned build/E2E/cleanup overlap; no Release, cloud, empty-cache, archive-scale or full-query memory claim.",
 }
 (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
 print(json.dumps(report["summary"], indent=2), flush=True)

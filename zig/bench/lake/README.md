@@ -2073,3 +2073,94 @@ run on the shared machine; `make gc` safely skipped while one was active. These
 are warm local Debug observations with readiness warming and retained caches.
 There is no Release, cloud, empty-cache, archive-scale or full-query-memory claim.
 Real-provider retention enforcement remains separately deferred.
+
+## Live Parquet admission and compiled delivery
+
+The [retained comparison](native-live-admission-and-compiled-delivery-v1-observation.json)
+contains **252 measured HTTP requests**, seven samples per case in old/new and
+new/old orders. Both source images include main
+`c912271651567d2294b18971ed86f2cf7ecbf834`. The control is
+`08c31ae364852bb686cd4d05688f36b8f3e1844c`, executable SHA-256
+`03133ac3adb54795c5f6dca9275aff1b2366ab3323c021da8c33838f5fda0de2`;
+the refined runtime is `feceea5ebe760a06797f732f069d46c4bb060037`, executable
+SHA-256 `ebeac0813963a6946deac297382f2ff3e0971cbab1387518055918eaf96e339a`.
+Subsequent qualification changes affect tests, the benchmark helper and documentation.
+
+Warm local Debug medians, milliseconds:
+
+| Shape | Old → new, primary | Old → new, reverse |
+| --- | ---: | ---: |
+| 128 native rows, 64 extra integer columns | 77.65 → 76.91 | 78.39 → 77.95 |
+| Same wide results with explicit source `_id` | 102.03 → 81.91 | 102.67 → 82.57 |
+| Physical SQL scan of all 66 columns | 83.63 → 78.16 | 83.75 → 85.83 |
+| Large native ASCII strings | 36.38 → 28.21 | 44.06 → 35.18 |
+| ASCII strings with explicit identity | 37.19 → 28.94 | 43.79 → 35.75 |
+| Large escaped/Unicode native strings | 37.65 → 33.90 | 41.40 → 34.02 |
+| Escaped strings with explicit identity | 38.60 → 34.30 | 41.81 → 34.42 |
+| Global exact disjunction over 128 terms | 63.87 → 56.62 | 59.85 → 57.18 |
+| Global bounded 128-term prefix | 50.12 → 47.01 | 46.96 → 46.38 |
+
+Compiled composition improves the wide explicit-identity case **19.6–19.7%**.
+Native ASCII delivery improves **20.1–22.5%**; escaped/Unicode native delivery
+improves **10.0–17.8%**. The global exact-term case improves **4.5–11.4%**, and
+the bounded prefix improves **1.2–6.2%**. These HTTP observations measure the
+combined refinements, rather than isolating a single kernel. Native-only wide
+results remain within 1%. The physical SQL control ranges from **6.5% faster to
+2.5% slower (2.08 ms)**; no scan latency win is claimed. The admission change
+instead broadens the set of page cohorts fitting unchanged resource limits.
+
+Every complete hit and total hash agrees across all four runs, including source
+`_id`, exact integers above `2^53`, SQL integer strings, NULLs, Unicode and
+escaping. The record retains every sample, profile, source/input/helper/binary
+identity and individual report hash. The helper is
+[live_delivery.py](live_delivery.py), SHA-256
+`5a9f0749a565e0bd884bbd1526bdf0a022b95a07327c17e87e12bdec4e894130`.
+
+The statistics fixture uses two independently written Parquet files with 128
+distinct terms. Both `admission_window_segments` and `admission_window_bytes`
+are set to 1, and every warmup asserts `bounded_global_text_frontier`. Every
+measured profile also reports that plan. Setting only the segment threshold did
+not suffice: compaction let an earlier 32-row fixture use ordinary whole-window
+search. Its exploratory observations are excluded from this comparison. A
+separate native work probe resolves **529 requested frequencies in two tree
+visits with zero new decodes**, preserving duplicate positions and missing terms.
+The old implementation created a cursor for each term; the work probe does not
+claim a reduction in warm provider GETs.
+
+Cursor tests admit a **66-column cohort containing a 256-KiB string** under
+unchanged 2-MiB input/uncompressed and 2-MiB structural allowances, locally and
+with cold/warm decoded caches. The old equal-share page check allowed only about
+31 KiB per column. This is a cursor admission test, not a public-query latency
+comparison. Separate tests reject aggregate vector/arena capacity even when raw
+scalar bytes fit, retain credits through result leases and cursor teardown,
+preserve dictionary ownership, refund injected allocation failures, and wake or
+cancel parallel input waiters without increasing their allowance. Scheduler
+fan-out estimates remain distinct from the shared live-byte admission rule.
+
+Reproduce from the worktree root:
+
+```sh
+TZ=UTC zig/e2e/antfly/.venv/bin/python -B zig/bench/lake/live_delivery.py \
+  LABEL IMMUTABLE_BINARY RUNTIME_SOURCE_COMMIT wide
+```
+
+Repeat with `ascii`, `escaped` and `statistics`, then reverse the executable
+order using fresh labels. Wide mode also measures an ordinary physical SQL
+scan. The helper verifies independently written Parquet values, every result,
+all requested fields and the statistics plan before accepting samples.
+
+No task-owned build, E2E or cleanup overlaps the timing runs. Other native work
+runs on the shared host. These are warm local Debug observations with retained
+caches and readiness warming. There is no Release, cloud, empty-cache,
+archive-scale or full-query-memory qualification. Actual cloud retention
+qualification remains deferred.
+
+Final qualification passes **167 focused native checks** (117 API/frontier and
+50 shared), with no failures, skips or leaks. The lease case is also repeated
+with local and cached pages surviving cursor teardown. **50 real Parquet/Iceberg
+E2E cases pass in 363.33 seconds** against the frozen refined executable,
+including the new 66-column unequal-page SQL test for both formats, cold/warm
+reads and restart. Existing hidden/projected highlights, unavailable originals,
+exact signed decimals, deletes, native ordering, refresh and deadline cases
+remain covered. The preceding 50-case run also passed before the final fan-out
+correction; only the final executable supplies the timings above.

@@ -10768,15 +10768,21 @@ test "external lake Parquet live admission fits unequal pages and fences cached 
         try std.testing.expectError(error.ParquetPageTooLarge, bounded.next());
         try std.testing.expect(bounded.admission.peak <= 6144);
     }
-    // Result leases remain valid after cursor teardown and own final refunds.
-    var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &names, .{});
-    cursor.shared_reader = &reader;
-    const batch = (try cursor.next()).?;
-    const vector = batch.columns[0];
-    const held = (try cursor.retainColumns(a)).?;
-    cursor.deinit();
-    try std.testing.expectEqualStrings(body, vector.values.bytes[0]);
-    held.release();
+    // Result leases remain valid after cursor teardown and own final refunds,
+    // with both request-owned buffers and globally cached immutable buffers.
+    for ([_]bool{ false, true }) |cached| {
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &names, .{});
+        var open = true;
+        defer if (open) cursor.deinit();
+        if (cached) cursor.shared_reader = &reader;
+        const batch = (try cursor.next()).?;
+        const vector = batch.columns[0];
+        const held = (try cursor.retainColumns(a)).?;
+        defer held.release();
+        cursor.deinit();
+        open = false;
+        try std.testing.expectEqualStrings(body, vector.values.bytes[0]);
+    }
 }
 
 test "external lake Parquet live admission refunds faults dictionary credits and cancelled input waits" {
