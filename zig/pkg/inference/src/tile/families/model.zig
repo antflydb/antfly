@@ -15,6 +15,12 @@
 
 //! Generated kernel regions of the `model` families.
 
-const Region = @import("../region.zig").Region;
+const r = @import("../region.zig");
+const lightonocr = @import("../model_lightonocr.zig");
 
-pub const regions = [_]Region{};
+const Region = r.Region;
+
+pub const regions = [_]Region{
+    r.metal("model.lightonocr3_vec4", r.metalLines(r.metal_indent, lightonocr.vec4Source())),
+    r.metal("model.lightonocr3_tiled", r.metalLines(r.metal_indent, lightonocr.tiledSource())),
+};

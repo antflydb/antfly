@@ -9595,6 +9595,7 @@ static NSString *termite_metal_shader_source(void) {
            " float gs=simd_sum(dot(g,float4(1.0f))),us=simd_sum(dot(u,float4(1.0f)));\n"
            " if(lane==0){gs+=gate_b[row];us+=up_b[row];y[row]=(gs/(1.0f+exp(-gs)))*us;}\n"
            "}\n"
+           // tile-codegen:begin model.lightonocr3_vec4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_lightonocr3_batch2_vec4(device const float *x [[buffer(0)]], device const ushort *w [[buffer(1)]], device const float *b [[buffer(2)]], device float *y [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], uint lane [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            " if(row>=p.out_dim || p.rows>2) return;\n"
            " float4 a0=0.0f;\n"
@@ -9713,6 +9714,7 @@ static NSString *termite_metal_shader_source(void) {
            " float s14=simd_sum(dot(a14,float4(1))); if(lane==0 && p.rows>14) y[14*p.out_dim+row]=s14+b[row];\n"
            " float s15=simd_sum(dot(a15,float4(1))); if(lane==0 && p.rows>15) y[15*p.out_dim+row]=s15+b[row];\n"
            "}\n"
+           // tile-codegen:end model.lightonocr3_vec4 family
            "template<uint SN>inline void termite_lightonocr3_segment_body(device const float*x,device const ushort*w,device const float*bias,device float*y,constant termite_metal_linear_params&p,uint lane,uint group){\n"
            " uint col=group*(32/SN)+lane/SN,k=lane%SN;float4 acc[4];for(uint b=0;b<4;b++)acc[b]=0;\n"
            " for(uint i=k*4;i<p.in_dim;i+=SN*4){float4 weights=as_type<float4>(uint4(*((device const ushort4*)(w+col*p.in_dim+i)))<<16);\n"
@@ -9756,6 +9758,7 @@ static NSString *termite_metal_shader_source(void) {
            "  }\n"
            " }\n"
            "}\n"
+           // tile-codegen:begin model.lightonocr3_tiled family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_lightonocr3_batch2_tile2(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<2,2>(x,w,bias,y,p,lane,group); }\n"
            "kernel void termite_lightonocr3_batch3_tile2(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<3,2>(x,w,bias,y,p,lane,group); }\n"
            "kernel void termite_lightonocr3_batch4_tile2(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<4,2>(x,w,bias,y,p,lane,group); }\n"
@@ -9771,6 +9774,7 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_lightonocr3_batch14_tile1(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<14,1>(x,w,bias,y,p,lane,group); }\n"
            "kernel void termite_lightonocr3_batch15_tile1(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<15,1>(x,w,bias,y,p,lane,group); }\n"
            "kernel void termite_lightonocr3_batch16_tile1(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant termite_metal_linear_params&p[[buffer(4)]],uint lane[[thread_index_in_threadgroup]],uint group[[threadgroup_position_in_grid]]) { termite_lightonocr3_tiled_body<16,1>(x,w,bias,y,p,lane,group); }\n"
+           // tile-codegen:end model.lightonocr3_tiled family
            "kernel void termite_lightonocr3_pack_bf16(device const float *input [[buffer(0)]], device ushort *output [[buffer(1)]], constant uint &count [[buffer(2)]], uint i [[thread_position_in_grid]]) {\n"
            " if(i>=count)return;uint bits=as_type<uint>(input[i]);\n"
            " output[i]=(bits&0x7fffffffu)>0x7f800000u?ushort((bits>>16)|0x40u):ushort((bits+0x7fffu+((bits>>16)&1u))>>16);\n"
