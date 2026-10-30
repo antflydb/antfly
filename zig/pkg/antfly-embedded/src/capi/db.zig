@@ -922,25 +922,31 @@ pub fn enterHandle(ptr: ?*anyopaque, access: HandleAccess) ?HandleGuard {
 }
 
 pub fn enterHandleWithIntent(ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent) ?HandleGuard {
-    if (intent != .mutation) return enterHandleInternal(ptr, access, intent, false);
     const entry = HandleEntry.capture(ptr) orelse return null;
-    const connection = entry.lock_handle.lite_connection orelse return enterCapturedHandle(entry, access, intent, false);
+    return enterWithAdmissionRetry(entry, ptr, access, intent, false);
+}
+
+/// Prepared SQL retains its original registry pins until preparation memory is
+/// freed. Ordinary exports release and recapture their pins between attempts.
+fn enterWithAdmissionRetry(initial: HandleEntry, ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent, comptime retain_entry: bool) ?HandleGuard {
+    const connection = initial.lock_handle.lite_connection orelse return enterCapturedHandle(initial, access, intent, false);
     const timeout_ms = connection.options.busy_timeout_ms;
-    if (timeout_ms == 0) return enterCapturedHandle(entry, access, intent, false);
+    if (intent != .mutation or timeout_ms == 0) return enterCapturedHandle(initial, access, intent, false);
     const io = handleLockIo();
-    const started = std.Io.Clock.awake.now(io).nanoseconds;
-    var guard = enterCapturedHandle(entry, access, intent, false);
-    const deadline = started + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    var entry = initial;
+    var guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline);
     var backoff: i96 = std.time.ns_per_ms;
     // Only admission is retried: the exported operation has not executed yet.
-    // Drop both locks and registry pins while waiting so a competing publisher
-    // can finish, and reacquire the opaque handle in case it was closed.
-    while (guard.entry_error != null and guard.entry_error.? == .busy) {
+    while (guard.entry_error == .busy) {
         const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
         if (remaining <= 0) return guard;
-        guard.leave();
+        guard.leaveWithRegistry(!retain_entry);
         const slept = io.sleep(.fromNanoseconds(@min(backoff, remaining)), .awake);
-        guard = enterHandleInternal(ptr, access, intent, false) orelse return null;
+        if (!retain_entry) entry = HandleEntry.capture(ptr) orelse return null;
+        // The same deadline covers every lease acquisition, including those
+        // after a detached proof. An expired sleep cannot start another proof.
+        guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline);
         slept catch |err| {
             if (guard.entry_error == null) guard.entry_error = capi.mapErrorContext(err, @src().fn_name);
             return guard;
@@ -994,6 +1000,10 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, intent: StorageIn
 }
 
 fn enterCapturedHandle(entry: HandleEntry, access: HandleAccess, intent: StorageIntent, pinned: bool) HandleGuard {
+    return enterCapturedHandleWithDeadline(entry, access, intent, pinned, null);
+}
+
+fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, intent: StorageIntent, pinned: bool, deadline: ?i96) HandleGuard {
     const handle = entry.handle;
     const slot = entry.slot;
     const lock_handle = entry.lock_handle;
@@ -1001,6 +1011,14 @@ fn enterCapturedHandle(entry: HandleEntry, access: HandleAccess, intent: Storage
     if (lock_handle.lite_connection) |connection| {
         connection.mutex.lockUncancelable(handleLockIo());
         var guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = access, .connection = connection };
+        connection.admission_deadline_ns = deadline;
+        defer connection.admission_deadline_ns = null;
+        if (deadline) |limit| {
+            if (std.Io.Clock.awake.now(handleLockIo()).nanoseconds >= limit) {
+                guard.entry_error = capi.mapError(error.FileBusy);
+                return guard;
+            }
+        }
         if (!pinned) {
             guard.path_lease = connection.acquire() catch |err| {
                 guard.entry_error = capi.mapError(err);
@@ -5886,7 +5904,7 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
         (if (@import("sql.zig").statementMayMutate(value.compiled.statement)) .mutation else .read_only)
     else |_|
         .read_only;
-    const guard = enterCapturedHandle(entry, .exclusive, intent, false);
+    const guard = enterWithAdmissionRetry(entry, handle_ptr, .exclusive, intent, true).?;
     defer guard.leaveAccess();
     if (guard.entry_error) |code| {
         return capi.ensureError(code, @src().fn_name);

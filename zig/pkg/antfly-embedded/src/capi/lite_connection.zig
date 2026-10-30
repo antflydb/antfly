@@ -1684,6 +1684,9 @@ pub const Connection = struct {
     gate: *PathGate,
     owner: *Owner,
     mutex: QueuedMutex = .{},
+    // Scoped to C API admission while mutex is held. Reacquisition after a
+    // detached allocator proof consumes the same request budget.
+    admission_deadline_ns: ?i96 = null,
     current: ?*h.Handle = null,
     attached: bool = false,
     sql_sessions: @FieldType(h.Handle, "sql_sessions") = .empty,
@@ -1703,9 +1706,10 @@ pub const Connection = struct {
 
     fn acquirePathLeaseAssumeLocked(self: *Connection) !native.PathWriterLock {
         const io = h.handleLockIo();
-        const deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, self.options.busy_timeout_ms) * std.time.ns_per_ms;
+        const deadline = self.admission_deadline_ns orelse (std.Io.Clock.awake.now(io).nanoseconds + @as(i96, self.options.busy_timeout_ms) * std.time.ns_per_ms);
         var backoff: i96 = std.time.ns_per_ms;
         while (true) {
+            if (self.admission_deadline_ns != null and std.Io.Clock.awake.now(io).nanoseconds >= deadline) return error.FileBusy;
             const lease = if (h.liteOpenModeCanWrite(self.options.open_mode))
                 native.lockWriterPathWithIo(alloc, io, self.path)
             else
@@ -3063,81 +3067,101 @@ test "capi native allocator proof queue retains eligible wake after spurious com
     try std.testing.expectEqual(gate.next, gate.serving);
 }
 
-test "capi native allocator proof mutation preflight honors busy timeout before batch execution" {
+test "capi native allocator proof mutation preflight honors busy timeout before batch and SQL execution" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = h.handleLockIo();
-    for ([_]u64{ 0, 1000 }) |timeout_ms| {
-        var tmp = try api.TestDirectory.init("batch-proof-admission");
-        defer tmp.cleanup();
-        try std.Io.Dir.cwd().createDirPath(io, tmp.path());
-        const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
-        defer a.free(path);
-        {
-            var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
-            defer seed.close();
-            const value: [32768]u8 = @splat('v');
-            for (0..16) |i| {
-                var key: [16]u8 = undefined;
-                try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+    for ([_]enum { batch, sql }{ .batch, .sql }) |operation| {
+        for ([_]u64{ 0, 1000 }) |timeout_ms| {
+            var tmp = try api.TestDirectory.init("batch-proof-admission");
+            defer tmp.cleanup();
+            try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+            const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+            defer a.free(path);
+            {
+                var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+                defer seed.close();
+                const value: [32768]u8 = @splat('v');
+                for (0..16) |i| {
+                    var key: [16]u8 = undefined;
+                    try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+                }
+                for (0..16) |i| {
+                    var key: [16]u8 = undefined;
+                    try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+                }
+                _ = try seed.reclaimPages(4096);
+                try std.testing.expect((try seed.allocatorStats()).?.reusable_pages > 64);
             }
-            for (0..16) |i| {
-                var key: [16]u8 = undefined;
-                try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+            const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = timeout_ms }, false);
+            const id = api.publishHandle(wrapper) catch |err| {
+                h.closeHandle(wrapper);
+                return err;
+            };
+            defer api.antfly_db_close(id);
+            const owner = wrapper.lite_connection.?.owner;
+            owner.stopping.store(true, .release);
+            owner.wake.set(io);
+            owner.worker.?.join();
+            owner.worker = null;
+            owner.stopping.store(false, .release);
+            owner.verification_cancel.requested.store(false, .release);
+            if (operation == .sql) {
+                var output: h.capi.Buffer = .{};
+                defer api.antfly_buffer_free_zero(&output);
+                try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"CREATE TABLE numbers (n BIGINT)\"}"), &output));
             }
-            _ = try seed.reclaimPages(4096);
-            try std.testing.expect((try seed.allocatorStats()).?.reusable_pages > 64);
+            const Probe = struct {
+                owner: *Owner,
+                captures: usize = 0,
+                failure: ?anyerror = null,
+                fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.captures += 1;
+                    if (self.captures != 1) return;
+                    self.publish() catch |err| {
+                        self.failure = err;
+                    };
+                }
+                fn publish(self: *@This()) !void {
+                    var lease = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.owner.path);
+                    defer lease.close();
+                    var file = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.owner.path, .{ .externally_locked = true, .no_sync = true });
+                    defer file.close();
+                    file.defer_allocator_verification = true;
+                    try file.putCatalogRecord("foreign", "invalidate the first proof before the requested batch starts");
+                }
+            };
+            var probe: Probe = .{ .owner = owner };
+            owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+            defer owner.test_after_allocator_capture = null;
+            owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+            const key = "accepted";
+            const value = "{\"text\":\"one accepted batch\"}";
+            const writes = [_]h.capi.WriteIntent{.{ .key = .{ .ptr = key.ptr, .len = key.len }, .value = .{ .ptr = value.ptr, .len = value.len }, .is_delete = false }};
+            var output: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&output);
+            const result = if (operation == .batch)
+                api.antfly_db_batch(id, &writes, writes.len, null, 0, 0, 0)
+            else
+                api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"INSERT INTO numbers (_id,n) VALUES ('accepted',7)\"}"), &output);
+            if (probe.failure) |err| return err;
+            try std.testing.expectEqual(if (timeout_ms == 0) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, result);
+            try std.testing.expectEqual(if (timeout_ms == 0) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, h.capi.lastErrorCode());
+            try std.testing.expectEqual(@as(usize, if (timeout_ms == 0) 1 else 2), probe.captures);
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            if (operation == .batch) {
+                const found = api.antfly_db_lookup_json(id, .{ .ptr = key.ptr, .len = key.len }, &out);
+                try std.testing.expectEqual(if (timeout_ms == 0) h.capi.ErrorCode.not_found else h.capi.ErrorCode.ok, found);
+            } else {
+                try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(id, .fromSlice("{\"statement\":\"SELECT n FROM numbers WHERE _id = 'accepted'\"}"), &out));
+                const parsed = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+                defer parsed.deinit();
+                const rows = parsed.value.object.get("rows").?.array.items;
+                try std.testing.expectEqual(@as(usize, if (timeout_ms == 0) 0 else 1), rows.len);
+            }
         }
-        const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = timeout_ms }, false);
-        const id = api.publishHandle(wrapper) catch |err| {
-            h.closeHandle(wrapper);
-            return err;
-        };
-        defer api.antfly_db_close(id);
-        const owner = wrapper.lite_connection.?.owner;
-        owner.stopping.store(true, .release);
-        owner.wake.set(io);
-        owner.worker.?.join();
-        owner.worker = null;
-        owner.stopping.store(false, .release);
-        owner.verification_cancel.requested.store(false, .release);
-        const Probe = struct {
-            owner: *Owner,
-            captures: usize = 0,
-            failure: ?anyerror = null,
-            fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
-                const self: *@This() = @ptrCast(@alignCast(ptr));
-                self.captures += 1;
-                if (self.captures != 1) return;
-                self.publish() catch |err| {
-                    self.failure = err;
-                };
-            }
-            fn publish(self: *@This()) !void {
-                var lease = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.owner.path);
-                defer lease.close();
-                var file = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.owner.path, .{ .externally_locked = true, .no_sync = true });
-                defer file.close();
-                file.defer_allocator_verification = true;
-                try file.putCatalogRecord("foreign", "invalidate the first proof before the requested batch starts");
-            }
-        };
-        var probe: Probe = .{ .owner = owner };
-        owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
-        defer owner.test_after_allocator_capture = null;
-        owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
-        const key = "accepted";
-        const value = "{\"text\":\"one accepted batch\"}";
-        const writes = [_]h.capi.WriteIntent{.{ .key = .{ .ptr = key.ptr, .len = key.len }, .value = .{ .ptr = value.ptr, .len = value.len }, .is_delete = false }};
-        const result = api.antfly_db_batch(id, &writes, writes.len, null, 0, 0, 0);
-        if (probe.failure) |err| return err;
-        try std.testing.expectEqual(if (timeout_ms == 0) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, result);
-        try std.testing.expectEqual(if (timeout_ms == 0) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, h.capi.lastErrorCode());
-        try std.testing.expectEqual(@as(usize, if (timeout_ms == 0) 1 else 2), probe.captures);
-        var out: h.capi.Buffer = .{};
-        defer api.antfly_buffer_free_zero(&out);
-        const found = api.antfly_db_lookup_json(id, .{ .ptr = key.ptr, .len = key.len }, &out);
-        try std.testing.expectEqual(if (timeout_ms == 0) h.capi.ErrorCode.not_found else h.capi.ErrorCode.ok, found);
     }
 }
 
@@ -3198,4 +3222,88 @@ test "capi native allocator proof peer close certificate survives runtime refres
     try std.testing.expect(timestamp != 0);
     try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
     try std.testing.expect(!owner.allocator_verification_started);
+}
+
+test "capi native allocator proof admission shares deadline with lease reacquisition" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("proof-admission-deadline");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    {
+        var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer seed.close();
+        const value: [32768]u8 = @splat('v');
+        for (0..16) |i| {
+            var key: [16]u8 = undefined;
+            try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+        }
+        for (0..16) |i| {
+            var key: [16]u8 = undefined;
+            try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+        }
+        _ = try seed.reclaimPages(4096);
+        try std.testing.expect((try seed.allocatorStats()).?.reusable_pages > 64);
+    }
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 1000 }, false);
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    owner.verification_cancel.requested.store(false, .release);
+    const Probe = struct {
+        connection: *Connection,
+        held: ?native.PathWriterLock = null,
+        failure: ?anyerror = null,
+        captures: usize = 0,
+        retries: usize = 0,
+        fn capture(ptr: *anyopaque, _: *native.NativeFile) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.captures += 1;
+            self.expireBudget() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn expireBudget(self: *@This()) !void {
+            self.held = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.connection.path);
+            // Expire the actual request deadline while the proof is detached.
+            // Reacquisition must fail without entering a fresh lease retry loop.
+            const deadline = self.connection.admission_deadline_ns orelse return error.MissingAdmissionDeadline;
+            const remaining = deadline - std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
+            if (remaining > 0) try h.handleLockIo().sleep(.fromNanoseconds(remaining + std.time.ns_per_ms), .awake);
+        }
+        fn busy(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.retries += 1;
+        }
+    };
+    var probe: Probe = .{ .connection = connection };
+    defer if (probe.held) |*held| held.close();
+    owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
+    connection.test_path_lease_busy = .{ .ptr = &probe, .notify = Probe.busy };
+    defer {
+        owner.test_after_allocator_capture = null;
+        connection.test_path_lease_busy = null;
+    }
+    owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+    const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("rejected"), .value = .fromSlice("{}"), .is_delete = false }};
+    const result = api.antfly_db_batch(id, &writes, writes.len, null, 0, 0, 0);
+    if (probe.failure) |err| return err;
+    try std.testing.expectEqual(h.capi.ErrorCode.busy, result);
+    try std.testing.expectEqual(@as(usize, 1), probe.captures);
+    try std.testing.expectEqual(@as(usize, 0), probe.retries);
+    try std.testing.expectEqual(@as(?i96, null), connection.admission_deadline_ns);
+    probe.held.?.close();
+    probe.held = null;
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.not_found, api.antfly_db_lookup_json(id, .fromSlice("rejected"), &out));
 }
