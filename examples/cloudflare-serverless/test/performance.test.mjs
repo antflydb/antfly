@@ -961,3 +961,11 @@ for(const mismatch of [false,true])test(`bounded cold metadata overlaps authorit
  else{assert.equal((await opening).version,'7');assert.equal(reader.store.acquired,false);assert.equal((await reader.open()).version,'7');}
  assert.equal(bucket.writes,writes);
 });
+
+
+test('compute placement can differ from bucket hints without changing durable storage identity',async()=>{
+ const{placementEnv}=await import('../runtime-placement.mjs');const calls=[],binding={idFromName:name=>name,getByName(name,options){calls.push({name,options});return name;}};
+ const env={COORDINATOR_BACKEND:'r2',RUNTIME_GENERATION:'placement-a',R2_LOCATION_HINT:'wnam',DO_LOCATION_HINT:'enam',COORDINATOR_STORAGE_ID:'durable',ANTFLY_INCARNATION:'namespace',COMMITS:binding,READERS:binding,BUILDERS:binding};
+ const placed=placementEnv(env);for(const key of ['COMMITS','READERS','BUILDERS'])placed[key].getByName('actor');assert.ok(calls.every(c=>c.options.locationHint==='enam'));assert.equal(placed.COORDINATOR_STORAGE_ID,'durable');assert.equal(placed.R2_LOCATION_HINT,'wnam');
+ assert.notEqual(placed.COMMITS.idFromName('actor'),placementEnv({...env,DO_LOCATION_HINT:'weur'}).COMMITS.idFromName('actor'));assert.throws(()=>placementEnv({...env,DO_LOCATION_HINT:'invalid'}),/InvalidRuntimePlacement/);
+});

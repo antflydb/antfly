@@ -290,6 +290,41 @@ pub const Context = struct {
     io: std.Io,
     cancellation: ?objects.CancellationToken = null,
 
+    /// Typed reads from an already captured root. This is a preparation hint,
+    /// never fresh authority: writers must validate exact dependencies at commit.
+    /// Each returned value and the result array belong to self.alloc.
+    pub fn readSnapshotValuesAlloc(self: Context, backend: RootBackend, state: journal.State, keys: []const []const u8, options: struct { compact_records: bool = false }) ![]?[]u8 {
+        if (keys.len > 512) return error.CoordinatorBatchExceeded;
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const m = scratch.allocator();
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(self.namespace, &digest, .{});
+        const base = try std.fmt.allocPrint(m, "{s}/{s}/{s}", .{ self.prefix, if (backend == .conditional) "coord-v2" else "coord-v1", std.fmt.bytesToHex(digest, .lower) });
+        const domain = Pages.domainForNamespace(base);
+        var reads: u64 = 16 * 1024 * 1024;
+        var writes: u64 = 0;
+        var client = self.client;
+        client.allocator = self.alloc;
+        var pages = Pages{ .client = client, .bucket = self.bucket, .prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}", .{ base, std.fmt.bytesToHex(domain, .lower) }), .domain = domain, .attempt = @splat(0), .cancellation = self.cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        var cache = tree.Cache{ .alloc = self.alloc, .underlying = pages.store() };
+        defer cache.deinit();
+        const root = try Root.load(m, state.root);
+        const output = try self.alloc.alloc(?[]u8, keys.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (output[0..initialized]) |value| if (value) |bytes| self.alloc.free(bytes);
+            self.alloc.free(output);
+        }
+        for (keys, output) |key, *value| {
+            if (self.cancellation) |token| try token.check();
+            const captured = if (options.compact_records and root.hot != null and std.mem.eql(u8, key, root.hot.?.wal.key)) root.hot.?.wal.value else try root.get(m, self.alloc, cache.store(), key);
+            value.* = if (captured) |bytes| try self.alloc.dupe(u8, bytes) else null;
+            initialized += 1;
+        }
+        return output;
+    }
+
     pub fn execute(self: Context, req: Request) ![]u8 {
         if (req.commands.len > 512) return error.CoordinatorBatchExceeded;
         if (req.inline_read_set) |rules| try rules.validate();
@@ -981,4 +1016,40 @@ test "bounded journal metadata transactions retain KV fused reads ownership and 
     const retired = try ctx.execute(.{ .action = .retire_logs, .root_backend = .bounded_journal, .root_proof_key = @splat(42), .owner = @splat(2), .state = claimed.state, .journal_proof = claimed.journal_proof, .before = "0", .keys = &.{"test/ROOT"} });
     const keys = (try std.json.parseFromSlice(struct { keys: []const []const u8 }, m, retired, .{})).value;
     try std.testing.expectEqual(@as(usize, 0), keys.keys.len);
+}
+
+test "typed snapshot preparation reads preserve order misses and ownership across metadata backends" {
+    const a = std.testing.allocator;
+    inline for (.{ RootBackend.journal, RootBackend.conditional, RootBackend.bounded_journal }) |backend| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const m = arena.allocator();
+        var memory = objects.MemoryClient.init(a);
+        defer memory.deinit();
+        var client = memory.client();
+        try client.makeBucket("db");
+        var ctx = Context{ .alloc = m, .client = client, .bucket = "db", .prefix = "typed", .namespace = @tagName(backend), .io = std.testing.io };
+        var request = Request{ .action = .begin, .root_backend = backend, .root_proof_scope = @splat(1), .root_proof_key = @splat(42), .owner = @splat(1) };
+        const Header = struct { state: journal.State, root_cursor: ?conditional.Cursor = null, journal_proof: ?journal.WriteProof = null };
+        const first = (try std.json.parseFromSlice(Header, m, try ctx.execute(request), .{ .ignore_unknown_fields = true })).value;
+        request.action = .commit;
+        request.state = first.state;
+        request.root_cursor = first.root_cursor;
+        request.journal_proof = first.journal_proof;
+        request.inline_read_set = .{ .keys = &.{"inline"} };
+        request.commands = &.{ .{ .kind = .put, .key = "inline", .value = "embedded" }, .{ .kind = .put, .key = "page", .value = "ordered" } };
+        const next = (try std.json.parseFromSlice(Header, m, try ctx.execute(request), .{ .ignore_unknown_fields = true })).value;
+        ctx.alloc = a;
+        const values = try ctx.readSnapshotValuesAlloc(backend, next.state, &.{ "page", "missing", "inline", "page" }, .{});
+        defer {
+            for (values) |value| if (value) |bytes| a.free(bytes);
+            a.free(values);
+        }
+        try std.testing.expectEqualStrings("ordered", values[0].?);
+        try std.testing.expectEqual(null, values[1]);
+        try std.testing.expectEqualStrings("embedded", values[2].?);
+        try std.testing.expectEqualStrings("ordered", values[3].?);
+        values[0].?[0] = 'O';
+        try std.testing.expectEqualStrings("ordered", values[3].?);
+    }
 }

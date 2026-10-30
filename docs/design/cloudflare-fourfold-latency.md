@@ -6,6 +6,15 @@ implementation of these next steps after the 2026-10-29 short paired workload.
 This file records the target and safety constraints; an implementation or local
 measurement is not a claim of hosted qualification.
 
+The next opt-in implementation and its measurement contract live in
+[compact serving blocks and deferred folding](serverless-compact-serving-blocks.md):
+shared immutable-forest packing, authenticated inline point routing, bounded
+HEAD deltas with guarded background folding, typed metadata reads, native I/O
+batches, and independent compute/storage placement probes. The same document
+records the October 30 discovery of missing local evidence binaries and the
+hash-identical control rebuild. Earlier full-closure verification statements
+below describe their recorded verification time, not current file availability.
+
 ## Starting evidence and target
 
 Sealed candidate `543a3ea27a` measured read p95 2,167 ms and write p95 2,669 ms

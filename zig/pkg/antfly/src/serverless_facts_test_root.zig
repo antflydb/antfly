@@ -21,6 +21,7 @@ test {
     _ = @import("serverless/query/read_state_cache.zig");
     _ = @import("serverless/wal/write_plan.zig");
     _ = @import("serverless/wal/indexed_object_store.zig");
+    _ = @import("serverless/wal/collector.zig");
     _ = @import("serverless/hosted_reindex.zig");
     _ = @import("serverless/text_segment/paged.zig");
     _ = @import("serverless/sparse_segment/paged.zig");
@@ -47,6 +48,8 @@ test {
     _ = @import("serverless/catalog/object_progress_store.zig");
     _ = @import("serverless/enrichment/worker.zig");
 }
+
+pub const antfly_sources = @import("source_owner_physical.zig");
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

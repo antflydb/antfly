@@ -43,6 +43,7 @@ import {openAuthority, activateR2,coordinatorAuthorityMode,isObjectStoreAuthorit
 import {DurableObject} from "cloudflare:workers";
 import module from "./dist/antfly-serverless.wasm";
 import {AuthorityAdmission} from "./authority-admission.mjs";
+import {placementStorageProbe} from "./placement-probe.mjs";
 import {placementEnv} from "./runtime-placement.mjs";
 import {R2CoordinatorStore} from "./r2-coordinator-store.mjs";
 import {migrateCoordinator, MIGRATION} from "./r2-coordinator-migration.mjs";
@@ -275,7 +276,7 @@ export class R2CommitCoordinator extends DurableObject {
       const dependencies=retained?this.optimisticWal.dependencies(view,keys.wal,encode):[];
       const transport=this.store.dataCache.wrap(withCommitCoordinator(edgeCacheForEnv(this.env,{background:promise=>this.ctx.waitUntil(promise),budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical)),prepared),this.env.ANTFLY_INCARNATION,{preserveProtected:this.env.FOREGROUND_CACHE_POLICY==="true"});
 
-      let result;try{result=await trace.span("wal_prepare",()=>buildKernel.request({op:"mutate",...(this.env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(this.env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}),wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:walWorkingBytes,mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-usedOperations,maxTransferBytes:32*1024*1024-usedBytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,...sample,physical}));}}));}catch(error){if(retained&&/^(FileNotFound|ObjectNotFound)$/.test(error?.message)){this.optimisticWal.clear();continue;}throw error;}
+      let result;try{result=await trace.span("wal_prepare",()=>buildKernel.request({op:"mutate",...(this.env.WAL_DEFERRED_INDEXES==="true"?{wal_deferred_indexes:true}:{}),...(this.env.WAL_PACKED_PAGES==="true"?{wal_packed_pages:true}:{}),...(this.env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(this.env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}),wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:walWorkingBytes,mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-usedOperations,maxTransferBytes:32*1024*1024-usedBytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,...sample,physical}));}}));}catch(error){if(retained&&/^(FileNotFound|ObjectNotFound)$/.test(error?.message)){this.optimisticWal.clear();continue;}throw error;}
       // Replays still take fresh authority admission; a cached receipt never
       // substitutes for current namespace/fencing validation.
       if(retained&&!prepared.head){this.optimisticWal.clear();continue;}
@@ -303,6 +304,7 @@ export class R2CommitCoordinator extends DurableObject {
     }
     throw new Error("WalCommitContended");
   }
+  placementProbe(){return placementStorageProbe(this.env,"writer",this.ctx.id.jurisdiction??null);}
   async commitNativeWritePlan(inputs,deadline,{trace,compactWal,walWorkingBytes}) {
     const started=performance.now();
     try{
@@ -317,7 +319,7 @@ export class R2CommitCoordinator extends DurableObject {
       if(ioBudget.operations>=1024||ioBudget.bytes>=32*1024*1024)throw Error("CoordinatorIoBudgetExceeded");
       let prepared,wave,permit;
       try{
-        const request={op:"mutate",...(this.env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(this.env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}),namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",working_set_bytes:walWorkingBytes,native_write_plan:{...(this.store.rootBackend!=="journal"?{metadata_backend:this.store.rootBackend}:{}),state:structuredClone(this.store.state),metadata_namespace:this.store.namespace,reservation_id:crypto.randomUUID()},mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))};
+        const request={op:"mutate",...(this.env.WAL_DEFERRED_INDEXES==="true"?{wal_deferred_indexes:true}:{}),...(this.env.WAL_PACKED_PAGES==="true"?{wal_packed_pages:true}:{}),...(this.env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(this.env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}),namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",working_set_bytes:walWorkingBytes,native_write_plan:{...(this.store.rootBackend!=="journal"?{metadata_backend:this.store.rootBackend}:{}),state:structuredClone(this.store.state),metadata_namespace:this.store.namespace,reservation_id:crypto.randomUUID()},mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))};
         const options=()=>({transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-ioBudget.operations,maxTransferBytes:32*1024*1024-ioBudget.bytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{ioBudget.operations+=sample.operations;ioBudget.bytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,native_write_plan:true,...sample,physical}));}});
         if(this.env.NATIVE_WRITE_READ_AHEAD==="true")permit=readAheadBudgetFor(buildKernel,Math.min(4,buildKernel.slots.length)).tryAcquire(this.env.ANTFLY_INCARNATION);
         if(permit){

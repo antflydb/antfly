@@ -18,9 +18,9 @@
 import{captureReadView}from"./read-view.mjs";
 import{publicationKeyAllowed}from"./publication-view.mjs";
 export class PreparedPublication {
- constructor(initial,{read}={}){
+ constructor(initial,{read,foldWal=false}={}){
   if(![2,3].includes(initial?.format)||!initial.lease)throw Error("InvalidPublicationSession");
-  this.format=initial.format;this.read=read;this.keys=initial.entries.map(([key])=>key);
+  this.format=initial.format;this.foldWal=foldWal===true;this.read=read;this.keys=initial.entries.map(([key])=>key);
   this.initial=new Map(initial.entries);this.records=new Map(initial.entries);this.expected=new Map();this.writes=new Map();this.lease=initial.lease;this.bytes=0;
   for(const[key,record]of initial.entries.slice(0,5))if(!/\/wal-v1\//.test(key))this.expected.set(key,record?.etag??null);
  }
@@ -42,7 +42,9 @@ export class PreparedPublication {
    return{status:0,json:{bucket:request.bucket,key,etag:previous.etag,content_length:previous.body.byteLength,content_type:previous.contentType},body:request.op==="get"?previous.body.slice():undefined};
   }
   const allowedWrite=this.format===3?publicationKeyAllowed(this.keys,key):/(?:\/HEAD|\/(?:READ_PINS|DOC_OFFSETS)\/[0-9]+)$/.test(key);
-  if(request.op!=="put"||!allowedWrite||/\/wal-v1\//.test(key)||request.collection!=null)return{status:3};
+  const walFold=this.foldWal&&key===this.keys[1]&&previous!=null&&request.if_match_etag===previous.etag&&!request.if_none_match;
+  if(request.op!=="put"||!allowedWrite||/\/wal-v1\//.test(key)&&!walFold||request.collection!=null)return{status:3};
+  if(walFold)this.expected.set(key,this.initial.get(key)?.etag??null);
   if(request.guard_key!=null||request.guard_etag!=null){
    if(this.format!==3||request.guard_key!==this.keys[0]||typeof request.guard_etag!=="string")return{status:3};
    if(this.records.get(request.guard_key)?.etag!==request.guard_etag)return{status:2};
@@ -54,24 +56,32 @@ export class PreparedPublication {
   if(bytes>32768||this.writes.size>=8&&!this.writes.has(key))throw Error("PublicationBatchExceeded");
   this.bytes=bytes;this.records.set(key,record);this.writes.set(key,record);return{status:0,json:{etag:record.etag}};
  }
- batch(){return{...(this.format===3?{format:3}:{}),lease:this.lease,expected:[...this.expected],writes:[...this.writes]};}
+ batch(){return{...(this.format===3?{format:3}:{}),...(this.writes.has(this.keys[1])?{wal_fold:true}:{}),lease:this.lease,expected:[...this.expected],writes:[...this.writes]};}
 }
 export async function applyPublication(tx,keys,batch,{clock=Date.now}={}){
  if(!batch||!Array.isArray(batch.expected)||batch.expected.length>16||!Array.isArray(batch.writes)||batch.writes.length>8)throw Error("InvalidPublicationBatch");
  const allowed=new Set(keys),permits=key=>allowed.has(key)||batch.format===3&&publicationKeyAllowed(keys,key),expected=new Map(batch.expected);
  if(expected.size!==batch.expected.length||keys.slice(0,5).filter(key=>!/\/wal-v1\//.test(key)).some(key=>!expected.has(key)))throw Error("InvalidPublicationReadSet");
  const values=await tx.getMany([...expected.keys()]);
- for(const[[key,etag],i]of [...expected].map((row,i)=>[row,i]))if(!permits(key)||(values[i]?.etag??null)!==etag)throw Error("PublicationConflict");
+ if(batch.wal_fold!=null&&batch.wal_fold!==true||batch.wal_fold===true&&(!expected.has(keys[1])||!batch.writes.some(([key])=>key===keys[1])))throw Error("InvalidPublicationBatch");
+ const isWalFold=key=>batch.wal_fold===true&&key===keys[1];
+ for(const[[key,etag],i]of [...expected].map((row,i)=>[row,i]))if(!permits(key)||!isWalFold(key)&&(values[i]?.etag??null)!==etag)throw Error("PublicationConflict");
  let bytes=0;const written=new Set();
  for(const [key,record]of batch.writes){
-  if(!permits(key)||!expected.has(key)||written.has(key)||!(batch.format===3?publicationKeyAllowed(keys,key):/(?:\/HEAD|\/(?:READ_PINS|DOC_OFFSETS)\/[0-9]+)$/.test(key))||/\/wal-v1\//.test(key)||!(record?.body instanceof Uint8Array)||record.body.byteLength>4096||typeof record.etag!=="string"||(record.etag.length<1||record.etag.length>64)||record.contentType!=null&&(typeof record.contentType!=="string"||record.contentType.length>4096))throw Error("InvalidPublicationBatch");
+  if(!permits(key)||!expected.has(key)||written.has(key)||!(batch.format===3?publicationKeyAllowed(keys,key):/(?:\/HEAD|\/(?:READ_PINS|DOC_OFFSETS)\/[0-9]+)$/.test(key))||/\/wal-v1\//.test(key)&&!isWalFold(key)||!(record?.body instanceof Uint8Array)||record.body.byteLength>4096||typeof record.etag!=="string"||(record.etag.length<1||record.etag.length>64)||record.contentType!=null&&(typeof record.contentType!=="string"||record.contentType.length>4096))throw Error("InvalidPublicationBatch");
   if(/\/READ_PINS\//.test(key)){
    const value=new TextDecoder().decode(record.body).trim(),prior=values[[...expected.keys()].indexOf(key)];
    if(!/^(0|[1-9][0-9]{0,19})$/.test(value)||BigInt(value)>18446744073709551615n||prior&&BigInt(value)<BigInt(new TextDecoder().decode(prior.body).trim()))throw Error("InvalidPublicationPin");
   }
   bytes+=record.body.byteLength;if(bytes>32768)throw Error("PublicationBatchExceeded");written.add(key);
  }
- for(const[key,record]of batch.writes)tx.put(key,record);
+ for(const[key,record]of batch.writes){
+  // Folding does not change the logical prefix. A concurrent append keeps
+  // its current WAL authority; publication can still consume its captured
+  // immutable prefix. Abandoned fold uploads remain ordinary GC garbage.
+  if(isWalFold(key)&&(values[[...expected.keys()].indexOf(key)]?.etag??null)!==expected.get(key))continue;
+  tx.put(key,record);
+ }
  // Establish read protection in the SAME authoritative transaction as HEAD.
  // Otherwise the first reader of every new generation must acquire a writable
  // admission and wait behind publication/maintenance despite an immutable read.

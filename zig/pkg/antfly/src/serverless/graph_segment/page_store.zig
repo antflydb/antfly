@@ -31,7 +31,29 @@ pub const ReadCache = struct {
     read: *const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, refs.ArtifactRef, u64, usize, [32]u8, CancellationToken, *u64) anyerror![]u8,
 };
 
+/// One request-owned small physical block. Never shared with parallel workers
+/// or retained beyond the caller's native memory reservation.
+pub const PackReadCache = struct {
+    allocator: ?std.mem.Allocator = null,
+    entry: ?struct { allocator: std.mem.Allocator, domain: [32]u8, attempt: [16]u8, digest: [32]u8, bytes: []u8 } = null,
+    directory: ?struct { allocator: std.mem.Allocator, bytes: []u8 } = null,
+    pub fn clearPack(self: *@This()) void {
+        if (self.entry) |value| value.allocator.free(value.bytes);
+        self.entry = null;
+    }
+    pub fn clearDirectory(self: *@This()) void {
+        if (self.directory) |value| value.allocator.free(value.bytes);
+        self.directory = null;
+    }
+    pub fn deinit(self: *@This()) void {
+        self.clearPack();
+        self.clearDirectory();
+    }
+};
+
 pub const PageStore = struct {
+    pack_cache: ?*PackReadCache = null,
+    inline_page: ?struct { ref: tree.Ref, bytes: []const u8 } = null,
     domain: [32]u8 = @splat(0),
     prefix_keys: bool = false,
     value_prefix: ?tree.ValuePrefix = null,
@@ -148,6 +170,39 @@ pub const PageStore = struct {
         return bytes;
     }
     fn read(self: *PageStore, alloc: std.mem.Allocator, ref: tree.Ref, id: []const u8) ![]u8 {
+        if (self.inline_page) |page| if (page.ref.eql(ref)) {
+            try self.cancellation.check();
+            try artifacts.chargeReadBudget(self.remaining_read_bytes, ref.bytes);
+            return alloc.dupe(u8, page.bytes);
+        };
+        if (self.pack_cache) |cache| if (ref.pack) |location| {
+            try self.cancellation.check();
+            if (cache.entry) |entry| if (entry.bytes.len == location.bytes and std.mem.eql(u8, &entry.domain, &self.domain) and std.mem.eql(u8, &entry.attempt, &ref.attempt) and std.mem.eql(u8, &entry.digest, &location.digest)) {
+                try artifacts.chargeReadBudget(self.remaining_read_bytes, ref.bytes);
+                return alloc.dupe(u8, entry.bytes[location.offset..][0..ref.bytes]);
+            };
+            const owner = cache.allocator orelse alloc;
+            const headroom = @import("../build/lake_build_limits.zig").WorkingSetAllocator.cacheHeadroom(owner) orelse std.math.maxInt(usize);
+            // Physical-block caching is optional. Leave room for the selected
+            // page and its decoder; the 128 KiB point lane must use ranges
+            // instead of failing an allocation for unrelated sibling pages.
+            const workspace = @as(usize, location.bytes) +| ref.bytes +| tree.readWorkspace(ref);
+            if (location.bytes <= tree.Forest.max_bytes + tree.max_write_batch * 4096 and location.bytes <= self.remaining_read_bytes.* and workspace <= headroom) {
+                const bytes = if (self.read_cache) |shared|
+                    try shared.read(shared.ptr, owner, self.artifacts, .{ .kind = .graph_segment, .artifact_id = id, .checksum = id[7..71], .byte_len = location.bytes }, 0, location.bytes, location.digest, self.cancellation, self.remaining_read_bytes)
+                else block: {
+                    try artifacts.chargeReadBudget(self.remaining_read_bytes, location.bytes);
+                    break :block try self.artifacts.getRangeAllocWithCancellationUsingAllocator(owner, id, 0, location.bytes, self.cancellation);
+                };
+                errdefer owner.free(bytes);
+                if (bytes.len != location.bytes) return error.ArtifactIntegrityMismatch;
+                try artifacts.validatePayloadSha256WithCancellation(bytes, id[7..71], self.cancellation);
+                const page = try alloc.dupe(u8, bytes[location.offset..][0..ref.bytes]);
+                cache.clearPack();
+                cache.entry = .{ .allocator = owner, .domain = self.domain, .attempt = ref.attempt, .digest = location.digest, .bytes = bytes };
+                return page;
+            }
+        };
         if (self.read_cache) |cache| return cache.read(cache.ptr, alloc, self.artifacts, .{
             .kind = .graph_segment,
             .artifact_id = id,
@@ -160,6 +215,11 @@ pub const PageStore = struct {
 
     fn readDecoded(raw: *anyopaque, a: std.mem.Allocator, ref: tree.Ref) !tree.Page {
         const self: *PageStore = @ptrCast(@alignCast(raw));
+        if ((ref.pack != null and self.pack_cache != null) or (if (self.inline_page) |page| page.ref.eql(ref) else false)) {
+            var plain = self.store();
+            plain.decoded_page = null;
+            return tree.readPage(a, plain, ref);
+        }
         const cache = self.read_cache.?;
         return cache.decoded_read.?(cache.ptr, a, self.artifacts, self.domain, ref, self.cancellation, self.remaining_read_bytes);
     }
@@ -204,6 +264,8 @@ pub const PageStore = struct {
             budgets[i] = ref.bytes;
             copies[i] = self.*;
             copies[i].io = null;
+            copies[i].pack_cache = null;
+            copies[i].inline_page = null;
             copies[i].remaining_read_bytes = &budgets[i];
             stores_[i] = copies[i].store();
         }

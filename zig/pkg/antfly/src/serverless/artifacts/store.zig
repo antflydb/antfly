@@ -265,6 +265,7 @@ pub const ArtifactStore = struct {
     pack_document_bodies: bool = false,
     inline_point_bodies: bool = false,
     canonical_point_bodies: bool = false,
+    point_read_blocks: bool = false,
     /// The host guarantees that replacement owners resolve the same immutable namespace.
     shared_across_owners: bool = false,
     namespace_identity: ?[32]u8 = null,

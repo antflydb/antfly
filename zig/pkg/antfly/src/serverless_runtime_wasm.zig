@@ -17,6 +17,8 @@ const std = @import("std");
 const objects = @import("objectstore");
 const wasm_allocator = std.heap.wasm_allocator;
 var working_set_peak: usize = 0;
+var rejected_growth: usize = 0;
+var backing_failure: usize = 0;
 var decoded_manifests: @import("serverless/manifest/decoded_cache.zig").Cache = .{};
 var shared_read_leases: @import("serverless/manifest/read_lease.zig").Cache = .{};
 var prepared_reads: @import("serverless/query/read_plan.zig").PreparedCache = .{};
@@ -62,6 +64,14 @@ export fn antfly_host_read_state_cache_extensions() u64 {
 }
 pub fn resetWorkingSetMetrics() void {
     working_set_peak = 0;
+    rejected_growth = 0;
+    backing_failure = 0;
+}
+export fn antfly_host_rejected_growth_bytes() usize {
+    return rejected_growth;
+}
+export fn antfly_host_backing_failure_bytes() usize {
+    return backing_failure;
 }
 export fn antfly_host_working_set_peak_bytes() usize {
     return working_set_peak;
@@ -135,7 +145,13 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
     if (maximum < 4096 or maximum > 20 * 1024 * 1024) return error.InvalidHostedWorkingSetBudget;
     var working = try @import("serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(wasm_allocator, .{ .max_working_set_bytes = maximum });
     working_set_peak = 0;
-    defer working_set_peak = working.peak_live_bytes;
+    rejected_growth = 0;
+    backing_failure = 0;
+    defer {
+        working_set_peak = working.peak_live_bytes;
+        rejected_growth = working.largest_rejected_growth;
+        backing_failure = working.largest_backing_failure;
+    }
     const result = executeAdditional(working.allocator(), raw) catch |err| {
         if (err == error.OutOfMemory and working.limit_exceeded) return error.HostedWorkingSetBudgetExceeded;
         return err;
@@ -152,6 +168,9 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         pack_small_bodies: bool = false,
         inline_point_bodies: bool = false,
         canonical_point_bodies: bool = false,
+        point_read_blocks: bool = false,
+        wal_packed_pages: bool = false,
+        wal_deferred_indexes: bool = false,
         bounded_manifest_reads: bool = false,
         native_write_plan: ?@import("serverless/wal/write_plan.zig").Input = null,
         native_write_read_ahead: bool = false,
@@ -257,6 +276,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     artifacts.pack_document_bodies = req.pack_small_bodies;
     artifacts.inline_point_bodies = req.inline_point_bodies;
     artifacts.canonical_point_bodies = req.canonical_point_bodies;
+    artifacts.point_read_blocks = req.point_read_blocks;
     defer artifacts.deinit();
     const manifest_prefix = try std.fmt.allocPrint(a, "{s}/manifests", .{req.prefix});
     defer a.free(manifest_prefix);
@@ -273,6 +293,8 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     indexed_wal.inline_tail_enabled = req.wal_inline_tail;
     indexed_wal.read_state_enabled = req.native_read_state;
     indexed_wal.document_index_enabled = req.wal_document_index;
+    indexed_wal.packed_pages_enabled = req.wal_packed_pages;
+    indexed_wal.deferred_indexes_enabled = req.wal_deferred_indexes;
     var wal = indexed_wal.walStore();
     const reindex_registry = @import("serverless/hosted_reindex.zig").Registry{ .client = host.client(), .bucket = req.bucket, .prefix = req.prefix, .namespace = req.namespace, .store = &artifacts };
     if (req.op == .reindex) return (@import("serverless/hosted_reindex.zig").Context{ .alloc = a, .registry = reindex_registry, .manifests = &manifests, .progress = &progress, .wal = &wal, .io = host_io, .cancellation = .{ .io = host_io, .cooperative = cancellation } }).run(req.reindex_action, req.reindex_job_id, req.reindex_records);
@@ -427,10 +449,11 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
             .ttl_ns = 30 * std.time.ns_per_s,
         } else null;
         if (req.publication_continuations) {
-            if (try (@import("serverless/hosted_publication_plan.zig").Context{ .alloc = a, .registry = publication_registry, .manifests = &manifests, .progress = &progress, .wal = &wal, .io = host_io, .cancellation = .{ .io = host_io, .cooperative = cancellation }, .policy = .{ .chunk_embeddings_enabled = req.enrichment, .chunk_embeddings_model_preference = .require_model }, .force = req.publication_continuation_force, .adaptive_slices = req.publication_adaptive_slices, .max_posting_units = req.publication_max_units, .prepare_slices = req.publication_prepared_slices, .prepared_lease = if (held) |*value| value else null, .batch_probe_records = if (req.publication_batch_probe) @min(64, @max(1, req.publication_records)) else null }).run(req.publication_action, req.publication_job_id, req.publication_units)) |result| return result;
+            if (try (@import("serverless/hosted_publication_plan.zig").Context{ .alloc = a, .registry = publication_registry, .manifests = &manifests, .progress = &progress, .wal = &wal, .io = host_io, .cancellation = .{ .io = host_io, .cooperative = cancellation }, .policy = .{ .chunk_embeddings_enabled = req.enrichment, .chunk_embeddings_model_preference = .require_model }, .force = req.publication_continuation_force, .adaptive_slices = req.publication_adaptive_slices, .max_posting_units = req.publication_max_units, .prepare_slices = req.publication_prepared_slices, .deferred_wal_maintenance = req.wal_deferred_indexes, .prepared_lease = if (held) |*value| value else null, .batch_probe_records = if (req.publication_batch_probe) @min(64, @max(1, req.publication_records)) else null }).run(req.publication_action, req.publication_job_id, req.publication_units)) |result| return result;
             if (req.publication_batch_probe) return error.PublicationNeedsPreparedBatch;
         }
         var builder = @import("serverless/build/builder.zig").Builder.init(a, &artifacts, &manifests, &progress, &wal);
+        builder.deferred_wal_maintenance = req.wal_deferred_indexes;
         builder.setIo(host_io);
         builder.paged_text = req.paged_text;
         builder.paged_projections = req.paged_projections;

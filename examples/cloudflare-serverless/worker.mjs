@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {placementProbe} from "./placement-probe.mjs";
 import {reserveInput} from "./request-pool.mjs";
 import {enableAppReads,readerKernel,sharedCache,kernelMetrics} from "./kernels.mjs";
 import {directReadViews} from "./direct-read-views.mjs";
@@ -24,7 +25,7 @@ import {tenantEnv,tenantEnvs} from "./tenants.mjs";
 import {managedMaintenance} from "./maintenance-tickets.mjs";
 import {createRuntime,Busy} from "./runtime.mjs";
 import {runtimeName,readerSlots,readerSlot,readOperations} from "./runtime-routing.mjs";
-import {unsupportedRpc,retryableRuntimeFailure} from "./performance.mjs";
+import {unsupportedRpc,retryableRuntimeFailure,resourceFailureCode} from "./performance.mjs";
 import {collect} from "./collect.mjs";
 import {pruneEmbeddingCheckpoints} from "./embedding-checkpoints.mjs";
 export {configureKernels} from "./kernels.mjs";
@@ -112,6 +113,9 @@ export default {
     if (request.method === "GET" && path === "/" && env.ASSETS) return env.ASSETS.fetch(request);
     if (!env.API_TOKEN || request.headers.get("Authorization") !== `Bearer ${env.API_TOKEN}`)
       return new Response("unauthorized", { status: 401 });
+    if(request.method==="POST"&&path==="/_qualification/placement"&&env.QUALIFICATION_PLACEMENT_PROBE==="true"){
+      try{const selected=tenantEnv(env,request.headers.get("X-Antfly-Tenant")??undefined);return Response.json(await placementProbe(request,selected),{headers:{"Cache-Control":"no-store"}});}catch(error){const code=resourceFailureCode(error);if(code)console.error(JSON.stringify({event:"antfly.placement_failure",failure_code:code}));return Response.json({error:"PlacementProbeFailed",...(code?{failure_code:code}:{})},{status:503});}
+    }
     if (request.method !== "POST" || !["/api", "/ai"].includes(path)) return new Response("not found", { status: 404 });
     if(admitted>=(env.SPLIT_RUNTIME==="true"?32:env.READERS&&env.BUILDERS?16:8))return Response.json({error:"database is busy"},{status:503,headers:{"Retry-After":"1"}});
     admitted++;

@@ -1218,3 +1218,24 @@ test('native bounded idle revalidation overlaps reads and charges every child to
  await assert.rejects(host.request(expired,{maxOperations:1,maxTransferBytes:65536}),/ObjectIoBudgetExceeded/);assert.equal(seen.length,0);
  await assert.rejects(host.request(expired,{maxOperations:8,maxTransferBytes:1024}),/ObjectIoBudgetExceeded/);assert.equal(seen.length,0);
 });
+
+
+for(const namespace of ['tenant/table/incarnation1','trace','packed-stress'])test(`packed native WAL and point blocks preserve receipts newer fences and deletes after disabling activation (${namespace})`,async()=>{
+ const native=(op,args={})=>request(op,{namespace,...args});
+ const{host,bucket,transport}=await setup(),flags={wal_deferred_indexes:true,wal_packed_pages:true,point_read_blocks:true,canonical_point_bodies:true,wal_inline_tail:true},body=i=>JSON.stringify({text:'packed '+i,payload:'x'.repeat(1024)}),mutation=native('mutate',{...flags,operation_id:'packed-seed',mutations:Array.from({length:64},(_,i)=>({kind:'upsert',doc_id:'doc/'+i,body:body(i)}))}),first=await host.request(mutation);
+ while((await host.request(native('publish',flags))).has_more){}
+ const reopened=await instantiateHost(module,transport);for(const i of[0,31,63])assert.equal((await reopened.request(native('lookup',{doc_id:'doc/'+i,required_visibility:first.visibility}))).body,body(i));
+ assert.equal((await reopened.request(mutation)).visibility,first.visibility);
+ const deleted=await reopened.request(native('mutate',{operation_id:'packed-delete',mutations:[{kind:'delete',doc_id:'doc/31'}]}));assert.equal((await reopened.request(native('lookup',{doc_id:'doc/31',required_visibility:deleted.visibility}))).body,null);
+ while((await reopened.request(native('publish'))).has_more){}assert.equal((await reopened.request(native('count'))).count,'63');
+ const heads=[...bucket.objects].filter(([key])=>key.includes('/wal-v1/')&&key.endsWith('/HEAD'));assert.equal(heads.length,1);assert.equal(JSON.parse(new TextDecoder().decode(heads[0][1].body)).format,6);
+});
+
+test('packed WAL ranges remain bounded after a 512-document publication and sixteen pending updates',async()=>{
+ const{host,transport}=await setup(),flags={wal_packed_pages:true,point_read_blocks:true,canonical_point_bodies:true,wal_inline_tail:true,native_read_state:true},body=i=>JSON.stringify({text:'document '+i,payload:'x'.repeat(1024)});
+ for(let start=0;start<512;start+=64){await host.request(request('mutate',{...flags,operation_id:'seed/'+start,mutations:Array.from({length:64},(_,j)=>({kind:'upsert',doc_id:'doc/'+(start+j),body:body(start+j)}))}));while((await host.request(request('publish',flags))).has_more){}}
+ const reader=await instantiateHost(module,async(req,body)=>req.op==='read_view_barrier'?{}:transport(req,body));
+ const first=await reader.request(request('lookup',{...flags,doc_id:'doc/0',native_read_plan_mode:true}));assert.ok(first.__read_plan);
+ for(let i=0;i<16;i++)await host.request(request('mutate',{...flags,operation_id:'update/'+i,mutations:[{kind:'upsert',doc_id:'doc/0',body:JSON.stringify({text:'new '+i})}]}));
+ for(let i=0;i<8;i++)assert.equal((await reader.request(request('lookup',{...flags,doc_id:'doc/0',native_read_plan_mode:true,native_read_plan:first.__read_plan,working_set_bytes:128*1024}))).body,'{"text":"new 15"}');
+});

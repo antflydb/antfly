@@ -242,6 +242,8 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
         read_state_cache_extensions: Number(wasm.antfly_host_read_state_cache_extensions?.() ?? 0)-readStateExtensionsBefore,
         prepared_read_cache_bytes: wasm.antfly_host_prepared_read_cache_bytes?.() ?? 0,
         decoded_manifest_cache_bytes: wasm.antfly_host_manifest_cache_bytes?.() ?? 0,
+        working_set_rejected_growth_bytes: wasm.antfly_host_rejected_growth_bytes?.() ?? null,
+        working_set_backing_failure_bytes: wasm.antfly_host_backing_failure_bytes?.() ?? null,
         working_set_peak_bytes: wasm.antfly_host_working_set_peak_bytes?.() ?? null});
       // Observation must never alter an accepted mutation or poison its lane.
       try { requestMetrics(metrics); } catch {}

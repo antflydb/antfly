@@ -32,6 +32,9 @@ const CliConfig = struct {
     indexed_wal: ?bool = null,
     native_read_state: ?bool = null,
     wal_document_index: ?bool = null,
+    wal_packed_pages: ?bool = null,
+    wal_deferred_indexes: ?bool = null,
+    point_read_blocks: ?bool = null,
     wal_gc: ?bool = null,
     progress_uri: ?[]const u8 = null,
     catalog_uri: ?[]const u8 = null,
@@ -171,6 +174,9 @@ pub fn runFromIterator(
         .indexed_wal = cli.indexed_wal orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_INDEXED_WAL", false),
         .native_read_state = cli.native_read_state orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_NATIVE_READ_STATE", false),
         .wal_document_index = cli.wal_document_index orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_DOCUMENT_INDEX", false),
+        .wal_packed_pages = cli.wal_packed_pages orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_PACKED_PAGES", false),
+        .wal_deferred_indexes = cli.wal_deferred_indexes orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_DEFERRED_INDEXES", false),
+        .point_read_blocks = cli.point_read_blocks orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_POINT_READ_BLOCKS", false),
         .wal_gc = cli.wal_gc orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_GC", false),
         .s3_options = configured_uris.s3_options,
         .gcs_options = configured_uris.gcs_options,
@@ -358,6 +364,18 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
         }
         if (std.mem.eql(u8, arg, "--native-read-state")) {
             cfg.native_read_state = try parseBoolArg(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--wal-deferred-indexes")) {
+            cfg.wal_deferred_indexes = try parseBoolArg(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--wal-packed-pages")) {
+            cfg.wal_packed_pages = try parseBoolArg(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--point-read-blocks")) {
+            cfg.point_read_blocks = try parseBoolArg(args.next() orelse return error.InvalidArguments);
             continue;
         }
         if (std.mem.eql(u8, arg, "--wal-document-index")) {
@@ -733,6 +751,9 @@ fn printUsage(argv0: []const u8) void {
         \\  --catalog-uri <uri>
         \\  --indexed-wal <bool> (requires an indexed or empty WAL prefix)
         \\  --native-read-state <bool>
+        \\  --wal-deferred-indexes <bool>
+        \\  --wal-packed-pages <bool>
+        \\  --point-read-blocks <bool>
         \\  --wal-document-index <bool>
         \\  --wal-gc <bool> (managed indexed WAL, new prefix only)
         \\  --query-cache-dir <path>

@@ -70,7 +70,7 @@ async function fixture(){
  const native=(tx,op,lease,owner=lease?.owner)=>leaseHost.request(req(op,{publication_owner:owner,publication_lease:lease??null}),{transport:withCommitCoordinator(raw,{objectCall:(request,body)=>metadataObjectCall(tx,request,body)})});
  const begin=(continuations=false)=>store.transaction(async tx=>{const lease=await native(tx,"publication_acquire",null,crypto.randomUUID());await captureReadView(tx,keys,{},()=>now);return{format:continuations?3:2,lease,entries:await publicationSnapshot(tx,await publicationKeys(namespace,continuations))};});
  const finish=batch=>store.transaction(async tx=>{await native(tx,"publication_validate",batch.lease);await applyPublication(tx,(await publicationSnapshot(tx,await publicationKeys(namespace,batch.format===3))).map(([key])=>key),batch,{clock:()=>now});assert.equal((await native(tx,"publication_release",batch.lease)).released,true);});
- const prepare=async(initial,options={})=>{const prepared=new PreparedPublication(initial,{read:(request,body)=>store.transaction(tx=>metadataObjectCall(tx,request,body))}),build=await instantiateHost(module,withCommitCoordinator(raw,prepared),{clock:()=>now});const result=await build.request(req("publish",{publication_continuations:initial.format===3,...options,publication_lease:initial.lease}));return{prepared,result};};
+ const prepare=async(initial,options={})=>{const prepared=new PreparedPublication(initial,{foldWal:options.wal_deferred_indexes===true,read:(request,body)=>store.transaction(tx=>metadataObjectCall(tx,request,body))}),build=await instantiateHost(module,withCommitCoordinator(raw,prepared),{clock:()=>now});const result=await build.request(req("publish",{publication_continuations:initial.format===3,...options,publication_lease:initial.lease}));return{prepared,result};};
  const mutate=id=>host.request(req("mutate",{operation_id:id,mutations:[{kind:"upsert",doc_id:id,body:JSON.stringify({text:"durable "+id})}]}));
  return{bucket,keys,pk,req,host,begin,finish,prepare,mutate,native,clock:()=>now,store:()=>store,tick:ms=>now+=ms,lose:()=>lose=true,reopen:()=>store=new R2CoordinatorStore(module,bucket,namespace,{clock:()=>now,transport})};
 }
@@ -257,4 +257,19 @@ test("prepared continuation guards cannot escape their namespace or overwrite a 
  assert.equal((await p.objectCall({op:"put",key:keys[5],guard_key:keys[0],guard_etag:"head",if_none_match:true},utf8.encode("pointer"))).status,0);
  const map=new Map(records),tx={getMany:async keys=>keys.map(key=>map.get(key)),get:async key=>map.get(key),put:(key,value)=>map.set(key,value)};
  map.set(keys[5],{etag:"concurrent",body:utf8.encode("other")});await assert.rejects(applyPublication(tx,keys,p.batch()),/PublicationConflict/);
+});
+
+for(const continuations of[false,true])test(`deferred WAL fold finalization preserves concurrent appends and replay (continuations=${continuations})`,async()=>{
+ const f=await fixture(),seed=f.req("mutate",{wal_deferred_indexes:true,wal_packed_pages:true,operation_id:"seed",mutations:[{kind:"upsert",doc_id:"seed",body:'{"text":"first"}'}]}),receipt=await f.host.request(seed);
+ const initial=await f.begin(continuations),{prepared,result}=await f.prepare(initial,{wal_deferred_indexes:true});
+ assert.equal(result.published,true);assert.equal(prepared.batch().wal_fold,true);
+ const forbidden=new PreparedPublication(initial),old=initial.entries.find(([key])=>key===f.keys.wal)[1];
+ assert.equal((await forbidden.objectCall({op:"put",key:f.keys.wal,if_match_etag:old.etag},old.body)).status,3);
+ await f.mutate("later");const concurrent=await f.store().transaction(tx=>tx.get(f.keys.wal));
+ await f.finish(prepared.batch());
+ const after=await f.store().transaction(tx=>tx.get(f.keys.wal));assert.equal(after.etag,concurrent.etag,"stale fold must leave the appended WAL untouched");
+ assert.equal((await f.host.request(f.req("count"))).count,"2");assert.equal((await f.host.request(seed)).visibility,receipt.visibility);
+ const next=await f.begin(continuations),fold=await f.prepare(next,{wal_deferred_indexes:true});assert.equal(fold.prepared.batch().wal_fold,true);await f.finish(fold.prepared.batch());
+ const final=JSON.parse(text.decode((await f.store().transaction(tx=>tx.get(f.keys.wal))).body));assert.equal(final.latest_lsn,2);assert.equal(final.deferred_tail,undefined);
+ assert.equal((await f.host.request(f.req("lookup",{doc_id:"later"}))).body,'{"text":"durable later"}');
 });

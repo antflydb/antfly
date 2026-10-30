@@ -54,6 +54,12 @@ const Meta = struct {
     cursor: Cursor = .{},
     marked: u64 = 0,
     deleted: u64 = 0,
+    physical_marks: u64 = 0,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        // Preserve the original job envelope for old, unpacked collections.
+        if (self.format == 1) return writer.write(.{ .format = self.format, .id = self.id, .retired = self.retired, .phase = self.phase, .next = self.next, .done = self.done, .child_offset = self.child_offset, .versions = self.versions, .cursor = self.cursor, .marked = self.marked, .deleted = self.deleted });
+        return writer.write(.{ .format = self.format, .id = self.id, .retired = self.retired, .phase = self.phase, .next = self.next, .done = self.done, .child_offset = self.child_offset, .versions = self.versions, .cursor = self.cursor, .marked = self.marked, .deleted = self.deleted, .physical_marks = self.physical_marks });
+    }
 };
 
 pub const Collector = struct {
@@ -368,8 +374,9 @@ pub const Collector = struct {
             }
             if (rows[0][0].value.len > 16 * 1024) return error.InvalidCollectionState;
             const meta = (try std.json.parseFromSlice(Meta, self.arena, rows[0][0].value, .{})).value;
-            if (meta.format != 1 or !std.mem.eql(u8, &meta.id, &self.active.id) or meta.retired != self.active.roots.retired_before or meta.versions != self.collector.versions.? or meta.marked > meta.done or
+            if ((meta.format != 1 and meta.format != 2) or !std.mem.eql(u8, &meta.id, &self.active.id) or meta.retired != self.active.roots.retired_before or meta.versions != self.collector.versions.? or meta.marked > meta.done or
                 meta.done > meta.next or (meta.phase == .mark and meta.done == meta.next) or (meta.phase != .mark and (meta.done != meta.next or meta.child_offset != 0))) return error.InvalidCollectionState;
+            if (meta.format == 2 and (meta.physical_marks > meta.marked + @as(u64, @intFromBool(meta.child_offset != 0)) or (meta.marked != 0 and meta.physical_marks == 0))) return error.InvalidCollectionState;
             try self.validateCounts(meta);
             return meta;
         }
@@ -384,9 +391,12 @@ pub const Collector = struct {
             // physical mark. Frontier rows and an unfinished parent's mark are
             // accounted separately. A copied sweep phase over a reset/missing
             // mark map cannot pass this authenticated tree-summary check.
-            var expected = std.math.mul(u64, meta.marked, 2) catch return error.CollectionCounterExhausted;
+            var expected = if (meta.format == 2)
+                std.math.add(u64, meta.marked, meta.physical_marks) catch return error.CollectionCounterExhausted
+            else
+                std.math.mul(u64, meta.marked, 2) catch return error.CollectionCounterExhausted;
             expected = std.math.add(u64, expected, meta.next - meta.done) catch return error.CollectionCounterExhausted;
-            expected = std.math.add(u64, expected, 1 + @as(u64, @intFromBool(meta.child_offset != 0))) catch return error.CollectionCounterExhausted;
+            expected = std.math.add(u64, expected, 1 + @as(u64, @intFromBool(meta.format == 1 and meta.child_offset != 0))) catch return error.CollectionCounterExhausted;
             if (page.records != expected) return error.CollectionStateMissing;
         }
         fn assertActive(self: *@This()) !void {
@@ -421,7 +431,10 @@ pub const Collector = struct {
             if (pending.value.len > 2048) return error.CollectionStateMissing;
             const ref = (try std.json.parseFromSlice(tree.Ref, self.arena, pending.value, .{})).value;
             try ref.validate();
-            if (ref.pack != null) return error.PackedWalCollectionUnsupported;
+            if (ref.pack != null and meta.format == 1) {
+                meta.format = 2;
+                meta.physical_marks = meta.marked + @as(u64, @intFromBool(meta.child_offset != 0));
+            }
             const encoded = try std.json.Stringify.valueAlloc(self.arena, ref, .{});
             const seen = try std.fmt.allocPrint(self.arena, "s/{s}", .{std.fmt.bytesToHex(hash(encoded), .lower)});
             const seen_row = try self.pendingRow(changes.items, seen);
@@ -442,7 +455,13 @@ pub const Collector = struct {
                 const key = try self.collector.wal.pageKeyAlloc(self.arena, self.namespace, ref);
                 const prefix = try pagesPrefix(self.arena, self.collector.wal.prefix, self.namespace);
                 if (!std.mem.startsWith(u8, key, prefix)) return error.InvalidCollectionState;
-                try self.queueChange(changes, .{ .kind = .put, .key = try std.fmt.allocPrint(self.arena, "m/{s}", .{key[prefix.len..]}), .value = "1" });
+                const mark_key = try std.fmt.allocPrint(self.arena, "m/{s}", .{key[prefix.len..]});
+                if (meta.format == 2) {
+                    if (try self.pendingRow(changes.items, mark_key)) |row| {
+                        if (!std.mem.eql(u8, row.value, "1")) return error.InvalidCollectionState;
+                    } else meta.physical_marks = try std.math.add(u64, meta.physical_marks, 1);
+                }
+                try self.queueChange(changes, .{ .kind = .put, .key = mark_key, .value = "1" });
                 if (end != children.items.len) {
                     meta.child_offset = @intCast(end);
                     return .{ .phase = .marking };
@@ -1280,4 +1299,24 @@ test "serverless multiprovider grouped frontier commit recovers all marks after 
     try std.testing.expectEqual(meta.next, meta.done);
     try fixture.finish();
     try fixture.verify();
+}
+
+test "serverless multiprovider native collection preserves packed forest pages and receipts across restart" {
+    var fixture: TestFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    fixture.wal.packed_pages_enabled = true;
+    try fixture.seed();
+    const body: [1024]u8 = @splat(42);
+    const payloads: [64][]const u8 = @splat(&body);
+    _ = try fixture.wal.appendBatchIdempotent("docs", 3, &payloads, "packed-batch");
+    try fixture.waitForSweep();
+    try fixture.reopen();
+    fixture.wal.packed_pages_enabled = false;
+    try fixture.finish();
+    try fixture.verify();
+    const records = try fixture.wal.readRangeAlloc(std.testing.allocator, "docs", .{ .start_lsn = 3, .end_lsn = 66 });
+    defer @import("types.zig").freeRecords(std.testing.allocator, records);
+    try std.testing.expectEqual(@as(usize, 64), records.len);
+    for (records) |record| try std.testing.expectEqualSlices(u8, &body, record.payload);
 }

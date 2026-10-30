@@ -55,24 +55,13 @@ pub const Plan = struct {
             try std.fmt.allocPrint(m, "{s}/progress/{s}/HEAD", .{ prefix, namespace }),
             try std.fmt.allocPrint(m, "{s}/progress/{s}/MANIFEST_GC_FLOOR", .{ prefix, namespace }),
         };
-        const encoded = try (tx.Context{ .alloc = a, .client = backing, .bucket = bucket, .prefix = prefix, .namespace = input.metadata_namespace, .io = io }).execute(.{
-            .action = .read,
-            .root_backend = input.metadata_backend,
-            .owner = input.state.owner,
-            .state = input.state,
-            .commands = &.{ .{ .kind = .get, .key = keys[0] }, .{ .kind = .get, .key = keys[1] }, .{ .kind = .get, .key = keys[2] } },
-        });
-        defer a.free(encoded);
-        const rows = (try std.json.parseFromSlice(struct { results: []const []const struct { key: []const u8, value: []const u8 } }, m, encoded, .{ .allocate = .alloc_always })).value.results;
-        if (rows.len != 3) return error.InvalidNativeWritePlan;
+        const rows = try (tx.Context{ .alloc = m, .client = backing, .bucket = bucket, .prefix = prefix, .namespace = input.metadata_namespace, .io = io }).readSnapshotValuesAlloc(input.metadata_backend, input.state, &keys, .{ .compact_records = true });
         var original: [3]?[]const u8 = @splat(null);
         var records: [3]?Record = @splat(null);
-        for (rows, 0..) |items, i| {
-            if (items.len > 1) return error.InvalidNativeWritePlan;
-            if (items.len == 0) continue;
-            if (!std.mem.eql(u8, keys[i], items[0].key)) return error.InvalidNativeWritePlan;
-            original[i] = items[0].value;
-            const value = (try std.json.parseFromSlice(EncodedRecord, m, items[0].value, .{ .allocate = .alloc_always })).value;
+        for (rows, 0..) |optional, i| {
+            const bytes = optional orelse continue;
+            original[i] = bytes;
+            const value = (try std.json.parseFromSlice(EncodedRecord, m, bytes, .{ .allocate = .alloc_always })).value;
             if ((value.body.__antfly_bytes == null) == (value.body.__antfly_utf8 == null)) return error.InvalidNativeWritePlan;
             const body = value.body.__antfly_bytes orelse value.body.__antfly_utf8.?;
             if (body.len > 4096 or value.etag.len == 0 or value.etag.len > 128) return error.InvalidNativeWritePlan;

@@ -56,6 +56,9 @@ pub const BootstrapConfig = struct {
     indexed_wal: bool = false,
     native_read_state: bool = false,
     wal_document_index: bool = false,
+    wal_packed_pages: bool = false,
+    wal_deferred_indexes: bool = false,
+    point_read_blocks: bool = false,
     /// Managed reader contract and physical collection, new WAL prefixes only.
     wal_gc: bool = false,
     progress_uri: []const u8,
@@ -462,6 +465,8 @@ pub const OwnedStack = struct {
             break :blk try artifacts_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
         } else try artifacts_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.artifacts_uri, cfg.s3_options[0]);
         self.artifacts = self.artifacts_impl.artifactStore();
+        self.artifacts.canonical_point_bodies = cfg.point_read_blocks;
+        self.artifacts.point_read_blocks = cfg.point_read_blocks;
         errdefer self.artifacts.deinit();
 
         var manifests_target = try s3TargetAlloc(alloc, cfg.manifests_uri);
@@ -504,7 +509,7 @@ pub const OwnedStack = struct {
         } else try wal_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.wal_uri, cfg.s3_options[2]);
         self.wal = self.wal_impl.walStore();
         // Establish unwind ownership before configuration can perform I/O.
-        if (cfg.indexed_wal) self.wal_impl.enableIndexed(.{ .read_state = cfg.native_read_state, .document_index = cfg.wal_document_index, .managed_collection = cfg.wal_gc }) catch |err| {
+        if (cfg.indexed_wal) self.wal_impl.enableIndexed(.{ .read_state = cfg.native_read_state, .document_index = cfg.wal_document_index, .packed_pages = cfg.wal_packed_pages, .deferred_indexes = cfg.wal_deferred_indexes, .managed_collection = cfg.wal_gc }) catch |err| {
             self.wal.deinit();
             return err;
         };
@@ -569,6 +574,7 @@ pub const OwnedStack = struct {
         errdefer self.catalog_store.deinit();
 
         self.builder = build_mod.Builder.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
+        self.builder.deferred_wal_maintenance = cfg.wal_deferred_indexes;
         self.builder.setIo(io);
         try self.builder.setGraphMetricMaxParallelism(cfg.graph_metric_max_parallelism);
         self.catalog = catalog_mod.CatalogService.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal, &self.builder, &self.catalog_store);
@@ -775,7 +781,7 @@ fn workLeaseOwnerIdAlloc(alloc: Allocator, io: std.Io) ![]u8 {
 }
 
 pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
-    if ((cfg.native_read_state or cfg.wal_document_index or cfg.wal_gc) and !cfg.indexed_wal) return error.IndexedWalRequired;
+    if ((cfg.native_read_state or cfg.wal_document_index or cfg.wal_gc or cfg.wal_packed_pages or cfg.wal_deferred_indexes) and !cfg.indexed_wal) return error.IndexedWalRequired;
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
     if (cfg.graph_metric_max_parallelism == 0 or cfg.graph_metric_max_parallelism > build_mod.max_graph_metric_compute_parallelism)
         return error.InvalidGraphMetricBuildOptions;
@@ -1591,45 +1597,50 @@ test "serverless multiprovider managed empty HTTP namespace remains writable" {
 }
 
 test "serverless multiprovider bootstrap owns indexed WAL and bounded live read state through publication" {
-    const a = std.testing.allocator;
-    var memory = objectstore.MemoryClient.init(a);
-    defer memory.deinit();
-    var client = memory.client();
-    try client.makeBucket("db");
-    var stack: OwnedStack = undefined;
-    try stack.init(a, .{
-        .native_location = .{ .client = client, .bucket = "db", .prefix = "native" },
-        .artifacts_uri = "file:///unused",
-        .manifests_uri = "file:///unused",
-        .wal_uri = "file:///unused",
-        .progress_uri = "file:///unused",
-        .catalog_uri = "file:///unused",
-        .indexed_wal = true,
-        .native_read_state = true,
-        .wal_document_index = true,
-    }, std.testing.io);
-    defer stack.deinit();
-    try std.testing.expect(try stack.catalog.ensureTable("docs", 100));
-    const ns = try stack.catalog.resolveTableNamespaceAlloc("docs");
-    defer a.free(ns);
-    const mutations = [_]api_mod.DocumentMutation{.{ .kind = .upsert, .doc_id = "doc-a", .body = "alpha" }};
-    var ingested = try stack.api.ingestTableBatch(.{ .table_name = "docs", .timestamp_ns = 123, .mutations = &mutations });
-    defer ingested.deinit(a);
-    for (0..2) |_| {
-        const session = try stack.openLiveSession(a, ns, .{ .io = std.testing.io, .view = .{ .point_id = "doc-a" } });
-        defer session.deinit();
-        const body = (try session.lookupAlloc("doc-a")).?;
-        defer a.free(body);
-        try std.testing.expectEqualStrings("alpha", body);
+    for ([_]bool{ false, true }) |use_blocks| {
+        const a = std.testing.allocator;
+        var memory = objectstore.MemoryClient.init(a);
+        defer memory.deinit();
+        var client = memory.client();
+        try client.makeBucket("db");
+        var stack: OwnedStack = undefined;
+        try stack.init(a, .{
+            .native_location = .{ .client = client, .bucket = "db", .prefix = "native" },
+            .artifacts_uri = "file:///unused",
+            .manifests_uri = "file:///unused",
+            .wal_uri = "file:///unused",
+            .progress_uri = "file:///unused",
+            .catalog_uri = "file:///unused",
+            .indexed_wal = true,
+            .native_read_state = true,
+            .wal_document_index = true,
+            .wal_packed_pages = use_blocks,
+            .wal_deferred_indexes = use_blocks,
+            .point_read_blocks = use_blocks,
+        }, std.testing.io);
+        defer stack.deinit();
+        try std.testing.expect(try stack.catalog.ensureTable("docs", 100));
+        const ns = try stack.catalog.resolveTableNamespaceAlloc("docs");
+        defer a.free(ns);
+        const mutations = [_]api_mod.DocumentMutation{.{ .kind = .upsert, .doc_id = "doc-a", .body = "alpha" }};
+        var ingested = try stack.api.ingestTableBatch(.{ .table_name = "docs", .timestamp_ns = 123, .mutations = &mutations });
+        defer ingested.deinit(a);
+        for (0..2) |_| {
+            const session = try stack.openLiveSession(a, ns, .{ .io = std.testing.io, .view = .{ .point_id = "doc-a" } });
+            defer session.deinit();
+            const body = (try session.lookupAlloc("doc-a")).?;
+            defer a.free(body);
+            try std.testing.expectEqualStrings("alpha", body);
+        }
+        try std.testing.expect(stack.read_states.hits > 0);
+        try std.testing.expect(stack.read_states.bytes <= query_mod.ReadStateCache.max_bytes);
+        var published = try stack.catalog.buildTable("docs");
+        defer published.deinit(a);
+        try std.testing.expect(published.published);
+        const reopened = try stack.openLiveSession(a, ns, .{ .io = std.testing.io });
+        defer reopened.deinit();
+        try std.testing.expectEqual(@as(u64, 1), try reopened.countDocuments());
     }
-    try std.testing.expect(stack.read_states.hits > 0);
-    try std.testing.expect(stack.read_states.bytes <= query_mod.ReadStateCache.max_bytes);
-    var published = try stack.catalog.buildTable("docs");
-    defer published.deinit(a);
-    try std.testing.expect(published.published);
-    const reopened = try stack.openLiveSession(a, ns, .{ .io = std.testing.io });
-    defer reopened.deinit();
-    try std.testing.expectEqual(@as(u64, 1), try reopened.countDocuments());
 }
 
 test "serverless multiprovider public batches use bounded fresh transforms without charging replacement writes" {

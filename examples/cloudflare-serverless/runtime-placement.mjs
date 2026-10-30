@@ -18,7 +18,7 @@
 // recovery still arbitrate access to the SAME authoritative R2 records.
 const applied=Symbol("antfly.runtime-placement"),locations=new Set(["wnam","enam","sam","weur","eeur","apac","apac-ne","apac-se","oc","afr","me"]);
 export function placementEnv(env){
- const hint=env.R2_LOCATION_HINT,generation=env.RUNTIME_GENERATION;
+ const hint=env.DO_LOCATION_HINT??env.R2_LOCATION_HINT,generation=env.RUNTIME_GENERATION;
  if(hint==null&&generation==null)return env;
  if(env.COORDINATOR_BACKEND!=="r2"||typeof generation!=="string"||!/^[a-zA-Z0-9_-]{1,64}$/.test(generation)||hint!=null&&!locations.has(hint))throw Error("InvalidRuntimePlacement");
  const policy=JSON.stringify([generation,hint??null]);

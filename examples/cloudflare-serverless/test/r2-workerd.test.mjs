@@ -107,8 +107,8 @@ test('native read capsules activate after compatible readers and survive erased 
 
 test('HTTP callers cannot activate experimental inline formats or compaction probes',{timeout:120000},async()=>{
  const f=await fixture('internal-latency-settings',false,true);
- try{f.options.bindings.PAGED_TEXT='false';f.options.bindings.PAGED_PROJECTIONS='false';await f.reopen();await f.call({op:'mutate',operation_id:'seed',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"durable"}'}]});while((await f.call({op:'publish',inline_point_bodies:true,canonical_point_bodies:true})).has_more){}
-  const bucket=await f.bucket();for(const row of(await bucket.list({prefix:'antfly/artifacts/',limit:1000})).objects){const object=await bucket.get(row.key),bytes=new Uint8Array(await object.arrayBuffer());assert.ok(!['AFDFACTB','AFDFACTC'].includes(new TextDecoder().decode(bytes.subarray(0,8))));}
+ try{f.options.bindings.PAGED_TEXT='false';f.options.bindings.PAGED_PROJECTIONS='false';await f.reopen();await f.call({op:'mutate',operation_id:'seed',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"durable"}'}]});while((await f.call({op:'publish',inline_point_bodies:true,canonical_point_bodies:true,point_read_blocks:true,wal_packed_pages:true,wal_deferred_indexes:true})).has_more){}
+  const bucket=await f.bucket();for(const row of(await bucket.list({prefix:'antfly/artifacts/',limit:1000})).objects){const object=await bucket.get(row.key),bytes=new Uint8Array(await object.arrayBuffer());assert.ok(!['AFDFACTB','AFDFACTC','AFDFACTD'].includes(new TextDecoder().decode(bytes.subarray(0,8))));}
   assert.equal((await f.call({op:'compact',compaction_probe_only:true})).published,true);assert.equal((await f.call({op:'lookup',doc_id:'one'})).body,'{"text":"durable"}');
  }finally{await f.close();}
 });

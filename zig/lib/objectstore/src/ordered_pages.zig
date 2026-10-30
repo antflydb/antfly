@@ -45,7 +45,7 @@ pub const Pages = struct {
         return std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ self.prefix, std.fmt.bytesToHex(ref.attempt, .lower), std.fmt.bytesToHex(ref.digest, .lower) });
     }
     pub fn store(self: *Pages) tree.Store {
-        return .{ .ptr = self, .domain = self.domain, .attempt = self.attempt, .prefix_keys = true, .get = get, .put = put, .put_many = putMany, .check = check };
+        return .{ .ptr = self, .domain = self.domain, .attempt = self.attempt, .prefix_keys = true, .get = get, .read_many = if (self.client.vtable.get_objects != null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = putMany, .check = check };
     }
     fn check(raw: *anyopaque) !void {
         const self: *Pages = @ptrCast(@alignCast(raw));
@@ -67,6 +67,56 @@ pub const Pages = struct {
         const body = result.body;
         result.body = &.{};
         return body; // ordered_tree.decodePage authenticates domain and digest.
+    }
+    fn readMany(raw: *anyopaque, a: A, refs: []const tree.Ref, output: []tree.Page) !void {
+        const self: *Pages = @ptrCast(@alignCast(raw));
+        if (refs.len != output.len or refs.len > tree.max_read_batch) return error.InvalidGraphPage;
+        var total: u64 = 0;
+        for (refs) |ref| {
+            try ref.validate();
+            total += ref.bytes;
+        }
+        try check(raw);
+        if (total > self.remaining_read_bytes.*) return error.OrderedPageReadBudgetExceeded;
+        var initialized: usize = 0;
+        errdefer for (output[0..initialized]) |*page| page.deinit(a);
+        var begin: usize = 0;
+        while (begin < refs.len) {
+            if (refs[begin].bytes > 256 * 1024) {
+                const encoded = try get(raw, a, refs[begin]);
+                output[begin] = try tree.decodePage(a, self.domain, refs[begin], encoded);
+                initialized += 1;
+                begin += 1;
+                continue;
+            }
+            var requests: [4]types.GetObjectRequest = undefined;
+            var count: usize = 0;
+            defer for (requests[0..count]) |request| a.free(request.key);
+            var batch_bytes: u64 = 0;
+            while (begin + count < refs.len and count < requests.len) {
+                const ref = refs[begin + count];
+                if (ref.bytes > 256 * 1024 - batch_bytes) break;
+                batch_bytes += ref.bytes;
+                requests[count] = .{ .key = try self.key(a, ref), .options = .{ .skip_metadata_probe = true, .max_response_bytes = ref.bytes, .cancellation = self.cancellation } };
+                count += 1;
+            }
+            self.remaining_read_bytes.* -= batch_bytes;
+            var client = self.client;
+            client.allocator = a;
+            const results = try client.getObjects(self.bucket, requests[0..count]);
+            defer {
+                for (results) |*result| if (result.*) |*value| value.deinit(a);
+                a.free(results);
+            }
+            try check(raw);
+            for (results, 0..) |*result, i| {
+                const body = (result.* orelse return error.FileNotFound).body;
+                result.*.?.body = &.{};
+                output[begin + i] = try tree.decodePage(a, self.domain, refs[begin + i], body);
+                initialized += 1;
+            }
+            begin += count;
+        }
     }
     fn validateWrite(self: *Pages, ref: tree.Ref, bytes: []const u8) !void {
         try ref.validate();

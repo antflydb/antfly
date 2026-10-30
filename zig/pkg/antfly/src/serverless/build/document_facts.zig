@@ -40,7 +40,11 @@ pub const BodyPack = struct {
     offset: u32,
     /// Nonzero only for a canonical body in a verified, standalone facts leaf.
     leaf_records: u64 = 0,
+    leaf_digest: ?[32]u8 = null,
+    leaf_bytes: u32 = 0,
+    leaf_offset: u32 = 0,
     pub fn jsonStringify(self: BodyPack, writer: anytype) !void {
+        if (self.leaf_digest != null) return writer.write(.{ .digest = self.digest, .bytes = self.bytes, .offset = self.offset, .leaf_records = self.leaf_records, .leaf_digest = self.leaf_digest, .leaf_bytes = self.leaf_bytes, .leaf_offset = self.leaf_offset });
         if (self.leaf_records != 0) return writer.write(.{ .digest = self.digest, .bytes = self.bytes, .offset = self.offset, .leaf_records = self.leaf_records });
         return writer.write(.{ .digest = self.digest, .bytes = self.bytes, .offset = self.offset });
     }
@@ -61,6 +65,7 @@ pub const max_inline_body_bytes = 1536;
 const inline_magic = "AFDINL01";
 const canonical_magic = "AFDINL02";
 const leaf_reference_magic = "AFDBREF1";
+const packed_leaf_reference_magic = "AFDBREF2";
 const canonical_reference_magic = "AFDCREF1";
 
 pub const Fact = struct {
@@ -121,11 +126,18 @@ pub const Fact = struct {
         _ = try Fact.decodeBase(out, if (self.body.pack) |pack| pack.leaf_records != 0 else false);
         if (self.body.pack) |pack| if (pack.leaf_records != 0) {
             if (self.inline_payload != null or self.canonical_body) return error.InvalidDocumentFact;
-            const locator = try alloc.alloc(u8, 208);
+            const locator = try alloc.alloc(u8, if (pack.leaf_digest != null) 256 else 208);
+            errdefer alloc.free(locator);
             @memset(locator, 0);
-            @memcpy(locator[0..8], leaf_reference_magic);
+            @memcpy(locator[0..8], if (pack.leaf_digest != null) packed_leaf_reference_magic else leaf_reference_magic);
             @memcpy(locator[16..200], out);
             std.mem.writeInt(u64, locator[200..208], pack.leaf_records, .little);
+            if (pack.leaf_digest) |digest| {
+                @memcpy(locator[208..240], &digest);
+                std.mem.writeInt(u32, locator[240..244], pack.leaf_bytes, .little);
+                std.mem.writeInt(u32, locator[244..248], pack.leaf_offset, .little);
+            }
+            _ = try leafBodyRef(self.body);
             alloc.free(out);
             return locator;
         };
@@ -157,12 +169,19 @@ pub const Fact = struct {
             fact.canonical_body = true;
             return fact;
         }
-        if (bytes.len == 208 and std.mem.eql(u8, bytes[0..8], leaf_reference_magic)) {
+        if ((bytes.len == 208 and std.mem.eql(u8, bytes[0..8], leaf_reference_magic)) or (bytes.len == 256 and std.mem.eql(u8, bytes[0..8], packed_leaf_reference_magic))) {
             if (!std.mem.allEqual(u8, bytes[8..16], 0)) return error.InvalidDocumentFact;
             var fact = try Fact.decodeBase(bytes[16..200], true);
             if (fact.body.pack == null) return error.InvalidDocumentFact;
             fact.body.pack.?.leaf_records = std.mem.readInt(u64, bytes[200..208], .little);
+            if (bytes.len == 256) {
+                if (!std.mem.allEqual(u8, bytes[248..256], 0)) return error.InvalidDocumentFact;
+                fact.body.pack.?.leaf_digest = bytes[208..240].*;
+                fact.body.pack.?.leaf_bytes = std.mem.readInt(u32, bytes[240..244], .little);
+                fact.body.pack.?.leaf_offset = std.mem.readInt(u32, bytes[244..248], .little);
+            }
             if (fact.body.pack.?.leaf_records == 0 or fact.body.pack.?.bytes > tree.max_page_bytes) return error.InvalidDocumentFact;
+            _ = try leafBodyRef(fact.body);
             return fact;
         }
 
@@ -233,12 +252,12 @@ pub fn decodeRecord(record: tree.Cursor.Record) !Fact {
     if (!fact.canonical_body) return fact;
     if (inlineBody(record.value) == null) return error.InvalidDocumentFact;
     const origin = record.origin orelse return error.InvalidDocumentFact;
-    if (origin.ref.height != 0 or origin.ref.pack != null) return error.InvalidDocumentFact;
+    if (origin.ref.height != 0) return error.InvalidDocumentFact;
     const base = std.mem.readInt(u32, record.value[8..12], .little);
     const offset = try std.math.add(u32, origin.value_offset, 16 + base);
     if (offset > origin.ref.bytes or fact.body.bytes > origin.ref.bytes - offset) return error.InvalidDocumentFact;
     fact.body.attempt = origin.ref.attempt;
-    fact.body.pack = .{ .digest = origin.ref.digest, .bytes = origin.ref.bytes, .offset = offset, .leaf_records = origin.ref.records };
+    fact.body.pack = .{ .digest = origin.ref.artifactDigest(), .bytes = origin.ref.artifactBytes(), .offset = try std.math.add(u32, origin.ref.offset(), offset), .leaf_records = origin.ref.records, .leaf_digest = if (origin.ref.pack != null) origin.ref.digest else null, .leaf_bytes = if (origin.ref.pack != null) origin.ref.bytes else 0, .leaf_offset = origin.ref.offset() };
     fact.canonical_body = false;
     return fact;
 }
@@ -256,8 +275,12 @@ fn indexValue(bytes: []const u8) []const u8 {
 }
 
 pub const Root = struct {
+    /// Payload ownership belongs to the request page store, never this copied
+    /// semantic descriptor or a retained prepared-read entry.
+    directory_len: u16 = 0,
     inline_records: bool = false,
     canonical_records: bool = false,
+    packed_records: bool = false,
     domain: [32]u8,
     policy_fingerprint: [32]u8,
     wal_end_lsn: u64 = 0,
@@ -271,13 +294,20 @@ pub const Root = struct {
     counts: [7]u64 = @splat(0),
 
     pub const encoded_bytes = 576;
+    pub const packed_header_bytes = 832;
+    pub const max_encoded_bytes = packed_header_bytes + 4096;
     pub const metadata_version = 12;
+    pub const packed_metadata_version = 13;
     pub fn eql(a: Root, b: Root) bool {
-        return std.mem.eql(u8, &a.encode(), &b.encode());
+        if (!std.mem.eql(u8, &a.encode(), &b.encode())) return false;
+        const left = [_]?tree.Ref{a.page} ++ a.pending_pages ++ [_]?tree.Ref{a.audit_page};
+        const right = [_]?tree.Ref{b.page} ++ b.pending_pages ++ [_]?tree.Ref{b.audit_page};
+        for (left, right) |l, r| if (!std.meta.eql(l, r)) return false;
+        return true;
     }
     pub fn encode(self: Root) [encoded_bytes]u8 {
         var out = @as([encoded_bytes]u8, @splat(0));
-        @memcpy(out[0..8], if (self.canonical_records) "AFDFACTC" else if (self.inline_records) "AFDFACTB" else "AFDFACTA");
+        @memcpy(out[0..8], if (self.packed_records) "AFDFACTD" else if (self.canonical_records) "AFDFACTC" else if (self.inline_records) "AFDFACTB" else "AFDFACTA");
         @memcpy(out[16..48], &self.domain);
         @memcpy(out[48..80], &self.policy_fingerprint);
         std.mem.writeInt(u64, out[80..88], self.wal_end_lsn, .little);
@@ -295,14 +325,33 @@ pub const Root = struct {
         };
         return out;
     }
+    pub fn encodePackedHeader(self: Root) [packed_header_bytes]u8 {
+        var out: [packed_header_bytes]u8 = @splat(0);
+        @memcpy(out[0..encoded_bytes], &self.encode());
+        const roots = [_]?tree.Ref{self.page} ++ self.pending_pages ++ [_]?tree.Ref{self.audit_page};
+        for (roots, 0..) |optional, i| if (optional) |ref| if (ref.pack) |location| {
+            const slot = out[encoded_bytes + i * 40 ..][0..40];
+            @memcpy(slot[0..32], &location.digest);
+            std.mem.writeInt(u32, slot[32..36], location.bytes, .little);
+            std.mem.writeInt(u32, slot[36..40], location.offset, .little);
+        };
+        std.mem.writeInt(u32, out[816..820], self.directory_len, .little);
+        return out;
+    }
     pub fn decode(bytes: []const u8) !Root {
+        const packed_format = bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "AFDFACTD");
+        const header_size: usize = if (packed_format) packed_header_bytes else encoded_bytes;
         const legacy = bytes.len == 512 and (std.mem.eql(u8, bytes[0..8], "AFDFACT3") or std.mem.eql(u8, bytes[0..8], "AFDFACT4"));
-        if (!legacy and (bytes.len != encoded_bytes or (!std.mem.eql(u8, bytes[0..8], "AFDFACT4") and !std.mem.eql(u8, bytes[0..8], "AFDFACT5") and !std.mem.eql(u8, bytes[0..8], "AFDFACT6") and !std.mem.eql(u8, bytes[0..8], "AFDFACT7") and !std.mem.eql(u8, bytes[0..8], "AFDFACT8") and !std.mem.eql(u8, bytes[0..8], "AFDFACT9") and !std.mem.eql(u8, bytes[0..8], "AFDFACTA") and !std.mem.eql(u8, bytes[0..8], "AFDFACTB") and !std.mem.eql(u8, bytes[0..8], "AFDFACTC")))) return error.InvalidDocumentFactsRoot;
+        if (!legacy and (bytes.len < header_size or bytes.len > max_encoded_bytes or (!std.mem.eql(u8, bytes[0..8], "AFDFACT4") and !std.mem.eql(u8, bytes[0..8], "AFDFACT5") and !std.mem.eql(u8, bytes[0..8], "AFDFACT6") and !std.mem.eql(u8, bytes[0..8], "AFDFACT7") and !std.mem.eql(u8, bytes[0..8], "AFDFACT8") and !std.mem.eql(u8, bytes[0..8], "AFDFACT9") and !std.mem.eql(u8, bytes[0..8], "AFDFACTA") and !std.mem.eql(u8, bytes[0..8], "AFDFACTB") and !std.mem.eql(u8, bytes[0..8], "AFDFACTC") and !std.mem.eql(u8, bytes[0..8], "AFDFACTD")))) return error.InvalidDocumentFactsRoot;
+        const directory_len: usize = if (packed_format) std.mem.readInt(u32, bytes[816..820], .little) else 0;
+        if (!legacy and (directory_len > 4096 or bytes.len != header_size + directory_len)) return error.InvalidDocumentFactsRoot;
         if (bytes[8] > (if (legacy) @as(u8, 31) else 63) or !std.mem.allEqual(u8, bytes[9..16], 0) or
-            !std.mem.allEqual(u8, bytes[if (legacy) @as(usize, 472) else 536..], 0)) return error.InvalidDocumentFactsRoot;
+            !std.mem.allEqual(u8, bytes[if (legacy) @as(usize, 472) else @as(usize, 536)..if (legacy) @as(usize, 512) else encoded_bytes], 0)) return error.InvalidDocumentFactsRoot;
+        if (packed_format and !std.mem.allEqual(u8, bytes[820..packed_header_bytes], 0)) return error.InvalidDocumentFactsRoot;
         var root = Root{
-            .inline_records = std.mem.eql(u8, bytes[0..8], "AFDFACTB") or std.mem.eql(u8, bytes[0..8], "AFDFACTC"),
-            .canonical_records = std.mem.eql(u8, bytes[0..8], "AFDFACTC"),
+            .inline_records = std.mem.eql(u8, bytes[0..8], "AFDFACTB") or std.mem.eql(u8, bytes[0..8], "AFDFACTC") or std.mem.eql(u8, bytes[0..8], "AFDFACTD"),
+            .canonical_records = std.mem.eql(u8, bytes[0..8], "AFDFACTC") or std.mem.eql(u8, bytes[0..8], "AFDFACTD"),
+            .packed_records = std.mem.eql(u8, bytes[0..8], "AFDFACTD"),
             .domain = bytes[16..48].*,
             .policy_fingerprint = bytes[48..80].*,
             .wal_end_lsn = std.mem.readInt(u64, bytes[80..88], .little),
@@ -316,20 +365,32 @@ pub const Root = struct {
             const slot = bytes[152 + i * 64 ..][0..64];
             const count = if (i == 0 or i == 5) root.document_count else root.counts[2 + i];
             if (bytes[8] & (@as(u8, 1) << @intCast(i)) == 0) {
-                if (count != 0 or !std.mem.allEqual(u8, slot, 0)) return error.InvalidDocumentFactsRoot;
+                if (count != 0 or !std.mem.allEqual(u8, slot, 0) or (packed_format and !std.mem.allEqual(u8, bytes[encoded_bytes + i * 40 ..][0..40], 0))) return error.InvalidDocumentFactsRoot;
                 continue;
             }
             if (!std.mem.allEqual(u8, slot[53..56], 0)) return error.InvalidDocumentFactsRoot;
-            const page: tree.Ref = .{
+            var page: tree.Ref = .{
                 .digest = slot[0..32].*,
                 .attempt = slot[32..48].*,
                 .bytes = std.mem.readInt(u32, slot[48..52], .little),
                 .height = slot[52],
                 .records = std.mem.readInt(u64, slot[56..64], .little),
             };
+            if (packed_format) {
+                const location = bytes[encoded_bytes + i * 40 ..][0..40];
+                if (!std.mem.allEqual(u8, location, 0)) page.pack = .{ .digest = location[0..32].*, .bytes = std.mem.readInt(u32, location[32..36], .little), .offset = std.mem.readInt(u32, location[36..40], .little) };
+            }
             try page.validate();
             if (page.records != count) return error.InvalidDocumentFactsRoot;
             if (i == 0) root.page = page else if (i == 5) root.audit_page = page else root.pending_pages[i - 1] = page;
+        }
+        if (directory_len != 0) {
+            const page = root.page orelse return error.InvalidDocumentFactsRoot;
+            if (page.height == 0 or page.bytes != directory_len) return error.InvalidDocumentFactsRoot;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes[header_size..], &digest, .{});
+            if (!std.mem.eql(u8, &digest, &page.digest)) return error.ArtifactIntegrityMismatch;
+            root.directory_len = @intCast(directory_len);
         }
         return root;
     }
@@ -440,10 +501,13 @@ pub const Plan = struct {
         // Primary and scheduling trees form one unpublished forest. Buffer
         // independent COW pages across that forest and flush before its root
         // can escape. Reads of newly built paths resolve through the buffer.
-        var writes = tree.BufferedWrites{ .alloc = self.alloc, .underlying = store };
+        var backing = store;
+        if (!self.next.packed_records) backing.pack_many = null;
+        var writes = tree.Forest{ .alloc = self.alloc, .underlying = backing };
         defer writes.deinit();
         const batched = writes.store();
         var next = self.next;
+        next.directory_len = 0;
         next.page = try tree.apply(self.alloc, batched, current.page, self.changes);
         for (&next.pending_pages, current.pending_pages, self.pending_changes[0..4], 0..) |*page, prior, changes, i| {
             // Identical pending sets often cover every enabled stage during
@@ -457,8 +521,12 @@ pub const Plan = struct {
             if (std.meta.eql(current.audit_page, current.pending_pages[i]) and sameChanges(self.pending_changes[4], self.pending_changes[i])) break i;
         } else null;
         next.audit_page = if (shared_audit) |i| next.pending_pages[i] else try applyIndex(self.alloc, batched, current.audit_page, self.pending_changes[4]);
-        _ = try Root.decode(&next.encode());
-        try writes.flush();
+        if (next.packed_records) _ = try Root.decode(&next.encodePackedHeader()) else _ = try Root.decode(&next.encode());
+        var roots = [_]?tree.Ref{next.page} ++ next.pending_pages ++ [_]?tree.Ref{next.audit_page};
+        try writes.finish(&roots);
+        next.page = roots[0];
+        @memcpy(&next.pending_pages, roots[1..5]);
+        next.audit_page = roots[5];
         return next;
     }
 };
@@ -840,7 +908,8 @@ pub fn readCheckpointPageAlloc(a: Allocator, pages: *page_store.PageStore, ref: 
 pub fn leafBodyRef(ref: BodyRef) !tree.Ref {
     const pack = ref.pack orelse return error.InvalidDocumentFact;
     if (pack.leaf_records == 0) return error.InvalidDocumentFact;
-    const result = tree.Ref{ .digest = pack.digest, .attempt = ref.attempt, .bytes = pack.bytes, .height = 0, .records = pack.leaf_records };
+    const result = tree.Ref{ .digest = pack.leaf_digest orelse pack.digest, .attempt = ref.attempt, .bytes = if (pack.leaf_digest != null) pack.leaf_bytes else pack.bytes, .height = 0, .records = pack.leaf_records, .pack = if (pack.leaf_digest != null) .{ .digest = pack.digest, .bytes = pack.bytes, .offset = pack.leaf_offset } else null };
+    if (pack.offset < result.offset() or pack.offset - result.offset() < body_header_bytes or pack.offset - result.offset() > result.bytes or ref.bytes > result.bytes - (pack.offset - result.offset())) return error.InvalidDocumentFact;
     try result.validate();
     return result;
 }
@@ -854,7 +923,7 @@ pub fn readCanonicalLeafBodyAlloc(alloc: Allocator, leaf: tree.Page, ref: BodyRe
         const base = std.mem.readInt(u32, value[8..12], .little);
         const address = @intFromPtr(value.ptr) + 16 + base;
         const start = @intFromPtr(leaf.bytes.ptr);
-        if (address < start or address - start != pack.offset or fact.body.bytes != ref.bytes or !std.mem.eql(u8, &fact.body.digest, &ref.digest)) continue;
+        if (address < start or address - start != pack.offset - leaf.ref.offset() or fact.body.bytes != ref.bytes or !std.mem.eql(u8, &fact.body.digest, &ref.digest)) continue;
         return alloc.dupe(u8, inlineBody(value).?);
     }
     return error.InvalidDocumentBody;
@@ -874,7 +943,8 @@ pub fn readStoredBodyAlloc(alloc: Allocator, pages: *page_store.PageStore, ref: 
         if (encoded.len != pack.bytes) return error.ArtifactIntegrityMismatch;
         try artifacts.validatePayloadSha256WithCancellation(encoded, id[7..71], pages.cancellation);
         if (pack.leaf_records != 0) {
-            var leaf = try tree.decodePage(alloc, pages.domain, .{ .digest = pack.digest, .attempt = ref.attempt, .bytes = pack.bytes, .height = 0, .records = pack.leaf_records }, try alloc.dupe(u8, encoded));
+            const leaf_ref = try leafBodyRef(ref);
+            var leaf = try tree.decodePage(alloc, pages.domain, leaf_ref, try alloc.dupe(u8, encoded[leaf_ref.offset()..][0..leaf_ref.bytes]));
             defer leaf.deinit(alloc);
             return readCanonicalLeafBodyAlloc(alloc, leaf, ref);
         }
@@ -904,7 +974,7 @@ pub fn readStoredBodyAlloc(alloc: Allocator, pages: *page_store.PageStore, ref: 
 }
 
 pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.ArtifactRef) !Root {
-    if (source.kind != .document_facts or !(((source.metadata_version == 3 or source.metadata_version == 4) and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == 6 or source.metadata_version == 7 or source.metadata_version == 8 or source.metadata_version == 9 or (source.metadata_version == 10 or source.metadata_version == 11 or source.metadata_version == Root.metadata_version)) and source.byte_len == Root.encoded_bytes)))
+    if (source.kind != .document_facts or !((source.metadata_version == Root.packed_metadata_version and source.byte_len >= Root.packed_header_bytes and source.byte_len <= Root.max_encoded_bytes) or ((source.metadata_version == 3 or source.metadata_version == 4) and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == 6 or source.metadata_version == 7 or source.metadata_version == 8 or source.metadata_version == 9 or (source.metadata_version == 10 or source.metadata_version == 11 or source.metadata_version == Root.metadata_version)) and source.byte_len == Root.encoded_bytes)))
         return error.InvalidDocumentFactsRoot;
     try artifacts.validateSha256ArtifactIdentity(source.artifact_id, source.checksum);
     const scope = (try artifacts.uploadScopeFromArtifactId(source.artifact_id)) orelse return error.InvalidDocumentFactsRoot;
@@ -927,6 +997,7 @@ pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.Art
         10 => "AFDFACTA",
         11 => "AFDFACTB",
         12 => "AFDFACTC",
+        13 => "AFDFACTD",
         else => return error.InvalidDocumentFactsRoot,
     };
     if (!std.mem.eql(u8, bytes[0..8], magic)) return error.InvalidDocumentFactsRoot;
@@ -934,18 +1005,40 @@ pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.Art
     if (!std.mem.eql(u8, &root.domain, &scope.domain)) return error.GraphPageDomainMismatch;
     if (!std.mem.allEqual(u8, &pages.domain, 0) and !std.mem.eql(u8, &root.domain, &pages.domain)) return error.GraphPageDomainMismatch;
     pages.domain = root.domain;
+    if (pages.pack_cache) |cache| {
+        cache.clearDirectory();
+        pages.inline_page = null;
+        if (root.directory_len != 0) {
+            const owner = cache.allocator orelse alloc;
+            const directory = try owner.dupe(u8, bytes[Root.packed_header_bytes..]);
+            cache.directory = .{ .allocator = owner, .bytes = directory };
+            pages.inline_page = .{ .ref = root.page.?, .bytes = directory };
+        }
+    }
     return root;
 }
 
 pub fn publishRoot(alloc: Allocator, pages: *page_store.PageStore, root: Root) !refs.ArtifactRef {
     if (!std.mem.eql(u8, &root.domain, &pages.domain)) return error.GraphPageDomainMismatch;
-    const bytes = root.encode();
-    _ = try Root.decode(&bytes);
-    const body = try putEncoded(pages, &bytes);
+    var published = root;
+    published.directory_len = 0;
+    var directory: ?tree.Page = null;
+    defer if (directory) |*page| page.deinit(alloc);
+    if (root.packed_records) if (root.page) |ref| if (ref.height != 0 and ref.bytes <= 4096) {
+        directory = try tree.readPage(alloc, pages.store(), ref);
+        published.directory_len = @intCast(directory.?.bytes.len);
+    };
+    const header_size: usize = if (published.packed_records) Root.packed_header_bytes else Root.encoded_bytes;
+    const bytes = try alloc.alloc(u8, header_size + published.directory_len);
+    defer alloc.free(bytes);
+    if (published.packed_records) @memcpy(bytes[0..header_size], &published.encodePackedHeader()) else @memcpy(bytes[0..header_size], &published.encode());
+    if (directory) |page| @memcpy(bytes[header_size..], page.bytes);
+    _ = try Root.decode(bytes);
+    const body = try putEncoded(pages, bytes);
     const id = try body.identity(root.domain);
     const owned_id = try alloc.dupe(u8, &id);
     errdefer alloc.free(owned_id);
-    return .{ .kind = .document_facts, .artifact_id = owned_id, .checksum = try alloc.dupe(u8, id[7..71]), .byte_len = bytes.len, .metadata_version = if (root.canonical_records) Root.metadata_version else if (root.inline_records) 11 else 10 };
+    return .{ .kind = .document_facts, .artifact_id = owned_id, .checksum = try alloc.dupe(u8, id[7..71]), .byte_len = bytes.len, .metadata_version = if (root.packed_records) Root.packed_metadata_version else if (root.canonical_records) Root.metadata_version else if (root.inline_records) 11 else 10 };
 }
 
 pub fn retainRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.ArtifactRef, retained: *std.StringHashMapUnmanaged(void)) !void {

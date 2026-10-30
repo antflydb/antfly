@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {placementStorageProbe} from "./placement-probe.mjs";
 import {readerKernel,buildKernel,sharedCache,kernelMetrics} from "./kernels.mjs";
 import {CriticalPath} from "./trace.mjs";
 import {reserveInput} from "./request-pool.mjs";
@@ -32,6 +33,7 @@ class RuntimeActor extends DurableObject {
   if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.actor_started",role,actor_id:ctx.id.toString(),actor_instance_id:instanceId,version:env.WORKER_VERSION?.id,...kernelMetrics()}));
   if(role==="reader"&&env.COORDINATOR_BACKEND==="r2"&&env.LOCAL_METADATA_READS==="true")this.readViews=new NativeReadViews(module,selected,{background:promise=>ctx.waitUntil(promise),kernel:readerKernel,cache:sharedCache,onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.reader_metadata",...sample,...kernelMetrics(),actor_instance_id:instanceId}));}});
  }
+ placementProbe(){return placementStorageProbe(this.runtimeEnv,this.role,this.ctx.id.jurisdiction??null);}
  execute(input,collection,traceMeta){
   if(!(this.role==="reader"?readOperations:buildOperations).has(input?.op))throw new Error("RuntimeCapabilityUnsupported");
   const inputBytes=new TextEncoder().encode(JSON.stringify([input,collection])).byteLength;

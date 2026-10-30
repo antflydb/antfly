@@ -39,8 +39,18 @@ pub const Plan = struct {
 
     pub fn prepare(self: Plan, a: A, namespace: []const u8, id: []const u8, pages: *PageStore) !Prepared {
         if (self.format != 1 or !std.mem.eql(u8, &self.domain, &PageStore.namespaceDomain(namespace)) or
-            self.source.kind != .document_facts or self.source.byte_len > facts.Root.encoded_bytes or
+            self.source.kind != .document_facts or self.source.byte_len > facts.Root.max_encoded_bytes or
             self.source.artifact_id.len > 256 or self.source.checksum.len != 64) return error.InvalidNativeReadPlan;
+        var block_cache: @import("../graph_segment/page_store.zig").PackReadCache = .{ .allocator = a };
+        defer block_cache.deinit();
+        const original_cache = pages.pack_cache;
+        const previous_inline = pages.inline_page;
+        pages.pack_cache = &block_cache;
+        pages.inline_page = null;
+        defer {
+            pages.pack_cache = original_cache;
+            pages.inline_page = previous_inline;
+        }
         const root = try facts.loadRoot(a, pages, self.source);
         if (!std.mem.eql(u8, &root.domain, &self.domain)) return error.InvalidNativeReadPlan;
         var cache = tree.Cache{ .alloc = a, .underlying = pages.store() };

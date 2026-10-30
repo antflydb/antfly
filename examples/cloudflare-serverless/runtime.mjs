@@ -160,10 +160,10 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       if(input.op==="compact"&&input.operation_id!==undefined){
         publicationView=await rpc("beginCompaction",input.operation_id);
         if(publicationView.complete){operationSucceeded=true;return publicationView.result;}
-        preparedPublication=new PreparedPublication(publicationView);publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);
+        preparedPublication=new PreparedPublication(publicationView,{foldWal:env.WAL_DEFERRED_INDEXES==="true"});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);
       }
       if(input.op==="publish"&&env.BATCHED_PUBLICATION!=="false"&&env.PUBLICATION_CONTINUATIONS!=="true"){
-        try{publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16));preparedPublication=new PreparedPublication(publicationView,{read:(request,body)=>rpc("objectCall",request,body)});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);}
+        try{publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16));preparedPublication=new PreparedPublication(publicationView,{foldWal:env.WAL_DEFERRED_INDEXES==="true",read:(request,body)=>rpc("objectCall",request,body)});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);}
         catch(error){if(!unsupportedRpc(error,"beginPublication"))throw error;}
       }
       try{const method=input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"?"openPublicationPlan":"openPublication";publicationView??=await rpc(method,Number(env.PUBLICATION_RECORDS??16));}
@@ -176,7 +176,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     if(readAdmission?.nativePlan)transport=withNativeReadPlan(transport,coordinator,env.ANTFLY_INCARNATION,{fresh:readAdmission.nativePlan.fresh,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}});
     if(readAdmission?.nativePreparation)transport=withNativeReadPreparation(transport);
     const activeContinuation=env.PUBLICATION_PREPARED_SLICES==="true"&&input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"&&input.publication_action!=="status"&&publicationView?.entries?.some(([key,record])=>key.endsWith("/PUBLICATION_PLAN")&&record?.body?.byteLength>0);
-    if(activeContinuation){publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16),true);preparedPublication=new PreparedPublication(publicationView,{read:(request,body)=>rpc("objectCall",request,body)});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);transport=withCommitCoordinator(transport,preparedPublication,collection);}
+    if(activeContinuation){publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16),true);preparedPublication=new PreparedPublication(publicationView,{foldWal:env.WAL_DEFERRED_INDEXES==="true",read:(request,body)=>rpc("objectCall",request,body)});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);transport=withCommitCoordinator(transport,preparedPublication,collection);}
     const publicationBudget = publicationView?.budget??(["publish", "reindex"].includes(input.op) ? await env.COMMITS.getByName(env.ANTFLY_INCARNATION).publicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)) : 16);
     const settings = input.op === "latest" ? {} : { ...(["conditional","bounded-journal"].includes(env.METADATA_ROOT_BACKEND)&&["lookup","list","count","search","status"].includes(input.op)?{bounded_manifest_reads:true}:{}), ...(env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}), wal_inline_tail:env.WAL_INLINE_TAIL==="true", coarse_probes:Number(input.coarse_probes??env.ANN_COARSE_PROBES??0), enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget,
       publication_lease:preparedPublication?.lease??null,
@@ -187,6 +187,9 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       ...(readAdmission?.nativeResume?{native_read_plan_mode:true,native_read_resume:readAdmission.nativeResume.ticket,native_read_spent_bytes:readAdmission.nativeResume.spentBytes}:{}),
       ...(input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"?{publication_continuations:true,publication_batch_probe:true,publication_continuation_force:env.PUBLICATION_CONTINUATION_FORCE==="true",publication_units:Number(env.PUBLICATION_UNITS??128),...(env.PUBLICATION_ADAPTIVE_SLICES==="true"?{publication_adaptive_slices:true,publication_max_units:publicationView?.posting_limit??4096}:{}),...(env.PUBLICATION_PREPARED_SLICES==="true"?{publication_prepared_slices:true}:{})}:{}),
       ...(env.INLINE_POINT_BODIES === "true"?{inline_point_bodies:true}:{}),
+      ...(env.POINT_READ_BLOCKS === "true"?{point_read_blocks:true}:{}),
+      ...(env.WAL_DEFERRED_INDEXES === "true"?{wal_deferred_indexes:true}:{}),
+      ...(env.WAL_PACKED_PAGES === "true"?{wal_packed_pages:true}:{}),
       ...(env.CANONICAL_POINT_BODIES === "true"?{canonical_point_bodies:true}:{}),
       pack_small_bodies: env.COORDINATOR_BACKEND === "r2" && env.PACK_SMALL_BODIES !== "false",
       paged_text: env.PAGED_TEXT === "true" || env.PAGED_PROJECTIONS === "true",
@@ -203,7 +206,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       return {json: await env.AI.run(env.EMBEDDING_MODEL, {text: request.texts}, {gateway: {id: env.AI_GATEWAY}})};
     };
     if(actorMutation){try{return await trace.span("writer_rpc",()=>stub.mutateBatch({...input,...settings,__trace_id:trace.id}));}catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"mutateBatch"))throw error;return await run({...env,COORDINATOR_RPC_FALLBACK:"true"},input,signal,collection);}}
-    const {bounded_manifest_reads:ignoredBounded,native_write_read_ahead:ignoredReadAhead,inline_point_bodies:ignoredInline,canonical_point_bodies:ignoredCanonical,native_read_plan_mode:ignoredReadMode,native_read_state:ignoredReadState,wal_document_index:ignoredDocumentIndex,native_read_plan:ignoredReadPlan,native_read_prepare:ignoredReadPrepare,native_read_resume:ignoredReadResume,native_read_spent_bytes:ignoredReadSpent,native_write_plan:ignoredWritePlan,publication_continuations:ignoredContinuation,publication_batch_probe:ignoredPublicationProbe,publication_batch_version:ignoredBatchVersion,publication_continuation_force:ignoredForce,publication_units:ignoredUnits,publication_adaptive_slices:ignoredAdaptive,publication_max_units:ignoredMaximum,publication_prepared_slices:ignoredPrepared,compaction_probe_only:ignoredProbe,...nativeInput}=input;
+    const {wal_deferred_indexes:ignoredDeferred,point_read_blocks:ignoredPointBlocks,wal_packed_pages:ignoredWalPacked,bounded_manifest_reads:ignoredBounded,native_write_read_ahead:ignoredReadAhead,inline_point_bodies:ignoredInline,canonical_point_bodies:ignoredCanonical,native_read_plan_mode:ignoredReadMode,native_read_state:ignoredReadState,wal_document_index:ignoredDocumentIndex,native_read_plan:ignoredReadPlan,native_read_prepare:ignoredReadPrepare,native_read_resume:ignoredReadResume,native_read_spent_bytes:ignoredReadSpent,native_write_plan:ignoredWritePlan,publication_continuations:ignoredContinuation,publication_batch_probe:ignoredPublicationProbe,publication_batch_version:ignoredBatchVersion,publication_continuation_force:ignoredForce,publication_units:ignoredUnits,publication_adaptive_slices:ignoredAdaptive,publication_max_units:ignoredMaximum,publication_prepared_slices:ignoredPrepared,compaction_probe_only:ignoredProbe,...nativeInput}=input;
     const plannedCompact=env.NATIVE_COMPACTION_PLAN==="true"&&env.COORDINATOR_BACKEND==="r2"&&input.op==="compact"&&input.operation_id===undefined&&env.BATCHED_PUBLICATION!=="false";
     const plannedPublication=input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true";
     const compactDeadline=Date.now()+30000;let probeOperations=0,probeBytes=0,probeMetrics,batchRecords,batchVersion,preparedSlice=false;
@@ -233,7 +236,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       probeOperations=nativeMetrics.operations;probeBytes=nativeMetrics.transferred_bytes;probeMetrics=nativeMetrics;
       if(probeOperations>=1024||probeBytes>=32*1024*1024)throw Error("ObjectIoBudgetExceeded");
       if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:plannedCompact?"antfly.compaction_plan":"antfly.publication_batch_plan",trace_id:trace.id,operations:probeOperations,transferred_bytes:probeBytes}));
-      publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16),preparedSlice);preparedPublication=new PreparedPublication(publicationView,{read:(request,body)=>rpc("objectCall",request,body)});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);
+      publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16),preparedSlice);preparedPublication=new PreparedPublication(publicationView,{foldWal:env.WAL_DEFERRED_INDEXES==="true",read:(request,body)=>rpc("objectCall",request,body)});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);
       transport=withCommitCoordinator(transport,preparedPublication,collection);
       result=await executeNative(false);
     }

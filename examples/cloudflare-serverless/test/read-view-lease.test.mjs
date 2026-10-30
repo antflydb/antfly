@@ -99,3 +99,8 @@ test('conditional cursor-producing and exact-generation reads request durable pr
  for(const op of['lookup','count','list','search'])await prepareReadAdmission({COORDINATOR_BACKEND:'r2',METADATA_ROOT_BACKEND:'conditional'},{op,required_visibility:fence(7)},new CriticalPath(),views);
  assert.deepEqual(options.map(o=>o.durable_pin),[false,false,true,true]);assert.deepEqual(options.map(o=>o.allow_cached),[true,true,false,false]);
 });
+
+for(const format of[5,6])test(`native certification can retain packed/deferred WAL format ${format} without extending its lease`,async()=>{
+ const f=fixture(),load=()=>issueReadLease({format:1,version:'0',entries:[['wal',{etag:'packed',body:utf8.encode(JSON.stringify({format,latest_lsn:7,packed_pages:true,...(format===6?{deferred_indexes:true}:{} )}))}]]},{scope,walKey:'wal',pinPrefix:'pin/',policy:readLeasePolicy,observedAt:f.wall(),now:f.wall()});
+ const view=await f.cache.run(fence(7),'native',load);assert.equal(f.cache.get(fence(7)),null);assert.equal(f.cache.confirm(view,fence(7)),true);assert.ok(f.cache.get(fence(7)));assert.equal(f.cache.get(fence(8)),null);f.advance(30000);assert.equal(f.cache.get(fence(7)),null);
+});

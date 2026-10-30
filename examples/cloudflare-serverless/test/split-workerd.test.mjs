@@ -23,10 +23,10 @@ import {fileURLToPath} from "node:url";
 
 // Two Miniflare startups compile all role modules. Budget fixture startup and
 // eviction separately from the unchanged five-second writer-progress assertion.
-test("split scripts keep writer and reader capacity available behind a suspended builder",{timeout:240000},async t=>{
+for(const blocks of [false,true])test(`split scripts keep writer and reader capacity available behind a suspended builder (blocks=${blocks})`,{timeout:240000},async t=>{
  const checkpoint=message=>{t.diagnostic(message);if(process.env.ANTFLY_TEST_TRACE)console.log(JSON.stringify({checkpoint:message,at:Date.now()}));};
  const output=fileURLToPath(new URL("../dist/worker/",import.meta.url)),persist=await mkdtemp(join(tmpdir(),"antfly-split-")),wasm=(await readdir(output)).filter(name=>name.endsWith(".wasm"));
- const bindings={...(process.env.ANTFLY_TEST_TRACE?{LOG_METRICS:"true"}:{}),API_TOKEN:"split-test",ANTFLY_INCARNATION:"split",COORDINATOR_BACKEND:"r2",SPLIT_RUNTIME:"true",PUBLICATION_RECORDS:"8",PAGED_TEXT:"true"};
+ const bindings={...(process.env.ANTFLY_TEST_TRACE?{LOG_METRICS:"true"}:{}),API_TOKEN:"split-test",ANTFLY_INCARNATION:"split",COORDINATOR_BACKEND:"r2",SPLIT_RUNTIME:"true",PUBLICATION_RECORDS:"8",PAGED_TEXT:"true",...(blocks?{METADATA_ROOT_BACKEND:"bounded-journal",NATIVE_WRITE_PLAN:"true",WAL_PACKED_PAGES:"true",WAL_DEFERRED_INDEXES:"true",POINT_READ_BLOCKS:"true",CANONICAL_POINT_BODIES:"true",QUALIFICATION_PLACEMENT_PROBE:"true"}:{})};
  const durableObjects={COMMITS:{className:"R2CommitCoordinator",scriptName:"writer",useSQLite:true},READERS:{className:"R2ReadRuntime",scriptName:"reader",useSQLite:true},BUILDERS:{className:"R2BuildRuntime",scriptName:"builder",useSQLite:true}};
  const entries={
   app:`import app,{configureKernels} from "./worker.js";configureKernels("app");export default{async fetch(request,env,ctx){const path=new URL(request.url).pathname,stub=env.BUILDERS.getByName(JSON.stringify(["runtime-v1",env.ANTFLY_INCARNATION,0]));if(path==="/hold")return Response.json(await stub.holdPublish());if(path==="/blocked")return Response.json(await stub.blocked());if(path==="/release"){await stub.release();return Response.json({released:true});}return app.fetch(request,{...env,MAINTENANCE:{async send(){}}},ctx);}};`,
@@ -41,6 +41,7 @@ test("split scripts keep writer and reader capacity available behind a suspended
  try{
   await call({op:"mutate",operation_id:"seed",mutations:[{kind:"upsert",doc_id:"one",body:'{"text":"first"}'}]});while((await call({op:"publish"})).has_more){}
   checkpoint('seed publication completed');
+  if(blocks){const placement=await call({},'/_qualification/placement');assert.equal(placement.qualification,false);assert.equal(placement.samples.length,4);assert.ok(placement.samples.every(s=>s.authority_present));assert.equal(placement.actual_bucket_region,null);}
   await call({op:"mutate",operation_id:"pending",mutations:[{kind:"upsert",doc_id:"pending",body:'{"text":"pending"}'}]});
   holding=true;const held=call({},"/hold").then(value=>({value}),error=>({error}));
   let blocked=false;for(let i=0;i<100;i++){if(await call({},"/blocked")){blocked=true;break;}await new Promise(resolve=>setTimeout(resolve,5));}assert.ok(blocked,"builder must suspend inside its native R2 read");
@@ -51,6 +52,6 @@ test("split scripts keep writer and reader capacity available behind a suspended
   assert.equal(JSON.parse((await call({op:"lookup",doc_id:"independent",required_visibility:receipt.visibility})).body).text,"writer progressed");
   await call({},"/release");holding=false;await held;while((await call({op:"publish"})).has_more){}
   checkpoint('publication drained after release');
-  assert.equal((await call({op:"count"})).count,"3");checkpoint("exact count verified before eviction");await mf.dispose();checkpoint("first isolate disposed");mf=new Miniflare(convertV4MiniflareOptions(options));assert.deepEqual(await call(input),receipt);checkpoint("receipt replay verified after eviction");
+  assert.equal((await call({op:"count"})).count,"3");checkpoint("exact count verified before eviction");await mf.dispose();checkpoint("first isolate disposed");if(blocks){bindings.WAL_PACKED_PAGES="false";bindings.WAL_DEFERRED_INDEXES="false";bindings.POINT_READ_BLOCKS="false";}mf=new Miniflare(convertV4MiniflareOptions(options));assert.deepEqual(await call(input),receipt);checkpoint("receipt replay verified after eviction");
  }finally{if(holding)await call({},"/release").catch(()=>{});await mf.dispose();checkpoint("final isolate disposed");await rm(persist,{recursive:true,force:true});}
 });

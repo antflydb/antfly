@@ -43,6 +43,7 @@ pub const Reader = struct {
     pages: PageStore,
     cache: tree.Cache,
     no_writes: u64 = 0,
+    block_cache: @import("../graph_segment/page_store.zig").PackReadCache = .{},
 
     pub fn create(alloc: Allocator, session: *runtime.QuerySession, remaining: *u64) !?*Reader {
         try session.checkCancellation();
@@ -55,11 +56,13 @@ pub const Reader = struct {
         errdefer alloc.destroy(self);
         self.* = .{
             .alloc = alloc,
+            .block_cache = .{ .allocator = alloc },
             .session = session,
             .root = undefined,
-            .pages = .{ .artifacts = session.artifacts, .cancellation = session.readCancellation(), .remaining_read_bytes = remaining, .remaining_write_bytes = &self.no_writes, .read_cache = session.graphAdjacencyCache() },
+            .pages = .{ .pack_cache = &self.block_cache, .artifacts = session.artifacts, .cancellation = session.readCancellation(), .remaining_read_bytes = remaining, .remaining_write_bytes = &self.no_writes, .read_cache = session.graphAdjacencyCache() },
             .cache = undefined,
         };
+        errdefer self.block_cache.deinit();
         self.root = facts.loadRoot(alloc, &self.pages, source) catch |err| return readFailure(err);
         if (!std.mem.eql(u8, &self.root.domain, &PageStore.namespaceDomain(session.namespace())) or
             self.root.wal_end_lsn != session.manifest.wal_end_lsn or
@@ -70,6 +73,7 @@ pub const Reader = struct {
 
     pub fn destroy(self: *Reader) void {
         self.cache.deinit();
+        self.block_cache.deinit();
         self.alloc.destroy(self);
     }
 

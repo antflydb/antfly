@@ -50,6 +50,8 @@ pub const WorkingSetAllocator = struct {
     peak_live_bytes: usize = 0,
     max_live_bytes: usize,
     limit_exceeded: bool = false,
+    largest_rejected_growth: usize = 0,
+    largest_backing_failure: usize = 0,
     mutex: std.atomic.Mutex = .unlocked,
 
     fn lock(self: *WorkingSetAllocator) void {
@@ -79,9 +81,23 @@ pub const WorkingSetAllocator = struct {
         if (@import("antfly_local_sources").sql_memory_budget.optionalLocalHeadroom(a)) |layer| return @min(layer.available, headroom(layer.backing) orelse return null);
         return @import("antfly_local_sources").sql_memory_budget.optionalHeadroom(a);
     }
+    /// Optional retention may use a known request cap even when the backing
+    /// allocator exposes no headroom. This is not a guarantee that backing
+    /// allocation succeeds and does not change admission's stricter headroom.
+    pub fn cacheHeadroom(a: std.mem.Allocator) ?usize {
+        if (a.vtable != &vtable) return headroom(a);
+        const self: *WorkingSetAllocator = @ptrCast(@alignCast(a.ptr));
+        self.lock();
+        const available = self.max_live_bytes -| self.live_bytes;
+        const backing = self.backing;
+        self.mutex.unlock();
+        return @min(available, headroom(backing) orelse available);
+    }
+
     fn permitsGrowth(self: *WorkingSetAllocator, additional_bytes: usize) bool {
         if (additional_bytes <= self.max_live_bytes -| self.live_bytes) return true;
         self.limit_exceeded = true;
+        self.largest_rejected_growth = @max(self.largest_rejected_growth, additional_bytes);
         return false;
     }
 
@@ -90,7 +106,10 @@ pub const WorkingSetAllocator = struct {
         self.lock();
         defer self.mutex.unlock();
         if (!self.permitsGrowth(len)) return null;
-        const memory = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        const memory = self.backing.rawAlloc(len, alignment, ret_addr) orelse {
+            self.largest_backing_failure = @max(self.largest_backing_failure, len);
+            return null;
+        };
         self.live_bytes += len;
         self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
         return memory;
@@ -246,6 +265,7 @@ test "lake build working-set allocator rejects growth before allocation" {
     defer bounded_alloc.free(first);
     try std.testing.expectError(error.OutOfMemory, bounded_alloc.alloc(u8, 1));
     try std.testing.expect(bounded.limit_exceeded);
+    try std.testing.expect(bounded.largest_rejected_growth > 0);
     try std.testing.expectEqual(@as(usize, 8), bounded.live_bytes);
     try std.testing.expectEqual(@as(usize, 8), bounded.peak_live_bytes);
 }
@@ -288,4 +308,17 @@ test "lake build working-set headroom composes SQL budgets without bypassing opa
     var unknown_backing = std.heap.FixedBufferAllocator.init(&buffer);
     var unknown: Memory = .{ .backing = unknown_backing.allocator(), .limit = 4096 };
     try std.testing.expectEqual(@as(?usize, null), WorkingSetAllocator.headroom(unknown.allocator()));
+}
+
+test "optional block retention respects a request cap above an opaque backing allocator" {
+    var buffer: [128 * 1024]u8 = undefined;
+    var buffer_allocator = std.heap.FixedBufferAllocator.init(&buffer);
+    var bounded = try WorkingSetAllocator.init(buffer_allocator.allocator(), .{ .max_working_set_bytes = 128 * 1024 });
+    const a = bounded.allocator();
+    try std.testing.expectEqual(@as(?usize, null), WorkingSetAllocator.headroom(a));
+    try std.testing.expectEqual(@as(?usize, 128 * 1024), WorkingSetAllocator.cacheHeadroom(a));
+    const bytes = try a.alloc(u8, 32 * 1024);
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(?usize, 96 * 1024), WorkingSetAllocator.cacheHeadroom(a));
+    try std.testing.expect(!bounded.limit_exceeded);
 }

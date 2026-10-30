@@ -272,13 +272,14 @@ pub fn publishAlloc(
         pages.value_prefix = saved_value_prefix;
     }
     if (pages.artifacts.canonical_point_bodies or (if (previous) |value| value.canonical_records else false)) {
-        pages.pack_pages = false;
+        pages.pack_pages = pages.artifacts.point_read_blocks or (if (previous) |value| value.packed_records else false);
         pages.value_prefix = null;
     }
     const rebuild = previous == null or mutations == null or !std.mem.eql(u8, &previous.?.policy_fingerprint, &policy_hash);
     if (!rebuild and mutations.?.len == 0 and previous.?.wal_end_lsn == wal_end_lsn)
         return builder.cloneArtifactRefAlloc(alloc, source_ref.?);
-    const source = if (rebuild) facts.Root{ .domain = pages.domain, .policy_fingerprint = policy_hash } else previous.?;
+    var source = if (rebuild) facts.Root{ .domain = pages.domain, .policy_fingerprint = policy_hash } else previous.?;
+    source.packed_records = source.packed_records or (pages.artifacts.point_read_blocks and pages.artifacts.canonical_point_bodies);
     var cache = tree.Cache{ .alloc = alloc, .underlying = pages.store() };
     defer cache.deinit();
     var pending = PendingBodies{ .alloc = alloc, .pages = pages };
@@ -737,96 +738,163 @@ test "model aware media serverless pending facts retain empty vector failures an
 }
 
 test "serverless canonical document facts bodies have one durable copy and resolved audit locators across flag disable and GC" {
+    for ([_]bool{ false, true }) |use_blocks| {
+        const a = std.testing.allocator;
+        var memory = @import("objectstore").MemoryClient.init(a);
+        defer memory.deinit();
+        var impl = try @import("../artifacts/object_store.zig").ObjectStore.initWithClient(a, memory.client(), "artifacts", "canonical");
+        var artifacts = impl.artifactStore();
+        defer artifacts.deinit();
+        artifacts.pack_document_bodies = true;
+        artifacts.canonical_point_bodies = true;
+        artifacts.point_read_blocks = use_blocks;
+        var reads: u64 = 64 * 1024 * 1024;
+        var writes: u64 = reads;
+        var pages = page_store.PageStore{ .domain = page_store.PageStore.namespaceDomain("canonical"), .attempt = @splat(1), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        const docs = [_]materializer.Document{
+            .{ .doc_id = @constCast("a"), .body = @constCast("{\"text\":\"first\"}"), .last_lsn = 1, .last_timestamp_ns = 1 },
+            .{ .doc_id = @constCast("b"), .body = @constCast("{\"text\":\"second\"}"), .last_lsn = 2, .last_timestamp_ns = 2 },
+        };
+        const first = try publishAlloc(a, &pages, null, &docs, null, .{}, "{}", 2);
+        defer freeRef(a, first);
+        try std.testing.expectEqual(@as(u32, if (use_blocks) 13 else 12), first.metadata_version);
+        const source = try facts.loadRoot(a, &pages, first);
+        try std.testing.expect(source.canonical_records);
+        const fact = (try facts.lookup(a, pages.store(), source, "a")).?;
+        try std.testing.expect(fact.body.pack.?.leaf_records != 0);
+        const body = try facts.readBodyAlloc(a, &pages, fact.body);
+        defer a.free(body);
+        try std.testing.expectEqualStrings(docs[0].body, body);
+        var missing = fact.body;
+        missing.pack = null;
+        const separate = try missing.identity(pages.domain);
+        try std.testing.expectError(error.FileNotFound, artifacts.getAlloc(&separate));
+        var audit = try facts.mediaCursor(a, pages.store(), source, "", null);
+        defer audit.deinit();
+        const scheduled = try facts.Fact.decode((try audit.next()).?.value);
+        const scheduled_body = try facts.readBodyAlloc(a, &pages, scheduled.body);
+        defer a.free(scheduled_body);
+        try std.testing.expectEqualStrings(docs[0].body, scheduled_body);
+        var invalid = fact.body;
+        invalid.pack.?.offset += 1;
+        try std.testing.expectError(error.InvalidDocumentBody, facts.readBodyAlloc(a, &pages, invalid));
+        // Enrichment descriptors serialize the typed locator and resolve their
+        // canonical source even when no standalone body object exists.
+        const checkpoint = try facts.encodeCheckpointBodyAlloc(a, fact.body, "{\"media_outputs\":{\"text\":\"derived\"}}");
+        defer a.free(checkpoint);
+        var parsed_checkpoint = try facts.parseCheckpointBody(a, checkpoint);
+        defer parsed_checkpoint.deinit();
+        try std.testing.expectEqualDeep(fact.body, parsed_checkpoint.value.base);
+        const resolved_checkpoint = try facts.resolveCheckpointBodyAlloc(a, &pages, checkpoint);
+        defer a.free(resolved_checkpoint);
+        var checkpoint_json = try std.json.parseFromSlice(std.json.Value, a, resolved_checkpoint, .{});
+        defer checkpoint_json.deinit();
+        try std.testing.expectEqualStrings("first", checkpoint_json.value.object.get("text").?.string);
+        try std.testing.expectEqualStrings("derived", checkpoint_json.value.object.get("media_outputs").?.object.get("text").?.string);
+        // Updating one member rewrites its shared leaf. The unchanged member's
+        // logical audit row must resolve through this new primary root, not pin
+        // the obsolete leaf through a physical locator in the scheduling index.
+        var changed = docs;
+        changed[0].body = @constCast("{\"text\":\"replacement\"}");
+        changed[0].last_lsn = 3;
+        pages.attempt = @splat(3);
+        const edited = try publishAlloc(a, &pages, first, &changed, null, .{}, "{}", 3);
+        defer freeRef(a, edited);
+        const edited_root = try facts.loadRoot(a, &pages, edited);
+        const neighbor = (try facts.lookup(a, pages.store(), edited_root, "b")).?;
+        try std.testing.expect(!std.mem.eql(u8, &neighbor.body.pack.?.digest, &fact.body.pack.?.digest));
+        var edited_audit = try facts.mediaCursor(a, pages.store(), edited_root, "", null);
+        defer edited_audit.deinit();
+        const neighbor_row = (try edited_audit.next()).?;
+        try std.testing.expectEqualStrings("b", neighbor_row.key);
+        const neighbor_audit = try facts.Fact.decode(neighbor_row.value);
+        try std.testing.expectEqualDeep(neighbor.body, neighbor_audit.body);
+        // Old pins still read their original body after the new generation exists.
+        const pinned_body = try facts.readBodyAlloc(a, &pages, fact.body);
+        defer a.free(pinned_body);
+        try std.testing.expectEqualStrings(docs[0].body, pinned_body);
+        artifacts.canonical_point_bodies = false;
+        artifacts.point_read_blocks = false;
+        artifacts.inline_point_bodies = true;
+        pages.attempt = @splat(2);
+        const next = try publishAlloc(a, &pages, first, &docs, null, .{}, "{}", 2);
+        defer freeRef(a, next);
+        const after = try facts.loadRoot(a, &pages, next);
+        const found = (try facts.lookup(a, pages.store(), after, "b")).?;
+        const restored = try facts.readBodyAlloc(a, &pages, found.body);
+        defer a.free(restored);
+        try std.testing.expectEqualStrings(docs[1].body, restored);
+        var retained = std.StringHashMapUnmanaged(void).empty;
+        defer {
+            var it = retained.keyIterator();
+            while (it.next()) |key| a.free(key.*);
+            retained.deinit(a);
+        }
+        try facts.retainRoot(a, &pages, next, &retained);
+        const id = try found.body.identity(pages.domain);
+        try std.testing.expect(retained.contains(&id));
+    }
+}
+
+test "serverless document facts packed point blocks need one physical body read after directory admission" {
     const a = std.testing.allocator;
     var memory = @import("objectstore").MemoryClient.init(a);
     defer memory.deinit();
-    var impl = try @import("../artifacts/object_store.zig").ObjectStore.initWithClient(a, memory.client(), "artifacts", "canonical");
+    var impl = try @import("../artifacts/object_store.zig").ObjectStore.initWithClient(a, memory.client(), "artifacts", "point-blocks");
     var artifacts = impl.artifactStore();
     defer artifacts.deinit();
-    artifacts.pack_document_bodies = true;
     artifacts.canonical_point_bodies = true;
+    artifacts.point_read_blocks = true;
     var reads: u64 = 64 * 1024 * 1024;
     var writes: u64 = reads;
-    var pages = page_store.PageStore{ .domain = page_store.PageStore.namespaceDomain("canonical"), .attempt = @splat(1), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
-    const docs = [_]materializer.Document{
-        .{ .doc_id = @constCast("a"), .body = @constCast("{\"text\":\"first\"}"), .last_lsn = 1, .last_timestamp_ns = 1 },
-        .{ .doc_id = @constCast("b"), .body = @constCast("{\"text\":\"second\"}"), .last_lsn = 2, .last_timestamp_ns = 2 },
-    };
-    const first = try publishAlloc(a, &pages, null, &docs, null, .{}, "{}", 2);
-    defer freeRef(a, first);
-    try std.testing.expectEqual(@as(u32, 12), first.metadata_version);
-    const source = try facts.loadRoot(a, &pages, first);
-    try std.testing.expect(source.canonical_records);
-    const fact = (try facts.lookup(a, pages.store(), source, "a")).?;
-    try std.testing.expect(fact.body.pack.?.leaf_records != 0);
-    const body = try facts.readBodyAlloc(a, &pages, fact.body);
-    defer a.free(body);
-    try std.testing.expectEqualStrings(docs[0].body, body);
-    var missing = fact.body;
-    missing.pack = null;
-    const separate = try missing.identity(pages.domain);
-    try std.testing.expectError(error.FileNotFound, artifacts.getAlloc(&separate));
-    var audit = try facts.mediaCursor(a, pages.store(), source, "", null);
-    defer audit.deinit();
-    const scheduled = try facts.Fact.decode((try audit.next()).?.value);
-    const scheduled_body = try facts.readBodyAlloc(a, &pages, scheduled.body);
-    defer a.free(scheduled_body);
-    try std.testing.expectEqualStrings(docs[0].body, scheduled_body);
-    var invalid = fact.body;
-    invalid.pack.?.offset += 1;
-    try std.testing.expectError(error.InvalidDocumentBody, facts.readBodyAlloc(a, &pages, invalid));
-    // Enrichment descriptors serialize the typed locator and resolve their
-    // canonical source even when no standalone body object exists.
-    const checkpoint = try facts.encodeCheckpointBodyAlloc(a, fact.body, "{\"media_outputs\":{\"text\":\"derived\"}}");
-    defer a.free(checkpoint);
-    var parsed_checkpoint = try facts.parseCheckpointBody(a, checkpoint);
-    defer parsed_checkpoint.deinit();
-    try std.testing.expectEqualDeep(fact.body, parsed_checkpoint.value.base);
-    const resolved_checkpoint = try facts.resolveCheckpointBodyAlloc(a, &pages, checkpoint);
-    defer a.free(resolved_checkpoint);
-    var checkpoint_json = try std.json.parseFromSlice(std.json.Value, a, resolved_checkpoint, .{});
-    defer checkpoint_json.deinit();
-    try std.testing.expectEqualStrings("first", checkpoint_json.value.object.get("text").?.string);
-    try std.testing.expectEqualStrings("derived", checkpoint_json.value.object.get("media_outputs").?.object.get("text").?.string);
-    // Updating one member rewrites its shared leaf. The unchanged member's
-    // logical audit row must resolve through this new primary root, not pin
-    // the obsolete leaf through a physical locator in the scheduling index.
-    var changed = docs;
-    changed[0].body = @constCast("{\"text\":\"replacement\"}");
-    changed[0].last_lsn = 3;
-    pages.attempt = @splat(3);
-    const edited = try publishAlloc(a, &pages, first, &changed, null, .{}, "{}", 3);
-    defer freeRef(a, edited);
-    const edited_root = try facts.loadRoot(a, &pages, edited);
-    const neighbor = (try facts.lookup(a, pages.store(), edited_root, "b")).?;
-    try std.testing.expect(!std.mem.eql(u8, &neighbor.body.pack.?.digest, &fact.body.pack.?.digest));
-    var edited_audit = try facts.mediaCursor(a, pages.store(), edited_root, "", null);
-    defer edited_audit.deinit();
-    const neighbor_row = (try edited_audit.next()).?;
-    try std.testing.expectEqualStrings("b", neighbor_row.key);
-    const neighbor_audit = try facts.Fact.decode(neighbor_row.value);
-    try std.testing.expectEqualDeep(neighbor.body, neighbor_audit.body);
-    // Old pins still read their original body after the new generation exists.
-    const pinned_body = try facts.readBodyAlloc(a, &pages, fact.body);
-    defer a.free(pinned_body);
-    try std.testing.expectEqualStrings(docs[0].body, pinned_body);
-    artifacts.canonical_point_bodies = false;
-    artifacts.inline_point_bodies = true;
-    pages.attempt = @splat(2);
-    const next = try publishAlloc(a, &pages, first, &docs, null, .{}, "{}", 2);
-    defer freeRef(a, next);
-    const after = try facts.loadRoot(a, &pages, next);
-    const found = (try facts.lookup(a, pages.store(), after, "b")).?;
-    const restored = try facts.readBodyAlloc(a, &pages, found.body);
-    defer a.free(restored);
-    try std.testing.expectEqualStrings(docs[1].body, restored);
-    var retained = std.StringHashMapUnmanaged(void).empty;
-    defer {
-        var it = retained.keyIterator();
-        while (it.next()) |key| a.free(key.*);
-        retained.deinit(a);
+    var pages = page_store.PageStore{ .domain = page_store.PageStore.namespaceDomain("point-blocks"), .attempt = @splat(1), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    const docs = try m.alloc(materializer.Document, 128);
+    const body: []const u8 = "{\"text\":\"" ++ @as([512]u8, @splat('x')) ++ "\"}";
+    for (docs, 0..) |*doc, i| doc.* = .{ .doc_id = try std.fmt.allocPrint(m, "doc/{d:0>4}", .{i}), .body = @constCast(body), .last_lsn = i + 1, .last_timestamp_ns = 1 };
+    const source = try publishAlloc(a, &pages, null, docs, null, .{}, "{}", 128);
+    defer freeRef(a, source);
+    var block_cache: page_store.PackReadCache = .{ .allocator = a };
+    defer block_cache.deinit();
+    pages.pack_cache = &block_cache;
+    const root = try facts.loadRoot(a, &pages, source);
+    try std.testing.expect(root.directory_len != 0 and root.page.?.height > 0);
+    for ([_]usize{ 0, 127 }) |index| {
+        block_cache.clearPack();
+        memory.resetOperationCount();
+        var cursor = try tree.Cursor.init(a, pages.store(), root.page, docs[index].doc_id, null);
+        defer cursor.deinit();
+        const row = (try cursor.next()).?;
+        try std.testing.expectEqualStrings(docs[index].doc_id, row.key);
+        const restored = try facts.readRecordBodyAlloc(a, &pages, row);
+        defer a.free(restored);
+        try std.testing.expectEqualStrings(body, restored);
+        try std.testing.expectEqual(@as(u64, 1), memory.operationCount());
     }
-    try facts.retainRoot(a, &pages, next, &retained);
-    const id = try found.body.identity(pages.domain);
-    try std.testing.expect(retained.contains(&id));
+    const Probe = struct {
+        fn run(alloc: std.mem.Allocator, backing: page_store.PageStore, captured: facts.Root, id: []const u8, expected: []const u8) !void {
+            var allowance: u64 = 1024 * 1024;
+            var no_writes: u64 = 0;
+            var physical: page_store.PackReadCache = .{ .allocator = alloc };
+            defer physical.deinit();
+            var query = backing;
+            query.remaining_read_bytes = &allowance;
+            query.remaining_write_bytes = &no_writes;
+            query.pack_cache = &physical;
+            const snapshot = captured;
+            var cursor = try tree.Cursor.init(alloc, query.store(), snapshot.page, id, null);
+            defer cursor.deinit();
+            const row = (try cursor.next()).?;
+            const restored = try facts.readRecordBodyAlloc(alloc, &query, row);
+            defer alloc.free(restored);
+            try std.testing.expectEqualStrings(expected, restored);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Probe.run, .{ pages, root, docs[127].doc_id, body });
+    const encoded = try artifacts.getAlloc(source.artifact_id);
+    defer a.free(encoded);
+    encoded[encoded.len - 1] ^= 1;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, facts.Root.decode(encoded));
 }

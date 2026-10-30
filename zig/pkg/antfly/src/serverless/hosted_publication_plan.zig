@@ -173,6 +173,7 @@ pub const Context = struct {
     force: bool = false,
     /// Borrowed prepared-slice lease; the outer transaction owns release.
     prepared_lease: ?*lease.HeldLease = null,
+    deferred_wal_maintenance: bool = false,
     adaptive_slices: bool = false,
     prepare_slices: bool = false,
     max_posting_units: usize = 4096,
@@ -242,6 +243,7 @@ pub const Context = struct {
         self.registry.store.upload_scope = scope;
         defer self.registry.store.upload_scope = prior_scope;
         var bridge = @import("maintenance_cancellation.zig").GraphBridge{ .maintenance = cancellation };
+        if (self.deferred_wal_maintenance and action == .step) _ = try self.wal.materializePendingCooperatively(self.registry.namespace, bridge.token());
         var reads: u64 = 16 * 1024 * 1024;
         var writes: u64 = 16 * 1024 * 1024;
         var pages = PageStore{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = self.registry.store, .cancellation = bridge.token(), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };

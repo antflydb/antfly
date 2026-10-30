@@ -209,6 +209,117 @@ pub const BufferedWrites = struct {
 /// Small operation-local immutable page cache. It is a capability wrapper, not
 /// mutable state installed on the shared artifact-store owner. Planning many
 /// touched sources can reuse routing pages without a GET per source per level.
+/// A bounded unpublished forest. Ordinary overflow writes retain their old
+/// identities. At publication, relocate the remaining child-before-parent pages
+/// into one immutable pack and only then release the new root references.
+/// Relative children omit their enclosing pack digest, avoiding a hash cycle.
+pub const Forest = struct {
+    alloc: Allocator,
+    underlying: Store,
+    buffer: BufferedWrites = undefined,
+    initialized: bool = false,
+    pub const max_bytes = 64 * 1024;
+    fn init(self: *Forest) void {
+        if (!self.initialized) {
+            self.buffer = .{ .alloc = self.alloc, .underlying = self.underlying };
+            self.initialized = true;
+        }
+    }
+    pub fn deinit(self: *Forest) void {
+        if (self.initialized) self.buffer.deinit();
+    }
+    pub fn store(self: *Forest) Store {
+        self.init();
+        if (self.underlying.pack_many == null) return self.buffer.store();
+        var result = self.buffer.store();
+        result.ptr = self;
+        result.get = get;
+        result.put = put;
+        result.put_many = many;
+        result.check = check;
+        result.decoded_page = null;
+        result.read_many = null;
+        result.pack_many = null;
+        return result;
+    }
+    fn check(raw: *anyopaque) !void {
+        const self: *Forest = @ptrCast(@alignCast(raw));
+        try self.underlying.check(self.underlying.ptr);
+    }
+    fn get(raw: *anyopaque, a: Allocator, ref: Ref) ![]u8 {
+        const self: *Forest = @ptrCast(@alignCast(raw));
+        return BufferedWrites.get(&self.buffer, a, ref);
+    }
+    fn put(raw: *anyopaque, ref: Ref, bytes: []const u8) !void {
+        const self: *Forest = @ptrCast(@alignCast(raw));
+        if (self.buffer.count != 0 and bytes.len > max_bytes - @min(max_bytes, self.buffer.bytes)) try self.buffer.flush();
+        try BufferedWrites.put(&self.buffer, ref, bytes);
+        if (self.buffer.bytes > max_bytes) try self.buffer.flush();
+    }
+    fn many(raw: *anyopaque, writes: []const Write) !void {
+        for (writes) |write| try put(raw, write.ref, write.bytes);
+    }
+    pub fn finish(self: *Forest, roots: []?Ref) !void {
+        self.init();
+        try check(self);
+        if (self.buffer.count < 2 or self.underlying.pack_many == null) return self.buffer.flush();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const originals: []const Write = self.buffer.pending[0..self.buffer.count];
+        var relocated: [max_write_batch]Write = undefined;
+        var order: [max_write_batch]usize = undefined;
+        for (order[0..originals.len], 0..) |*index, i| index.* = i;
+        std.mem.sort(usize, order[0..originals.len], originals, struct {
+            fn less(writes: []const Write, l: usize, r: usize) bool {
+                return writes[l].ref.height < writes[r].ref.height;
+            }
+        }.less);
+        // Pass one determines offsets and total size; pass two fixes the total
+        // in every relative edge and recomputes page digests bottom-up.
+        var total: usize = max_pack_bytes;
+        var offsets: [max_write_batch]u32 = undefined;
+        for (0..2) |_| {
+            var offset: usize = 0;
+            for (order[0..originals.len], 0..) |index, rank| {
+                try check(self);
+                const original = originals[index];
+                var page = try decodePage(a, self.underlying.domain, original.ref, try a.dupe(u8, original.bytes));
+                defer page.deinit(a);
+                const entries = try a.alloc(Entry, page.entries.len);
+                for (page.entries, entries) |entry, *copy| {
+                    copy.* = entry.valueEntry();
+                    if (entry.child) |child| for (order[0..rank], 0..) |prior, position| {
+                        if (!child.eql(originals[prior].ref)) continue;
+                        var replacement = relocated[position].ref;
+                        replacement.pack = .{ .digest = @splat(0), .bytes = @intCast(total), .offset = offsets[position] };
+                        copy.child = replacement;
+                        break;
+                    };
+                }
+                var aggregate: []u8 = undefined;
+                relocated[rank] = encode(a, self.underlying, entries, original.ref.height, &aggregate) catch |err| switch (err) {
+                    error.GraphPageTooLarge => return self.buffer.flush(),
+                    else => return err,
+                };
+                offsets[rank] = @intCast(offset);
+                offset = try std.math.add(usize, offset, relocated[rank].bytes.len);
+            }
+            if (offset > max_bytes + max_write_batch * 4096) return self.buffer.flush();
+            total = offset;
+        }
+        try self.underlying.pack_many.?(self.underlying.ptr, relocated[0..originals.len]);
+        try check(self);
+        for (roots) |*root| if (root.*) |ref| {
+            for (order[0..originals.len], 0..) |index, rank| if (ref.eql(originals[index].ref)) {
+                root.* = relocated[rank].ref;
+                break;
+            };
+        };
+        self.buffer.deinit();
+    }
+};
+
 pub const Cache = struct {
     alloc: Allocator,
     underlying: Store,
@@ -674,10 +785,24 @@ fn load(alloc: Allocator, store: Store, ref: Ref) !Page {
     try store.check(store.ptr);
     try ref.validate();
     if (store.decoded_page) |cache| return cache.read(cache.ptr, alloc, ref);
-    return decodePage(alloc, store.domain, ref, try store.get(store.ptr, alloc, ref));
+    // Storage can suspend the WASM stack. Complete that boundary before
+    // assembling the decoder's aggregate arguments and optional locators.
+    const bytes = try store.get(store.ptr, alloc, ref);
+    return decodePage(alloc, store.domain, ref, bytes);
 }
 /// Consume independently read page bytes on success and failure. Batched range
 /// readers retain the same full-reference and structural validation as get.
+// Keep wire validation separate from construction of an optional Ref locator.
+// In particular, no invalid zero-digest locator may escape into a decoded page.
+noinline fn resolveRelativePack(parent: Ref, attempt: [16]u8, length: u32, encoded: Pack) !Pack {
+    const enclosing = parent.pack orelse return error.InvalidGraphPage;
+    if (!std.mem.allEqual(u8, &encoded.digest, 0)) return error.InvalidRelativePageDigest;
+    if (!std.mem.eql(u8, &attempt, &parent.attempt)) return error.GraphPageAttemptMismatch;
+    if (encoded.bytes != enclosing.bytes) return error.InvalidRelativePageSize;
+    if (encoded.offset > enclosing.offset or length > enclosing.offset - encoded.offset) return error.InvalidRelativePageExtent;
+    return .{ .digest = enclosing.digest, .bytes = encoded.bytes, .offset = encoded.offset };
+}
+
 pub fn decodePage(alloc: Allocator, domain: [32]u8, ref: Ref, bytes: []u8) !Page {
     errdefer alloc.free(bytes);
     try ref.validate();
@@ -786,12 +911,14 @@ pub fn decodePage(alloc: Allocator, domain: [32]u8, ref: Ref, bytes: []u8) !Page
             };
             var child_end: usize = ref_bytes;
             if (bytes[9] & 4 != 0) {
-                if (value_len <= child_end or value[child_end] > 1) return error.InvalidGraphPage;
-                const is_packed = value[child_end] == 1;
+                if (value_len <= child_end or value[child_end] > 2) return error.InvalidGraphPage;
+                const pack_kind = value[child_end];
+                const is_packed = pack_kind != 0;
                 child_end += 1;
                 if (is_packed) {
                     if (value_len - child_end < 40) return error.InvalidGraphPage;
-                    child.pack = .{ .digest = value[child_end..][0..32].*, .bytes = readU32(value, child_end + 32), .offset = readU32(value, child_end + 36) };
+                    const encoded = Pack{ .digest = value[child_end..][0..32].*, .bytes = readU32(value, child_end + 32), .offset = readU32(value, child_end + 36) };
+                    child.pack = if (pack_kind == 2) try resolveRelativePack(ref, child.attempt, child.bytes, encoded) else encoded;
                     child_end += 40;
                 }
             }
@@ -926,7 +1053,7 @@ fn encode(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ag
             @memcpy(bytes[offset + 45 ..][0..16], &child.attempt);
             offset += ref_bytes;
             if (packed_children) {
-                bytes[offset] = if (child.pack != null) 1 else 0;
+                bytes[offset] = if (child.pack) |location| (if (std.mem.allEqual(u8, &location.digest, 0)) @as(u8, 2) else 1) else 0;
                 offset += 1;
                 if (child.pack) |pack_| {
                     @memcpy(bytes[offset..][0..32], &pack_.digest);
@@ -4597,4 +4724,132 @@ test "external lake cache admission failures leave no published slot" {
         defer a.free(bytes);
         try std.testing.expectEqual(@as(usize, root.bytes), cache.bytes);
     }
+}
+
+const ForestTest = struct {
+    memory: TestStore,
+    packs: usize = 0,
+    fn store(self: *@This()) Store {
+        return .{ .ptr = self, .domain = @splat(9), .attempt = @splat(1), .get = get, .put = put, .pack_many = packMany, .check = check };
+    }
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try TestStore.check(&self.memory);
+    }
+    fn get(raw: *anyopaque, a: Allocator, ref: Ref) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.memory.reads += 1;
+        const bytes = self.memory.pages.get(ref.artifactDigest()) orelse return error.FileNotFound;
+        if (ref.offset() > bytes.len or ref.bytes > bytes.len - ref.offset()) return error.InvalidGraphPage;
+        return a.dupe(u8, bytes[ref.offset()..][0..ref.bytes]);
+    }
+    fn put(raw: *anyopaque, ref: Ref, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return TestStore.put(&self.memory, ref, bytes);
+    }
+    fn packMany(raw: *anyopaque, writes: []Write) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var total: usize = 0;
+        for (writes) |write| total += write.bytes.len;
+        const bytes = try self.memory.alloc.alloc(u8, total);
+        defer self.memory.alloc.free(bytes);
+        var offset: usize = 0;
+        for (writes) |write| {
+            @memcpy(bytes[offset..][0..write.bytes.len], write.bytes);
+            offset += write.bytes.len;
+        }
+        var digest: [32]u8 = undefined;
+        Sha256.hash(bytes, &digest, .{});
+        try TestStore.put(&self.memory, .{ .digest = digest, .bytes = @intCast(total), .height = 0, .records = 1 }, bytes);
+        self.packs += 1;
+        offset = 0;
+        for (writes) |*write| {
+            write.ref.pack = .{ .digest = digest, .bytes = @intCast(total), .offset = @intCast(offset) };
+            offset += write.bytes.len;
+        }
+    }
+    fn run(a: Allocator, fail_upload: bool) !void {
+        var probe = ForestTest{ .memory = .{ .alloc = a } };
+        defer probe.memory.deinit();
+        var forest = Forest{ .alloc = a, .underlying = probe.store() };
+        defer forest.deinit();
+        var builder = SortedBuilder{ .alloc = a, .store = forest.store(), .target_bytes = 1024 };
+        defer builder.deinit();
+        for (0..12) |i| {
+            var key: [8]u8 = undefined;
+            std.mem.writeInt(u64, &key, i, .big);
+            try builder.add(&key, &@as([200]u8, @splat('v')));
+        }
+        var roots = [_]?Ref{ try builder.finish(), try apply(a, forest.store(), null, &.{.{ .key = "receipt", .value = "accepted" }}) };
+        const before = roots;
+        try std.testing.expectEqual(@as(usize, 0), probe.memory.writes);
+        if (fail_upload) {
+            probe.memory.fail_put = 0;
+            try std.testing.expectError(error.InjectedUploadFailure, forest.finish(&roots));
+            try std.testing.expectEqual(before, roots);
+            return;
+        }
+        try forest.finish(&roots);
+        try std.testing.expectEqual(@as(usize, 1), probe.packs);
+        try std.testing.expectEqual(@as(usize, 1), probe.memory.writes);
+        try std.testing.expect(roots[0].?.pack != null and roots[1].?.pack != null);
+        var cursor = try Cursor.init(a, probe.store(), roots[0], "", null);
+        defer cursor.deinit();
+        var count: usize = 0;
+        while (try cursor.next()) |row| {
+            try std.testing.expectEqual(count, std.mem.readInt(u64, row.key[0..8], .big));
+            try std.testing.expectEqual(@as(usize, 200), row.value.len);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 12), count);
+        const values = try lookupMany(a, probe.store(), roots[1], &.{"receipt"});
+        defer {
+            for (values) |value| if (value) |entry| entry.deinit(a);
+            a.free(values);
+        }
+        try std.testing.expectEqualStrings("accepted", values[0].?.value);
+        var detached = roots[0].?;
+        detached.pack = null;
+        var invalid = decodePage(a, probe.store().domain, detached, try get(&probe, a, roots[0].?)) catch |err| {
+            if (err != error.InvalidGraphPage) return err;
+            return;
+        };
+        invalid.deinit(a);
+        return error.TestUnexpectedResult;
+    }
+};
+
+test "immutable forest packs data routing and receipt roots atomically with authenticated relative children" {
+    try ForestTest.run(std.testing.allocator, false);
+    try ForestTest.run(std.testing.allocator, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, ForestTest.run, .{false});
+}
+
+test "immutable forest native reader accepts a WASM emitted relative routing page" {
+    const a = std.testing.allocator;
+    const bytes = @as([324]u8, .{ 65, 70, 71, 80, 84, 48, 48, 51, 1, 6, 0, 0, 3, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 138, 233, 11, 35, 60, 186, 123, 254, 161, 164, 149, 83, 140, 46, 77, 206, 49, 163, 45, 213, 92, 63, 242, 181, 62, 248, 171, 200, 99, 18, 11, 30, 7, 0, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 62, 0, 0, 0, 1, 157, 177, 13, 178, 223, 133, 206, 17, 83, 242, 25, 251, 22, 80, 118, 107, 228, 125, 109, 63, 161, 91, 209, 25, 143, 41, 161, 4, 222, 96, 86, 99, 236, 124, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 62, 0, 0, 0, 30, 74, 223, 2, 210, 190, 236, 249, 125, 162, 143, 35, 101, 167, 41, 245, 7, 144, 88, 110, 156, 69, 169, 27, 173, 93, 11, 138, 152, 223, 23, 185, 24, 0, 125, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 102, 0, 0, 0, 59, 165, 164, 162, 247, 181, 184, 212, 51, 106, 153, 91, 181, 83, 87, 16, 15, 148, 241, 219, 62, 88, 131, 30, 73, 48, 242, 3, 147, 178, 160, 56, 214, 21, 26, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 213, 27, 0, 0, 0, 0, 0, 0 });
+    const ref = Ref{ .digest = .{ 218, 95, 188, 69, 189, 75, 17, 247, 43, 68, 100, 221, 136, 141, 225, 144, 56, 254, 4, 133, 182, 144, 20, 122, 35, 97, 167, 189, 129, 154, 237, 132 }, .attempt = .{ 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 }, .bytes = 324, .height = 1, .records = 64, .pack = .{ .digest = .{ 100, 190, 170, 133, 225, 202, 195, 229, 155, 143, 122, 235, 173, 208, 137, 235, 142, 142, 179, 9, 73, 127, 172, 248, 177, 99, 84, 89, 195, 12, 216, 189 }, .bytes = 7125, .offset = 6801 } };
+    var page = try decodePage(a, bytes[24..56].*, ref, try a.dupe(u8, &bytes));
+    defer page.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), page.entries.len);
+    try std.testing.expectEqual(ref.pack.?.digest, page.entries[2].child.?.pack.?.digest);
+    // Mutate authenticated wire bytes and update their outer checksum so these
+    // cases reach the relative locator checks, not merely the page hash guard.
+    const Case = struct { offset: usize, expected: anyerror };
+    for ([_]Case{
+        .{ .offset = 284, .expected = error.InvalidRelativePageDigest },
+        .{ .offset = 267, .expected = error.GraphPageAttemptMismatch },
+        .{ .offset = 316, .expected = error.InvalidRelativePageSize },
+    }) |case| {
+        const corrupted = try a.dupe(u8, &bytes);
+        corrupted[case.offset] ^= 1;
+        var changed = ref;
+        Sha256.hash(corrupted, &changed.digest, .{});
+        try std.testing.expectError(case.expected, decodePage(a, bytes[24..56].*, changed, corrupted));
+    }
+    const forward = try a.dupe(u8, &bytes);
+    std.mem.writeInt(u32, forward[320..324], ref.pack.?.offset + 1, .little);
+    var changed = ref;
+    Sha256.hash(forward, &changed.digest, .{});
+    try std.testing.expectError(error.InvalidRelativePageExtent, decodePage(a, bytes[24..56].*, changed, forward));
 }

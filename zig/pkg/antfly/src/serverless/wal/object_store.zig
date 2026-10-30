@@ -206,7 +206,7 @@ pub const ObjectStore = struct {
 
     /// Explicit format selection. Existing legacy WALs must be migrated into a
     /// new prefix; activation may never silently hide acknowledged records.
-    pub fn enableIndexed(self: *ObjectStore, options: struct { read_state: bool = false, document_index: bool = false, inline_tail: bool = true, managed_collection: bool = false }) !void {
+    pub fn enableIndexed(self: *ObjectStore, options: struct { read_state: bool = false, document_index: bool = false, packed_pages: bool = false, deferred_indexes: bool = false, inline_tail: bool = true, managed_collection: bool = false }) !void {
         if (self.indexed != null) return error.WalAlreadyConfigured;
         const selected = try self.readLayout();
         if (selected == .legacy) return error.LegacyWalMigrationRequired;
@@ -264,6 +264,8 @@ pub const ObjectStore = struct {
         indexed.* = try @import("indexed_object_store.zig").IndexedObjectStore.init(self.alloc, self.client, self.bucket, indexed_prefix);
         indexed.read_state_enabled = options.read_state;
         indexed.document_index_enabled = options.document_index;
+        indexed.packed_pages_enabled = options.packed_pages;
+        indexed.deferred_indexes_enabled = options.deferred_indexes;
         indexed.inline_tail_enabled = options.inline_tail;
         indexed.managed_reads = wanted.managed();
         self.indexed = indexed;
@@ -526,12 +528,17 @@ pub const ObjectStore = struct {
     const indexed_vtable: wal_store.WalStore.VTable = blk: {
         var value = vtable;
         value.read_snapshot = erasedSnapshot;
+        value.materialize_pending = erasedMaterialize;
         value.read_point_alloc = erasedPoint;
         value.read_range_alloc = erasedRange;
         value.append_batch = erasedUnkeyedBatch;
         value.append_batch_idempotent = erasedBatch;
         break :blk value;
     };
+    fn erasedMaterialize(ptr: *anyopaque, ns: []const u8, cancellation: ?objectstore.CancellationToken) !bool {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.materializePendingWithCancellation(ns, cancellation);
+    }
     fn erasedSnapshot(ptr: *anyopaque, ns: []const u8) !wal_types.ReadSnapshot {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return self.indexed.?.readSnapshot(ns);

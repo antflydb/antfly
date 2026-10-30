@@ -332,6 +332,25 @@ activation. Disabling activation flags does not downgrade existing HEADs.
 `OPPORTUNISTIC_READ_PREPARE=true` additionally avoids queued or late preparation
 with detached reads. See [shared native read state](../../docs/design/native-read-state.md).
 
+Three additional storage experiments default off: `WAL_PACKED_PAGES=true`
+co-locates an unpublished WAL forest in bounded immutable blocks (HEAD format 5),
+`POINT_READ_BLOCKS=true` with `CANONICAL_POINT_BODIES=true` embeds authenticated
+point routing and preserves packed canonical locators (facts format 13), and
+`WAL_DEFERRED_INDEXES=true` commits a bounded record/receipt delta before folding
+indexes (HEAD format 6). Publish compatible native modules to every reader,
+writer, publisher and collector before activation. Existing new-format data
+remains readable when flags are disabled; downgrade requires migration, not
+switching a flag. The resource and acceptance limits remain unchanged.
+See [compact serving blocks and deferred folding](../../docs/design/serverless-compact-serving-blocks.md)
+for persistence, concurrency, overflow, collection, and measurement contracts.
+
+`DO_LOCATION_HINT` can override compute placement independently of the bucket
+hint, with `RUNTIME_GENERATION` selecting fresh compute identities while keeping
+R2 storage identity. Hints are not evidence of physical colocation. The opt-in,
+authenticated `QUALIFICATION_PLACEMENT_PROBE=true` endpoint and
+`qualification/probe-placement.mjs` measure role-to-storage/RPC latency. Probe
+identities are warmed and cannot serve as physical-cold qualification samples.
+
 With publication continuations enabled, `publish` returns `job_id`, `phase`,
 `offset` and `has_more` while work remains. Resume with `publication_job_id`,
 inspect with `publication_action: "status"`, or cancel with

@@ -25,6 +25,7 @@ const codec = @import("record_codec.zig");
 const types = @import("types.zig");
 const WalStore = @import("store.zig").WalStore;
 const A = std.mem.Allocator;
+const DeferredTail = @import("deferred_tail.zig").Tail;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const IndexedObjectStore = struct {
@@ -39,6 +40,9 @@ pub const IndexedObjectStore = struct {
     inline_tail_enabled: bool = false,
     read_state_enabled: bool = false,
     document_index_enabled: bool = false,
+    /// Requires compatible readers; persisted format five keeps this contract.
+    packed_pages_enabled: bool = false,
+    deferred_indexes_enabled: bool = false,
     /// Selected only by the managed-layout bootstrap on a pristine prefix.
     /// A persisted HEAD contract remains authoritative when this hint is off.
     managed_reads: bool = false,
@@ -102,6 +106,9 @@ pub const IndexedObjectStore = struct {
     pub const ReadParent = struct { latest_lsn: u64, write_epoch: u64, physical_first_lsn: u64, records: ?tree.Ref = null };
     pub const Head = struct {
         format: u32 = 2,
+        packed_pages: ?bool = null,
+        deferred_indexes: ?bool = null,
+        deferred_tail: ?DeferredTail = null,
         root_lifetime_ms: ?u32 = null,
         write_epoch: u64 = 1,
         physical_first_lsn: u64 = 1,
@@ -160,7 +167,7 @@ pub const IndexedObjectStore = struct {
             var current = try ctx.readHead();
             defer current.deinit(self.alloc);
             ctx.setEpoch(current.value.write_epoch);
-            var uploads = tree.BufferedWrites{ .alloc = self.alloc, .underlying = ctx.store() };
+            var uploads = tree.Forest{ .alloc = self.alloc, .underlying = ctx.store() };
             defer uploads.deinit();
             var cache = tree.Cache{ .alloc = self.alloc, .underlying = uploads.store() };
             defer cache.deinit();
@@ -169,7 +176,7 @@ pub const IndexedObjectStore = struct {
             std.mem.writeInt(u64, receipt[8..16], timestamp, .little);
             Sha256.hash(payload, receipt[16..48], .{});
             if (operation_id) |id| {
-                const found = try tree.lookupMany(self.alloc, pages, current.value.operations, &.{id});
+                const found = try self.lookupReceipts(self.alloc, pages, current.value, &.{id});
                 defer self.alloc.free(found);
                 defer if (found[0]) |value| value.deinit(self.alloc);
                 if (found[0]) |value| {
@@ -193,18 +200,22 @@ pub const IndexedObjectStore = struct {
             if (encoded.len + 8 > tree.max_record_bytes) return error.WalRecordTooLarge;
             var lsn_key: [8]u8 = undefined;
             std.mem.writeInt(u64, &lsn_key, next, .big);
-            var updated = current.value;
             const changes = [_]tree.Mutation{.{ .key = &lsn_key, .value = encoded }};
-            updated.read_parent = self.parent(current.value);
-            updated.document_index = try self.updateDocumentIndex(pages, current.value, &changes);
-            updated.records = try tree.apply(self.alloc, pages, updated.records, &changes);
-            if (operation_id) |id| {
-                std.mem.writeInt(u64, receipt[0..8], next, .little);
-                updated.operations = try tree.apply(self.alloc, pages, updated.operations, &.{.{ .key = id, .value = &receipt }});
+            std.mem.writeInt(u64, receipt[0..8], next, .little);
+            var receipt_change: [1]tree.Mutation = undefined;
+            const operation_changes: []const tree.Mutation = if (operation_id) |id| blk: {
+                receipt_change[0] = .{ .key = id, .value = &receipt };
+                break :blk &receipt_change;
+            } else &.{};
+            switch (try self.tryDeferred(&ctx, current, &changes, operation_changes, next)) {
+                .committed => return next,
+                .contended => continue,
+                .materialize => {},
             }
+            var updated = try self.applyChanges(pages, current.value, &changes, operation_changes);
             updated.latest_lsn = next;
             updated.inline_tail = if (self.inline_tail_enabled) InlineTail.fromRecord(encoded) else null;
-            try uploads.flush();
+            try ctx.finishForest(&uploads, &updated);
             ctx.writeHead(updated, current.revision) catch |err| switch (err) {
                 error.PreconditionFailed => continue,
                 else => return err,
@@ -281,7 +292,7 @@ pub const IndexedObjectStore = struct {
             var current = try ctx.readHead();
             defer current.deinit(self.alloc);
             ctx.setEpoch(current.value.write_epoch);
-            var uploads = tree.BufferedWrites{ .alloc = self.alloc, .underlying = ctx.store() };
+            var uploads = tree.Forest{ .alloc = self.alloc, .underlying = ctx.store() };
             defer uploads.deinit();
             var cache = tree.Cache{ .alloc = self.alloc, .underlying = uploads.store() };
             defer cache.deinit();
@@ -290,7 +301,7 @@ pub const IndexedObjectStore = struct {
                 const empty = try scratch.alloc(?tree.BatchEntry, 1);
                 empty[0] = null;
                 break :blk empty;
-            } else try tree.lookupMany(scratch, pages, current.value.operations, ids);
+            } else try self.lookupReceipts(scratch, pages, current.value, ids);
             var changes = std.ArrayList(tree.Mutation).empty;
             var operations = std.ArrayList(tree.Mutation).empty;
             var last = current.value.latest_lsn;
@@ -332,19 +343,15 @@ pub const IndexedObjectStore = struct {
                 results[index] = .{ .start_lsn = first, .end_lsn = last };
             }
             if (changes.items.len == 0) return results;
-            var updated = current.value;
-            updated.read_parent = self.parent(current.value);
-            updated.document_index = try self.updateDocumentIndex(pages, current.value, changes.items);
-            updated.records = try tree.apply(self.alloc, pages, updated.records, changes.items);
-            std.mem.sort(tree.Mutation, operations.items, {}, struct {
-                fn less(_: void, left: tree.Mutation, right: tree.Mutation) bool {
-                    return std.mem.lessThan(u8, left.key, right.key);
-                }
-            }.less);
-            updated.operations = try tree.apply(self.alloc, pages, updated.operations, operations.items);
+            switch (try self.tryDeferred(&ctx, current, changes.items, operations.items, last)) {
+                .committed => return results,
+                .contended => continue,
+                .materialize => {},
+            }
+            var updated = try self.applyChanges(pages, current.value, changes.items, operations.items);
             updated.latest_lsn = last;
             updated.inline_tail = if (self.inline_tail_enabled) InlineTail.fromRecord(changes.items[changes.items.len - 1].value.?) else null;
-            try uploads.flush();
+            try ctx.finishForest(&uploads, &updated);
             ctx.writeHead(updated, current.revision) catch |err| switch (err) {
                 error.PreconditionFailed => continue,
                 else => return err,
@@ -354,7 +361,139 @@ pub const IndexedObjectStore = struct {
         return error.WalCommitContended;
     }
 
+    fn lookupReceipts(self: *@This(), a: A, pages: tree.Store, head: Head, ids: []const []const u8) ![]?tree.BatchEntry {
+        const out = try a.alloc(?tree.BatchEntry, ids.len);
+        @memset(out, null);
+        errdefer {
+            for (out) |entry| if (entry) |value| value.deinit(a);
+            a.free(out);
+        }
+        // A hit in the delta requires no dependent tree read. Misses are still
+        // batched against the immutable receipt tree.
+        var missing = std.ArrayList([]const u8).empty;
+        defer missing.deinit(a);
+        var positions = std.ArrayList(usize).empty;
+        defer positions.deinit(a);
+        for (ids, 0..) |id, i| {
+            const pending = if (head.deferred_tail) |*tail| try tail.lookup(id) else null;
+            if (pending) |value| {
+                const key = try a.dupe(u8, id);
+                errdefer a.free(key);
+                out[i] = .{ .key = key, .value = try a.dupe(u8, value), .rank = 0 };
+            } else {
+                try missing.append(a, id);
+                try positions.append(a, i);
+            }
+        }
+        if (missing.items.len != 0) {
+            const found = try tree.lookupMany(a, pages, head.operations, missing.items);
+            defer a.free(found);
+            for (found, positions.items) |value, i| out[i] = value;
+        }
+        _ = self;
+        return out;
+    }
+    fn tryDeferred(self: *@This(), ctx: *Context, current: Snapshot, changes: []const tree.Mutation, operations: []const tree.Mutation, latest: u64) !enum { committed, contended, materialize } {
+        if (!self.deferred_indexes_enabled and current.value.deferred_indexes != true) return .materialize;
+        const tail = current.value.deferred_tail orelse DeferredTail{};
+        var updated = current.value;
+        updated.deferred_tail = (try tail.append(changes, operations)) orelse return .materialize;
+        updated.deferred_indexes = true;
+        if (self.document_index_enabled or current.value.document_index != null) {
+            for (changes) |change| {
+                const encoded = change.value orelse return error.InvalidWal;
+                const record = try codec.parseRecord(encoded, 0);
+                _ = try @import("../api/codec.zig").decodeMutationView(record.payload);
+            }
+            // Index activation starts at this accepting batch, including when
+            // older generic WAL records still live in the bounded delta.
+            if (updated.document_index == null) updated.document_index = .{ .first_lsn = current.value.latest_lsn + 1 };
+        }
+        updated.latest_lsn = latest;
+        updated.inline_tail = null;
+        updated.read_parent = self.parent(current.value);
+        ctx.writeHead(updated, current.revision) catch |err| switch (err) {
+            error.PreconditionFailed => return .contended,
+            error.WalHeadTooLarge => return .materialize,
+            else => return err,
+        };
+        return .committed;
+    }
+    fn materialize(self: *@This(), pages: tree.Store, current: Head) !Head {
+        return self.applyChanges(pages, current, &.{}, &.{});
+    }
+    fn applyChanges(self: *@This(), pages: tree.Store, current: Head, appended: []const tree.Mutation, receipts: []const tree.Mutation) !Head {
+        var out = current;
+        if (self.deferred_indexes_enabled) out.deferred_indexes = true;
+        if (current.deferred_tail == null and appended.len == 0) return out;
+        const tail = current.deferred_tail;
+        const view = if (tail) |*value| try value.view() else DeferredTail.View{};
+        // Fold the pending prefix and this accepting batch in one COW update.
+        // Intermediate private roots would otherwise be encoded/uploaded twice
+        // exactly on the overflow writes that determine tail latency.
+        var keys: [DeferredTail.max_records][8]u8 = undefined;
+        const merged = if (view.record_count != 0) try self.alloc.alloc(tree.Mutation, view.record_count + appended.len) else null;
+        defer if (merged) |value| self.alloc.free(value);
+        const changes = if (merged) |value| blk: {
+            for (view.records[0..view.record_count], 0..) |encoded, i| {
+                const record = try codec.parseRecord(encoded, 0);
+                std.mem.writeInt(u64, &keys[i], record.lsn, .big);
+                value[i] = .{ .key = &keys[i], .value = encoded };
+            }
+            @memcpy(value[view.record_count..], appended);
+            break :blk @as([]const tree.Mutation, value);
+        } else appended;
+        var base = current;
+        if (base.document_index == null and self.document_index_enabled) base.document_index = .{ .first_lsn = current.latest_lsn + 1 };
+        base.latest_lsn -= view.record_count;
+        out.document_index = try self.updateDocumentIndex(pages, base, changes);
+        out.records = try tree.apply(self.alloc, pages, current.records, changes);
+        var operations: [DeferredTail.max_records + 16]tree.Mutation = undefined;
+        const n = view.operation_count + receipts.len;
+        if (n > operations.len) return error.InvalidWalBatch;
+        @memcpy(operations[0..view.operation_count], view.operations[0..view.operation_count]);
+        @memcpy(operations[view.operation_count..n], receipts);
+        std.mem.sort(tree.Mutation, operations[0..n], {}, struct {
+            fn less(_: void, left: tree.Mutation, right: tree.Mutation) bool {
+                return std.mem.lessThan(u8, left.key, right.key);
+            }
+        }.less);
+        out.operations = try tree.apply(self.alloc, pages, current.operations, operations[0..n]);
+        out.deferred_tail = null;
+        out.read_parent = if (appended.len == 0) null else self.parent(current);
+        return out;
+    }
+    /// Bounded background folding. Call only under the runtime's existing
+    /// maintenance/leader ownership. CAS failure retries the captured root;
+    /// uploaded pages are never authority on their own.
+    pub fn materializePending(self: *@This(), namespace: []const u8) !bool {
+        return self.materializePendingWithCancellation(namespace, null);
+    }
+    pub fn materializePendingWithCancellation(self: *@This(), namespace: []const u8, cancellation: ?objectstore.CancellationToken) !bool {
+        var ctx = try Context.init(self, namespace, cancellation);
+        defer ctx.deinit();
+        for (0..self.max_attempts) |_| {
+            var head = try ctx.readHead();
+            defer head.deinit(self.alloc);
+            if (head.value.deferred_tail == null) return false;
+            ctx.setEpoch(head.value.write_epoch);
+            var uploads = tree.Forest{ .alloc = self.alloc, .underlying = ctx.store() };
+            defer uploads.deinit();
+            var cache = tree.Cache{ .alloc = self.alloc, .underlying = uploads.store() };
+            defer cache.deinit();
+            var next = try self.materialize(cache.store(), head.value);
+            try ctx.finishForest(&uploads, &next);
+            ctx.writeHead(next, head.revision) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => return err,
+            };
+            return true;
+        }
+        return error.WalCommitContended;
+    }
+
     fn parent(self: *@This(), current: Head) ?ReadParent {
+        if (current.deferred_tail != null) return null;
         if (!self.read_state_enabled and !self.document_index_enabled and current.read_parent == null and current.document_index == null) return null;
         return .{ .latest_lsn = current.latest_lsn, .write_epoch = current.write_epoch, .physical_first_lsn = current.physical_first_lsn, .records = current.records };
     }
@@ -369,6 +508,7 @@ pub const IndexedObjectStore = struct {
             const encoded = change.value orelse return error.InvalidWal;
             const record = try codec.parseRecord(encoded, 0);
             if (record.next_cursor != encoded.len) return error.InvalidWal;
+            if (record.lsn < index.first_lsn) continue;
             const mutation = try @import("../api/codec.zig").decodeMutationView(record.payload);
             // Store small records in the authenticated index leaf. Large bodies
             // retain only their LSN and use the ordinary record tree on a hit.
@@ -457,7 +597,7 @@ pub const IndexedObjectStore = struct {
         std.mem.writeInt(u64, lineage[32..40], head.value.write_epoch, .big);
         var lineage_id: [32]u8 = undefined;
         Sha256.hash(&lineage, &lineage_id, .{});
-        return .{ .latest_lsn = head.value.latest_lsn, .first_lsn = head.value.first_lsn, .identity = try identity(self.alloc, ctx.domain, .{ .latest_lsn = head.value.latest_lsn, .write_epoch = head.value.write_epoch, .physical_first_lsn = head.value.physical_first_lsn, .records = head.value.records }), .lineage = lineage_id, .small_tail = head.value.inline_tail != null, .parent_identity = if (head.value.read_parent) |value| try identity(self.alloc, ctx.domain, value) else null, .parent_lsn = if (head.value.read_parent) |value| value.latest_lsn else 0 };
+        return .{ .latest_lsn = head.value.latest_lsn, .first_lsn = head.value.first_lsn, .identity = try identity(self.alloc, ctx.domain, .{ .latest_lsn = head.value.latest_lsn, .write_epoch = head.value.write_epoch, .physical_first_lsn = head.value.physical_first_lsn, .records = head.value.records }), .lineage = lineage_id, .small_tail = head.value.inline_tail != null or head.value.deferred_tail != null, .parent_identity = if (head.value.read_parent) |value| try identity(self.alloc, ctx.domain, value) else null, .parent_lsn = if (head.value.read_parent) |value| value.latest_lsn else 0 };
     }
     pub fn readPointAlloc(self: *@This(), a: A, namespace: []const u8, id: []const u8, range: types.ReadRange) !types.PointRead {
         try range.check();
@@ -469,6 +609,26 @@ pub const IndexedObjectStore = struct {
         defer head.deinit(self.alloc);
         if (range.start_lsn < head.value.first_lsn) return error.WalSnapshotExpired;
         if (range.end_lsn > head.value.latest_lsn) return error.WalVisibilityUnavailable;
+        if (range.end_lsn != head.value.latest_lsn) return .{};
+        if (head.value.deferred_tail) |*tail| {
+            const view = try tail.view();
+            var i = view.record_count;
+            while (i > 0) {
+                i -= 1;
+                const encoded = view.records[i];
+                const record = try codec.parseRecord(encoded, 0);
+                if (record.lsn < range.start_lsn) break;
+                const mutation = @import("../api/codec.zig").decodeMutationView(record.payload) catch return .{};
+                if (!std.mem.eql(u8, id, mutation.doc_id)) continue;
+                if (encoded.len + @sizeOf(types.Record) > range.max_bytes) return error.WalReadBudgetExceeded;
+                const payload = try a.dupe(u8, record.payload);
+                errdefer a.free(payload);
+                const operation_id = if (record.operation_id) |op| try a.dupe(u8, op) else null;
+                errdefer if (operation_id) |op| a.free(op);
+                try range.check();
+                return .{ .indexed = true, .record = .{ .lsn = record.lsn, .timestamp_ns = record.timestamp_ns, .payload = payload, .operation_id = operation_id } };
+            }
+        }
         const index = head.value.document_index orelse return .{};
         if (range.end_lsn != head.value.latest_lsn or range.start_lsn < index.first_lsn) return .{};
         const found = try tree.lookupMany(a, ctx.store(), index.root, &.{id});
@@ -538,7 +698,8 @@ pub const IndexedObjectStore = struct {
         var lower: [8]u8 = undefined;
         var upper: [8]u8 = undefined;
         std.mem.writeInt(u64, &lower, range.start_lsn, .big);
-        std.mem.writeInt(u64, &upper, range.end_lsn + 1, .big);
+        const base_latest = head.value.latest_lsn - if (head.value.deferred_tail) |*tail| tail.count() else @as(usize, 0);
+        std.mem.writeInt(u64, &upper, @min(range.end_lsn, base_latest) + 1, .big);
         var cursor = try tree.Cursor.init(alloc, ctx.store(), head.value.records, &lower, &upper);
         defer cursor.deinit();
         var out: std.ArrayListUnmanaged(types.Record) = .empty;
@@ -564,6 +725,22 @@ pub const IndexedObjectStore = struct {
             errdefer if (id) |value| alloc.free(value);
             try out.append(alloc, .{ .lsn = record.lsn, .timestamp_ns = record.timestamp_ns, .payload = payload, .operation_id = id });
             expected += 1;
+        }
+        if (head.value.deferred_tail) |*tail| {
+            const view = try tail.view();
+            for (view.records[0..view.record_count]) |encoded| {
+                const record = try codec.parseRecord(encoded, 0);
+                if (record.lsn < range.start_lsn or record.lsn > range.end_lsn) continue;
+                if (record.lsn != expected) return error.InvalidWal;
+                bytes = std.math.add(usize, bytes, encoded.len + @sizeOf(types.Record)) catch return error.WalReadBudgetExceeded;
+                if (bytes > range.max_bytes) return error.WalReadBudgetExceeded;
+                const payload = try alloc.dupe(u8, record.payload);
+                errdefer alloc.free(payload);
+                const id = if (record.operation_id) |value| try alloc.dupe(u8, value) else null;
+                errdefer if (id) |value| alloc.free(value);
+                try out.append(alloc, .{ .lsn = record.lsn, .timestamp_ns = record.timestamp_ns, .payload = payload, .operation_id = id });
+                expected += 1;
+            }
         }
         if (expected != range.end_lsn + 1) return error.InvalidWal;
         try range.check();
@@ -606,12 +783,13 @@ pub const IndexedObjectStore = struct {
             defer head.deinit(self.alloc);
             if (head.value.physical_first_lsn == head.value.first_lsn) return false;
             ctx.setEpoch(head.value.write_epoch);
-            var uploads = tree.BufferedWrites{ .alloc = self.alloc, .underlying = ctx.store() };
+            var uploads = tree.Forest{ .alloc = self.alloc, .underlying = ctx.store() };
             defer uploads.deinit();
             var cache = tree.Cache{ .alloc = self.alloc, .underlying = uploads.store() };
             defer cache.deinit();
             const pages = cache.store();
-            const pruned = try self.pruneDocumentIndex(pages, head.value, @min(head.value.first_lsn, head.value.physical_first_lsn +| max_records));
+            const materialized = try self.materialize(pages, head.value);
+            const pruned = try self.pruneDocumentIndex(pages, materialized, @min(head.value.first_lsn, head.value.physical_first_lsn +| max_records));
             const end = pruned.end;
             var keys: [256][8]u8 = undefined;
             var changes: [256]tree.Mutation = undefined;
@@ -620,11 +798,11 @@ pub const IndexedObjectStore = struct {
                 std.mem.writeInt(u64, key, head.value.physical_first_lsn + i, .big);
                 change.* = .{ .key = key, .value = null };
             }
-            var updated = head.value;
+            var updated = materialized;
             updated.document_index = pruned.index;
-            updated.records = try tree.apply(self.alloc, pages, head.value.records, changes[0..count]);
+            updated.records = try tree.apply(self.alloc, pages, materialized.records, changes[0..count]);
             updated.physical_first_lsn = end;
-            try uploads.flush();
+            try ctx.finishForest(&uploads, &updated);
             ctx.writeHead(updated, head.revision) catch |err| switch (err) {
                 error.PreconditionFailed => continue,
                 else => return err,
@@ -690,6 +868,13 @@ pub const IndexedObjectStore = struct {
             var next = head.value;
             if (!std.mem.eql(u8, &next.gc_attempt, &id)) {
                 if (next.root_lifetime_ms != null and !std.mem.allEqual(u8, &next.gc_attempt, 0)) return error.CollectionBusy;
+                ctx.setEpoch(head.value.write_epoch);
+                var uploads = tree.Forest{ .alloc = self.alloc, .underlying = ctx.store() };
+                defer uploads.deinit();
+                var cache = tree.Cache{ .alloc = self.alloc, .underlying = uploads.store() };
+                defer cache.deinit();
+                next = try self.materialize(cache.store(), next);
+                try ctx.finishForest(&uploads, &next);
                 next.write_epoch = std.math.add(u64, next.write_epoch, 1) catch return error.WalLsnExhausted;
                 next.gc_attempt = id;
                 next.gc_records = next.records;
@@ -779,6 +964,8 @@ pub const IndexedObjectStore = struct {
         opened_ns: u64,
         bounded_roots: bool,
         attempt: [16]u8 = @splat(0),
+        pack_enabled: bool = false,
+        packed_cache: ?struct { allocator: A, digest: [32]u8, attempt: [16]u8, bytes: []u8 } = null,
 
         fn init(owner: *IndexedObjectStore, namespace: []const u8, cancellation: ?objectstore.CancellationToken) !@This() {
             // Hash the namespace so untrusted names cannot escape the prefix.
@@ -787,16 +974,17 @@ pub const IndexedObjectStore = struct {
             const root = try std.fmt.allocPrint(owner.alloc, "{s}/wal-v1/{s}", .{ owner.prefix, std.fmt.bytesToHex(digest, .lower) });
             var domain: [32]u8 = undefined;
             Sha256.hash(root, &domain, .{});
-            return .{ .owner = owner, .root = root, .domain = domain, .cancellation = cancellation, .opened_ns = owner.read_clock.read(), .bounded_roots = owner.managed_reads };
+            return .{ .owner = owner, .root = root, .domain = domain, .cancellation = cancellation, .opened_ns = owner.read_clock.read(), .bounded_roots = owner.managed_reads, .pack_enabled = owner.packed_pages_enabled };
         }
         fn deinit(self: *@This()) void {
+            if (self.packed_cache) |cache| cache.allocator.free(cache.bytes);
             self.owner.alloc.free(self.root);
         }
         fn setEpoch(self: *@This(), epoch: u64) void {
             std.mem.writeInt(u64, self.attempt[0..8], epoch, .big);
         }
         fn store(self: *@This()) tree.Store {
-            return .{ .ptr = self, .domain = self.domain, .get = getPage, .put = putPage, .put_many = putPages, .check = check, .prefix_keys = true, .attempt = self.attempt };
+            return .{ .ptr = self, .domain = self.domain, .get = getPage, .read_many = if (self.owner.client.vtable.get_objects != null) .{ .ptr = self, .read = readPages } else null, .put = putPage, .put_many = putPages, .pack_many = if (self.pack_enabled) packPages else null, .check = check, .prefix_keys = true, .attempt = self.attempt };
         }
         fn check(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -834,18 +1022,23 @@ pub const IndexedObjectStore = struct {
             const parsed = try std.json.parseFromSlice(Head, a, result.body, .{});
             defer parsed.deinit();
             const head = parsed.value;
+            if ((head.packed_pages orelse false) != (head.format == 5) and head.format != 6) return error.InvalidWal;
+            if ((head.deferred_indexes == true) != (head.format == 6) or (head.deferred_tail != null and head.deferred_indexes != true)) return error.InvalidWal;
+            if (head.deferred_tail) |*tail| try tail.validate(head.latest_lsn);
+            const base_latest = head.latest_lsn - if (head.deferred_tail) |*tail| tail.count() else @as(usize, 0);
+            self.pack_enabled = self.owner.packed_pages_enabled or (head.packed_pages orelse false);
             if (head.root_lifetime_ms) |limit| {
                 if (limit != root_lifetime_ms) return error.InvalidWal;
                 self.bounded_roots = true;
             } else if (self.owner.managed_reads) return error.WalReaderContractMissing;
             try check(self);
-            if ((head.format != 1 and head.format != 2 and head.format != 3 and head.format != 4) or head.write_epoch == 0 or head.physical_first_lsn == 0 or head.physical_first_lsn > head.first_lsn or head.first_lsn == 0 or head.latest_lsn == std.math.maxInt(u64) or
-                head.first_lsn > head.latest_lsn + 1 or (head.latest_lsn >= head.physical_first_lsn and head.records == null)) return error.InvalidWal;
-            if (head.format != 4 and (head.document_index != null or head.read_parent != null or head.gc_documents != null)) return error.InvalidWal;
-            if (head.format != 4 and (head.format == 3) != (head.inline_tail != null)) return error.InvalidWal;
+            if ((head.format != 1 and head.format != 2 and head.format != 3 and head.format != 4 and head.format != 5 and head.format != 6) or head.write_epoch == 0 or head.physical_first_lsn == 0 or head.physical_first_lsn > head.first_lsn or head.physical_first_lsn > base_latest + 1 or head.first_lsn == 0 or head.latest_lsn == std.math.maxInt(u64) or
+                head.first_lsn > head.latest_lsn + 1 or (base_latest >= head.physical_first_lsn and head.records == null)) return error.InvalidWal;
+            if (head.format < 4 and (head.document_index != null or head.read_parent != null or head.gc_documents != null)) return error.InvalidWal;
+            if (head.format < 4 and (head.format == 3) != (head.inline_tail != null)) return error.InvalidWal;
             if (head.document_index) |index| {
                 if (index.first_lsn == 0 or index.first_lsn > head.latest_lsn + 1) return error.InvalidWal;
-                if (head.latest_lsn >= @max(index.first_lsn, head.physical_first_lsn) and index.root == null) return error.InvalidWal;
+                if (base_latest >= @max(index.first_lsn, head.physical_first_lsn) and index.root == null) return error.InvalidWal;
                 if (index.root) |ref| {
                     try ref.validate();
                     if (ref.records > head.latest_lsn) return error.InvalidWal;
@@ -871,7 +1064,7 @@ pub const IndexedObjectStore = struct {
             }
             if (head.records) |ref| {
                 try ref.validate();
-                if (ref.records != head.latest_lsn + 1 - head.physical_first_lsn) return error.InvalidWal;
+                if (ref.records != base_latest + 1 - head.physical_first_lsn) return error.InvalidWal;
             }
             if (head.operations) |ref| {
                 try ref.validate();
@@ -886,13 +1079,14 @@ pub const IndexedObjectStore = struct {
             const key = try std.fmt.allocPrint(a, "{s}/HEAD", .{self.root});
             defer a.free(key);
             var upgraded = head;
+            upgraded.packed_pages = if (self.pack_enabled or (head.packed_pages orelse false)) true else null;
             if (upgraded.first_lsn > upgraded.latest_lsn) upgraded.inline_tail = null;
-            upgraded.format = if (upgraded.document_index != null or upgraded.read_parent != null or upgraded.gc_documents != null) 4 else if (upgraded.inline_tail != null) 3 else 2;
+            upgraded.format = if (upgraded.deferred_indexes == true) 6 else if (upgraded.packed_pages == true) 5 else if (upgraded.document_index != null or upgraded.read_parent != null or upgraded.gc_documents != null) 4 else if (upgraded.inline_tail != null) 3 else 2;
             var bytes = try std.json.Stringify.valueAlloc(a, upgraded, .{ .emit_null_optional_fields = false });
             if (bytes.len > 4096 and upgraded.inline_tail != null) {
                 a.free(bytes);
                 upgraded.inline_tail = null;
-                upgraded.format = if (upgraded.document_index != null or upgraded.read_parent != null or upgraded.gc_documents != null) 4 else 2;
+                upgraded.format = if (upgraded.deferred_indexes == true) 6 else if (upgraded.packed_pages == true) 5 else if (upgraded.document_index != null or upgraded.read_parent != null or upgraded.gc_documents != null) 4 else 2;
                 bytes = try std.json.Stringify.valueAlloc(a, upgraded, .{ .emit_null_optional_fields = false });
             }
             defer a.free(bytes);
@@ -909,17 +1103,39 @@ pub const IndexedObjectStore = struct {
             defer result.deinit(a);
         }
         fn pageKey(self: *@This(), a: A, ref: tree.Ref) ![]u8 {
-            if (std.mem.allEqual(u8, &ref.attempt, 0)) return std.fmt.allocPrint(a, "{s}/pages/{s}", .{ self.root, std.fmt.bytesToHex(ref.digest, .lower) });
-            return std.fmt.allocPrint(a, "{s}/pages/{s}/{s}", .{ self.root, std.fmt.bytesToHex(ref.attempt, .lower), std.fmt.bytesToHex(ref.digest, .lower) });
+            if (std.mem.allEqual(u8, &ref.attempt, 0)) return std.fmt.allocPrint(a, "{s}/pages/{s}", .{ self.root, std.fmt.bytesToHex(ref.artifactDigest(), .lower) });
+            return std.fmt.allocPrint(a, "{s}/pages/{s}/{s}", .{ self.root, std.fmt.bytesToHex(ref.attempt, .lower), std.fmt.bytesToHex(ref.artifactDigest(), .lower) });
         }
         fn getPage(raw: *anyopaque, a: A, ref: tree.Ref) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try check(raw);
+            try ref.validate();
+            const headroom = @import("../build/lake_build_limits.zig").WorkingSetAllocator.cacheHeadroom(self.owner.alloc) orelse std.math.maxInt(usize);
+            if (ref.pack) |location| if (location.bytes <= tree.Forest.max_bytes + tree.max_write_batch * 4096 and @as(usize, location.bytes) +| ref.bytes +| tree.readWorkspace(ref) <= headroom) {
+                const hit = if (self.packed_cache) |cache| cache.bytes.len == location.bytes and std.mem.eql(u8, &cache.digest, &location.digest) and std.mem.eql(u8, &cache.attempt, &ref.attempt) else false;
+                if (!hit) {
+                    const key = try self.pageKey(a, ref);
+                    defer a.free(key);
+                    const cache_allocator = self.owner.alloc;
+                    var client = self.owner.client;
+                    client.allocator = cache_allocator;
+                    var result = try client.getObject(self.owner.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = location.bytes, .cancellation = self.transportToken() });
+                    defer result.metadata.deinit(cache_allocator);
+                    errdefer cache_allocator.free(result.body);
+                    try check(raw);
+                    var digest: [32]u8 = undefined;
+                    Sha256.hash(result.body, &digest, .{});
+                    if (result.body.len != location.bytes or !std.mem.eql(u8, &digest, &location.digest)) return error.ArtifactIntegrityMismatch;
+                    if (self.packed_cache) |cache| cache.allocator.free(cache.bytes);
+                    self.packed_cache = .{ .allocator = cache_allocator, .digest = digest, .attempt = ref.attempt, .bytes = result.body };
+                }
+                return a.dupe(u8, self.packed_cache.?.bytes[location.offset..][0..ref.bytes]);
+            };
             const key = try self.pageKey(a, ref);
             defer a.free(key);
             var client = self.owner.client;
             client.allocator = a;
-            var result = client.getObject(self.owner.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = ref.bytes, .cancellation = self.transportToken() }) catch |err| {
+            var result = client.getObject(self.owner.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = ref.bytes, .range = if (ref.pack != null) .{ .offset = ref.offset(), .length = ref.bytes } else null, .cancellation = self.transportToken() }) catch |err| {
                 if (err == error.Canceled) try check(raw);
                 return err;
             };
@@ -927,6 +1143,97 @@ pub const IndexedObjectStore = struct {
             errdefer a.free(result.body);
             try check(raw);
             return result.body;
+        }
+        fn readPages(raw: *anyopaque, a: A, refs: []const tree.Ref, output: []tree.Page) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (refs.len != output.len or refs.len > @import("objectstore").ordered_tree.max_read_batch) return error.InvalidGraphPage;
+            var initialized: usize = 0;
+            errdefer for (output[0..initialized]) |*page| page.deinit(a);
+            var begin: usize = 0;
+            while (begin < refs.len) {
+                try check(raw);
+                // A packed page may already share the request's physical block.
+                if (refs[begin].pack != null or refs[begin].bytes > 256 * 1024) {
+                    const encoded = try getPage(raw, a, refs[begin]);
+                    output[begin] = try tree.decodePage(a, self.domain, refs[begin], encoded);
+                    initialized += 1;
+                    begin += 1;
+                    continue;
+                }
+                var requests: [4]objectstore.GetObjectRequest = undefined;
+                var count: usize = 0;
+                defer for (requests[0..count]) |request| a.free(request.key);
+                var batch_bytes: usize = 0;
+                while (begin + count < refs.len and count < requests.len and refs[begin + count].pack == null) : (count += 1) {
+                    const ref = refs[begin + count];
+                    try ref.validate();
+                    if (ref.bytes > 256 * 1024 - batch_bytes) break;
+                    batch_bytes += ref.bytes;
+                    requests[count] = .{ .key = try self.pageKey(a, ref), .options = .{ .skip_metadata_probe = true, .max_response_bytes = ref.bytes, .cancellation = self.transportToken() } };
+                }
+                var client = self.owner.client;
+                client.allocator = a;
+                const results = try client.getObjects(self.owner.bucket, requests[0..count]);
+                defer {
+                    for (results) |*result| if (result.*) |*value| value.deinit(a);
+                    a.free(results);
+                }
+                try check(raw);
+                for (results, 0..) |*result, i| {
+                    const body = (result.* orelse return error.FileNotFound).body;
+                    result.*.?.body = &.{};
+                    output[begin + i] = try tree.decodePage(a, self.domain, refs[begin + i], body);
+                    initialized += 1;
+                }
+                begin += count;
+            }
+        }
+        fn finishForest(_: *@This(), forest: *tree.Forest, head: *Head) !void {
+            var roots = [_]?tree.Ref{ head.records, head.operations, if (head.document_index) |index| index.root else null };
+            try forest.finish(&roots);
+            head.records = roots[0];
+            head.operations = roots[1];
+            if (head.document_index) |*index| index.root = roots[2];
+        }
+        fn packPages(raw: *anyopaque, writes: []tree.Write) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try check(raw);
+            if (writes.len == 0 or writes.len > tree.max_write_batch) return error.InvalidObjectBatch;
+            var total: usize = 0;
+            for (writes) |write| {
+                try write.ref.validate();
+                if (write.ref.pack != null or write.ref.bytes != write.bytes.len or !std.mem.eql(u8, &write.ref.attempt, &self.attempt)) return error.InvalidGraphPage;
+                total = try std.math.add(usize, total, write.bytes.len);
+            }
+            if (total > tree.Forest.max_bytes + tree.max_write_batch * 4096) return error.InvalidObjectBatch;
+            const a = self.owner.alloc;
+            const bytes = try a.alloc(u8, total);
+            defer a.free(bytes);
+            var offset: usize = 0;
+            for (writes) |write| {
+                @memcpy(bytes[offset..][0..write.bytes.len], write.bytes);
+                offset += write.bytes.len;
+            }
+            var digest: [32]u8 = undefined;
+            Sha256.hash(bytes, &digest, .{});
+            const key = try self.pageKey(a, .{ .digest = digest, .attempt = self.attempt, .bytes = @intCast(total), .height = 0, .records = 1 });
+            defer a.free(key);
+            var result: ?objectstore.types.PutResult = self.owner.client.putObject(self.owner.bucket, key, bytes, .{ .if_none_match = true, .cancellation = self.transportToken() }) catch |err| switch (err) {
+                error.PreconditionFailed => blk: {
+                    var existing = try self.owner.client.getObject(self.owner.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = total, .cancellation = self.transportToken() });
+                    defer existing.deinit(a);
+                    if (!std.mem.eql(u8, bytes, existing.body)) return error.ArtifactIntegrityMismatch;
+                    break :blk null;
+                },
+                else => return err,
+            };
+            defer if (result) |*value| value.deinit(a);
+            try check(raw);
+            offset = 0;
+            for (writes) |*write| {
+                write.ref.pack = .{ .digest = digest, .bytes = @intCast(total), .offset = @intCast(offset) };
+                offset += write.bytes.len;
+            }
         }
         fn putPages(raw: *anyopaque, writes: []const tree.Write) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -994,6 +1301,7 @@ pub const IndexedObjectStore = struct {
         .read_from_alloc = erasedRead,
         .read_range_alloc = erasedRange,
         .truncate_prefix = erasedTruncate,
+        .materialize_pending = erasedMaterialize,
     };
     fn erasedDeinit(_: A, raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1022,6 +1330,10 @@ pub const IndexedObjectStore = struct {
     fn erasedLatest(raw: *anyopaque, ns: []const u8) !u64 {
         const self: *@This() = @ptrCast(@alignCast(raw));
         return self.latestLsn(ns);
+    }
+    fn erasedMaterialize(raw: *anyopaque, ns: []const u8, cancellation: ?objectstore.CancellationToken) !bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.materializePendingWithCancellation(ns, cancellation);
     }
     fn erasedTruncate(raw: *anyopaque, ns: []const u8, keep: u64) !u64 {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1512,4 +1824,278 @@ test "serverless multiprovider unkeyed WAL batch preserves the committed outcome
     const another = try reopened.appendBatch("docs", 1, &.{ "one", "two" });
     try std.testing.expectEqual(@as(u64, 3), another.start_lsn);
     try std.testing.expectEqual(@as(u64, 4), another.end_lsn);
+}
+
+test "serverless indexed WAL packed forest allocation failures preserve request allocator lifetimes" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            var memory = objectstore.MemoryClient.init(std.testing.allocator);
+            defer memory.deinit();
+            var seed = try IndexedObjectStore.init(std.testing.allocator, memory.client(), "db", "allocation");
+            defer seed.deinit();
+            seed.packed_pages_enabled = true;
+            _ = try seed.appendIdempotent("docs", 1, "before", "first");
+            var reopened = try IndexedObjectStore.init(a, memory.client(), "db", "allocation");
+            defer reopened.deinit();
+            const result = try reopened.appendBatchIdempotent("docs", 2, &.{ "one", "two", "three" }, "batch");
+            try std.testing.expectEqual(@as(u64, 2), result.start_lsn);
+            try std.testing.expectEqual(@as(u64, 4), result.end_lsn);
+            const rows = try reopened.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 4 });
+            defer types.freeRecords(a, rows);
+            try std.testing.expectEqualStrings("before", rows[0].payload);
+            try std.testing.expectEqualStrings("three", rows[3].payload);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "serverless indexed WAL packed scans preserve native batched page reads" {
+    const Batch = struct {
+        fn getMany(raw: *anyopaque, a: A, bucket: []const u8, items: []const objectstore.GetObjectRequest) ![]?objectstore.types.GetResult {
+            const memory: *objectstore.MemoryClient = @ptrCast(@alignCast(raw));
+            var client = memory.client();
+            client.allocator = a;
+            return client.getObjects(bucket, items);
+        }
+    };
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    var table = client.vtable.*;
+    table.get_objects = Batch.getMany;
+    client.vtable = &table;
+    var wal = try IndexedObjectStore.init(a, client, "db", "batched");
+    defer wal.deinit();
+    wal.packed_pages_enabled = true;
+    const body: [1152]u8 = @splat('a');
+    const payloads: [64][]const u8 = @splat(&body);
+    _ = try wal.appendBatchIdempotent("docs", 1, &payloads, "batch");
+    const rows = try wal.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 64 });
+    defer types.freeRecords(a, rows);
+    try std.testing.expectEqual(@as(usize, 64), rows.len);
+    for (rows) |row| try std.testing.expectEqualSlices(u8, &body, row.payload);
+}
+
+test "serverless indexed WAL deferred tail commits one HEAD and folds bounded records with receipts" {
+    const a = std.testing.allocator;
+    var fixture: ManagedReadFixture = undefined;
+    try fixture.init(a);
+    defer fixture.deinit();
+    const wal = &fixture.wal;
+    wal.deferred_indexes_enabled = true;
+    wal.packed_pages_enabled = true;
+    fixture.memory.resetOperationCount();
+    try std.testing.expectEqual(@as(u64, 1), try wal.appendIdempotent("docs", 10, "one", "op-1"));
+    // One authority GET and one CAS; there are no private page uploads yet.
+    try std.testing.expectEqual(@as(u64, 2), fixture.memory.operationCount());
+    var ctx = try IndexedObjectStore.Context.init(wal, "docs", null);
+    defer ctx.deinit();
+    {
+        var head = try ctx.readHead();
+        defer head.deinit(a);
+        try std.testing.expectEqual(@as(u32, 6), head.value.format);
+        try std.testing.expectEqual(@as(usize, 1), head.value.deferred_tail.?.count());
+        try std.testing.expect(head.value.records == null);
+        try std.testing.expect(head.value.operations == null);
+    }
+    // Persisted mode survives disable/reopen and duplicate receipts avoid I/O.
+    wal.deferred_indexes_enabled = false;
+    try std.testing.expectEqual(@as(u64, 1), try wal.appendIdempotent("docs", 10, "one", "op-1"));
+    try std.testing.expectError(error.WalIdempotencyConflict, wal.appendIdempotent("docs", 10, "other", "op-1"));
+    try std.testing.expectEqual(@as(?u64, null), try wal.appendIdempotentIfLatest("docs", 10, "other", "op-2", 0));
+    _ = try wal.appendBatchIdempotent("docs", 20, &.{ "two", "three" }, "batch");
+    const pending = try wal.readRangeAlloc(a, "docs", .{ .start_lsn = 2, .end_lsn = 3 });
+    defer types.freeRecords(a, pending);
+    try std.testing.expectEqualStrings("two", pending[0].payload);
+    try std.testing.expectEqualStrings("three", pending[1].payload);
+    try std.testing.expectError(error.WalReadBudgetExceeded, wal.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 3, .max_bytes = 1 }));
+    try std.testing.expect(try wal.materializePending("docs"));
+    try std.testing.expect(!try wal.materializePending("docs"));
+    for (0..10) |i| _ = try wal.append("docs", i, "next");
+    const all = try wal.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 13 });
+    defer types.freeRecords(a, all);
+    try std.testing.expectEqual(@as(usize, 13), all.len);
+    try std.testing.expectEqual(@as(u64, 1), try wal.appendIdempotent("docs", 10, "one", "op-1"));
+    // The collection barrier folds in the old epoch before capturing roots.
+    const id: [16]u8 = @splat(42);
+    const roots = try wal.beginCollection("docs", id);
+    try std.testing.expect(roots.records != null and roots.operations != null);
+    _ = try wal.truncatePrefix("docs", 14);
+    while (try wal.compactPrefixStep("docs", 256)) {}
+    try std.testing.expectEqual(@as(u64, 3), (try wal.appendBatchIdempotent("docs", 20, &.{ "two", "three" }, "batch")).end_lsn);
+    try std.testing.expectEqual(@as(u64, 14), try wal.append("docs", 0, "after"));
+}
+
+test "serverless indexed WAL deferred point projection overlays updates deletes and captured ranges" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var wal = try IndexedObjectStore.init(a, client, "db", "deferred-point");
+    defer wal.deinit();
+    wal.document_index_enabled = true;
+    wal.deferred_indexes_enabled = true;
+    const api = @import("../api/codec.zig");
+    const first = try api.encodeMutationAlloc(a, .{ .kind = .upsert, .doc_id = "a", .body = "old" });
+    defer a.free(first);
+    _ = try wal.append("docs", 1, first);
+    _ = try wal.materializePending("docs");
+    const deleted = try api.encodeMutationAlloc(a, .{ .kind = .delete, .doc_id = "a", .body = null });
+    defer a.free(deleted);
+    _ = try wal.append("docs", 2, deleted);
+    const point = try wal.readPointAlloc(a, "docs", "a", .{ .start_lsn = 1, .end_lsn = 2 });
+    defer if (point.record) |record| {
+        a.free(record.payload);
+        if (record.operation_id) |id| a.free(id);
+    };
+    try std.testing.expect(point.indexed);
+    try std.testing.expectEqualStrings(deleted, point.record.?.payload);
+    const older = try wal.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 1 });
+    defer types.freeRecords(a, older);
+    try std.testing.expectEqualStrings(first, older[0].payload);
+    try std.testing.expect(!(try wal.readPointAlloc(a, "docs", "a", .{ .start_lsn = 1, .end_lsn = 1 })).indexed);
+}
+
+test "serverless indexed WAL deferred ambiguous HEAD ack preserves grouped receipt and cancellation" {
+    const a = std.testing.allocator;
+    var fixture: ManagedReadFixture = undefined;
+    try fixture.init(a);
+    defer fixture.deinit();
+    fixture.wal.deferred_indexes_enabled = true;
+    fixture.faults.commitNextPutThenFail(error.InjectedAckLoss);
+    try std.testing.expectError(error.InjectedAckLoss, fixture.wal.appendBatchIdempotent("docs", 1, &.{ "one", "two" }, "batch"));
+    const replay = try fixture.wal.appendBatchIdempotent("docs", 1, &.{ "one", "two" }, "batch");
+    try std.testing.expectEqual(@as(u64, 1), replay.start_lsn);
+    try std.testing.expectEqual(@as(u64, 2), replay.end_lsn);
+    var cancelled = true;
+    const token = objectstore.CancellationToken{ .ptr = &cancelled, .is_cancelled_fn = struct {
+        fn isCancelled(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    }.isCancelled };
+    try std.testing.expectError(error.Canceled, fixture.wal.materializePendingWithCancellation("docs", token));
+    cancelled = false;
+    try std.testing.expect(try fixture.wal.materializePendingWithCancellation("docs", token));
+    try std.testing.expectEqual(replay, try fixture.wal.appendBatchIdempotent("docs", 1, &.{ "one", "two" }, "batch"));
+}
+
+test "serverless indexed WAL deferred allocation failures preserve append fold and owned reads" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            var memory = objectstore.MemoryClient.init(std.testing.allocator);
+            defer memory.deinit();
+            var seed = try IndexedObjectStore.init(std.testing.allocator, memory.client(), "db", "deferred-allocation");
+            defer seed.deinit();
+            seed.deferred_indexes_enabled = true;
+            seed.packed_pages_enabled = true;
+            _ = try seed.appendIdempotent("docs", 1, "before", "first");
+            var reopened = try IndexedObjectStore.init(a, memory.client(), "db", "deferred-allocation");
+            defer reopened.deinit();
+            _ = try reopened.appendBatchIdempotent("docs", 2, &.{ "one", "two", "three" }, "batch");
+            const rows = try reopened.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 4 });
+            defer types.freeRecords(a, rows);
+            try std.testing.expectEqualStrings("before", rows[0].payload);
+            try std.testing.expectEqualStrings("three", rows[3].payload);
+            _ = try reopened.materializePending("docs");
+            try std.testing.expectEqual(@as(u64, 1), try reopened.appendIdempotent("docs", 1, "before", "first"));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "serverless indexed WAL deferred fold retries CAS and preserves pending receipts after failed upload" {
+    const a = std.testing.allocator;
+    var fixture: ManagedReadFixture = undefined;
+    try fixture.init(a);
+    defer fixture.deinit();
+    fixture.wal.deferred_indexes_enabled = true;
+    fixture.wal.packed_pages_enabled = true;
+    _ = try fixture.wal.appendIdempotent("docs", 1, "one", "first");
+    fixture.faults.failNextPutBefore(error.InjectedUploadFailure);
+    try std.testing.expectError(error.InjectedUploadFailure, fixture.wal.materializePending("docs"));
+    try std.testing.expectEqual(@as(u64, 1), try fixture.wal.appendIdempotent("docs", 1, "one", "first"));
+    fixture.faults.put_filter = .{ .ptr = &fixture, .matches = ManagedReadFixture.headPut };
+    fixture.faults.failNextPutBefore(error.PreconditionFailed);
+    try std.testing.expect(try fixture.wal.materializePending("docs"));
+    try std.testing.expectEqual(@as(u64, 1), try fixture.wal.appendIdempotent("docs", 1, "one", "first"));
+    _ = try fixture.wal.appendIdempotent("docs", 2, "two", "second");
+    fixture.faults.put_filter = .{ .ptr = &fixture, .matches = ManagedReadFixture.headPut };
+    fixture.faults.commitNextPutThenFail(error.InjectedAckLoss);
+    try std.testing.expectError(error.InjectedAckLoss, fixture.wal.materializePending("docs"));
+    try std.testing.expect(!try fixture.wal.materializePending("docs"));
+    try std.testing.expectEqual(@as(u64, 2), try fixture.wal.appendIdempotent("docs", 2, "two", "second"));
+}
+
+test "serverless indexed WAL deferred HEAD rejects invalid delta bounds and mismatched record intervals" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var wal = try IndexedObjectStore.init(a, memory.client(), "db", "invalid-deferred");
+    defer wal.deinit();
+    wal.deferred_indexes_enabled = true;
+    _ = try wal.append("docs", 1, "one");
+    var ctx = try IndexedObjectStore.Context.init(&wal, "docs", null);
+    defer ctx.deinit();
+    var head = try ctx.readHead();
+    defer head.deinit(a);
+    const original = head.value;
+    const key = try std.fmt.allocPrint(a, "{s}/HEAD", .{ctx.root});
+    defer a.free(key);
+    for (0..5) |case| {
+        var invalid = original;
+        switch (case) {
+            0 => invalid.deferred_tail.?.bytes[0] = 9,
+            1 => invalid.latest_lsn = 2,
+            2 => invalid.deferred_tail.?.len = 2,
+            3 => invalid.deferred_indexes = null,
+            4 => invalid.physical_first_lsn = 3,
+            else => unreachable,
+        }
+        const bytes = try std.json.Stringify.valueAlloc(a, invalid, .{ .emit_null_optional_fields = false });
+        defer a.free(bytes);
+        var result = try wal.client.putObject("db", key, bytes, .{});
+        defer result.deinit(a);
+        if (wal.latestLsn("docs")) |_| return error.ExpectedInvalidWal else |_| {}
+    }
+}
+
+test "serverless indexed WAL deferred projection validates before acceptance and activates after an opaque tail" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var wal = try IndexedObjectStore.init(a, memory.client(), "db", "deferred-projection-activation");
+    defer wal.deinit();
+    wal.deferred_indexes_enabled = true;
+    wal.document_index_enabled = true;
+    try std.testing.expectError(error.InvalidMutationPayload, wal.append("docs", 1, "opaque"));
+    try std.testing.expectEqual(@as(u64, 0), try wal.latestLsn("docs"));
+    wal.document_index_enabled = false;
+    _ = try wal.append("docs", 1, "opaque");
+    wal.document_index_enabled = true;
+    const encoded = try @import("../api/codec.zig").encodeMutationAlloc(a, .{ .kind = .upsert, .doc_id = "a", .body = "new" });
+    defer a.free(encoded);
+    _ = try wal.append("docs", 2, encoded);
+    try std.testing.expect(try wal.materializePending("docs"));
+    const point = try wal.readPointAlloc(a, "docs", "a", .{ .start_lsn = 2, .end_lsn = 2 });
+    defer if (point.record) |record| {
+        a.free(record.payload);
+        if (record.operation_id) |id| a.free(id);
+    };
+    try std.testing.expect(point.indexed);
+    try std.testing.expectEqualStrings(encoded, point.record.?.payload);
+    const rows = try wal.readRangeAlloc(a, "docs", .{ .start_lsn = 1, .end_lsn = 2 });
+    defer types.freeRecords(a, rows);
+    try std.testing.expectEqualStrings("opaque", rows[0].payload);
+    wal.document_index_enabled = false;
+    _ = try wal.append("background", 1, "opaque");
+    wal.document_index_enabled = true;
+    try std.testing.expect(try wal.materializePending("background"));
+    _ = try wal.append("background", 2, encoded);
+    try std.testing.expect(try wal.materializePending("background"));
+    const background = try wal.readRangeAlloc(a, "background", .{ .start_lsn = 1, .end_lsn = 2 });
+    defer types.freeRecords(a, background);
+    try std.testing.expectEqualStrings("opaque", background[0].payload);
+    try std.testing.expectEqualStrings(encoded, background[1].payload);
 }

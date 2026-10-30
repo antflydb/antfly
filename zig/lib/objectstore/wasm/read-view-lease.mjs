@@ -24,7 +24,7 @@ export function visibilityFence(value,scope){if(typeof value!=='string'||!/^01[a
 export function issueReadLease(view,{scope,walKey,pinPrefix,policy,observedAt,now}){
  if(!validReadLeasePolicy(policy)||!Number.isSafeInteger(observedAt)||observedAt<=0||!Number.isSafeInteger(now)||now<observedAt||!Array.isArray(view?.entries))return view;
  try{const rows=new Map(view.entries),record=rows.get(walKey);if(!(record?.body instanceof Uint8Array)||record.body.byteLength>4096)return view;
-  const head=JSON.parse(text.decode(record.body),(key,value,context)=>key==='latest_lsn'&&context?.source&&/^[0-9]+$/.test(context.source)?BigInt(context.source):value),lsn=u64(head.latest_lsn);if(lsn===null||![1,2,3,4].includes(head.format)||!/^[a-f0-9]{64}$/.test(scope))return view;
+  const head=JSON.parse(text.decode(record.body),(key,value,context)=>key==='latest_lsn'&&context?.source&&/^[0-9]+$/.test(context.source)?BigInt(context.source):value),lsn=u64(head.latest_lsn);if(lsn===null||![1,2,3,4,5,6].includes(head.format)||!/^[a-f0-9]{64}$/.test(scope))return view;
   let expires=observedAt+policy.root_lifetime_ms;
   if(view.version!=='0'){const pin=rows.get(pinPrefix+view.version);if(!(pin?.body instanceof Uint8Array))return view;const ns=u64(text.decode(pin.body).trim());if(ns===null)return view;expires=Math.min(expires,Number(ns/1000000n));}
   if(expires<=now)return view;

@@ -147,6 +147,7 @@ pub const Builder = struct {
     manifests: *manifest_mod.ManifestStore,
     progress: *catalog_mod.ProgressStore,
     wal: *wal_mod.WalStore,
+    deferred_wal_maintenance: bool = false,
     io: ?std.Io = null,
     /// Hosted invocations publish a bounded prefix. A subsequent invocation
     /// resumes from the durably published manifest's WAL watermark.
@@ -493,6 +494,11 @@ pub const Builder = struct {
         cancellation: ?maintenance_cancellation.Token,
     ) !BuildResult {
         try maintenance_cancellation.check(cancellation);
+        if (self.deferred_wal_maintenance) {
+            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+            _ = try self.wal.materializePendingCooperatively(namespace, bridge.token());
+            try maintenance_cancellation.check(cancellation);
+        }
         const targets = plan.targets;
         var head = try self.loadCurrentHeadManifestAlloc(namespace);
         defer head.deinit(self.alloc);

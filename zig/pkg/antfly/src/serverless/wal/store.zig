@@ -33,9 +33,32 @@ pub const WalStore = struct {
         read_range_alloc: ?*const fn (*anyopaque, Allocator, []const u8, wal_types.ReadRange) anyerror![]wal_types.Record = null,
         read_snapshot: ?*const fn (*anyopaque, []const u8) anyerror!wal_types.ReadSnapshot = null,
         read_point_alloc: ?*const fn (*anyopaque, Allocator, []const u8, []const u8, wal_types.ReadRange) anyerror!wal_types.PointRead = null,
+        materialize_pending: ?*const fn (*anyopaque, []const u8, ?@import("objectstore").CancellationToken) anyerror!bool = null,
         latest_lsn: *const fn (*anyopaque, []const u8) anyerror!u64,
         truncate_prefix: *const fn (*anyopaque, []const u8, u64) anyerror!u64,
     };
+
+    pub fn materializePending(self: *WalStore, namespace: []const u8, cancellation: ?@import("objectstore").CancellationToken) !bool {
+        const call = self.vtable.materialize_pending orelse return false;
+        return call(self.ptr, namespace, cancellation);
+    }
+
+    pub fn materializePendingCooperatively(self: *WalStore, namespace: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
+        try cancellation.check();
+        const token = cancellation;
+        const result = self.materializePending(namespace, .{ .ptr = &token, .is_cancelled_fn = struct {
+            fn check(raw: *const anyopaque) bool {
+                const value: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(raw));
+                value.check() catch return true;
+                return false;
+            }
+        }.check }) catch |err| {
+            try cancellation.check();
+            return err;
+        };
+        try cancellation.check();
+        return result;
+    }
 
     pub fn deinit(self: *WalStore) void {
         self.vtable.deinit(self.allocator, self.ptr);
