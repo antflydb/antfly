@@ -718,6 +718,8 @@ pub const Owner = struct {
                 // for every immutable input while foreground traffic waits.
                 try current.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(probe.header);
                 if (self.maintenance_snapshot) |snapshot| try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+                if (self.options.profile == .native and self.options.open_mode == .writer and !file.free_pages_verified)
+                    _ = try file.inheritAllocatorCertificate();
                 return current;
             }
             if (self.maintenance_snapshot) |snapshot| {
@@ -733,9 +735,7 @@ pub const Owner = struct {
         // advance the header. The probe is borrowed only by synchronous open.
         var certified: ?native.NativeFile = null;
         defer if (certified) |*file| file.close();
-        if (self.options.profile == .native and self.options.open_mode == .writer and
-            (options.allocator_verification_owner == null or !options.allocator_verification_owner.?.free_pages_verified))
-        {
+        if (self.options.profile == .native and self.options.open_mode == .writer) {
             certified = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             if (try certified.?.inheritAllocatorCertificate()) options.allocator_verification_owner = &certified.?;
         }
@@ -1046,6 +1046,7 @@ pub const Owner = struct {
                 .io = h.handleLockIo(),
             });
             errdefer backend.deinit();
+            backend.native_docstore.?.file.allocator_certificate_on_commit = true;
             const opened = try alloc.create(h.Handle);
             opened.* = .{ .alloc = alloc, .db = undefined, .db_live = false, .owned_lite_backend = backend, .open_mode = options.open_mode };
             break :blk opened;
@@ -1636,6 +1637,7 @@ pub const Owner = struct {
                             file.transaction_header == null and file.durable_header == null) can_prove_current = true;
                         continue;
                     }
+                    if (file.allocator_certificate_on_commit and try file.inheritAllocatorCertificate()) return;
                     try file.sync();
                     _ = try file.certifyAllocator();
                     return;
@@ -2557,6 +2559,10 @@ test "capi native allocator proof survives close and foreground runtime replacem
                 connection.gate.mutex.unlock(io);
             }
             const store = owner.current.?.owned_lite_backend.?.native_docstore.?;
+            // Bootstrap may now publish a live certificate. Keep this fixture
+            // explicitly unsealed so replacement/cancellation still exercises
+            // the original pending-proof lineage, including legacy writers.
+            try store.file.putCatalogRecord("uncertified-proof-fixture", "primitive publication without a seal");
             store.file.free_pages_verified = false;
             store.file.defer_allocator_verification = true;
             store.file.max_file_bytes = null;
@@ -3251,7 +3257,7 @@ test "capi native allocator proof peer close certificate survives runtime refres
         try foreign.putCatalogRecord("foreign-certificate", "new primary tip with unchanged index inputs");
         try foreign.sync();
         try std.testing.expect(try foreign.certifyAllocator());
-        owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+        try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
         owner.allocator_verification_started = false;
     }
     var timestamp: u64 = 0;
