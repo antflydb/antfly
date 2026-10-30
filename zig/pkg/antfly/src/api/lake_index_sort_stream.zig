@@ -178,10 +178,11 @@ test "external lake leased publication benchmark sorted record drain" {
             var sort = spill.Sort.init(a, &manager, &.{.{}}, memory);
             defer sort.deinit();
             sort.parallel_runs = false;
-            const payload: [2048]u8 = @splat('p');
+            var payload: [2048]u8 = @splat('p');
             for (0..1024) |i| {
                 var key: [32]u8 = undefined;
                 const encoded = try std.fmt.bufPrint(&key, "key-{d:0>16}", .{1023 - i});
+                std.mem.writeInt(u64, payload[0..8], @intCast(1023 - i), .little);
                 try sort.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = encoded })}, .values = &.{local.sql_scalar.Datum.json(.{ .string = &payload })}, .ordinal = 1023 - i });
             }
             var records: Records = .{ .sort = &sort };
@@ -199,6 +200,7 @@ test "external lake leased publication benchmark sorted record drain" {
                 };
                 var key: [32]u8 = undefined;
                 try std.testing.expectEqualStrings(try std.fmt.bufPrint(&key, "key-{d:0>16}", .{seen}), record.key);
+                std.mem.writeInt(u64, payload[0..8], @intCast(seen), .little);
                 try std.testing.expectEqualSlices(u8, &payload, record.value);
                 seen += 1;
             }
