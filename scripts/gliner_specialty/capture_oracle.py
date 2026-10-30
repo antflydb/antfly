@@ -49,6 +49,35 @@ def tensor_record(tensor):
     value = tensor.detach().cpu().float().contiguous()
     return {"shape":list(value.shape),"values":[stable(x) for x in value.flatten().tolist()]}
 
+def pack_valid_span_tensor(record: dict) -> dict:
+    """Pack ``[slots, labels, words, widths]`` into valid span candidates.
+
+    The packed axis is word-major then width-major and omits candidates whose
+    inclusive end would exceed the word sequence. This helper is intentionally
+    pure Python so fixture ordering can be tested without importing Torch.
+    """
+    shape = record.get("shape")
+    values = record.get("values")
+    if (
+        not isinstance(shape, list)
+        or len(shape) != 4
+        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in shape)
+        or not isinstance(values, list)
+    ):
+        raise ValueError("raw span tensor must have shape [slots, labels, words, widths]")
+    slots, labels, words, widths = shape
+    if len(values) != slots * labels * words * widths:
+        raise ValueError("raw span tensor shape does not match its values")
+    valid_spans = sum(min(widths, words - word) for word in range(words))
+    packed = []
+    for slot in range(slots):
+        for label in range(labels):
+            base = (slot * labels + label) * words * widths
+            for word in range(words):
+                word_base = base + word * widths
+                packed.extend(values[word_base:word_base + min(widths, words - word)])
+    return {"shape":[slots,labels,valid_spans],"values":packed}
+
 def verify_environment(source_root: Path, model_root: Path, profile: str, verify_weight: bool = True) -> dict:
     if sys.version_info[:3] != (3, 12, 3): raise RuntimeError(f"oracle Python mismatch: {platform.python_version()}")
     actual = {name:importlib.metadata.version(name) for name in LOCKED_PACKAGES}
@@ -117,7 +146,7 @@ def capture_pii(model, cases):
             if predicted_count > 0 and bound["span_info"] is not None:
                 projected = model.count_embed(embs[1:], predicted_count)
                 raw = torch.einsum("lkd,bpd->bplk",bound["span_info"]["span_rep"],projected)
-                head["raw_span_logits"] = tensor_record(raw)
+                head["raw_span_logits"] = pack_valid_span_tensor(tensor_record(raw))
             observed.append(head); return original(*args, **kwargs)
         model._extract_span_result = observe
         try:
@@ -180,7 +209,7 @@ def main() -> int:
     cases = json.loads(args.cases.read_text()); pin = MODEL_PINS[args.profile]; model_dir = args.model_root / pin["directory"]
     model = AutoExtractor.from_pretrained(str(model_dir),map_location="cpu").eval()
     captured = capture_pii(model,cases) if args.profile == "pii_multi" else capture_gliguard(model,cases)
-    document = {"format_version":1,"profile":args.profile,"model":{k:v for k,v in pin.items() if k != "marker_id"},"upstream_commit":UPSTREAM_COMMIT,"runtime":{**receipt,"device":"cpu","dtype":"float32","torch_threads":2,"deterministic_algorithms":True,"gliner2_version":gliner2.__version__,"gliner2_module":imported.relative_to(args.source_root.resolve()).as_posix(),"worktree_local_modules":local_modules},"cases":captured}
+    document = {"format_version":2 if args.profile == "pii_multi" else 1,"profile":args.profile,"model":{k:v for k,v in pin.items() if k != "marker_id"},"upstream_commit":UPSTREAM_COMMIT,"runtime":{**receipt,"device":"cpu","dtype":"float32","torch_threads":2,"deterministic_algorithms":True,"gliner2_version":gliner2.__version__,"gliner2_module":imported.relative_to(args.source_root.resolve()).as_posix(),"worktree_local_modules":local_modules},"cases":captured}
     serialized = render_document(document)
     if args.check:
         if args.output.read_text() != serialized: raise RuntimeError(f"oracle fixture drift: {args.output}")

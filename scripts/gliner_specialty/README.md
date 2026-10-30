@@ -38,6 +38,11 @@ PYTHONPATH=.benchmark-results/gliner-specialty/upstream \
 Run one profile at a time. Supply `--check` to reproduce and compare an
 existing capture byte-for-byte. Numeric arrays use the shared GLiNER2.5
 width-bounded formatter, keeping values intact without one scalar per line.
+PII capture format version 2 stores raw span logits as
+`[slots, labels, valid_spans]`. Within each slot and label, the valid-span axis
+is word-major then width-major and contains only candidates satisfying
+`word + width < words`; masked tail cells have no inference contract and are
+not retained. GLiGuard remains capture format version 1.
 
 The offline fixture contract needs neither Python ML packages nor model files:
 

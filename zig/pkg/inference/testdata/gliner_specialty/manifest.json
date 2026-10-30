@@ -57,8 +57,8 @@
   "captures": {
     "pii_multi": {
       "path": "pii_multi_oracle.json",
-      "sha256": "ff6e8905bac207e4d38b8172f4d1e37ece002406fc8a2150bb4774ba3f65ef6f",
-      "size_bytes": 742304,
+      "sha256": "c98e3e7f617590830e3f820d457c2a8499fdc990184a25a45ba43e680caa8c67",
+      "size_bytes": 582074,
       "case_count": 14,
       "maximum_active_tokens": 250
     },

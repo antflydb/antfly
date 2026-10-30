@@ -863,24 +863,29 @@ fn directPiiParity(a: Allocator, node: *Node, directory: []const u8, cases: []co
         defer a.free(actual_scores);
         const raw = head_capture.get("raw_span_logits").?.object;
         const shape = raw.get("shape").?.array.items;
+        try std.testing.expectEqual(@as(usize, 3), shape.len);
         const slots: usize = @intCast(shape[0].integer);
         try std.testing.expect(slots >= 1);
         try std.testing.expectEqual(@as(i64, @intCast(columns)), shape[1].integer);
-        try std.testing.expectEqual(@as(i64, @intCast(sample.words.len)), shape[2].integer);
-        try std.testing.expectEqual(@as(i64, 8), shape[3].integer);
+        var valid_span_count: usize = 0;
+        for (0..sample.words.len) |word| valid_span_count += @min(8, sample.words.len - word);
+        try std.testing.expectEqual(@as(i64, @intCast(valid_span_count)), shape[2].integer);
         const expected_scores = raw.get("values").?.array.items;
-        try std.testing.expectEqual(slots * actual_scores.len, expected_scores.len);
+        try std.testing.expectEqual(slots * columns * valid_span_count, expected_scores.len);
         var span_max_error: f64 = 0;
+        var packed_index: usize = 0;
         for (0..columns) |label| for (0..sample.words.len) |word| for (0..8) |width| {
             // Upstream gathers word zero for masked tail cells; the shared
             // native head clamps their end. Both decoders discard these
             // placeholders, so only valid candidates have a parity contract.
             if (word + width >= sample.words.len) continue;
-            const want = try number(expected_scores[(label * sample.words.len + word) * 8 + width]);
+            const want = try number(expected_scores[packed_index]);
+            packed_index += 1;
             const got: f64 = actual_scores[(word * 8 + width) * columns + label];
             span_max_error = @max(span_max_error, @abs(want - got));
             try expectClose(context, "direct_slot0_raw_span_logit", "entities", case.object.get("labels").?.array.items[label].string, word * 8 + width, want, got, tolerance + 1e-5 * @abs(want));
         };
+        try std.testing.expectEqual(columns * valid_span_count, packed_index);
         std.debug.print("GLiNER specialty parity backend={s} profile={s} case={s} stage=direct_slot0_raw_span_logit max_abs_error={d} base_tolerance={d}\n", .{ @tagName(context.backend), @tagName(context.profile), context.case_id, span_max_error, tolerance });
     }
     if (backend == .metal) {

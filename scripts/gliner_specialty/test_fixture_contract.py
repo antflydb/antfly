@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import re
+import sys
 import unittest
 from pathlib import Path
 
@@ -22,6 +24,13 @@ LOCKED_PACKAGES = {
 
 def load(path: Path): return json.loads(path.read_text())
 def digest(path: Path): return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def load_capture_module():
+    path = ROOT / "scripts/gliner_specialty/capture_oracle.py"
+    spec = importlib.util.spec_from_file_location("gliner_specialty_capture", path)
+    if spec is None or spec.loader is None: raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    return module
 
 class FixtureContract(unittest.TestCase):
     @classmethod
@@ -75,6 +84,8 @@ class FixtureContract(unittest.TestCase):
         self.assertTrue(any(case.get("request_options", {}).get("offset_unit") == "unicode_codepoints" for case in self.cases["pii_cases"]))
 
     def test_bounded_geometry_and_head_shapes(self):
+        self.assertEqual(2, self.pii["format_version"])
+        self.assertEqual(1, self.guard["format_version"])
         for case in self.pii["cases"]:
             prep = case["preprocessing"]
             self.assertTrue(0 < len(prep["active_input_ids"]) <= 512)
@@ -85,8 +96,10 @@ class FixtureContract(unittest.TestCase):
                 self.assertNotIn("raw_span_logits", head)
             else:
                 shape = head["raw_span_logits"]["shape"]
-                self.assertEqual(len(case["labels"]), shape[1]); self.assertEqual(8, shape[3])
-                self.assertEqual(shape[0] * shape[1] * shape[2] * shape[3], len(head["raw_span_logits"]["values"]))
+                words = len(prep["text_tokens"])
+                valid_spans = sum(min(8, words - word) for word in range(words))
+                self.assertEqual([head["predicted_count"],len(case["labels"]),valid_spans], shape)
+                self.assertEqual(shape[0] * shape[1] * shape[2], len(head["raw_span_logits"]["values"]))
         for case in self.guard["cases"]:
             prep = case["preprocessing"]
             self.assertTrue(0 < len(prep["active_input_ids"]) <= 512)
@@ -96,6 +109,24 @@ class FixtureContract(unittest.TestCase):
                 self.assertEqual([width], head["probabilities"]["shape"])
                 self.assertEqual(width, len(head["raw_logits"]["values"]))
                 self.assertEqual(width, len(head["probabilities"]["values"]))
+
+    def test_valid_span_packing_order_is_slot_label_word_width(self):
+        torch_was_loaded = "torch" in sys.modules
+        capture = load_capture_module()
+        self.assertEqual(torch_was_loaded, "torch" in sys.modules)
+        values = list(range(2 * 2 * 3 * 8))
+        packed = capture.pack_valid_span_tensor(
+            {"shape":[2,2,3,8],"values":values}
+        )
+        self.assertEqual([2,2,6], packed["shape"])
+        expected = []
+        for slot in range(2):
+            for label in range(2):
+                base = (slot * 2 + label) * 3 * 8
+                expected.extend(values[base:base + 3])
+                expected.extend(values[base + 8:base + 10])
+                expected.extend(values[base + 16:base + 17])
+        self.assertEqual(expected, packed["values"])
 
     def test_pii_option_semantics_and_offsets(self):
         cases = {case["id"]:case for case in self.pii["cases"]}
