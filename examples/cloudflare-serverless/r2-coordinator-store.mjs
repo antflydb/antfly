@@ -59,7 +59,7 @@ export class R2CoordinatorStore {
     this.transport = this.cache.wrap(this.remoteCache(async(request,body)=>instrumentTransport(raw,this.physical??={})(request,body),{budgetKey:()=>this.physical??={},onMetrics:sample=>{for(const[key,value]of Object.entries(sample)){this.physical??={};this.physical[key]=(this.physical[key]??0)+value;}}}), `coordinator/${namespace}`);
     this.pending = []; this.running = false; this.state = null;
     this.rows=new Map();this.rowBytes=0;this.hintBytes=0;this.readHints=null;this.rowRevision=null;this.acquired=false;
-    if(background)this.idleCheckpoint=new IdleCheckpoint({revision:()=>this.state?.revision??0,isIdle:()=>this.acquired&&!this.recovering,background,onError:error=>{try{this.onMetrics?.({event:"antfly.checkpoint_deferred",error:String(error)});}catch{}},checkpoint:()=>this.checkpointHint()});
+    if(background)this.idleCheckpoint=new IdleCheckpoint({clock:this.clock,revision:()=>this.state?.revision??0,isIdle:()=>this.acquired&&!this.recovering,background,onError:error=>{try{this.onMetrics?.({event:"antfly.checkpoint_deferred",error:String(error)});}catch{}},checkpoint:options=>this.checkpointHint(options)});
   }
   configureAuthority(descriptor){
     if(!["r2","r2-conditional","r2-bounded","sqlite"].includes(descriptor?.mode))throw Error("CoordinatorAuthorityMismatch");const backend=descriptor.mode==="r2-conditional"?"conditional":descriptor.mode==="r2-bounded"?"bounded_journal":"journal";
@@ -79,11 +79,11 @@ export class R2CoordinatorStore {
   // observation pool. Foreground transactions never await this hint or share
   // its mutable accounting. Native authentication/CAS rejects stale owners and
   // preserves a newer checkpoint; the native one-second write limit applies.
-  async checkpointHint() {
+  async checkpointHint({deadlineMs=Infinity}={}) {
     if(this.rootBackend==="conditional"||!this.acquired||this.recovering||this.ioDrain||!this.state)return{busy:true};
     const state=structuredClone(this.state),physical={};
     const transport=this.cache.wrap(instrumentTransport(this.rawTransport,physical),`coordinator/${this.namespace}`);
-    const result=await this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{action:"checkpoint",owner:this.owner,state,checkpoint_commits:this.checkpointCommits}},{transport,fairKey:this.namespace,priority:"maintenance",deadlineMs:this.clock()+10000,maxOperations:32,maxTransferBytes:1024*1024,onMetrics:sample=>{try{this.onMetrics?.({event:"antfly.checkpoint_hint",...sample,physical_r2:physical});}catch{}}});
+    const result=await this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{action:"checkpoint",owner:this.owner,state,checkpoint_commits:this.checkpointCommits}},{transport,fairKey:this.namespace,priority:"maintenance",deadlineMs:Math.min(this.clock()+10000,deadlineMs),maxOperations:32,maxTransferBytes:1024*1024,onMetrics:sample=>{try{this.onMetrics?.({event:"antfly.checkpoint_hint",...sample,physical_r2:physical});}catch{}}});
     return{done:result.checkpointed,revision:state.revision};
   }
   async native(coordinate) {
@@ -191,8 +191,8 @@ export class R2CoordinatorStore {
     let snapshotProof=structuredClone(owned?this.journalProof:this.observedProof??null);
     const native=async(state,coordinate)=>{
       if(usedOperations>=254||usedBytes>=8*1024*1024)throw Error("ReadSnapshotNeedsAdmission");
-      const result=await this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{...this.rootOptions(),...(this.rootBackend==="bounded_journal"?{journal_proof:snapshotProof}:{}),owner:coordinate.action==="read"?state.owner:this.owner,state,...coordinate}},{transport,background:background??this.background,onIoSettled:sample=>this.onMetrics?.(sample),fairKey:this.namespace,priority,onStage:sample=>{if(sample.name==="kernel_queue")onAdmission?.();},deadlineMs,maxOperations:254-usedOperations,maxTransferBytes:8*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,action:coordinate.action,...sample});}catch{}}});
-      if(Object.hasOwn(result,"journal_proof"))snapshotProof=result.journal_proof;return result;
+      const result=await this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{...this.rootOptions(),...(this.rootBackend==="bounded_journal"?{journal_proof:snapshotProof}:{}),owner:coordinate.action==="read"?state.owner:this.owner,state,...coordinate}},{transport,background:background??this.background,onIoSettled:sample=>this.onMetrics?.(sample),fairKey:this.namespace,priority,onStage:sample=>{if(sample.name==="kernel_queue"){onAdmission?.();capsuleMetrics.observation_queue_ms=(capsuleMetrics.observation_queue_ms??0)+sample.duration_ms;}if(sample.name==="wasm_instantiate")capsuleMetrics.observation_instantiate_ms=(capsuleMetrics.observation_instantiate_ms??0)+sample.duration_ms;},deadlineMs,maxOperations:254-usedOperations,maxTransferBytes:8*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,action:coordinate.action,...sample});}catch{}}});
+      if(Object.hasOwn(result,"journal_proof"))snapshotProof=result.journal_proof;for(const[key,value]of Object.entries(result.journal_observation??{}))if(Number.isSafeInteger(value)&&value>=0)capsuleMetrics['journal_'+key]=(capsuleMetrics['journal_'+key]??0)+value;return result;
     };
     this.snapshotReaders++;
     const finish=()=>{
@@ -237,7 +237,7 @@ export class R2CoordinatorStore {
         readKeys.forEach((key,i)=>rows.set(key,observed.results[i][0]?decode(observed.results[i][0].value):undefined));
         if(observed.selected){if(!readPrefix||!observed.selected.key.startsWith(readPrefix))throw Error("InvalidCoordinatorReadProjection");rows.set(observed.selected.key,decode(observed.selected.value));}
       }
-      capsuleMetrics=rootMetrics(observed.state);
+      Object.assign(capsuleMetrics,rootMetrics(observed.state));
       if(!this.observedState||observed.state.revision>=this.observedState.revision){this.observedState=structuredClone(observed.state);this.observedProof=structuredClone(snapshotProof);}
       this.base??=observed.base;this.pagePrefix??=observed.page_prefix;
       const tx={getMany:async names=>{

@@ -314,11 +314,13 @@ export class R2CommitCoordinator extends DurableObject {
     const refresh=()=>trace.span("write_refresh",()=>this.transaction(async()=>{},{deadlineMs:deadline,traceId:trace.id,ioBudget}));
     if(!this.store.state||this.store.recovering||this.store.needsWriteRefresh())await refresh();
     const transport=this.store.dataCache.wrap(edgeCacheForEnv(this.env,{background:promise=>this.ctx.waitUntil(promise),budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical)),this.env.ANTFLY_INCARNATION,{preserveProtected:this.env.FOREGROUND_CACHE_POLICY==="true"});
+    let prepared,prepareAttempts=0;
     for(let attempt=0;attempt<3;attempt++){
       if(Date.now()>=deadline)throw Error("DeadlineExceeded");
       if(ioBudget.operations>=1024||ioBudget.bytes>=32*1024*1024)throw Error("CoordinatorIoBudgetExceeded");
-      let prepared,wave,permit;
-      try{
+      let wave,permit;
+      if(!prepared)try{
+        prepareAttempts++;
         const request={op:"mutate",...(this.env.WAL_DEFERRED_INDEXES==="true"?{wal_deferred_indexes:true}:{}),...(this.env.WAL_PACKED_PAGES==="true"?{wal_packed_pages:true}:{}),...(this.env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(this.env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}),namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",working_set_bytes:walWorkingBytes,native_write_plan:{...(this.store.rootBackend!=="journal"?{metadata_backend:this.store.rootBackend}:{}),state:structuredClone(this.store.state),metadata_namespace:this.store.namespace,reservation_id:crypto.randomUUID()},mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))};
         const options=()=>({transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-ioBudget.operations,maxTransferBytes:32*1024*1024-ioBudget.bytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{ioBudget.operations+=sample.operations;ioBudget.bytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,native_write_plan:true,...sample,physical}));}});
         if(this.env.NATIVE_WRITE_READ_AHEAD==="true")permit=readAheadBudgetFor(buildKernel,Math.min(4,buildKernel.slots.length)).tryAcquire(this.env.ANTFLY_INCARNATION);
@@ -332,12 +334,15 @@ export class R2CommitCoordinator extends DurableObject {
       catch(error){if(error?.message!=="FileNotFound")throw error;await refresh();continue;}
       finally{wave?.close();permit?.();}
       if(!prepared.__write_plan||!Array.isArray(prepared.results)||prepared.results.length!==inputs.length)throw Error("NativeWritePlanRequired");
+      // Authority refreshes do not invalidate immutable preparation. The native
+      // finalizer rechecks WAL/head/GC dependencies against the refreshed root;
+      // only a semantic dependency conflict requires rebuilding the plan.
       let committed;
       try{committed=await trace.span("native_wal_finalize",()=>this.store.commitWal({...prepared.__write_plan,migration_required:this.env.COORDINATOR_MIGRATION_REQUIRED==="true"},{deadlineMs:deadline,traceId:trace.id,nativePlan:true,ioBudget}));}
       catch(error){if(!["PreconditionFailed","ImmutableLogRotationRequired","ImmutableLogProofExpired"].includes(error?.message))throw error;await refresh();continue;}
-      if(!committed.applied){await refresh();continue;}
+      if(!committed.applied){prepared=null;await refresh();continue;}
       trace.publicationId=committed.publication.id;
-      if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",trace_id:trace.id,trace_ids:inputs.map(input=>input.__trace_id).filter(Boolean),callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started,native_write_plan:true,prepare_attempts:attempt+1,operations:ioBudget.operations,transferred_bytes:ioBudget.bytes,physical_r2:physical}));
+      if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",trace_id:trace.id,trace_ids:inputs.map(input=>input.__trace_id).filter(Boolean),callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started,native_write_plan:true,prepare_attempts:prepareAttempts,finalize_attempts:attempt+1,operations:ioBudget.operations,transferred_bytes:ioBudget.bytes,physical_r2:physical}));
       return prepared.results.map((item,i)=>({...item,__publication:i===0?committed.publication:{...committed.publication,enqueue:false}}));
     }
     throw Error("WalCommitContended");

@@ -28,7 +28,7 @@ import {readAheadBudgetFor} from "../../zig/lib/objectstore/wasm/read-ahead.mjs"
 export class NativeReadViews {
  constructor(module,env,{kernel,cache,clock=Date.now,onMetrics,background,cohortDelayMs=2}={}){
   this.env=env;this.clock=clock;this.cohorts=new FreshReadAdmissions({delayMs:cohortDelayMs});this.authorityAdmission=new AuthorityAdmission(()=>openAuthority(env,coordinatorAuthorityMode(env),{allowCreate:false}));
-  const observation={request:(input,options)=>kernel.request(input,{...options,kernelVariant:"observe",memoryReservationBytes:8*1024*1024,reservationClass:"authority"})};
+  const observation={request:(input,options)=>kernel.request(input,{...options,...(env.NATIVE_READ_AFFINITY==="true"?{affinityKey:env.ANTFLY_INCARNATION}:{}),kernelVariant:"observe",memoryReservationBytes:8*1024*1024,reservationClass:"authority"})};
   this.background=background;this.leaseCapacity=env.FENCED_READ_LEASES==="false"?0:32768;
   this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,readBatch:env.NATIVE_METADATA_READ_BATCH!=="false",rowBudgetBytes:512*1024-this.leaseCapacity,readKernel:observation,cache,onMetrics,proofBudget:env.DETACHED_METADATA_PROOFS==="true"&&kernel.slots?.length?readAheadBudgetFor(kernel,Math.min(4,kernel.slots.length)):undefined,remoteCache:edgeCacheForEnv(env,{background})});
  }

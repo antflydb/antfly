@@ -499,3 +499,14 @@ sanitized archives, both passing minute checks, frozen deployed bundles and
 source revisions, test logs and independent cleanup inventory. An earlier seal
 had an incorrect top-level source label due to a script variable being reused;
 it remains preserved as invalid and is explicitly superseded by this seal.
+
+The next recovery/preparation implementation is described in
+[Bounded metadata recovery and reusable immutable preparation](serverless-metadata-recovery.md).
+It adds shared native bounded journal catch-up, direct advanced-checkpoint
+rebasing with the original proof anchor, bounded checkpoint repair, metadata
+observation affinity and write-plan reuse after authority refresh. The corrected
+metadata-only matrix verifies all candidate observations and measures about
+2.6× faster 32-entry cold/expired recovery at 100 ms binding delay. This is not
+a new hosted latency result. End-to-end trials and placement qualification
+remain separate from the metadata-stage result and the unreproduced historical
+allocator error.

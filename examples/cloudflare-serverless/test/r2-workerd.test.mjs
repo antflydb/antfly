@@ -34,6 +34,8 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
         for(const key of ["sql","kv"])Object.defineProperty(ctx.storage,key,{get(){throw Error("UnexpectedPlatformDatabaseAccess:"+key);}});
         super(ctx,env);
       }
+      armPlanRetry(code){const original=this.retryCommitOriginal??=this.store.commitWal.bind(this.store);let first=true;this.planRetryIds=[];this.store.commitWal=async(plan,options)=>{this.planRetryIds.push(plan.id);if(first){first=false;await this.store.transaction(tx=>tx.put("unrelated-retry",code));if(code==="dependency-conflict")return{applied:false,state:this.store.state};throw Error(code);}return original(plan,options);};}
+      planRetryDiagnostics(){return this.planRetryIds;}
       collectMetadata(...args){this.metadataCalls=(this.metadataCalls??0)+1;return super.collectMetadata(...args);}
       maintenanceDiagnostics(){return{collect_metadata:this.metadataCalls??0};}
       commitMutations(inputs,deadline){this.groupSizes??=[];this.groupSizes.push(inputs.length);return super.commitMutations(inputs,deadline);}
@@ -64,6 +66,8 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
         return Response.json({hints,sent,ack,retry,metadata:await stub.maintenanceDiagnostics()});
       }
       if(path==="/runtime-capabilities"){for(const [binding,op] of [["READERS","mutate"],["BUILDERS","lookup"]]){try{await env[binding].getByName(JSON.stringify(["runtime-v1",env.ANTFLY_INCARNATION,0])).execute({op});return Response.json({rejected:false});}catch(error){if(!String(error).includes("RuntimeCapabilityUnsupported"))throw error;}}return Response.json({rejected:true});}
+      if(path==="/arm-plan-retry"){await stub.armPlanRetry((await request.json()).code);return Response.json({armed:true});}
+      if(path==="/plan-retry-diagnostics")return Response.json(await stub.planRetryDiagnostics());
       if(path==="/latency-counts")return Response.json(await stub.latencyDiagnostics());
       if(path==="/mutation-groups"){const tenant=request.headers.get("X-Antfly-Tenant"),name=tenant?JSON.parse(env.ANTFLY_TENANTS)[tenant].incarnation:env.ANTFLY_INCARNATION;return Response.json(await env.COMMITS.getByName(name).mutationDiagnostics());}
       if(path==="/wipe-platform"){await stub.erasePlatformStorage();return Response.json({done:true});}
@@ -320,5 +324,21 @@ test('bounded immutable journal supports native plans, bounded read cuts and reo
   while((await f.call({op:'publish'})).has_more){}assert.equal((await f.call({op:'count'})).count,'1');
   const bucket=await f.bucket(),objects=(await bucket.list({prefix:'antfly/coord-v1/',limit:1000})).objects;
   assert.ok(objects.some(o=>o.key.includes('/epochs/')));assert.ok(!objects.some(o=>o.key.endsWith('/ROOT')));
+ }finally{await f.close();}
+});
+
+
+test('native immutable write preparation survives authority refresh but rebuilds after dependency rejection',{timeout:120000},async()=>{
+ const f=await fixture('native-write-reuse',false,true);
+ try{
+  Object.assign(f.options.bindings,{NATIVE_WRITE_PLAN:'true',WAL_INLINE_TAIL:'true',METADATA_ROOT_BACKEND:'bounded-journal'});await f.reopen();
+  for(const code of['ImmutableLogRotationRequired','ImmutableLogProofExpired','PreconditionFailed','dependency-conflict']){
+   await f.call({code},'/arm-plan-retry');
+   const input={op:'mutate',operation_id:'retry/'+code,mutations:[{kind:'upsert',doc_id:code,body:JSON.stringify({text:code})}]};
+   const receipt=await f.call(input),ids=await f.call({},'/plan-retry-diagnostics');assert.equal(ids.length,2);
+   if(code==='dependency-conflict')assert.notEqual(ids[0],ids[1]);else assert.equal(ids[0],ids[1]);
+   assert.equal((await f.call(input)).visibility,receipt.visibility);
+   assert.equal((await f.call({op:'lookup',doc_id:code,required_visibility:receipt.visibility})).body,input.mutations[0].body);
+  }
  }finally{await f.close();}
 });

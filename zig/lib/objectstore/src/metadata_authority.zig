@@ -54,6 +54,7 @@ pub const Authority = struct {
             if (self.journal_proof) |proof| {
                 if (self.log.observeCertified(a, state.?, auth, proof, follow_owners)) |value| return self.acceptJournal(value) else |err| switch (err) {
                     error.ImmutableLogProofExpired => {
+                        if (self.log.observation_metrics) |metrics| metrics.expired_refreshes += 1;
                         if (self.refreshObserved(a, state.?, auth, proof, follow_owners)) |refreshed| return self.acceptJournal(refreshed) else |failure| switch (failure) {
                             error.ImmutableLogProofRequiresRecovery => {},
                             else => return failure,
@@ -64,6 +65,7 @@ pub const Authority = struct {
                 }
             }
         }
+        if (self.log.observation_metrics) |metrics| metrics.legacy_fallbacks += 1;
         const result = if (follow_owners) try self.log.observeCommitted(a, state) else if (read_only) try self.log.observe(a, state.?) else try self.log.recover(a, state, takeover);
         return self.certify(result, anchor);
     }

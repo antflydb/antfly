@@ -16,19 +16,28 @@
 // Coalesced recovery hints never become a condition of a foreground ACK.
 // The caller decides whether checkpoint work may overlap foreground work.
 export class IdleCheckpoint {
- constructor({revision,isIdle,checkpoint,background,onError=()=>{},every=1,delay=250,retryDelay=1100}){Object.assign(this,{revision,isIdle,checkpoint,background,onError,every,delay,retryDelay});this.last=0;this.pending=false;}
+ constructor({revision,isIdle,checkpoint,background,onError=()=>{},every=1,delay=250,retryDelay=1100,maxAttempts=4,timeoutMs=10000,clock=Date.now,monotonic=()=>performance.now(),sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms))}){
+  if(![revision,isIdle,checkpoint,background,onError,clock,monotonic,sleep].every(v=>typeof v==='function')||!Number.isInteger(maxAttempts)||maxAttempts<1||maxAttempts>8||!Number.isFinite(timeoutMs)||timeoutMs<1||timeoutMs>10000||!Number.isInteger(every)||every<1||![delay,retryDelay].every(v=>Number.isFinite(v)&&v>=0))throw Error('InvalidIdleCheckpoint');
+  Object.assign(this,{revision,isIdle,checkpoint,background,onError,every,delay,retryDelay,maxAttempts,timeoutMs,clock,monotonic,sleep});this.last=0;this.pending=false;this.attempts=0;this.deferrals=0;this.failures=0;
+ }
  schedule(){
-  if(this.pending||!this.isIdle()||this.revision()-this.last<this.every)return;
+  if(this.pending||this.revision()-this.last<this.every)return;
   this.pending=true;
-  let advanced=false;
+  let advanced=false;const wall=this.clock(),mono=this.monotonic(),remaining=()=>Math.max(0,Math.min(this.timeoutMs-(this.clock()-wall),this.timeoutMs-(this.monotonic()-mono)));
   const work=(async()=>{
-   for(let attempt=0;attempt<2;attempt++){
-    await new Promise(resolve=>setTimeout(resolve,attempt?this.retryDelay:this.delay));
-    if(!this.isIdle())return;
-    const result=await this.checkpoint();if(result.busy)return;
+   for(let attempt=0;attempt<this.maxAttempts;attempt++){
+    const available=remaining();if(available<=0)return;
+    await this.sleep(Math.min(attempt?this.retryDelay:this.delay,available));
+    if(remaining()<=0)return;
+    if(!this.isIdle()){this.deferrals++;continue;}
+    this.attempts++;let result;
+    try{result=await this.checkpoint({deadlineMs:this.clock()+remaining()});}
+    catch(error){this.failures++;try{this.onError(error);}catch{}if(/^(?:ImmutableLogFenced|CoordinatorMigrationRequired|InvalidImmutableLog|InvalidImmutableLogProof)$/.test(error?.message??''))return;continue;}
+    if(remaining()<=0)return;
     if(result.done){this.last=result.revision;advanced=true;return;}
+    this.deferrals++;
    }
-  })().catch(error=>this.onError(error)).finally(()=>{this.pending=false;if(advanced&&this.revision()>this.last)this.schedule();});
+  })().catch(error=>{this.failures++;try{this.onError(error);}catch{}}).finally(()=>{this.pending=false;if(advanced&&this.revision()>this.last)this.schedule();});
   this.background(work);
  }
 }
