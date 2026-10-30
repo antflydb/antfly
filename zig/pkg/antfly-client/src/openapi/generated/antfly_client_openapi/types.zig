@@ -25909,6 +25909,7 @@ pub const GraphWhereExpression = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
+        if (source.object.count() != 1) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
             "and",
         })) {
@@ -53702,6 +53703,7 @@ pub const SqlSettingMutationRequest = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
+        if (source.object.count() != 1) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
             "drop",
         })) {

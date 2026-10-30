@@ -650,6 +650,7 @@ pub const TypeGenerator = struct {
         // nullability belongs to an external schema we cannot inspect. Presence
         // remains part of the containing object's wire contract either way.
         if (strict_optional_fields.count() > 0 or
+            try self.propertyNamesNeedMapping(schema.properties.keys()) or
             self.schemaNeedsRequiredFieldSerializer(schema, &required_set, true))
         {
             try self.w.blank();
@@ -818,6 +819,7 @@ pub const TypeGenerator = struct {
         );
 
         if (strict_optional_fields.count() > 0 or
+            try self.propertyNamesNeedMapping(emitted_props.keys()) or
             self.schemaNeedsRequiredFieldSerializer(schema, &all_required, true))
         {
             try self.w.blank();
@@ -903,13 +905,25 @@ pub const TypeGenerator = struct {
         }
     }
 
+    // Even an object with only required non-null fields needs custom JSON
+    // methods when a wire name differs from its normalized Zig field name.
+    fn propertyNamesNeedMapping(self: *TypeGenerator, names: []const []const u8) !bool {
+        for (names) |name| {
+            const identifier = try naming.zigFieldName(self.arena, name);
+            const field_name = if (std.mem.startsWith(u8, identifier, "@\"")) identifier[2 .. identifier.len - 1] else identifier;
+            if (!std.mem.eql(u8, name, field_name)) return true;
+        }
+        return false;
+    }
+
     fn emitPresenceAwareObjectParsers(
         self: *TypeGenerator,
         property_names: []const []const u8,
         strict_optional_fields: *const std.StringArrayHashMapUnmanaged(void),
         has_required_presence_fields: bool,
     ) !void {
-        if (strict_optional_fields.count() == 0 and !has_required_presence_fields) return;
+        if (strict_optional_fields.count() == 0 and !has_required_presence_fields and
+            !try self.propertyNamesNeedMapping(property_names)) return;
         self.uses_presence_aware_object = true;
 
         try self.w.blank();
@@ -1656,6 +1670,26 @@ pub const TypeGenerator = struct {
             try self.w.line("pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {{", .{});
             self.w.indent();
             try self.w.line("if (source != .object) return error.UnexpectedToken;", .{});
+            // A oneOf of closed single-member wrappers is a tagged object
+            // union. Enforce its cardinality even when callers tolerate new
+            // fields inside the variant payload for upstream compatibility.
+            var closed_single_member_union = variants.items.len > 0;
+            for (variants.items) |variant| {
+                const closed = if (variant.schema.additional_properties) |ap| switch (ap) {
+                    .boolean => |allowed| !allowed,
+                    else => false,
+                } else false;
+                if (!closed or variant.schema.properties.count() != 1 or
+                    variant.schema.required.len != 1 or
+                    !variant.schema.properties.contains(variant.schema.required[0]))
+                {
+                    closed_single_member_union = false;
+                    break;
+                }
+            }
+            if (closed_single_member_union) {
+                try self.w.line("if (source.object.count() != 1) return error.UnexpectedToken;", .{});
+            }
 
             if (inferred_discriminator) |disc| {
                 try self.w.line("const disc_val = source.object.get(\"{s}\") orelse {{", .{disc.property_name});
