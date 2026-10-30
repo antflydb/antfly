@@ -125,7 +125,6 @@ def run(args):
             db.sql("CREATE TABLE large_proof_numbers (n BIGINT)")
         run_nonce = time.time_ns()
         sql_key = "measured-" + str(run_nonce)
-        before = measurement_stats(db)
         emit(
             kind="seeded",
             file_bytes=database.stat().st_size,
@@ -163,9 +162,11 @@ def run(args):
                 check=True,
                 timeout=300,
             )
+            before = measurement_stats(db)
             began = time.monotonic()
             value = operation()
             elapsed = time.monotonic() - began
+            after = measurement_stats(db)
             if name == "read":
                 assert (
                     hashlib.sha256(value["payload"].encode()).hexdigest()
@@ -177,7 +178,6 @@ def run(args):
                 )["rows"]
                 assert len(rows) == 1 and int(rows[0][0]) == 7
             assert db.lookup("foreign")["sequence"] == sequence
-            after = measurement_stats(db)
             if (
                 name != "read"
                 and after["allocator_proof_walks"] <= before["allocator_proof_walks"]
@@ -198,7 +198,6 @@ def run(args):
                 proof_failures=after["allocator_proof_failures"]
                 - before["allocator_proof_failures"],
             )
-            before = after
         integrity = db.check()
         if not isinstance(integrity, dict) or integrity.get("valid") is not True:
             raise RuntimeError(f"integrity failed: {integrity}")
