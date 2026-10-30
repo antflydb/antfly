@@ -14,12 +14,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import io
 import unittest
 from unittest.mock import patch
-from qualify_reader_generator_pools import Probe
+from qualify_reader_generator_pools import Probe, main
 
 
 class ProbeAssertionsTest(unittest.TestCase):
+    def test_cli_qualifies_requested_reader_ceiling_and_its_exact_rejection(self):
+        for ceiling in (512, 2048):
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "probe",
+                        "--reader-url",
+                        "http://example.invalid",
+                        "--reader-max-output-tokens",
+                        str(ceiling),
+                        "--report",
+                        "unused.json",
+                    ],
+                ),
+                patch("pathlib.Path.read_bytes", return_value=b"fixture"),
+                patch("pathlib.Path.write_text"),
+                patch.object(Probe, "accepted", return_value={}) as accepted,
+                patch.object(Probe, "rejected", return_value={}) as rejected,
+                patch.object(Probe, "overload", return_value={}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(0, main())
+                self.assertEqual(4, accepted.call_count)
+                self.assertTrue(
+                    all(
+                        call.args[2]["max_tokens"] == ceiling
+                        for call in accepted.call_args_list
+                    )
+                )
+                self.assertEqual(
+                    ceiling + 1, rejected.call_args_list[0].args[2]["max_tokens"]
+                )
+                self.assertEqual(
+                    "OUTPUT_TOKEN_LIMIT_EXCEEDED", rejected.call_args_list[0].args[3]
+                )
+
     def test_reader_qualification_requires_actual_recurrent_placement(self):
         probe = Probe(1)
         for metrics in [

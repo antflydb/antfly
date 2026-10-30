@@ -16,7 +16,8 @@
 
 """Bounded native GPU qualification; does not provision, scale, or deploy pools.
 
-Requires canonical candidate policies: output=512 tokens/item, input=8192
+Requires canonical candidate policies: reader output=512 tokens/item by default
+ (override with --reader-max-output-tokens), generator output=512, input=8192
  tokens/item, decoded pixels=4,000,000/batch, max dimension=2048, request
  concurrency=1. Rejection fixtures stay below endpoint/model hard limits.
 """
@@ -204,6 +205,7 @@ class Probe:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reader-url")
+    parser.add_argument("--reader-max-output-tokens", type=int, default=512)
     parser.add_argument("--generator-url")
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--report", type=Path, required=True)
@@ -214,6 +216,10 @@ def main():
         / "pkg/inference/src/models/testdata/lightonocr3/invoice.png",
     )
     args = parser.parse_args()
+    if not 1 <= args.reader_max_output_tokens < 8192:
+        parser.error(
+            "reader output ceiling must be 1..8191 so its rejection fixture stays within the endpoint limit"
+        )
     if not (args.reader_url or args.generator_url) or not 1 <= args.timeout <= 300:
         parser.error(
             "provide at least one pool URL and a timeout between 1 and 300 seconds"
@@ -222,7 +228,7 @@ def main():
     if args.reader_url:
         body = {
             "images": [{"url": image_url(args.invoice.read_bytes())}],
-            "max_tokens": 512,
+            "max_tokens": args.reader_max_output_tokens,
         }
         # Exercise cold/request-time loads, repeated work, and both switch directions.
         for model in [READERS[0], READERS[1], READERS[1], READERS[0]]:
@@ -240,7 +246,7 @@ def main():
             lambda: probe.rejected(
                 args.reader_url,
                 "/read",
-                dict(request, max_tokens=513),
+                dict(request, max_tokens=args.reader_max_output_tokens + 1),
                 "OUTPUT_TOKEN_LIMIT_EXCEEDED",
             ),
         )
