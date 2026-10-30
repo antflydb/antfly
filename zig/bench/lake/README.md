@@ -2377,3 +2377,74 @@ source hashes, executable hashes, and independent count/value/memory oracles.
 These are synthetic in-memory kernels. They establish neither a new HTTP scan
 speedup nor cloud, empty-cache or archive-throughput performance. Earlier HTTP
 observations remain separately attributed to their original revisions.
+
+
+## Borrowed payloads and parked row-group lookahead
+
+The [retained observation](borrowed-payloads-and-parked-lookahead-v1-observation.json)
+compares merged control `945f7db284763fd441c8f6b05d75390c3bafbdb6` with runtime
+`3196cec646e6259407e5d993f06c4d450fe96ea2`. Both include main
+`b2f6226fbdc4baa7387fe2ca601833f5a48c6f1e`. Runtime ABI is **76**; native reader
+protocol remains **97**. This comparison is separate from the previous
+final-vector transfer and compact-fence observations.
+
+For 1,024 independent 8,192-row uncompressed PLAIN i64 pages, six alternating
+ReleaseSafe production-scanner pairs give median **13.106 → 6.632 ms (1.98×)**.
+Cumulative requested allocation falls **134,217,728 → 67,108,864 bytes (50%)**.
+A full-vector oracle runs before each timed sample; timed iterations sample an
+independent expected value and require balanced allocation ownership.
+A 64-KiB fixed allocator rejects the control and admits the candidate. The native
+budget check separately reports **65,536 retained bytes and a 65,536-byte peak**
+in the decoder allocator. The fetched input lease is outside that allocator and
+remains separately accounted for. These figures establish an uncompressed
+integer-kernel improvement, not an HTTP, archive, cloud or empty-cache speedup.
+Compressed pages still own decompressed storage. Deferred projection framing
+explicitly owns its payload; poisoned-input checks exercise later nullable
+string and numeric evaluation, including allocation failures.
+
+The row-group lookahead change has a separate progress oracle. Controlled
+one- and two-column provider gates verify zero occupied CPU slots while reads
+are parked, progress by an unrelated CPU task, cancellation and full cleanup.
+CPU/I/O saturation drops optional work instead of executing it inline, while a
+required cursor completes under the same pressure. Optional pull coordinators
+leave half the descriptor and retained-memory capacity available to required
+operators. No provider-latency percentage is inferred from those gates.
+
+The final source passes **158 shared and 17 API focused checks**, with no
+failures/skips/leaks, plus **12 standalone ReleaseSafe scheduler tests**.
+These suites overlap and must not be summed as distinct checks. The observation
+records final real-file qualification and the frozen executable identity.
+Apache boundary (2,338 source files), license headers, formatting and whitespace
+checks also pass. The final frozen executable passes **50 real Parquet/Iceberg
+E2E cases in 365.78 seconds**, including cold/warm reads, restarts, unequal wide
+projections, hidden/projected highlights, exact decimals, deletes, ordering and
+refresh. Its SHA-256 is
+`92a2556ffcd5d745cdca420606e6029069618c89afb9f4afb7529180fd9f3dc5`.
+
+Reproduce the decoder comparison from the worktree root:
+
+```sh
+results=.benchmark-results/lake/borrowed-payloads-v1
+mkdir -p "$results/before/src" "$results/after/src"
+git archive 945f7db284763fd441c8f6b05d75390c3bafbdb6:zig/pkg/antfly-embedded/src \
+  | tar -x -C "$results/before/src"
+git archive 3196cec646e6259407e5d993f06c4d450fe96ea2:zig/pkg/antfly-embedded/src \
+  | tar -x -C "$results/after/src"
+for variant in before after; do
+  cat > "$results/$variant/src/root.zig" <<'ZIG'
+pub const page = @import("serverless/query/lake_parquet_page.zig");
+ZIG
+done
+~/bin/zig test -lc -O ReleaseSafe --cache-dir zig/.zig-cache \
+  --global-cache-dir zig/.zig-cache/global --test-no-exec \
+  -femit-bin="$results/borrowed-payload-probe" \
+  --test-filter borrowed_payload_production_comparison --dep before --dep after \
+  -Mroot=zig/bench/lake/borrowed_payload_probe.zig \
+  -Mbefore="$results/before/src/root.zig" -Mafter="$results/after/src/root.zig"
+"$results/borrowed-payload-probe" > "$results/probe-results.log" 2>&1
+```
+
+Finish task-owned compilation, native tests, E2E and cleanup before timing the
+probe. Other host activity is uncontrolled. All twelve raw samples, source/helper
+hashes, probe hash, executable identity and memory oracles are in the observation.
+Real-provider retention qualification remains deferred.
