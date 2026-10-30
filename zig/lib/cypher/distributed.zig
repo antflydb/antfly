@@ -363,7 +363,7 @@ pub const ReadSet = struct {
                     };
                     return result.examined;
                 }
-                return if (job.err != null and job.err.? == error.CypherStateBudgetExceeded) job.maximum else 0;
+                return if (job.err != null and (job.err.? == error.CypherStateBudgetExceeded or job.err.? == error.OutOfMemory or job.err.? == error.CypherMemoryBudgetExceeded)) job.maximum else 0;
             }
             if (job.operation != .ordered) return 0;
             const input = job.operation.ordered;
@@ -985,6 +985,10 @@ pub const ReadSet = struct {
             result[index] = (try (v.Value{ .node = value }).clone(a)).node;
         };
     }
+    fn declineExpansion(pages: []?b.Page(*const v.Relationship), examined: usize) b.ExpansionBatch {
+        @memset(pages, null);
+        return .{ .pages = pages, .examined = examined };
+    }
     fn expandMany(ptr: *anyopaque, a: A, mapping: catalog.Relationship, identities: []const v.Identity, direction: ast.Direction, limit: usize, maximum: usize) !?b.ExpansionBatch {
         const self = cast(ptr);
         if (identities.len == 0 or identities.len > 16 or limit == 0 or limit > 128) return null;
@@ -1039,12 +1043,26 @@ pub const ReadSet = struct {
             }
             try checkpoint(ptr);
             if (width > 1) {
-                try wave.run(maximum - examined);
+                wave.run(maximum - examined) catch |err| {
+                    // Prefetch is advisory. A parallel scratch quota decline
+                    // must not turn a readable scalar query into a failure.
+                    // Joined work and worst-case physical reservations survive.
+                    if (err == error.CypherMemoryBudgetExceeded) {
+                        for (wave.jobs[0..width]) |job| if (job.err) |failure| {
+                            if (failure != error.OutOfMemory and failure != error.CypherMemoryBudgetExceeded and failure != error.CypherStateBudgetExceeded and failure != error.CypherAnchorBudgetExceeded) return failure;
+                        };
+                        return declineExpansion(pages, examined + wave.examined);
+                    }
+                    return err;
+                };
                 examined += wave.examined;
             } else {
                 single.maximum = @min(allowance, maximum - examined);
                 single.arena = .init(b.reclaimingAllocator(a));
-                try single.invoke(self);
+                single.invoke(self) catch |err| {
+                    if (err == error.OutOfMemory or err == error.CypherMemoryBudgetExceeded) return declineExpansion(pages, examined + single.maximum);
+                    return err;
+                };
                 examined += try ReadWave.usage(single);
             }
             for (jobs, 0..) |job, slot| {
@@ -1072,10 +1090,19 @@ pub const ReadSet = struct {
                         finished[index] = true;
                         continue;
                     }
-                    const copied = try @import("expansion_batch.zig").clone(a, value);
+                    const copied = @import("expansion_batch.zig").clone(a, value) catch |err| {
+                        if (err == error.OutOfMemory) return declineExpansion(pages, examined);
+                        return err;
+                    };
                     bytes += needed;
-                    try items[index].appendSlice(a, copied.items);
-                    const continuation = try self.adjacencyNext(a, mapping, identities[index], null, direction, .{ .owner = owner }, copied.next);
+                    items[index].appendSlice(a, copied.items) catch |err| {
+                        if (err == error.OutOfMemory) return declineExpansion(pages, examined);
+                        return err;
+                    };
+                    const continuation = self.adjacencyNext(a, mapping, identities[index], null, direction, .{ .owner = owner }, copied.next) catch |err| {
+                        if (err == error.OutOfMemory) return declineExpansion(pages, examined);
+                        return err;
+                    };
                     pages[index] = .{ .items = items[index].items, .next = continuation };
                     finished[index] = copied.items.len != 0 or copied.next != null or continuation == null;
                 }

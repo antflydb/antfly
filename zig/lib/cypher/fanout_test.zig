@@ -663,6 +663,8 @@ test "adjacency waves retain original first owner and charge speculative pages" 
         activity: Activity,
         calls: atomic = .init(0),
         skew: bool = false,
+        memory: bool = false,
+        forbidden: bool = false,
         owners: [8]Owner = undefined,
         const Owner = struct {
             f: *ThisFixture,
@@ -679,6 +681,8 @@ test "adjacency waves retain original first owner and charge speculative pages" 
                 try self.f.activity.enter();
                 defer self.f.activity.leave();
                 _ = self.f.calls.fetchAdd(1, .monotonic);
+                if (self.f.forbidden and self.index == 1) return error.Forbidden;
+                if (self.f.memory) _ = try a.alloc(u8, 256 << 10);
                 const units: usize = if (self.f.skew and self.index == 0) 9000 else 1;
                 for (0..units) |_| if (self.work) |work| try work.charge(work.ptr, 1);
                 try std.testing.expect(maximum >= 1);
@@ -714,6 +718,27 @@ test "adjacency waves retain original first owner and charge speculative pages" 
         try std.testing.expect(result.pages[0].?.next != null);
         try std.testing.expect(f.activity.peak.load(.acquire) > 1);
         try std.testing.expectEqual(@as(usize, 0), f.activity.active.load(.acquire));
+        // Concurrent scratch pressure declines prefetch and keeps the scalar
+        // path available. Every started owner is joined and physical attempts
+        // retain their bounded reservations. Authority errors still win.
+        if (!skew) for ([_]bool{ false, true }) |forbidden| {
+            f.memory = true;
+            f.forbidden = forbidden;
+            var quota: @import("budget.zig") = .{ .backing = std.testing.allocator, .limit = 128 << 10 };
+            var limited = std.heap.ArenaAllocator.init(quota.allocator());
+            defer limited.deinit();
+            const attempt = backend.vtable.expand_many.?(backend.ptr, limited.allocator(), mapping, &.{.{ .table = "docs", .key = "a" }}, .out, 128, 4096);
+            if (forbidden) {
+                try std.testing.expectError(error.Forbidden, attempt);
+            } else {
+                const declined = (try attempt).?;
+                try std.testing.expect(declined.pages[0] == null);
+                try std.testing.expect(declined.examined > 0 and declined.examined <= 4096);
+            }
+            try std.testing.expectEqual(@as(usize, 0), f.activity.active.load(.acquire));
+        };
+        f.memory = false;
+        f.forbidden = false;
         // Excluded owners consume neither batch quota nor capability probes.
         // The last physical owner can contain a producer-owned source a.
         var excluded: [7]b.Backend.VTable = undefined;

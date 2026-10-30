@@ -4766,3 +4766,11 @@ throughput claims. Regression coverage includes skewed reservations, work
 charging, revocation, controller-thread affinity, speculative edge accounting,
 original owner ordering, binary endpoint keys, producer placement and cloned
 routing-proof ownership.
+
+Advisory adjacency waves also decline on concurrent scratch quota pressure.
+All jobs join and retain work/physical reservations before returning NULL cache
+slots, allowing the scalar executor to continue after scratch is released.
+An authorization, cancellation or other owner failure takes precedence over a
+memory decline. Copy admission follows the same rule. Focused tests combine a
+128-KiB scratch quota with four simultaneous 256-KiB attempts, and separately
+combine quota failures with a forbidden owner.
