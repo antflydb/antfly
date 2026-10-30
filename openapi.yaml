@@ -13221,6 +13221,94 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+  /ai/v1/generate/context/resume/batch:
+    post:
+      summary: Resume one checkpoint and generate serial ordinary siblings
+      description: >
+        Accepts one AFATT001 envelope whose JSON metadata is a GenerateBatchRequest
+
+        and whose single application/vnd.antfly.kv-checkpoint attachment belongs
+
+        to the first request. The remaining requests use ordinary exact generation.
+
+        All requests run serially in submission order and release their private
+
+        generation state before the next request starts. The checkpoint remains
+
+        immutable and reusable; ordinary siblings never inherit its compacted KV.
+
+
+        The batch must contain 2 through 16 requests with distinct nonempty
+
+        custom_id values of at most 128 bytes, the same model and backend
+
+        preference. Every item must explicitly use mode=eager and max_tokens from
+
+        1 through 256. The endpoint disables prompt caching for every item;
+
+        prompt_cache may be false or omitted. Explicit prompt_cache=true,
+
+        streaming, context policies, prompt-cache keys, draft models,
+
+        compiled targets, and context-rewriting options are rejected before any
+
+        item executes. Metadata and each item response are limited to 2 MiB;
+
+        the checkpoint is limited to 2 GiB.
+
+
+        The first request uses the same identity, prefix, resource and release
+
+        certificate checks as single-checkpoint resume. A failed native resume
+
+        returns its normal error and no sibling executes. Once native resume
+
+        succeeds, ordinary sibling failures are returned as indexed batch errors.
+
+        Parent cancellation and its absolute deadline apply to every item.
+      operationId: resumeNativeKvCheckpointBatch
+      requestBody:
+        required: true
+        content:
+          application/vnd.antfly.attachments.v1:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Indexed serial results, with the native checkpoint result first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceGenerateBatchResponse'
+        '400':
+          description: Invalid checkpoint, prefix/model mismatch or unsupported runtime
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Checkpoint exceeds transfer or state limits
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '507':
+          description: Insufficient inference memory budget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/embed:
     post:
       summary: Create embeddings (alias of `/embeddings`)

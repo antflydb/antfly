@@ -32,6 +32,10 @@ SQL_OPERATIONS = [
     Path(f"api/data_operations/{operation}.py")
     for operation in ("execute_sql", "prepare_sql", "execute_prepared_sql", "close_prepared_sql")
 ]
+NATIVE_CHECKPOINT_RESUME_OPERATIONS = [
+    Path("api/default/resume_native_kv_checkpoint.py"),
+    Path("api/default/resume_native_kv_checkpoint_batch.py"),
+]
 EMBED_REQUEST = Path("models/inference_embed_request.py")
 NDJSON_RESPONSE = "response_200 = cast(str, response.content)"
 
@@ -171,6 +175,28 @@ def fix_generated_client(root: Path) -> None:
             (
                 "response = await client.get_async_httpx_client().request(",
                 "response = await sql_request_async(client.get_async_httpx_client(),",
+            ),
+        ):
+            if source.count(original) != 1:
+                raise RuntimeError(f"unexpected generated shape in {operation}: {original}")
+            source = source.replace(original, replacement)
+        updates[path] = source
+
+    # HTTPX AsyncClient cannot consume the generated synchronous File stream.
+    # Keep native checkpoint uploads bounded through the handwritten adapter.
+    for operation in NATIVE_CHECKPOINT_RESUME_OPERATIONS:
+        path = root / operation
+        source = path.read_text(encoding="utf-8")
+        if source.count('_kwargs["content"] = body.payload') != 1:
+            raise RuntimeError(f"unexpected generated shape in {operation}: binary file body")
+        for original, replacement in (
+            (
+                "from ...client import",
+                "from ....native_kv_transport import native_kv_request_async\nfrom ...client import",
+            ),
+            (
+                "response = await client.get_async_httpx_client().request(",
+                "response = await native_kv_request_async(client.get_async_httpx_client(),",
             ),
         ):
             if source.count(original) != 1:

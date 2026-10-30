@@ -33,14 +33,20 @@ from qualify_native_checkpoint_http import (
     REPO,
     canonical_choices,
     git_provenance,
+    normalize_request_body,
     read_response,
     requests,
     response_headers,
     resume,
     server,
     sha256_file,
+    validate_backend_configuration,
 )
-from qualify_native_cancellation import AbortableRequest, observe_guard
+from qualify_native_cancellation import (
+    AbortableRequest,
+    observe_guard,
+    validate_campaign_memory,
+)
 
 
 def first_content_delta(response):
@@ -81,9 +87,10 @@ def first_content_delta(response):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", choices=["cuda", "metal"], default="cuda")
     parser.add_argument("--server", type=Path, required=True)
     parser.add_argument(
-        "--server-kind", choices=["inference", "standalone"], default="standalone"
+        "--server-kind", choices=["inference", "standalone", "metal-test"], default="standalone"
     )
     parser.add_argument("--models-dir", type=Path, default=Path(".models"))
     parser.add_argument("--model", default="google/gemma-4-E4B-it-qat-q4_0-gguf")
@@ -92,14 +99,25 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--port", type=int, default=8520)
     parser.add_argument("--timeout", type=float, default=1800)
+    parser.add_argument(
+        "--encoding", choices=["f32", "f16", "fp8", "rotated4"], default="f16"
+    )
+    parser.add_argument("--experimental-rotated4", action="store_true")
     args = parser.parse_args()
     args.fixture = "fact"
+    args.qualification_minimum_savings = None
+    try:
+        validate_backend_configuration(args)
+    except ValueError as error:
+        parser.error(str(error))
     if args.output.exists():
         raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     evidence = {
         "passed": False,
         "production_ready": False,
+        "backend": args.backend,
+        "server_kind": args.server_kind,
         "scope": __doc__,
         "source": git_provenance(REPO),
         "binary_sha256": sha256_file(args.server),
@@ -129,9 +147,11 @@ def main():
         if len(exports) != 1:
             raise AssertionError("ambiguous reference")
         prepared = exports[0]
+        encoding = prepared["metadata"].get("encoding", "f32")
         if (
             prepared["file_sha256"] != evidence["checkpoint_sha256"]
             or prepared["metadata"]["logical_tokens"] != 8189
+            or encoding != args.encoding
         ):
             raise AssertionError("reference checkpoint mismatch")
         body = copy.deepcopy(
@@ -139,6 +159,7 @@ def main():
         )
         body.pop("context_management")
         body.pop("cache_dtype")
+        body = normalize_request_body(args, body)
         long_body = copy.deepcopy(body)
         long_body["messages"] += [
             {"role": "assistant", "content": "violet-729"},
@@ -169,7 +190,7 @@ def main():
                     raise AssertionError(
                         f"long reference HTTP {response.status}: {response.read(65536)!r}"
                     )
-                response_headers(response, record)
+                response_headers(response, record, args)
                 result = read_response(response, True)
                 evidence["long_reference"] = {
                     "seconds": time.monotonic() - started,
@@ -205,7 +226,7 @@ def main():
                     raise AssertionError(
                         f"abort request HTTP {response.status}: {response.read(65536)!r}"
                     )
-                response_headers(response, record)
+                response_headers(response, record, args)
                 if not response.getheader("Content-Type", "").startswith(
                     "text/event-stream"
                 ):
@@ -239,14 +260,7 @@ def main():
                 raise AssertionError("post-abort saved-prefix continuation changed")
             case["passed"] = True
             publish()
-        memory = evidence["worker"]["memory"]
-        if memory["samples"] < 2 or memory["errors"] or not memory["gpu_uuids"]:
-            raise AssertionError("incomplete memory sampling")
-        if (
-            not 0 < memory["peak_host_rss_bytes"] <= 8 * 1024**3
-            or not 0 < memory["peak_gpu_memory_bytes"] <= 18 * 1024**3
-        ):
-            raise AssertionError("SSE campaign exceeded memory cap")
+        validate_campaign_memory(args, evidence["worker"]["memory"])
         if git_provenance(REPO) != evidence["source"]:
             raise AssertionError("source changed")
         for path, key in [

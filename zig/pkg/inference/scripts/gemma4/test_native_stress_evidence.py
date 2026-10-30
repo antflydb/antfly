@@ -19,7 +19,7 @@ import unittest
 from qualify_native_stress import assert_equivalent, summarize_blocks, TEN_REQUESTS
 
 
-def completed_blocks():
+def completed_blocks(metal=False):
     return [
         {
             "passed": True,
@@ -31,16 +31,39 @@ def completed_blocks():
                 }
                 for kind in TEN_REQUESTS * 5
             ],
-            "quiescent_memory": {
+            "quiescent_memory": ({
+                "group_rss_bytes": 5 * 1024**3,
+                "free_memory_percent": 42.0,
+                "swapout_bytes": 0,
+            } if metal else {
                 "host_rss_bytes": 5 * 1024**3,
                 "gpu_memory_bytes": 11 * 1024**3,
-            },
+            }),
         }
         for _ in range(20)
     ]
 
 
 class StressEvidenceTests(unittest.TestCase):
+    def test_metal_bounded_profile_proves_100_mixed_and_10_independent_compactions(self):
+        result = summarize_blocks(completed_blocks(metal=True)[:2], "bounded")
+        self.assertEqual(result["mixed_requests"], 100)
+        self.assertEqual(result["actual_compactions"], 10)
+        self.assertEqual(result["independent_repreparations"], 10)
+        self.assertFalse(result["successive_compaction_cycles_qualified"])
+        self.assertIn("public checkpoint protocol", result["successive_compaction_reason"])
+        self.assertEqual(set(result["quiescent_growth"]), {"group_rss_bytes"})
+
+    def test_metal_rejects_inconsistent_or_growing_quiescent_evidence(self):
+        blocks = completed_blocks(metal=True)[:2]
+        blocks[1]["quiescent_memory"].pop("swapout_bytes")
+        with self.assertRaisesRegex(AssertionError, "inconsistent"):
+            summarize_blocks(blocks, "bounded")
+        blocks = completed_blocks(metal=True)[:2]
+        blocks[1]["quiescent_memory"]["group_rss_bytes"] += 129 * 1024**2
+        with self.assertRaisesRegex(AssertionError, "quiescent memory growth"):
+            summarize_blocks(blocks, "bounded")
+
     def test_bounded_profile_reports_its_actual_scope(self):
         blocks = completed_blocks()[:2]
         result = summarize_blocks(blocks, "bounded")

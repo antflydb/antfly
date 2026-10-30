@@ -41,6 +41,8 @@ from qualify_native_checkpoint_http import (
     resume,
     server,
     sha256_file,
+    validate_backend_configuration,
+    validate_metal_memory,
 )
 from qualify_native_cancellation import AbortableRequest, observe_guard
 
@@ -123,7 +125,8 @@ def competing_request(args, body, kind):
                 "POST",
                 "/ai/v1/generate/context/checkpoint",
                 payload,
-                {"Content-Type": "application/json"},
+                {"Content-Type": "application/json",
+                 "X-Antfly-KV-Encoding": args.encoding},
             )
         elif kind == "resume":
             size = args.checkpoint.stat().st_size
@@ -160,8 +163,9 @@ def competing_request(args, body, kind):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", type=Path, required=True)
+    parser.add_argument("--backend", choices=["cuda", "metal"], default="cuda")
     parser.add_argument(
-        "--server-kind", choices=["inference", "standalone"], default="standalone"
+        "--server-kind", choices=["inference", "standalone", "metal-test"], default="standalone"
     )
     parser.add_argument("--models-dir", type=Path, default=Path(".models"))
     parser.add_argument("--model", default="google/gemma-4-E4B-it-qat-q4_0-gguf")
@@ -170,8 +174,17 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--port", type=int, default=8518)
     parser.add_argument("--timeout", type=float, default=1800)
+    parser.add_argument(
+        "--encoding", choices=["f32", "f16", "fp8", "rotated4"], default="f16"
+    )
+    parser.add_argument("--experimental-rotated4", action="store_true")
     args = parser.parse_args()
     args.fixture = "fact"
+    args.qualification_minimum_savings = 1.5 if args.backend == "metal" else None
+    try:
+        validate_backend_configuration(args)
+    except ValueError as error:
+        parser.error(str(error))
     args.inference_admission_capacity = OVERLAP_ADMISSION_CAPACITY
     if args.output.exists():
         raise FileExistsError(args.output)
@@ -180,6 +193,9 @@ def main():
         "passed": False,
         "production_ready": False,
         "scope": __doc__,
+        "backend": args.backend,
+        "server_kind": args.server_kind,
+        "encoding": args.encoding,
         "source": git_provenance(REPO),
         "binary_sha256": sha256_file(args.server),
         "reference_sha256": sha256_file(args.reference),
@@ -213,6 +229,7 @@ def main():
         if (
             prepared["file_sha256"] != evidence["checkpoint_sha256"]
             or prepared["metadata"]["logical_tokens"] != 8189
+            or prepared["metadata"].get("encoding", "f32") != args.encoding
         ):
             raise AssertionError("reference checkpoint mismatch")
         original = copy.deepcopy(
@@ -287,13 +304,17 @@ def main():
             case["passed"] = True
             publish()
         memory = evidence["worker"]["memory"]
-        if memory["samples"] < 2 or memory["errors"] or not memory["gpu_uuids"]:
-            raise AssertionError("incomplete memory sampling")
-        if (
-            not 0 < memory["peak_host_rss_bytes"] <= 8 * 1024**3
-            or not 0 < memory["peak_gpu_memory_bytes"] <= 18 * 1024**3
-        ):
-            raise AssertionError("overlapping requests exceeded memory cap")
+        if args.backend == "metal":
+            validate_metal_memory(memory)
+            if (not evidence["worker"].get("graceful_stop") or
+                    evidence["worker"].get("remaining_group_members")):
+                raise AssertionError("Metal concurrency worker did not drain")
+        else:
+            if memory["samples"] < 2 or memory["errors"] or not memory["gpu_uuids"]:
+                raise AssertionError("incomplete memory sampling")
+            if (not 0 < memory["peak_host_rss_bytes"] <= 8 * 1024**3 or
+                    not 0 < memory["peak_gpu_memory_bytes"] <= 18 * 1024**3):
+                raise AssertionError("overlapping requests exceeded memory cap")
         if git_provenance(REPO) != evidence["source"]:
             raise AssertionError("source changed")
         for path, key in [

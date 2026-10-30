@@ -132,13 +132,19 @@ def _utf8_prefix(raw, limit):
     return b""
 
 
-def _utf8_evidence_excerpt(raw, start, end, budget):
+def _utf8_evidence_excerpt(raw, start, end, budget, prefix_limit=None):
     require(type(start) is int and type(end) is int and 0 <= start < end <= len(raw),
             "evidence range escapes primary source")
     require(raw[start:end].decode("utf-8").encode() == raw[start:end],
             "evidence range is not a UTF-8 boundary")
     budget = max(budget, end - start)
-    left = max(0, start - (budget - (end - start)) // 2)
+    require(prefix_limit is None or type(prefix_limit) is int and 0 <= prefix_limit <= 4096,
+            "invalid primary prefix limit")
+    context_before = (budget - (end - start)) // 2
+    if prefix_limit is not None:
+        context_before = min(context_before, prefix_limit)
+        budget = min(budget, len(raw) - start + prefix_limit)
+    left = max(0, start - context_before)
     right = min(len(raw), left + budget)
     left = max(0, right - budget)
     while left < start:
@@ -177,7 +183,7 @@ def _utf8_boundary_before(raw,index):
     return 0
 
 
-def compose_candidate(work_case, source_rows, source_root, byte_budget, insertion_index=None, padding_units=0):
+def compose_candidate(work_case, source_rows, source_root, byte_budget, insertion_index=None, padding_units=0, prefix_padding_units=0, suffix_padding_units=0, primary_prefix_limit=None, insertion_subpart_units=0):
     """Build one deterministic candidate; loaded receipts, never bytes, finalize it."""
     case = work_case["case"]
     families = list(work_case["distractor_families"])
@@ -203,20 +209,64 @@ def compose_candidate(work_case, source_rows, source_root, byte_budget, insertio
                                 case["earlier_source_byte_end"]))
     evidence_lower = min(start for start, _ in evidence_ranges)
     evidence_upper = max(end for _, end in evidence_ranges)
-    primary_minimum = max(4096, evidence_upper - evidence_lower)
-    allocations = {}
-    remaining = byte_budget
-    for index, family in enumerate(families):
-        raw_size = Path(source_root, source_rows[family]["path"]).stat().st_size
-        minimum = min(raw_size, primary_minimum) if family == primary else min(raw_size, 1024)
-        later_minimum = sum(
-            min(Path(source_root, source_rows[later]["path"]).stat().st_size,
-                primary_minimum if later == primary else 1024)
-            for later in families[index + 1:])
-        take = min(raw_size, max(minimum, remaining - later_minimum))
-        allocations[family] = take
-        remaining -= take
+    primary_minimum = max(1024, evidence_upper - evidence_lower)
+    sizes = {family: Path(source_root, source_rows[family]["path"]).stat().st_size
+             for family in families}
+    require(primary_prefix_limit is None or type(primary_prefix_limit) is int and
+            0 <= primary_prefix_limit <= 4096, "invalid primary prefix limit")
+    if primary_prefix_limit is not None:
+        require(case.get("bucket") == "structured_tool", "primary prefix limit requires tool history")
+        # Preserve the cited span while keeping its context after the span.
+        # Mandatory tool-call metadata precedes the response, so a centered
+        # excerpt can make the first eligible quartile unreachable. Spare
+        # bytes still go to the same assigned distractor source reservoirs.
+        sizes[primary] = min(sizes[primary], sizes[primary] - evidence_lower + primary_prefix_limit)
+    # Placement search must reorder the same excerpts. A greedy first-part
+    # allocation changes both content and evidence position when it moves a
+    # family, and can make an otherwise reachable quartile impossible.
+    allocations = {family: min(size, primary_minimum if family == primary else 4)
+                   for family, size in sizes.items()}
+    remaining = byte_budget - sum(allocations.values())
+    require(remaining >= 0, "candidate source budget cannot retain mandatory evidence")
+
+    def distribute(capacities):
+        nonlocal remaining
+        while remaining:
+            active = sorted(family for family in families
+                            if allocations[family] < capacities[family])
+            if not active:
+                return
+            share = max(1, remaining // len(active))
+            for family in active:
+                take = min(share, remaining, capacities[family] - allocations[family])
+                allocations[family] += take
+                remaining -= take
+                if not remaining:
+                    return
+
+    preferred = {family: min(size, primary_minimum if family == primary else 1024)
+                 for family, size in sizes.items()}
+    distribute(preferred)
+    # Keep the evidence window bounded, including evidence at a file's end.
+    # Use the already assigned distractor reservoirs for the long context;
+    # grow the primary only if those reservoirs are fully consumed.
+    distractor_capacity = {family: (allocations[family] if family == primary else size)
+                           for family, size in sizes.items()}
+    distribute(distractor_capacity)
+    distribute(sizes)
     require(remaining == 0, "candidate source reservoir cannot meet byte budget")
+    require(type(insertion_subpart_units) is int and 0 <= insertion_subpart_units < 65536,
+            "invalid fractional source placement")
+    split_family = None
+    split_excerpt = None
+    split_cut = 0
+    if insertion_subpart_units:
+        primary_index = families.index(primary)
+        require(primary_index + 1 < len(families), "fractional placement has no following source")
+        split_family = families[primary_index + 1]
+        split_excerpt = _utf8_prefix(source_bytes(source_root, source_rows[split_family]), allocations[split_family])
+        split_cut = _utf8_boundary_before(split_excerpt, (len(split_excerpt) * insertion_subpart_units) // 65536)
+        require(0 < split_cut < len(split_excerpt), "source fragment cannot be split at this UTF-8 boundary")
     first_parts, final_parts, segments = [], [], []
     primary_label = None
     evidence_text_start = evidence_text_end = None
@@ -226,7 +276,9 @@ def compose_candidate(work_case, source_rows, source_root, byte_budget, insertio
     def append_source(target,family,row,source_start,source_end,excerpt,kind=None):
         nonlocal next_label
         header = (f"SOURCE family={family} path={row['path']} bytes={source_start}:{source_end}\n").encode()
-        footer = b"\nEND SOURCE\n"; text=header+excerpt+footer
+        # Loaded Gemma templates trim each content part. Keep framing edges
+        # non-whitespace so the selected part survives rendering byte-for-byte.
+        footer = b"\nEND SOURCE"; text=header+excerpt+footer
         part_index=len(target);label=next_label;next_label+=1
         target.append({"text":text.decode("utf-8"),"selected":True})
         segment={"message_index":0 if target is first_parts else 2,"part_index":part_index,
@@ -241,12 +293,17 @@ def compose_candidate(work_case, source_rows, source_root, byte_budget, insertio
         row = source_rows[family]
         raw = source_bytes(source_root, row)
         if family != primary:
-            excerpt = _utf8_prefix(raw, allocations[family])
-            source_start, source_end = 0, len(excerpt)
+            excerpt = split_excerpt[split_cut:] if family == split_family else _utf8_prefix(raw, allocations[family])
+            source_start = split_cut if family == split_family else 0
+            source_end = source_start + len(excerpt)
             require(excerpt,"empty source excerpt")
             append_source(first_parts if before_primary else final_parts,
-                          family,row,source_start,source_end,excerpt)
+                          family,row,source_start,source_end,excerpt,
+                          "split_after_primary_v1" if family == split_family else None)
             continue
+        if split_family is not None:
+            append_source(first_parts,split_family,source_rows[split_family],0,split_cut,
+                          split_excerpt[:split_cut],"split_before_primary_v1")
         if case.get("bucket") == "multiturn":
             earlier_start,earlier_end=evidence_ranges[1];later_start,later_end=evidence_ranges[0]
             require(earlier_end<=later_start,"multiturn cited ranges are not chronological")
@@ -274,7 +331,7 @@ def compose_candidate(work_case, source_rows, source_root, byte_budget, insertio
             late_segment["evidence_part_byte_end"]=evidence_text_end
         else:
             source_start,source_end,excerpt=_utf8_evidence_excerpt(
-                raw,evidence_lower,evidence_upper,allocations[family])
+                raw,evidence_lower,evidence_upper,allocations[family],primary_prefix_limit)
             segment,text=append_source(first_parts,family,row,source_start,source_end,excerpt)
             primary_label=segment["label"];answer_part=text
             evidence_text_start=segment["part_byte_start"]+case["source"]["byte_start"]-source_start
@@ -365,23 +422,105 @@ def compose_candidate(work_case, source_rows, source_root, byte_budget, insertio
     else:
         require(isinstance(case.get("question_utf8"),str) and case["question_utf8"],
                 "invalid frozen question")
+        # Ordinary single-message tasks retain the sources on both sides of
+        # the primary evidence. Their segment locations follow the merge.
+        first_count = len(first_parts)
+        for segment in segments:
+            if segment.get("message_index") == 2:
+                segment["message_index"] = 0
+                segment["part_index"] += first_count
+        first_parts.extend(final_parts)
         first_parts.append({"text": case["question_utf8"], "selected": False})
         messages = {"schema_version": 1, "messages": [{"role": "user", "parts": first_parts}]}
+    for count in (prefix_padding_units, suffix_padding_units):
+        require(type(count) is int and 0 <= count <= 768, "invalid eligibility guard padding")
+    # Extend existing framing rather than exceeding the ordered-message part
+    # bound. Prefix padding can cover only synthetic framing inside the
+    # protected prefix; source-byte offsets continue to name the original file.
+    if prefix_padding_units:
+        prefix = "NEUTRAL PREFIX BEGIN" + (" neutral" * prefix_padding_units) + " NEUTRAL PREFIX END\n"
+        part = messages["messages"][0]["parts"][0]
+        part["text"] = prefix + part["text"]
+        prefix_bytes = len(prefix.encode())
+        for segment in segments:
+            if segment["message_index"] == 0 and segment["part_index"] == 0:
+                segment["prefix_padding_units"] = prefix_padding_units
+                for name in ("part_byte_start", "part_byte_end", "evidence_part_byte_start", "evidence_part_byte_end"):
+                    if name in segment:
+                        segment[name] += prefix_bytes
+                if segment["label"] == primary_label:
+                    answer_part = part["text"].encode()
+                    evidence_text_start += prefix_bytes
+                    evidence_text_end += prefix_bytes
+    if suffix_padding_units:
+        suffix = "NEUTRAL SUFFIX BEGIN" + (" neutral" * suffix_padding_units) + " NEUTRAL SUFFIX END\n"
+        part = messages["messages"][-1]["parts"][-1]
+        require(part["selected"] is False, "suffix guard requires protected final instructions")
+        part["text"] = suffix + part["text"]
     return {"messages": messages, "segments": segments, "primary_label": primary_label,
             "evidence_part_utf8": answer_part,
             "evidence_part_byte_start": evidence_text_start,
             "evidence_part_byte_end": evidence_text_end,
             "reference_utf8": case["reference_utf8"], "byte_budget": byte_budget,
-            "padding_units": padding_units}
+            "padding_units": padding_units, "prefix_padding_units": prefix_padding_units,
+            "suffix_padding_units": suffix_padding_units}
 
 
 
-def next_candidate_control(control, observed_prompt_tokens, observed_quartile):
+def evidence_quartile(start, end, prompt_tokens, protected_prefix=0, protected_recent=0):
+    """Quartiles of the actual declared eligible interval, without model outputs."""
+    require(all(type(x) is int for x in (start, end, prompt_tokens, protected_prefix, protected_recent)) and
+            0 <= protected_prefix < prompt_tokens - protected_recent <= prompt_tokens and
+            0 <= start < end <= prompt_tokens, "invalid evidence quartile interval")
+    width = prompt_tokens - protected_prefix - protected_recent
+    return min(3, max(0, (2 * (start + end - 2 * protected_prefix)) // width))
+
+
+def next_candidate_control(control, observed_prompt_tokens, observed_quartile, *, evidence_eligible=True, evidence_token_start=None, evidence_token_end=None, protected_prefix=512, protected_recent=512):
     """Advance bounded source-byte then neutral-padding search without outputs."""
     required = {"target_prompt_tokens", "intended_quartile", "byte_budget",
         "maximum_byte_budget", "insertion_index", "maximum_insertion_index",
         "phase", "padding_units", "samples"}
-    require(type(control) is dict and set(control) == required, "invalid packing search control")
+    optional = {"prefix_padding_units", "suffix_padding_units", "insertion_subpart_units"}
+    require(type(control) is dict and required.issubset(control) and set(control) <= required | optional,
+            "invalid packing search control")
+    require(type(protected_prefix) is int and type(protected_recent) is int and
+            0 <= protected_prefix < observed_prompt_tokens - protected_recent <= observed_prompt_tokens,
+            "invalid protected packing windows")
+    native_windows = protected_prefix == 128 and protected_recent == 2048
+    subpart = control.get("insertion_subpart_units", 0)
+    require(type(subpart) is int and 0 <= subpart < 65536, "invalid fractional search placement")
+    # Establish the exact prompt length before reserving native eligibility
+    # guards. Shrinking an oversized source moves the evidence too; using its
+    # old position against the final length can exhaust the guard prematurely.
+    if not evidence_eligible:
+        require(type(evidence_token_start) is int and type(evidence_token_end) is int and
+                0 <= evidence_token_start < evidence_token_end <= observed_prompt_tokens,
+                "invalid eligibility interval")
+        require(evidence_token_start < protected_prefix or
+                evidence_token_end > observed_prompt_tokens - protected_recent,
+                "evidence eligibility failure is outside protected windows")
+    native_tail = native_windows and not evidence_eligible and evidence_token_end > observed_prompt_tokens - protected_recent
+    if not evidence_eligible and (not native_windows or
+            observed_prompt_tokens == control["target_prompt_tokens"] and not native_tail):
+        require(type(evidence_token_start) is int and type(evidence_token_end) is int and
+                0 <= evidence_token_start < evidence_token_end <= observed_prompt_tokens,
+                "invalid eligibility interval")
+        prefix = control.get("prefix_padding_units", 0)
+        suffix = control.get("suffix_padding_units", 0)
+        margin = 128 if native_windows else 16
+        final_prompt = min(observed_prompt_tokens, control["target_prompt_tokens"]) if native_windows else observed_prompt_tokens
+        require(all(type(value) is int and 0 <= value <= 768 for value in (prefix, suffix)),
+                "invalid eligibility guard state")
+        if evidence_token_start < protected_prefix:
+            prefix += protected_prefix - evidence_token_start + margin
+        elif evidence_token_end > observed_prompt_tokens - protected_recent:
+            suffix += evidence_token_end - (final_prompt - protected_recent) + margin
+        else:
+            raise ValueError("evidence eligibility failure is outside protected windows")
+        require(max(prefix, suffix) <= 768, "eligibility guard search is exhausted")
+        return {**control, "prefix_padding_units": prefix, "suffix_padding_units": suffix,
+                "padding_units": 0, "phase": "source", "samples": []}
     target, budget, maximum = (control[k] for k in
                                ("target_prompt_tokens", "byte_budget", "maximum_byte_budget"))
     insertion, padding = control["insertion_index"], control["padding_units"]
@@ -393,17 +532,43 @@ def next_candidate_control(control, observed_prompt_tokens, observed_quartile):
             "invalid packing search observation")
     samples=list(control["samples"])
     keys={"bytes","tokens","insertion_index","padding_units"}
-    require(len(samples)<128 and all(type(row) is dict and set(row)==keys for row in samples),
+    native_keys=keys|{"quartile","insertion_subpart_units"}
+    require(len(samples)<128 and all(type(row) is dict and set(row) in (keys,native_keys) for row in samples),
             "invalid packing search history")
     require(not any(row["bytes"]==budget and row["insertion_index"]==insertion and
-                    row["padding_units"]==padding for row in samples), "repeated packing candidate")
-    samples.append({"bytes":budget,"tokens":observed_prompt_tokens,
-                    "insertion_index":insertion,"padding_units":padding})
+                    row["padding_units"]==padding and row.get("insertion_subpart_units",0)==subpart
+                    for row in samples), "repeated packing candidate")
+    sample={"bytes":budget,"tokens":observed_prompt_tokens,
+            "insertion_index":insertion,"padding_units":padding}
+    # An overlap with the protected tail is above every eligible quartile,
+    # including quartile 3. Move/split source parts before consuming a guard.
+    placement_quartile = 4 if native_tail and observed_prompt_tokens == target else observed_quartile
+    if native_windows:sample.update(quartile=placement_quartile,insertion_subpart_units=subpart)
+    samples.append(sample)
     intended=control["intended_quartile"]
-    if observed_prompt_tokens==target and observed_quartile==intended:
+    if observed_prompt_tokens==target and placement_quartile==intended and evidence_eligible:
         return {**control,"samples":samples,"completed":True}
     if observed_prompt_tokens==target:
-        insertion += 1 if observed_quartile<intended else -1
+        proposed = insertion + (1 if placement_quartile<intended else -1)
+        crossed = native_windows and any(row["insertion_index"]==proposed and
+            row.get("insertion_subpart_units",0)==0 and row.get("quartile",intended)!=intended and
+            (row["quartile"]<intended)!=(placement_quartile<intended) for row in samples)
+        if native_windows and (subpart or crossed):
+            if not subpart:
+                insertion=min(insertion,proposed);proposal=32768
+            else:
+                current=[row for row in samples if row["insertion_index"]==insertion and
+                         "quartile" in row and row["tokens"]==target]
+                lower=max((row.get("insertion_subpart_units",0) for row in current
+                           if row["quartile"]<intended),default=0)
+                upper=min((row.get("insertion_subpart_units",0) for row in current
+                           if row["quartile"]>intended),default=65536)
+                require(lower<upper,"fractional placement bounds conflict")
+                proposal=(lower+upper)//2
+            require(0<proposal<65536 and proposal!=subpart,"fractional placement search is exhausted")
+            return {**control,"insertion_index":insertion,"insertion_subpart_units":proposal,
+                    "phase":"source","padding_units":0,"samples":samples}
+        insertion=proposed
         require(0<=insertion<=control["maximum_insertion_index"],
                 "source placement cannot reach intended quartile")
         return {**control,"insertion_index":insertion,"phase":"source",
@@ -412,7 +577,8 @@ def next_candidate_control(control, observed_prompt_tokens, observed_quartile):
         return {**control,"phase":"padding","padding_units":target-observed_prompt_tokens,
                 "samples":samples}
     if control["phase"]=="padding":
-        current=[r for r in samples if r["bytes"]==budget and r["insertion_index"]==insertion]
+        current=[r for r in samples if r["bytes"]==budget and r["insertion_index"]==insertion and
+                 r.get("insertion_subpart_units",0)==subpart]
         lower=max((r for r in current if r["tokens"]<target),key=lambda r:(r["tokens"],r["padding_units"]),default=None)
         upper=min((r for r in current if r["tokens"]>target),key=lambda r:(r["tokens"],r["padding_units"]),default=None)
         if lower and upper:
@@ -426,7 +592,8 @@ def next_candidate_control(control, observed_prompt_tokens, observed_quartile):
         require(proposal!=padding and not any(r["padding_units"]==proposal for r in current),
                 "neutral padding search is exhausted")
         return {**control,"padding_units":proposal,"samples":samples}
-    current=[r for r in samples if r["insertion_index"]==insertion and r["padding_units"]==0]
+    current=[r for r in samples if r["insertion_index"]==insertion and r["padding_units"]==0 and
+             r.get("insertion_subpart_units",0)==subpart]
     lower=max((r for r in current if r["tokens"]<target),key=lambda r:(r["tokens"],r["bytes"]),default=None)
     upper=min((r for r in current if r["tokens"]>target),key=lambda r:(r["tokens"],r["bytes"]),default=None)
     if lower and upper:

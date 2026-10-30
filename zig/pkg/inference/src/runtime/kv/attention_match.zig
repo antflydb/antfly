@@ -271,9 +271,24 @@ fn solveValues(allocator: std.mem.Allocator, a: []const f64, y: []const f64, q: 
     try fitValues(allocator, a, y, q, m, d, ridge, cfg.control, out);
 }
 
+/// Four FP64 accumulation chains keep independent held-out attention off a
+/// serial scalar dependency chain. Products and sums remain FP64; the native
+/// softcap, bias, finite checks, and all acceptance thresholds are unchanged.
+fn attentionDot(query: []const f64, keys: []const f64) f64 {
+    var lanes: @Vector(4, f64) = @splat(0);
+    var offset: usize = 0;
+    while (offset + 4 <= query.len) : (offset += 4) {
+        const q: @Vector(4, f64) = query[offset..][0..4].*;
+        const k: @Vector(4, f64) = keys[offset..][0..4].*;
+        lanes += q * k;
+    }
+    var result: f64 = @reduce(.Add, lanes);
+    while (offset < query.len) : (offset += 1) result += query[offset] * keys[offset];
+    return result;
+}
+
 fn logit(h: Head, query: []const f64, row: usize) !f64 {
-    var x: f64 = 0;
-    for (query, h.keys[row * h.dim ..][0..h.dim]) |q, k| x += q * k;
+    var x = attentionDot(query, h.keys[row * h.dim ..][0..h.dim]);
     x *= h.scale;
     if (!std.math.isFinite(x)) return error.NonFiniteAttention;
     if (h.softcap > 0) x = h.softcap * std.math.tanh(x / h.softcap);
@@ -459,6 +474,13 @@ pub fn fitMassActive(allocator: std.mem.Allocator, a: []const f64, q: usize, m: 
 /// Householder QR of ridge-augmented [A; sqrt(lambda) I], avoiding normal
 /// equations (which square the condition number). RHS columns are transformed
 /// together, and one scratch vector is reused for each reflector.
+/// Test-only access to the unchanged scalar Householder oracle. Production
+/// accelerators cannot invoke this seam or replace the direct NNLS/KKT checks.
+pub fn fitValuesReferenceForTest(allocator: std.mem.Allocator, a: []const f64, y: []const f64, q: usize, m: usize, d: usize, ridge: f64, control: Control, out: []f64) !void {
+    if (comptime !@import("builtin").is_test) @compileError("reference value solve is test-only");
+    try fitValues(allocator, a, y, q, m, d, ridge, control, out);
+}
+
 fn fitValues(allocator: std.mem.Allocator, a: []const f64, y: []const f64, q: usize, m: usize, d: usize, ridge: f64, control: Control, out: []f64) !void {
     const rows = try add(q, m);
     const qr = try allocator.alloc(f64, try mul(rows, m));
@@ -1178,4 +1200,46 @@ test "attention_match output-only validation rejects nonfinite accelerated summa
     var targets: [1]f64 = undefined;
     var masses: [1]f64 = undefined;
     try std.testing.expectError(error.NonFiniteAttention, attendSummary(std.testing.allocator, h, &.{1}, &targets, &masses, .{ .target_rows = 1, .backend = implementation }));
+}
+
+test "attention_match FP64 vector dot agrees with independent quad precision across tails" {
+    var queries: [1024]f64 = undefined;
+    var keys: [1024]f64 = undefined;
+    for ([_]usize{ 1, 2, 3, 4, 7, 31, 32, 63, 64, 127, 128, 255, 256, 511, 512, 1023, 1024 }) |dim| {
+        var quad: f128 = 0;
+        for (queries[0..dim], keys[0..dim], 0..) |*q, *k, i| {
+            q.* = @as(f64, @floatFromInt(@as(i64, @intCast((i * 31 + i / 7) % 127)) - 63)) / 73.123456712345;
+            k.* = @as(f64, @floatFromInt(@as(i64, @intCast((i * 23 + i / 11) % 127)) - 63)) / 71.123456712345;
+            quad += @as(f128, q.*) * @as(f128, k.*);
+        }
+        const expected: f64 = @floatCast(quad);
+        try std.testing.expectApproxEqAbs(expected, attentionDot(queries[0..dim], keys[0..dim]), 2e-12);
+    }
+}
+
+test "attention_match FP64 vector dot preserves attention probabilities mass and poison rejection" {
+    const queries = [_]f64{ 0.1371239123, -0.25349123, 0.342349123, 0.412349123, -0.582349123, 0.612349123, 0.72349123 };
+    var keys = [_]f64{ 0.81349123, -0.912349123, 0.1212349123, 0.232349123, 0.34349123, -0.4512349123, 0.512349123, 0, 0, 0, 0, 0, 0, 0 };
+    var quad: f128 = 0;
+    for (queries, keys[0..7]) |q, k| quad += @as(f128, q) * @as(f128, k);
+    const score: f64 = @floatCast(quad);
+    const expected_mass = @log(1 + @exp(score));
+    const first = @exp(score - expected_mass);
+    const values = [_]f64{ 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, -0.75, -0.75, -0.75, -0.75, -0.75, -0.75, -0.75 };
+    const head: Head = .{ .keys = &keys, .values = &values, .rows = 2, .dim = 7, .scale = 1 };
+    var probabilities: [2]f64 = undefined;
+    var output: [7]f64 = undefined;
+    const mass = try attend(head, &queries, &probabilities, &output);
+    try std.testing.expectApproxEqAbs(expected_mass, mass, 2e-12);
+    try std.testing.expectApproxEqAbs(first, probabilities[0], 2e-12);
+    try std.testing.expectApproxEqAbs(1 - first, probabilities[1], 2e-12);
+    for (output) |value| try std.testing.expectApproxEqAbs(first * 0.125 - (1 - first) * 0.75, value, 2e-12);
+    for (0..7) |index| {
+        const original = keys[index];
+        keys[index] = std.math.nan(f64);
+        try std.testing.expectError(error.NonFiniteAttention, attend(head, &queries, &probabilities, &output));
+        keys[index] = std.math.inf(f64);
+        try std.testing.expectError(error.NonFiniteAttention, attend(head, &queries, &probabilities, &output));
+        keys[index] = original;
+    }
 }

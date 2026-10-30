@@ -14501,6 +14501,28 @@ test "load huggingface tokenizer from gguf gemma4 bpe metadata" {
     try std.testing.expectEqual(@as(i32, 1), encoded.attention_mask[1]);
     try std.testing.expectEqual(@as(i32, 1), encoded.attention_mask[2]);
 
+    var aligned = try tok.tokenizer().encodeGenerationWithOffsets(allocator, "hello world", 8, true);
+    defer aligned.deinit();
+    try std.testing.expectEqualSlices(i32, encoded.ids, aligned.ids);
+    try std.testing.expectEqualSlices(i32, encoded.attention_mask, aligned.attention_mask);
+    try std.testing.expectEqualSlices([2]u32, &.{ .{ 0, 0 }, .{ 0, 5 }, .{ 5, 11 } }, aligned.offsets.?[0..3]);
+
+    const repeated = try allocator.alloc(u8, 12 * 48);
+    defer allocator.free(repeated);
+    for (0..48) |i| @memcpy(repeated[i * 12 ..][0..12], "hello world\n");
+    var ordinary_long = try tok.tokenizer().encodeForGenerationConfigured(allocator, repeated, 512, true);
+    defer ordinary_long.deinit();
+    var aligned_long = try tok.tokenizer().encodeGenerationWithOffsets(allocator, repeated, 512, true);
+    defer aligned_long.deinit();
+    try std.testing.expectEqualSlices(i32, ordinary_long.ids, aligned_long.ids);
+    try std.testing.expectEqualSlices(i32, ordinary_long.attention_mask, aligned_long.attention_mask);
+    var previous_end: u32 = 0;
+    for (aligned_long.offsets.?) |span| {
+        if (span[1] == 0) continue;
+        try std.testing.expect(span[0] >= previous_end and span[1] <= repeated.len);
+        previous_end = span[1];
+    }
+
     const special_ids = try tok.tokenizer().encode(allocator, "<|turn>hello");
     defer allocator.free(special_ids);
     try std.testing.expectEqualSlices(i32, &.{ 6, 7 }, special_ids);

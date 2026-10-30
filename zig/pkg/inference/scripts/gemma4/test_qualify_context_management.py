@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -26,6 +27,52 @@ import qualify_context_management as subject
 
 
 class ContextQualificationTests(unittest.TestCase):
+    def test_qualification_artifacts_do_not_change_source_provenance(self):
+        # Exercise real Git ignore/status/content handling without creating
+        # any commits. Only the synthetic HEAD lookup/diff base is substituted.
+        actual_check_output = subprocess.check_output
+        ignore = Path(__file__).resolve().parents[5] / ".gitignore"
+        self.assertIn("/.qualification/", ignore.read_text().splitlines())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / ".gitignore").write_text("/.qualification/\n")
+            source = root / "source.zig"
+            source.write_text("const revision = 1;\n")
+            subprocess.run(["git", "-C", str(root), "add", ".gitignore", "source.zig"],
+                           check=True)
+            artifacts = root / ".qualification"
+            artifacts.mkdir()
+            report = artifacts / "resource.json"
+            report.write_text('{"samples":1}\n')
+
+            def git_output(command):
+                if command[3:] == ("rev-parse", "HEAD"):
+                    return b"a" * 40 + b"\n"
+                if command[3:5] == ("diff", "--binary"):
+                    command = tuple(arg for arg in command if arg != "HEAD")
+                return actual_check_output(command)
+
+            with mock.patch.object(subject.subprocess, "check_output",
+                                   side_effect=git_output):
+                before = subject.git_provenance(root)
+                report.write_text('{"samples":100}\n')
+                (artifacts / "new-report.json").write_text('{"passed":true}\n')
+                (artifacts / "reproduce.py").write_text("print('artifact')\n")
+                self.assertEqual(before, subject.git_provenance(root))
+                source.write_text("const revision = 2;\n")
+                tracked = subject.git_provenance(root)
+                self.assertNotEqual(before["source_snapshot_sha256"],
+                                    tracked["source_snapshot_sha256"])
+                untracked = root / "new.zig"
+                untracked.write_text("const revision = 1;\n")
+                added = subject.git_provenance(root)
+                self.assertNotEqual(tracked["source_snapshot_sha256"],
+                                    added["source_snapshot_sha256"])
+                untracked.write_text("const revision = 2;\n")
+                self.assertNotEqual(added["source_snapshot_sha256"],
+                                    subject.git_provenance(root)["source_snapshot_sha256"])
+
     def test_provenance_includes_untracked_cuda_sources(self):
         def git_output(command):
             arguments = command[3:]
@@ -394,7 +441,11 @@ class ContextQualificationTests(unittest.TestCase):
     def test_cuda_sampler_filters_to_tested_pid(self):
         pid = __import__("os").getpid()
         output = f"GPU-a, {pid + 1}, 999\nGPU-b, {pid}, 123\n"
-        with mock.patch.object(subject.subprocess, "check_output", return_value=output):
+        def proc_status(path):
+            self.assertEqual(path, Path(f"/proc/{pid}/status"))
+            return "Name:\tfixture\nVmRSS:\t1024 kB\n"
+        with (mock.patch.object(subject.subprocess, "check_output", return_value=output),
+              mock.patch.object(Path, "read_text", autospec=True, side_effect=proc_status)):
             row = subject.sample_cuda_process(pid)
         self.assertEqual(row["pid"], pid)
         self.assertGreater(row["host_rss_bytes"], 0)

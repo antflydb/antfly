@@ -18,7 +18,8 @@ import hashlib
 import json
 import unittest
 
-from native_quality_score import evaluate, same_json, score, strict_json
+from native_quality_score import (evaluate, same_json, score, strict_json,
+                                  validate_request_models)
 from prepare_native_quality_suite import build_cases, task
 
 
@@ -60,6 +61,23 @@ class QualityTests(unittest.TestCase):
             {"fixture": c["case_id"], "body": c["body"], "response": response_for(c)}
             for c in self.cases
         ]
+
+    def test_all_requests_bind_the_frozen_model_before_case_selection(self):
+        cases = [{"case_id": "first", "body": {"model": "e2b"}},
+                 {"case_id": "last", "body": {"model": "e2b"},
+                  "checkpoint_body": {"model": "e2b"}}]
+        validate_request_models(cases, "e2b")
+        for field in ("body", "checkpoint_body"):
+            for invalid in (None, {}, {"model": "e4b"}):
+                with self.subTest(field=field, invalid=invalid):
+                    changed = copy.deepcopy(cases)
+                    changed[-1][field] = invalid
+                    with self.assertRaisesRegex(ValueError, field + r"\.model"):
+                        validate_request_models(changed, "e2b")
+        with self.assertRaisesRegex(ValueError, "expected model"):
+            validate_request_models(cases, "")
+        with self.assertRaisesRegex(ValueError, r"body\.model"):
+            validate_request_models([{"case_id": "missing"}], "e2b")
 
     def test_fixed_suite_covers_families_positions_and_critical_cases(self):
         encoded = "".join(

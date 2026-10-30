@@ -577,10 +577,50 @@ pub const Kernels = struct {
         inputs: []const Ref,
         output: Ref,
     ) !void {
+        return self.runOnActiveRuntimeImpl(false, owner_runtime, params, inputs, output);
+    }
+
+    /// The caller owns the shader ABI: set each bit whose binding may write.
+    /// Unset bits are read-only, including dummy bindings. Aliases retain the
+    /// union of their roles through the existing runtime range hazard tracker.
+    pub fn runCoalescedOnActiveRuntime(
+        self: *Kernels,
+        owner_runtime: *mr.RawMetalDecodeRuntime,
+        params: Params,
+        inputs: []const Ref,
+        output: Ref,
+        write_mask: u8,
+    ) !void {
         if (self.cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
         try validateDispatch(params, inputs, output);
         var buffers = self.dispatchBuffers(inputs, output);
-        if (mr.termite_metal_generated_dispatch_on_active_frame(
+        if (mr.termite_metal_generated_dispatch_accesses_coalesced_on_active_frame(
+            owner_runtime,
+            self.pipeline,
+            &buffers.handles,
+            &buffers.offsets,
+            &buffers.lengths,
+            8,
+            &params,
+            @sizeOf(Params),
+            params.n,
+            write_mask,
+        ) != 0) return error.GeneratedMetalDispatchFailed;
+    }
+
+    fn runOnActiveRuntimeImpl(
+        self: *Kernels,
+        comptime coalesced: bool,
+        owner_runtime: *mr.RawMetalDecodeRuntime,
+        params: Params,
+        inputs: []const Ref,
+        output: Ref,
+    ) !void {
+        if (self.cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
+        try validateDispatch(params, inputs, output);
+        var buffers = self.dispatchBuffers(inputs, output);
+        const dispatch = if (coalesced) mr.termite_metal_generated_dispatch_coalesced_on_active_frame else mr.termite_metal_generated_dispatch_on_active_frame;
+        if (dispatch(
             owner_runtime,
             self.pipeline,
             &buffers.handles,
@@ -654,10 +694,58 @@ pub const Kernels = struct {
         grid: [3]usize,
         group: [3]usize,
     ) !void {
+        return self.runThreadgroupsPipelineOnActiveRuntimeImpl(false, owner_runtime, pipeline, params, inputs, output, grid, group);
+    }
+
+    pub fn runThreadgroupsPipelineCoalescedOnActiveRuntime(
+        self: *Kernels,
+        owner_runtime: *mr.RawMetalDecodeRuntime,
+        pipeline: *mr.RawMetalGeneratedPipeline,
+        params: Params,
+        inputs: []const Ref,
+        output: Ref,
+        grid: [3]usize,
+        group: [3]usize,
+        write_mask: u8,
+    ) !void {
         if (self.cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
         if (self.batch_submitted or inputs.len > 7) return error.InvalidGeneratedDispatch;
         var buffers = self.dispatchBuffers(inputs, output);
-        if (mr.termite_metal_generated_dispatch_threadgroups_on_active_frame(
+        if (mr.termite_metal_generated_dispatch_threadgroups_accesses_coalesced_on_active_frame(
+            owner_runtime,
+            pipeline,
+            &buffers.handles,
+            &buffers.offsets,
+            &buffers.lengths,
+            8,
+            &params,
+            @sizeOf(Params),
+            grid[0],
+            grid[1],
+            grid[2],
+            group[0],
+            group[1],
+            group[2],
+            write_mask,
+        ) != 0) return error.GeneratedMetalDispatchFailed;
+    }
+
+    fn runThreadgroupsPipelineOnActiveRuntimeImpl(
+        self: *Kernels,
+        comptime coalesced: bool,
+        owner_runtime: *mr.RawMetalDecodeRuntime,
+        pipeline: *mr.RawMetalGeneratedPipeline,
+        params: Params,
+        inputs: []const Ref,
+        output: Ref,
+        grid: [3]usize,
+        group: [3]usize,
+    ) !void {
+        if (self.cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
+        if (self.batch_submitted or inputs.len > 7) return error.InvalidGeneratedDispatch;
+        var buffers = self.dispatchBuffers(inputs, output);
+        const dispatch = if (coalesced) mr.termite_metal_generated_dispatch_threadgroups_coalesced_on_active_frame else mr.termite_metal_generated_dispatch_threadgroups_on_active_frame;
+        if (dispatch(
             owner_runtime,
             pipeline,
             &buffers.handles,
@@ -834,4 +922,92 @@ test "context replay split pair rejects stale geometry and aliases before frame 
     try std.testing.expectError(error.InvalidReplaySplitDispatch, Kernels.validateReplaySplitPair(stage, &short_tail, scratch, reduce, &reduce_inputs, output));
     const aliased_output = Ref{ .handle = scratch.handle, .bytes = output.bytes };
     try std.testing.expectError(error.InvalidReplaySplitDispatch, Kernels.validateReplaySplitPair(stage, &stage_inputs, scratch, reduce, &reduce_inputs, aliased_output));
+}
+
+test "attention_match Metal explicit generated access roles preserve RAW WAR WAW and read fanout across scoped policies" {
+    if (comptime !options.enable_metal) return error.SkipZigTest;
+    const source =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\struct Params {uint op,n,dim,groups,position,stride,mode,index;float epsilon,scale,theta,reserved;};
+        \\kernel void access_chain(device const float* input [[buffer(0)]],device float* output [[buffer(7)]],constant Params&p [[buffer(8)]],uint tid [[thread_position_in_grid]]) {if(tid<p.n)output[tid]=input[tid]*p.scale;}
+    ;
+    var kernels = try Kernels.initSource(source, "access_chain");
+    defer kernels.deinit();
+    const count = 256;
+    var a = try kernels.buffer(count * 4);
+    defer a.deinit();
+    var b = try kernels.buffer(count * 4);
+    defer b.deinit();
+    var c = try kernels.buffer(count * 4);
+    defer c.deinit();
+    var d = try kernels.buffer(count * 4);
+    defer d.deinit();
+    const initial_policy = mr.termite_metal_decode_runtime_native_frame_policy_state(kernels.runtime);
+    // Exercise restoration of both an existing request and the default policy.
+    for ([_]c_int{ 0, 1 }) |previous_requested| {
+        try std.testing.expectEqual(@as(c_int, 0), mr.termite_metal_decode_runtime_set_concurrent_planned_dispatch(kernels.runtime, previous_requested));
+        const previous_policy = mr.termite_metal_decode_runtime_native_frame_policy_state(kernels.runtime);
+        for (0..3) |policy| {
+            var conservative_barriers: u64 = 0;
+            var conservative_encoders: u64 = 0;
+            for ([_]u8{ 0xff, 0x80 }) |mask| {
+                if (policy != 0) {
+                    try std.testing.expectEqual(@as(c_int, 0), mr.termite_metal_decode_runtime_begin_native_frame_policy(kernels.runtime, @intFromBool(policy == 2), 1));
+                    try std.testing.expectEqual(@as(c_int, -3), mr.termite_metal_decode_runtime_begin_native_frame_policy(kernels.runtime, 0, 0));
+                    try std.testing.expectEqual(@as(c_int, -3), mr.termite_metal_decode_runtime_set_concurrent_planned_dispatch(kernels.runtime, 0));
+                }
+                errdefer {
+                    if (mr.hasActiveFrame(kernels.runtime)) mr.cancelFrame(kernels.runtime) catch {};
+                    if (mr.hasSubmittedFrame(kernels.runtime)) mr.waitFrame(kernels.runtime) catch {};
+                    if (policy != 0) _ = mr.termite_metal_decode_runtime_end_native_frame_policy(kernels.runtime);
+                }
+                @memset(a.floats(), 1);
+                @memset(b.floats(), -1);
+                @memset(c.floats(), -1);
+                @memset(d.floats(), -1);
+                try mr.beginFrame(kernels.runtime);
+                try std.testing.expectEqual(@as(c_int, -2), mr.termite_metal_decode_runtime_begin_native_frame_policy(kernels.runtime, 1, 1));
+                if (policy != 0) try std.testing.expectEqual(@as(c_int, -2), mr.termite_metal_decode_runtime_end_native_frame_policy(kernels.runtime));
+                errdefer {
+                    if (mr.hasActiveFrame(kernels.runtime)) mr.cancelFrame(kernels.runtime) catch {};
+                    if (mr.hasSubmittedFrame(kernels.runtime)) mr.waitFrame(kernels.runtime) catch {};
+                }
+                try kernels.runCoalescedOnActiveRuntime(kernels.runtime, .{ .op = 1, .n = count, .scale = 2 }, &.{a.ref()}, b.ref(), mask);
+                // Two independent consumers share a read-only input.
+                try kernels.runCoalescedOnActiveRuntime(kernels.runtime, .{ .op = 1, .n = count, .scale = 3 }, &.{a.ref()}, c.ref(), mask);
+                try kernels.runThreadgroupsPipelineCoalescedOnActiveRuntime(kernels.runtime, kernels.pipeline, .{ .op = 1, .n = count, .scale = 5 }, &.{b.ref()}, d.ref(), .{ 4, 1, 1 }, .{ 64, 1, 1 }, mask);
+                // Reuse the earlier input as an output, then overwrite b twice.
+                try kernels.runCoalescedOnActiveRuntime(kernels.runtime, .{ .op = 1, .n = count, .scale = 7 }, &.{c.ref()}, a.ref(), mask);
+                try kernels.runCoalescedOnActiveRuntime(kernels.runtime, .{ .op = 1, .n = count, .scale = 11 }, &.{a.ref()}, b.ref(), mask);
+                try kernels.runCoalescedOnActiveRuntime(kernels.runtime, .{ .op = 1, .n = count, .scale = 13 }, &.{c.ref()}, b.ref(), mask);
+                try mr.submitFrame(kernels.runtime);
+                try mr.waitFrame(kernels.runtime);
+                if (policy != 0) try std.testing.expectEqual(@as(c_int, 0), mr.termite_metal_decode_runtime_end_native_frame_policy(kernels.runtime));
+                try std.testing.expectEqual(previous_policy, mr.termite_metal_decode_runtime_native_frame_policy_state(kernels.runtime));
+                for (a.floats(), b.floats(), c.floats(), d.floats()) |av, bv, cv, dv| {
+                    try std.testing.expectEqual(@as(f32, 21), av);
+                    try std.testing.expectEqual(@as(f32, 39), bv);
+                    try std.testing.expectEqual(@as(f32, 3), cv);
+                    try std.testing.expectEqual(@as(f32, 10), dv);
+                }
+                const snapshot = mr.runtimeMemorySnapshot(kernels.runtime);
+                if (mask == 0xff) {
+                    conservative_barriers = snapshot.last_frame_planned_barrier_count;
+                    conservative_encoders = snapshot.last_frame_compute_encoder_count;
+                } else if (policy == 0 and conservative_barriers != 0 and conservative_encoders == 1 and snapshot.last_frame_compute_encoder_count == 1) {
+                    try std.testing.expect(snapshot.last_frame_planned_barrier_count < conservative_barriers);
+                    try std.testing.expect(snapshot.last_frame_planned_barrier_count > 0);
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(c_int, 0), mr.termite_metal_decode_runtime_begin_native_frame_policy(kernels.runtime, 1, 1));
+        try mr.beginFrame(kernels.runtime);
+        try kernels.runCoalescedOnActiveRuntime(kernels.runtime, .{ .op = 1, .n = count, .scale = 17 }, &.{a.ref()}, b.ref(), 0x80);
+        try mr.cancelFrame(kernels.runtime);
+        try std.testing.expectEqual(@as(c_int, 0), mr.termite_metal_decode_runtime_end_native_frame_policy(kernels.runtime));
+        try std.testing.expectEqual(previous_policy, mr.termite_metal_decode_runtime_native_frame_policy_state(kernels.runtime));
+    }
+    try std.testing.expectEqual(@as(c_int, 0), mr.termite_metal_decode_runtime_set_concurrent_planned_dispatch(kernels.runtime, @intCast(initial_policy & 1)));
+    try std.testing.expectEqual(initial_policy, mr.termite_metal_decode_runtime_native_frame_policy_state(kernels.runtime));
 }

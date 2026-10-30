@@ -472,6 +472,114 @@ current source closure. These results cover implementation and synthetic GPU
 fixtures; no E4B model quality, performance, or serving campaign ran on this
 merged source. The remaining release gates below still apply.
 
+## Common Metal packed storage continuation, 2026-10-26
+
+Work continues from saved commit `ad109be382` in
+`.worktrees/codex-metal-compaction-production`. The shared portable checkpoint
+adapter now implements f16, E4M3FN FP8 and the existing CUDA-compatible
+`rotated4` codec. This is the repository's versioned two-Hadamard rotated
+4-bit key codec with per-row int8 values; it does not change its codebook,
+seeds, rounding contract or numerical acceptance limits.
+
+Rotated rows remain packed in resident Metal buffers. A 48-byte storage
+header and canonical span table map exact prefix, recent and fallback rows
+to dense f16 buffers. Both serial and split-K attention rotate queries once
+per SIMD group, apply the existing packed centroids and value scales, and
+keep fitted bias outside the model softcap. Upload, clone, growth, append,
+readback and allocation admission preserve the original packed bytes and
+charge the full page-rounded representation. Resident span bounds are
+revalidated before dispatch.
+
+Portable Metal release authority now binds the loaded model identity, exact
+wire encoding, implementation closure and a separate release-report digest.
+Streaming decode retains encoding provenance. The implementation identity
+also covers the split-K shader and all release-selection code; only the
+certificate table itself is omitted to avoid a self-referential digest.
+The certificate table remains empty pending qualification.
+
+The qualification launcher covers f16/FP8/rotated4 at 8K and 32K, with serial
+smoke, quality and performance phases. Its bounded and extended quality
+suites contain 16 and 64 cases, respectively. The smoke's global-KV savings
+check is distinct from the paired performance collector's measured total
+committed-context savings gate. A complete campaign also needs reliability
+and production-route evidence; passing the 18 phase cells alone does not
+authorize production. Current build, test and model evidence is retained in
+the worktree's `.qualification/metal-compaction-20261026/` and
+`.qualification/metal-common-production-20261026-v1/` directories.
+
+The resident-storage changes passed 165 focused ReleaseSafe tests on the M4
+Pro, including scalar/split-K GPU comparisons, with no leaks or new swap.
+The production semantic check also passed. Subsequent E2B planning work
+removed the Metal adapter's 4,096-query ceiling: its actual shared global head
+needs 10,240 training queries: 320 samples per stratum with every fifth held
+out leave 256 training rows in each of forty strata. The adapter bounds calls at 16,384 and
+retains the unchanged 512 MiB solver workspace limit. New E2B planning tests
+cover all three encodings at both context sizes. The final source still needs
+a passing full build and real-model campaign: `build-v4` was stopped by the
+unchanged 8 GiB process-group guard at 8,199.8 MiB, with no new swap and a
+fully drained compiler group. The prepared direct-compile cache warmup was
+subsequently run with the same compiler, flags, caches and limits. It also hit
+the guard: 8,194.875 MiB at 393.95 seconds, zero new swapouts, and a fully
+drained compiler group. This workaround does not unblock the full build; its
+receipt is `metal-compaction-20261026/direct-compile-v1-resource.json` under
+the worktree's `.qualification/` directory. No model qualification or release
+enrollment is claimed for this continuation.
+
+Fresh ReleaseSafe validation exposed a second E2B planning issue: the adapter
+dispatched sixteen queries at a time but reserved GPU query/result buffers for
+the complete matrix. It now reuses sixteen-query buffers and scatters each
+fenced result into the caller's full matrices. The 1,024-row/512-target-row E2B
+solver workspace falls from 542.626 MiB to 462.345 MiB, within the unchanged
+512 MiB limit. Query selection, fitting chunk sizes, retention and numerical
+limits are unchanged. All 170 focused tests passed, including all-format
+E2B 8K/32K planning, ragged-tail GPU/FP64 comparisons and cancellation; there
+were no leaks or new swapouts. The receipt is
+`metal-compaction-20261026/resume-focused-v2.json`.
+
+The canonical full source-bound `build-v5`, including this fix, also stopped
+at the unchanged process-group limit: 8,192.469 MiB at 380.61 seconds. It
+recorded zero new swapouts and no remaining compiler processes. Its source
+archive and resource receipt are retained, but no passing release receipt was
+issued and no model campaign was launched. These failures establish that the
+configured build watchdog was exceeded; they do not establish exhaustion of
+the host's physical memory.
+
+The resumed review corrected the public quality collector's distinction
+between checkpoint wire encoding and actual resident storage. An FP8 or
+rotated4 checkpoint that preserves exact f16 state is now checked against
+the f16 owner ledger. Quantization counters must still reconcile before
+selection, and exact fallback never satisfies codec category coverage.
+The 83 focused Python checks passed, including new fallback, mixed-head and
+malformed-evidence regressions; their log is
+`metal-compaction-20261026/resume-python-tests-v5.log`.
+The final production Metal semantic check also passed under the same resource
+guard, peaking at 1,234.422 MiB with zero new swapouts and complete process
+drain (`metal-compaction-20261026/resume-production-check-v1.json`). This
+does not replace the incomplete full release build or model campaigns.
+
+The build recorder now accepts `--max-build-rss-mib 16384` for a build-only
+16 GiB compiler budget on the 24 GiB host. Its default remains 8 GiB. The
+16 GiB profile aligns the process-group watchdog, Zig scheduler budget and
+`-Dcontext-test-compile-memory-mb=16384` compilation-step declaration, while
+retaining serial compilation. Version 4 receipts bind this exact profile;
+historical v1/v2/v3 profiles retain their original commands. Free-memory,
+swap-growth and disk guards remain active, independently of the unchanged
+8 GiB model-campaign guard and 512 MiB solver limit.
+
+The cold `build-v6` completed compilation and all 758 tests (50 opt-in skips)
+in 418.41 seconds, peaking at 9,056.563 MiB with zero new swapouts. It could
+not seal a receipt because Zig's separate compilation-step declaration still
+said 8 GiB. After aligning all three budgets, `build-v7` repeated all 808
+selected tests using the compilation cache: 758 passed, 50 skipped, zero
+failures or leaks. Its source-bound v4 receipt was sealed and independently
+validated by the full release auditor. The rerun took 38.48 seconds, peaked at
+580.547 MiB, grew swap by zero, and drained completely. The receipt is
+`metal-compaction-20261026/build-v7/full-release-build.json`, SHA-256
+`794e0ca931470c9fe228f04c3a23c83f9b2dbb929a864eec1766d6f62e06869a`.
+All 48 focused build-recorder/provenance checks and 168 release-auditor tests
+passed. This resolves the compiler-budget blocker; model campaigns and release
+registry enrollment remain separate gates.
+
 ## Remaining release gates
 
 - Capture a complete Gemma4 head and obtain a passing native recipe within the

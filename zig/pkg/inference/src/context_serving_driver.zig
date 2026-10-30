@@ -808,7 +808,7 @@ pub const Driver = struct {
         return result;
     }
 
-    fn nativeMessages(
+    pub fn nativeMessages(
         request: Request,
         messages: *[ordered_messages.max_messages]@import("pipelines/generation.zig").Message,
         parts: *[ordered_messages.max_messages * ordered_messages.max_parts_per_message]@import("pipelines/generation.zig").Message.ContentPart,

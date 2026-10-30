@@ -265,14 +265,25 @@ fn converted(allocator: std.mem.Allocator, values: []const f32) ![]f64 {
     return result;
 }
 
-fn compactHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_index: usize, head_index: usize, batches: []const ReferenceBatch, layout: Layout, options: Options, resident: usize, validation_gate: ?*HeadValidationGate) !?checkpoint.Head {
-    const original = source.donors[donor_index].heads[head_index];
-    const d = original.dim;
-    const boundary = source.logical_length - @min(source.logical_length, options.recent_rows);
+pub const HeadPlan = struct {
+    old_rows: usize,
+    prefix_rows: usize,
+    target_rows: usize,
+    block_rows: usize,
+};
+
+/// The admission planner and fitter share the same coverage boundaries. Prior
+/// fitted rows remain immutable; only newly eligible exact rows can shrink.
+/// The caller validates the checkpoint's complete shape and numerical state.
+pub fn headPlan(logical_length: u64, original: checkpoint.Head, options: Options) !?HeadPlan {
+    if (options.chunk_rows == 0 or options.retention_divisor < 2 or options.retention_divisor > 4 or
+        original.positions.len != original.coverage_ends.len or original.positions.len != original.bias.len)
+        return error.InvalidFitConfig;
+    const boundary = logical_length - @min(logical_length, options.recent_rows);
     if (boundary < original.compacted_until) return error.CompactionRecentWindowUnavailable;
     var old_rows: usize = 0;
     while (old_rows < original.positions.len and original.coverage_ends[old_rows] <= boundary) : (old_rows += 1) {}
-    var prefix = @min(options.prefix_rows, @as(usize, @intCast(source.logical_length)));
+    var prefix = @min(options.prefix_rows, std.math.cast(usize, logical_length) orelse return error.InvalidFitConfig);
     if (prefix > original.positions.len) return error.CompactionPrefixUnavailable;
     for (0..prefix) |i| {
         if (original.positions[i] != i or original.coverage_ends[i] != i + 1 or original.bias[i] != 0)
@@ -284,20 +295,30 @@ fn compactHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_ind
     while (prefix < original.positions.len and original.coverage_ends[prefix] <= original.compacted_until) : (prefix += 1) {}
     if (old_rows <= prefix or old_rows - prefix < 2) return null;
     var target_rows: usize = original.positions.len - old_rows + prefix;
-    var offset: usize = prefix;
-    while (offset < old_rows) {
-        const count = @min(options.chunk_rows, old_rows - offset);
+    var planned_offset: usize = prefix;
+    while (planned_offset < old_rows) {
+        const count = @min(options.chunk_rows, old_rows - planned_offset);
         target_rows = try add(target_rows, std.math.divCeil(usize, count, options.retention_divisor) catch unreachable);
-        offset += count;
+        planned_offset += count;
     }
     if (target_rows == original.positions.len) return null;
+    return .{ .old_rows = old_rows, .prefix_rows = prefix, .target_rows = target_rows, .block_rows = @min(old_rows - prefix, options.chunk_rows) };
+}
+
+fn compactHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_index: usize, head_index: usize, batches: []const ReferenceBatch, layout: Layout, options: Options, resident: usize, validation_gate: ?*HeadValidationGate) !?checkpoint.Head {
+    const original = source.donors[donor_index].heads[head_index];
+    const d = original.dim;
+    const plan = (try headPlan(source.logical_length, original, options)) orelse return null;
+    const old_rows = plan.old_rows;
+    const prefix = plan.prefix_rows;
+    const target_rows = plan.target_rows;
     var train_elements: usize = 0;
     var heldout_elements: usize = 0;
     for (batches) |batch| if (belongs(batch, source, layout, donor_index, head_index)) {
         train_elements = try add(train_elements, batch.train.len);
         heldout_elements = try add(heldout_elements, batch.heldout.len);
     };
-    const block_rows = @min(old_rows - prefix, options.chunk_rows);
+    const block_rows = plan.block_rows;
     const workspace = try headWorkspaceBytes(original.positions.len, target_rows, block_rows, train_elements, heldout_elements, d, options);
     try budget(try add(resident, workspace.bytes), options.max_transient_host_bytes);
     try budget(workspace.solver_bytes, options.fit.max_workspace_bytes);
@@ -334,7 +355,7 @@ fn compactHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_ind
     @memcpy(biases[0..prefix], original.bias[0..prefix]);
     @memcpy(keys[0 .. prefix * d], original.keys[0 .. prefix * d]);
     @memcpy(values[0 .. prefix * d], original.values[0 .. prefix * d]);
-    offset = prefix;
+    var offset: usize = prefix;
     var out: usize = prefix;
     while (offset < old_rows) {
         try options.fit.control.check();
@@ -401,6 +422,7 @@ fn compactHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_ind
     @memcpy(values[out * d ..], original.values[old_rows * d ..]);
     std.debug.assert(out + remaining == target_rows);
     var result: checkpoint.Head = .{ .dim = d, .compacted_until = original.coverage_ends[old_rows - 1], .positions = positions, .coverage_ends = ends, .keys = keys, .values = values, .bias = biases };
+    if (options.fp8_checkpoint) result.fp8 = original.fp8;
     result.compressed = try original.compressed.clone(allocator);
     errdefer result.compressed.deinit(allocator);
     if (options.validation == .whole_head) {
@@ -461,12 +483,18 @@ fn compactHead(allocator: std.mem.Allocator, source: checkpoint.State, donor_ind
 
 fn quantizeCheckpointHead(allocator: std.mem.Allocator, original: solver.Head, compact: solver.Head, result: *checkpoint.Head, first: usize, end: usize, queries: []const f64, cfg: solver.Config) !bool {
     const codec = checkpoint.codec;
+    const previous = result.fp8;
+    // The wire format has one contiguous FP8 range per head. Keep its scales
+    // and bytes immutable across fits. A new range can extend it only when
+    // adjacent and representable at the same scales; otherwise new rows keep
+    // their validated f16 representation and the prior FP8 range survives.
+    if (previous.rows != 0 and @as(usize, previous.first_row) + previous.rows != first) return false;
     const begin_element = first * result.dim;
     const end_element = end * result.dim;
     const keys = @constCast(compact.keys[begin_element..end_element]);
     const values = @constCast(compact.values[begin_element..end_element]);
-    const key_scale = codec.scaleFor(keys);
-    const value_scale = codec.scaleFor(values);
+    const key_scale = if (previous.rows == 0) codec.scaleFor(keys) else previous.key_scale;
+    const value_scale = if (previous.rows == 0) codec.scaleFor(values) else previous.value_scale;
     var offset: usize = 0;
     while (offset < keys.len) {
         try cfg.control.check();
@@ -489,7 +517,8 @@ fn quantizeCheckpointHead(allocator: std.mem.Allocator, original: solver.Head, c
         @constCast(result.keys)[i] = @floatCast(k);
         @constCast(result.values)[i] = @floatCast(v);
     }
-    result.fp8 = .{ .first_row = @intCast(first), .rows = @intCast(end - first), .key_scale = key_scale, .value_scale = value_scale };
+    const encoded_first = if (previous.rows == 0) first else previous.first_row;
+    result.fp8 = .{ .first_row = @intCast(encoded_first), .rows = @intCast(end - encoded_first), .key_scale = key_scale, .value_scale = value_scale };
     if (cfg.metrics) |out_metrics| out_metrics.* = metrics;
     return true;
 }
@@ -827,6 +856,30 @@ fn batchesFixture() [8]ReferenceBatch {
     var batches: [8]ReferenceBatch = undefined;
     for (&batches, 0..) |*b, i| b.* = .{ .consumer_layer = if (i < 4) 0 else 2, .query_head = @intCast(i % 4), .train = &.{0}, .heldout = &.{1}, .train_positions = &.{4}, .heldout_positions = &.{5} };
     return batches;
+}
+
+test "attention_match head plan preserves prior fitted coverage across cycles" {
+    const options: Options = .{ .prefix_rows = 2, .recent_rows = 2, .chunk_rows = 4, .retention_divisor = 2 };
+    const head: checkpoint.Head = .{
+        .dim = 1,
+        .compacted_until = 14,
+        .positions = &.{ 0, 1, 2, 4, 6, 8, 10, 12, 14, 15, 16, 17, 18, 19 },
+        .coverage_ends = &.{ 1, 2, 4, 6, 8, 10, 12, 14, 15, 16, 17, 18, 19, 20 },
+        .bias = &.{ 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0 },
+    };
+    const plan = (try headPlan(20, head, options)).?;
+    try std.testing.expectEqualDeep(HeadPlan{ .old_rows = 12, .prefix_rows = 8, .target_rows = 12, .block_rows = 4 }, plan);
+    var recent_only = options;
+    recent_only.recent_rows = 6;
+    try std.testing.expectEqual(@as(?HeadPlan, null), try headPlan(20, head, recent_only));
+    recent_only.recent_rows = 7;
+    try std.testing.expectError(error.CompactionRecentWindowUnavailable, headPlan(20, head, recent_only));
+    var unavailable = options;
+    unavailable.prefix_rows = 3;
+    try std.testing.expectError(error.CompactionPrefixUnavailable, headPlan(20, head, unavailable));
+    var invalid = options;
+    invalid.chunk_rows = 0;
+    try std.testing.expectError(error.InvalidFitConfig, headPlan(20, head, invalid));
 }
 
 test "attention_match engine compacts shared donors once and preserves exact recent and local rows" {
@@ -1338,6 +1391,105 @@ test "attention_match FP8 requires serving half precision and whole-head validat
     const batches = batchesFixture();
     try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .fp8_checkpoint = true }));
     try std.testing.expectError(error.InvalidFitConfig, prepare(std.testing.allocator, state, &batches, layout_fixture, .{ .fp8_checkpoint = true, .storage_precision = .f16 }));
+}
+
+test "attention_match FP8 successive fit preserves prior encoded rows and scales" {
+    const a = std.testing.allocator;
+    for ([_]f32{ 3, 1000 }) |new_value| {
+        const values = [_]f32{ 3, 3, new_value, new_value, new_value, new_value, new_value };
+        const old: checkpoint.Head = .{
+            .dim = 1,
+            .compacted_until = 3,
+            .positions = &.{ 0, 1, 3, 4, 5, 6, 7 },
+            .coverage_ends = &.{ 1, 3, 4, 5, 6, 7, 8 },
+            .keys = &.{ 0, 0, 0, 0, 0, 0, 0 },
+            .values = &values,
+            .bias = &.{ 0, @log(@as(f32, 2)), 0, 0, 0, 0, 0 },
+            .fp8 = .{ .first_row = 1, .rows = 1, .key_scale = 1, .value_scale = 1 },
+        };
+        const source: checkpoint.State = .{
+            .identity = identity,
+            .logical_length = 8,
+            .tokens = &.{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .logits = &.{0},
+            .layer_donors = &.{0},
+            .donors = &.{.{ .layer = 0, .heads = &.{old} }},
+        };
+        const batches = [_]ReferenceBatch{.{ .consumer_layer = 0, .query_head = 0, .train = &.{0}, .heldout = &.{0}, .train_positions = &.{8}, .heldout_positions = &.{9} }};
+        const layout: Layout = .{ .query_heads_by_layer = &.{1}, .scales_by_donor = &.{1}, .softcaps_by_donor = &.{0} };
+        var stats: Stats = .{};
+        var result = try prepare(a, source, &batches, layout, .{
+            .stats = &stats,
+            .recent_rows = 2,
+            .prefix_rows = 1,
+            .chunk_rows = 3,
+            .validation = .whole_head,
+            .storage_precision = .f16,
+            .fp8_checkpoint = true,
+        });
+        defer result.deinit();
+        const head = result.state.donors[0].heads[0];
+        try std.testing.expectEqual(@as(u32, 1), head.fp8.first_row);
+        try std.testing.expectEqual(@as(u32, if (new_value == 3) 2 else 1), head.fp8.rows);
+        try std.testing.expectEqual(old.fp8.key_scale, head.fp8.key_scale);
+        try std.testing.expectEqual(old.fp8.value_scale, head.fp8.value_scale);
+        try std.testing.expectEqualSlices(u64, old.coverage_ends[0..2], head.coverage_ends[0..2]);
+        try std.testing.expectEqualSlices(f32, old.keys[0..2], head.keys[0..2]);
+        try std.testing.expectEqualSlices(f32, old.values[0..2], head.values[0..2]);
+        try std.testing.expectEqualSlices(f32, old.bias[0..2], head.bias[0..2]);
+        try std.testing.expectEqual(try checkpoint.codec.encode(old.values[1], old.fp8.value_scale), try checkpoint.codec.encode(head.values[1], head.fp8.value_scale));
+        try std.testing.expectEqual(@as(usize, @intFromBool(new_value == 1000)), stats.fp8_fallback_heads);
+        const encoded = try checkpoint.encodeWithEncoding(a, result.state, .{}, .fp8, .{});
+        defer a.free(encoded);
+        var decoded = try checkpoint.decode(a, encoded, identity, .{});
+        defer decoded.deinit();
+        try std.testing.expectEqualDeep(head.fp8, decoded.state.donors[0].heads[0].fp8);
+        try std.testing.expectEqualSlices(f32, old.values[0..2], decoded.state.donors[0].heads[0].values[0..2]);
+    }
+}
+
+test "attention_match FP8 later f16 gap preserves the prior encoded range" {
+    const a = std.testing.allocator;
+    const old: checkpoint.Head = .{
+        .dim = 1,
+        .compacted_until = 6,
+        .positions = &.{ 0, 1, 3, 6, 7, 8, 9, 10 },
+        .coverage_ends = &.{ 1, 3, 6, 7, 8, 9, 10, 11 },
+        .keys = &.{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        .values = &.{ 3, 3, 1000, 1000, 1000, 1000, 1000, 1000 },
+        .bias = &.{ 0, @log(@as(f32, 2)), @log(@as(f32, 3)), 0, 0, 0, 0, 0 },
+        .fp8 = .{ .first_row = 1, .rows = 1, .key_scale = 1, .value_scale = 1 },
+    };
+    const source: checkpoint.State = .{
+        .identity = identity,
+        .logical_length = 11,
+        .tokens = &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        .logits = &.{0},
+        .layer_donors = &.{0},
+        .donors = &.{.{ .layer = 0, .heads = &.{old} }},
+    };
+    const batches = [_]ReferenceBatch{.{ .consumer_layer = 0, .query_head = 0, .train = &.{0}, .heldout = &.{0}, .train_positions = &.{11}, .heldout_positions = &.{12} }};
+    const layout: Layout = .{ .query_heads_by_layer = &.{1}, .scales_by_donor = &.{1}, .softcaps_by_donor = &.{0} };
+    var result = try prepare(a, source, &batches, layout, .{
+        .recent_rows = 2,
+        .prefix_rows = 1,
+        .chunk_rows = 3,
+        .validation = .whole_head,
+        .storage_precision = .f16,
+        .fp8_checkpoint = true,
+    });
+    defer result.deinit();
+    const head = result.state.donors[0].heads[0];
+    try std.testing.expectEqualDeep(old.fp8, head.fp8);
+    try std.testing.expectEqualSlices(f32, old.keys[0..3], head.keys[0..3]);
+    try std.testing.expectEqualSlices(f32, old.values[0..3], head.values[0..3]);
+    try std.testing.expectEqualSlices(f32, old.bias[0..3], head.bias[0..3]);
+    try std.testing.expect(head.positions.len < old.positions.len);
+    const encoded = try checkpoint.encodeWithEncoding(a, result.state, .{}, .fp8, .{});
+    defer a.free(encoded);
+    var decoded = try checkpoint.decode(a, encoded, identity, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(old.fp8, decoded.state.donors[0].heads[0].fp8);
 }
 
 fn retryBatches() [8]ReferenceBatch {

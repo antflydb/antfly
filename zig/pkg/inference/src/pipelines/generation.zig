@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const native_kv_checkpoint = @import("../runtime/kv/attention_match_checkpoint.zig");
+const native_checkpoint_release = @import("../runtime/kv/attention_match_release.zig");
 const builtin = @import("builtin");
 const context_fault_injection = @import("../context_fault_injection.zig");
 const Gemma4Projection = @import("gemma4_channels.zig").Projection;
@@ -411,7 +412,7 @@ pub const GenerationConfig = struct {
     /// Test-binary-only request-scoped cancellation controller. Release
     /// GenerationConfig contains `void`, so request/env input cannot enable it.
     context_fault_controller: context_fault_injection.Slot = if (@import("builtin").is_test) null else {},
-    /// Test/qualification-binary-only ingress for the portable f16/FP8
+    /// Test/qualification-binary-only ingress for portable Metal checkpoints.
     /// Metal checkpoint path. Production availability remains release-profile
     /// gated and is intentionally absent until hardware qualification seals it.
     metal_native_checkpoint_qualification: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
@@ -901,13 +902,13 @@ pub const NativeCheckpointPrepare = struct {
     pub fn hostPlan(config: gpt_mod.Config, tokens: usize, encoding: runtime.kv.attention_match_checkpoint.Encoding, metal: bool) !HostPlan {
         if (metal) {
             if (comptime !build_options.enable_metal) return error.UnsupportedCompactionQueryRoute;
-            if (encoding != .f16 and encoding != .fp8) return error.UnsupportedMetalKvCheckpointEncoding;
+            if (encoding != .f16 and encoding != .fp8 and encoding != .rotated4)
+                return error.UnsupportedMetalKvCheckpointEncoding;
         } else if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
         if (config.family != .gemma or !config.usesGemma4Channels() or
             config.num_hidden_layers == 0 or config.num_hidden_layers > 256)
             return error.UnsupportedCompactionQueryModel;
         if (tokens < 2 or tokens > native_kv_checkpoint.max_context_tokens) return error.CompactionQueryLimit;
-        const engine = runtime.kv.attention_match_engine;
         const snapshot = runtime.kv.attention_match_snapshot;
         var options = fittingOptions();
         options.independent_fp64_publication = metal;
@@ -974,6 +975,64 @@ pub const NativeCheckpointPrepare = struct {
             if (workspace.solver_bytes > options.fit.max_workspace_bytes) return error.CompactionWorkspaceLimit;
             maximum = @max(maximum, workspace.bytes);
         }
+        return finishHostPlan(source_bytes, heads, maximum, metal);
+    }
+
+    /// Admission for an installed checkpoint uses its retained rows and
+    /// immutable fitted coverage, including each head's largest retry.
+    pub fn hostPlanForState(config: gpt_mod.Config, state: runtime.kv.attention_match_checkpoint.State, encoding: runtime.kv.attention_match_checkpoint.Encoding, control: runtime.kv.attention_match.Control) !HostPlan {
+        if (comptime !build_options.enable_metal) return error.UnsupportedCompactionQueryRoute;
+        if (encoding != .f16 and encoding != .fp8 and encoding != .rotated4)
+            return error.UnsupportedMetalKvCheckpointEncoding;
+        if (config.family != .gemma or !config.usesGemma4Channels() or config.num_hidden_layers == 0 or
+            config.num_hidden_layers > 256 or config.num_hidden_layers != state.layer_donors.len or
+            config.vocab_size != state.logits.len or state.logical_length < 2)
+            return error.UnsupportedCompactionQueryModel;
+        try state.validateWithControl(native_kv_checkpoint.serving_limits, control);
+        var options = fittingOptions();
+        options.independent_fp64_publication = true;
+        options.fp8_checkpoint = encoding == .fp8;
+        options.rotated4_checkpoint = encoding == .rotated4;
+        options.retention_divisor = options.min_retention_divisor.?;
+        const samples = @min(@min(state.tokens.len, max_repeat_tokens), collection_options.samples_per_consumer);
+        const heldout = (samples - 1) / collection_options.heldout_stride + 1;
+        var maximum: usize = 0;
+        var heads: usize = 0;
+        var expected_donors: usize = 0;
+        for (0..config.num_hidden_layers) |layer| {
+            const geometry = try config.kvDonorGeometry(layer);
+            const donor = state.donors[state.layer_donors[layer]];
+            if (donor.layer != geometry.donor_layer or donor.heads.len != geometry.num_kv_heads or
+                donor.heads[0].dim != geometry.head_dim or
+                donor.window != (if (config.layerUsesSlidingAttention(layer)) config.sliding_window else @as(u32, 0)))
+                return error.UnsupportedKvSnapshotLayout;
+            expected_donors += @intFromBool(config.isKvDonorLayer(layer));
+        }
+        if (state.donors.len != expected_donors) return error.UnsupportedKvSnapshotLayout;
+        for (state.donors, 0..) |donor, di| {
+            try control.check();
+            if (donor.window != 0) continue;
+            heads = try std.math.add(usize, heads, donor.heads.len);
+            var consumers: usize = 0;
+            for (state.layer_donors) |mapped| {
+                if (mapped == di) consumers += 1;
+            }
+            if (consumers == 0 or config.num_attention_heads == 0 or config.num_attention_heads % donor.heads.len != 0)
+                return error.InvalidCompactionQueries;
+            for (donor.heads) |head| {
+                try control.check();
+                const plan = (try runtime.kv.attention_match_engine.headPlan(state.logical_length, head, options)) orelse continue;
+                const width = try std.math.mul(usize, try std.math.mul(usize, consumers, config.num_attention_heads / donor.heads.len), head.dim);
+                const workspace = try @import("../ops/metal_attention_match_fit.zig").Fitter.headHostWorkspace(head.positions.len, plan.target_rows, plan.block_rows, try std.math.mul(usize, width, samples - heldout), try std.math.mul(usize, width, heldout), head.dim, options);
+                if (workspace.solver_bytes > options.fit.max_workspace_bytes) return error.CompactionWorkspaceLimit;
+                maximum = @max(maximum, workspace.bytes);
+            }
+        }
+        return finishHostPlan(try state.residentBytes(), heads, maximum, true);
+    }
+
+    fn finishHostPlan(source_bytes: usize, heads: usize, maximum: usize, metal: bool) !HostPlan {
+        const engine = runtime.kv.attention_match_engine;
         const fit_bytes, const workers = if (metal) plan: {
             if (comptime build_options.enable_metal) {
                 const resident = try engine.parallelResidentBytes(source_bytes, heads);
@@ -1003,9 +1062,15 @@ pub const NativeCheckpointPrepare = struct {
         return .{ .fit_bytes = fit_bytes, .reservation_bytes = try std.math.add(usize, fit_bytes, auxiliary_host_bytes), .source_bytes = source_bytes, .head_workspace_bytes = maximum, .workers = workers };
     }
 
+    fp64_accelerated_value_solves: u64 = 0,
+
     planned_fit_host_bytes: ?usize = null,
     planned_fit_workers: ?usize = null,
     planned_fit_head_workspace_bytes: ?usize = null,
+    /// Only the independent quality collector requests these extra seals.
+    capture_quality_evidence: bool = false,
+    quality_source_sha256: [32]u8 = @splat(0),
+    quality_calibration: ?runtime.kv.attention_match_queries.Seal = null,
 
     encoding: runtime.kv.attention_match_checkpoint.Encoding = .f16,
     minimum_savings_ratio: f64 = 1.5,
@@ -1079,7 +1144,7 @@ test "native checkpoint exact host plan sizes Gemma4 E4B and preserves the relea
     std.debug.print("native_checkpoint_host_plan_fixture tokens=32752 source_bytes={d} head_workspace_bytes={d} fit_bytes={d} reservation_bytes={d} workers={d}\n", .{ large.source_bytes, large.head_workspace_bytes, large.fit_bytes, large.reservation_bytes, large.workers });
 }
 
-test "Metal checkpoint host plan admits bounded parallel fitters and rejects rotated4" {
+test "Metal checkpoint host plan admits bounded E4B parallel fitters and all release encodings" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const config: gpt_mod.Config = .{
         .family = .gemma,
@@ -1126,13 +1191,121 @@ test "Metal checkpoint host plan admits bounded parallel fitters and rejects rot
         ),
         long_plan.fit_bytes,
     );
-    try std.testing.expectError(error.UnsupportedMetalKvCheckpointEncoding, NativeCheckpointPrepare.hostPlan(config, 8189, .rotated4, true));
+    const rotated = try NativeCheckpointPrepare.hostPlan(config, 8189, .rotated4, true);
+    try std.testing.expect(rotated.workers >= 1 and rotated.workers <= NativeCheckpointPrepare.fit_workers);
+    try std.testing.expect(rotated.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+    try std.testing.expect(rotated.head_workspace_bytes >= f16_plan.head_workspace_bytes);
+    try std.testing.expectError(error.UnsupportedMetalKvCheckpointEncoding, NativeCheckpointPrepare.hostPlan(config, 8189, .f32, true));
+}
+
+test "Metal checkpoint host plan admits E2B forty-stratum query geometry at 8K and 32K" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const config: gpt_mod.Config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+        .num_kv_shared_layers = 20,
+        .ple_hidden_size = 256,
+        .vocab_size = 262144,
+        .max_position_embeddings = 131072,
+    };
+    for ([_]usize{ 8189, 32752 }) |tokens| {
+        for ([_]runtime.kv.attention_match_checkpoint.Encoding{ .f16, .fp8, .rotated4 }) |encoding| {
+            const plan = try NativeCheckpointPrepare.hostPlan(config, tokens, encoding, true);
+            try std.testing.expect(plan.head_workspace_bytes > 0);
+            try std.testing.expect(plan.workers >= 1 and plan.workers <= NativeCheckpointPrepare.fit_workers);
+            try std.testing.expect(plan.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+            try std.testing.expectEqual(plan.fit_bytes + NativeCheckpointPrepare.auxiliary_host_bytes, plan.reservation_bytes);
+        }
+    }
+}
+
+test "Metal checkpoint host plan uses installed rows and newly eligible exact coverage" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const checkpoint = runtime.kv.attention_match_checkpoint;
+    const config: gpt_mod.Config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+        .hidden_size = 4,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 2,
+        .global_head_dim = 2,
+        .sliding_window_pattern = 1,
+        .vocab_size = 2,
+    };
+    var positions: [4104]u64 = undefined;
+    var ends: [4104]u64 = undefined;
+    var biases: [4104]f32 = @splat(0);
+    const keys: [4104 * 2]f32 = @splat(0);
+    const tokens: [4104]u32 = @splat(0);
+    for (&positions, &ends, 0..) |*position, *end, i| {
+        position.* = i;
+        end.* = i + 1;
+    }
+    var head: checkpoint.Head = .{
+        .dim = 2,
+        .positions = positions[0..4096],
+        .coverage_ends = ends[0..4096],
+        .bias = biases[0..4096],
+        .keys = keys[0 .. 4096 * 2],
+        .values = keys[0 .. 4096 * 2],
+    };
+    const donors = [_]checkpoint.Donor{.{ .layer = 0, .heads = @as(*const [1]checkpoint.Head, @ptrCast(&head)) }};
+    var state: checkpoint.State = .{
+        .identity = .{ .weights = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4) },
+        .logical_length = 4096,
+        .tokens = tokens[0..4096],
+        .logits = &.{ 0, 0 },
+        .layer_donors = &.{0},
+        .donors = &donors,
+    };
+    for ([_]checkpoint.Encoding{ .f16, .fp8, .rotated4 }) |encoding| {
+        try std.testing.expectEqualDeep(try NativeCheckpointPrepare.hostPlan(config, 4096, encoding, true), try NativeCheckpointPrepare.hostPlanForState(config, state, encoding, .{}));
+    }
+    // The first fit kept 128 prefix rows, 960 fitted rows and 2,048 recent
+    // rows. Eight appended exact rows expose only eight new rows to fitting.
+    for (128..1088) |i| {
+        positions[i] = 128 + (i - 128) * 2;
+        ends[i] = positions[i] + 2;
+        biases[i] = @log(@as(f32, 2));
+    }
+    for (1088..3144) |i| {
+        positions[i] = 2048 + i - 1088;
+        ends[i] = positions[i] + 1;
+    }
+    head = .{ .dim = 2, .compacted_until = 2048, .positions = positions[0..3144], .coverage_ends = ends[0..3144], .bias = biases[0..3144], .keys = keys[0 .. 3144 * 2], .values = keys[0 .. 3144 * 2] };
+    state.logical_length = 4104;
+    state.tokens = &tokens;
+    var options = NativeCheckpointPrepare.fittingOptions();
+    options.retention_divisor = options.min_retention_divisor.?;
+    options.independent_fp64_publication = true;
+    const workspace = try @import("../ops/metal_attention_match_fit.zig").Fitter.headHostWorkspace(3144, 3140, 8, 1024, 256, 2, options);
+    const installed = try NativeCheckpointPrepare.hostPlanForState(config, state, .f16, .{});
+    try std.testing.expectEqual(try state.residentBytes(), installed.source_bytes);
+    try std.testing.expectEqual(workspace.bytes, installed.head_workspace_bytes);
+    const exact = try NativeCheckpointPrepare.hostPlan(config, 4104, .f16, true);
+    try std.testing.expect(installed.source_bytes < exact.source_bytes);
+    try std.testing.expect(installed.head_workspace_bytes < exact.head_workspace_bytes);
+    try std.testing.expect(installed.fit_bytes <= NativeCheckpointPrepare.metal_parallel_target_host_bytes);
+    var wrong_config = config;
+    wrong_config.attention_head_dim = 4;
+    try std.testing.expectError(error.UnsupportedKvSnapshotLayout, NativeCheckpointPrepare.hostPlanForState(wrong_config, state, .f16, .{}));
 }
 
 /// The pipeline retires decoded host arrays after successful GPU restoration.
 /// On failure the request scope still owns and releases them.
 pub const NativeCheckpointResume = struct {
     checkpoint: ?runtime.kv.attention_match_checkpoint.Owned = null,
+    encoding: ?runtime.kv.attention_match_checkpoint.Encoding = null,
     restored_tokens: usize = 0,
     appended_tokens: usize = 0,
     validation_ns: u64 = 0,
@@ -1142,6 +1315,7 @@ pub const NativeCheckpointResume = struct {
     pub fn deinit(self: *@This()) void {
         if (self.checkpoint) |*saved| saved.deinit();
         self.checkpoint = null;
+        self.encoding = null;
     }
 };
 
@@ -4827,6 +5001,7 @@ pub const NativeGenerationPipeline = struct {
     /// the decode loop traces the forward pass once, caches the graph,
     /// and replays it through the interpreter on subsequent steps.
     graph_cache: ?*graph_mod.cache.GraphCache = null,
+
     /// Optional device mesh for multi-device inference. graphForward only
     /// dispatches through the multi-device executor when this is set and
     /// parallel_config requests real sharding across multiple devices.
@@ -4844,6 +5019,59 @@ pub const NativeGenerationPipeline = struct {
     /// Optional PJRT client for TPU/CPU partition execution. Type-erased
     /// pointer to pjrt.Client; cast back in attachPjrtExecutors.
     pjrt_client: ?*anyopaque = null,
+
+    const AttentionMatchForwardFrame = struct {
+        compute: *metal_compute.MetalCompute,
+        storage: *runtime.kv.storage_runtime.KvStorageRuntime,
+        active: bool = true,
+        profile_begin_ns: u64 = 0,
+        profile_ready_ns: u64 = 0,
+        profile_position: u64 = 0,
+
+        fn begin(pipeline: *NativeGenerationPipeline, batch: usize, dc: *const gpt_arch.DecodeContext) !?AttentionMatchForwardFrame {
+            if (comptime !build_options.enable_metal) return null;
+            if (pipeline.cb.kind() != .metal or batch != 1 or dc.query_sequence_len != 1 or dc.total_sequence_len == 0 or
+                pipeline.gpt_config.family != .gemma or !pipeline.gpt_config.usesGemma4Channels()) return null;
+            if (dc.kv_batch) |items| if (items.len != 1) return null;
+            const storage = dc.kv_storage orelse return null;
+            const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(pipeline.cb.ptr));
+            if (!compute.attentionMatchExecution().forward_frame) return null;
+            if (!compute.hasInstalledAttentionMatch(storage)) return null;
+            if (pipeline.cb.decoderRuntimeHasActiveFrame()) return null;
+            const profile = builtin.is_test and platform.env.getenvBool("ANTFLY_CONTEXT_PROFILE");
+            const started = if (profile) @import("../backends/metal_generated_kernels.zig").Profile.now() else 0;
+            if (!try compute.beginAttentionMatchForwardFrame(storage, &pipeline.gpt_config, dc.total_sequence_len - 1)) return null;
+            return .{
+                .compute = compute,
+                .storage = storage,
+                .profile_begin_ns = started,
+                .profile_ready_ns = if (profile) @import("../backends/metal_generated_kernels.zig").Profile.now() else 0,
+                .profile_position = dc.total_sequence_len - 1,
+            };
+        }
+
+        fn finish(self: *AttentionMatchForwardFrame) !void {
+            if (comptime !build_options.enable_metal) return error.UnsupportedOperation;
+            const finishing = if (self.profile_begin_ns != 0) @import("../backends/metal_generated_kernels.zig").Profile.now() else 0;
+            try self.compute.finishAttentionMatchForwardFrame(self.storage, true);
+            self.active = false;
+            if (builtin.is_test and self.profile_begin_ns != 0) {
+                const completed = @import("../backends/metal_generated_kernels.zig").Profile.now();
+                // The body may synchronize internally for a host readback. It
+                // is wall time, not a claim of pure CPU encoding duration.
+                std.debug.print("attention_match_forward_timing {{\"position\":{d},\"preparation_ns\":{d},\"active_body_wall_ns\":{d},\"finish_and_release_ns\":{d},\"total_wall_ns\":{d},\"last_frame_gpu_ns\":{d}}}\n", .{
+                    self.profile_position,              self.profile_ready_ns -| self.profile_begin_ns,
+                    finishing -| self.profile_ready_ns, completed -| finishing,
+                    completed -| self.profile_begin_ns, metal_runtime.lastFrameGpuNanos(self.compute.provider_impl.raw_decode_runtime),
+                });
+            }
+        }
+
+        fn deinit(self: *AttentionMatchForwardFrame) void {
+            if (comptime !build_options.enable_metal) return;
+            if (self.active) self.compute.finishAttentionMatchForwardFrame(self.storage, false) catch {};
+        }
+    };
 
     const prefetch_drain_budget_per_step: usize = 4;
     const default_mtp_zero_match_fallback_rounds: usize = 16;
@@ -4927,11 +5155,13 @@ pub const NativeGenerationPipeline = struct {
             .tracked_combined_live_bytes = snapshot.tracked_combined_live_bytes,
             .tracked_combined_peak_bytes = snapshot.tracked_combined_peak_bytes,
             .binding = activity != null,
-            .binding_representation = if (activity) |value| if (value.fp8_heads != 0) @as([]const u8, "fp8") else "f16" else "none",
+            .binding_representation = if (activity) |value| value.representation() else "none",
             .binding_logical_tokens = if (activity) |value| value.logical_tokens else 0,
             .binding_allocated_bytes = if (activity) |value| value.allocated_bytes else 0,
             .binding_fp8_heads = if (activity) |value| value.fp8_heads else 0,
             .binding_fp8_rows = if (activity) |value| value.fp8_rows else 0,
+            .binding_rotated4_heads = if (activity) |value| value.rotated4_heads else 0,
+            .binding_rotated4_rows = if (activity) |value| value.rotated4_rows else 0,
             .binding_exact_resident_bytes = if (activity) |value| value.exact_resident_bytes else 0,
             .binding_encoded_resident_bytes = if (activity) |value| value.encoded_resident_bytes else 0,
             .binding_metadata_resident_bytes = if (activity) |value| value.metadata_resident_bytes else 0,
@@ -4979,6 +5209,13 @@ pub const NativeGenerationPipeline = struct {
         cleanup_ns: u64 = 0,
         cloned_bytes: usize = 0,
         shadow_allocation_bound_bytes: usize = 0,
+        shadow_owner_id: u64 = 0,
+        shadow_owner_peak_bytes: u64 = 0,
+        shadow_scope_released: bool = false,
+        shadow_scope_delta_bytes: ?u64 = null,
+        shadow_uses_source_owner: bool = false,
+        shadow_scope_before_bytes: u64 = 0,
+        shadow_scope_after_bytes: u64 = 0,
     };
 
     /// Diagnostic sink deliberately cannot publish a checkpoint. The probe has
@@ -5287,7 +5524,7 @@ pub const NativeGenerationPipeline = struct {
         if (request.result == null) return error.InvalidNativeCheckpointResult;
     }
 
-    /// Baseline f16/FP8 Metal preparation uses the common checkpoint/engine
+    /// Metal preparation uses the common checkpoint/engine
     /// contracts and a single Metal matrix adapter. Publication remains
     /// request-private until every rounded whole-head gate has passed.
     fn prepareMetalAttentionMatchFit(
@@ -5301,7 +5538,7 @@ pub const NativeGenerationPipeline = struct {
     ) !runtime.kv.attention_match_engine.Stats {
         if (comptime !build_options.enable_metal) return error.UnsupportedCompactionQueryRoute;
         if (self.cb.kind() != .metal or self.kv_dtype != .f16) return error.UnsupportedCompactionQueryDType;
-        if (request.encoding != .f16 and request.encoding != .fp8)
+        if (request.encoding != .f16 and request.encoding != .fp8 and request.encoding != .rotated4)
             return error.UnsupportedMetalKvCheckpointEncoding;
         if (request.validation_workers != 1)
             return error.InvalidNativeCheckpointRequest;
@@ -5315,8 +5552,12 @@ pub const NativeGenerationPipeline = struct {
         const source_storage = source.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
         const source_revision = try compute.attentionMatchRevision(source_storage);
         const limits: checkpoint.Limits = native_kv_checkpoint.serving_limits;
+        var phase: []const u8 = "snapshot";
         var stats: engine.Stats = .{};
         const started = mtpProfileTimestamp(true, self.io);
+        errdefer std.log.err("attention_match_fit_rejected backend=metal phase={s} elapsed_ns={d} donor_layer={d} head={d} chunk_start={d} attempted_chunks={d} completed_chunks={d} mass_error={d} output_rmse={d} nnls_sweeps={d} validating_storage={d} rounded_mass_error={d} rounded_output_rmse={d} validating_head={d} validated_heads={d}", .{
+            phase, mtpProfileElapsedNs(true, self.io, started), stats.donor_layer, stats.head, stats.chunk_start, stats.attempted_chunks, stats.completed_chunks, stats.last_fit.max_relative_mass_error, stats.last_fit.relative_output_rmse, stats.last_fit.nnls_sweeps, @intFromBool(stats.validating_storage), stats.rounded_fit.max_relative_mass_error, stats.rounded_fit.relative_output_rmse, @intFromBool(stats.validating_head), stats.validated_heads,
+        });
         const ids = try self.allocator.alloc(u32, tokens.len);
         defer self.allocator.free(ids);
         for (tokens, ids) |token, *id| id.* = std.math.cast(u32, token) orelse return error.InvalidCompactionQueries;
@@ -5325,6 +5566,15 @@ pub const NativeGenerationPipeline = struct {
         var original_live = true;
         defer if (original_live) original.deinit();
         const source_host_bytes = try original.state.residentBytes();
+        if (comptime builtin.is_test) {
+            if (request.capture_quality_evidence) {
+                var sink: AttentionMatchProbeSink = .{};
+                const source_seal = try checkpoint.exportEncoded(original.state, limits, .f16, &sink, control);
+                if (sink.bytes != source_seal.bytes) return error.InvalidNativeQualityPublication;
+                request.quality_source_sha256 = source_seal.file_sha256;
+                request.quality_calibration = try queries.seal(control);
+            }
+        }
         const snapshot_ns = mtpProfileElapsedNs(true, self.io, started);
 
         var query_heads: [256]u32 = undefined;
@@ -5357,9 +5607,12 @@ pub const NativeGenerationPipeline = struct {
             actual_worker_plan.admitted_bytes != fit_host_bytes or
             actual_worker_plan.per_worker_bytes > head_workspace_bytes)
             return error.InvalidNativeCheckpointRequest;
+        request.fp64_accelerated_value_solves = 0;
         var metal_fitters: [NativeCheckpointPrepare.fit_workers]Fitter = undefined;
         var metal_fitter_count: usize = 0;
-        defer for (metal_fitters[0..metal_fitter_count]) |*fitter| fitter.deinit();
+        defer for (metal_fitters[0..metal_fitter_count]) |*fitter| {
+            request.fp64_accelerated_value_solves +|= fitter.deinitAndTakeValueSolves();
+        };
         var fit_backends: [NativeCheckpointPrepare.fit_workers]runtime.kv.attention_match.Backend = undefined;
         if (head_workspace_bytes != 0) {
             for (metal_fitters[0..fit_workers], fit_backends[0..fit_workers]) |*fitter, *backend| {
@@ -5376,6 +5629,7 @@ pub const NativeGenerationPipeline = struct {
         var options = NativeCheckpointPrepare.fittingOptions();
         options.independent_fp64_publication = true;
         options.fp8_checkpoint = request.encoding == .fp8;
+        options.rotated4_checkpoint = request.encoding == .rotated4;
         options.stats = &stats;
         options.fit.control = control;
         if (metal_fitter_count != 0) options.fit.backend = fit_backends[0];
@@ -5394,6 +5648,7 @@ pub const NativeGenerationPipeline = struct {
             .softcaps_by_donor = caps[0..original.state.donors.len],
         };
         const fit_queries = try queries.finish();
+        phase = "fit";
         var candidate = (if (metal_fitter_count > 1)
             engine.prepareParallel(original.state, fit_queries, layout, options, fit_backends[0..metal_fitter_count])
         else
@@ -5412,12 +5667,15 @@ pub const NativeGenerationPipeline = struct {
                 original_live = false;
                 return stats;
             }
+            std.log.err("attention_match_fit_error backend=metal error={s}", .{@errorName(err)});
             return err;
         };
         // All Metal calls are synchronous. Retire the independent runtimes and
         // their tracked dummy buffers before physical savings validation and
         // candidate publication; error paths retain the defer above.
-        for (metal_fitters[0..metal_fitter_count]) |*fitter| fitter.deinit();
+        for (metal_fitters[0..metal_fitter_count]) |*fitter| {
+            request.fp64_accelerated_value_solves +|= fitter.deinitAndTakeValueSolves();
+        }
         metal_fitter_count = 0;
         var candidate_live = true;
         defer if (candidate_live) candidate.deinit();
@@ -5776,24 +6034,32 @@ pub const NativeGenerationPipeline = struct {
         }
 
         fn initEmpty(self: *@This(), pipeline: *NativeGenerationPipeline) !void {
+            return self.initEmptyAllocated(pipeline, pipeline.allocator, null);
+        }
+
+        fn initEmptyAllocated(self: *@This(), pipeline: *NativeGenerationPipeline, allocator: std.mem.Allocator, tracker: ?*runtime.kv.host_allocation_tracker.HostAllocationTracker) !void {
             if (self.manager != null or self.storage != null or self.state != null) return error.InvalidCompactionProbe;
             const dtype = pipeline.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
             if ((pipeline.cb.kind() != .cuda and pipeline.cb.kind() != .metal) or dtype != .f16) return error.UnsupportedCompactionQueryRoute;
             if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex);
             defer if (pipeline.execution_lock) |mutex| mutex.unlock();
-            self.manager = runtime.kv.manager.KvManager.init(pipeline.allocator);
+            self.manager = runtime.kv.manager.KvManager.init(allocator);
             errdefer self.deinit();
             const config = attentionMatchCheckpointPoolConfig(if (pipeline.cb.kind() == .metal) .metal else .cuda, dtype, pipeline.gpt_config);
             const pool = try self.manager.?.addPool(config);
-            self.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(pipeline.allocator, config);
+            self.storage = try runtime.kv.storage_runtime.KvStorageRuntime.initTracked(allocator, config, tracker);
             try pipeline.cb.provisionKvDeviceWriteHook(&self.storage.?);
-            self.state = NativeDecodeState.initPaged(pipeline.allocator, &self.manager.?, pool, null);
+            self.state = NativeDecodeState.initPaged(allocator, &self.manager.?, pool, null);
             self.state.?.kv_storage = &self.storage.?;
             self.state.?.configureForGptConfig(pipeline.gpt_config);
             self.state.?.allow_swa_ring = false;
         }
 
         fn init(self: *@This(), pipeline: *NativeGenerationPipeline, source: *const NativeDecodeState, capacity: usize) !void {
+            return self.initAllocated(pipeline, source, capacity, pipeline.allocator, null);
+        }
+
+        fn initAllocated(self: *@This(), pipeline: *NativeGenerationPipeline, source: *const NativeDecodeState, capacity: usize, allocator: std.mem.Allocator, tracker: ?*runtime.kv.host_allocation_tracker.HostAllocationTracker) !void {
             if (self.manager != null or self.storage != null or self.state != null) return error.InvalidCompactionProbe;
             const dtype = pipeline.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
             if ((pipeline.cb.kind() != .cuda and pipeline.cb.kind() != .metal) or dtype != .f16 or !source.isPaged() or source.isKvCompacted()) return error.UnsupportedCompactionQueryRoute;
@@ -5811,16 +6077,16 @@ pub const NativeGenerationPipeline = struct {
             }
             if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex);
             defer if (pipeline.execution_lock) |mutex| mutex.unlock();
-            self.manager = runtime.kv.manager.KvManager.init(pipeline.allocator);
+            self.manager = runtime.kv.manager.KvManager.init(allocator);
             errdefer self.deinit();
             var config = kvPoolConfig(if (pipeline.cb.kind() == .metal) .metal else .cuda, dtype, pipeline.gpt_config, false);
             config.store_cpu_bytes = false;
             config.sliding_window_size = null;
             const pool = try self.manager.?.addPool(config);
-            self.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(pipeline.allocator, config);
+            self.storage = try runtime.kv.storage_runtime.KvStorageRuntime.initTracked(allocator, config, tracker);
             try pipeline.cb.provisionKvDeviceWriteHook(&self.storage.?);
             const hook = self.storage.?.device_write_hook orelse return error.UnsupportedCompactionQueryRoute;
-            self.state = NativeDecodeState.initPaged(pipeline.allocator, &self.manager.?, pool, null);
+            self.state = NativeDecodeState.initPaged(allocator, &self.manager.?, pool, null);
             self.state.?.kv_storage = &self.storage.?;
             self.state.?.configureForGptConfig(pipeline.gpt_config);
             self.state.?.allow_swa_ring = false;
@@ -5860,9 +6126,9 @@ pub const NativeGenerationPipeline = struct {
         }
     };
 
-    /// Eager append with a single last-token logit projection. Keeping the last
-    /// token separate avoids materializing [chunk, vocabulary] host logits and
-    /// avoids graph/replay state shared with the original request.
+    /// Append with a single last-token logit projection. Keeping the last token
+    /// separate avoids materializing [chunk, vocabulary] host logits. The final
+    /// row uses the common serving wrapper, including its installed-KV frame.
     fn appendAttentionMatchProbeTokens(self: *NativeGenerationPipeline, state: *NativeDecodeState, tokens: []const i64) ![]f32 {
         if (tokens.len == 0) return error.InvalidCompactionProbe;
         if (self.execution_lock) |mutex| try self.lockExecution(mutex);
@@ -5879,7 +6145,998 @@ pub const NativeGenerationPipeline = struct {
         try checkAttentionMatchQueryWork(self);
         try state.appendPrefillChunk(1);
         var context = state.gptDecodeContext(state.total_tokens, 1);
-        return gpt_arch.forward(&self.cb, self.allocator, self.gpt_config, tokens[tokens.len - 1 ..], 1, state.total_tokens, &context);
+        return self.forwardLastLogits(tokens[tokens.len - 1 ..], 1, state.total_tokens, &context);
+    }
+
+    /// Reuse the public prefill loop for an empty, full-history exact owner.
+    /// The private owner disables SWA ring eviction before this call, so every
+    /// source donor remains available for calibration and checkpoint fitting.
+    fn nativeQualityServingPrefill(self: *NativeGenerationPipeline, state: *NativeDecodeState, tokens: []const i64) ![]f32 {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeQualityPreparedRoute;
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        try checkAttentionMatchQueryWork(self);
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const storage = state.kv_storage orelse return error.UnsupportedNativeQualityPreparedRoute;
+        if (tokens.len < 2 or state.total_tokens != 0 or !state.isPaged() or state.allow_swa_ring or
+            compute.hasInstalledAttentionMatch(storage) or self.graph_cache != null or
+            self.compiled_partition_backend != null or self.scheduler != null or self.scheduler_lease != null)
+            return error.UnsupportedNativeQualityPreparedRoute;
+        try setWorkloadProfileRegime(&self.cb, .prefill);
+        const output = try self.executePrefill(tokens, tokens.len, 0, state, .{ .prefill_chunk_size = 256 }, false, false, false);
+        errdefer if (output.last_logits) |logits| self.allocator.free(logits);
+        defer if (output.last_hidden) |hidden| self.cb.free(hidden);
+        if (output.greedy_token != null or output.last_hidden != null or output.last_hidden_rows != 0 or
+            state.total_tokens != tokens.len or state.allow_swa_ring)
+            return error.UnsupportedNativeQualityPreparedRoute;
+        return output.last_logits orelse error.UnsupportedNativeQualityPreparedRoute;
+    }
+
+    fn nativeQualityPublicText(self: *NativeGenerationPipeline, prompt: []const u8, tokens: []const i64) ![]u8 {
+        const private = canonicalGemma4Prompt(prompt) orelse return error.InvalidNativeQualityPrompt;
+        const start = try self.resolveChannelStartTokenId() orelse return error.InvalidNativeQualityPrompt;
+        const end = try self.resolveFinalChannelEndTokenId() orelse return error.InvalidNativeQualityPrompt;
+        const turn = try self.resolveTurnEndTokenId() orelse return error.InvalidNativeQualityPrompt;
+        const header = try self.tokenizer.encode(self.allocator, "<|channel>thought\n");
+        defer self.allocator.free(header);
+        if (header.len < 2 or header[0] != start) return error.InvalidNativeQualityPrompt;
+        var projection = Gemma4Projection.init(private, start, end, turn, header);
+        projection.update(tokens);
+        const public = projection.publicTokens(tokens);
+        const ids = try self.allocator.alloc(i32, public.len);
+        defer self.allocator.free(ids);
+        for (public, ids) |token, *id| id.* = std.math.cast(i32, token) orelse return error.InvalidModelOutput;
+        return self.tokenizer.decode(self.allocator, ids);
+    }
+
+    /// Use the same prepared greedy entrypoint as checkpoint serving. Only an
+    /// installed private owner enters this helper; ordinary cloned KV retains
+    /// its proven generic continuation. A decline after append is terminal.
+    fn nativeQualityPreparedGreedyStep(self: *NativeGenerationPipeline, state: *NativeDecodeState, token: i64, first: bool) !struct { token: usize, blocks: u64 } {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeQualityPreparedRoute;
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        try checkAttentionMatchQueryWork(self);
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const storage = state.kv_storage orelse return error.UnsupportedNativeQualityPreparedRoute;
+        if (!compute.hasInstalledAttentionMatch(storage)) return error.UnsupportedNativeQualityPreparedRoute;
+        self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
+        try state.appendPrefillChunk(1);
+        const context = state.gptDecodeContext(state.total_tokens, 1);
+        var frame = (try AttentionMatchForwardFrame.begin(self, 1, &context)) orelse return error.UnsupportedNativeQualityPreparedRoute;
+        defer frame.deinit();
+        const before = compute.attention_match_prepared_tail_blocks;
+        const next = (try decoder_gated_runtime.forwardGreedyToken(&self.cb, self.allocator, self.gpt_config, self.gpt_config.num_hidden_layers, token, state.total_tokens, &context)) orelse return error.UnsupportedNativeQualityPreparedRoute;
+        try frame.finish();
+        const blocks = compute.attention_match_prepared_tail_blocks - before;
+        @import("../runtime/kv/metal_checkpoint_quality.zig").validatePreparedStep(blocks, self.gpt_config.num_hidden_layers, first) catch |err| {
+            std.log.err("native_quality_prepared_route_rejected kind=greedy position={d} completed_blocks={d} expected_blocks={d} cold_allowed={} next={d}", .{ state.total_tokens - 1, blocks, self.gpt_config.num_hidden_layers, first, next });
+            return err;
+        };
+        if (next < 0 or next >= self.gpt_config.vocab_size) return error.InvalidNativeQualityPreparedRoute;
+        return .{ .token = @intCast(next), .blocks = blocks };
+    }
+
+    /// Score the prepared decoder's raw logits after its frame has drained.
+    /// Reading back a borrowed frame output before its fence would make the
+    /// teacher path depend on an implicit synchronization side effect.
+    fn nativeQualityPreparedLogitsStep(self: *NativeGenerationPipeline, state: *NativeDecodeState, token: i64, first: bool) !struct { logits: []f32, blocks: u64 } {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeQualityPreparedRoute;
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        try checkAttentionMatchQueryWork(self);
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const storage = state.kv_storage orelse return error.UnsupportedNativeQualityPreparedRoute;
+        if (!compute.hasInstalledAttentionMatch(storage)) return error.UnsupportedNativeQualityPreparedRoute;
+        self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
+        try state.appendPrefillChunk(1);
+        const context = state.gptDecodeContext(state.total_tokens, 1);
+        var frame = (try AttentionMatchForwardFrame.begin(self, 1, &context)) orelse return error.UnsupportedNativeQualityPreparedRoute;
+        defer frame.deinit();
+        const before = compute.attention_match_prepared_tail_blocks;
+        const tensor = (try decoder_gated_runtime.forwardLastLogitsTensor(&self.cb, self.allocator, self.gpt_config, self.gpt_config.num_hidden_layers, token, state.total_tokens, &context)) orelse return error.UnsupportedNativeQualityPreparedRoute;
+        defer self.cb.free(tensor);
+        try frame.finish();
+        const blocks = compute.attention_match_prepared_tail_blocks - before;
+        @import("../runtime/kv/metal_checkpoint_quality.zig").validatePreparedStep(blocks, self.gpt_config.num_hidden_layers, first) catch |err| {
+            std.log.err("native_quality_prepared_route_rejected kind=teacher position={d} completed_blocks={d} expected_blocks={d} cold_allowed={}", .{ state.total_tokens - 1, blocks, self.gpt_config.num_hidden_layers, first });
+            return err;
+        };
+        const logits = try self.cb.toFloat32(tensor, self.allocator);
+        gpt_arch.applyFinalLogitSoftcapInPlace(self.gpt_config, logits);
+        return .{ .logits = logits, .blocks = blocks };
+    }
+
+    /// The ordinary serving decoder owns its complete frame and returns a
+    /// fenced token ID. Do not open an installed-KV frame or read borrowed raw
+    /// logits here: neither operation belongs to the ordinary owner contract.
+    fn nativeQualityOrdinaryGreedyStep(self: *NativeGenerationPipeline, state: *NativeDecodeState, token: i64) !usize {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeQualityPreparedRoute;
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        try checkAttentionMatchQueryWork(self);
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const storage = state.kv_storage orelse return error.UnsupportedNativeQualityPreparedRoute;
+        const model_runtime = compute.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        if (compute.hasInstalledAttentionMatch(storage) or metal_runtime.hasActiveFrame(model_runtime) or metal_runtime.hasSubmittedFrame(model_runtime))
+            return error.UnsupportedNativeQualityPreparedRoute;
+        errdefer {
+            if (metal_runtime.hasActiveFrame(model_runtime)) metal_runtime.cancelFrame(model_runtime) catch {};
+            if (metal_runtime.hasSubmittedFrame(model_runtime)) metal_runtime.waitFrame(model_runtime) catch {};
+        }
+        self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
+        try state.appendPrefillChunk(1);
+        const context = state.gptDecodeContext(state.total_tokens, 1);
+        const frames_before = compute.timing_stats.active_decode_frame_successes;
+        const next = (try decoder_gated_runtime.forwardGreedyToken(&self.cb, self.allocator, self.gpt_config, self.gpt_config.num_hidden_layers, token, state.total_tokens, &context)) orelse
+            return error.UnsupportedNativeQualityPreparedRoute;
+        if (metal_runtime.hasActiveFrame(model_runtime) or metal_runtime.hasSubmittedFrame(model_runtime) or
+            compute.timing_stats.active_decode_frame_successes != frames_before + 1 or
+            next < 0 or next >= self.gpt_config.vocab_size)
+            return error.UnsupportedNativeQualityPreparedRoute;
+        return @intCast(next);
+    }
+
+    /// Each branch owns a fresh clone of an immutable prompt boundary. Answer
+    /// tokens are chosen independently, with the ordinary model suppression
+    /// mask and EOS policy. No gold provider is reachable from this helper.
+    fn nativeQualityGreedy(
+        self: *NativeGenerationPipeline,
+        source: *const NativeDecodeState,
+        prefill_logits: []const f32,
+        prompt: []const u8,
+        output_limit: usize,
+    ) !@import("../runtime/kv/metal_checkpoint_quality.zig").Greedy {
+        const allocation = runtime.kv.host_allocation_tracker;
+        var owner = try allocation.RequestAllocationOwner.init(null);
+        var owner_live = true;
+        defer if (owner_live) {
+            _ = owner.release();
+        };
+        var shadow: AttentionMatchProbeShadow = .{};
+        defer shadow.deinit();
+        try shadow.initAllocated(self, source, source.total_tokens + output_limit, owner.allocator(), owner.tracker);
+        var logits = try self.allocator.dupe(f32, prefill_logits);
+        defer self.allocator.free(logits);
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const compacted = compute.hasInstalledAttentionMatch(&shadow.storage.?);
+        const ordinary_prepared = !compacted and platform.env.getenvBool("ANTFLY_METAL_QUALITY_ORDINARY_PREPARED_GREEDY");
+        var prepared_next: ?usize = null;
+        var result: @import("../runtime/kv/metal_checkpoint_quality.zig").Greedy = .{ .owner_id = owner.tracker.snapshot().owner_identity };
+        errdefer self.allocator.free(result.public_text);
+        for (0..output_limit) |index| {
+            try checkAttentionMatchQueryWork(self);
+            const token = prepared_next orelse blk: {
+                for (logits) |value| if (!std.math.isFinite(value)) return error.NonFiniteTeacherForcedLogits;
+                applySuppressTokenMask(logits, self.gpt_config.suppressTokenIds());
+                break :blk activations.argmax(logits);
+            };
+            result.tokens[index] = @intCast(token);
+            result.count += 1;
+            if (self.gpt_config.isEosToken(token)) {
+                result.hit_eos = true;
+                break;
+            }
+            if (index + 1 == output_limit) break;
+            const next = [_]i64{@intCast(token)};
+            if (compacted) {
+                const step = try self.nativeQualityPreparedGreedyStep(&shadow.state.?, next[0], result.forward_steps == 0);
+                prepared_next = step.token;
+                result.serving_forward_steps += 1;
+                result.prepared_layer_blocks += @intCast(step.blocks);
+                if (step.blocks != 0) result.prepared_forward_steps += 1 else result.cold_staged_forward_steps += 1;
+            } else if (ordinary_prepared) {
+                prepared_next = try self.nativeQualityOrdinaryGreedyStep(&shadow.state.?, next[0]);
+                result.ordinary_serving_forward_steps += 1;
+                result.ordinary_backend_frames += 1;
+            } else {
+                const next_logits = try self.appendAttentionMatchProbeTokens(&shadow.state.?, &next);
+                self.allocator.free(logits);
+                logits = next_logits;
+            }
+            result.forward_steps += 1;
+        }
+        const text_count = result.count - @intFromBool(result.hit_eos);
+        result.public_text = try self.nativeQualityPublicText(prompt, result.tokens[0..text_count]);
+        try compute.synchronizeAttentionMatchKv();
+        _ = owner.captureCommitted();
+        shadow.deinit();
+        result.release = owner.release();
+        owner_live = false;
+        if (!result.release.released or !result.release.measurement.available or
+            result.release.measurement.committed_live_bytes == 0 or result.release.post_release_live_bytes != 0)
+            return error.ContextPhysicalAccountingUnavailable;
+        return result;
+    }
+
+    /// Teacher scoring starts from a separate prompt clone after greedy
+    /// generation has completed. Its first row is the sealed prompt's logits;
+    /// every later row forwards the preceding gold token through real KV.
+    fn nativeQualityTeacher(
+        self: *NativeGenerationPipeline,
+        source: *const NativeDecodeState,
+        prefill_logits: []const f32,
+        reference: []const i64,
+        compacted: bool,
+    ) !@import("../runtime/kv/metal_checkpoint_quality.zig").Scores {
+        const allocation = runtime.kv.host_allocation_tracker;
+        var owner = try allocation.RequestAllocationOwner.init(null);
+        var owner_live = true;
+        defer if (owner_live) {
+            _ = owner.release();
+        };
+        var shadow: AttentionMatchProbeShadow = .{};
+        defer shadow.deinit();
+        try shadow.initAllocated(self, source, source.total_tokens + reference.len, owner.allocator(), owner.tracker);
+        var logits = try self.allocator.dupe(f32, prefill_logits);
+        defer self.allocator.free(logits);
+        var result: @import("../runtime/kv/metal_checkpoint_quality.zig").Scores = .{ .owner_id = owner.tracker.snapshot().owner_identity };
+        for (reference, 0..) |token, index| {
+            try checkAttentionMatchQueryWork(self);
+            const id = std.math.cast(u32, token) orelse return error.InvalidTeacherForcedToken;
+            const probability = try context_teacher_forced.logProbability(logits, id);
+            result.log_probabilities[index] = probability;
+            result.nll -= probability;
+            result.count += 1;
+            if (index + 1 == reference.len) break;
+            const next = [_]i64{token};
+            const next_logits = if (compacted) blk: {
+                const step = try self.nativeQualityPreparedLogitsStep(&shadow.state.?, next[0], result.forward_steps == 0);
+                result.serving_forward_steps += 1;
+                result.prepared_layer_blocks += @intCast(step.blocks);
+                if (step.blocks != 0) result.prepared_forward_steps += 1 else result.cold_staged_forward_steps += 1;
+                break :blk step.logits;
+            } else try self.appendAttentionMatchProbeTokens(&shadow.state.?, &next);
+            self.allocator.free(logits);
+            logits = next_logits;
+            result.forward_steps += 1;
+        }
+        if (compacted) {
+            const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+            const activity = (try compute.installedAttentionMatchActivity(&shadow.storage.?, shadow.state.?.sequence_id.?)) orelse
+                return error.InvalidNativeQualityPublication;
+            if (activity.invalid or activity.attention_calls == 0 or activity.donor_appends == 0)
+                return error.InvalidNativeQualityPublication;
+            result.attention_calls = activity.attention_calls;
+            result.donor_appends = activity.donor_appends;
+        }
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        try compute.synchronizeAttentionMatchKv();
+        _ = owner.captureCommitted();
+        shadow.deinit();
+        result.release = owner.release();
+        owner_live = false;
+        if (!result.release.released or !result.release.measurement.available or
+            result.release.measurement.committed_live_bytes == 0 or result.release.post_release_live_bytes != 0)
+            return error.ContextPhysicalAccountingUnavailable;
+        return result;
+    }
+
+    fn finishNativeQualityPhase(self: *NativeGenerationPipeline, started: *std.Io.Timestamp, comptime phase: []const u8) u64 {
+        const elapsed = mtpProfileElapsedNs(true, self.io, started.*);
+        std.debug.print("metal_checkpoint_quality_phase phase={s} elapsed_ns={d}\n", .{ phase, elapsed });
+        started.* = mtpProfileTimestamp(true, self.io);
+        return elapsed;
+    }
+
+    /// Native whole-head qualification, independent of the legacy block
+    /// profile route. Gold is revealed only after transport, installed-byte
+    /// verification, and both independent greedy answers. Numerical or task
+    /// regressions are retained as observations, never filtered out here.
+    pub fn qualifyMetalCheckpointQuality(
+        self: *NativeGenerationPipeline,
+        tokens: []const i64,
+        prompt: []const u8,
+        request: @import("../runtime/kv/metal_checkpoint_quality.zig").Request,
+        reference: @import("../runtime/kv/metal_checkpoint_quality.zig").Reference,
+    ) !@import("../runtime/kv/metal_checkpoint_quality.zig").Report {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedCompactionQueryRoute;
+        const quality = @import("../runtime/kv/metal_checkpoint_quality.zig");
+        const cycles = @import("../runtime/kv/metal_checkpoint_cycles.zig");
+        const checkpoint = runtime.kv.attention_match_checkpoint;
+        const allocation = runtime.kv.host_allocation_tracker;
+        if (self.cb.kind() != .metal or self.kv_dtype != .f16 or self.scheduler != null or
+            self.scheduler_lease != null or self.checkpoint_prepare != null or self.checkpoint_resume != null or
+            canonicalGemma4Prompt(prompt) == null) return error.UnsupportedCompactionQueryRoute;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        const capacity = try request.capacity(tokens.len, self.gpt_config.max_position_embeddings);
+        const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const limits = checkpoint.serving_limits;
+        const previous_quality_execution = compute.attention_match_execution;
+        defer compute.attention_match_execution = previous_quality_execution;
+        compute.attention_match_execution = native_checkpoint_release.Execution.diagnosticFromEnvironment();
+        const auxiliary = NativeCheckpointPrepare.auxiliary_host_bytes;
+        const estimate = try runtime.tier.memory.estimateGptGeneration(.metal, .f16, self.gpt_config, @max(capacity, tokens.len + 512), 1, 256);
+        for (tokens) |token| if (token < 0 or token >= self.gpt_config.vocab_size) return error.InvalidCompactionQueries;
+        _ = try (cycles.PhasePlan{ .owners = 0, .host = auxiliary, .device = try std.math.add(usize, estimate.kv_bytes, estimate.scratch_bytes) }).admit();
+        var exact_owner = try allocation.RequestAllocationOwner.init(null);
+        var exact_owner_live = true;
+        defer if (exact_owner_live) {
+            _ = exact_owner.release();
+        };
+        var compacted_owner = try allocation.RequestAllocationOwner.init(null);
+        var compacted_owner_live = true;
+        defer if (compacted_owner_live) {
+            _ = compacted_owner.release();
+        };
+        var exact: AttentionMatchProbeShadow = .{};
+        defer exact.deinit();
+        var compacted: AttentionMatchProbeShadow = .{};
+        defer compacted.deinit();
+        var phase: []const u8 = "exact_prefill";
+        errdefer std.log.err("metal_checkpoint_quality_rejected phase={s}", .{phase});
+        const collection_started = mtpProfileTimestamp(true, self.io);
+        var phase_started = collection_started;
+        var phase_durations: quality.PhaseDurations = .{};
+        try exact.initEmptyAllocated(self, exact_owner.allocator(), exact_owner.tracker);
+        const serving_prefill = platform.env.getenvBool("ANTFLY_METAL_QUALITY_SERVING_PREFILL");
+        const logits = if (serving_prefill)
+            try self.nativeQualityServingPrefill(&exact.state.?, tokens)
+        else
+            try self.appendAttentionMatchProbeTokens(&exact.state.?, tokens);
+        defer self.allocator.free(logits);
+        phase_durations.exact_prefill = self.finishNativeQualityPhase(&phase_started, "exact_prefill");
+        const source_revision = try compute.attentionMatchRevision(&exact.storage.?);
+        const owners = try cycleOwnerBytes(exact_owner.tracker, compacted_owner.tracker);
+        const plan = try NativeCheckpointPrepare.hostPlan(self.gpt_config, tokens.len, request.encoding, true);
+        const query_overhead = try std.math.add(usize, auxiliary, try std.math.add(usize, estimate.scratch_bytes, NativeCheckpointPrepare.collection_options.max_bytes));
+        const query_base = try std.math.add(usize, owners, query_overhead);
+        if (query_base >= cycles.max_aggregate_bytes) return error.CompactionWorkspaceLimit;
+        const query_limit = @min(4 * 1024 * 1024 * 1024, cycles.max_aggregate_bytes - query_base);
+        var admitted = try (cycles.PhasePlan{ .owners = owners, .host = auxiliary, .queries = NativeCheckpointPrepare.collection_options.max_bytes, .device = try std.math.add(usize, estimate.scratch_bytes, query_limit) }).admit();
+        phase = "query_collection";
+        var query_stats: AttentionMatchQueryStats = .{};
+        const started = mtpProfileTimestamp(true, self.io);
+        var queries = try self.collectAttentionMatchQueries(tokens, &exact.state.?, .{
+            .prefix_mode = .clone,
+            .repeat_mode = .reference,
+            .stats = &query_stats,
+            .collection = NativeCheckpointPrepare.collection_options,
+            .chunk_size = 256,
+            .max_repeat_tokens = 512,
+            .representative_repeat = true,
+            .max_shadow_kv_bytes = query_limit,
+        });
+        var queries_live = true;
+        defer if (queries_live) queries.deinit();
+        phase_durations.query_collection = self.finishNativeQualityPhase(&phase_started, "query_collection");
+        if (!query_stats.shadow_scope_released or query_stats.shadow_scope_delta_bytes != 0 or !query_stats.shadow_uses_source_owner)
+            return error.ContextPhysicalAccountingUnavailable;
+        admitted = @max(admitted, try (cycles.PhasePlan{ .owners = owners, .host = try std.math.add(usize, auxiliary, plan.fit_bytes), .queries = queries.peak_bytes }).admit());
+        var prepare: NativeCheckpointPrepare = .{
+            .encoding = request.encoding,
+            .minimum_savings_ratio = request.minimum_savings_ratio,
+            .planned_fit_host_bytes = plan.fit_bytes,
+            .planned_fit_workers = plan.workers,
+            .planned_fit_head_workspace_bytes = plan.head_workspace_bytes,
+            .capture_quality_evidence = true,
+        };
+        defer prepare.deinit();
+        phase = "fit";
+        const stats = try self.prepareMetalAttentionMatchFit(tokens, logits, &exact.state.?, &queries, mtpProfileElapsedNs(true, self.io, started), &prepare);
+        var calibration_consumers: [256]runtime.kv.attention_match_queries.Consumer = @splat(std.mem.zeroes(runtime.kv.attention_match_queries.Consumer));
+        if (queries.consumers.len > calibration_consumers.len) return error.InvalidNativeQualityPublication;
+        @memcpy(calibration_consumers[0..queries.consumers.len], queries.consumers);
+        queries.deinit();
+        queries_live = false;
+        phase_durations.fit = self.finishNativeQualityPhase(&phase_started, "fit");
+        if (prepare.result == null or prepare.result.?.outcome != .compacted or stats.completed_chunks == 0 or
+            stats.validated_heads == 0 or stats.candidate_global_bytes >= stats.source_global_bytes)
+            return error.CompactionCycleDidNotCompact;
+        phase = "transport";
+        const candidate_bytes = try prepare.result.?.checkpoint.state.residentBytes();
+        const wire_bytes = try checkpoint.encodedSize(prepare.result.?.checkpoint.state, limits, request.encoding, control);
+        admitted = @max(admitted, try (cycles.PhasePlan{ .owners = owners, .host = try std.math.add(usize, auxiliary, candidate_bytes), .wire = wire_bytes, .import = limits.max_state_bytes }).admit());
+        const wire = try checkpoint.encodeWithEncoding(self.allocator, prepare.result.?.checkpoint.state, limits, request.encoding, control);
+        var wire_live = true;
+        defer if (wire_live) self.allocator.free(wire);
+        var wire_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(wire, &wire_digest, .{});
+        var decoded = try checkpoint.decodeWithControl(self.allocator, wire, identity, limits, control);
+        var decoded_live = true;
+        defer if (decoded_live) decoded.deinit();
+        const solves = prepare.fp64_accelerated_value_solves;
+        prepare.deinit();
+        self.allocator.free(wire);
+        wire_live = false;
+        const ids = try self.allocator.alloc(u32, tokens.len);
+        defer self.allocator.free(ids);
+        for (tokens, ids) |token, *id| id.* = @intCast(token);
+        phase_durations.transport = self.finishNativeQualityPhase(&phase_started, "transport");
+        phase = "install";
+        admitted = @max(admitted, try (cycles.PhasePlan{
+            .owners = try cycleOwnerBytes(exact_owner.tracker, compacted_owner.tracker),
+            .host = try std.math.add(usize, auxiliary, try decoded.state.residentBytes()),
+            .device = try metal_attention_storage.allocationBytesWithControl(decoded.state, limits, control),
+        }).admit());
+        try compacted.initEmptyAllocated(self, compacted_owner.allocator(), compacted_owner.tracker);
+        const before_install = try compute.attentionMatchRevision(&compacted.storage.?);
+        const compacted_logits = try self.restoreAttentionMatchState(decoded.state, ids, request.output_tokens, true, &compacted.state.?, null);
+        defer self.allocator.free(compacted_logits);
+        const after_install = try compute.attentionMatchRevision(&compacted.storage.?);
+        if (after_install != before_install + 1) return error.InvalidNativeQualityPublication;
+        phase = "installed_bytes";
+        const installed_digest = digest: {
+            var installed = try self.snapshotAttentionMatchState(ids, compacted_logits, &compacted.state.?, identity, limits, limits.max_state_bytes);
+            defer installed.deinit();
+            const encoded = try checkpoint.encodeWithEncoding(self.allocator, installed.state, limits, request.encoding, control);
+            defer self.allocator.free(encoded);
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(encoded, &hash, .{});
+            if (!std.mem.eql(u8, &hash, &wire_digest)) return error.KvCheckpointResumeMismatch;
+            break :digest hash;
+        };
+        decoded.deinit();
+        decoded_live = false;
+        const installed_activity = (try compute.installedAttentionMatchActivity(&compacted.storage.?, compacted.state.?.sequence_id.?)) orelse
+            return error.InvalidNativeQualityPublication;
+        phase_durations.install = self.finishNativeQualityPhase(&phase_started, "install");
+        if (compute.require_f32_linears) return error.UnsupportedNativeQualityPreparedRoute;
+        const observed_configuration = try compute.provider_impl.nativeCheckpointObserved();
+        const execution_configuration = compute.attentionMatchExecution();
+        var report: quality.Report = .{
+            .allocator = self.allocator,
+            .calibration_consumers = calibration_consumers,
+            .phase_durations_ns = phase_durations,
+            .source_serving_prefill = serving_prefill,
+            .frozen = .{
+                .identity = identity,
+                .observed = observed_configuration,
+                .execution = execution_configuration,
+                .configuration_sha256 = native_checkpoint_release.configurationFingerprint(execution_configuration, observed_configuration.backend_environment_sha256),
+                .implementation_sha256 = @import("compaction_identity").digest,
+                .prompt_sha256 = try context_teacher_forced.promptTokenDigest(tokens),
+                .checkpoint_sha256 = wire_digest,
+                .installed_sha256 = installed_digest,
+                .source_checkpoint_sha256 = prepare.quality_source_sha256,
+                .calibration = prepare.quality_calibration orelse return error.InvalidNativeQualityPublication,
+                .source_revision = source_revision,
+                .destination_revision_before_install = before_install,
+                .installed_revision = after_install,
+                .logical_tokens = tokens.len,
+                .completed_chunks = stats.completed_chunks,
+                .validated_heads = stats.validated_heads,
+                .preserved_heads = stats.preserved_heads,
+                .protected_prefix_rows = NativeCheckpointPrepare.fittingOptions().prefix_rows,
+                .protected_recent_rows = NativeCheckpointPrepare.fittingOptions().recent_rows,
+                .fp8_heads = installed_activity.fp8_heads,
+                .fp8_fallback_heads = stats.fp8_fallback_heads,
+                .rotated4_heads = installed_activity.rotated4_heads,
+                .rotated4_fallback_heads = stats.rotated4_fallback_heads,
+            },
+            .source_owner_id = exact_owner.tracker.snapshot().owner_identity,
+            .compacted_owner_id = compacted_owner.tracker.snapshot().owner_identity,
+            .admitted_peak_bytes = admitted,
+            .source_global_bytes = stats.source_global_bytes,
+            .candidate_global_bytes = stats.candidate_global_bytes,
+            .max_head_mass_error = stats.max_head_mass_error,
+            .max_head_output_rmse = stats.max_head_output_rmse,
+            .fp64_accelerated_value_solves = solves,
+            .query_scope_released = query_stats.shadow_scope_released,
+            .query_scope_delta_bytes = query_stats.shadow_scope_delta_bytes,
+        };
+        errdefer report.deinit();
+        try report.frozen.validate();
+        phase = "model_slots";
+        {
+            if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+            defer if (self.execution_lock) |mutex| mutex.unlock();
+            const model_runtime = compute.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+            report.model_slot_runtime_kv_bytes_before = metal_runtime.runtimeMemorySnapshot(model_runtime).attention_span_bytes;
+            if (!try decoder_gated_runtime.prepareModelSlots(&self.cb, self.allocator, self.gpt_config, self.gpt_config.num_hidden_layers))
+                return error.UnsupportedNativeQualityPreparedRoute;
+            try compute.reserveAttentionMatchForwardScratch(&self.gpt_config);
+            report.model_slot_runtime_kv_bytes_after = metal_runtime.runtimeMemorySnapshot(model_runtime).attention_span_bytes;
+            if (report.model_slot_runtime_kv_bytes_before != report.model_slot_runtime_kv_bytes_after)
+                return error.InvalidNativeQualityPreparedRoute;
+            report.model_slots_prepared_without_kv_allocation = true;
+        }
+        report.phase_durations_ns.model_slots = self.finishNativeQualityPhase(&phase_started, "model_slots");
+        // Branches execute serially. Reserve one complete clone plus forward
+        // scratch alongside both immutable boundary owners before any clone.
+        report.admitted_peak_bytes = @max(report.admitted_peak_bytes, try (cycles.PhasePlan{
+            .owners = try cycleOwnerBytes(exact_owner.tracker, compacted_owner.tracker),
+            .host = auxiliary,
+            .device = try std.math.add(usize, estimate.kv_bytes, estimate.scratch_bytes),
+        }).admit());
+        // No provider has been passed to preparation, study, fitting,
+        // transport, installation, or either independent answer generator.
+        phase = "exact_greedy";
+        report.exact_greedy = try self.nativeQualityGreedy(&exact.state.?, logits, prompt, request.output_tokens);
+        report.phase_durations_ns.exact_greedy = self.finishNativeQualityPhase(&phase_started, "exact_greedy");
+        phase = "compacted_greedy";
+        report.compacted_greedy_runtime_kv_bytes_before = metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime).attention_span_bytes;
+        report.compacted_greedy = try self.nativeQualityGreedy(&compacted.state.?, compacted_logits, prompt, request.output_tokens);
+        report.compacted_greedy_runtime_kv_bytes_after = metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime).attention_span_bytes;
+        if (report.compacted_greedy_runtime_kv_bytes_after != report.compacted_greedy_runtime_kv_bytes_before) {
+            std.log.err("native_quality_runtime_kv_changed phase=compacted_greedy before={d} after={d}", .{ report.compacted_greedy_runtime_kv_bytes_before, report.compacted_greedy_runtime_kv_bytes_after });
+            return error.InvalidNativeQualityPreparedRoute;
+        }
+        report.phase_durations_ns.compacted_greedy = self.finishNativeQualityPhase(&phase_started, "compacted_greedy");
+        phase = "reference_reveal";
+        const gold = try reference.reveal(report.frozen, request.output_tokens);
+        report.phase_durations_ns.reference_reveal = self.finishNativeQualityPhase(&phase_started, "reference_reveal");
+        report.reference_sha256 = reference.sha256;
+        report.reference_revealed_after_both_greedy_branches = true;
+        phase = "exact_teacher";
+        report.exact_teacher = try self.nativeQualityTeacher(&exact.state.?, logits, gold, false);
+        report.phase_durations_ns.exact_teacher = self.finishNativeQualityPhase(&phase_started, "exact_teacher");
+        phase = "compacted_teacher";
+        report.compacted_teacher_runtime_kv_bytes_before = metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime).attention_span_bytes;
+        report.compacted_teacher = try self.nativeQualityTeacher(&compacted.state.?, compacted_logits, gold, true);
+        report.compacted_teacher_runtime_kv_bytes_after = metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime).attention_span_bytes;
+        if (report.compacted_teacher_runtime_kv_bytes_after != report.compacted_teacher_runtime_kv_bytes_before) {
+            std.log.err("native_quality_runtime_kv_changed phase=compacted_teacher before={d} after={d}", .{ report.compacted_teacher_runtime_kv_bytes_before, report.compacted_teacher_runtime_kv_bytes_after });
+            return error.InvalidNativeQualityPreparedRoute;
+        }
+        report.phase_durations_ns.compacted_teacher = self.finishNativeQualityPhase(&phase_started, "compacted_teacher");
+        phase = "teardown";
+        if (report.exact_greedy.serving_forward_steps != 0 or report.exact_teacher.serving_forward_steps != 0 or
+            (report.exact_greedy.ordinary_serving_forward_steps != 0 and report.exact_greedy.ordinary_serving_forward_steps != report.exact_greedy.forward_steps) or
+            report.exact_greedy.ordinary_backend_frames != report.exact_greedy.ordinary_serving_forward_steps or
+            report.exact_teacher.ordinary_serving_forward_steps != 0 or report.exact_teacher.ordinary_backend_frames != 0 or
+            report.compacted_greedy.ordinary_serving_forward_steps != 0 or report.compacted_greedy.ordinary_backend_frames != 0 or
+            report.compacted_teacher.ordinary_serving_forward_steps != 0 or report.compacted_teacher.ordinary_backend_frames != 0 or
+            report.compacted_greedy.serving_forward_steps != report.compacted_greedy.forward_steps or
+            report.compacted_teacher.serving_forward_steps != report.compacted_teacher.forward_steps or
+            report.compacted_greedy.prepared_forward_steps + report.compacted_greedy.cold_staged_forward_steps != report.compacted_greedy.forward_steps or
+            report.compacted_teacher.prepared_forward_steps + report.compacted_teacher.cold_staged_forward_steps != report.compacted_teacher.forward_steps or
+            report.compacted_greedy.cold_staged_forward_steps > 1 or report.compacted_teacher.cold_staged_forward_steps > 1)
+            return error.InvalidNativeQualityPreparedRoute;
+        report.continuation_runtime_kv_bytes = metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime).attention_span_bytes;
+        const owner_ids = [_]u64{ report.source_owner_id, report.compacted_owner_id, report.exact_greedy.owner_id, report.compacted_greedy.owner_id, report.exact_teacher.owner_id, report.compacted_teacher.owner_id };
+        for (owner_ids, 0..) |owner_id, i| {
+            if (owner_id == 0) return error.ContextPhysicalAccountingUnavailable;
+            for (owner_ids[0..i]) |previous| if (owner_id == previous) return error.ContextPhysicalAccountingUnavailable;
+        }
+        if (try compute.attentionMatchRevision(&exact.storage.?) != source_revision or
+            try compute.attentionMatchRevision(&compacted.storage.?) != after_install or
+            exact.state.?.total_tokens != tokens.len or compacted.state.?.total_tokens != tokens.len)
+            return error.CompactionSourceChanged;
+        report.source_unchanged = true;
+        try compute.synchronizeAttentionMatchKv();
+        _ = exact_owner.captureCommitted();
+        _ = compacted_owner.captureCommitted();
+        compacted.deinit();
+        exact.deinit();
+        report.compacted_release = compacted_owner.release();
+        compacted_owner_live = false;
+        report.source_release = exact_owner.release();
+        exact_owner_live = false;
+        if (report.compacted_release.post_release_live_bytes != 0 or report.source_release.post_release_live_bytes != 0)
+            return error.ContextPhysicalAccountingUnavailable;
+        report.phase_durations_ns.teardown = self.finishNativeQualityPhase(&phase_started, "teardown");
+        report.collection_elapsed_ns = mtpProfileElapsedNs(true, self.io, collection_started);
+        report.collection_complete = true;
+        return report;
+    }
+
+    /// Test-driver-only sustained decode on two owners installed exactly once.
+    /// Each fenced token is immediately rolled back to its immutable prefix;
+    /// no import, clone, model reload, sleep, or gold callback enters the window.
+    pub fn qualifyMetalCheckpointSoak(
+        self: *NativeGenerationPipeline,
+        saved: [2]runtime.kv.attention_match_checkpoint.State,
+        request: @import("../runtime/kv/metal_checkpoint_soak.zig").Request,
+        journal: *std.Io.File,
+    ) !@import("../runtime/kv/metal_checkpoint_soak.zig").Report {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeSoakRoute;
+        const soak = @import("../runtime/kv/metal_checkpoint_soak.zig");
+        const checkpoint = runtime.kv.attention_match_checkpoint;
+        const allocation = runtime.kv.host_allocation_tracker;
+        try request.validate();
+        if (self.io == null or self.cb.kind() != .metal or self.kv_dtype != .f16 or
+            self.scheduler != null or self.scheduler_lease != null or self.checkpoint_prepare != null or
+            self.checkpoint_resume != null or self.load_generation == 0)
+            return error.UnsupportedNativeSoakRoute;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const model_runtime = compute.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        var owners: [2]allocation.RequestAllocationOwner = undefined;
+        var owners_live: [2]bool = @splat(false);
+        defer for (&owners, owners_live) |*owner, live| {
+            if (live) {
+                _ = owner.release();
+            }
+        };
+        for (&owners, &owners_live) |*owner, *live| {
+            owner.* = try allocation.RequestAllocationOwner.init(null);
+            live.* = true;
+        }
+        var shadows: [2]AttentionMatchProbeShadow = @splat(.{});
+        defer for (&shadows) |*shadow| shadow.deinit();
+        var inputs: [2]i64 = undefined;
+        var prefix_sha: [2][32]u8 = undefined;
+        var prepared: [2]u64 = @splat(0);
+        const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
+        for (saved, &shadows, &owners, soak.contexts, 0..) |state, *shadow, *owner, context, index| {
+            if (!std.meta.eql(state.identity, identity) or state.logical_length != state.tokens.len or
+                (state.tokens.len != context - 256 and !(context == 8192 and state.tokens.len == context - 64)))
+                return error.InvalidNativeSoakRequest;
+            const wire = try checkpoint.encodeWithEncoding(self.allocator, state, checkpoint.serving_limits, request.encoding, control);
+            defer self.allocator.free(wire);
+            std.crypto.hash.sha2.Sha256.hash(wire, &prefix_sha[index], .{});
+            try shadow.initEmptyAllocated(self, owner.allocator(), owner.tracker);
+            const logits = try self.restoreAttentionMatchState(state, state.tokens, context - state.tokens.len, true, &shadow.state.?, null);
+            defer self.allocator.free(logits);
+            for (logits) |value| if (!std.math.isFinite(value)) return error.NonFiniteTeacherForcedLogits;
+            applySuppressTokenMask(logits, self.gpt_config.suppressTokenIds());
+            inputs[index] = @intCast(activations.argmax(logits));
+            const activity = (try compute.installedAttentionMatchActivity(&shadow.storage.?, shadow.state.?.sequence_id.?)) orelse
+                return error.InvalidNativeSoakProgress;
+            if (activity.invalid or activity.logical_tokens != state.logical_length or
+                (request.encoding == .fp8 and activity.fp8_heads == 0) or
+                (request.encoding == .rotated4 and activity.rotated4_heads == 0))
+                return error.InvalidNativeSoakProgress;
+        }
+        if (compute.require_f32_linears) return error.UnsupportedNativeSoakRoute;
+        {
+            if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+            defer if (self.execution_lock) |mutex| mutex.unlock();
+            if (!try decoder_gated_runtime.prepareModelSlots(&self.cb, self.allocator, self.gpt_config, self.gpt_config.num_hidden_layers))
+                return error.UnsupportedNativeSoakRoute;
+            try compute.reserveAttentionMatchForwardScratch(&self.gpt_config);
+        }
+        var output_tokens: [2]usize = undefined;
+        for (0..8) |round| {
+            for (&shadows, inputs, 0..) |*shadow, token, index| {
+                const step = try self.nativeQualityPreparedGreedyStep(&shadow.state.?, token, round == 0);
+                prepared[index] += step.blocks;
+                if (round != 0 and step.token != output_tokens[index]) return error.NativeSoakOutputChanged;
+                output_tokens[index] = step.token;
+                try shadow.state.?.truncateTokens(1);
+            }
+        }
+        const runtime_kv_before = metal_runtime.runtimeMemorySnapshot(model_runtime).attention_span_bytes;
+        var initial: [2]soak.Activity = undefined;
+        for (&shadows, &owners, prepared, &initial) |*shadow, *owner, blocks, *value|
+            value.* = try self.nativeSoakActivity(shadow, owner, blocks);
+        var previous = initial;
+        var batches: usize = 0;
+        var active_ns: u64 = 0;
+        const started = mtpProfileTimestamp(true, self.io);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        std.log.info("native_soak_window_started owners={d},{d} duration_seconds={d}", .{ initial[0].owner_id, initial[1].owner_id, request.duration_seconds });
+        while (active_ns < @as(u64, request.duration_seconds) * std.time.ns_per_s) {
+            var row: soak.Batch = .{ .index = batches, .steps = @splat(0), .start = previous, .finish = undefined, .active_ns = 0, .elapsed_ns = 0, .output_tokens = output_tokens };
+            for (0..soak.steps_per_batch) |step_index| {
+                const index = step_index % 2;
+                const shadow = &shadows[index];
+                try control.check();
+                const step_started = mtpProfileTimestamp(true, self.io);
+                const step = try self.nativeQualityPreparedGreedyStep(&shadow.state.?, inputs[index], false);
+                prepared[index] += step.blocks;
+                if (step.token != output_tokens[index]) return error.NativeSoakOutputChanged;
+                try shadow.state.?.truncateTokens(1);
+                const elapsed = mtpProfileElapsedNs(true, self.io, step_started);
+                if (elapsed == 0) return error.InvalidNativeSoakClock;
+                row.active_ns += elapsed;
+                row.steps[index] += 1;
+            }
+            for (&shadows, &owners, prepared, &row.finish) |*shadow, *owner, blocks, *value|
+                value.* = try self.nativeSoakActivity(shadow, owner, blocks);
+            active_ns += row.active_ns;
+            row.elapsed_ns = mtpProfileElapsedNs(true, self.io, started);
+            try row.validate(self.gpt_config.num_hidden_layers, saved[0].donors.len);
+            for (initial, row.finish) |first, last| if (last.owner_id != first.owner_id or last.live_bytes != first.live_bytes)
+                return error.NativeSoakAllocationGrowth;
+            if (metal_runtime.runtimeMemorySnapshot(model_runtime).attention_span_bytes != runtime_kv_before)
+                return error.NativeSoakAllocationGrowth;
+            const raw = try std.json.Stringify.valueAlloc(self.allocator, row, .{});
+            defer self.allocator.free(raw);
+            try journal.writeStreamingAll(self.io.?, raw);
+            try journal.writeStreamingAll(self.io.?, "\n");
+            try journal.sync(self.io.?);
+            hash.update(raw);
+            hash.update("\n");
+            previous = row.finish;
+            batches += 1;
+        }
+        const window_elapsed = mtpProfileElapsedNs(true, self.io, started);
+        if (active_ns > window_elapsed or @as(f64, @floatFromInt(active_ns)) / @as(f64, @floatFromInt(window_elapsed)) < 0.9)
+            return error.NativeSoakActivityInsufficient;
+        std.log.info("native_soak_window_finished batches={d} active_ns={d} elapsed_ns={d}", .{ batches, active_ns, window_elapsed });
+        var prefix_after: [2][32]u8 = undefined;
+        for (&shadows, saved, &prefix_after) |*shadow, state, *digest| {
+            var snapshot = try self.snapshotAttentionMatchState(state.tokens, state.logits, &shadow.state.?, identity, checkpoint.serving_limits, checkpoint.serving_limits.max_state_bytes);
+            defer snapshot.deinit();
+            const wire = try checkpoint.encodeWithEncoding(self.allocator, snapshot.state, checkpoint.serving_limits, request.encoding, control);
+            defer self.allocator.free(wire);
+            std.crypto.hash.sha2.Sha256.hash(wire, digest, .{});
+        }
+        if (!std.meta.eql(prefix_sha, prefix_after)) return error.NativeSoakPrefixChanged;
+        var report: soak.Report = .{ .diagnostic_only = request.duration_seconds < soak.formal_seconds, .load_generation = self.load_generation, .batches = batches, .forward_steps = batches * soak.steps_per_batch, .active_ns = active_ns, .window_elapsed_ns = window_elapsed, .journal_sha256 = hash.finalResult(), .output_tokens = output_tokens, .initial = initial, .final = previous, .prefix_sha256_before = prefix_sha, .prefix_sha256_after = prefix_after, .runtime_kv_bytes_before = runtime_kv_before, .runtime_kv_bytes_after = metal_runtime.runtimeMemorySnapshot(model_runtime).attention_span_bytes, .release = undefined };
+        try compute.synchronizeAttentionMatchKv();
+        for (&shadows, &owners, &report.release, &owners_live) |*shadow, *owner, *receipt, *live| {
+            _ = owner.captureCommitted();
+            shadow.deinit();
+            receipt.* = owner.release();
+            live.* = false;
+            if (!receipt.released or receipt.post_release_live_bytes != 0) return error.ContextPhysicalAccountingUnavailable;
+        }
+        report.collection_complete = true;
+        return report;
+    }
+
+    fn nativeSoakActivity(
+        self: *NativeGenerationPipeline,
+        shadow: *AttentionMatchProbeShadow,
+        owner: *runtime.kv.host_allocation_tracker.RequestAllocationOwner,
+        prepared: u64,
+    ) !@import("../runtime/kv/metal_checkpoint_soak.zig").Activity {
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const activity = (try compute.installedAttentionMatchActivity(&shadow.storage.?, shadow.state.?.sequence_id.?)) orelse
+            return error.InvalidNativeSoakProgress;
+        const allocation = owner.tracker.snapshot();
+        if (activity.invalid or activity.logical_tokens != shadow.state.?.total_tokens or
+            !allocation.available or !allocation.tracked_combined_physical_available)
+            return error.InvalidNativeSoakProgress;
+        return .{ .owner_id = allocation.owner_identity, .revision = activity.revision, .logical_tokens = activity.logical_tokens, .attention_calls = activity.attention_calls, .donor_appends = activity.donor_appends, .live_bytes = allocation.tracked_combined_live_bytes, .prepared_layer_blocks = prepared };
+    }
+
+    /// Dedicated test-driver entry point. The exact reference never compacts;
+    /// every replacement is installed into the same tracked compacted owner.
+    /// Gold continuation tokens remain unread until the candidate is frozen,
+    /// transported and installed. No request JSON or production flag calls it.
+    pub fn qualifyMetalCheckpointCycles(
+        self: *NativeGenerationPipeline,
+        tokens: []const i64,
+        request: @import("../runtime/kv/metal_checkpoint_cycles.zig").Request,
+    ) !@import("../runtime/kv/metal_checkpoint_cycles.zig").Report {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedCompactionQueryRoute;
+        var phase: []const u8 = "admission";
+        errdefer std.log.err("metal_checkpoint_cycles_rejected phase={s}", .{phase});
+        const cycles = @import("../runtime/kv/metal_checkpoint_cycles.zig");
+        const checkpoint = runtime.kv.attention_match_checkpoint;
+        const allocation = runtime.kv.host_allocation_tracker;
+        if (self.cb.kind() != .metal or self.kv_dtype != .f16 or self.scheduler != null or
+            self.scheduler_lease != null or self.checkpoint_prepare != null or self.checkpoint_resume != null)
+            return error.UnsupportedCompactionQueryRoute;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        const capacity = try request.capacity(tokens.len);
+        const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
+        for (tokens) |token| if (token < 0 or token >= self.gpt_config.vocab_size) return error.InvalidCompactionQueries;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const limits = checkpoint.serving_limits;
+        const auxiliary = NativeCheckpointPrepare.auxiliary_host_bytes;
+        const generation_estimate = try runtime.tier.memory.estimateGptGeneration(.metal, .f16, self.gpt_config, capacity + cycles.query_tail_tokens, 1, 256);
+        _ = try (cycles.PhasePlan{ .owners = 0, .host = auxiliary, .device = try std.math.add(usize, generation_estimate.kv_bytes, generation_estimate.scratch_bytes) }).admit();
+        var exact_owner = try allocation.RequestAllocationOwner.init(null);
+        var exact_owner_live = true;
+        defer if (exact_owner_live) {
+            _ = exact_owner.release();
+        };
+        var compacted_owner = try allocation.RequestAllocationOwner.init(null);
+        var compacted_owner_live = true;
+        defer if (compacted_owner_live) {
+            _ = compacted_owner.release();
+        };
+        var exact: AttentionMatchProbeShadow = .{};
+        defer exact.deinit();
+        var compacted: AttentionMatchProbeShadow = .{};
+        defer compacted.deinit();
+        phase = "exact_prefill";
+        try exact.initEmptyAllocated(self, exact_owner.allocator(), exact_owner.tracker);
+        std.log.info("metal_checkpoint_cycle_prefill tokens={d}", .{tokens.len});
+        var exact_logits = try self.appendAttentionMatchProbeTokens(&exact.state.?, tokens);
+        defer self.allocator.free(exact_logits);
+        _ = try (cycles.PhasePlan{ .owners = try cycleOwnerBytes(exact_owner.tracker, compacted_owner.tracker), .host = auxiliary, .device = try std.math.add(usize, 4 * 1024 * 1024 * 1024, generation_estimate.scratch_bytes) }).admit();
+        phase = "initial_clone";
+        std.log.info("metal_checkpoint_cycle_prefill_complete tokens={d} logits={d}", .{ exact.state.?.total_tokens, exact_logits.len });
+        try compacted.initAllocated(self, &exact.state.?, capacity, compacted_owner.allocator(), compacted_owner.tracker);
+        var compacted_logits = try self.allocator.dupe(f32, exact_logits);
+        defer self.allocator.free(compacted_logits);
+        const history = try self.allocator.alloc(i64, capacity);
+        defer self.allocator.free(history);
+        const ids = try self.allocator.alloc(u32, capacity);
+        defer self.allocator.free(ids);
+        @memcpy(history[0..tokens.len], tokens);
+        var length = tokens.len;
+        var report: cycles.Report = .{ .initial_tokens = length, .frozen_reference = request.reference.len != 0 };
+        const owner_id = compacted_owner.tracker.snapshot().owner_identity;
+        var total_exact_nll: f64 = 0;
+        var total_compacted_nll: f64 = 0;
+        var total_comparisons: usize = 0;
+        for (0..request.cycles) |cycle| {
+            try control.check();
+            std.log.info("metal_checkpoint_cycle_started cycle={d} logical_tokens={d} encoding={s} owner_id={d}", .{ cycle + 1, length, @tagName(request.encoding), owner_id });
+            if (cycle != 0) {
+                const suffix = tokens[tokens.len - request.append_tokens ..];
+                const next_exact = try self.appendAttentionMatchProbeTokens(&exact.state.?, suffix);
+                self.allocator.free(exact_logits);
+                exact_logits = next_exact;
+                const next_compacted = try self.appendAttentionMatchProbeTokens(&compacted.state.?, suffix);
+                self.allocator.free(compacted_logits);
+                compacted_logits = next_compacted;
+                @memcpy(history[length..][0..suffix.len], suffix);
+                length += suffix.len;
+            }
+            for (history[0..length], ids[0..length]) |token, *id| id.* = @intCast(token);
+            const source_revision = try compute.attentionMatchRevision(&compacted.storage.?);
+            const owners = try cycleOwnerBytes(exact_owner.tracker, compacted_owner.tracker);
+            var admitted = try (cycles.PhasePlan{ .owners = owners, .host = try std.math.add(usize, auxiliary, limits.max_state_bytes) }).admit();
+            var descriptors: [256]cycles.Descriptor = undefined;
+            var descriptor_count: usize = 0;
+            var immutable: [32]u8 = undefined;
+            const plan = plan: {
+                phase = "snapshot_plan";
+                var snapshot = try self.snapshotAttentionMatchState(ids[0..length], compacted_logits, &compacted.state.?, identity, limits, limits.max_state_bytes);
+                defer snapshot.deinit();
+                descriptor_count = (try cycles.capture(snapshot.state, NativeCheckpointPrepare.fittingOptions().prefix_rows, &descriptors, control)).len;
+                immutable = try cycles.immutableDigest(snapshot.state, descriptors[0..descriptor_count], control);
+                break :plan try NativeCheckpointPrepare.hostPlanForState(self.gpt_config, snapshot.state, request.encoding, control);
+            };
+            // Bound the private query clone by the remaining aggregate, then
+            // let its backend enforce that exact allowance during allocation.
+            const query_overhead = try std.math.add(usize, auxiliary, try std.math.add(usize, generation_estimate.scratch_bytes, NativeCheckpointPrepare.collection_options.max_bytes));
+            const query_base = try std.math.add(usize, owners, query_overhead);
+            if (query_base >= cycles.max_aggregate_bytes) return error.CompactionWorkspaceLimit;
+            const query_clone_limit = @min(4 * 1024 * 1024 * 1024, cycles.max_aggregate_bytes - query_base);
+            admitted = @max(admitted, try (cycles.PhasePlan{ .owners = owners, .host = auxiliary, .queries = NativeCheckpointPrepare.collection_options.max_bytes, .device = try std.math.add(usize, generation_estimate.scratch_bytes, query_clone_limit) }).admit());
+            phase = "query_collection";
+            var query_stats: AttentionMatchQueryStats = .{};
+            const query_started = mtpProfileTimestamp(true, self.io);
+            var queries = try self.collectAttentionMatchQueries(history[0..length], &compacted.state.?, .{
+                .prefix_mode = .clone,
+                .repeat_mode = .reference,
+                .stats = &query_stats,
+                .collection = NativeCheckpointPrepare.collection_options,
+                .chunk_size = 256,
+                .max_repeat_tokens = cycles.query_tail_tokens,
+                .representative_repeat = true,
+                .max_shadow_kv_bytes = query_clone_limit,
+            });
+            var queries_live = true;
+            defer if (queries_live) queries.deinit();
+            if (!query_stats.shadow_scope_released or query_stats.shadow_scope_delta_bytes != 0 or
+                !query_stats.shadow_uses_source_owner or query_stats.shadow_owner_id != owner_id)
+            {
+                std.debug.print("metal_checkpoint_query_scope_rejected owner={d} before={d} after={d} released={} borrowed={}\n", .{
+                    query_stats.shadow_owner_id,       query_stats.shadow_scope_before_bytes, query_stats.shadow_scope_after_bytes,
+                    query_stats.shadow_scope_released, query_stats.shadow_uses_source_owner,
+                });
+                return error.ContextPhysicalAccountingUnavailable;
+            }
+            if (cycle != 0 and query_stats.ragged_repeat_calls == 0) return error.UnsupportedCompactionQueryRoute;
+            admitted = @max(admitted, try (cycles.PhasePlan{ .owners = owners, .host = try std.math.add(usize, auxiliary, plan.fit_bytes), .queries = queries.peak_bytes }).admit());
+            var prepare: NativeCheckpointPrepare = .{
+                .encoding = request.encoding,
+                .minimum_savings_ratio = if (cycle == 0) request.initial_minimum_savings_ratio else request.incremental_minimum_savings_ratio,
+                .planned_fit_host_bytes = plan.fit_bytes,
+                .planned_fit_workers = plan.workers,
+                .planned_fit_head_workspace_bytes = plan.head_workspace_bytes,
+            };
+            defer prepare.deinit();
+            phase = "fit";
+            const stats = try self.prepareMetalAttentionMatchFit(history[0..length], compacted_logits, &compacted.state.?, &queries, mtpProfileElapsedNs(true, self.io, query_started), &prepare);
+            queries.deinit();
+            queries_live = false;
+            if (prepare.result == null or prepare.result.?.outcome != .compacted or stats.completed_chunks == 0 or
+                stats.candidate_global_bytes >= stats.source_global_bytes) return error.CompactionCycleDidNotCompact;
+            if (!std.mem.eql(u8, &immutable, &try cycles.immutableDigest(prepare.result.?.checkpoint.state, descriptors[0..descriptor_count], control)))
+                return error.CompactionHistoryChanged;
+            phase = "transport";
+            const candidate_bytes = try prepare.result.?.checkpoint.state.residentBytes();
+            const wire_bytes = try checkpoint.encodedSize(prepare.result.?.checkpoint.state, limits, request.encoding, control);
+            admitted = @max(admitted, try (cycles.PhasePlan{ .owners = owners, .host = try std.math.add(usize, auxiliary, candidate_bytes), .wire = wire_bytes, .import = limits.max_state_bytes }).admit());
+            const wire = try checkpoint.encodeWithEncoding(self.allocator, prepare.result.?.checkpoint.state, limits, request.encoding, control);
+            var wire_live = true;
+            defer if (wire_live) self.allocator.free(wire);
+            var wire_sha256: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(wire, &wire_sha256, .{});
+            var decoded = try checkpoint.decodeWithControl(self.allocator, wire, identity, limits, control);
+            var decoded_live = true;
+            defer if (decoded_live) decoded.deinit();
+            if (!std.mem.eql(u8, &immutable, &try cycles.immutableDigest(decoded.state, descriptors[0..descriptor_count], control)))
+                return error.CompactionHistoryChanged;
+            prepare.deinit();
+            self.allocator.free(wire);
+            wire_live = false;
+            const installed_revision = install: {
+                phase = "install";
+                if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+                defer if (self.execution_lock) |mutex| mutex.unlock();
+                try compute.synchronizeAttentionMatchKv();
+                if (try compute.attentionMatchRevision(&compacted.storage.?) != source_revision)
+                    return error.CompactionSourceChanged;
+                const before_upload = try cycleOwnerBytes(exact_owner.tracker, compacted_owner.tracker);
+                const imported_host = try decoded.state.residentBytes();
+                const upload_base = try std.math.add(usize, before_upload, try std.math.add(usize, auxiliary, imported_host));
+                if (upload_base >= cycles.max_aggregate_bytes) return error.CompactionWorkspaceLimit;
+                const upload_limit = cycles.max_aggregate_bytes - upload_base;
+                admitted = @max(admitted, try (cycles.PhasePlan{ .owners = before_upload, .host = try std.math.add(usize, auxiliary, imported_host), .device = upload_limit }).admit());
+                const backend = try compute.attentionMatchStorageBackend(&compacted.storage.?, self.allocator, limits, upload_limit);
+                var uploaded: ?metal_attention_storage.DeviceState = try backend.upload(decoded.state, upload_limit, control);
+                defer if (uploaded) |*device| device.deinit();
+                try compute.installAttentionMatchWithOptions(&compacted.storage.?, compacted.state.?.sequence_id.?, &uploaded, length, source_revision, upload_limit, control, .{ .diagnostic_only = true });
+                break :install try compute.attentionMatchRevision(&compacted.storage.?);
+            };
+            decoded.deinit();
+            decoded_live = false;
+            if (installed_revision != source_revision + 1 or compacted_owner.tracker.snapshot().owner_identity != owner_id)
+                return error.CompactionSourceChanged;
+            // Verify the actual installed bytes, rather than only the host
+            // candidate that was submitted to the uploader.
+            {
+                var installed = try self.snapshotAttentionMatchState(ids[0..length], compacted_logits, &compacted.state.?, identity, limits, limits.max_state_bytes);
+                defer installed.deinit();
+                if (!std.mem.eql(u8, &immutable, &try cycles.immutableDigest(installed.state, descriptors[0..descriptor_count], control)))
+                    return error.CompactionHistoryChanged;
+            }
+            var row: cycles.Row = .{ .cycle = cycle + 1, .owner_id = owner_id, .source_revision = source_revision, .installed_revision = installed_revision, .completed_chunks = stats.completed_chunks, .validated_heads = stats.validated_heads, .max_head_mass_error = stats.max_head_mass_error, .max_head_output_rmse = stats.max_head_output_rmse, .fp64_accelerated_value_solves = prepare.fp64_accelerated_value_solves, .ragged_repeat_calls = query_stats.ragged_repeat_calls, .query_owner_id = query_stats.shadow_owner_id, .query_owner_peak_bytes = query_stats.shadow_owner_peak_bytes, .query_scope_released = query_stats.shadow_scope_released, .query_scope_delta_bytes = query_stats.shadow_scope_delta_bytes, .query_uses_source_owner = query_stats.shadow_uses_source_owner, .immutable_rows_sha256 = immutable, .checkpoint_sha256 = wire_sha256, .source_global_bytes = stats.source_global_bytes, .candidate_global_bytes = stats.candidate_global_bytes, .admitted_peak_bytes = admitted };
+            for (0..request.answer_tokens) |answer| {
+                phase = "teacher_forced_continuation";
+                try control.check();
+                if (exact_logits.len != compacted_logits.len or exact_logits.len != self.gpt_config.vocab_size)
+                    return error.InvalidCompactionProbe;
+                var squared: f64 = 0;
+                var reference_squared: f64 = 0;
+                for (exact_logits, compacted_logits) |reference, actual| {
+                    if (!std.math.isFinite(reference) or !std.math.isFinite(actual)) return error.NonFiniteTeacherForcedLogits;
+                    const difference = @as(f64, actual) - reference;
+                    squared += difference * difference;
+                    reference_squared += @as(f64, reference) * reference;
+                }
+                row.max_logit_relative_l2 = @max(row.max_logit_relative_l2, @sqrt(squared / @max(reference_squared, 1e-30)));
+                const expected = activations.argmax(exact_logits);
+                row.greedy_matches += @intFromBool(expected == activations.argmax(compacted_logits));
+                const target = if (request.reference.len == 0) @as(i64, @intCast(expected)) else request.reference[cycle * request.answer_tokens + answer];
+                const target_id = std.math.cast(u32, target) orelse return error.InvalidTeacherForcedToken;
+                row.exact_nll -= try context_teacher_forced.logProbability(exact_logits, target_id);
+                row.compacted_nll -= try context_teacher_forced.logProbability(compacted_logits, target_id);
+                row.comparisons += 1;
+                const next = [_]i64{target};
+                const next_exact = try self.appendAttentionMatchProbeTokens(&exact.state.?, &next);
+                self.allocator.free(exact_logits);
+                exact_logits = next_exact;
+                const next_compacted = try self.appendAttentionMatchProbeTokens(&compacted.state.?, &next);
+                self.allocator.free(compacted_logits);
+                compacted_logits = next_compacted;
+                history[length] = target;
+                length += 1;
+            }
+            const activity = (try compute.installedAttentionMatchActivity(&compacted.storage.?, compacted.state.?.sequence_id.?)) orelse
+                return error.InvalidCompactionProbe;
+            if (activity.invalid or activity.attention_calls == 0 or activity.donor_appends == 0 or
+                exact.state.?.total_tokens != length or compacted.state.?.total_tokens != length)
+                return error.CompactionSourceChanged;
+            row.logical_tokens = length;
+            row.fp8_heads = activity.fp8_heads;
+            row.rotated4_heads = activity.rotated4_heads;
+            row.attention_calls = activity.attention_calls;
+            row.donor_appends = activity.donor_appends;
+            report.rows[cycle] = row;
+            report.completed += 1;
+            report.final_tokens = length;
+            total_exact_nll += row.exact_nll;
+            total_compacted_nll += row.compacted_nll;
+            total_comparisons += row.comparisons;
+            const json = try std.json.Stringify.valueAlloc(self.allocator, row, .{});
+            defer self.allocator.free(json);
+            std.debug.print("metal_checkpoint_cycle {s}\n", .{json});
+        }
+        phase = "release";
+        compacted.deinit();
+        exact.deinit();
+        report.compacted_release = compacted_owner.release();
+        compacted_owner_live = false;
+        report.exact_release = exact_owner.release();
+        exact_owner_live = false;
+        if (report.compacted_release.post_release_live_bytes != 0 or report.exact_release.post_release_live_bytes != 0 or
+            total_comparisons == 0 or (total_compacted_nll - total_exact_nll) / @as(f64, @floatFromInt(total_comparisons)) > @log(@as(f64, 1.05)))
+            return error.CompactionCycleQualityRejected;
+        report.passed = true;
+        return report;
+    }
+
+    fn cycleOwnerBytes(first: *runtime.kv.host_allocation_tracker.HostAllocationTracker, second: *runtime.kv.host_allocation_tracker.HostAllocationTracker) !usize {
+        const a = first.snapshot();
+        const b = second.snapshot();
+        if (!a.tracked_combined_physical_available or !b.tracked_combined_physical_available)
+            return error.ContextPhysicalAccountingUnavailable;
+        return std.math.cast(usize, try std.math.add(u64, a.tracked_combined_live_bytes, b.tracked_combined_live_bytes)) orelse
+            return error.CompactionWorkspaceLimit;
     }
 
     /// Diagnostic only: both branches start from the same original exact prefix.
@@ -6160,18 +7417,52 @@ pub const NativeGenerationPipeline = struct {
                 try checkAttentionMatchQueryWork(self);
             }
         }
-        var manager = runtime.kv.manager.KvManager.init(self.allocator);
+        // Query branches borrow the request ledger when available, so its
+        // physical peak includes every temporary clone allocation. Standalone
+        // diagnostics without a request ledger use an independent owner.
+        const source_tracker = if (self.cb.kind() == .metal)
+            if (source.kv_storage) |source_storage| source_storage.ownerAllocationTracker() else null
+        else
+            null;
+        var shadow_owner: ?runtime.kv.host_allocation_tracker.RequestAllocationOwner =
+            if (self.cb.kind() == .metal and source_tracker == null)
+                try runtime.kv.host_allocation_tracker.RequestAllocationOwner.init(null)
+            else
+                null;
+        defer if (shadow_owner) |*owner| {
+            _ = owner.release();
+        };
+        const shadow_tracker = if (source_tracker) |tracker| tracker else if (shadow_owner) |owner| owner.tracker else null;
+        const shadow_allocator = if (shadow_tracker) |tracker| tracker.allocator() else self.allocator;
+        const shadow_before = if (shadow_tracker) |tracker| tracker.snapshot() else null;
+        defer if (shadow_tracker) |tracker| {
+            const before = shadow_before.?;
+            const after = tracker.snapshot();
+            const released = before.tracked_combined_physical_available and after.tracked_combined_physical_available and
+                before.logical_live_bytes == after.logical_live_bytes and before.physical_live_bytes == after.physical_live_bytes and
+                before.shared_backing_live_bytes == after.shared_backing_live_bytes and before.private_device_live_bytes == after.private_device_live_bytes;
+            if (options.stats) |stats| {
+                stats.shadow_owner_id = after.owner_identity;
+                stats.shadow_owner_peak_bytes = after.tracked_combined_peak_bytes;
+                stats.shadow_scope_released = released;
+                stats.shadow_scope_delta_bytes = if (released) 0 else null;
+                stats.shadow_uses_source_owner = source_tracker != null;
+                stats.shadow_scope_before_bytes = before.tracked_combined_live_bytes;
+                stats.shadow_scope_after_bytes = after.tracked_combined_live_bytes;
+            }
+        };
+        var manager = runtime.kv.manager.KvManager.init(shadow_allocator);
         defer manager.deinit();
         var pool_config = kvPoolConfig(if (self.cb.kind() == .metal) .metal else .cuda, dtype, self.gpt_config, false);
         pool_config.store_cpu_bytes = false;
         pool_config.sliding_window_size = null;
         const pool_id = try manager.addPool(pool_config);
-        var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(self.allocator, pool_config);
+        var storage = try runtime.kv.storage_runtime.KvStorageRuntime.initTracked(shadow_allocator, pool_config, shadow_tracker);
         defer storage.deinit();
         // Provisioning a separate hook does not begin/reset the model request.
         try self.cb.provisionKvDeviceWriteHook(&storage);
         if (storage.device_write_hook == null) return error.UnsupportedCompactionQueryRoute;
-        var shadow = NativeDecodeState.initPaged(self.allocator, &manager, pool_id, null);
+        var shadow = NativeDecodeState.initPaged(shadow_allocator, &manager, pool_id, null);
         shadow.kv_storage = &storage;
         shadow.configureForGptConfig(self.gpt_config);
         shadow.allow_swa_ring = false;
@@ -6810,6 +8101,18 @@ pub const NativeGenerationPipeline = struct {
         var config = requested_config;
         try validateKvCachePolicy(config);
         const native_checkpoint = self.checkpoint_prepare != null or self.checkpoint_resume != null;
+        var selected_checkpoint_certificate: ?*const native_checkpoint_release.Certificate = null;
+        const checkpoint_compute: ?*metal_compute.MetalCompute = if (comptime build_options.enable_metal)
+            (if (native_checkpoint and self.cb.kind() == .metal) @ptrCast(@alignCast(self.cb.ptr)) else null)
+        else
+            null;
+        const previous_checkpoint_execution: ?native_checkpoint_release.Execution = if (comptime build_options.enable_metal)
+            (if (checkpoint_compute) |compute| compute.attention_match_execution else null)
+        else
+            null;
+        defer if (comptime build_options.enable_metal) {
+            if (checkpoint_compute) |compute| compute.attention_match_execution = previous_checkpoint_execution;
+        };
         if (native_checkpoint and (self.checkpoint_prepare != null and self.checkpoint_resume != null or
             (self.cb.kind() != .cuda and self.cb.kind() != .metal) or self.kv_dtype != .f16 or self.gpt_config.family != .gemma or
             !self.gpt_config.usesGemma4Channels() or self.gpt_config.gemma4_mtp_assistant or
@@ -6819,12 +8122,42 @@ pub const NativeGenerationPipeline = struct {
             config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.speculation_requested))
             return error.UnsupportedAttentionMatchRoute;
         if (native_checkpoint and self.cb.kind() == .metal) {
-            if (comptime builtin.is_test) {
-                if (!config.metal_native_checkpoint_qualification) return error.UnqualifiedCompactionArtifact;
-            } else return error.UnqualifiedCompactionArtifact;
+            const qualification = if (comptime builtin.is_test) config.metal_native_checkpoint_qualification else false;
+            const encoding = if (self.checkpoint_prepare) |request|
+                request.encoding
+            else
+                self.checkpoint_resume.?.encoding orelse return error.InvalidNativeCheckpointRequest;
+            if (qualification) {
+                if (comptime build_options.enable_metal) {
+                    const compute = checkpoint_compute orelse return error.UnqualifiedCompactionArtifact;
+                    compute.attention_match_execution = native_checkpoint_release.Execution.diagnosticFromEnvironment();
+                }
+            }
+            if (!qualification) {
+                if (comptime build_options.enable_metal) {
+                    const compute = checkpoint_compute orelse return error.UnqualifiedCompactionArtifact;
+                    if (compute.require_f32_linears) return error.UnqualifiedCompactionArtifact;
+                    const certificate = try native_checkpoint_release.select(
+                        self.attention_match_identity orelse return error.UnsupportedKvIdentity,
+                        encoding,
+                        try compute.provider_impl.nativeCheckpointObserved(),
+                    );
+                    if (self.checkpoint_prepare) |request| {
+                        if (request.minimum_savings_ratio != 1.5 or request.validation_workers != 1)
+                            return error.UnqualifiedCompactionArtifact;
+                    }
+                    if (self.checkpoint_resume) |request| {
+                        const saved = request.checkpoint orelse return error.InvalidNativeCheckpointRequest;
+                        try certificate.admitCheckpoint(std.math.cast(usize, saved.state.logical_length) orelse return error.UnqualifiedCompactionArtifact);
+                    }
+                    selected_checkpoint_certificate = certificate;
+                    compute.attention_match_execution = certificate.execution;
+                } else return error.UnqualifiedCompactionArtifact;
+            }
         }
         if (native_checkpoint and self.cb.kind() == .metal and self.checkpoint_prepare != null and
-            self.checkpoint_prepare.?.encoding != .f16 and self.checkpoint_prepare.?.encoding != .fp8)
+            self.checkpoint_prepare.?.encoding != .f16 and self.checkpoint_prepare.?.encoding != .fp8 and
+            self.checkpoint_prepare.?.encoding != .rotated4)
             return error.UnsupportedMetalKvCheckpointEncoding;
         // select_v1 currently has a complete explicit-position storage and
         // attention implementation only on Metal. CUDA exposes contiguous or
@@ -7130,6 +8463,8 @@ pub const NativeGenerationPipeline = struct {
         var actual_prompt_tokens: usize = 0;
         while (actual_prompt_tokens < encoded_attention_mask.len and encoded_attention_mask[actual_prompt_tokens] != 0) : (actual_prompt_tokens += 1) {}
         if (actual_prompt_tokens == 0) return error.EmptyPrompt;
+        if (selected_checkpoint_certificate) |certificate|
+            try certificate.admitRequest(actual_prompt_tokens, requested_max_tokens);
         if (serving_compaction) |request| {
             if (request.prompt.len != actual_prompt_tokens) return error.InvalidPayloadProvenance;
             for (request.prompt, encoded_ids[0..actual_prompt_tokens]) |expected, actual| {
@@ -7698,6 +9033,7 @@ pub const NativeGenerationPipeline = struct {
 
         // Prefill
         try setWorkloadProfileRegime(&self.cb, .prefill);
+        try self.logMetalCheckpointQualificationPhase(decode_state, config, "prefill_started", null);
         const quality_requested = if (comptime builtin.is_test) config.context_quality_request != null else false;
         const allow_prefill_greedy_token = !quality_requested and (!use_speculative or (use_speculative and draft_is_gemma4_mtp));
         const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
@@ -9082,6 +10418,14 @@ pub const NativeGenerationPipeline = struct {
     /// Run the prefill phase: process prompt tokens through the model,
     /// either chunked (for paged KV) or in one pass. Returns the logits
     /// for the last prompt position, or null if handled by the scheduler.
+    fn checkPrefillRequest(self: *const NativeGenerationPipeline) !void {
+        if (self.execution_control) |control| try control.check();
+        if (self.continue_fn) |should_continue| {
+            const context = self.continue_ctx orelse return error.InvalidCallbackContext;
+            if (!should_continue(context)) return error.Cancelled;
+        }
+    }
+
     fn executePrefill(
         self: *NativeGenerationPipeline,
         prompt_ids: []const i64,
@@ -9093,6 +10437,7 @@ pub const NativeGenerationPipeline = struct {
         capture_last_hidden: bool,
         discard_final_output: bool,
     ) !PrefillOutput {
+        try self.checkPrefillRequest();
         if (discard_final_output and self.compiled_partition_backend != null)
             return error.UnsupportedCompactionCapturePrefill;
         const allocator = self.allocator;
@@ -9111,6 +10456,7 @@ pub const NativeGenerationPipeline = struct {
         };
 
         var prefill_last_logits: ?[]f32 = null;
+        errdefer if (prefill_last_logits) |logits| allocator.free(logits);
         var prefill_greedy_token: ?usize = null;
         var prefill_last_hidden: ?ops.CT = null;
         var prefill_last_hidden_rows: usize = 0;
@@ -9225,6 +10571,7 @@ pub const NativeGenerationPipeline = struct {
             );
             var processed: usize = 0;
             while (processed < prompt_ids.len) {
+                try self.checkPrefillRequest();
                 const chunk_end = @min(prompt_ids.len, processed + prefill_chunk_size);
                 const chunk = prompt_ids[processed..chunk_end];
                 const total_chunk_end = prefilled_tokens + chunk_end;
@@ -9380,6 +10727,7 @@ pub const NativeGenerationPipeline = struct {
             var processed: usize = 0;
             var plan_chunk_index: usize = 0;
             while (processed < query_len) {
+                try self.checkPrefillRequest();
                 var direct_prefill_turn_acquired = false;
                 defer if (direct_prefill_turn_acquired) {
                     self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
@@ -11045,6 +12393,8 @@ pub const NativeGenerationPipeline = struct {
 
         self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
         const decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
+        var attention_match_frame = try AttentionMatchForwardFrame.begin(self, 1, &decode_context);
+        defer if (attention_match_frame) |*owned| owned.deinit();
         if (backend_kind == .metal and self.gpt_config.family == .gemma and self.gpt_config.hasPle() and gemma4MetalDirectGreedyEnabled()) {
             if (try decoder_gated_runtime.forwardGreedyToken(
                 &self.cb,
@@ -11056,6 +12406,7 @@ pub const NativeGenerationPipeline = struct {
                 &decode_context,
             )) |token_id| {
                 if (token_id < 0) return error.InvalidModelOutput;
+                if (attention_match_frame) |*owned| try owned.finish();
                 return .{ .token = @intCast(token_id) };
             }
         }
@@ -11075,6 +12426,8 @@ pub const NativeGenerationPipeline = struct {
                         seq_len,
                         &decode_context,
                     )) |result| {
+                        errdefer if (result.token_tensor) |tensor| self.cb.free(tensor);
+                        if (attention_match_frame) |*owned| try owned.finish();
                         decoder_runtime_debug_stats.device_token_handoff_hits += 1;
                         return .{
                             .token = result.token_id,
@@ -11091,6 +12444,8 @@ pub const NativeGenerationPipeline = struct {
                     seq_len,
                     &decode_context,
                 )) |result| {
+                    errdefer if (result.token_tensor) |tensor| self.cb.free(tensor);
+                    if (attention_match_frame) |*owned| try owned.finish();
                     decoder_runtime_debug_stats.device_token_handoff_hits += 1;
                     return .{
                         .token = result.token_id,
@@ -11102,7 +12457,7 @@ pub const NativeGenerationPipeline = struct {
         }
 
         const input_ids = token_ids[seq_len - 1 .. seq_len];
-        return .{ .token = try gpt_arch.forwardGreedyLastToken(
+        const token = try gpt_arch.forwardGreedyLastToken(
             &self.cb,
             self.allocator,
             self.gpt_config,
@@ -11110,7 +12465,9 @@ pub const NativeGenerationPipeline = struct {
             1,
             seq_len,
             &decode_context,
-        ) };
+        );
+        if (attention_match_frame) |*owned| try owned.finish();
+        return .{ .token = token };
     }
 
     fn forwardGreedyDeviceDecodeTokenTensor(
@@ -11225,6 +12582,21 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn forwardLastLogits(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) ![]f32 {
+        var frame = try AttentionMatchForwardFrame.begin(self, batch, decode_context);
+        defer if (frame) |*owned| owned.deinit();
+        const result = try self.forwardLastLogitsImpl(input_ids, batch, seq_len, decode_context);
+        errdefer self.allocator.free(result);
+        if (frame) |*owned| try owned.finish();
+        return result;
+    }
+
+    fn forwardLastLogitsImpl(
         self: *NativeGenerationPipeline,
         input_ids: []const i64,
         batch: usize,
@@ -11366,6 +12738,21 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn forwardAllLogits(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) ![]f32 {
+        var frame = try AttentionMatchForwardFrame.begin(self, batch, decode_context);
+        defer if (frame) |*owned| owned.deinit();
+        const result = try self.forwardAllLogitsImpl(input_ids, batch, seq_len, decode_context);
+        errdefer self.allocator.free(result);
+        if (frame) |*owned| try owned.finish();
+        return result;
+    }
+
+    fn forwardAllLogitsImpl(
         self: *NativeGenerationPipeline,
         input_ids: []const i64,
         batch: usize,
@@ -20373,4 +21760,37 @@ test "context private study provider deltas are monotonic and fail closed on res
     after = before;
     after.native_quant_null = true;
     try std.testing.expect(NativeGenerationPipeline.compactionStudyProviderDelta(before, after) == null);
+}
+
+test "context prefill cancellation rejects work before touching backend" {
+    const State = struct {
+        checked: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checked = true;
+            return error.Cancelled;
+        }
+    };
+    var state: State = .{};
+    // A cancelled request must not inspect or initialize any backend state.
+    var pipeline: NativeGenerationPipeline = .{
+        .allocator = std.testing.allocator,
+        .cb = undefined,
+        .session = undefined,
+        .gpt_config = undefined,
+        .tokenizer = undefined,
+        .execution_control = .{ .ptr = &state, .check_fn = State.check },
+    };
+    var decode_state: NativeDecodeState = undefined;
+    try std.testing.expectError(error.Cancelled, pipeline.executePrefill(
+        &.{ 1, 2 },
+        2,
+        0,
+        &decode_state,
+        .{ .max_tokens = 1 },
+        false,
+        false,
+        false,
+    ));
+    try std.testing.expect(state.checked);
 }

@@ -3856,5 +3856,8 @@ test "native checkpoint route manifest preserves binary upload and export stream
         const resume_request = routeMetadata(.post, prefix ++ "/generate/context/resume");
         try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, resume_request.request_body);
         try std.testing.expect(resume_request.streaming_response);
+        const batch_request = routeMetadata(.post, prefix ++ "/generate/context/resume/batch");
+        try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, batch_request.request_body);
+        try std.testing.expect(!batch_request.streaming_response);
     }
 }

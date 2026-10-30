@@ -118,6 +118,20 @@ class FullReleaseRecorder(unittest.TestCase):
         binary=cache/'context-tests'; binary.write_bytes(b'executable'); binary.chmod(0o755)
         log=f'cd pkg/inference/. && ./../../.zig-cache/o/{"b"*32}/context-tests\n'
         self.assertEqual(recorder.executed_binary(log,self.root/'zig'),binary.resolve())
+    def test_larger_watchdog_is_bound_in_sealed_resource_receipt(self):
+        recorder.configure_profile(True, 16384)
+        try:
+            head,source=recorder.source_snapshot(self.root)
+            archive=recorder.freeze_archive(self.root,self.campaign,head,source,self.tools)
+            resource=self.make_successful_evidence()
+            receipt=recorder.seal(self.root,self.campaign,'2026-10-19T00:00:00Z',head,source,archive,resource,self.tools)
+            value=json.loads(receipt.read_text())
+            self.assertEqual(value['schema'],recorder.SCHEMA_V4)
+            guard=json.loads((self.campaign/value['resource']['path']).read_text())
+            self.assertEqual(guard['limits']['max_rss_mib'],16384)
+            self.assertEqual(value['resource']['sha256'],recorder.digest(resource))
+        finally:
+            recorder.configure_profile(False)
     def test_all_skipped_is_not_a_successful_full_build(self):
         with self.assertRaisesRegex(RuntimeError,'compiled tests did not pass'):
             recorder.parse_tests('12 selected; 0 passed; 12 skipped.\n')
@@ -126,12 +140,13 @@ class FullReleaseRecorder(unittest.TestCase):
         binary=cache/'context-tests'; binary.write_bytes(b'executable'); binary.chmod(0o755)
         resource=self.campaign/'build-resource.json'
         values={'schema':'antfly.benchmark_resources.v1','command':recorder.COMMAND,'pass':True,
-          'returncode':0,'violation':None,'limits':{'timeout_seconds':3600,'max_rss_mib':8192,
+          'returncode':0,'violation':None,'limits':{'timeout_seconds':3600,'max_rss_mib':recorder.LIMITS['max_rss_mib'],
           'min_free_percent':15,'max_swap_growth_mib':512,'min_disk_free_mib':4096},'samples':2,
           'pid':123,'elapsed_seconds':1,'peak_group_rss_mib':100,'initial_free_percent':70,
           'min_free_percent':60,'swapout_growth_mib':0,'min_disk_free_mib':5000}
         resource.write_text(json.dumps(values)+'\n'); resource.with_suffix('.stdout').write_bytes(b'')
-        resource.with_suffix('.stderr').write_text(f'{binary}\n12 selected; 10 passed; 2 skipped.\n')
+        profile = '' if recorder.SCHEMA == recorder.SCHEMA_V1 else 'context_compiler_profile: {"schema_version":1,"strip_debug_info":true,"have_error_return_tracing":false}\n'
+        resource.with_suffix('.stderr').write_text(profile+f'{binary}\n12 selected; 10 passed; 2 skipped.\n')
         return resource
 
 

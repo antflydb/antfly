@@ -1263,7 +1263,35 @@ test "checkpoint replacement validation can cancel without changing owner" {
 /// reader may contain following envelope data, which is left untouched. The
 /// caller owns transport EOF/framing checks. No state is returned before its
 /// checksum and semantic checks pass, and wire bytes are not buffered twice.
-pub fn decodeReaderWithControl(allocator: std.mem.Allocator, reader: anytype, file_length: usize, expected: Identity, limits: Limits, control: Control) !Owned {
+pub const Decoded = struct {
+    checkpoint: Owned,
+    encoding: Encoding,
+
+    pub fn deinit(self: *Decoded) void {
+        self.checkpoint.deinit();
+        self.* = undefined;
+    }
+};
+
+fn wireEncoding(wire_version: u32, flags: u32) !Encoding {
+    return switch (wire_version) {
+        1, 2 => .f32,
+        3 => if (flags == 0) .f16 else if (flags == 1) .fp8 else error.UnsupportedKvCheckpoint,
+        4 => .rotated4,
+        else => error.UnsupportedKvCheckpoint,
+    };
+}
+
+test "checkpoint wire provenance distinguishes release encodings" {
+    try std.testing.expectEqual(Encoding.f32, try wireEncoding(1, 0));
+    try std.testing.expectEqual(Encoding.f32, try wireEncoding(2, 0));
+    try std.testing.expectEqual(Encoding.f16, try wireEncoding(3, 0));
+    try std.testing.expectEqual(Encoding.fp8, try wireEncoding(3, 1));
+    try std.testing.expectEqual(Encoding.rotated4, try wireEncoding(4, 0));
+    try std.testing.expectError(error.UnsupportedKvCheckpoint, wireEncoding(3, 2));
+}
+
+pub fn decodeReaderWithEncodingAndControl(allocator: std.mem.Allocator, reader: anytype, file_length: usize, expected: Identity, limits: Limits, control: Control) !Decoded {
     try control.check();
     if (file_length > limits.max_file_bytes) return error.KvCheckpointLimit;
     if (file_length < header_bytes) return error.InvalidKvCheckpoint;
@@ -1297,7 +1325,14 @@ pub fn decodeReaderWithControl(allocator: std.mem.Allocator, reader: anytype, fi
     if (!std.mem.eql(u8, &expected_digest, &digest)) return error.KvCheckpointChecksum;
     try owned.state.validateWithControl(limits, control);
     try control.check();
-    return owned;
+    return .{ .checkpoint = owned, .encoding = try wireEncoding(wire_version, flags) };
+}
+
+pub fn decodeReaderWithControl(allocator: std.mem.Allocator, reader: anytype, file_length: usize, expected: Identity, limits: Limits, control: Control) !Owned {
+    var decoded = try decodeReaderWithEncodingAndControl(allocator, reader, file_length, expected, limits, control);
+    const checkpoint = decoded.checkpoint;
+    decoded = undefined;
+    return checkpoint;
 }
 
 fn readCheckpointExact(reader: anytype, destination: []u8, control: Control) !void {

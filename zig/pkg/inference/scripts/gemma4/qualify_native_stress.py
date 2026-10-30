@@ -40,9 +40,12 @@ from qualify_native_checkpoint_http import (
     server,
     sha256_file,
     git_provenance,
+    validate_backend_configuration,
+    validate_metal_memory,
 )
 from qualify_context_management import sample_cuda_process
 from native_checkpoint_unified_host import sum_listener_rss
+from benchmark_resources import group_rss_mib, memory_free_percent, swapout_bytes
 
 TEN_REQUESTS = (
     "prepare",
@@ -65,7 +68,16 @@ def assert_equivalent(actual, expected):
         raise AssertionError("saved-prefix/append token accounting changed")
 
 
-def memory_observation(record):
+def memory_observation(record, backend="cuda"):
+    if backend == "metal":
+        row = {
+            "group_rss_bytes": round(group_rss_mib(record["worker_pid"]) * 1024 * 1024),
+            "free_memory_percent": memory_free_percent(),
+            "swapout_bytes": swapout_bytes(),
+        }
+        if not 0 < row["group_rss_bytes"] <= 8 * 1024**3:
+            raise AssertionError("unified process-group RSS cap exceeded")
+        return row
     row = sample_cuda_process(record["worker_pid"])
     if "listener_pid" in record:
         row = sum_listener_rss(row, record["listener_pid"])
@@ -106,7 +118,18 @@ def summarize_blocks(blocks, profile="extended"):
         )
     growth = {}
     window = min(5, len(blocks) // 2)
-    for key in ("host_rss_bytes", "gpu_memory_bytes"):
+    memory_keys = set(blocks[0]["quiescent_memory"])
+    expected_keys = (
+        {"group_rss_bytes", "free_memory_percent", "swapout_bytes"}
+        if "group_rss_bytes" in memory_keys
+        else {"host_rss_bytes", "gpu_memory_bytes"}
+    )
+    if memory_keys != expected_keys or any(
+        set(block["quiescent_memory"]) != expected_keys for block in blocks
+    ):
+        raise AssertionError("inconsistent quiescent memory evidence")
+    for key in (("group_rss_bytes",) if "group_rss_bytes" in memory_keys else
+                ("host_rss_bytes", "gpu_memory_bytes")):
         values = [block["quiescent_memory"][key] for block in blocks]
         first = statistics.median(values[:window])
         last = statistics.median(values[-window:])
@@ -126,6 +149,12 @@ def summarize_blocks(blocks, profile="extended"):
     return {
         "mixed_requests": len(operations),
         "actual_compactions": len(compactions),
+        "independent_repreparations": len(compactions),
+        "successive_compaction_cycles_qualified": False,
+        "successive_compaction_reason": (
+            "the public checkpoint protocol prepares from request messages; it does not "
+            "checkpoint the state installed by a prior resume"
+        ),
         "profile": profile,
         "extended_run_qualified": profile == "extended",
         "quiescent_growth": growth,
@@ -136,8 +165,9 @@ def summarize_blocks(blocks, profile="extended"):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", type=Path, required=True)
+    parser.add_argument("--backend", choices=["cuda", "metal"], default="cuda")
     parser.add_argument(
-        "--server-kind", choices=["inference", "standalone"], default="standalone"
+        "--server-kind", choices=["inference", "standalone", "metal-test"], default="standalone"
     )
     parser.add_argument("--models-dir", type=Path, default=Path(".models"))
     parser.add_argument("--model", default="google/gemma-4-E4B-it-qat-q4_0-gguf")
@@ -155,6 +185,12 @@ def main():
     )
     parser.add_argument("--experimental-rotated4", action="store_true")
     args = parser.parse_args()
+    args.qualification_minimum_savings = 1.5 if args.backend == "metal" else None
+    args.minimum_fp8_heads = 1 if args.encoding == "fp8" else 0
+    try:
+        validate_backend_configuration(args)
+    except ValueError as error:
+        parser.error(str(error))
     minimum_blocks = {"bounded": 2, "extended": 20}[args.profile]
     if args.blocks is None:
         args.blocks = minimum_blocks
@@ -174,6 +210,7 @@ def main():
         "production_ready": False,
         "scope": __doc__,
         "server_kind": args.server_kind,
+        "backend": args.backend,
         "encoding": args.encoding,
         "source": git_provenance(REPO),
         "binary_sha256": sha256_file(args.server),
@@ -312,7 +349,7 @@ def main():
                             raise AssertionError("rejection changed its error identity")
                     operation.update(passed=True, seconds=time.monotonic() - started)
                     publish()
-                block["quiescent_memory"] = memory_observation(record)
+                block["quiescent_memory"] = memory_observation(record, args.backend)
                 block["passed"] = True
                 publish()
                 print(
@@ -327,13 +364,20 @@ def main():
                 )
         evidence["summary"] = summarize_blocks(evidence["blocks"], args.profile)
         memory = evidence["worker"]["memory"]
-        if memory["samples"] < 2 or memory["errors"] or not memory["gpu_uuids"]:
-            raise AssertionError("incomplete memory sampling")
-        if (
-            not 0 < memory["peak_host_rss_bytes"] <= 8 * 1024**3
-            or not 0 < memory["peak_gpu_memory_bytes"] <= 18 * 1024**3
-        ):
-            raise AssertionError("sampled peak memory cap exceeded")
+        if args.backend == "metal":
+            validate_metal_memory(memory)
+            if (not evidence["worker"].get("graceful_stop") or
+                    evidence["worker"].get("remaining_group_members")):
+                raise AssertionError("Metal stress worker did not drain")
+            swapouts = [block["quiescent_memory"]["swapout_bytes"] for block in evidence["blocks"]]
+            if max(swapouts) != min(swapouts):
+                raise AssertionError("Metal stress observed swapout growth")
+        else:
+            if memory["samples"] < 2 or memory["errors"] or not memory["gpu_uuids"]:
+                raise AssertionError("incomplete memory sampling")
+            if (not 0 < memory["peak_host_rss_bytes"] <= 8 * 1024**3 or
+                    not 0 < memory["peak_gpu_memory_bytes"] <= 18 * 1024**3):
+                raise AssertionError("sampled peak memory cap exceeded")
         if git_provenance(REPO) != evidence["source"]:
             raise AssertionError("source changed")
         for path, key in [

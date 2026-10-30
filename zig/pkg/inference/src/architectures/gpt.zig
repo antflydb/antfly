@@ -3440,6 +3440,28 @@ fn forwardFinalHiddenWithSharedKvOutput(
     // attention after the hook has begun mutating its private branch.
     if (require_context_decode_frame and !owns_context_forward_frame)
         return error.ContextFramedExecutionUnsupported;
+    var owns_attention_match_forward_frame = false;
+    defer if (owns_attention_match_forward_frame)
+        finishMetalAttentionMatchForwardFrame(cb, decode_context.?, false) catch {};
+    if (comptime build_options.enable_metal) {
+        if (batch == 1 and isDecodeStep(decode_context) and trace_sink == null and
+            config.family == .gemma and config.hasPle() and config.usesGemma4Channels() and
+            metalAttentionMatchInstalled(cb, decode_context) and
+            attentionMatchForwardFrameShape(batch, decode_context.?) and
+            !cb.decoderRuntimeHasActiveFrame())
+        {
+            const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            if (compute.attentionMatchExecution().forward_frame) {
+                const dc = decode_context.?;
+                owns_attention_match_forward_frame = try compute.beginAttentionMatchForwardFrame(
+                    dc.kv_storage.?,
+                    &config,
+                    dc.total_sequence_len - 1,
+                );
+                if (owns_attention_match_forward_frame) try cb.decoderRuntimeSetActiveFrameRegime(.decode);
+            }
+        }
+    }
     // A long-lived Metal frame may recycle a released buffer immediately for
     // a later encoded layer even though an earlier command still reads it.
     // Keep prior hidden tensors owned until frame completion; this retains the
@@ -3449,7 +3471,7 @@ fn forwardFinalHiddenWithSharedKvOutput(
         for (deferred_a4b_hidden_frees.items) |tensor| cb.free(tensor);
         deferred_a4b_hidden_frees.deinit(allocator);
     }
-    if (owns_a4b_forward_frame or owns_context_forward_frame) {
+    if (owns_a4b_forward_frame or owns_context_forward_frame or owns_attention_match_forward_frame) {
         try deferred_a4b_hidden_frees.ensureTotalCapacity(
             allocator,
             config.num_hidden_layers * 2 + 2,
@@ -3479,7 +3501,7 @@ fn forwardFinalHiddenWithSharedKvOutput(
     // buffers. Those copies are useful for per-layer frames, but inside this
     // cross-layer frame they add one blit and a long dependency chain per
     // layer. Let the naturally device-resident result flow directly instead.
-    var reserved_hidden: ?ReservedHiddenCarrier = if (owns_a4b_forward_frame or owns_context_forward_frame)
+    var reserved_hidden: ?ReservedHiddenCarrier = if (owns_a4b_forward_frame or owns_context_forward_frame or owns_attention_match_forward_frame)
         null
     else
         try ReservedHiddenCarrier.init(cb, hidden, total, hidden_size);
@@ -3563,7 +3585,7 @@ fn forwardFinalHiddenWithSharedKvOutput(
             owns_hidden = false;
         } else {
             if (new_hidden != hidden) {
-                if (owns_a4b_forward_frame or owns_context_forward_frame)
+                if (owns_a4b_forward_frame or owns_context_forward_frame or owns_attention_match_forward_frame)
                     deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
                 else
                     cb.free(hidden);
@@ -3575,7 +3597,7 @@ fn forwardFinalHiddenWithSharedKvOutput(
         if (cb.kind() == .metal and forceLayerCloneDebug()) {
             const cloned_hidden = try cloneTensorMaterialized(cb, allocator, hidden);
             if (owns_hidden) {
-                if (owns_a4b_forward_frame or owns_context_forward_frame)
+                if (owns_a4b_forward_frame or owns_context_forward_frame or owns_attention_match_forward_frame)
                     deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
                 else
                     cb.free(hidden);
@@ -3637,12 +3659,18 @@ fn forwardFinalHiddenWithSharedKvOutput(
         reserved_hidden = null;
         owns_hidden = true;
     } else if (final_hidden != hidden) {
-        if (owns_a4b_forward_frame or owns_context_forward_frame)
+        if (owns_a4b_forward_frame or owns_context_forward_frame or owns_attention_match_forward_frame)
             deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
         else
             cb.free(hidden);
     }
     hidden = final_hidden;
+    if (owns_attention_match_forward_frame) {
+        try finishMetalAttentionMatchForwardFrame(cb, decode_context.?, true);
+        owns_attention_match_forward_frame = false;
+        for (deferred_a4b_hidden_frees.items) |tensor| cb.free(tensor);
+        deferred_a4b_hidden_frees.clearRetainingCapacity();
+    }
     if (owns_qwen3vl_forward_frame) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         owns_qwen3vl_forward_frame = false;
@@ -6399,20 +6427,23 @@ fn decoderBlock(
     }
     defer if (owns_qwen3vl_prefill_frame) cb.decoderRuntimeCancelFrame() catch {};
 
-    // Independent Gemma4 KV rows use the eager batched math, rather than the
-    // singleton prepared decoder. Bound temporary lifetimes to one layer while
-    // coalescing its GPU dispatches; singleton direct decoding is unaffected.
-    var owns_gemma4_batch_frame = false;
+    // Independent KV rows and installed ragged KV use Gemma4's eager math.
+    // Keep its projection and FFN dispatches in bounded layer frames around
+    // the synchronous attention fence, retaining the same tensor lifetimes.
+    var owns_gemma4_eager_layer_frame = false;
+    const independent_gemma4_rows = batch <= 4 and decode_context != null and
+        decode_context.?.kv_batch != null and
+        !getenvBool("ANTFLY_GEMMA4_METAL_OCR_DISABLE_LAYER_FRAMES");
+    const installed_gemma4_attention = batch == 1 and metalAttentionMatchInstalled(cb, decode_context);
     if (cb.kind() == .metal and config.family == .gemma and config.hasPle() and
         config.usesGemma4Channels() and isDecodeStep(decode_context) and
-        batch <= 4 and decode_context != null and decode_context.?.kv_batch != null and
-        !getenvBool("ANTFLY_GEMMA4_METAL_OCR_DISABLE_LAYER_FRAMES") and
+        (independent_gemma4_rows or installed_gemma4_attention) and
         !cb.decoderRuntimeHasActiveFrame())
     {
-        owns_gemma4_batch_frame = try cb.decoderRuntimeBeginFrame();
-        if (owns_gemma4_batch_frame) try cb.decoderRuntimeSetActiveFrameRegime(.decode);
+        owns_gemma4_eager_layer_frame = try cb.decoderRuntimeBeginFrame();
+        if (owns_gemma4_eager_layer_frame) try cb.decoderRuntimeSetActiveFrameRegime(.decode);
     }
-    defer if (owns_gemma4_batch_frame) cb.decoderRuntimeCancelFrame() catch {};
+    defer if (owns_gemma4_eager_layer_frame) cb.decoderRuntimeCancelFrame() catch {};
 
     const result = try decoderBlockImpl(
         cb,
@@ -6446,9 +6477,9 @@ fn decoderBlock(
         try cb.decoderRuntimeSubmitAndWaitFrame();
         owns_qwen3vl_prefill_frame = false;
     }
-    if (owns_gemma4_batch_frame) {
+    if (owns_gemma4_eager_layer_frame) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
-        owns_gemma4_batch_frame = false;
+        owns_gemma4_eager_layer_frame = false;
     }
     return result;
 }
@@ -6952,7 +6983,7 @@ fn decoderBlockImpl(
     var qk_already_roped = false;
     var fused_q_rope: ?CT = null;
     var fused_k_rope: ?CT = null;
-    if (!shares_kv and config.family == .gemma and config.position_encoding == .rope and batch == 1) fused_blk: {
+    if (config.family == .gemma and config.position_encoding == .rope and batch == 1) fused_blk: {
         const rope_dim = config.layerRopeActiveDim(layer);
         const rope_theta = config.layerRopeEffectiveTheta(layer);
         const offset = positionOffset(seq_len, total, decode_context);
@@ -6960,11 +6991,13 @@ fn decoderBlockImpl(
         const q_scale = if (config.global_head_dim != 0) @sqrt(@as(f32, @floatFromInt(head_dim))) else 1.0;
         fused_q_rope = try maybeApplyQKHeadNormRope(cb, allocator, config, Q, total, num_heads * head_dim, layer, "q", head_dim, rope_dim, rope_theta, config.rope_freq_scale, offset, total, consecutive_pairs, q_scale, &name_buf);
         if (fused_q_rope == null) break :fused_blk;
-        fused_k_rope = try maybeApplyQKHeadNormRope(cb, allocator, config, K, total, num_kv_heads * head_dim, layer, "k", head_dim, rope_dim, rope_theta, config.rope_freq_scale, offset, total, consecutive_pairs, 1.0, &name_buf);
-        if (fused_k_rope == null) {
-            if (fused_q_rope) |tensor| cb.free(tensor);
-            fused_q_rope = null;
-            break :fused_blk;
+        if (!shares_kv) {
+            fused_k_rope = try maybeApplyQKHeadNormRope(cb, allocator, config, K, total, num_kv_heads * head_dim, layer, "k", head_dim, rope_dim, rope_theta, config.rope_freq_scale, offset, total, consecutive_pairs, 1.0, &name_buf);
+            if (fused_k_rope == null) {
+                if (fused_q_rope) |tensor| cb.free(tensor);
+                fused_q_rope = null;
+                break :fused_blk;
+            }
         }
         qk_already_roped = true;
     }
@@ -8052,6 +8085,46 @@ fn metalAttentionMatchInstalled(
     const storage = dc.kv_storage orelse return false;
     const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
     return compute.hasInstalledAttentionMatch(storage);
+}
+
+fn finishMetalAttentionMatchForwardFrame(cb: *const ComputeBackend, dc: *const DecodeContext, accept: bool) !void {
+    if (comptime !build_options.enable_metal) return error.UnsupportedOperation;
+    const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    try compute.finishAttentionMatchForwardFrame(dc.kv_storage orelse return error.InvalidAttentionMatchCache, accept);
+}
+
+fn attentionMatchForwardFrameShape(batch: usize, dc: *const DecodeContext) bool {
+    if (batch != 1 or dc.query_sequence_len != 1 or dc.total_sequence_len == 0 or dc.kv_storage == null) return false;
+    const items = dc.kv_batch orelse return true;
+    if (items.len != 1) return false;
+    const item = items[0];
+    const storage = item.kv_storage orelse item.kv_cache.kv_storage orelse return false;
+    return storage == dc.kv_storage.? and
+        (item.per_item_query_len orelse dc.query_sequence_len) == 1 and
+        (item.per_item_total_len orelse dc.total_sequence_len) == dc.total_sequence_len;
+}
+
+test "attention_match Metal forward frame admits only one consistent owner" {
+    var storage: runtime.kv.storage_runtime.KvStorageRuntime = undefined;
+    var manager: runtime.kv.manager.KvManager = undefined;
+    var item: DecodeContext.KvBatchView = .{
+        .kv_cache = .{ .sequence_id = 1, .pool_id = 1, .logical_block_count = 1, .tail_tokens = 1 },
+        .kv_manager = &manager,
+        .kv_storage = &storage,
+    };
+    var dc: DecodeContext = .{ .kv_storage = &storage, .query_sequence_len = 1, .total_sequence_len = 9, .kv_sequence_len = 9 };
+    try std.testing.expect(attentionMatchForwardFrameShape(1, &dc));
+    dc.kv_batch = (&item)[0..1];
+    try std.testing.expect(attentionMatchForwardFrameShape(1, &dc));
+    try std.testing.expect(!attentionMatchForwardFrameShape(2, &dc));
+    item.per_item_query_len = 2;
+    try std.testing.expect(!attentionMatchForwardFrameShape(1, &dc));
+    item.per_item_query_len = 1;
+    item.per_item_total_len = 8;
+    try std.testing.expect(!attentionMatchForwardFrameShape(1, &dc));
+    item.per_item_total_len = 9;
+    item.kv_storage = null;
+    try std.testing.expect(!attentionMatchForwardFrameShape(1, &dc));
 }
 
 /// Add one Qwen3-VL DeepStack tap to visual rows after the corresponding text

@@ -20,8 +20,54 @@ from qualify_native_checkpoint_quality import (
     completed_summary,
     coverage,
     fp8_noninferiority,
+    resident_representation,
 )
 from native_quality_score import evaluate
+
+
+class ResidentRepresentationTests(unittest.TestCase):
+    def metadata(self, encoding, heads=0, fallback=0):
+        row = {
+            "encoding": encoding,
+            "validated_heads": heads + fallback,
+            encoding + "_heads": heads,
+            encoding + "_fallback_heads": fallback,
+        }
+        if encoding == "rotated4":
+            row.update(rotated4_compressed_rows=heads,
+                       rotated4_exact_rows=fallback,
+                       rotated4_eligible_rows=heads + fallback)
+        return row
+
+    def test_wire_encoding_does_not_claim_resident_codec_after_fallback(self):
+        for encoding in ("fp8", "rotated4"):
+            for fallback in (0, 6):
+                with self.subTest(encoding=encoding, fallback=fallback):
+                    self.assertEqual("f16", resident_representation(
+                        self.metadata(encoding, fallback=fallback), encoding))
+
+    def test_actual_and_mixed_fallback_heads_require_encoded_residency(self):
+        for encoding in ("fp8", "rotated4"):
+            for fallback in (0, 5):
+                with self.subTest(encoding=encoding, fallback=fallback):
+                    self.assertEqual(encoding, resident_representation(
+                        self.metadata(encoding, heads=1, fallback=fallback), encoding))
+        self.assertEqual("f16", resident_representation({"encoding": "f16"}, "f16"))
+
+    def test_invalid_or_mismatched_codec_evidence_cannot_become_f16(self):
+        for encoding in ("fp8", "rotated4"):
+            row = self.metadata(encoding, fallback=6)
+            row[encoding + "_heads"] = True
+            with self.subTest(encoding=encoding), self.assertRaises(AssertionError):
+                resident_representation(row, encoding)
+        with self.assertRaises(ValueError):
+            resident_representation(self.metadata("fp8"), "rotated4")
+        with self.assertRaises(AssertionError):
+            resident_representation({"encoding": "fp8"}, "fp8")
+        row = self.metadata("rotated4", fallback=6)
+        row["rotated4_compressed_rows"] = 1
+        with self.assertRaises(AssertionError):
+            resident_representation(row, "rotated4")
 
 
 class CoverageTests(unittest.TestCase):
@@ -101,6 +147,25 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(result["categories"]["tool_call"]["compacted"], 0)
         self.assertEqual(result["categories"]["fact"]["compacted_resume_correct"], 1)
 
+    def test_unchanged_quantized_checkpoint_retains_f16_without_codec_coverage(self):
+        fixtures = ResidentRepresentationTests()
+        for encoding in ("fp8", "rotated4"):
+            checkpoints = copy.deepcopy(self.checkpoints)
+            for checkpoint in checkpoints:
+                checkpoint["metadata"].update(
+                    fixtures.metadata(encoding),
+                    outcome="unchanged_insufficient_savings",
+                    global_savings_ratio=1,
+                )
+                self.assertEqual("f16", resident_representation(
+                    checkpoint["metadata"], encoding))
+            result = coverage(
+                self.cases, self.responses, self.responses, checkpoints, encoding
+            )
+            with self.subTest(encoding=encoding):
+                self.assertFalse(result["every_category_exercised_compaction"])
+                self.assertFalse(result["every_category_exercised_" + encoding])
+                self.assertFalse(result[encoding + "_quality_passed"])
     def test_reordered_or_incomplete_evidence_rejected(self):
         self.checkpoints.reverse()
         with self.assertRaises(ValueError):
@@ -203,6 +268,40 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(
             result["categories"]["fact"]["fp8_regression_case_ids"], ["fact-0"]
         )
+
+    def test_rotated4_requires_real_compressed_rows_and_tracks_regressions(self):
+        cases = [dict(self.cases[0], case_id=f"fact-{i}") for i in range(2)]
+        good = self.responses[0]
+        bad = copy.deepcopy(good)
+        bad["response"]["choices"][0]["message"]["content"] = "wrong"
+        checkpoints = [
+            dict(
+                self.checkpoints[0],
+                case_id=case["case_id"],
+                metadata=dict(
+                    self.checkpoints[0]["metadata"],
+                    encoding="rotated4",
+                    rotated4_heads=2,
+                    rotated4_fallback_heads=4,
+                    rotated4_eligible_rows=80,
+                    rotated4_compressed_rows=15,
+                    rotated4_exact_rows=65,
+                ),
+            )
+            for case in cases
+        ]
+        result = coverage(
+            cases, [good, bad], [bad, good], checkpoints, encoding="rotated4"
+        )
+        self.assertTrue(result["every_category_exercised_rotated4"])
+        self.assertFalse(result["rotated4_quality_passed"])
+        self.assertEqual(
+            result["categories"]["fact"]["rotated4_regression_case_ids"],
+            ["fact-0"],
+        )
+        checkpoints[0]["metadata"]["rotated4_compressed_rows"] = 0
+        with self.assertRaises(ValueError):
+            coverage(cases, [good, bad], [bad, good], checkpoints, encoding="rotated4")
 
     def test_fp8_accounting_must_match_encoding_and_validated_heads(self):
         for changes in [

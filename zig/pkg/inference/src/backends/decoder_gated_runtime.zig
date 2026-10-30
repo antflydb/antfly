@@ -648,6 +648,22 @@ fn maybeDumpInitialGatedInputs(
     }
 }
 
+fn applyGemmaAttentionPrenorm(cb: *const ops.ComputeBackend, request: *const ops.DecoderRuntimeApplyRmsNormRequest) !?ops.CT {
+    if (comptime build_options.enable_metal) if (cb.kind() == .metal) {
+        const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (try compute.attentionMatchPrenorm(request)) |tensor| return tensor;
+    };
+    return cb.decoderRuntimeApplyRmsNorm(request);
+}
+
+fn applyGemmaAttentionProjection(cb: *const ops.ComputeBackend, request: *const ops.DecoderRuntimeApplyLinearRequest, index: usize) !?ops.CT {
+    if (comptime build_options.enable_metal) if (cb.kind() == .metal) {
+        const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (try compute.attentionMatchProjection(request, index)) |tensor| return tensor;
+    };
+    return cb.decoderRuntimeApplyLinear(request);
+}
+
 fn prepareGemmaQueryForAttention(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -684,12 +700,22 @@ fn prepareGemmaValueForAttention(
     shares_kv: bool,
 ) !ops.CT {
     if (gpt_config.global_head_dim == 0 or shares_kv) return v_input;
-    const ones = try allocator.alloc(f32, head_dim);
-    defer allocator.free(ones);
-    @memset(ones, 1.0);
-    const ones_shape = [_]i32{@intCast(head_dim)};
-    const ones_ct = try cb.fromFloat32Shape(ones, &ones_shape);
-    defer cb.free(ones_ct);
+    const cached_ones: ?ops.CT = if (comptime build_options.enable_metal) blk: {
+        if (cb.kind() != .metal) break :blk null;
+        const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        break :blk compute.attentionMatchValueNormOnes(head_dim);
+    } else null;
+    var owned_ones: ?ops.CT = null;
+    defer if (owned_ones) |weight| cb.free(weight);
+    const ones_ct = cached_ones orelse blk: {
+        const ones = try allocator.alloc(f32, head_dim);
+        defer allocator.free(ones);
+        @memset(ones, 1.0);
+        const ones_shape = [_]i32{@intCast(head_dim)};
+        const weight = try cb.fromFloat32Shape(ones, &ones_shape);
+        owned_ones = weight;
+        break :blk weight;
+    };
 
     if (try cb.reshape2d(v_input, rows * num_kv_heads, head_dim)) |reshaped| {
         defer cb.free(reshaped);
@@ -2388,6 +2414,17 @@ fn finishDecoderRuntimeFrame(cb: *const ops.ComputeBackend, active: *bool) !void
     try cb.decoderRuntimeSubmitAndWaitFrame();
 }
 
+/// A hidden-state producer may join a caller-owned native frame. Transfer no
+/// submit/cancel authority back from that borrowed producer: the caller keeps
+/// the final norm, output projection and token selection in its transaction.
+fn finishDecoderHiddenFrame(cb: *const ops.ComputeBackend, active: *bool, borrowed: bool) !void {
+    if (borrowed) {
+        active.* = false;
+        return;
+    }
+    try finishDecoderRuntimeFrame(cb, active);
+}
+
 fn cancelDecoderRuntimeFrame(cb: *const ops.ComputeBackend, active: *bool) void {
     if (!active.*) return;
     cb.decoderRuntimeCancelFrame() catch |err| {
@@ -2478,8 +2515,14 @@ fn forwardFinalHiddenTensorGemmaDirect(
             ple_vectors != null,
         },
     );
+    const native_storage_attention = if (comptime build_options.enable_metal) blk: {
+        if (cb.kind() != .metal) break :blk false;
+        const storage = decode_context.kv_storage orelse break :blk false;
+        const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        break :blk compute.hasInstalledAttentionMatch(storage);
+    } else false;
     var planned_barriers_suppressed = false;
-    if (decoder_frame_active and decode_context.context_session == null) {
+    if (decoder_frame_active and decode_context.context_session == null and !native_storage_attention) {
         // Gemma direct-runtime frames encode their full producer/consumer order
         // in one backend-owned command plan. Avoid per-dispatch buffer barriers
         // on this hot path. Context attention deliberately takes the staged
@@ -2595,7 +2638,12 @@ fn forwardFinalHiddenTensorGemmaDirect(
         );
     }
 
-    const use_copy_based_reserved_hidden = !decoder_frame_active or phase != .prefill or decode_context.query_sequence_len <= 1;
+    const retained_native_hidden: ?*metal_compute_mod.MetalCompute = if (comptime build_options.enable_metal) blk: {
+        if (!native_storage_attention or phase == .prefill) break :blk null;
+        const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        break :blk if (compute.attentionMatchForwardRetainsHidden(hidden_input)) compute else null;
+    } else null;
+    const use_copy_based_reserved_hidden = retained_native_hidden == null and (!decoder_frame_active or phase != .prefill or decode_context.query_sequence_len <= 1);
     var reserved_hidden: ?ReservedHiddenCarrier = if (disableReservedHiddenCarrierRequested() or !use_copy_based_reserved_hidden)
         null
     else
@@ -2618,6 +2666,16 @@ fn forwardFinalHiddenTensorGemmaDirect(
 
     const layer_count: usize = gpt_config.num_hidden_layers;
     for (0..layer_count) |layer| {
+        if (comptime build_options.enable_metal) if (native_storage_attention) {
+            const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            try compute.enterAttentionMatchForwardLayer(layer);
+        };
+        if (comptime build_options.enable_metal) if (retained_native_hidden) |compute| {
+            // Request-owned layer outputs already remain live through the frame.
+            // Only pool-owned allocations need an additional completion lease.
+            if (compute.attentionMatchForwardRetainsHidden(hidden))
+                try compute.retainAttentionMatchForwardHidden(hidden);
+        };
         if (phase == .prefill) timing_stats.prefill_layers += 1;
         var layer_input_snapshot: ?ops.CT = null;
         defer if (layer_input_snapshot) |ct| cb.free(ct);
@@ -2647,7 +2705,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
         const kv_dim = num_kv_heads * head_dim;
 
         const attention_qkv_started_at = monotonicNowNs();
-        const attn_normed = (try cb.decoderRuntimeApplyRmsNorm(&.{
+        const attn_normed = (try applyGemmaAttentionPrenorm(cb, &.{
             .slot = normSlot(layer, .attn_pre),
             .input = hidden,
             .hidden_size = gpt_config.hidden_size,
@@ -2817,17 +2875,26 @@ fn forwardFinalHiddenTensorGemmaDirect(
         }
 
         const q: ops.CT, const k_value: ops.CT, const v_value: ops.CT = if (shares_kv) blk: {
-            const q_local = (try cb.decoderRuntimeApplyLinear(&.{
+            const q_local = (try applyGemmaAttentionProjection(cb, &.{
                 .slot = linearSlot(layer, .attn_q),
                 .input = attn_normed,
                 .in_dim = gpt_config.hidden_size,
                 .out_dim = gpt_config.num_attention_heads * head_dim,
-            })) orelse {
+            }, 0)) orelse {
                 if (owns_hidden) cb.free(hidden);
                 return null;
             };
             if (phase == .prefill) timing_stats.prefill_q_linear_ops += 1;
             errdefer cb.free(q_local);
+            if (native_storage_attention and decode_context.query_sequence_len == 1) {
+                // Shared native KV ignores these suffix operands. Retained Q
+                // views preserve their shapes and lifetime without allocating
+                // or clearing two unused shared Metal buffers in every layer.
+                const unused_k = try cb.sliceLastDim(q_local, 0, kv_dim);
+                errdefer cb.free(unused_k);
+                const unused_v = try cb.sliceLastDim(q_local, 0, kv_dim);
+                break :blk .{ q_local, unused_k, unused_v };
+            }
             const zero_k = try createZeroTensor(cb, allocator, decode_context.query_sequence_len * kv_dim);
             errdefer cb.free(zero_k);
             const zero_v = try createZeroTensor(cb, allocator, decode_context.query_sequence_len * kv_dim);
@@ -2859,35 +2926,35 @@ fn forwardFinalHiddenTensorGemmaDirect(
                 timing_stats.prefill_qkv_split_ops += 1;
             }
 
-            const q_local = (try cb.decoderRuntimeApplyLinear(&.{
+            const q_local = (try applyGemmaAttentionProjection(cb, &.{
                 .slot = linearSlot(layer, .attn_q),
                 .input = attn_normed,
                 .in_dim = gpt_config.hidden_size,
                 .out_dim = gpt_config.num_attention_heads * head_dim,
-            })) orelse {
+            }, 0)) orelse {
                 if (owns_hidden) cb.free(hidden);
                 return null;
             };
             if (phase == .prefill) timing_stats.prefill_q_linear_ops += 1;
             errdefer cb.free(q_local);
             if (gpt_config.family == .gemma) {
-                const k_local = (try cb.decoderRuntimeApplyLinear(&.{
+                const k_local = (try applyGemmaAttentionProjection(cb, &.{
                     .slot = linearSlot(layer, .attn_k),
                     .input = attn_normed,
                     .in_dim = gpt_config.hidden_size,
                     .out_dim = kv_dim,
-                })) orelse {
+                }, 1)) orelse {
                     cb.free(q_local);
                     if (owns_hidden) cb.free(hidden);
                     return null;
                 };
                 errdefer cb.free(k_local);
-                const v_local = (try cb.decoderRuntimeApplyLinear(&.{
+                const v_local = (try applyGemmaAttentionProjection(cb, &.{
                     .slot = linearSlot(layer, .attn_v),
                     .input = attn_normed,
                     .in_dim = gpt_config.hidden_size,
                     .out_dim = kv_dim,
-                })) orelse {
+                }, 2)) orelse {
                     cb.free(q_local);
                     cb.free(k_local);
                     if (owns_hidden) cb.free(hidden);
@@ -2931,7 +2998,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
         var qk_already_roped = false;
         var fused_q_rope: ?ops.CT = null;
         var fused_k_rope: ?ops.CT = null;
-        if (!shares_kv and gpt_config.family == .gemma and gpt_config.position_encoding == .rope and decode_context.query_sequence_len == 1) fused_blk: {
+        if (gpt_config.family == .gemma and gpt_config.position_encoding == .rope and decode_context.query_sequence_len == 1) fused_blk: {
             const rope_dim = gpt_config.layerRopeActiveDim(layer);
             const rope_theta = gpt_config.layerRopeEffectiveTheta(layer);
             const position_offset = gpt_arch.positionOffset(seq_len, decode_context.query_sequence_len, decode_context);
@@ -2958,29 +3025,31 @@ fn forwardFinalHiddenTensorGemmaDirect(
             );
             if (fused_q_rope == null) break :fused_blk;
             errdefer if (fused_q_rope) |tensor| cb.free(tensor);
-            fused_k_rope = try gpt_arch.maybeApplyQKHeadNormRope(
-                cb,
-                allocator,
-                gpt_config,
-                k_value,
-                decode_context.query_sequence_len,
-                @intCast(num_kv_heads * head_dim),
-                layer,
-                "k",
-                @intCast(head_dim),
-                rope_dim,
-                rope_theta,
-                gpt_config.rope_freq_scale,
-                position_offset,
-                decode_context.query_sequence_len,
-                rope_consecutive_pairs,
-                1.0,
-                &name_buf,
-            );
-            if (fused_k_rope == null) {
-                if (fused_q_rope) |tensor| cb.free(tensor);
-                fused_q_rope = null;
-                break :fused_blk;
+            if (!shares_kv) {
+                fused_k_rope = try gpt_arch.maybeApplyQKHeadNormRope(
+                    cb,
+                    allocator,
+                    gpt_config,
+                    k_value,
+                    decode_context.query_sequence_len,
+                    @intCast(num_kv_heads * head_dim),
+                    layer,
+                    "k",
+                    @intCast(head_dim),
+                    rope_dim,
+                    rope_theta,
+                    gpt_config.rope_freq_scale,
+                    position_offset,
+                    decode_context.query_sequence_len,
+                    rope_consecutive_pairs,
+                    1.0,
+                    &name_buf,
+                );
+                if (fused_k_rope == null) {
+                    if (fused_q_rope) |tensor| cb.free(tensor);
+                    fused_q_rope = null;
+                    break :fused_blk;
+                }
             }
             qk_already_roped = true;
         }
@@ -3506,10 +3575,32 @@ fn forwardFinalHiddenTensorGemmaDirect(
             }
         }
 
-        if (decode_context.attention_mode == .paged_decode and decode_context.query_sequence_len == 1 and !disableActivePagedGatedBlockForDecodeRequested() and (gpt_config.position_encoding != .rope or qk_already_roped)) {
+        const native_execution: @import("../runtime/kv/attention_match_release.zig").Execution = if (comptime build_options.enable_metal)
+            (if (native_storage_attention) @as(*metal_compute_mod.MetalCompute, @ptrCast(@alignCast(cb.ptr))).attentionMatchExecution() else .{})
+        else
+            .{};
+        if ((!native_storage_attention or native_execution.precomputed_tail) and decode_context.attention_mode == .paged_decode and decode_context.query_sequence_len == 1 and !disableActivePagedGatedBlockForDecodeRequested() and (gpt_config.position_encoding != .rope or qk_already_roped)) {
             var attention = gpt_arch.attentionContextFromDecode(decode_context);
             attention.layer_index = kv_layer_index;
             attention.skip_kv_write = shares_kv;
+            if (native_storage_attention) {
+                attention.context_consumer_layer = @intCast(layer);
+                attention.sliding_window = if (gpt_config.layerUsesSlidingAttention(layer) and !platform.env.getenvBool("TERMITE_DISABLE_SLIDING_ATTENTION")) gpt_config.sliding_window else 0;
+            }
+            var block_ple_input: ?ops.CT = null;
+            defer if (block_ple_input) |value| cb.free(value);
+            var block_output_scale: ?ops.CT = null;
+            defer if (block_output_scale) |value| cb.free(value);
+            if (native_storage_attention and native_execution.ple_tail and
+                !disableDirectPleRequested() and !materializeDirectPleSliceRequested())
+            {
+                if (ple_vectors) |ple| {
+                    const ple_dim: usize = gpt_config.ple_hidden_size;
+                    const offset = layer * ple_dim;
+                    block_ple_input = try cb.sliceLastDim(ple, offset, offset + ple_dim);
+                    block_output_scale = getLayerOutputScaleWeight(cb, gpt_config, layer);
+                }
+            }
             const block_started_at = monotonicNowNs();
             if (try cb.runGatedDecoderBlock(&.{
                 .q = q_for_attn,
@@ -3532,6 +3623,12 @@ fn forwardFinalHiddenTensorGemmaDirect(
                 .down_ffn_linear_slot = linearSlot(layer, .mlp_down),
                 .intermediate_size = gpt_config.intermediateSize(layer),
                 .activation = decoderActivationKind(gpt_config),
+                .ple = block_ple_input,
+                .ple_gate_linear_slot = if (block_ple_input != null) pleGateSlot(configured_layer_count, layer) else null,
+                .ple_proj_linear_slot = if (block_ple_input != null) pleProjSlot(configured_layer_count, layer) else null,
+                .ple_post_norm_slot = if (block_ple_input != null) plePostNormSlot(configured_layer_count, layer) else null,
+                .ple_hidden_size = if (block_ple_input != null) gpt_config.ple_hidden_size else 0,
+                .output_scale = block_output_scale,
                 .graph_plan_tail_vocab_size = gpt_config.vocab_size,
             })) |block_hidden| {
                 const block_finished_at = monotonicNowNs();
@@ -3547,8 +3644,9 @@ fn forwardFinalHiddenTensorGemmaDirect(
                     addBlockAttentionTiming(phase, attention_finished_at - attention_started_at);
                 }
                 var layer_result = block_hidden;
-                var layer_result_output_scaled = false;
-                if (ple_vectors) |ple| {
+                var layer_result_output_scaled = block_output_scale != null;
+                if (block_ple_input == null and ple_vectors != null) {
+                    const ple = ple_vectors.?;
                     const ple_started_at = monotonicNowNs();
                     const ple_output_scale = if (!disableDirectPleRequested())
                         try gpt_arch.getLayerOutputScaleWeight(cb, gpt_config, layer)
@@ -3644,7 +3742,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             }
         }
 
-        if (decode_context.attention_mode == .paged_decode and decode_context.query_sequence_len == 1 and !disableActivePagedGatedBlockForDecodeRequested()) {
+        if (!native_storage_attention and decode_context.attention_mode == .paged_decode and decode_context.query_sequence_len == 1 and !disableActivePagedGatedBlockForDecodeRequested()) {
             var attention = gpt_arch.attentionContextFromDecode(decode_context);
             attention.layer_index = kv_layer_index;
             attention.skip_kv_write = shares_kv;
@@ -3791,8 +3889,8 @@ fn forwardFinalHiddenTensorGemmaDirect(
         const attention_apply_started_at = monotonicNowNs();
         const attn_residual = if (decode_context.attention_mode == .paged_decode and decode_context.query_sequence_len == 1) blk: {
             const fused_residual_started_at = monotonicNowNs();
-            if (!qk_already_roped) {
-                if (try gpt_arch.applyAttentionResidual(
+            const fused_attn_residual_result = if (qk_already_roped)
+                try gpt_arch.applyPreparedAttentionResidual(
                     cb,
                     gpt_config,
                     q_for_attn,
@@ -3812,14 +3910,36 @@ fn forwardFinalHiddenTensorGemmaDirect(
                     null,
                     normSlot(layer, .attn_post),
                     decode_context,
-                )) |fused_attn_residual| {
-                    recordGemmaDirectAttentionResidual(true, true);
-                    const fused_residual_finished_at = monotonicNowNs();
-                    if (fused_residual_finished_at > fused_residual_started_at) {
-                        addBlockAttentionFusedResidualTiming(phase, fused_residual_finished_at - fused_residual_started_at);
-                    }
-                    break :blk fused_attn_residual;
+                )
+            else
+                try gpt_arch.applyAttentionResidual(
+                    cb,
+                    gpt_config,
+                    q_for_attn,
+                    k_attn,
+                    v_for_attn,
+                    hidden,
+                    1,
+                    seq_len,
+                    gpt_config.num_attention_heads,
+                    num_kv_heads,
+                    head_dim,
+                    gpt_config.hidden_size,
+                    layer,
+                    kv_layer_index,
+                    shares_kv,
+                    linearSlot(layer, .attn_out_proj),
+                    null,
+                    normSlot(layer, .attn_post),
+                    decode_context,
+                );
+            if (fused_attn_residual_result) |fused_attn_residual| {
+                recordGemmaDirectAttentionResidual(true, true);
+                const fused_residual_finished_at = monotonicNowNs();
+                if (fused_residual_finished_at > fused_residual_started_at) {
+                    addBlockAttentionFusedResidualTiming(phase, fused_residual_finished_at - fused_residual_started_at);
                 }
+                break :blk fused_attn_residual;
             }
 
             const attn_out = if (qk_already_roped)
@@ -5137,8 +5257,18 @@ fn forwardFinalHiddenTensorGemmaDirect(
         }
     }
 
-    return_decoder_frame = decoder_frame_active and phase == .prefill and decode_context.query_sequence_len > 1;
-    if (!return_decoder_frame) try finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+    if (comptime build_options.enable_metal) if (retained_native_hidden) |compute| {
+        // Request-owned layer outputs already remain live through the frame.
+        // Only pool-owned allocations need an additional completion lease.
+        if (compute.attentionMatchForwardRetainsHidden(hidden))
+            try compute.retainAttentionMatchForwardHidden(hidden);
+    };
+    const borrowed_native_frame = if (comptime build_options.enable_metal)
+        native_storage_attention and @as(*metal_compute_mod.MetalCompute, @ptrCast(@alignCast(cb.ptr))).attention_match_forward_active
+    else
+        false;
+    return_decoder_frame = !borrowed_native_frame and decoder_frame_active and phase == .prefill and decode_context.query_sequence_len > 1;
+    if (!return_decoder_frame) try finishDecoderHiddenFrame(cb, &decoder_frame_active, borrowed_native_frame);
     if (reserved_hidden) |*carrier| {
         carrier.deinit(cb, true);
         reserved_hidden = null;
@@ -5554,7 +5684,7 @@ fn prepareRuntime(
     try cb.checkExecutionControl();
     if (!supportsPreparedDecodeConfig(gpt_config)) return false;
     timing_stats.prepare_calls += 1;
-    var started_at = monotonicNowNs();
+    const started_at = monotonicNowNs();
     if (!(try cb.decoderRuntimePrepareGreedy(&.{
         .hidden_size = gpt_config.hidden_size,
         .intermediate_size = gpt_config.intermediate_size,
@@ -5568,9 +5698,36 @@ fn prepareRuntime(
         timing_stats.prepare_greedy_failures += 1;
         return false;
     }
-    var finished_at = monotonicNowNs();
+    const finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prepare_greedy_nanos += finished_at - started_at;
 
+    return prepareModelSlotsImpl(cb, allocator, gpt_config, configured_layer_count, include_lm_head);
+}
+
+/// Prepare immutable model weights and normalization slots without reserving
+/// ordinary KV, resetting a sequence, or preparing a decoder-family KV cache.
+/// Native installed owners can share these slots with the exact decoder.
+pub fn prepareModelSlots(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+) !bool {
+    try cb.checkExecutionControl();
+    if (!supportsPreparedDecodeConfig(gpt_config)) return false;
+    if (cb.decoderRuntimeHasActiveFrame()) return error.ContextTransactionBusy;
+    return prepareModelSlotsImpl(cb, allocator, gpt_config, configured_layer_count, true);
+}
+
+fn prepareModelSlotsImpl(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    include_lm_head: bool,
+) !bool {
+    var started_at = monotonicNowNs();
+    var finished_at = started_at;
     const prepared_layer_count = preparedLayers(@min(configured_layer_count, gpt_config.num_hidden_layers));
     for (0..prepared_layer_count) |layer| {
         try cb.checkExecutionControl();
@@ -7902,5 +8059,47 @@ test "context gated frame completion propagates device failure and never resubmi
         try std.testing.expectEqual(@as(usize, 1), probe.calls);
         try finishDecoderRuntimeFrame(&cb, &active);
         try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    }
+}
+
+test "attention_match Metal borrowed decoder frame includes tail and propagates caller submission failure" {
+    const Probe = struct {
+        tail_encoded: bool = false,
+        submits: usize = 0,
+        cancels: usize = 0,
+        fail: bool,
+        fn submit(raw: *anyopaque) !void {
+            const probe: *@This() = @ptrCast(@alignCast(raw));
+            if (!probe.tail_encoded) return error.TailSubmittedOutsideCallerFrame;
+            probe.submits += 1;
+            if (probe.fail) return error.InjectedBorrowedFrameFailure;
+        }
+        fn cancel(raw: *anyopaque) !void {
+            const probe: *@This() = @ptrCast(@alignCast(raw));
+            probe.cancels += 1;
+        }
+    };
+    var table = @import("../ops/native_compute.zig").vtable_impl;
+    table.decoderRuntimeSubmitAndWaitFrame = Probe.submit;
+    table.decoderRuntimeCancelFrame = Probe.cancel;
+    inline for (.{ true, false }) |fail| {
+        var probe: Probe = .{ .fail = fail };
+        const cb: ops.ComputeBackend = .{ .ptr = &probe, .vtable = &table };
+        var producer_active = true;
+        var caller_active = true;
+        try finishDecoderHiddenFrame(&cb, &producer_active, true);
+        cancelDecoderRuntimeFrame(&cb, &producer_active);
+        try std.testing.expect(!producer_active);
+        try std.testing.expect(caller_active);
+        try std.testing.expectEqual(@as(usize, 0), probe.submits);
+        try std.testing.expectEqual(@as(usize, 0), probe.cancels);
+        probe.tail_encoded = true;
+        if (fail) {
+            try std.testing.expectError(error.InjectedBorrowedFrameFailure, finishDecoderHiddenFrame(&cb, &caller_active, false));
+        } else try finishDecoderHiddenFrame(&cb, &caller_active, false);
+        try std.testing.expect(!caller_active);
+        try finishDecoderHiddenFrame(&cb, &caller_active, false);
+        try std.testing.expectEqual(@as(usize, 1), probe.submits);
+        try std.testing.expectEqual(@as(usize, 0), probe.cancels);
     }
 }

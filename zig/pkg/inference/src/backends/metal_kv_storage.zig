@@ -233,6 +233,7 @@ pub const AttentionMatchBinding = struct {
     rollback_tokens: usize = 0,
 
     pub fn deinit(self: *AttentionMatchBinding) void {
+        self.device.runner.cancelDeferredFrame();
         std.log.info("{s} source_tokens={d} logical_tokens={d} attention_calls={d} donor_appends={d} allocated_device_bytes={d} invalid={d} rollback_tokens={d}", .{
             if (self.diagnostic_only) @as([]const u8, "attention_match_shadow_serving") else "attention_match_serving",
             self.device.initial_logical_length,
@@ -734,11 +735,34 @@ pub const MetalKvStorage = struct {
                 return error.StaleKvCompaction;
             if (binding.selected_positions != null or binding.ring_page_count != 0 or
                 !binding.logical_contiguous or binding.position_offset != 0 or
-                binding.written_tokens != expected_length or heads.len != @as(usize, self.num_kv_heads))
+                binding.physical_base_tokens != 0 or binding.written_tokens != expected_length)
                 return error.StaleKvCompaction;
-            for (heads) |stored| if (stored.dim != self.head_dim) return error.InvalidKvCheckpoint;
+            try validateExactAttentionMatchGeometry(self.num_kv_heads, self.head_dim, heads, try self.slotInfo(binding.slot), expected_length);
         }
         if (donors != self.slot_map.count()) return error.UnsupportedAttentionMatchRoute;
+    }
+
+    fn validateExactAttentionMatchGeometry(pool_heads: u32, maximum_dim: u32, heads: []const attention_match_storage.Head, info: SlotInfo, expected_length: usize) !void {
+        // Pool dimensions are allocation maxima. Gemma4 local/global donors
+        // have different widths; the encoded source slot proves the actual
+        // width. Keep the existing fixed-head-count route restriction so a
+        // different head grouping cannot alias the same combined row width.
+        if (heads.len == 0 or heads.len != pool_heads or heads[0].dim == 0 or heads[0].dim > maximum_dim)
+            return error.InvalidKvCheckpoint;
+        const dim = heads[0].dim;
+        for (heads, 0..) |head, index| {
+            if (head.dim != dim or head.head != index or head.layer != heads[0].layer or
+                head.window != heads[0].window or head.logical_length != expected_length)
+                return error.InvalidKvCheckpoint;
+        }
+        const width = try std.math.mul(usize, heads.len, dim);
+        const row_bytes = try std.math.mul(usize, width, @sizeOf(f16));
+        const bytes = try std.math.mul(usize, expected_length, row_bytes);
+        if (info.tokens != expected_length or info.position_offset != 0 or
+            info.key_row_bytes != row_bytes or info.v_row_stride != width or
+            info.encoded_key_handle == null or info.v_handle == null or
+            info.encoded_key_capacity < bytes or info.v_capacity < bytes)
+            return error.InvalidKvCheckpoint;
     }
 
     fn cloneAllocationBytes(request: storage_runtime.device_clone.Request) !usize {
@@ -2015,6 +2039,39 @@ pub const MetalKvStorage = struct {
         position_offset: usize = 0,
     };
 };
+
+test "attention_match exact source validates actual local and global slot widths" {
+    var heads = [_]attention_match_storage.Head{
+        .{ .layer = 0, .head = 0, .dim = 256, .logical_length = 3 },
+        .{ .layer = 0, .head = 1, .dim = 256, .logical_length = 3 },
+    };
+    var info: MetalKvStorage.SlotInfo = .{
+        .encoded_key_handle = @ptrFromInt(0x1000),
+        .v_handle = @ptrFromInt(0x2000),
+        .tokens = 3,
+        .key_row_bytes = 1024,
+        .v_row_stride = 512,
+        .encoded_key_capacity = 3072,
+        .v_capacity = 3072,
+    };
+    try MetalKvStorage.validateExactAttentionMatchGeometry(2, 512, &heads, info, 3);
+    for (&heads) |*head| head.dim = 512;
+    // A wider candidate must not reinterpret the smaller source slot.
+    try std.testing.expectError(error.InvalidKvCheckpoint, MetalKvStorage.validateExactAttentionMatchGeometry(2, 512, &heads, info, 3));
+    info.key_row_bytes = 2048;
+    info.v_row_stride = 1024;
+    info.encoded_key_capacity = 6144;
+    info.v_capacity = 6144;
+    try MetalKvStorage.validateExactAttentionMatchGeometry(2, 512, &heads, info, 3);
+    heads[0].dim = 256;
+    try std.testing.expectError(error.InvalidKvCheckpoint, MetalKvStorage.validateExactAttentionMatchGeometry(2, 512, &heads, info, 3));
+    heads[0].dim = 512;
+    info.v_capacity -= 1;
+    try std.testing.expectError(error.InvalidKvCheckpoint, MetalKvStorage.validateExactAttentionMatchGeometry(2, 512, &heads, info, 3));
+    info.v_capacity += 1;
+    info.tokens -= 1;
+    try std.testing.expectError(error.InvalidKvCheckpoint, MetalKvStorage.validateExactAttentionMatchGeometry(2, 512, &heads, info, 3));
+}
 
 test "Metal KV rollout flags recognize common false values" {
     try std.testing.expect(!MetalKvStorage.flagValueEnabled(""));

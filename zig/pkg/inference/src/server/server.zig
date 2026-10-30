@@ -3897,7 +3897,7 @@ fn isModelPublicationError(err: anyerror) bool {
 }
 
 fn isTransientInferenceCapacityError(err: anyerror) bool {
-    return err == error.ResourceTemporarilyUnavailable or err == error.ConcurrencyUnavailable or err == error.GenerationCapacityUnavailable;
+    return err == error.ResourceTemporarilyUnavailable or err == error.ConcurrencyUnavailable or err == error.GenerationCapacityUnavailable or err == error.ContextExecutionPoolBusy;
 }
 
 fn transientCapacityFailureResponse(
@@ -14403,6 +14403,10 @@ pub const Node = struct {
     }
 
     pub fn resumeNativeKvCheckpoint(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        return self.resumeNativeKvCheckpointScoped(ctx, false);
+    }
+
+    fn resumeNativeKvCheckpointScoped(self: *Node, ctx: *httpx.Context, serial_batch: bool) !httpx.Response {
         var lease = NativeCheckpointLease.acquire(&self.native_checkpoint_active) orelse
             return modelResourceBusyResponse(ctx);
         defer lease.release();
@@ -14426,7 +14430,88 @@ pub const Node = struct {
             .reader = &reader,
             .checkpoint_bytes = start.checkpoint_bytes,
         };
-        return self.completeNativeOrOrdinaryGeneration(ctx, &transfer);
+        return if (serial_batch) self.completeNativeKvCheckpointBatch(ctx, &transfer) else self.completeNativeOrOrdinaryGeneration(ctx, &transfer);
+    }
+
+    pub fn resumeNativeKvCheckpointBatch(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        return self.resumeNativeKvCheckpointScoped(ctx, true);
+    }
+
+    fn completeNativeKvCheckpointBatch(self: *Node, ctx: *httpx.Context, transfer: *NativeCheckpointTransfer) !httpx.Response {
+        if (!rawGenerateChatTemplateKwargsAreValid(ctx.allocator, transfer.metadata, true))
+            return nativeCheckpointErrorResponse(ctx, error.InvalidNativeCheckpointBatch);
+        var parsed = parseGenerateBody(api.GenerateBatchRequest, ctx.allocator, transfer.metadata) catch
+            return nativeCheckpointErrorResponse(ctx, error.InvalidNativeCheckpointBatch);
+        defer parsed.deinit();
+        @import("native_kv_batch.zig").validate(parsed.value) catch |err| return nativeCheckpointErrorResponse(ctx, err);
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const results = try a.alloc(api.GenerateBatchResultItem, parsed.value.requests.len);
+        const work: NativeCheckpointWork = .{ .execution = httpInferenceExecutionControl(self, ctx) };
+        const ParentCancellation = struct {
+            fn requested(raw: ?*const anyopaque) bool {
+                const parent: *const NativeCheckpointWork = @ptrCast(@alignCast(raw orelse return true));
+                parent.execution.check() catch return true;
+                return false;
+            }
+        };
+        var succeeded: i64 = 0;
+        for (parsed.value.requests, 0..) |item, index| {
+            try work.execution.check();
+            // This endpoint owns cache bypass, including when generated SDKs
+            // omit a zero-valued false. Every child receives explicit false.
+            var body = item.body;
+            body.prompt_cache = false;
+            const metadata = try std.json.Stringify.valueAlloc(ctx.allocator, body, .{});
+            defer ctx.allocator.free(metadata);
+            var request = try httpx.Request.init(ctx.allocator, .POST, if (index == 0) "/generate/context/resume" else "/generate");
+            defer request.deinit();
+            request.body = metadata;
+            var child = httpx.Context.init(ctx.allocator, ctx.io, &request);
+            defer child.deinit();
+            child.application_deadline_ns = ctx.application_deadline_ns;
+            child.application_deadline_io = ctx.application_deadline_io;
+            child.cancellation_probe = .{ .ptr = &work, .is_cancelled = ParentCancellation.requested };
+            var native_item = transfer.*;
+            native_item.metadata = metadata;
+            var response = if (index == 0)
+                try self.completeNativeOrOrdinaryGeneration(&child, &native_item)
+            else
+                try self.generateContent(&child);
+            // Never execute siblings after native validation/import failure.
+            // Returning the child response transfers its owned body/headers.
+            if (index == 0 and !response.ok()) return response;
+            defer response.deinit();
+            try work.execution.check();
+            const bytes = response.body orelse return error.InvalidNativeCheckpointBatchResponse;
+            if (bytes.len > 2 * 1024 * 1024) return ctx.status(413).json(.{
+                .@"error" = "KV_CHECKPOINT_BATCH_RESPONSE_TOO_LARGE",
+                .message = "batch item response exceeds 2 MiB",
+            });
+            results[index] = .{ .custom_id = item.custom_id, .index = @intCast(index) };
+            if (response.ok()) {
+                if (index == 0) try setContextRuntimeHeaders(ctx, response.header("X-Antfly-Inference-Backend") orelse return error.InvalidNativeCheckpointBatchResponse, "checkpoint-resume-batch");
+                results[index].response = try @import("native_kv_batch.zig").parseResponse(a, bytes);
+                succeeded += 1;
+            } else {
+                const failure = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .allocate = .alloc_always });
+                if (failure != .object) return error.InvalidNativeCheckpointBatchResponse;
+                const code = failure.object.get("error") orelse return error.InvalidNativeCheckpointBatchResponse;
+                const message = failure.object.get("message") orelse return error.InvalidNativeCheckpointBatchResponse;
+                if (code != .string or message != .string) return error.InvalidNativeCheckpointBatchResponse;
+                const retryable = failure.object.get("retryable");
+                if (retryable) |value| if (value != .bool) return error.InvalidNativeCheckpointBatchResponse;
+                results[index].@"error" = .{ .code = code.string, .message = message.string, .retryable = if (retryable) |value| value.bool else response.status.code == 503 };
+                if (failure.object.get("retry_after_ms")) |value| {
+                    if (value != .integer or value.integer <= 0) return error.InvalidNativeCheckpointBatchResponse;
+                    results[index].@"error".?.retry_after_ms = .{ .value = value.integer };
+                }
+            }
+        }
+        try work.execution.check();
+        const total: i64 = @intCast(results.len);
+        return ctx.json(api.GenerateBatchResponse{ .object = "generate.batch", .data = results, .summary = .{ .total = total, .succeeded = succeeded, .failed = total - succeeded } });
     }
 
     fn nativeCheckpointResponse(ctx: *httpx.Context, request: *generation.NativeCheckpointPrepare, model: []const u8, execution: InferenceExecutionControl, completion: *?DeferredGenerationCompletion) !httpx.Response {
@@ -15756,15 +15841,6 @@ pub const Node = struct {
             budget_limits = runtime.tier.memory.maxCompositeLimits(budget_limits, draft_budget_limits);
         }
         budget_limits = self.config.generation_budget_overrides.apply(budget_limits);
-        if (compaction_selection != null or qualification_tracks_owner) {
-            const pool = model.ensureContextExecutionPool(budget_limits, null, execution_control) catch |err|
-                return generationErrorResponse(ctx, err);
-            context_execution_lease = pool.acquire(model.load_generation) catch |err|
-                return generationErrorResponse(ctx, err);
-            context_execution_lease.?.bindContextOwner(&context_request_owner.?, context_scope_witness.?) catch |err|
-                return generationErrorResponse(ctx, err);
-            config.context_execution_lease = &context_execution_lease.?;
-        }
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const native_host_reservation: usize = if (native_transfer) |transfer|
             if (transfer.prepare) |request| blk: {
@@ -16022,11 +16098,7 @@ pub const Node = struct {
                 backend_selection.graph_mode_requested or graphModeEnabled())
                 return nativeCheckpointErrorResponse(ctx, error.UnsupportedAttentionMatchRoute);
             if (backend_kind == .metal) {
-                if (comptime builtin.is_test) {
-                    if (!config.metal_native_checkpoint_qualification)
-                        return nativeCheckpointErrorResponse(ctx, error.UnqualifiedCompactionArtifact);
-                } else return nativeCheckpointErrorResponse(ctx, error.UnqualifiedCompactionArtifact);
-                if (native_transfer.?.prepare) |request| if (request.encoding != .f16 and request.encoding != .fp8)
+                if (native_transfer.?.prepare) |request| if (request.encoding != .f16 and request.encoding != .fp8 and request.encoding != .rotated4)
                     return nativeCheckpointErrorResponse(ctx, error.UnsupportedMetalKvCheckpointEncoding);
             }
             if (prompt_tokens >= runtime.kv.attention_match_checkpoint.max_context_tokens or @as(usize, @intCast(config.max_tokens)) > runtime.kv.attention_match_checkpoint.max_context_tokens - prompt_tokens)
@@ -16058,7 +16130,7 @@ pub const Node = struct {
         if (native_transfer) |transfer| {
             if (transfer.resume_request) |resume_request| {
                 var work: NativeCheckpointWork = .{ .execution = execution_control };
-                resume_request.checkpoint = runtime.kv.attention_match_checkpoint.decodeReaderWithControl(
+                var decoded = runtime.kv.attention_match_checkpoint.decodeReaderWithEncodingAndControl(
                     ctx.allocator,
                     transfer.reader orelse return error.InvalidNativeCheckpointRequest,
                     transfer.checkpoint_bytes,
@@ -16066,6 +16138,9 @@ pub const Node = struct {
                     runtime.kv.attention_match_checkpoint.serving_limits,
                     work.control(),
                 ) catch |err| return nativeCheckpointErrorResponse(ctx, err);
+                resume_request.checkpoint = decoded.checkpoint;
+                resume_request.encoding = decoded.encoding;
+                decoded = undefined;
                 native_kv_wire.finish(transfer.reader.?, work.control()) catch |err| return nativeCheckpointErrorResponse(ctx, err);
                 if (backend_kind == .metal) {
                     if (comptime build_options.enable_metal) {
@@ -16082,6 +16157,17 @@ pub const Node = struct {
         // Admit execution only after a native upload has been fully decoded
         // and its framing validated. The separate host lease remains charged,
         // so admission still enforces the combined host/device envelope.
+        // A partial upload must leave the exclusive execution pool available
+        // for ordinary requests until its checkpoint and framing are valid.
+        if (compaction_selection != null or qualification_tracks_owner) {
+            const pool = model.ensureContextExecutionPool(budget_limits, null, execution_control) catch |err|
+                return generationErrorResponse(ctx, err);
+            context_execution_lease = pool.acquire(model.load_generation) catch |err|
+                return generationErrorResponse(ctx, err);
+            context_execution_lease.?.bindContextOwner(&context_request_owner.?, context_scope_witness.?) catch |err|
+                return generationErrorResponse(ctx, err);
+            config.context_execution_lease = &context_execution_lease.?;
+        }
         var admission_lease = self.model_manager.acquireGenerationResources(
             admission_requests[0..admission_request_count],
         ) catch |err| {
@@ -30002,6 +30088,7 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
             std.mem.eql(u8, path, "/generate/context/prepare") or
             std.mem.eql(u8, path, "/generate/context/checkpoint") or
             std.mem.eql(u8, path, "/generate/context/resume") or
+            std.mem.eql(u8, path, "/generate/context/resume/batch") or
             std.mem.eql(u8, path, "/chunk") or
             std.mem.eql(u8, path, "/dictate") or
             std.mem.eql(u8, path, "/transcription/sessions") or
@@ -30079,7 +30166,7 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
                 httpx.Handler.wrap(self.node, handler, admittedInferenceHandler)
             else
                 handler;
-            if (comptime std.mem.eql(u8, path, "/generate/context/resume") and @hasDecl(Inner, "routeStreamingRawWithBodyLimit"))
+            if (comptime (std.mem.eql(u8, path, "/generate/context/resume") or std.mem.eql(u8, path, "/generate/context/resume/batch")) and @hasDecl(Inner, "routeStreamingRawWithBodyLimit"))
                 try self.inner.routeStreamingRawWithBodyLimit(.POST, prefix ++ path, Node.native_checkpoint_stream_limit, wrapped)
             else if (comptime inferenceRouteStreamsRawBody(path) and @hasDecl(Inner, "postStreamingRaw"))
                 try self.inner.postStreamingRaw(prefix ++ path, wrapped)
@@ -30125,7 +30212,7 @@ fn AiPrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
                 httpx.Handler.wrap(self.node, handler, admittedInferenceHandler)
             else
                 handler;
-            if (comptime std.mem.eql(u8, path, "/generate/context/resume") and @hasDecl(Inner, "routeStreamingRawWithBodyLimit"))
+            if (comptime (std.mem.eql(u8, path, "/generate/context/resume") or std.mem.eql(u8, path, "/generate/context/resume/batch")) and @hasDecl(Inner, "routeStreamingRawWithBodyLimit"))
                 try self.inner.routeStreamingRawWithBodyLimit(.POST, prefix ++ path, Node.native_checkpoint_stream_limit, wrapped)
             else if (comptime inferenceRouteStreamsRawBody(path) and @hasDecl(Inner, "postStreamingRaw"))
                 try self.inner.postStreamingRaw(prefix ++ path, wrapped)
@@ -35128,6 +35215,40 @@ test "generation memory exhaustion is an actionable non-retryable capacity error
     const batch_error = batchGenerationError(error.MemoryBudgetExceeded);
     try std.testing.expectEqualStrings("MEMORY_BUDGET_EXCEEDED", batch_error.code);
     try std.testing.expect(!batch_error.retryable);
+}
+
+test "native checkpoint execution contention retains retryable capacity" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate/context/resume");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    const Payload = struct {
+        @"error": []const u8,
+        reason: []const u8,
+        retryable: bool,
+        retry_after_ms: u32,
+    };
+
+    for ([_]bool{ false, true }) |is_native| {
+        var response = if (is_native)
+            try nativeCheckpointErrorResponse(&ctx, error.ContextExecutionPoolBusy)
+        else
+            try generationErrorResponse(&ctx, error.ContextExecutionPoolBusy);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expectEqualStrings("1", response.header("Retry-After").?);
+        var payload = try std.json.parseFromSlice(Payload, allocator, response.body.?, .{ .ignore_unknown_fields = true });
+        defer payload.deinit();
+        try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", payload.value.@"error");
+        try std.testing.expectEqualStrings("inference_capacity", payload.value.reason);
+        try std.testing.expect(payload.value.retryable);
+        try std.testing.expectEqual(@as(u32, 1000), payload.value.retry_after_ms);
+    }
+
+    const batch = batchGenerationError(error.ContextExecutionPoolBusy);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", batch.code);
+    try std.testing.expect(batch.retryable);
 }
 
 test "generation live pressure is an actionable retryable capacity error" {
@@ -41219,6 +41340,7 @@ fn internalErrorResponse(ctx: *httpx.Context, code: []const u8, err: anyerror) !
 fn nativeCheckpointErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     return switch (err) {
         error.InvalidNativeCheckpointRequest,
+        error.InvalidNativeCheckpointBatch,
         error.InvalidNativeKvFrame,
         error.InvalidKvCheckpoint,
         error.KvCheckpointChecksum,

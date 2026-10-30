@@ -24,6 +24,11 @@ test {
     _ = @import("context_stored_installed_caller.zig");
     _ = @import("context_model_test.zig");
     _ = @import("context_metal_checkpoint_qualify.zig");
+    _ = @import("runtime/kv/metal_checkpoint_cycles.zig");
+    _ = @import("runtime/kv/metal_checkpoint_soak.zig");
+    _ = @import("cli/native_kv_upload.zig");
+    _ = @import("runtime/kv/metal_checkpoint_quality.zig");
+    _ = @import("context_native_checkpoint_quality.zig");
     _ = @import("context_query_campaign_capture.zig");
     _ = @import("context_fault_injection.zig");
     _ = @import("backends/context_teacher_forced.zig");
@@ -39,6 +44,7 @@ test {
     _ = @import("context_serving_messages.zig");
     _ = @import("context_serving_protocol.zig");
     _ = @import("context_quality_materializer.zig");
+    _ = @import("context_native_quality_materializer.zig");
     _ = @import("backends/context_kernels.zig");
     _ = @import("backends/context_flash.zig");
     _ = @import("backends/context_execution_pool.zig");
@@ -63,6 +69,7 @@ test {
     _ = @import("backends/decoder_gated_runtime.zig");
     _ = @import("ops/metal_compute.zig");
     _ = @import("ops/metal_attention_match_fit.zig");
+    _ = @import("ops/metal_attention_match_lapack_test.zig");
     _ = @import("ops/metal_attention_match_storage.zig");
     _ = @import("runtime/kv/context_view.zig");
     _ = @import("runtime/kv/attention_matching.zig");
@@ -75,6 +82,7 @@ test {
     _ = @import("native_generate.zig");
     _ = @import("pipelines/generation.zig");
     _ = @import("server/server.zig");
+    _ = @import("server/native_kv_batch.zig");
     _ = @import("models/gpt.zig");
     _ = @import("runtime/kv/compaction.zig");
     _ = @import("runtime/kv/storage_runtime.zig");
@@ -87,5 +95,6 @@ test "context generation entrypoints compile" {
     std.mem.doNotOptimizeAway(&@import("native_generate.zig").main);
     std.mem.doNotOptimizeAway(&@import("server/server.zig").Node.generateContent);
     std.mem.doNotOptimizeAway(&@import("server/server.zig").Node.generateBatchContent);
+    std.mem.doNotOptimizeAway(&@import("server/server.zig").Node.resumeNativeKvCheckpointBatch);
     std.mem.doNotOptimizeAway(&@import("pipelines/generation.zig").NativeGenerationPipeline.runCompactionStudy);
 }

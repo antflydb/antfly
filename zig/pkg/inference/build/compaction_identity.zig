@@ -17,6 +17,7 @@
 //! input is a file argument so Zig's cache and watch graph invalidate the
 //! generated module when, and only when, a canonical source changes.
 const std = @import("std");
+const source_inputs = @import("compaction_source_inputs.zig");
 
 pub fn create(b: *std.Build, root: std.Build.LazyPath) *std.Build.Module {
     const tool = b.addExecutable(.{
@@ -35,6 +36,13 @@ pub fn create(b: *std.Build, root: std.Build.LazyPath) *std.Build.Module {
     }
     run.addArgs(&.{ "profile", "runtime/kv/compaction_profile.zig" });
     run.addFileArg2(root.path(b, "src/runtime/kv/compaction_profile.zig"), .{ .make_absolute = true });
+    run.addArgs(&.{ "metal-release", "runtime/kv/attention_match_release.zig" });
+    run.addFileArg2(root.path(b, "src/runtime/kv/attention_match_release.zig"), .{ .make_absolute = true });
+    var seeds: [canonical_sources.len + 2][]const u8 = undefined;
+    for (canonical_sources, 0..) |source, index| seeds[index] = source.path;
+    seeds[canonical_sources.len] = "src/runtime/kv/compaction_profile.zig";
+    seeds[canonical_sources.len + 1] = "src/runtime/kv/attention_match_release.zig";
+    source_inputs.addTransitive(b, root, run, &seeds);
     run.addArg("--output");
 
     return b.createModule(.{
@@ -48,9 +56,26 @@ const Source = struct {
 };
 
 const canonical_sources = [_]Source{
+    // Compiler flags, backend/module wiring and generated source policies are
+    // part of the qualified implementation, alongside their imported helpers.
+    .{ .logical_name = "build.zig", .path = "build.zig" },
     .{ .logical_name = "build/compaction_identity.zig", .path = "build/compaction_identity.zig" },
+    .{ .logical_name = "backends/metal_kernels.m", .path = "src/backends/metal_kernels.m" },
+    .{ .logical_name = "server/model_manager.zig", .path = "src/server/model_manager.zig" },
     .{ .logical_name = "tools/compaction_identity.zig", .path = "tools/compaction_identity.zig" },
     .{ .logical_name = "context_capture_coverage.zig", .path = "src/context_capture_coverage.zig" },
+    .{ .logical_name = "context_quality_materializer.zig", .path = "src/context_quality_materializer.zig" },
+    .{ .logical_name = "context_native_quality_materializer.zig", .path = "src/context_native_quality_materializer.zig" },
+    .{ .logical_name = "context_native_checkpoint_quality.zig", .path = "src/context_native_checkpoint_quality.zig" },
+    .{ .logical_name = "runtime/kv/metal_checkpoint_quality.zig", .path = "src/runtime/kv/metal_checkpoint_quality.zig" },
+    .{ .logical_name = "tokenizer/tokenizer.zig", .path = "../../lib/tokenizer/src/tokenizer.zig" },
+    .{ .logical_name = "tokenizer/hf_tokenizer.zig", .path = "../../lib/tokenizer/src/hf_tokenizer.zig" },
+    .{ .logical_name = "tokenizer/priority_queue.zig", .path = "../../lib/tokenizer/src/priority_queue.zig" },
+    .{ .logical_name = "tokenizer/unicode_normalizer.zig", .path = "../../lib/tokenizer/src/unicode_normalizer.zig" },
+    .{ .logical_name = "tokenizer/unicode_nfc_data.zig", .path = "../../lib/tokenizer/src/unicode_nfc_data.zig" },
+    .{ .logical_name = "tokenizer/unicode_classes.zig", .path = "../../lib/tokenizer/src/unicode_classes.zig" },
+    .{ .logical_name = "tokenizer/unicode_punctuation_data.zig", .path = "../../lib/tokenizer/src/unicode_punctuation_data.zig" },
+
     .{ .logical_name = "context_query_campaign_capture.zig", .path = "src/context_query_campaign_capture.zig" },
     .{ .logical_name = "context_native_head_qualify.zig", .path = "src/context_native_head_qualify.zig" },
     .{ .logical_name = "context_fault_injection.zig", .path = "src/context_fault_injection.zig" },
@@ -63,9 +88,14 @@ const canonical_sources = [_]Source{
     .{ .logical_name = "backends/context_attention.metal", .path = "src/backends/context_attention.metal" },
     .{ .logical_name = "backends/context_attention_match.metal", .path = "src/backends/context_attention_match.metal" },
     .{ .logical_name = "ops/metal_attention_match_fit.zig", .path = "src/ops/metal_attention_match_fit.zig" },
+    .{ .logical_name = "ops/metal_attention_match_lapack.zig", .path = "src/ops/metal_attention_match_lapack.zig" },
     .{ .logical_name = "ops/metal_attention_match_fit.metal", .path = "src/ops/metal_attention_match_fit.metal" },
     .{ .logical_name = "ops/metal_attention_match_storage.zig", .path = "src/ops/metal_attention_match_storage.zig" },
     .{ .logical_name = "ops/metal_attention_match_storage.metal", .path = "src/ops/metal_attention_match_storage.metal" },
+    .{ .logical_name = "ops/metal_attention_match_split_k.metal", .path = "src/ops/metal_attention_match_split_k.metal" },
+    .{ .logical_name = "ops/metal_attention_match_parallel_split.metal", .path = "src/ops/metal_attention_match_parallel_split.metal" },
+    .{ .logical_name = "ops/metal_attention_match_matrix_stage.metal", .path = "src/ops/metal_attention_match_matrix_stage.metal" },
+    .{ .logical_name = "ops/metal_attention_match_rotated_matrix.metal", .path = "src/ops/metal_attention_match_rotated_matrix.metal" },
     .{ .logical_name = "backends/context_attention_match.zig", .path = "src/backends/context_attention_match.zig" },
     .{ .logical_name = "backends/context_compaction.metal", .path = "src/backends/context_compaction.metal" },
     .{ .logical_name = "backends/context_compaction.zig", .path = "src/backends/context_compaction.zig" },
@@ -88,6 +118,7 @@ const canonical_sources = [_]Source{
     .{ .logical_name = "backends/metal_kernels.m", .path = "src/backends/metal_kernels.m" },
     .{ .logical_name = "backends/metal_kv_storage.zig", .path = "src/backends/metal_kv_storage.zig" },
     .{ .logical_name = "backends/metal_runtime.zig", .path = "src/backends/metal_runtime.zig" },
+    .{ .logical_name = "backends/metal_native_provider.zig", .path = "src/backends/metal_native_provider.zig" },
     .{ .logical_name = "backends/metal_tensor.zig", .path = "src/backends/metal_tensor.zig" },
     .{ .logical_name = "backends/model_replay_context.zig", .path = "src/backends/model_replay_context.zig" },
     .{ .logical_name = "backends/packed_context_session.zig", .path = "src/backends/packed_context_session.zig" },
@@ -110,6 +141,12 @@ const canonical_sources = [_]Source{
     .{ .logical_name = "runtime/file_snapshot.zig", .path = "src/runtime/file_snapshot.zig" },
     .{ .logical_name = "runtime/kv/attention_matching.zig", .path = "src/runtime/kv/attention_matching.zig" },
     .{ .logical_name = "runtime/kv/attention_match.zig", .path = "src/runtime/kv/attention_match.zig" },
+    .{ .logical_name = "runtime/kv/attention_match_checkpoint.zig", .path = "src/runtime/kv/attention_match_checkpoint.zig" },
+    .{ .logical_name = "runtime/kv/attention_match_codec.zig", .path = "src/runtime/kv/attention_match_codec.zig" },
+    .{ .logical_name = "runtime/kv/attention_match_packed.zig", .path = "src/runtime/kv/attention_match_packed.zig" },
+    .{ .logical_name = "runtime/kv/attention_match_quantized.zig", .path = "src/runtime/kv/attention_match_quantized.zig" },
+    .{ .logical_name = "runtime/kv/attention_match_snapshot.zig", .path = "src/runtime/kv/attention_match_snapshot.zig" },
+    .{ .logical_name = "runtime/kv/turboquant_rotated.zig", .path = "src/runtime/kv/turboquant_rotated.zig" },
     .{ .logical_name = "runtime/kv/attention_match_study.zig", .path = "src/runtime/kv/attention_match_study.zig" },
     .{ .logical_name = "runtime/kv/compaction.zig", .path = "src/runtime/kv/compaction.zig" },
     .{ .logical_name = "runtime/kv/context_session.zig", .path = "src/runtime/kv/context_session.zig" },
@@ -124,6 +161,11 @@ const canonical_sources = [_]Source{
     .{ .logical_name = "runtime/tier/memory.zig", .path = "src/runtime/tier/memory.zig" },
     .{ .logical_name = "server/model_manager.zig", .path = "src/server/model_manager.zig" },
     .{ .logical_name = "server/server.zig", .path = "src/server/server.zig" },
+    // Bind route metadata, incremental worker uploads and the generated wire
+    // contract, as well as all relative implementation helpers they import.
+    .{ .logical_name = "host/host.zig", .path = "src/host/host.zig" },
+    .{ .logical_name = "host/worker.zig", .path = "src/host/worker.zig" },
+    .{ .logical_name = "api/generated/inference_api/root.zig", .path = "src/api/generated/inference_api/root.zig" },
     .{ .logical_name = "lib/jinja/src/provenance.zig", .path = "../../lib/jinja/src/provenance.zig" },
     .{ .logical_name = "lib/jinja/src/eval.zig", .path = "../../lib/jinja/src/eval.zig" },
     .{ .logical_name = "lib/jinja/src/jinja.zig", .path = "../../lib/jinja/src/jinja.zig" },

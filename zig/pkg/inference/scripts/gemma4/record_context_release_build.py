@@ -39,6 +39,7 @@ import zipfile
 SCHEMA_V1 = "antfly.context-release-build.v1"
 SCHEMA_V2 = "antfly.context-release-build.v2"
 SCHEMA_V3 = "antfly.context-release-build.v3"
+SCHEMA_V4 = "antfly.context-release-build.v4"
 SCHEMA = SCHEMA_V1
 SCOPE = "full_context_release_build"
 MANIFEST = "FULL-RELEASE-SOURCE.json"
@@ -62,13 +63,26 @@ MAX_UNCOMPRESSED = 768 * 1024 * 1024
 EXPECTED_STRIPPED_COMPILER_PROFILE = {"strip_debug_info": True, "have_error_return_tracing": False}
 COMPILER_PROFILE_PREFIX = "context_compiler_profile: "
 
-def configure_profile(stripped: bool) -> None:
-    global SCHEMA, COMMAND, BUILD
+def configure_profile(stripped: bool, max_build_rss_mib: int = 8192) -> None:
+    global SCHEMA, COMMAND, BUILD, ENVIRONMENT
+    if type(max_build_rss_mib) is not int or max_build_rss_mib not in (8192, 16384):
+        raise ValueError("build RSS cap must be 8192 or 16384 MiB")
+    if max_build_rss_mib == 16384 and not stripped:
+        raise ValueError("16 GiB compiler profile requires --stripped-profile")
+    # V4 aligns the watchdog, scheduler and compilation-step declaration.
+    # Historical V1/V2/V3 commands remain exact; runtime limits are separate.
+    LIMITS["max_rss_mib"] = max_build_rss_mib
     # V1/V2 remain the exact historical contracts. Current main no longer has
     # an `onnx` build option, so new stripped evidence uses V3 rather than
     # silently changing the command accepted by historical V2 receipts.
-    SCHEMA = SCHEMA_V3 if stripped else SCHEMA_V1
+    SCHEMA = SCHEMA_V4 if max_build_rss_mib == 16384 else SCHEMA_V3 if stripped else SCHEMA_V1
     COMMAND = [*CURRENT_MAIN_BASE_COMMAND, "-Dstrip=true"] if stripped else list(BASE_COMMAND)
+    budget_bytes = str(max_build_rss_mib * 1024 * 1024)
+    ENVIRONMENT = {"inherit_non_runtime_environment": True, "cleared_prefixes": CLEARED_ENV_PREFIXES,
+                   "set_by_command": {"ANTFLY_ZIG_MAX_RSS": budget_bytes}}
+    if SCHEMA == SCHEMA_V4:
+        COMMAND[1] = "ANTFLY_ZIG_MAX_RSS=" + budget_bytes
+        COMMAND.append("-Dcontext-test-compile-memory-mb=16384")
     BUILD = {"cwd": "zig", "command": COMMAND, "target": "inference-test-context",
              "environment": ENVIRONMENT, "optimize": "ReleaseFast", "metal": True,
              "cuda": False}
@@ -300,7 +314,7 @@ def seal(root: Path, campaign: Path, created: str, head: str, source: dict, arch
     with source_binary.open("rb") as incoming, binary.open("xb") as outgoing:
         shutil.copyfileobj(incoming, outgoing)
     binary.chmod(source_binary.stat().st_mode | stat.S_IXUSR)
-    compiler_profile = parse_compiler_profile(stderr) if SCHEMA in {SCHEMA_V2, SCHEMA_V3} else None
+    compiler_profile = parse_compiler_profile(stderr) if SCHEMA in {SCHEMA_V2, SCHEMA_V3, SCHEMA_V4} else None
     receipt = {
         "schema": SCHEMA, "evidence_scope": SCOPE, "release_eligible": True,
         "serving_qualified": False, "created_utc": created,
@@ -352,8 +366,10 @@ def main() -> int:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--campaign", type=Path, required=True)
     parser.add_argument("--stripped-profile", action="store_true")
+    parser.add_argument("--max-build-rss-mib", type=int, choices=(8192, 16384), default=8192,
+                        help="Compiler process-group watchdog cap; independent of inference limits")
     args = parser.parse_args()
-    configure_profile(args.stripped_profile)
+    configure_profile(args.stripped_profile, args.max_build_rss_mib)
     receipt = run(args.root, args.campaign)
     print(json.dumps({"receipt": str(receipt), "sha256": digest(receipt)}))
     return 0

@@ -166,6 +166,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/generate/context/checkpoint", .operation_id = "prepareNativeKvCheckpoint", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/generate/context/prepare", .operation_id = "prepareChatContext", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/generate/context/resume", .operation_id = "resumeNativeKvCheckpoint", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "POST", .path = "/generate/context/resume/batch", .operation_id = "resumeNativeKvCheckpointBatch", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/models", .operation_id = "listModels", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/models/instances", .operation_id = "listModelInstances", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/models/instances", .operation_id = "loadModelInstance", .request_body = .buffered, .streaming_response = false },
@@ -207,6 +208,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "prepareNativeKvCheckpoint")) @compileError("ServerRouter: Impl missing required method 'prepareNativeKvCheckpoint'");
         if (!@hasDecl(Impl, "prepareChatContext")) @compileError("ServerRouter: Impl missing required method 'prepareChatContext'");
         if (!@hasDecl(Impl, "resumeNativeKvCheckpoint")) @compileError("ServerRouter: Impl missing required method 'resumeNativeKvCheckpoint'");
+        if (!@hasDecl(Impl, "resumeNativeKvCheckpointBatch")) @compileError("ServerRouter: Impl missing required method 'resumeNativeKvCheckpointBatch'");
         if (!@hasDecl(Impl, "listModels")) @compileError("ServerRouter: Impl missing required method 'listModels'");
         if (!@hasDecl(Impl, "listModelInstances")) @compileError("ServerRouter: Impl missing required method 'listModelInstances'");
         if (!@hasDecl(Impl, "loadModelInstance")) @compileError("ServerRouter: Impl missing required method 'loadModelInstance'");
@@ -246,6 +248,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/generate/context/checkpoint", httpx.Handler.bind(self.impl, prepareNativeKvCheckpoint));
             try server.post("/generate/context/prepare", httpx.Handler.bind(self.impl, prepareChatContext));
             try server.post("/generate/context/resume", httpx.Handler.bind(self.impl, resumeNativeKvCheckpoint));
+            try server.post("/generate/context/resume/batch", httpx.Handler.bind(self.impl, resumeNativeKvCheckpointBatch));
             try server.get("/models", httpx.Handler.bind(self.impl, listModels));
             try server.get("/models/instances", httpx.Handler.bind(self.impl, listModelInstances));
             try server.post("/models/instances", httpx.Handler.bind(self.impl, loadModelInstance));
@@ -334,6 +337,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /generate/context/resume
         fn resumeNativeKvCheckpoint(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.resumeNativeKvCheckpoint(ctx);
+        }
+
+        /// Resume one checkpoint and generate serial ordinary siblings
+        /// POST /generate/context/resume/batch
+        fn resumeNativeKvCheckpointBatch(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.resumeNativeKvCheckpointBatch(ctx);
         }
 
         /// List available models
@@ -459,6 +468,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn prepareNativeKvCheckpoint(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn prepareChatContext(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn resumeNativeKvCheckpoint(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn resumeNativeKvCheckpointBatch(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listModels(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listModelInstances(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn loadModelInstance(self: *Impl, ctx: *httpx.Context) !httpx.Response

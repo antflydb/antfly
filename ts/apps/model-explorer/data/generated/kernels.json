@@ -1418,6 +1418,30 @@
    }
   },
   {
+   "name": "termite_argmax_logits_finite_1x",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_argmax_logits_finite_partials",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_argmax_logits_finite_reduce",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_argmax_logits_partials",
    "family": "sampling",
    "generated": false,

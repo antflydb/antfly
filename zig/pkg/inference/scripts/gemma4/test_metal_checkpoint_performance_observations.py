@@ -59,6 +59,7 @@ class PerformanceObservationEvidence(unittest.TestCase):
             port=1234,
             timeout=1,
             encoding="f16",
+            model="google/gemma-4-E4B-it-qat-q4_0-gguf",
         )
         raw = {
             "ttft_ms": 34_170.0,
@@ -137,7 +138,8 @@ class PendingSampledTokenLedger(unittest.TestCase):
             "suffix_prefill_ns": 0,
             "tracked_combined_live_bytes": 180, "tracked_combined_peak_bytes": 200,
             "binding_representation": "f16", "binding_fp8_heads": 0,
-            "binding_fp8_rows": 0, "binding_exact_resident_bytes": 60,
+            "binding_fp8_rows": 0, "binding_rotated4_heads": 0,
+            "binding_rotated4_rows": 0, "binding_exact_resident_bytes": 60,
             "binding_encoded_resident_bytes": 0,
             "binding_metadata_resident_bytes": 15, "binding_allocated_bytes": 75,
             "kv_boundary_proven": True,
@@ -169,11 +171,75 @@ class PendingSampledTokenLedger(unittest.TestCase):
         }
         return ready, committed, released
 
+    def test_context_e2b_geometry_is_independently_pinned(self):
+        ready, committed, released = self.rows()
+        for row in (ready, committed):
+            row["binding_attention_calls_per_materialized_token"] = 35
+            row["binding_donor_appends_per_materialized_token"] = 15
+        committed["attention_calls"] = 63 * 35
+        committed["donor_appends"] = 63 * 15
+        result = performance.ledger_contract(
+            [ready, committed, released], "checkpoint_resume",
+            expected_representation="f16",
+            expected_model="google/gemma-4-E2B-it-qat-q4_0-gguf",
+        )
+        self.assertEqual(result["committed"]["attention_calls"], 63 * 35)
+
+    def test_context_rotated4_requires_actual_heads_rows_and_encoded_bytes(self):
+        ready, committed, released = self.rows()
+        committed.update(binding_representation="rotated4",
+                         binding_exact_resident_bytes=0,
+                         binding_encoded_resident_bytes=60,
+                         binding_rotated4_heads=1,
+                         binding_rotated4_rows=8128)
+        performance.ledger_contract(
+            [ready, committed, released], "checkpoint_resume",
+            expected_representation="rotated4",
+            expected_model="google/gemma-4-E4B-it-qat-q4_0-gguf",
+            expected_encoded_heads=1, expected_encoded_rows=8128,
+        )
+        for field in ("binding_rotated4_heads", "binding_rotated4_rows",
+                      "binding_encoded_resident_bytes"):
+            with self.subTest(field=field):
+                changed = dict(committed)
+                changed[field] = 0
+                with self.assertRaisesRegex(ValueError, "rotated4 restore|does not reconcile"):
+                    performance.ledger_contract(
+                        [ready, changed, released], "checkpoint_resume",
+                        expected_representation="rotated4",
+                        expected_model="google/gemma-4-E4B-it-qat-q4_0-gguf",
+                    )
+
+    def test_context_rotated4_rejects_mixed_or_differing_counts(self):
+        ready, committed, released = self.rows()
+        committed.update(binding_representation="rotated4",
+                         binding_exact_resident_bytes=0,
+                         binding_encoded_resident_bytes=60,
+                         binding_rotated4_heads=2,
+                         binding_rotated4_rows=8128)
+        for mutation in ({"binding_fp8_heads": 1}, {"binding_fp8_rows": 1}):
+            changed = {**committed, **mutation}
+            with self.assertRaisesRegex(ValueError, "rotated4 restore"):
+                performance.ledger_contract(
+                    [ready, changed, released], "checkpoint_resume",
+                    expected_representation="rotated4",
+                    expected_model="google/gemma-4-E4B-it-qat-q4_0-gguf",
+                )
+        for expected_heads, expected_rows in ((1, 8128), (2, 8127)):
+            with self.assertRaisesRegex(ValueError, "count differs"):
+                performance.ledger_contract(
+                    [ready, committed, released], "checkpoint_resume",
+                    expected_representation="rotated4",
+                    expected_model="google/gemma-4-E4B-it-qat-q4_0-gguf",
+                    expected_encoded_heads=expected_heads,
+                    expected_encoded_rows=expected_rows,
+                )
+
     def test_context_pending_sampled_token_requires_exact_boundary_and_activity(self):
         ready, committed, released = self.rows()
         result = performance.ledger_contract(
             [ready, committed, released], "checkpoint_resume",
-            expected_representation="f16",
+            expected_representation="f16", expected_model="google/gemma-4-E4B-it-qat-q4_0-gguf",
         )
         self.assertEqual(result["committed"]["binding_logical_tokens"], 8191)
         self.assertEqual(result["committed"]["pending_sampled_tokens"], 1)
@@ -202,7 +268,7 @@ class PendingSampledTokenLedger(unittest.TestCase):
                         ValueError, "KV boundary|KV activity|KV rates|typed"):
                     performance.ledger_contract(
                         [ready, committed, released], "checkpoint_resume",
-                        expected_representation="f16",
+                        expected_representation="f16", expected_model="google/gemma-4-E4B-it-qat-q4_0-gguf",
                     )
 
     def test_context_pending_sampled_token_rejects_consistent_skipped_consumer(self):
@@ -210,10 +276,10 @@ class PendingSampledTokenLedger(unittest.TestCase):
         ready["binding_attention_calls_per_materialized_token"] = 41
         committed["binding_attention_calls_per_materialized_token"] = 41
         committed["attention_calls"] = 63 * 41
-        with self.assertRaisesRegex(ValueError, "qualified E4B geometry"):
+        with self.assertRaisesRegex(ValueError, "qualified model geometry"):
             performance.ledger_contract(
                 [ready, committed, released], "checkpoint_resume",
-                expected_representation="f16",
+                expected_representation="f16", expected_model="google/gemma-4-E4B-it-qat-q4_0-gguf",
             )
 
     def test_context_equal_binding_rejects_contradictory_optional_proof(self):
@@ -228,7 +294,7 @@ class PendingSampledTokenLedger(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "KV activity"):
             performance.ledger_contract(
                 [ready, committed, released], "checkpoint_resume",
-                expected_representation="f16",
+                expected_representation="f16", expected_model="google/gemma-4-E4B-it-qat-q4_0-gguf",
             )
 
     def test_context_pending_sampled_token_rejects_unproved_ready_boundary(self):
@@ -244,7 +310,7 @@ class PendingSampledTokenLedger(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "KV boundary"):
                     performance.ledger_contract(
                         [ready, committed, released], "checkpoint_resume",
-                        expected_representation="f16",
+                        expected_representation="f16", expected_model="google/gemma-4-E4B-it-qat-q4_0-gguf",
                     )
 
 

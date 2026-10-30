@@ -161,7 +161,7 @@ fn checkNativeCheckpointRoutes(table: *const bridge.FunctionTable, handle: *anyo
     if (!status.isOk()) return bridge.errorFromStatus(status);
     const manifest = (entries orelse return error.MissingInferenceRoutes)[0..count];
     inline for (.{ bridge.ai_api_prefix, bridge.public_api_prefix }) |prefix| {
-        var resume_route: ?bridge.RouteManifestEntry = null;
+        var resume_routes: [2]?bridge.RouteManifestEntry = @splat(null);
         var prepare_seen = false;
         for (manifest) |entry| {
             if (entry.method != .post) continue;
@@ -169,12 +169,17 @@ fn checkNativeCheckpointRoutes(table: *const bridge.FunctionTable, handle: *anyo
                 if (entry.request_body != .buffered or entry.streaming_response == 0) return error.InvalidCheckpointRouteCapabilities;
                 prepare_seen = true;
             }
-            if (std.mem.eql(u8, entry.path.slice(), prefix ++ "/generate/context/resume")) {
-                if (entry.request_body != .buffered or entry.streaming_response == 0) return error.InvalidCheckpointRouteCapabilities;
-                resume_route = entry;
+            inline for (.{ "/generate/context/resume", "/generate/context/resume/batch" }, 0..) |suffix, index| {
+                if (std.mem.eql(u8, entry.path.slice(), prefix ++ suffix)) {
+                    // Uploads are incremental for both endpoints; only the
+                    // single continuation can return SSE. Batch returns JSON.
+                    if (entry.request_body != .buffered or entry.streaming_response != @intFromBool(index == 0))
+                        return error.InvalidCheckpointRouteCapabilities;
+                    resume_routes[index] = entry;
+                }
             }
         }
-        if (!prepare_seen or resume_route == null) return error.MissingCheckpointRoute;
+        if (!prepare_seen or resume_routes[0] == null or resume_routes[1] == null) return error.MissingCheckpointRoute;
         const Source = struct {
             bytes: [40]u8 = @splat(0),
             offset: usize = 0,
@@ -188,24 +193,26 @@ fn checkNativeCheckpointRoutes(table: *const bridge.FunctionTable, handle: *anyo
                 return .ok;
             }
         };
-        for ([_]u16{ 400, 413, 400 }) |expected| {
-            var source: Source = .{};
-            if (expected == 413) {
-                @memcpy(source.bytes[0..8], "AFATT001");
-                std.mem.writeInt(u64, source.bytes[8..16], 2 * 1024 * 1024 + 1, .little);
-                std.mem.writeInt(u32, source.bytes[16..20], 1, .little);
-                std.mem.writeInt(u32, source.bytes[24..28], "application/vnd.antfly.kv-checkpoint".len, .little);
-                std.mem.writeInt(u64, source.bytes[32..40], 192, .little);
+        inline for (.{ "/generate/context/resume", "/generate/context/resume/batch" }, 0..) |suffix, index| {
+            for ([_]u16{ 400, 413, 400 }) |expected| {
+                var source: Source = .{};
+                if (expected == 413) {
+                    @memcpy(source.bytes[0..8], "AFATT001");
+                    std.mem.writeInt(u64, source.bytes[8..16], 2 * 1024 * 1024 + 1, .little);
+                    std.mem.writeInt(u32, source.bytes[16..20], 1, .little);
+                    std.mem.writeInt(u32, source.bytes[24..28], "application/vnd.antfly.kv-checkpoint".len, .little);
+                    std.mem.writeInt(u64, source.bytes[32..40], 192, .little);
+                }
+                const headers = [_]http.HeaderView{.{ .name = .init("Content-Type"), .value = .init("application/vnd.antfly.attachments.v1") }};
+                const request: http.HttpRequestView = .{ .method = .post, .path = .init(prefix ++ suffix), .headers_ptr = &headers, .headers_len = headers.len };
+                var response_handle: ?*anyopaque = null;
+                var response: http.HttpResponseView = .{ .body = .init("") };
+                defer if (response_handle) |owned| table.destroy_http_response(owned);
+                const result = table.handle_http(&.{ .abi_version = bridge.abi_version, .route_handle = resume_routes[index].?.route_handle, .request = &request, .body_source = .{ .context = &source, .read = Source.read, .streaming = 1 }, .out_response_handle = &response_handle, .out_response = &response });
+                if (!result.isOk()) return bridge.errorFromStatus(result);
+                if (response.status != expected or source.offset != 40 or source.calls <= 1)
+                    return error.InvalidCheckpointIncrementalAbi;
             }
-            const headers = [_]http.HeaderView{.{ .name = .init("Content-Type"), .value = .init("application/vnd.antfly.attachments.v1") }};
-            const request: http.HttpRequestView = .{ .method = .post, .path = .init(prefix ++ "/generate/context/resume"), .headers_ptr = &headers, .headers_len = headers.len };
-            var response_handle: ?*anyopaque = null;
-            var response: http.HttpResponseView = .{ .body = .init("") };
-            defer if (response_handle) |owned| table.destroy_http_response(owned);
-            const result = table.handle_http(&.{ .abi_version = bridge.abi_version, .route_handle = resume_route.?.route_handle, .request = &request, .body_source = .{ .context = &source, .read = Source.read, .streaming = 1 }, .out_response_handle = &response_handle, .out_response = &response });
-            if (!result.isOk()) return bridge.errorFromStatus(result);
-            if (response.status != expected or source.offset != 40 or source.calls <= 1)
-                return error.InvalidCheckpointIncrementalAbi;
         }
     }
     var admission: bridge.RequestAdmissionStats = undefined;

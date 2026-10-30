@@ -35,6 +35,7 @@ const manifest_mod = @import("models/manifest.zig");
 const gpt_mod = @import("models/gpt.zig");
 const runtime = @import("runtime/root.zig");
 const c_file = @import("util/c_file.zig");
+const native_kv_upload = @import("cli/native_kv_upload.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
 const native_run_artifact = @import("native_run_artifact.zig");
 const compiled_artifact = @import("compiled_artifact.zig");
@@ -146,6 +147,8 @@ const Options = struct {
     compiled_target: ?CompiledTarget = null,
     artifact_dir: ?[]const u8 = null,
     server_url: ?[]const u8 = null,
+    messages_file: ?[]const u8 = null,
+    native_kv_checkpoint: ?[]const u8 = null,
     require_server: bool = false,
     stream: bool = false,
     json_timing_path: ?[]const u8 = null,
@@ -371,6 +374,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return;
     }
     var opts = try parseArgs(args);
+    try validateRemoteMessageOptions(opts);
     var structured_cli = try loadStructuredCliInput(allocator, io, opts);
     defer if (structured_cli) |*value| value.deinit();
     if (structured_cli) |value| {
@@ -7298,6 +7302,7 @@ fn generateWithOptionalStreaming(
 
 fn serverGenerateRequest(allocator: std.mem.Allocator, opts: Options, messages: []const api.ChatMessage) !api.GenerateRequest {
     try validateContextExecutionMode(opts);
+    try validateRemoteMessageOptions(opts);
     const targets: ?[]api.GenerateCompactionTarget = if (opts.context_policy_explicit and opts.context_policy.compaction_targets.count != 0) blk: {
         const selected = opts.context_policy.compaction_targets.slice();
         const wire = try allocator.alloc(api.GenerateCompactionTarget, selected.len);
@@ -7323,6 +7328,7 @@ fn serverGenerateRequest(allocator: std.mem.Allocator, opts: Options, messages: 
         .speculation_calibration = if (draft_requested) opts.speculation_calibration.name() else null,
         .cache_dtype = opts.cache_dtype,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
+        .prompt_cache = if (opts.native_kv_checkpoint != null) false else null,
         .context_policy = if (opts.context_policy_explicit) .{
             .mode = @tagName(opts.context_policy.mode),
             .max_context_tokens = if (opts.context_policy.max_context_tokens) |v| v else null,
@@ -7345,7 +7351,50 @@ fn serializeServerGenerateRequest(allocator: std.mem.Allocator, request: api.Gen
     return std.json.Stringify.valueAlloc(allocator, request, .{ .emit_null_optional_fields = false });
 }
 
+const ServerMessagesFile = struct {
+    allocator: std.mem.Allocator,
+    bytes: []u8,
+    parsed: std.json.Parsed([]api.ChatMessage),
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !ServerMessagesFile {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only, .allow_directory = false, .follow_symlinks = false });
+        defer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.kind != .file or stat.size == 0 or stat.size > 2 * 1024 * 1024) return error.InvalidMessagesFile;
+        const bytes = try allocator.alloc(u8, @intCast(stat.size));
+        errdefer allocator.free(bytes);
+        if (try file.readPositionalAll(io, bytes, 0) != bytes.len or !std.unicode.utf8ValidateSlice(bytes)) return error.InvalidMessagesFile;
+        var parsed = try std.json.parseFromSlice([]api.ChatMessage, allocator, bytes, .{ .allocate = .alloc_always });
+        errdefer parsed.deinit();
+        if (parsed.value.len == 0) return error.InvalidMessagesFile;
+        return .{ .allocator = allocator, .bytes = bytes, .parsed = parsed };
+    }
+
+    fn deinit(self: *ServerMessagesFile) void {
+        self.parsed.deinit();
+        self.allocator.free(self.bytes);
+    }
+};
+
+fn validateRemoteMessageOptions(opts: Options) !void {
+    if (opts.messages_file) |path| {
+        if (path.len == 0 or !std.mem.eql(u8, opts.prompt, "-") or opts.context_document_file != null or
+            opts.context_question_file != null or opts.context_document != null or opts.context_question != null or
+            opts.image_count != 0 or opts.audio_count != 0 or opts.video_path != null)
+            return error.InvalidMessagesFileOptions;
+    }
+    if (opts.native_kv_checkpoint) |path| {
+        if (path.len == 0 or opts.max_tokens < 1 or opts.max_tokens > 256 or opts.context_policy_explicit or
+            opts.mode == .compiled or opts.compiled_target != null or opts.cache_compaction_ratio != null or
+            (opts.cache_dtype != null and !std.mem.eql(u8, opts.cache_dtype.?, "f16")) or
+            opts.draft_model != null or opts.image_count != 0 or opts.audio_count != 0 or opts.video_path != null or
+            opts.raw_prompt or opts.no_bos or opts.no_chat_template or opts.raw_decode_bench)
+            return error.UnsupportedNativeCheckpointCliOptions;
+    }
+}
+
 fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, quiet_errors: bool) !void {
+    try validateRemoteMessageOptions(opts);
     if (!serverGenerateSupportsOptions(opts)) {
         return error.UnsupportedServerGenerateOption;
     }
@@ -7355,8 +7404,13 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
     var http = httpx.Client.init(allocator, io_impl.io());
     defer http.deinit();
 
-    const url = try generateEndpointUrl(allocator, opts.server_url.?);
-    defer allocator.free(url);
+    const generate_url = try generateEndpointUrl(allocator, opts.server_url.?);
+    defer allocator.free(generate_url);
+    const url = if (opts.native_kv_checkpoint != null)
+        try std.fmt.allocPrint(allocator, "{s}/context/resume", .{generate_url})
+    else
+        generate_url;
+    defer if (opts.native_kv_checkpoint != null) allocator.free(url);
 
     var document_object: std.json.ObjectMap = .empty;
     defer document_object.deinit(allocator);
@@ -7374,22 +7428,35 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
         break :blk .{ .array = structured_parts };
     } else .{ .string = opts.prompt };
     const messages = [_]api.ChatMessage{.{ .role = .user, .content = content }};
-    const request = try serverGenerateRequest(allocator, opts, &messages);
+    var file_messages: ?ServerMessagesFile = if (opts.messages_file) |path| try ServerMessagesFile.init(allocator, io, path) else null;
+    defer if (file_messages) |*value| value.deinit();
+    const request = try serverGenerateRequest(allocator, opts, if (file_messages) |value| value.parsed.value else &messages);
     defer freeServerGenerateTargets(allocator, request);
     const body = try serializeServerGenerateRequest(allocator, request);
     defer allocator.free(body);
 
+    var native_upload: ?native_kv_upload.Upload = if (opts.native_kv_checkpoint) |path|
+        try native_kv_upload.Upload.init(allocator, io, path, body)
+    else
+        null;
+    defer if (native_upload) |*upload| upload.deinit();
     if (opts.stream) {
-        return try runServerGenerateStream(allocator, io, &http, url, body, opts, quiet_errors);
+        return try runServerGenerateStream(allocator, io, &http, url, body, opts, quiet_errors, if (native_upload) |*upload| upload else null);
     }
 
+    var native_response: native_kv_upload.JsonResponse = .{ .allocator = allocator };
+    defer native_response.deinit();
     const started_at = std.Io.Timestamp.now(io, .awake);
-    var resp = try http.post(url, .{ .json = body, .timeout_ms = 300_000 });
+    var resp = if (native_upload) |*upload|
+        try http.requestToWriter(.POST, url, upload.requestOptions(false), &native_response, null, null)
+    else
+        try http.post(url, .{ .json = body, .timeout_ms = 300_000 });
     defer resp.deinit();
     const finished_at = std.Io.Timestamp.now(io, .awake);
+    const response_payload: ?[]const u8 = if (native_upload != null) native_response.bytes.items else resp.body;
     if (!resp.ok()) {
         if (!quiet_errors) {
-            if (resp.body) |payload| {
+            if (response_payload) |payload| {
                 print("server_error status={d} body={s}\n", .{ resp.status.code, payload });
             } else {
                 print("server_error status={d}\n", .{resp.status.code});
@@ -7397,7 +7464,7 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
         }
         return error.GenerateRequestFailed;
     }
-    const payload = resp.body orelse return error.EmptyResponse;
+    const payload = response_payload orelse return error.EmptyResponse;
     var parsed = try std.json.parseFromSlice(api.GenerateResponse, allocator, payload, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const choice = if (parsed.value.choices.len > 0) parsed.value.choices[0] else return error.EmptyResponse;
@@ -7573,6 +7640,7 @@ fn runServerGenerateStream(
     body: []const u8,
     opts: Options,
     quiet_errors: bool,
+    native_upload: ?*native_kv_upload.Upload,
 ) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
@@ -7587,11 +7655,11 @@ fn runServerGenerateStream(
     };
 
     const started_at = std.Io.Timestamp.now(io, .awake);
-    var resp = try http.requestToWriter(.POST, url, .{
-        .json = body,
-        .headers = &headers,
-        .timeout_ms = 300_000,
-    }, &stream_writer, null, null);
+    const request_options: httpx.RequestOptions = if (native_upload) |upload|
+        upload.requestOptions(true)
+    else
+        .{ .json = body, .headers = &headers, .timeout_ms = 300_000 };
+    var resp = try http.requestToWriter(.POST, url, request_options, &stream_writer, null, null);
     defer resp.deinit();
     const finished_at = std.Io.Timestamp.now(io, .awake);
 
@@ -7644,7 +7712,8 @@ fn runServerGenerateStream(
 }
 
 fn requireWarmServer(opts: Options) bool {
-    return opts.require_server or platform.env.getenvBool("ANTFLY_INFERENCE_REQUIRE_WARM_SERVER");
+    return opts.require_server or opts.messages_file != null or opts.native_kv_checkpoint != null or
+        platform.env.getenvBool("ANTFLY_INFERENCE_REQUIRE_WARM_SERVER");
 }
 
 fn defaultServerModelName(model_dir: []const u8) ?[]const u8 {
@@ -7706,6 +7775,7 @@ fn validateContextExecutionMode(opts: Options) !void {
 }
 
 fn serverGenerateModeName(opts: Options) ?[]const u8 {
+    if (opts.native_kv_checkpoint != null) return "eager";
     if (opts.mode) |mode| return @tagName(mode);
     if (opts.context_policy.mode != .exact) return @tagName(ExecutionMode.eager);
     if (opts.backend == .metal) return @tagName(ExecutionMode.compiled);
@@ -7713,6 +7783,7 @@ fn serverGenerateModeName(opts: Options) ?[]const u8 {
 }
 
 fn serverGenerateCompiledTargetName(opts: Options) ?[]const u8 {
+    if (opts.native_kv_checkpoint != null) return null;
     if (opts.context_policy.mode != .exact) return null;
     if (opts.compiled_target) |target| return compiledTargetName(target);
     if (opts.backend == .metal and (opts.mode == null or opts.mode.? != .eager)) return compiledTargetName(.whole_model);
@@ -8049,6 +8120,16 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingServerUrl;
             opts.server_url = args[i];
+        } else if (std.mem.eql(u8, arg, "--messages-file") or std.mem.eql(u8, arg, "--kv-checkpoint")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.InvalidArguments;
+            if (std.mem.eql(u8, arg, "--messages-file")) {
+                if (opts.messages_file != null) return error.InvalidArguments;
+                opts.messages_file = args[i];
+            } else {
+                if (opts.native_kv_checkpoint != null) return error.InvalidArguments;
+                opts.native_kv_checkpoint = args[i];
+            }
         } else if (std.mem.eql(u8, arg, "--require-server")) {
             opts.require_server = true;
         } else {
@@ -8058,6 +8139,7 @@ fn parseArgs(args: []const []const u8) !Options {
     }
 
     try opts.context_policy.validate();
+    try validateRemoteMessageOptions(opts);
     if (opts.context_policy_explicit and opts.cache_compaction_ratio != null) return error.InvalidContextPolicy;
     if (opts.cache_compaction_ratio == 1) opts.cache_compaction_ratio = null;
     return opts;
@@ -8492,10 +8574,12 @@ test "video CLI accepts one clip and rejects conflicting inputs" {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path]... [--audio path] [--video h264.mp4] [--backend auto|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--context-mode exact|rolling|attention_matching] [--context-window N] [--max-kv-tokens N] [--keep-prefix-tokens N] [--keep-recent-tokens N] [--compact-part MESSAGE:PART]... [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--messages-file path] [--kv-checkpoint path] [--image path]... [--audio path] [--video h264.mp4] [--backend auto|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--context-mode exact|rolling|attention_matching] [--context-window N] [--max-kv-tokens N] [--keep-prefix-tokens N] [--keep-recent-tokens N] [--compact-part MESSAGE:PART]... [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
+        \\  --messages-file reads a JSON message array with prompt '-' and requires a warm server.
+        \\  --kv-checkpoint resumes an existing native KV checkpoint on the warm server in eager mode.
         \\  --video accepts one progressive 8-bit H.264 MP4 clip on local CUDA Gemma4 (up to 60s, sampled at 1 FPS).
         \\  Video currently excludes audio, mixed image inputs, HDR, rotation, and non-square pixels.
         \\  Sealed attention-matching CLI input requires prompt '-' plus --context-document-file,
@@ -9814,4 +9898,33 @@ test "context structured CLI rejects video before opening sealed text inputs" {
         error.InvalidStructuredCliInput,
         loadStructuredCliInput(std.testing.allocator, std.testing.io, opts),
     );
+}
+
+test "context CLI native checkpoint preserves remote controls and excludes conflicting execution" {
+    const opts = try parseArgs(&.{ "gemma-e2b", "-", "--server", "http://127.0.0.1:8090", "--backend", "metal", "--messages-file", "messages.json", "--kv-checkpoint", "saved.kv", "--stream", "--max-tokens", "64", "--temperature", "0" });
+    try std.testing.expectEqualStrings("messages.json", opts.messages_file.?);
+    try std.testing.expectEqualStrings("saved.kv", opts.native_kv_checkpoint.?);
+    try std.testing.expect(requireWarmServer(opts));
+    try std.testing.expectEqualStrings("eager", serverGenerateModeName(opts).?);
+    try std.testing.expect(serverGenerateCompiledTargetName(opts) == null);
+    const messages = [_]api.ChatMessage{.{ .role = .user, .content = .{ .string = "consumed" } }};
+    const request = try serverGenerateRequest(std.testing.allocator, opts, &messages);
+    defer freeServerGenerateTargets(std.testing.allocator, request);
+    try std.testing.expectEqual(@as(?bool, false), request.prompt_cache);
+    try std.testing.expectEqual(@as(?f32, 0), request.temperature);
+    try std.testing.expectEqual(@as(?i64, 64), request.max_tokens);
+    try std.testing.expect(request.context_policy == null);
+    var changed = opts;
+    changed.mode = .compiled;
+    try std.testing.expectError(error.UnsupportedNativeCheckpointCliOptions, validateRemoteMessageOptions(changed));
+    changed = opts;
+    changed.context_policy_explicit = true;
+    try std.testing.expectError(error.UnsupportedNativeCheckpointCliOptions, validateRemoteMessageOptions(changed));
+    changed = opts;
+    changed.max_tokens = 257;
+    try std.testing.expectError(error.UnsupportedNativeCheckpointCliOptions, validateRemoteMessageOptions(changed));
+    changed = opts;
+    changed.prompt = "silently ignored prompt";
+    try std.testing.expectError(error.InvalidMessagesFileOptions, validateRemoteMessageOptions(changed));
+    try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "model", "-", "--kv-checkpoint", "a", "--kv-checkpoint", "b" }));
 }

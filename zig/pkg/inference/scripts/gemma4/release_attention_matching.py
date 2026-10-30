@@ -380,6 +380,7 @@ FULL_RELEASE_BUILD_FIELDS = FULL_RELEASE_BUILD_FIELDS_V1
 FULL_RELEASE_SCHEMA_V1 = "antfly.context-release-build.v1"
 FULL_RELEASE_SCHEMA_V2 = "antfly.context-release-build.v2"
 FULL_RELEASE_SCHEMA_V3 = "antfly.context-release-build.v3"
+FULL_RELEASE_SCHEMA_V4 = "antfly.context-release-build.v4"
 FULL_RELEASE_EXPECTED_STRIPPED_PROFILE = {"strip_debug_info": True, "have_error_return_tracing": False}
 FULL_RELEASE_COMPILER_PROFILE_PREFIX = "context_compiler_profile: "
 FULL_RELEASE_SOURCE_NOTE = (
@@ -398,11 +399,19 @@ FULL_RELEASE_STRIPPED_COMMAND = [*FULL_RELEASE_COMMAND, "-Dstrip=true"]
 FULL_RELEASE_CURRENT_STRIPPED_COMMAND = [
     argument for argument in FULL_RELEASE_COMMAND if argument != "-Donnx=false"
 ] + ["-Dstrip=true"]
+FULL_RELEASE_16G_STRIPPED_COMMAND = [
+    "ANTFLY_ZIG_MAX_RSS=17179869184" if argument == "ANTFLY_ZIG_MAX_RSS=8589934592" else argument
+    for argument in FULL_RELEASE_CURRENT_STRIPPED_COMMAND
+] + ["-Dcontext-test-compile-memory-mb=16384"]
 FULL_RELEASE_CLEARED_ENV_PREFIXES = ["ANTFLY_", "TERMITE_", "MTL_", "METAL_", "CUDA_", "GGML_", "ZIG_"]
 FULL_RELEASE_ENVIRONMENT = {
     "inherit_non_runtime_environment": True,
     "cleared_prefixes": FULL_RELEASE_CLEARED_ENV_PREFIXES,
     "set_by_command": {"ANTFLY_ZIG_MAX_RSS": "8589934592"},
+}
+FULL_RELEASE_16G_ENVIRONMENT = {
+    **FULL_RELEASE_ENVIRONMENT,
+    "set_by_command": {"ANTFLY_ZIG_MAX_RSS": "17179869184"},
 }
 
 
@@ -448,7 +457,8 @@ def full_release_build_contract(root, receipt_path, expected_binary):
     schema = receipt.get("schema")
     expected_fields = (FULL_RELEASE_BUILD_FIELDS_V1 if schema == FULL_RELEASE_SCHEMA_V1 else
                        FULL_RELEASE_BUILD_FIELDS_V2 if schema in {FULL_RELEASE_SCHEMA_V2,
-                                                                  FULL_RELEASE_SCHEMA_V3} else None)
+                                                                  FULL_RELEASE_SCHEMA_V3,
+                                                                  FULL_RELEASE_SCHEMA_V4} else None)
     require(expected_fields is not None and set(receipt) == expected_fields and
             receipt["release_eligible"] is True and receipt["serving_qualified"] is False and
             receipt["source_verified_after_build"] is True,
@@ -486,21 +496,22 @@ def full_release_build_contract(root, receipt_path, expected_binary):
 
     build = receipt["build"]
     expected_build_fields = ({"cwd", "command", "target", "optimize", "metal", "cuda", "environment"}
-                             if schema == FULL_RELEASE_SCHEMA_V3 else
+                             if schema in {FULL_RELEASE_SCHEMA_V3, FULL_RELEASE_SCHEMA_V4} else
                              {"cwd", "command", "target", "optimize", "metal", "cuda", "onnx", "environment"})
     require(type(build) is dict and set(build) == expected_build_fields and
             build["cwd"] == "zig" and build["target"] == "inference-test-context" and
             build["optimize"] == "ReleaseFast" and build["metal"] is True and
             build["cuda"] is False and
-            (schema == FULL_RELEASE_SCHEMA_V3 or build["onnx"] is False) and
-            build["environment"] == FULL_RELEASE_ENVIRONMENT,
+            (schema in {FULL_RELEASE_SCHEMA_V3, FULL_RELEASE_SCHEMA_V4} or build["onnx"] is False) and
+            build["environment"] == (FULL_RELEASE_16G_ENVIRONMENT if schema == FULL_RELEASE_SCHEMA_V4 else FULL_RELEASE_ENVIRONMENT),
             "invalid full release build configuration")
     command = build["command"]
     expected_command = (FULL_RELEASE_COMMAND if schema == FULL_RELEASE_SCHEMA_V1 else
                         FULL_RELEASE_STRIPPED_COMMAND if schema == FULL_RELEASE_SCHEMA_V2 else
-                        FULL_RELEASE_CURRENT_STRIPPED_COMMAND)
+                        FULL_RELEASE_CURRENT_STRIPPED_COMMAND if schema == FULL_RELEASE_SCHEMA_V3 else
+                        FULL_RELEASE_16G_STRIPPED_COMMAND)
     require(command == expected_command, "invalid full release guarded command")
-    if schema in {FULL_RELEASE_SCHEMA_V2, FULL_RELEASE_SCHEMA_V3}:
+    if schema in {FULL_RELEASE_SCHEMA_V2, FULL_RELEASE_SCHEMA_V3, FULL_RELEASE_SCHEMA_V4}:
         compiler_profile = receipt["compiler_profile"]
         require(type(compiler_profile) is dict and
                 set(compiler_profile) == {"strip_debug_info", "have_error_return_tracing"} and
@@ -516,13 +527,16 @@ def full_release_build_contract(root, receipt_path, expected_binary):
         ref = receipt[field]
         refs[field] = campaign_file(root, ref, "full release build " + field, maximum)
         require(allow_empty or refs[field].stat().st_size > 0, "empty full release build " + field)
-    _full_release_resource_contract(read_json(refs["resource"], receipt["resource"]["sha256"]), command)
+    resource = read_json(refs["resource"], receipt["resource"]["sha256"])
+    _full_release_resource_contract(resource, command)
+    if schema == FULL_RELEASE_SCHEMA_V4:
+        require(resource["limits"]["max_rss_mib"] == 16384, "V4 compiler watchdog differs from declared budget")
     stderr = refs["stderr"].read_text(encoding="utf-8", errors="replace")
     require(not any(line.startswith("error:") for line in stderr.splitlines()),
             "full release compiler log contains an error")
     profile_rows = [line[len(FULL_RELEASE_COMPILER_PROFILE_PREFIX):] for line in stderr.splitlines()
                     if line.startswith(FULL_RELEASE_COMPILER_PROFILE_PREFIX)]
-    if schema in {FULL_RELEASE_SCHEMA_V2, FULL_RELEASE_SCHEMA_V3}:
+    if schema in {FULL_RELEASE_SCHEMA_V2, FULL_RELEASE_SCHEMA_V3, FULL_RELEASE_SCHEMA_V4}:
         require(len(profile_rows) == 1, "stripped full release requires exactly one compiler profile observation")
         try:
             observed_profile = json.loads(profile_rows[0])

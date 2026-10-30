@@ -1515,6 +1515,11 @@ typedef struct termite_metal_decode_runtime {
     BOOL concurrent_planned_dispatch_force_enabled;
     BOOL concurrent_planned_dispatch_force_disabled;
     BOOL concurrent_planned_dispatch_enabled;
+    // Request-owned native checkpoint policy. It is entered and restored only
+    // while the provider is idle; independently loaded models keep their policy.
+    BOOL native_frame_policy_active;
+    BOOL native_frame_resource_barriers;
+    BOOL native_frame_previous_concurrent_requested;
     // A4B-specific concurrent command DAG.  This is deliberately independent
     // from the generic concurrent-encoder switch so it can tighten barriers
     // without changing another model loaded in the same process.
@@ -3822,6 +3827,12 @@ size_t termite_metal_copy_device_name(char *buffer, size_t capacity) {
     }
 }
 
+uint64_t termite_metal_physical_memory_bytes(void) {
+    @autoreleasepool {
+        return (uint64_t)NSProcessInfo.processInfo.physicalMemory;
+    }
+}
+
 size_t termite_metal_copy_compiler_identity(char *buffer, size_t capacity) {
     @autoreleasepool {
         NSString *version = NSProcessInfo.processInfo.operatingSystemVersionString;
@@ -3881,6 +3892,8 @@ static void termite_metal_generated_pipeline_set_error(char *buffer, size_t capa
     memcpy(buffer, utf8, copy_length);
     buffer[copy_length] = '\0';
 }
+
+static void termite_metal_debug_dispatch_profile_register_pipeline(id<MTLComputePipelineState> pipeline, NSString *label);
 
 termite_metal_generated_pipeline *termite_metal_generated_pipeline_create(
     const char *source,
@@ -3959,6 +3972,7 @@ termite_metal_generated_pipeline *termite_metal_generated_pipeline_create(
         result->device = device;
         result->library = library;
         result->pipeline = pipeline;
+        termite_metal_debug_dispatch_profile_register_pipeline(pipeline, kernel);
         return result;
     }
 }
@@ -16245,7 +16259,8 @@ static bool termite_metal_a4b_dag_scheduler_enabled(
 static bool termite_metal_planned_compute_barriers_enabled(termite_metal_decode_runtime *runtime) {
     // Concurrent dispatch relies on range-tracked barriers for correctness, so
     // they cannot be disabled or suppressed in that mode.
-    if (termite_metal_concurrent_planned_dispatch_enabled(runtime)) return true;
+    if (termite_metal_concurrent_planned_dispatch_enabled(runtime) ||
+        (runtime != NULL && runtime->native_frame_policy_active)) return true;
     const char *disabled = getenv("TERMITE_METAL_DISABLE_PLANNED_COMPUTE_BARRIERS");
     if (disabled != NULL && disabled[0] != '\0' && strcmp(disabled, "0") != 0) return false;
     if (runtime != NULL && runtime->planned_compute_barrier_suppression_depth != 0) return false;
@@ -16546,7 +16561,10 @@ static bool termite_metal_encode_resource_barrier(
     id<MTLResource> const *resources,
     size_t resource_count
 ) {
-    if (!termite_metal_a4b_dag_scheduler_enabled(runtime) || encoder == nil ||
+    const bool resource_policy = termite_metal_a4b_dag_scheduler_enabled(runtime) ||
+        (runtime != NULL && runtime->native_frame_policy_active &&
+         runtime->native_frame_resource_barriers);
+    if (!resource_policy || encoder == nil ||
         resources == NULL || resource_count == 0 ||
         ![encoder respondsToSelector:@selector(memoryBarrierWithResources:count:)])
     {
@@ -17359,6 +17377,119 @@ static bool termite_metal_context_split_params_match(
         stage_theta == reduce_theta;
 }
 
+// Borrow the provider planned encoder with explicit binding access roles.
+// A set bit declares a possible write (including read/write atomics). Existing
+// generic callers keep every bit set. RAW, WAR and WAW hazards stay ordered;
+// incompatible runtime policy retains the isolated encoder path.
+static int termite_metal_generated_encode_coalesced_on_active_frame(
+    termite_metal_decode_runtime *runtime,
+    const termite_metal_generated_pipeline *generated,
+    void *const *handles, const size_t *offsets, const size_t *lengths,
+    size_t count, const void *params, size_t params_bytes,
+    bool threadgroups, MTLSize grid, MTLSize group, uint8_t write_mask
+) {
+    if (runtime->active_frame_cb == nil || runtime->submitted_frame_cb != nil ||
+        termite_metal_active_encoder_runtime != runtime) return -6;
+    // Retain the existing isolated-encoder path under incompatible runtime
+    // policy. Coalescing must never weaken the owner's hazard contract.
+    if (!termite_metal_should_coalesce_planned_compute_encoder(runtime) ||
+        !termite_metal_planned_compute_barriers_enabled(runtime)) {
+        if (threadgroups) return termite_metal_generated_dispatch_threadgroups_on_active_frame(
+            runtime, generated, handles, offsets, lengths, count, params, params_bytes,
+            grid.width, grid.height, grid.depth, group.width, group.height, group.depth);
+        return termite_metal_generated_dispatch_on_active_frame(
+            runtime, generated, handles, offsets, lengths, count, params, params_bytes, grid.width);
+    }
+    termite_metal_planned_encoder_range accesses[8];
+    for (size_t i = 0; i < count; ++i) {
+        if (termite_metal_planned_range_make((__bridge id<MTLBuffer>)handles[i],
+                offsets[i], lengths[i], (write_mask & (1u << i)) != 0u
+                    ? TERMITE_METAL_PLANNED_RANGE_WRITE : TERMITE_METAL_PLANNED_RANGE_READ,
+                &accesses[i], -8) != 0) return -8;
+    }
+    if (runtime->active_planned_compute_encoder == nil) {
+        const int rc = termite_metal_decode_runtime_begin_planned_compute_scope(
+            runtime, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, TERMITE_METAL_COMPUTE_REGION_ATTENTION);
+        if (rc != 0) return -9;
+    }
+    if (runtime->active_planned_compute_encoder == nil) return -9;
+    if (termite_metal_decode_runtime_prepare_planned_compute_accesses(
+            runtime, accesses, count, -10) != 0) return -10;
+    id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+    [encoder setComputePipelineState:generated->pipeline];
+    for (size_t i = 0; i < count; ++i) [encoder setBuffer:(__bridge id<MTLBuffer>)handles[i]
+        offset:offsets[i] atIndex:i];
+    [encoder setBytes:params length:params_bytes atIndex:8];
+    if (threadgroups) [encoder dispatchThreadgroups:grid threadsPerThreadgroup:group];
+    else [encoder dispatchThreads:grid threadsPerThreadgroup:group];
+    return 0;
+}
+
+int termite_metal_generated_dispatch_coalesced_on_active_frame(
+    termite_metal_decode_runtime *runtime,
+    const termite_metal_generated_pipeline *generated,
+    void *const *handles, const size_t *offsets, const size_t *lengths,
+    size_t count, const void *params, size_t params_bytes, size_t threads
+) {
+    size_t width = 0;
+    const int validation = termite_metal_generated_validate_dispatch(
+        runtime, generated, handles, offsets, lengths, count, params, params_bytes, threads, &width);
+    if (validation != 0) return validation;
+    return termite_metal_generated_encode_coalesced_on_active_frame(
+        runtime, generated, handles, offsets, lengths, count, params, params_bytes,
+        false, MTLSizeMake(threads, 1, 1), MTLSizeMake(width, 1, 1), UINT8_MAX);
+}
+
+int termite_metal_generated_dispatch_threadgroups_coalesced_on_active_frame(
+    termite_metal_decode_runtime *runtime,
+    const termite_metal_generated_pipeline *generated,
+    void *const *handles, const size_t *offsets, const size_t *lengths,
+    size_t count, const void *params, size_t params_bytes,
+    size_t grid_x, size_t grid_y, size_t grid_z,
+    size_t group_x, size_t group_y, size_t group_z
+) {
+    const int validation = termite_metal_generated_validate_threadgroups(
+        runtime, generated, handles, offsets, lengths, count, params, params_bytes,
+        grid_x, grid_y, grid_z, group_x, group_y, group_z);
+    if (validation != 0) return validation;
+    return termite_metal_generated_encode_coalesced_on_active_frame(
+        runtime, generated, handles, offsets, lengths, count, params, params_bytes,
+        true, MTLSizeMake(grid_x, grid_y, grid_z), MTLSizeMake(group_x, group_y, group_z), UINT8_MAX);
+}
+
+// Explicit access roles are supplied only by callers that own the shader ABI.
+int termite_metal_generated_dispatch_accesses_coalesced_on_active_frame(
+    termite_metal_decode_runtime *runtime,
+    const termite_metal_generated_pipeline *generated,
+    void *const *handles, const size_t *offsets, const size_t *lengths,
+    size_t count, const void *params, size_t params_bytes, size_t threads, uint8_t write_mask
+) {
+    size_t width = 0;
+    const int validation = termite_metal_generated_validate_dispatch(
+        runtime, generated, handles, offsets, lengths, count, params, params_bytes, threads, &width);
+    if (validation != 0) return validation;
+    return termite_metal_generated_encode_coalesced_on_active_frame(
+        runtime, generated, handles, offsets, lengths, count, params, params_bytes,
+        false, MTLSizeMake(threads, 1, 1), MTLSizeMake(width, 1, 1), write_mask);
+}
+
+int termite_metal_generated_dispatch_threadgroups_accesses_coalesced_on_active_frame(
+    termite_metal_decode_runtime *runtime,
+    const termite_metal_generated_pipeline *generated,
+    void *const *handles, const size_t *offsets, const size_t *lengths,
+    size_t count, const void *params, size_t params_bytes,
+    size_t grid_x, size_t grid_y, size_t grid_z,
+    size_t group_x, size_t group_y, size_t group_z, uint8_t write_mask
+) {
+    const int validation = termite_metal_generated_validate_threadgroups(
+        runtime, generated, handles, offsets, lengths, count, params, params_bytes,
+        grid_x, grid_y, grid_z, group_x, group_y, group_z);
+    if (validation != 0) return validation;
+    return termite_metal_generated_encode_coalesced_on_active_frame(
+        runtime, generated, handles, offsets, lengths, count, params, params_bytes,
+        true, MTLSizeMake(grid_x, grid_y, grid_z), MTLSizeMake(group_x, group_y, group_z), write_mask);
+}
+
 // Encode the context split stage and reduction into one active-frame scoped
 // encoder. The contract is intentionally context-specific: input 5 is an
 // atomic sticky-status write and all other stage inputs are read-only.
@@ -17752,9 +17883,50 @@ int termite_metal_decode_runtime_set_concurrent_planned_dispatch(
     // Changing encoder dispatch semantics with an active or in-flight frame
     // would make access/barrier ownership ambiguous.  Require a frame boundary.
     if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -2;
+    if (runtime->native_frame_policy_active) return -3;
     runtime->concurrent_planned_dispatch_requested = requested != 0;
     termite_metal_refresh_concurrent_planned_dispatch_policy(runtime);
     return 0;
+}
+
+int termite_metal_decode_runtime_begin_native_frame_policy(
+    termite_metal_decode_runtime *runtime,
+    int concurrent_requested,
+    int resource_barriers
+) {
+    if (runtime == NULL) return -1;
+    if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -2;
+    if (runtime->native_frame_policy_active || runtime->a4b_concurrent_ffn_scope_active) return -3;
+    runtime->native_frame_previous_concurrent_requested = runtime->concurrent_planned_dispatch_requested;
+    runtime->native_frame_resource_barriers = resource_barriers != 0;
+    runtime->native_frame_policy_active = YES;
+    runtime->concurrent_planned_dispatch_requested =
+        runtime->concurrent_planned_dispatch_requested || concurrent_requested != 0;
+    // The captured global kill switch still wins over a scoped request.
+    termite_metal_refresh_concurrent_planned_dispatch_policy(runtime);
+    return 0;
+}
+
+int termite_metal_decode_runtime_end_native_frame_policy(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL) return -1;
+    if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -2;
+    if (!runtime->native_frame_policy_active) return -3;
+    runtime->concurrent_planned_dispatch_requested = runtime->native_frame_previous_concurrent_requested;
+    runtime->native_frame_policy_active = NO;
+    runtime->native_frame_resource_barriers = NO;
+    runtime->native_frame_previous_concurrent_requested = NO;
+    termite_metal_refresh_concurrent_planned_dispatch_policy(runtime);
+    return 0;
+}
+
+// Requested and effective bits are separate so a force-enabled runtime can
+// prove that a temporary native request did not escape into its next owner.
+unsigned termite_metal_decode_runtime_native_frame_policy_state(const termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL) return 0;
+    return (runtime->concurrent_planned_dispatch_requested ? 1u : 0u) |
+        (runtime->native_frame_resource_barriers ? 2u : 0u) |
+        (runtime->native_frame_policy_active ? 4u : 0u) |
+        (runtime->concurrent_planned_dispatch_enabled ? 8u : 0u);
 }
 
 int termite_metal_decode_runtime_configure_a4b_dag_scheduler(
@@ -17763,6 +17935,7 @@ int termite_metal_decode_runtime_configure_a4b_dag_scheduler(
 ) {
     if (runtime == NULL) return -1;
     if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -2;
+    if (runtime->native_frame_policy_active) return -3;
     const bool enable = qualified_a4b_model != 0 && runtime->a4b_dag_scheduler_requested &&
         !runtime->concurrent_planned_dispatch_force_disabled;
     const bool enable_concurrent_hazard = qualified_a4b_model != 0 &&
@@ -17799,7 +17972,7 @@ int termite_metal_decode_runtime_begin_a4b_concurrent_ffn_scope(
 ) {
     if (runtime == NULL) return -1;
     if (runtime->active_frame_cb == nil || runtime->submitted_frame_cb != nil) return -2;
-    if (runtime->a4b_concurrent_ffn_scope_active) return -3;
+    if (runtime->a4b_concurrent_ffn_scope_active || runtime->native_frame_policy_active) return -3;
     if (runtime->concurrent_planned_dispatch_enabled ||
         runtime->concurrent_planned_dispatch_force_disabled) return -4;
     termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);

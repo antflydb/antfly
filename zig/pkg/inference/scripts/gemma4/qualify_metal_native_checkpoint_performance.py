@@ -17,7 +17,7 @@
 """Matched Metal full-replay versus portable-checkpoint observations.
 
 This collector is test-ingress evidence.  Its paired comparison restores an
-unchanged exact f16 checkpoint and a fitted f16/FP8 checkpoint at the same
+unchanged exact f16 checkpoint and a fitted f16/FP8/rotated4 checkpoint at the same
 logical prefix. Full replay is recorded separately and is never used as the
 decode denominator.
 """
@@ -182,6 +182,9 @@ def load_prepared_evidence(args, request_path, normalized_request_sha256):
                 "producer checkpoint omitted " + field)
     require(args.encoding != "fp8" or metadata["fp8_heads"] > 0,
             "producer FP8 checkpoint has no encoded heads")
+    if args.encoding == "rotated4":
+        from qualify_attention_match_queries import validate_quantization_evidence
+        validate_quantization_evidence([metadata], "rotated4", require_actual=True)
 
     exact_summary = {key: exact_meta.get(key) for key in (
         "outcome", "encoding", "checkpoint_bytes", "logical_tokens",
@@ -190,6 +193,11 @@ def load_prepared_evidence(args, request_path, normalized_request_sha256):
         "outcome", "encoding", "checkpoint_bytes", "logical_tokens",
         "global_savings_ratio", "validated_heads", "preserved_heads",
         "fp8_heads", "fp8_fallback_heads")}
+    if args.encoding == "rotated4":
+        candidate_summary.update({key: metadata.get(key) for key in (
+            "rotated4_heads", "rotated4_fallback_heads",
+            "rotated4_eligible_rows", "rotated4_compressed_rows",
+            "rotated4_exact_rows")})
     require(producer.get("exact_control") == exact_summary and
             producer.get("physical_ledger") == candidate_summary,
             "producer checkpoint summary differs from prepare receipts")
@@ -393,7 +401,12 @@ def observe(args, body, record, mode, checkpoint=None):
         result["owner_ledger"] = ledger_contract(
             rows, route, require_binding=checkpoint is not None,
             expected_representation=(None if checkpoint is None else
-                                     "f16" if mode == "exact" else args.encoding))
+                                     "f16" if mode == "exact" else args.encoding),
+            expected_model=args.model,
+            expected_encoded_heads=(getattr(args, "expected_encoded_heads", None)
+                                    if mode == "compacted" else None),
+            expected_encoded_rows=(getattr(args, "expected_encoded_rows", None)
+                                   if mode == "compacted" else None))
     except Exception as exc:
         attempt["validation_error"] = f"{type(exc).__name__}: {exc}"
         raise
@@ -421,7 +434,7 @@ def main(argv=None):
     parser.add_argument("--request", type=Path, required=True)
     parser.add_argument("--declared-context-tokens", type=int,
                         choices=[8192, 32768], required=True)
-    parser.add_argument("--encoding", choices=["f16", "fp8"], required=True)
+    parser.add_argument("--encoding", choices=["f16", "fp8", "rotated4"], required=True)
     parser.add_argument("--warmups", type=int, default=MIN_WARMUPS)
     parser.add_argument("--pairs", type=int, default=MIN_PAIRS)
     parser.add_argument("--smoke", action="store_true")
@@ -448,7 +461,7 @@ def main(argv=None):
     args.fixture = "fact"
     args.expected_outcome = "compacted"
     args.minimum_fp8_heads = 1 if args.encoding == "fp8" else 0
-    args.experimental_rotated4 = False
+    args.experimental_rotated4 = args.encoding == "rotated4"
     args.generation_timing = False
     validate_backend_configuration(args)
     source = git_provenance(REPO)
@@ -520,6 +533,7 @@ def main(argv=None):
                 # the original rather than fitting; anything else aborts the pair.
                 args.checkpoint = exact_checkpoint
                 args.encoding = "f16"
+                args.experimental_rotated4 = False
                 args.expected_outcome = "unchanged_insufficient_savings"
                 args.minimum_savings = 4.0
                 args.qualification_minimum_savings = 4.0
@@ -527,6 +541,7 @@ def main(argv=None):
                 exact_prepared = prepare(args, body, record)
                 args.checkpoint = candidate_checkpoint
                 args.encoding = result["encoding"]
+                args.experimental_rotated4 = args.encoding == "rotated4"
                 args.expected_outcome = "compacted"
                 args.minimum_savings = 1.5
                 args.qualification_minimum_savings = 1.5
@@ -545,6 +560,10 @@ def main(argv=None):
                         "consumer loaded-model identity differs from producer")
             exact_meta = exact_prepared["metadata"]
             metadata = prepared["metadata"]
+            args.expected_encoded_heads = (metadata.get("rotated4_heads")
+                                           if args.encoding == "rotated4" else None)
+            args.expected_encoded_rows = (metadata.get("rotated4_compressed_rows")
+                                          if args.encoding == "rotated4" else None)
             require(exact_meta.get("outcome") == "unchanged_insufficient_savings" and
                     exact_meta.get("global_savings_ratio") == 1 and
                     exact_meta.get("validated_heads") == 0,
@@ -561,6 +580,11 @@ def main(argv=None):
                     "outcome", "encoding", "checkpoint_bytes", "logical_tokens",
                     "global_savings_ratio", "validated_heads", "preserved_heads",
                     "fp8_heads", "fp8_fallback_heads")}
+            if args.encoding == "rotated4":
+                result["physical_ledger"].update({key: metadata.get(key) for key in (
+                    "rotated4_heads", "rotated4_fallback_heads",
+                    "rotated4_eligible_rows", "rotated4_compressed_rows",
+                    "rotated4_exact_rows")})
             result["physical_ledger_source"] = (
                 "public checkpoint metadata computed from backend allocation accounting")
             result["total_committed_context_qualified"] = False

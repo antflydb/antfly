@@ -129,11 +129,13 @@ pub fn create(ctx: Context) Suite {
     runtime_build.configureMetal(b, context_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
     runtime_build.configureCudaVideo(b, context_module, ctx.target, ctx.backend.enable_cuda, ctx.paths);
     context_module.link_libc = ctx.backend.link_libc;
+    const context_compile_memory_mb = b.option(usize, "context-test-compile-memory-mb", "Declared context-test compiler memory bound in MiB") orelse 8192;
+    if (context_compile_memory_mb == 0) @panic("context-test compiler memory bound must be positive");
     const context_tests = b.addTest(.{
         .name = "context-tests",
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        .max_rss = std.math.mul(usize, context_compile_memory_mb, 1024 * 1024) catch @panic("context-test compiler memory bound overflows"),
         .root_module = context_module,
-        .filters = if (main_test_filters.len != 0) main_test_filters else &.{ "context ", "compaction", "attention_match", "sliding", "gemma4", "native generation prompt", "swa ring", "serving qualification", "server generate stream", "native checkpoint", "selected Metal" },
+        .filters = if (main_test_filters.len != 0) main_test_filters else &.{ "context ", "compaction", "attention_match", "sliding", "gemma4", "native generation prompt", "swa ring", "serving qualification", "server generate stream", "native checkpoint", "Metal checkpoint host plan", "selected Metal" },
         .test_runner = runtime_filter_test_runner,
     });
     const run_context_tests = ctx.addRunArtifact(context_tests);

@@ -53,6 +53,10 @@ from benchmark_resources import group_rss_mib, memory_free_percent, swapout_byte
 
 METAL_TEST_SERVER_SCHEMA = "antfly.metal-checkpoint-test-server.v1"
 METAL_TEST_MODEL = "google/gemma-4-E4B-it-qat-q4_0-gguf"
+METAL_TEST_MODELS = {
+    "google/gemma-4-E2B-it-qat-q4_0-gguf",
+    METAL_TEST_MODEL,
+}
 METAL_COMBINED_RSS_LIMIT_BYTES = 8 * 1024**3
 METAL_MINIMUM_FREE_MEMORY_PERCENT = 15
 METAL_MINIMUM_DISK_FREE_MIB = 4096
@@ -420,13 +424,15 @@ def validate_metal_memory(memory, max_rss_bytes=METAL_COMBINED_RSS_LIMIT_BYTES):
 def validate_backend_configuration(args):
     if (args.backend == "metal") != (args.server_kind == "metal-test"):
         raise ValueError("--backend metal requires --server-kind metal-test and vice versa")
+    if args.backend == "metal" and args.encoding not in ("f16", "fp8", "rotated4"):
+        raise ValueError("Metal qualification supports only f16, fp8, and rotated4 checkpoints")
     if args.backend == "metal" and (
-        args.encoding not in ("f16", "fp8")
-        or getattr(args, "experimental_rotated4", False)
+        getattr(args, "experimental_rotated4", False)
+        != (args.encoding == "rotated4")
     ):
-        raise ValueError("Metal qualification supports only f16 and fp8 checkpoints")
-    if args.backend == "metal" and getattr(args, "model", METAL_TEST_MODEL) != METAL_TEST_MODEL:
-        raise ValueError("Metal checkpoint qualification is pinned to Gemma4 E4B")
+        raise ValueError("Metal rotated4 qualification requires its explicit experimental gate")
+    if args.backend == "metal" and getattr(args, "model", METAL_TEST_MODEL) not in METAL_TEST_MODELS:
+        raise ValueError("Metal checkpoint qualification supports only Gemma4 E2B and E4B")
     test_minimum = getattr(args, "qualification_minimum_savings", None)
     if test_minimum is not None:
         if args.backend != "metal" or args.server_kind != "metal-test":
@@ -508,6 +514,7 @@ def metal_ledger_finish(
         expected_route,
         require_binding=require_binding,
         expected_representation=expected_representation,
+        expected_model=getattr(args, "model", METAL_TEST_MODEL),
     )
     current = proof["committed"]
     if not require_binding and (
@@ -570,9 +577,11 @@ def server(args, label, evidence):
         }
         overrides = {
             "ANTFLY_METAL_CHECKPOINT_MODELS_ROOT": str(args.models_dir.resolve()),
+            "ANTFLY_METAL_CHECKPOINT_MODEL": getattr(args, "model", METAL_TEST_MODEL),
             "ANTFLY_METAL_CHECKPOINT_PORT": str(args.port),
             "ANTFLY_METAL_CHECKPOINT_READY_FILE": str(ready_path.resolve()),
             "ANTFLY_METAL_CHECKPOINT_STOP_FILE": str(stop_path.resolve()),
+            "ANTFLY_METAL_CHECKPOINT_MAX_CONCURRENT_REQUESTS": str(capacity),
         }
         environment.update(overrides)
         command = [
@@ -782,7 +791,7 @@ def server(args, label, evidence):
             record["stopped"] = True
 
 
-def response_headers(response, record, args):
+def response_headers(response, record, args=None):
     headers = {k.lower(): v for k, v in response.getheaders()}
     backend = getattr(args, "backend", "cuda")
     if headers.get("x-antfly-inference-backend") != backend:

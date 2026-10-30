@@ -38,11 +38,15 @@ from qualify_native_checkpoint_http import (
     REPO,
     canonical_choices,
     git_provenance,
+    normalize_request_body,
+    prepare_headers,
     requests,
     response_headers,
     resume,
     server,
     sha256_file,
+    validate_backend_configuration,
+    validate_metal_memory,
 )
 
 
@@ -143,6 +147,11 @@ def diagnostic_messages(data):
             match = re.fullmatch(
                 r"(?:debug|info|warn|warning|err|error)(?:\([^\r\n()]+\))?: (.*)", text
             )
+            if match is None:
+                match = re.fullmatch(
+                    r"\[[^\r\n\[\]]+\] \((?:debug|info|warn|warning|err|error)\): (.*)",
+                    text,
+                )
             if match:
                 messages.append(match[1])
         else:
@@ -151,7 +160,7 @@ def diagnostic_messages(data):
     return messages
 
 
-def wait_prefill_route(log, offset, timeout):
+def wait_prefill_route(args, log, offset, timeout):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         with log.open("rb") as source:
@@ -161,14 +170,45 @@ def wait_prefill_route(log, offset, timeout):
             data = source.read(1024 * 1024)
         if len(data) == 1024 * 1024:
             raise RuntimeError("unexpected excessive prefill diagnostics")
+        if args.backend == "metal":
+            phases = []
+            for line in data.splitlines():
+                prefix = b"metal_checkpoint_qualification "
+                if line.startswith(prefix):
+                    line = line[len(prefix):]
+                try:
+                    row = json.loads(line)
+                except (UnicodeError, ValueError):
+                    continue
+                if (
+                    isinstance(row, dict)
+                    and row.get("schema") == "antfly.metal-checkpoint-phase.v1"
+                    and row.get("phase") == "prefill_started"
+                ):
+                    phases.append(row)
+            if len(phases) > 1:
+                raise AssertionError("ambiguous fresh Metal prefill owner ledger")
+            if phases:
+                row = phases[0]
+                if (
+                    not isinstance(row.get("request"), int)
+                    or row["request"] <= 0
+                    or not isinstance(row.get("owner_id"), int)
+                    or row["owner_id"] <= 0
+                    or row.get("owner_available") is not True
+                    or row.get("physical_available") is not True
+                    or row.get("combined_available") is not True
+                ):
+                    raise AssertionError("invalid Metal prefill owner ledger")
+                return row
         for message in diagnostic_messages(data):
-            if message.startswith("cuda_gqa_prefill_profile: status=active "):
+            if args.backend == "cuda" and message.startswith("cuda_gqa_prefill_profile: status=active "):
                 return message
         time.sleep(0.01)
-    raise TimeoutError("no fresh active CUDA prefill route marker")
+    raise TimeoutError(f"no fresh active {args.backend} prefill route marker")
 
 
-def fitting_cancellation_evidence(data):
+def fitting_cancellation_evidence(data, backend="cuda"):
     messages = diagnostic_messages(data)
     errors = [
         message
@@ -181,18 +221,22 @@ def fitting_cancellation_evidence(data):
         if message.startswith("attention_match_fit_rejected ")
     ]
     if len(errors) != 1 or len(phases) != 1:
-        raise AssertionError("missing/ambiguous fresh fitting error and phase evidence")
-    if (
-        re.fullmatch(
-            r"attention_match_fit_error error=(Cancelled|Canceled|CompactionCancelled)",
-            errors[0],
+        raise AssertionError(
+            f"missing/ambiguous fresh {backend} fitting error and phase evidence"
         )
-        is None
-    ):
+    backend_field = r"(?:backend=" + re.escape(backend) + r" )?"
+    if re.fullmatch(
+        r"attention_match_fit_error "
+        + backend_field
+        + r"error=(Cancelled|Canceled|CompactionCancelled)",
+        errors[0],
+    ) is None:
         raise AssertionError("fitting failed for a reason other than cancellation")
     fields = dict(
         field.split("=", 1) for field in phases[0].split()[1:] if "=" in field
     )
+    if fields.get("backend", backend) != backend:
+        raise AssertionError("fitting evidence came from another backend")
     if fields.get("phase") != "fit":
         raise AssertionError("cancellation did not interrupt fitting")
     try:
@@ -212,11 +256,25 @@ def fitting_cancellation_evidence(data):
     }
 
 
+def validate_campaign_memory(args, memory):
+    if args.backend == "metal":
+        validate_metal_memory(memory)
+        return
+    if memory["samples"] < 2 or memory["errors"] or not memory["gpu_uuids"]:
+        raise AssertionError("incomplete memory evidence")
+    if (
+        not 0 < memory["peak_host_rss_bytes"] <= 8 * 1024**3
+        or not 0 < memory["peak_gpu_memory_bytes"] <= 18 * 1024**3
+    ):
+        raise AssertionError("memory cap exceeded")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", choices=["cuda", "metal"], default="cuda")
     parser.add_argument("--server", type=Path, required=True)
     parser.add_argument(
-        "--server-kind", choices=["inference", "standalone"], default="standalone"
+        "--server-kind", choices=["inference", "standalone", "metal-test"], default="standalone"
     )
     parser.add_argument("--models-dir", type=Path, default=Path(".models"))
     parser.add_argument("--model", default="google/gemma-4-E4B-it-qat-q4_0-gguf")
@@ -228,8 +286,16 @@ def main():
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--recovery-limit-seconds", type=float, default=5)
     parser.add_argument("--experimental-rotated4", action="store_true")
+    parser.add_argument(
+        "--encoding", choices=["f32", "f16", "fp8", "rotated4"], default="f16"
+    )
     args = parser.parse_args()
     args.fixture = "fact"
+    args.qualification_minimum_savings = None
+    try:
+        validate_backend_configuration(args)
+    except ValueError as error:
+        parser.error(str(error))
     if not 0 < args.recovery_limit_seconds <= 5:
         parser.error("recovery bound must be positive and at most 5s")
     if args.output.exists():
@@ -241,6 +307,7 @@ def main():
         "fitting_cancellation_qualified": False,
         "live_replacement_cancellation_qualified": False,
         "server_kind": args.server_kind,
+        "backend": args.backend,
         "scope": "Actual TCP reset during partial native upload, prefill, export, and evidenced fitting; same-worker recovery",
         "source": git_provenance(REPO),
         "binary_sha256": sha256_file(args.server),
@@ -275,6 +342,8 @@ def main():
 
             validate_quantization_evidence([prepared["metadata"]], "rotated4")
         evidence["encoding"] = encoding
+        if encoding != args.encoding:
+            raise AssertionError("reference encoding differs from requested backend cell")
         if prepared["file_sha256"] != evidence["checkpoint_sha256"]:
             raise AssertionError("checkpoint changed")
         body = copy.deepcopy(
@@ -282,6 +351,7 @@ def main():
         )
         body.pop("context_management")
         body.pop("cache_dtype")
+        body = normalize_request_body(args, body)
         with server(args, "worker", evidence) as record:
             baseline = resume(args, body, record, prepared, "before_cancellation")
             log = args.output.with_suffix(".worker.log")
@@ -318,14 +388,11 @@ def main():
                             "POST",
                             "/ai/v1/generate/context/checkpoint",
                             json.dumps(body).encode(),
-                            {
-                                "Content-Type": "application/json",
-                                "X-Antfly-KV-Encoding": encoding,
-                            },
+                            prepare_headers(args),
                         )
                         if kind == "prefill":
                             case["active_route_marker"] = wait_prefill_route(
-                                log, offset, 30
+                                args, log, offset, 30
                             )
                         elif kind == "fitting":
                             if export_ready_seconds is None:
@@ -351,7 +418,7 @@ def main():
                                 )
                             export_ready_seconds = time.monotonic() - request_started
                             case["export_ready_seconds"] = export_ready_seconds
-                            response_headers(response, record)
+                            response_headers(response, record, args)
                             part = response.read(64 * 1024)
                             if (
                                 not part.startswith(b"AFATT001")
@@ -378,7 +445,9 @@ def main():
                             fresh = source.read(1024 * 1024)
                         if len(fresh) == 1024 * 1024:
                             raise AssertionError("excessive fitting diagnostics")
-                        case["fitting_evidence"] = fitting_cancellation_evidence(fresh)
+                        case["fitting_evidence"] = fitting_cancellation_evidence(
+                            fresh, args.backend
+                        )
                 finally:
                     request.close()
                 # This valid request gets no retries. Header attestation requires
@@ -397,14 +466,7 @@ def main():
                 print(json.dumps(case), flush=True)
                 if kind == "fitting":
                     evidence["fitting_cancellation_qualified"] = True
-        memory = evidence["worker"]["memory"]
-        if memory["samples"] < 2 or memory["errors"] or not memory["gpu_uuids"]:
-            raise AssertionError("incomplete memory evidence")
-        if (
-            not 0 < memory["peak_host_rss_bytes"] <= 8 * 1024**3
-            or not 0 < memory["peak_gpu_memory_bytes"] <= 18 * 1024**3
-        ):
-            raise AssertionError("memory cap exceeded")
+        validate_campaign_memory(args, evidence["worker"]["memory"])
         if git_provenance(REPO) != evidence["source"]:
             raise AssertionError("source changed")
         for path, key in [

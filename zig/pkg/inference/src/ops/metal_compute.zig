@@ -51,6 +51,7 @@ const linalg = @import("inference_linalg");
 const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 const metal_attention_match_storage = @import("metal_attention_match_storage.zig");
 const attention_match_checkpoint = @import("../runtime/kv/attention_match_checkpoint.zig");
+const native_checkpoint_release = @import("../runtime/kv/attention_match_release.zig");
 const attention_match_snapshot = @import("../runtime/kv/attention_match_snapshot.zig");
 const AttentionMatchControl = @import("../runtime/kv/attention_match.zig").Control;
 
@@ -1172,6 +1173,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     provider: if (false) ?mlx_quant.Provider else void =
         if (false) null else {},
     provider_impl: *ProviderImpl,
+    attention_match_forward_active: bool = false,
+    attention_match_front_scratch_ops: usize = 0,
+    attention_match_forward_runner: ?*metal_attention_match_storage.Runner = null,
+    attention_match_forward_layer: usize = std.math.maxInt(usize),
+    attention_match_execution: ?native_checkpoint_release.Execution = null,
+    attention_match_frame_execution: native_checkpoint_release.Execution = .{},
+    attention_match_frame_policy_active: bool = false,
+    attention_match_ple_tail: bool = false,
+    /// Test-only observation of successfully encoded prepared layer tails.
+    attention_match_prepared_tail_blocks: u64 = 0,
+    attention_match_retain_hidden: bool = false,
+    attention_match_forward_hidden: std.ArrayListUnmanaged(MetalTensor) = .empty,
+    attention_match_value_norm_ones: [2]?CT = @splat(null),
     owned_native_provider: bool = false,
     // The cached provider owns mutable command encoders, prepared slots and
     // frame resources. Its lease covers execution and teardown, not just lazy
@@ -4855,6 +4869,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime;
         if (metal_runtime.hasActiveFrame(runtime)) metal_runtime.cancelFrame(runtime) catch {};
         if (metal_runtime.hasSubmittedFrame(runtime)) metal_runtime.waitFrame(runtime) catch {};
+        self.restoreAttentionMatchFramePolicy() catch {};
+        self.releaseAttentionMatchForwardHidden();
+        self.attention_match_forward_hidden.deinit(self.allocator);
+        for (&self.attention_match_value_norm_ones) |*weight| if (weight.*) |value| {
+            freeOp(self, value);
+            weight.* = null;
+        };
         if (self.require_f32_linears) {
             const rc = metal_runtime.termite_metal_decode_runtime_release_linear_views(runtime, metal_runtime.decoder_runtime_linear_slot_capacity);
             std.debug.assert(rc == 0);
@@ -5148,9 +5169,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         revision: u64,
         fp8_heads: usize,
         fp8_rows: usize,
+        rotated4_heads: usize = 0,
+        rotated4_rows: usize = 0,
         exact_resident_bytes: usize,
         encoded_resident_bytes: usize,
         metadata_resident_bytes: usize,
+
+        pub fn representation(self: @This()) []const u8 {
+            if (self.rotated4_heads != 0) return if (self.fp8_heads != 0) "mixed" else "rotated4";
+            return if (self.fp8_heads != 0) "fp8" else "f16";
+        }
     };
 
     pub fn installedAttentionMatchActivity(
@@ -5163,12 +5191,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (binding.sequence != sequence) return error.StaleKvCompaction;
         var fp8_heads: usize = 0;
         var fp8_rows: usize = 0;
+        var rotated4_heads: usize = 0;
+        var rotated4_rows: usize = 0;
         var exact_resident_bytes: usize = 0;
         var encoded_resident_bytes: usize = 0;
         var metadata_resident_bytes: usize = 0;
         for (binding.device.heads) |head| {
             if (head.fp8_rows != 0) fp8_heads += 1;
             fp8_rows = try std.math.add(usize, fp8_rows, head.fp8_rows);
+            if (head.encoding == .rotated4) {
+                rotated4_heads = try std.math.add(usize, rotated4_heads, 1);
+                rotated4_rows = try std.math.add(usize, rotated4_rows, head.compressed_rows);
+            }
             for ([_]?metal_attention_match_storage.Buffer{ head.keys, head.values }) |buffer| {
                 if (buffer) |value| exact_resident_bytes = try std.math.add(usize, exact_resident_bytes, value.bytes.len);
             }
@@ -5189,6 +5223,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .revision = owner.attention_match_revision,
             .fp8_heads = fp8_heads,
             .fp8_rows = fp8_rows,
+            .rotated4_heads = rotated4_heads,
+            .rotated4_rows = rotated4_rows,
             .exact_resident_bytes = exact_resident_bytes,
             .encoded_resident_bytes = encoded_resident_bytes,
             .metadata_resident_bytes = metadata_resident_bytes,
@@ -5201,6 +5237,171 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) bool {
         const owner = self.attentionMatchStorage(storage) catch return false;
         return owner.attention_match_binding != null;
+    }
+
+    fn prepareAttentionMatchValueNormOnes(self: *MetalCompute, dim: usize) !void {
+        const index: usize = switch (dim) {
+            256 => 0,
+            512 => 1,
+            else => return error.InvalidAttentionShape,
+        };
+        if (self.attention_match_value_norm_ones[index] != null) return;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        if (metal_runtime.hasActiveFrame(runtime) or metal_runtime.hasSubmittedFrame(runtime)) return error.ContextTransactionBusy;
+        const ones: [512]f32 = @splat(1);
+        const shape = [_]i32{@intCast(dim)};
+        const cb = self.computeBackend();
+        self.attention_match_value_norm_ones[index] = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(ones[0..dim], &shape));
+    }
+
+    /// Borrow an immutable device weight prepared before the installed frame.
+    /// Callers do not release this model-lifetime constant.
+    pub fn attentionMatchValueNormOnes(self: *const MetalCompute, dim: usize) ?CT {
+        if (!self.attentionMatchForwardActive() or !self.attentionMatchExecution().precomputed_tail) return null;
+        const index: usize = switch (dim) {
+            256 => 0,
+            512 => 1,
+            else => return null,
+        };
+        return self.attention_match_value_norm_ones[index];
+    }
+
+    pub fn reserveAttentionMatchForwardScratch(self: *MetalCompute, config: *const @import("../models/gpt.zig").Config) !void {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        if (metal_runtime.hasActiveFrame(runtime) or metal_runtime.hasSubmittedFrame(runtime)) return error.ContextTransactionBusy;
+        if (config.num_hidden_layers == 0 or config.num_hidden_layers > 256 or config.num_attention_heads == 0 or
+            config.hidden_size == 0 or config.vocab_size == 0) return error.InvalidAttentionShape;
+        var head_dim: usize = 0;
+        var kv_heads: usize = 0;
+        var intermediate: usize = config.ple_hidden_size;
+        for (0..config.num_hidden_layers) |layer| {
+            const geometry = try config.kvDonorGeometry(layer);
+            if (config.family == .gemma and config.global_head_dim != 0 and self.attentionMatchExecution().precomputed_tail and
+                (geometry.head_dim == 256 or geometry.head_dim == 512))
+                try self.prepareAttentionMatchValueNormOnes(geometry.head_dim);
+            head_dim = @max(head_dim, geometry.head_dim);
+            kv_heads = @max(kv_heads, geometry.num_kv_heads);
+            intermediate = @max(intermediate, config.intermediateSize(layer));
+        }
+        // This reserves singleton activations only. It neither prepares a
+        // decoder family nor creates/seeds any retired ordinary KV slot.
+        if (!metal_runtime.decoderRuntimeReservePrefillLayerScratch(self.provider_impl, 1, config.num_attention_heads, kv_heads, head_dim, config.hidden_size, intermediate, 0) or
+            !metal_runtime.decoderRuntimeReserveGreedyTailScratch(self.provider_impl, config.vocab_size))
+            return error.MetalRuntimeUnavailable;
+    }
+
+    pub fn attentionMatchExecution(self: *const MetalCompute) native_checkpoint_release.Execution {
+        if (self.attention_match_forward_active) return self.attention_match_frame_execution;
+        return self.attention_match_execution orelse native_checkpoint_release.Execution.diagnosticFromEnvironment();
+    }
+
+    pub fn beginAttentionMatchForwardFrame(self: *MetalCompute, storage: *runtime_root.kv.storage_runtime.KvStorageRuntime, config: *const @import("../models/gpt.zig").Config, first_position: u64) !bool {
+        if (self.attention_match_forward_active or self.attention_match_frame_policy_active) return error.ContextTransactionBusy;
+        if (self.attention_match_forward_hidden.items.len != 0) return error.ContextTransactionBusy;
+        const owner = try self.attentionMatchStorage(storage);
+        const binding = owner.attention_match_binding orelse return false;
+        if (binding.invalid) return error.InvalidAttentionMatchCache;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (builtin.is_test and getenvBool("ANTFLY_CONTEXT_PROFILE")) std.debug.print("attention_match_forward_frame_begin active={} submitted={} position={d}\n", .{ metal_runtime.hasActiveFrame(runtime), metal_runtime.hasSubmittedFrame(runtime), first_position });
+        if (metal_runtime.hasActiveFrame(runtime) or metal_runtime.hasSubmittedFrame(runtime)) return false;
+        const execution = self.attentionMatchExecution();
+        binding.device.runner.matrix_stage_enabled = execution.matrix_stage;
+        binding.device.runner.coalesced_frame_enabled = execution.coalesced_stage;
+        try self.reserveAttentionMatchForwardScratch(config);
+        if (execution.precomputed_tail) {
+            try binding.device.runner.reserveLayerOutputs(config.num_hidden_layers, config.hidden_size);
+            var plans: [256]metal_attention_match_storage.LayerActivationPlan = undefined;
+            for (plans[0..config.num_hidden_layers], 0..) |*plan, layer| {
+                const geometry = try config.kvDonorGeometry(layer);
+                const q = try std.math.mul(usize, config.num_attention_heads, geometry.head_dim);
+                const kv = try std.math.mul(usize, geometry.num_kv_heads, geometry.head_dim);
+                plan.* = .{ .widths = .{ q, kv, kv, q, kv, config.hidden_size } };
+            }
+            try binding.device.runner.reserveLayerActivations(plans[0..config.num_hidden_layers]);
+        }
+        const retain_hidden = execution.retain_hidden;
+        if (retain_hidden) try self.attention_match_forward_hidden.ensureTotalCapacity(self.allocator, config.num_hidden_layers + 1);
+        errdefer binding.invalid = true;
+        const concurrent_frame = execution.concurrent_frame;
+        const resource_barriers = execution.resource_barriers;
+        if (concurrent_frame or resource_barriers) {
+            if (metal_runtime.termite_metal_decode_runtime_begin_native_frame_policy(runtime, @intFromBool(concurrent_frame), @intFromBool(resource_barriers)) != 0)
+                return error.ContextTransactionBusy;
+            self.attention_match_frame_policy_active = true;
+        }
+        errdefer self.restoreAttentionMatchFramePolicy() catch {};
+        try binding.device.runner.beginDeferredFrame(&binding.device, runtime, config.num_attention_heads, first_position, binding.control);
+        self.attention_match_frame_execution = execution;
+        self.attention_match_forward_active = true;
+        self.attention_match_forward_runner = binding.device.runner;
+        self.attention_match_forward_layer = std.math.maxInt(usize);
+        self.attention_match_ple_tail = execution.ple_tail;
+        self.attention_match_retain_hidden = retain_hidden;
+        return true;
+    }
+
+    pub fn finishAttentionMatchForwardFrame(self: *MetalCompute, storage: *runtime_root.kv.storage_runtime.KvStorageRuntime, accept: bool) !void {
+        defer {
+            // Even an unexpected owner/finish error must fence before a Zig
+            // allocation lease becomes eligible for same-frame pool reuse.
+            const runtime = self.provider_impl.raw_decode_runtime;
+            if (metal_runtime.hasActiveFrame(runtime)) metal_runtime.cancelFrame(runtime) catch {};
+            if (metal_runtime.hasSubmittedFrame(runtime)) metal_runtime.waitFrame(runtime) catch {};
+            self.restoreAttentionMatchFramePolicy() catch {};
+            self.releaseAttentionMatchForwardHidden();
+            self.attention_match_forward_active = false;
+            self.attention_match_forward_runner = null;
+            self.attention_match_forward_layer = std.math.maxInt(usize);
+            self.attention_match_frame_execution = .{};
+            self.attention_match_ple_tail = false;
+            self.attention_match_retain_hidden = false;
+        }
+        const owner = try self.attentionMatchStorage(storage);
+        const binding = owner.attention_match_binding orelse return error.InvalidAttentionMatchCache;
+        if (!accept) {
+            binding.device.runner.cancelDeferredFrame();
+            binding.invalid = true;
+            return;
+        }
+        errdefer binding.invalid = true;
+        try binding.device.runner.finishDeferredFrame(binding.control);
+        try self.restoreAttentionMatchFramePolicy();
+        if (builtin.is_test and getenvBool("ANTFLY_CONTEXT_PROFILE")) std.debug.print("attention_match_forward_frame_complete logical_tokens={d}\n", .{binding.device.logical_length});
+    }
+
+    fn restoreAttentionMatchFramePolicy(self: *MetalCompute) !void {
+        if (!self.attention_match_frame_policy_active) return;
+        if (metal_runtime.termite_metal_decode_runtime_end_native_frame_policy(self.provider_impl.raw_decode_runtime) != 0)
+            return error.ContextTransactionBusy;
+        self.attention_match_frame_policy_active = false;
+    }
+
+    fn attentionMatchForwardActive(self: *const MetalCompute) bool {
+        return self.attention_match_forward_active and metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
+    }
+
+    pub fn attentionMatchForwardRetainsHidden(self: *const MetalCompute, tensor: CT) bool {
+        if (!self.attentionMatchForwardActive() or !self.attention_match_retain_hidden) return false;
+        const buf = toBuf(tensor);
+        if (hasHostView(buf)) return false;
+        const value = buf.metal_tensor orelse return false;
+        // A borrowed runtime scratch view can be overwritten independently
+        // of its wrapper. Only an owned allocation lease can prevent reuse.
+        return value.isDevice() and value.dtype == .f32 and value.device.?.ref.release_on_drop;
+    }
+
+    pub fn retainAttentionMatchForwardHidden(self: *MetalCompute, tensor: CT) !void {
+        if (!self.attentionMatchForwardRetainsHidden(tensor)) return error.UnsupportedAttentionMatchRoute;
+        if (self.attention_match_forward_hidden.items.len == self.attention_match_forward_hidden.capacity) return error.CompactionWorkspaceLimit;
+        const value = try self.ownedMetalTensorFromCt(tensor);
+        self.attention_match_forward_hidden.appendAssumeCapacity(value);
+    }
+
+    fn releaseAttentionMatchForwardHidden(self: *MetalCompute) void {
+        std.debug.assert(!metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and !metal_runtime.hasSubmittedFrame(self.provider_impl.raw_decode_runtime));
+        if (builtin.is_test and self.attention_match_forward_hidden.items.len != 0 and getenvBool("ANTFLY_CONTEXT_PROFILE")) std.debug.print("attention_match_hidden_release tensors={d}\n", .{self.attention_match_forward_hidden.items.len});
+        for (self.attention_match_forward_hidden.items) |*tensor| tensor.deinit();
+        self.attention_match_forward_hidden.clearRetainingCapacity();
     }
 
     pub fn snapshotInstalledAttentionMatch(
@@ -16140,7 +16341,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (input_buf.quantized_storage != null or weight_buf.quantized_storage != null) return error.UnsupportedTensorType;
         // Device-weight RMSNorm must use the same row reduction as prepared
         // SIMD4 slots; the scalar-per-output fallback repeats the row sum.
-        if (self.require_f32_linears and dim != 0 and dim % 4 == 0) {
+        const native_head_norm = self.attentionMatchForwardActive() and (dim == 256 or dim == 512) and
+            !getenvBool("TERMITE_METAL_DISABLE_A4B_PARALLEL_RMS_NORM");
+        if ((self.require_f32_linears or native_head_norm) and dim != 0 and dim % 4 == 0) {
             if (denseDeviceF32(input)) |device| {
                 const count = device.elemCount();
                 if (count > 0 and count % dim == 0 and count <= std.math.maxInt(u32) and dim <= std.math.maxInt(u32)) {
@@ -18584,7 +18787,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
     fn rmsNormClampedOp(ctx: *anyopaque, input: CT, weight: CT, p: ops.NormClampParams) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (!self.require_f32_linears or p.dim % 4 != 0 or disableRuntimeElementwise() or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) return null;
+        const native_head_norm = self.attentionMatchForwardActive() and p.flags == 0 and p.rows <= 32 and
+            (p.dim == 256 or p.dim == 512) and !getenvBool("TERMITE_METAL_DISABLE_A4B_PARALLEL_RMS_NORM");
+        if ((!self.require_f32_linears and !native_head_norm) or p.dim % 4 != 0 or disableRuntimeElementwise() or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) return null;
         var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
         defer x.deinit();
         var w = try self.ownedDeviceMetalTensorFromCt(weight);
@@ -20508,7 +20713,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         scale: f32,
     ) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (!a4bHighMemoryFeatureEnabled(
+        const native_head_rope = self.attentionMatchForwardActive() and
+            !getenvBool("TERMITE_METAL_DISABLE_A4B_HEAD_NORM_ROPE_FUSION");
+        if (!native_head_rope and !a4bHighMemoryFeatureEnabled(
             "TERMITE_METAL_ENABLE_A4B_HEAD_NORM_ROPE_FUSION",
             "TERMITE_METAL_DISABLE_A4B_HEAD_NORM_ROPE_FUSION",
         )) return null;
@@ -20534,7 +20741,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const slot = (try self.ensureDynamicRmsNormSlot(weight, head_dim)) orelse return null;
         var input_mt = try input_metal.retainedCopy();
         defer input_mt.deinit();
-        const tensor = (try metal_runtime.decoderRuntimeApplyHeadRmsNormRopeBatched(self.provider_impl, .{
+        const norm_request = .{
             .slot = slot,
             .input = input_mt,
             .total_heads = total_heads,
@@ -20546,7 +20753,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .eps = eps,
             .value_scale = scale,
             .consecutive_pairs = consecutive_pairs,
-        }, heads_per_row, seq_len)) orelse return null;
+        };
+        const scratch_index: ?usize = if (native_head_rope and self.attentionMatchExecution().precomputed_tail and rows == 1 and seq_len == 1)
+            (if (heads_per_row == 8) @as(usize, 3) else if (heads_per_row == 1 or heads_per_row == 2) @as(usize, 4) else null)
+        else
+            null;
+        if (scratch_index) |index| if (try self.borrowAttentionMatchLayerActivation(index, total_dim)) |borrowed| {
+            var output = borrowed;
+            defer output.deinit();
+            if (input_mt.deviceHandle() != output.deviceHandle() and try metal_runtime.decoderRuntimeApplyHeadRmsNormRopeInto(self.provider_impl, norm_request, output)) {
+                self.attention_match_front_scratch_ops +|= 1;
+                return self.ctFromOwnedMetalTensor(try output.retainedCopy());
+            }
+        };
+        const tensor = (try metal_runtime.decoderRuntimeApplyHeadRmsNormRopeBatched(self.provider_impl, norm_request, heads_per_row, seq_len)) orelse return null;
         return self.ctFromOwnedMetalTensor(tensor);
     }
 
@@ -22502,6 +22722,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        destination: ?MetalTensor,
     ) !CT {
         if (binding.invalid) return error.InvalidAttentionMatchCache;
         errdefer binding.invalid = true;
@@ -22518,9 +22739,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return error.InvalidAttentionShape;
         const first_position = attention.total_sequence_len - attention.query_sequence_len;
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
-        if (metal_runtime.hasActiveFrame(runtime) and
-            metal_runtime.termite_metal_decode_runtime_flush_active_frame(runtime) != 0)
-            return error.MetalFrameSyncFailed;
+        const resume_provider_frame = metal_runtime.hasActiveFrame(runtime);
+        // Encode storage work into the provider's frame. Its Q/K/V commands,
+        // append and attention complete at one fence without changing the
+        // thread-local encoder owner to a different runtime.
         if (metal_runtime.hasSubmittedFrame(runtime)) try metal_runtime.waitFrame(runtime);
         var q = try self.ownedDeviceMetalTensorFromCt(Q);
         defer q.deinit();
@@ -22528,7 +22750,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return error.InvalidAttentionShape, head_dim) catch return error.InvalidAttentionShape;
         if (q.elemCount() != q_count) return error.InvalidAttentionShape;
         const shape = [_]i32{ @intCast(attention.query_sequence_len), @intCast(num_heads * head_dim) };
-        var output = try MetalTensor.deviceAllocateFreshWithAllocator(
+        var output = if (destination) |tensor| blk: {
+            if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.deviceByteOffset() != 0 or
+                tensor.elemCount() != q_count or !std.mem.eql(i32, tensor.shape(), &shape) or
+                tensor.deviceHandle() == q.deviceHandle()) return error.InvalidAttentionShape;
+            break :blk try tensor.retainedCopy();
+        } else try MetalTensor.deviceAllocateFreshWithAllocator(
             self.allocator,
             runtime,
             std.math.mul(usize, q_count, @sizeOf(f32)) catch return error.InvalidAttentionShape,
@@ -22536,31 +22763,41 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             &shape,
         );
         errdefer output.deinit();
+        var keys: ?MetalTensor = null;
+        defer if (keys) |*tensor| tensor.deinit();
+        var values: ?MetalTensor = null;
+        defer if (values) |*tensor| tensor.deinit();
+        var append_request: ?metal_attention_match_storage.Runner.Append = null;
         if (!attention.skip_kv_write) {
             if (owner.attention_match_revision == std.math.maxInt(u64)) return error.StaleKvCompaction;
-            var k = try self.ownedDeviceMetalTensorFromCt(K);
-            defer k.deinit();
-            var v = try self.ownedDeviceMetalTensorFromCt(V);
-            defer v.deinit();
+            keys = try self.ownedDeviceMetalTensorFromCt(K);
+            values = try self.ownedDeviceMetalTensorFromCt(V);
             const kv_count = std.math.mul(usize, std.math.mul(usize, attention.query_sequence_len, num_kv_heads) catch
                 return error.InvalidAttentionShape, head_dim) catch return error.InvalidAttentionShape;
-            if (k.elemCount() != kv_count or v.elemCount() != kv_count) return error.InvalidAttentionShape;
+            if (keys.?.elemCount() != kv_count or values.?.elemCount() != kv_count) return error.InvalidAttentionShape;
+            if (keys.?.deviceHandle() == output.deviceHandle() or values.?.deviceHandle() == output.deviceHandle()) return error.InvalidAttentionShape;
             try binding.device.retainLocalWindow(layer);
-            try binding.device.runner.append(
-                &binding.device,
-                layer,
-                try attentionMatchRef(&k),
-                try attentionMatchRef(&v),
-                attention.query_sequence_len,
-                @intCast(first_position),
-                binding.control,
-            );
-            owner.attention_match_revision += 1;
-            binding.donor_appends += 1;
+            append_request = .{
+                .state = &binding.device,
+                .layer = layer,
+                .keys = try attentionMatchRef(&keys.?),
+                .values = try attentionMatchRef(&values.?),
+                .rows = attention.query_sequence_len,
+                .first_position = @intCast(first_position),
+            };
         }
-        for (heads) |head| if (head.logical_length != @as(u64, @intCast(attention.total_sequence_len)))
-            return error.InvalidAttentionMatchCache;
-        try binding.device.runner.attend(.{
+        if (!metal_runtime.hasActiveFrame(runtime)) try metal_runtime.beginFrame(runtime);
+        errdefer {
+            if (metal_runtime.hasActiveFrame(runtime)) metal_runtime.cancelFrame(runtime) catch {};
+            if (metal_runtime.hasSubmittedFrame(runtime)) metal_runtime.waitFrame(runtime) catch {};
+        }
+        if (binding.device.runner.deferred_runtime != null) {
+            try q.retainForActiveFrame();
+            if (keys) |*tensor| try tensor.retainForActiveFrame();
+            if (values) |*tensor| try tensor.retainForActiveFrame();
+            try output.retainForActiveFrame();
+        }
+        try binding.device.runner.attendOnFrame(runtime, .{
             .heads = heads,
             .queries = try attentionMatchRef(&q),
             .output = try attentionMatchRef(&output),
@@ -22568,8 +22805,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .query_heads = num_heads,
             .first_query_position = @intCast(first_position),
             .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
-        }, binding.control);
+        }, append_request, binding.control);
+        for (heads) |head| if (head.logical_length != @as(u64, @intCast(attention.total_sequence_len)))
+            return error.InvalidAttentionMatchCache;
+        if (append_request != null) {
+            owner.attention_match_revision += 1;
+            binding.donor_appends += 1;
+        }
         binding.attention_calls += 1;
+        if (resume_provider_frame and !metal_runtime.hasActiveFrame(runtime)) try metal_runtime.beginFrame(runtime);
         return self.ctFromOwnedMetalTensor(output);
     }
 
@@ -22591,7 +22835,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (attention.kv_storage) |storage| if (storage.device_write_hook != null) {
             const owner = self.attentionMatchStorage(storage) catch null;
             if (owner) |metal_owner| if (metal_owner.attention_match_binding) |binding|
-                return self.gqaAttentionMatch(metal_owner, binding, Q, K, V, attn_bias, attention, batch, num_heads, num_kv_heads, head_dim);
+                return self.gqaAttentionMatch(metal_owner, binding, Q, K, V, attn_bias, attention, batch, num_heads, num_kv_heads, head_dim, null);
         };
         const has_attention_sink = attention.attention_sink.hasMetadata();
         if (dumpDecodeKvLayerTarget()) |target_layer| {
@@ -23609,16 +23853,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var attention = request.attention;
         if (request.attention_sink.hasMetadata()) attention.attention_sink = request.attention_sink;
         if (attention.attention_sink.hasMetadata()) return null;
-        // Installed ragged attention exclusively owns K/V mutation and the
-        // attention result.  Decline this optional ordinary-KV fusion before
-        // it probes or writes retired exact slots; the GPT fallback reaches
-        // gqaAttentionMatch through gqaPagedAttentionOp.
+        // Route the installed owner through custom attention, then reuse only
+        // the output projection/residual tail. Ordinary KV slots stay retired.
+        var native_custom_attention = false;
         if (attention.kv_storage) |storage| if (storage.device_write_hook != null) {
             if (self.attentionMatchStorage(storage)) |owner| {
-                if (owner.attention_match_binding != null) return null;
+                if (owner.attention_match_binding != null) {
+                    if (!self.attentionMatchForwardActive()) return null;
+                    // A cold embedding can still be host-backed. The optional
+                    // device tail must decline before attention appends KV.
+                    var residual = try self.ownedMetalTensorFromCt(request.residual);
+                    defer residual.deinit();
+                    if (!residual.isDevice() or residual.ndim() != 2 or
+                        residual.dim(0) != attention.query_sequence_len or residual.dim(1) != request.hidden_size)
+                    {
+                        if (builtin.is_test and getenvBool("ANTFLY_CONTEXT_PROFILE")) std.debug.print("attention_match_residual_decline layer={d} device={} ndim={d}\n", .{ attention.layer_index, residual.isDevice(), residual.ndim() });
+                        return null;
+                    }
+                    const input_size = std.math.mul(usize, request.num_heads, request.head_dim) catch return error.InvalidAttentionShape;
+                    if (metal_runtime.decoderRuntimeAttentionOutputResidualFormat(self.provider_impl, request.linear_slot, input_size, request.hidden_size, request.pre_linear_rms_norm_slot, request.post_linear_rms_norm_slot) == null) return null;
+                    native_custom_attention = true;
+                }
             } else |_| {}
         };
-        if (attention.context_session != null) {
+        if (attention.context_session != null or native_custom_attention) {
             const attention_output = try gqaPagedAttentionOp(
                 ctx,
                 request.q,
@@ -23642,7 +23900,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .pre_linear_rms_norm_slot = request.pre_linear_rms_norm_slot,
                 .post_linear_rms_norm_slot = request.post_linear_rms_norm_slot,
                 .eps = request.eps,
-            })) orelse return error.ContextFramedExecutionUnsupported;
+            })) orelse return if (native_custom_attention) error.UnsupportedAttentionMatchRoute else error.ContextFramedExecutionUnsupported;
         }
         const trace_attn_null = traceAttentionResidualNullRequested() and
             (traceAttentionResidualNullLayerTarget() == null or traceAttentionResidualNullLayerTarget().? == attention.layer_index);
@@ -24030,7 +24288,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .pre_linear_rms_norm_slot = request.pre_linear_rms_norm_slot,
             .post_linear_rms_norm_slot = request.post_linear_rms_norm_slot,
             .eps = request.eps,
-        })) orelse return null;
+        })) orelse {
+            if (builtin.is_test and self.attentionMatchForwardActive() and getenvBool("ANTFLY_CONTEXT_PROFILE")) std.debug.print("attention_match_residual_tail_unavailable output_device={} output_ndim={d} output_offset={d} residual_device={} residual_ndim={d}\n", .{ attention_output.isDevice(), attention_output.ndim(), attention_output.deviceByteOffset(), residual.isDevice(), residual.ndim() });
+            return null;
+        };
         return self.ctFromOwnedMetalTensor(tensor);
     }
 
@@ -26847,16 +27108,69 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return result;
     }
 
+    fn runAttentionMatchGatedDecoderBlock(self: *MetalCompute, owner: *MetalKvStorage, request: *const ops.RunGatedDecoderBlockRequest) !?CT {
+        if (!self.attentionMatchForwardActive() or !self.attentionMatchExecution().precomputed_tail) return null;
+        const attention = request.attention;
+        if (attention.mode != .paged_decode or attention.query_sequence_len != 1 or attention.kv_batch != null or
+            attention.attn_or_mask != null or attention.attention_sink.hasMetadata() or
+            request.attention_input != null or request.q_linear_slot != null or request.q_head_norm_slot != null or
+            request.rope_active_dim != 0 or request.global_head_dim != 0)
+            return null;
+        const has_ple_metadata = request.ple != null or request.ple_gate_linear_slot != null or
+            request.ple_proj_linear_slot != null or request.ple_post_norm_slot != null or request.ple_hidden_size != 0;
+        if ((has_ple_metadata or request.output_scale != null) and !self.attention_match_ple_tail) return null;
+        var resolved = request.*;
+        if (request.output_scale) |scale| {
+            if (request.output_scale_value != null) return null;
+            const scale_buf = toBuf(scale);
+            if (bufElemCount(scale_buf) != 1) return null;
+            // Model output scale is immutable host metadata. Never synchronize
+            // or read a device tensor while the installed frame is pending.
+            resolved.output_scale_value = tryDirectDenseHostValue(scale_buf, 0) orelse return null;
+            resolved.output_scale = null;
+        }
+        var ple: ?MetalTensor = if (request.ple) |value| try self.ownedMetalTensorFromCt(value) else null;
+        defer if (ple) |*value| value.deinit();
+        const q = request.q orelse return null;
+        const k = request.k orelse if (attention.skip_kv_write) q else return null;
+        const v = request.v orelse if (attention.skip_kv_write) q else return null;
+        const binding = owner.attention_match_binding orelse return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        var residual = try self.ownedMetalTensorFromCt(request.residual);
+        defer residual.deinit();
+        const width = std.math.mul(usize, request.num_heads, request.head_dim) catch return error.InvalidAttentionShape;
+        var attention_destination = (try metal_runtime.decoderRuntimeBorrowActiveDirectHiddenScratch(self.provider_impl, self.allocator, 0, 1, width)) orelse return null;
+        defer attention_destination.deinit();
+        const shape = [_]i32{ 1, std.math.cast(i32, request.hidden_size) orelse return error.InvalidAttentionShape };
+        const bytes = std.math.mul(usize, request.hidden_size, @sizeOf(f32)) catch return error.InvalidAttentionShape;
+        const layer: usize = attention.context_consumer_layer orelse std.math.cast(u32, attention.layer_index) orelse return null;
+        const reserved_output = try binding.device.runner.layerOutput(layer, request.hidden_size);
+        if (reserved_output.bytes != bytes) return error.InvalidAttentionShape;
+        var output = try MetalTensor.deviceBorrowedWithAllocator(self.allocator, runtime, reserved_output.handle, reserved_output.offset, bytes, &shape);
+        defer output.deinit();
+        // Admission checks model slots, scratch, shapes, aliasing and frame
+        // identity before the custom owner can append a single KV row.
+        const admission = metal_runtime.admitPrecomputedGatedBlockDevice(self.provider_impl, &resolved, layer, residual, ple, output) orelse return null;
+        errdefer binding.invalid = true;
+        const attention_ct = try self.gqaAttentionMatch(owner, binding, q, k, v, null, attention, 1, request.num_heads, request.num_kv_heads, request.head_dim, attention_destination);
+        defer freeOp(self, attention_ct);
+        var attention_output = try self.ownedMetalTensorFromCt(attention_ct);
+        defer attention_output.deinit();
+        const finished = try metal_runtime.runAdmittedPrecomputedGatedBlockDevice(self.provider_impl, self.allocator, &resolved, layer, attention_output, residual, ple, output, &self.timing_stats, admission);
+        if (builtin.is_test) self.attention_match_prepared_tail_blocks +|= 1;
+        if (builtin.is_test and getenvBool("ANTFLY_CONTEXT_PROFILE")) std.debug.print("attention_match_precomputed_tail_complete layer={d} ple={} scaled={}\n", .{ layer, ple != null, resolved.output_scale_value != null });
+        return self.ctFromOwnedMetalTensor(finished);
+    }
+
     fn runGatedDecoderBlockOp(ctx: *anyopaque, request: *const ops.RunGatedDecoderBlockRequest) anyerror!?CT {
         if (request.attention.context_session != null) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const attention = request.attention;
-        // Installed ragged attention owns K/V mutation and attention. Force
-        // the ordinary block orchestration to call gqaPagedAttentionOp; a
-        // fused block must never consume or update the retired exact slots.
+        // Installed attention owns KV and feeds only its precomputed output
+        // to the admitted projection/MLP tail. Ordinary KV stays retired.
         if (attention.kv_storage) |storage| if (storage.device_write_hook != null) {
             if (self.attentionMatchStorage(storage)) |owner| {
-                if (owner.attention_match_binding != null) return null;
+                if (owner.attention_match_binding != null) return self.runAttentionMatchGatedDecoderBlock(owner, request);
             } else |_| {}
         };
         if (attention.mode == .dense_causal) {
@@ -35344,6 +35658,68 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ensureDynamicRmsNormSlot(request.weight, request.hidden_size);
     }
 
+    /// Attention's six projection buffers are reserved before the native
+    /// frame. These operands are consumed within their layer, unlike hidden
+    /// outputs, which retain distinct request-owned backing through the fence.
+    pub fn enterAttentionMatchForwardLayer(self: *MetalCompute, layer: usize) !void {
+        if (!self.attentionMatchForwardActive() or !self.attentionMatchExecution().precomputed_tail) return;
+        const runner = self.attention_match_forward_runner orelse return error.InvalidAttentionShape;
+        if (layer >= runner.layer_activation_count) return error.InvalidAttentionShape;
+        self.attention_match_forward_layer = layer;
+    }
+
+    fn borrowAttentionMatchLayerActivation(self: *MetalCompute, role: usize, width: usize) !?MetalTensor {
+        if (!self.attentionMatchForwardActive() or !self.attentionMatchExecution().precomputed_tail) return null;
+        const runner = self.attention_match_forward_runner orelse return null;
+        const ref = runner.layerActivation(self.attention_match_forward_layer, role, width) catch return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        const shape = [_]i32{ 1, std.math.cast(i32, width) orelse return error.InvalidAttentionShape };
+        return try MetalTensor.deviceBorrowedWithAllocator(self.allocator, runtime, ref.handle, ref.offset, ref.bytes, &shape);
+    }
+
+    pub fn attentionMatchPrenorm(self: *MetalCompute, request: *const ops.DecoderRuntimeApplyRmsNormRequest) !?CT {
+        var output = (try self.borrowAttentionMatchLayerActivation(5, request.hidden_size)) orelse return null;
+        defer output.deinit();
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input.deinit();
+        if (!try metal_runtime.decoderRuntimeApplyRmsNormInto(self.provider_impl, .{ .slot = request.slot, .input = input, .hidden_size = request.hidden_size, .eps = request.eps }, output, &self.timing_stats)) return null;
+        self.attention_match_front_scratch_ops +|= 1;
+        return self.ctFromOwnedMetalTensor(try output.retainedCopy());
+    }
+
+    pub fn attentionMatchProjection(self: *MetalCompute, request: *const ops.DecoderRuntimeApplyLinearRequest, index: usize) !?CT {
+        if (index > 2) return null;
+        var output = (try self.borrowAttentionMatchLayerActivation(index, request.out_dim)) orelse return null;
+        defer output.deinit();
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input.deinit();
+        if (input.ndim() != 2 or input.dim(0) != 1 or input.elemCount() != request.in_dim or input.deviceHandle() == output.deviceHandle()) return null;
+        const encoded = try metal_runtime.tryApplyQuantizedRuntimeLinearInto(self.provider_impl, request.slot, input, 1, request.in_dim, request.out_dim, output) or
+            try metal_runtime.tryApplyDenseRuntimeLinearInto(self.provider_impl, request.slot, input, 1, request.in_dim, request.out_dim, output);
+        if (!encoded) return null;
+        self.attention_match_front_scratch_ops +|= 1;
+        return self.ctFromOwnedMetalTensor(try output.retainedCopy());
+    }
+
+    fn attentionMatchQkv(self: *MetalCompute, request: *const ops.DecoderRuntimeApplyLinearQkvRequest) !?ops.LinearNoBiasTripleResult {
+        var q = (try self.borrowAttentionMatchLayerActivation(0, request.q_out_dim)) orelse return null;
+        defer q.deinit();
+        var k = (try self.borrowAttentionMatchLayerActivation(1, request.kv_out_dim)) orelse return null;
+        defer k.deinit();
+        var v = (try self.borrowAttentionMatchLayerActivation(2, request.kv_out_dim)) orelse return null;
+        defer v.deinit();
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input.deinit();
+        if (!try metal_runtime.tryApplyQuantizedRuntimeLinearQkvAllInto(self.provider_impl, request.q_slot, request.k_slot, request.v_slot, input, request.in_dim, request.q_out_dim, request.kv_out_dim, q, k, v)) return null;
+        const q_ct = try self.ctFromOwnedMetalTensor(try q.retainedCopy());
+        errdefer freeOp(self, q_ct);
+        const k_ct = try self.ctFromOwnedMetalTensor(try k.retainedCopy());
+        errdefer freeOp(self, k_ct);
+        const v_ct = try self.ctFromOwnedMetalTensor(try v.retainedCopy());
+        self.attention_match_front_scratch_ops +|= 3;
+        return .{ .first = q_ct, .second = k_ct, .third = v_ct };
+    }
+
     fn decoderRuntimeApplyRmsNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyRmsNormRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedDeviceMetalTensorFromCt(request.input);
@@ -36446,6 +36822,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn decoderRuntimeApplyLinearQkvOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearQkvRequest) anyerror!?ops.LinearNoBiasTripleResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.attentionMatchQkv(request)) |result| return result;
         var input = try self.ownedMetalTensorFromCt(request.input);
         defer input.deinit();
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
@@ -37503,10 +37880,187 @@ test "context Metal KV provisioning keeps hook allocation in request owner" {
     try std.testing.expectEqual(@as(?u64, 0), release.post_release_live_bytes);
 }
 
+test "attention_match Metal forward hidden leases prevent pool reuse and release after wait or cancel" {
+    if (!build_options.enable_metal or !metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var store = testMetalWeightStoreInit(allocator);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const runtime = compute.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+    const shape = [_]i32{ 1, 4 };
+    const values = [_]f32{ 1.25, -2.5, 3.75, 4.5 };
+    try compute.attention_match_forward_hidden.ensureTotalCapacity(allocator, 2);
+    for ([_]bool{ true, false }) |complete| {
+        const input = try MetalTensor.deviceAllocateWithAllocator(allocator, runtime, 16, .shared, &shape);
+        const handle = input.deviceHandle().?;
+        const memory = metal_runtime_mod.termite_metal_buffer_contents(handle) orelse return error.TestUnexpectedResult;
+        @memcpy(@as([*]f32, @ptrCast(@alignCast(memory)))[0..4], &values);
+        const input_ct = try compute.ctFromOwnedMetalTensor(input);
+        var input_ct_live = true;
+        defer if (input_ct_live) MetalCompute.freeOp(&compute, input_ct);
+        try metal_runtime_mod.beginFrame(runtime);
+        compute.attention_match_forward_active = true;
+        compute.attention_match_retain_hidden = true;
+        try compute.retainAttentionMatchForwardHidden(input_ct);
+        MetalCompute.freeOp(&compute, input_ct);
+        input_ct_live = false;
+        try std.testing.expectEqual(@as(usize, 1), compute.attention_match_forward_hidden.items.len);
+        const borrowed = try compute.ctFromOwnedMetalTensor(try MetalTensor.deviceBorrowedWithAllocator(allocator, runtime, handle, 0, 16, &shape));
+        defer MetalCompute.freeOp(&compute, borrowed);
+        try std.testing.expect(!compute.attentionMatchForwardRetainsHidden(borrowed));
+        try std.testing.expectError(error.UnsupportedAttentionMatchRoute, compute.retainAttentionMatchForwardHidden(borrowed));
+        var zeros = try MetalTensor.deviceAllocateWithAllocator(allocator, runtime, 16, .shared, &shape);
+        defer zeros.deinit();
+        try std.testing.expect(zeros.deviceHandle().? != handle);
+        const zero_memory = metal_runtime_mod.termite_metal_buffer_contents(zeros.deviceHandle()) orelse return error.TestUnexpectedResult;
+        @memset(@as([*]f32, @ptrCast(@alignCast(zero_memory)))[0..4], 0);
+        var result = (try metal_runtime_mod.decoderRuntimeApplyAdd(compute.provider_impl, .{
+            .lhs = compute.attention_match_forward_hidden.items[0],
+            .rhs = zeros,
+            .dim = @as(usize, 4),
+        }, &compute.timing_stats)) orelse return error.TestUnexpectedResult;
+        defer result.deinit();
+        if (complete) {
+            try metal_runtime_mod.submitFrame(runtime);
+            try metal_runtime_mod.waitFrame(runtime);
+            try std.testing.expectEqualSlices(f32, &values, try result.toHostSlice());
+        } else try metal_runtime_mod.cancelFrame(runtime);
+        compute.releaseAttentionMatchForwardHidden();
+        compute.attention_match_forward_active = false;
+        compute.attention_match_retain_hidden = false;
+        try std.testing.expectEqual(@as(usize, 0), compute.attention_match_forward_hidden.items.len);
+    }
+}
+
+test "attention_match Metal model slot preparation leaves ordinary KV unallocated" {
+    if (!build_options.enable_metal or !metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const decoder = @import("../backends/decoder_gated_runtime.zig");
+    var store = testMetalWeightStoreInit(allocator);
+    defer store.lazy_weights.deinit(allocator);
+    initPrefetchQueue(&store, allocator);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var values: [128]f32 = @splat(1);
+    const Weight = struct { name: []const u8, rows: usize, cols: usize = 0 };
+    const weights = [_]Weight{
+        .{ .name = "model.layers.0.input_layernorm.weight", .rows = 8 },
+        .{ .name = "model.layers.0.post_attention_layernorm.weight", .rows = 8 },
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .rows = 8, .cols = 8 },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .rows = 4, .cols = 8 },
+        .{ .name = "model.layers.0.self_attn.v_proj.weight", .rows = 4, .cols = 8 },
+        .{ .name = "model.layers.0.self_attn.o_proj.weight", .rows = 8, .cols = 8 },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .rows = 16, .cols = 8 },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .rows = 16, .cols = 8 },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .rows = 8, .cols = 16 },
+        .{ .name = "model.norm.weight", .rows = 8 },
+        .{ .name = "lm_head.weight", .rows = 16, .cols = 8 },
+    };
+    var shapes: [weights.len][2]i64 = undefined;
+    for (weights, 0..) |weight, index| {
+        shapes[index] = .{ @intCast(weight.rows), @intCast(weight.cols) };
+        const count = weight.rows * @max(weight.cols, 1);
+        try store.lazy_weights.put(allocator, weight.name, .{
+            .tensor_ref = .{ .name = weight.name },
+            .host_loaded = .{ .tensor = .{
+                .data = std.mem.sliceAsBytes(values[0..count]),
+                .shape = shapes[index][0..if (weight.cols == 0) @as(usize, 1) else 2],
+                .dtype = .f32,
+                .name = weight.name,
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            } },
+        });
+    }
+    var compute = try MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const slot_runtime = compute.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+    const config: @import("../models/gpt.zig").Config = .{
+        .family = .llama,
+        .hidden_size = 8,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 4,
+        .intermediate_size = 16,
+        .vocab_size = 16,
+    };
+    const before = metal_runtime_mod.runtimeMemorySnapshot(slot_runtime);
+    std.debug.print("attention_match_model_slot_test phase=prepare\n", .{});
+    try std.testing.expect(try decoder.prepareModelSlots(&cb, allocator, config, 1));
+    const prepared = metal_runtime_mod.runtimeMemorySnapshot(slot_runtime);
+    try std.testing.expect(prepared.norm_bytes > before.norm_bytes);
+    try std.testing.expectEqual(@as(u64, 0), prepared.attention_span_bytes);
+    try std.testing.expectEqual(before.attention_span_bytes, prepared.attention_span_bytes);
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 1, 8 }));
+    defer cb.free(input);
+    std.debug.print("attention_match_model_slot_test phase=prepared_linear\n", .{});
+    const output = (try cb.decoderRuntimeApplyLinear(&.{ .slot = decoder.linearSlot(0, .attn_q), .input = input, .in_dim = 8, .out_dim = 8 })) orelse return error.UnsupportedBackend;
+    defer cb.free(output);
+    const actual = try cb.toFloat32(output, allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqual(@as(usize, 8), actual.len);
+    for (actual) |value| try std.testing.expectApproxEqAbs(@as(f32, 36), value, 1e-5);
+    try std.testing.expect(try decoder.prepareModelSlots(&cb, allocator, config, 1));
+    try std.testing.expectEqual(@as(u64, 0), metal_runtime_mod.runtimeMemorySnapshot(slot_runtime).attention_span_bytes);
+    std.debug.print("attention_match_model_slot_test phase=active_rejection\n", .{});
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    defer cb.decoderRuntimeCancelFrame() catch {};
+    try std.testing.expectError(error.ContextTransactionBusy, decoder.prepareModelSlots(&cb, allocator, config, 1));
+}
+
+test "attention_match Metal cold forward reserves bounded activations without ordinary KV" {
+    if (!build_options.enable_metal or !metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var store = testMetalWeightStoreInit(allocator);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const runtime = compute.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+    var config: @import("../models/gpt.zig").Config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+        .num_hidden_layers = 2,
+        .hidden_size = 1536,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .intermediate_size = 6144,
+        .ple_hidden_size = 256,
+        .vocab_size = 262144,
+        .sliding_window = 512,
+        .attention_schedule_len = 2,
+    };
+    config.attention_schedule[0] = .sliding;
+    const before = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+    try compute.reserveAttentionMatchForwardScratch(&config);
+    const reserved = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+    try std.testing.expect(reserved.graph_plan_bytes > before.graph_plan_bytes);
+    try std.testing.expect(reserved.graph_plan_bytes < 8 * 1024 * 1024);
+    try std.testing.expectEqual(before.attention_span_bytes, reserved.attention_span_bytes);
+    try std.testing.expectEqual(before.quant_linear_bytes, reserved.quant_linear_bytes);
+    try std.testing.expectEqual(before.norm_bytes, reserved.norm_bytes);
+    try compute.reserveAttentionMatchForwardScratch(&config);
+    const reused = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(reserved.graph_plan_allocations, reused.graph_plan_allocations);
+    try std.testing.expectEqual(reserved.graph_plan_bytes, reused.graph_plan_bytes);
+    try metal_runtime_mod.beginFrame(runtime);
+    defer metal_runtime_mod.cancelFrame(runtime) catch {};
+    try std.testing.expectError(error.ContextTransactionBusy, compute.reserveAttentionMatchForwardScratch(&config));
+    const active = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(reserved.graph_plan_allocations, active.graph_plan_allocations);
+    try std.testing.expectEqual(before.attention_span_bytes, active.attention_span_bytes);
+}
+
 test "Metal attention_match install owns append clone rollback and teardown" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
 
+    const metal_runtime = metal_runtime_mod;
     const allocator = std.testing.allocator;
     const max_device_bytes = 128 * 1024 * 1024;
     const checkpoint = attention_match_checkpoint;
@@ -37549,13 +38103,15 @@ test "Metal attention_match install owns append clone rollback and teardown" {
     defer if (source_owner_live) {
         _ = source_owner.release();
     };
+    // The pool stores a maximum head width; this donor uses the smaller
+    // width, as Gemma4 local layers do beside its wider global layers.
     var source_storage = try runtime_root.kv.storage_runtime.KvStorageRuntime.initTracked(source_owner.allocator(), .{
         .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 8,
         .num_layers_packed = 1,
         .num_kv_heads = 1,
-        .head_dim = 1,
+        .head_dim = 2,
         .store_cpu_bytes = false,
     }, source_owner.tracker);
     var source_storage_live = true;
@@ -37686,19 +38242,49 @@ test "Metal attention_match install owns append clone rollback and teardown" {
         .kv_storage = &source_storage,
         .layer_index = 0,
     };
-    try std.testing.expect((try cb.runAttentionResidual(&.{
-        .q = q,
-        .k = k,
-        .v = v,
-        .residual = q,
-        .attention = installed_attention,
-        .num_heads = 1,
-        .num_kv_heads = 1,
-        .head_dim = 1,
-        .linear_slot = 0,
-        .hidden_size = 1,
-        .eps = 1e-6,
-    })) == null);
+    // A cold optional tail must decline before appending any installed KV,
+    // including when a native forward already owns the provider frame.
+    for ([_]bool{ false, true }) |native_forward| {
+        if (native_forward) {
+            try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            compute.attention_match_forward_active = true;
+        }
+        defer if (native_forward) {
+            compute.attention_match_forward_active = false;
+            cb.decoderRuntimeCancelFrame() catch {};
+        };
+        try std.testing.expect((try cb.runAttentionResidual(&.{
+            .q = q,
+            .k = k,
+            .v = v,
+            .residual = q,
+            .attention = installed_attention,
+            .num_heads = 1,
+            .num_kv_heads = 1,
+            .head_dim = 1,
+            .linear_slot = 0,
+            .hidden_size = 1,
+            .eps = 1e-6,
+        })) == null);
+        try std.testing.expect((try cb.runGatedDecoderBlock(&.{
+            .q = q,
+            .k = k,
+            .v = v,
+            .residual = q,
+            .attention = installed_attention,
+            .num_heads = 1,
+            .num_kv_heads = 1,
+            .head_dim = 1,
+            .attention_linear_slot = 0,
+            .hidden_size = 1,
+            .eps = 1e-6,
+            .gate_ffn_linear_slot = 0,
+            .up_ffn_linear_slot = 1,
+            .down_ffn_linear_slot = 2,
+            .intermediate_size = 1,
+            .activation = .gelu_new,
+        })) == null);
+    }
     const untouched_activity = (try compute.installedAttentionMatchActivity(
         &source_storage,
         source_sequence,
@@ -37742,6 +38328,13 @@ test "Metal attention_match install owns append clone rollback and teardown" {
     try std.testing.expectEqual(@as(usize, 0), decode_decline_activity.attention_calls);
     try std.testing.expectEqual(@as(usize, 0), decode_decline_activity.donor_appends);
     try std.testing.expect(!decode_decline_activity.invalid);
+    // The real decoder owns a provider frame before dispatching installed
+    // attention. Storage work must return its encoder context to that frame.
+    const provider_runtime = compute.provider_impl.raw_decode_runtime.?;
+    try metal_runtime.beginFrame(provider_runtime);
+    defer if (metal_runtime.hasActiveFrame(provider_runtime)) {
+        metal_runtime.cancelFrame(provider_runtime) catch {};
+    };
     const output = try cb.gqaPagedAttention(q, k, v, null, .{
         .mode = .paged_decode,
         .total_sequence_len = 3,
@@ -37758,6 +38351,28 @@ test "Metal attention_match install owns append clone rollback and teardown" {
         .layer_index = 0,
     }, 1, 1, 1, 1);
     defer cb.free(output);
+    try std.testing.expect(metal_runtime.hasActiveFrame(provider_runtime));
+    {
+        const runner = source_storage_owner.attention_match_binding.?.device.runner;
+        var copied = try runner.core.buffer(@sizeOf(f32));
+        defer copied.deinit();
+        var device_output = try compute.ownedDeviceMetalTensorFromCt(output);
+        defer device_output.deinit();
+        // The native active-frame API checks encoder ownership before encoding,
+        // so a lost provider context fails safely instead of triggering an AGX
+        // assertion in the next model operation.
+        try runner.copier.runThreadgroupsPipelineOnActiveRuntime(
+            provider_runtime,
+            runner.copier.pipeline,
+            .{ .op = 3, .n = 1, .dim = 1 },
+            &.{try MetalCompute.attentionMatchRef(&device_output)},
+            copied.ref(),
+            .{ 1, 1, 1 },
+            .{ 32, 1, 1 },
+        );
+        try metal_runtime.submitFrame(provider_runtime);
+        try metal_runtime.waitFrame(provider_runtime);
+    }
     const output_values = try cb.toFloat32(output, allocator);
     defer allocator.free(output_values);
     const denominator = 1.0 + @exp(@as(f32, 0.5)) + @exp(@as(f32, 0.25));
@@ -37779,7 +38394,7 @@ test "Metal attention_match install owns append clone rollback and teardown" {
         .page_size_tokens = 8,
         .num_layers_packed = 1,
         .num_kv_heads = 1,
-        .head_dim = 1,
+        .head_dim = 2,
         .store_cpu_bytes = false,
     }, destination_owner.tracker);
     var destination_storage_live = true;
@@ -39351,6 +39966,76 @@ test "metal_compute: paged decode attention matches native on Gemma qLen1 f32 ca
     try std.testing.expectEqual(native_data.len, metal_data.len);
     for (native_data, metal_data) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+}
+
+test "attention_match Metal forward head normalization matches independent f64 oracle" {
+    if (!build_options.enable_metal or !metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var store = testMetalWeightStoreInit(allocator);
+    defer store.lazy_weights.deinit(allocator);
+    var compute = try MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    compute.attention_match_forward_active = true;
+    defer compute.attention_match_forward_active = false;
+    for ([_]usize{ 256, 512 }) |dim| {
+        const heads = 8;
+        const data = try allocator.alloc(f32, heads * dim);
+        defer allocator.free(data);
+        const weights = try allocator.alloc(f32, dim);
+        defer allocator.free(weights);
+        const expected = try allocator.alloc(f64, data.len);
+        defer allocator.free(expected);
+        for (data, 0..) |*v, i| v.* = if (i < dim) 0 else @as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) * 0.00003;
+        for (weights, 0..) |*v, i| v.* = 0.7 + @as(f32, @floatFromInt(i % 11)) * 0.03;
+        const host = try cb.fromFloat32Shape(data, &.{ heads, @intCast(dim) });
+        defer cb.free(host);
+        var device = try compute.ownedDeviceMetalTensorFromCt(host);
+        defer device.deinit();
+        const input = try compute.ctFromOwnedMetalTensor(try device.retainedCopy());
+        defer cb.free(input);
+        const weight = try cb.fromFloat32Shape(weights, &.{@intCast(dim)});
+        defer cb.free(weight);
+        for ([_]f32{ 1e-6, 1e-4 }) |eps| {
+            for ([_]bool{ false, true }) |consecutive| {
+                try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+                defer cb.decoderRuntimeCancelFrame() catch {};
+                const norm = try cb.rmsNorm(input, weight, dim, eps);
+                defer cb.free(norm);
+                const scale = @sqrt(@as(f32, @floatFromInt(dim)));
+                const rope_dim = dim / 2;
+                const roped = (try cb.rmsNormHeadsRope(input, weight, 1, heads * dim, dim, rope_dim, eps, 10000, 1, 7, 1, consecutive, scale)) orelse return error.TestUnexpectedResult;
+                defer cb.free(roped);
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                const actual_norm = try cb.toFloat32(norm, allocator);
+                defer allocator.free(actual_norm);
+                const actual_rope = try cb.toFloat32(roped, allocator);
+                defer allocator.free(actual_rope);
+                for (0..heads) |head| {
+                    var sum: f64 = 0;
+                    for (data[head * dim ..][0..dim]) |v| sum += @as(f64, v) * v;
+                    const inverse = 1.0 / @sqrt(sum / @as(f64, @floatFromInt(dim)) + eps);
+                    for (0..dim) |d| {
+                        const i = head * dim + d;
+                        expected[i] = @as(f64, data[i]) * inverse * weights[d];
+                        try std.testing.expectApproxEqAbs(expected[i], @as(f64, actual_norm[i]), 2e-5);
+                    }
+                    for (0..rope_dim / 2) |pair| {
+                        const lo = if (consecutive) 2 * pair else pair;
+                        // Partial split-half RoPE spans the two full-head
+                        // halves; rope_dim limits the number of active pairs.
+                        const hi = if (consecutive) lo + 1 else pair + dim / 2;
+                        const angle = 7.0 / std.math.pow(f64, 10000, 2.0 * @as(f64, @floatFromInt(pair)) / @as(f64, @floatFromInt(rope_dim)));
+                        const x = expected[head * dim + lo];
+                        const y = expected[head * dim + hi];
+                        expected[head * dim + lo] = x * @cos(angle) - y * @sin(angle);
+                        expected[head * dim + hi] = x * @sin(angle) + y * @cos(angle);
+                    }
+                }
+                for (expected, actual_rope) |want, got| try std.testing.expectApproxEqAbs(want * scale, @as(f64, got), 2e-4);
+            }
+        }
     }
 }
 
@@ -50046,4 +50731,586 @@ test "embeddinggemma2 video Metal input frame gathers projects and positions wit
             (positions[(row % 3) * 768 + h] + positions[(axis + (row / 3) % 3) * 768 + h]);
         try std.testing.expectApproxEqAbs(expected, v, 1e-6);
     }
+}
+
+test "attention_match Metal resident activity distinguishes every packed representation" {
+    var activity = std.mem.zeroes(MetalCompute.AttentionMatchActivity);
+    try std.testing.expectEqualStrings("f16", activity.representation());
+    activity.fp8_heads = 1;
+    try std.testing.expectEqualStrings("fp8", activity.representation());
+    activity.rotated4_heads = 1;
+    try std.testing.expectEqualStrings("mixed", activity.representation());
+    activity.fp8_heads = 0;
+    try std.testing.expectEqualStrings("rotated4", activity.representation());
+}
+
+test "attention_match Metal installed PLE tail matches staged output and rejects before append" {
+    if (!build_options.enable_metal or !metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const tail_name = "ANTFLY_METAL_ATTENTION_MATCH_PRECOMPUTED_TAIL";
+    const previous_tail = if (std.c.getenv(tail_name)) |v| try a.dupeSentinel(u8, std.mem.span(v), 0) else null;
+    defer if (previous_tail) |v| {
+        _ = Env.setenv(tail_name, v.ptr, 1);
+        a.free(v);
+    } else {
+        _ = Env.unsetenv(tail_name);
+    };
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(tail_name, "1", 1));
+    const ple_name = "ANTFLY_METAL_ATTENTION_MATCH_PLE_TAIL";
+    const previous_ple = if (std.c.getenv(ple_name)) |v| try a.dupeSentinel(u8, std.mem.span(v), 0) else null;
+    defer if (previous_ple) |v| {
+        _ = Env.setenv(ple_name, v.ptr, 1);
+        a.free(v);
+    } else {
+        _ = Env.unsetenv(ple_name);
+    };
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(ple_name, "1", 1));
+    const policy_names = [_][*:0]const u8{ "ANTFLY_METAL_ATTENTION_MATCH_CONCURRENT_FRAME", "ANTFLY_METAL_ATTENTION_MATCH_RESOURCE_BARRIERS" };
+    var previous_policy_flags: [2]?[:0]u8 = .{ null, null };
+    defer for (policy_names, previous_policy_flags) |name, previous| {
+        if (previous) |value| {
+            _ = Env.setenv(name, value.ptr, 1);
+            a.free(value);
+        } else _ = Env.unsetenv(name);
+    };
+    for (policy_names, &previous_policy_flags) |name, *previous| {
+        previous.* = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+        try std.testing.expectEqual(@as(c_int, 0), Env.setenv(name, "1", 1));
+    }
+    const width = 64;
+    const ple_width = 32;
+    const head_dim = 32;
+    const heads = 2;
+    const budget = 64 * 1024 * 1024;
+    const checkpoint = attention_match_checkpoint;
+    var raw_weights: [6][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (raw_weights[0..initialized]) |raw| a.free(raw);
+    var shapes: [6][2]i64 = undefined;
+    var descriptors: [6]QuantizedStorage = undefined;
+    for (0..6) |slot| {
+        const in_dim: usize = if (slot == 5) ple_width else width;
+        const out_dim: usize = if (slot == 4) ple_width else width;
+        const dense = try a.alloc(f32, in_dim * out_dim);
+        defer a.free(dense);
+        for (dense, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 17 + slot * 11) % 37)) - 18)) / 97;
+        raw_weights[slot] = try quant_codec.quantizeQ8_0FromF32(a, dense);
+        initialized += 1;
+        shapes[slot] = .{ @intCast(out_dim), @intCast(in_dim) };
+        descriptors[slot] = .{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = raw_weights[slot], .shape = &shapes[slot], .raw_owned = false, .allocator = a };
+    }
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const runtime = compute.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+    for (0..6) |slot| {
+        const in_dim: usize = @intCast(shapes[slot][1]);
+        const out_dim: usize = @intCast(shapes[slot][0]);
+        const bias_values = try a.alloc(f32, out_dim);
+        defer a.free(bias_values);
+        @memset(bias_values, 0);
+        var bias = try MetalTensor.ownedCloneFrom(bias_values, &.{@intCast(out_dim)});
+        defer bias.deinit();
+        var dummy_values = [_]f32{0};
+        const dummy = MetalTensor.borrowed(&dummy_values, 1, &.{0});
+        try std.testing.expect(try metal_runtime_mod.decoderRuntimePrepareLinear(compute.provider_impl, .{
+            .slot = slot,
+            .weight = dummy,
+            .bias = bias,
+            .quantized_storage = @as(?*const QuantizedStorage, &descriptors[slot]),
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .retain_dense_fallback = false,
+        }, &compute.timing_stats));
+    }
+    var norm_values: [width]f32 = undefined;
+    for (&norm_values, 0..) |*v, i| v.* = 0.7 + @as(f32, @floatFromInt(i % 7)) / 32;
+    var norm = try MetalTensor.ownedCloneFrom(&norm_values, &.{width});
+    defer norm.deinit();
+    for (0..4) |slot| try std.testing.expect(try metal_runtime_mod.decoderRuntimePrepareRmsNorm(compute.provider_impl, .{ .slot = slot, .weight = norm, .hidden_size = width }));
+
+    var owner = try runtime_root.kv.host_allocation_tracker.RequestAllocationOwner.init(null);
+    var owner_live = true;
+    defer if (owner_live) {
+        _ = owner.release();
+    };
+    var storage = try runtime_root.kv.storage_runtime.KvStorageRuntime.initTracked(owner.allocator(), .{
+        .backend = .metal,
+        .dtype = .f16,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = head_dim,
+        .store_cpu_bytes = false,
+    }, owner.tracker);
+    var storage_live = true;
+    defer if (storage_live) storage.deinit();
+    try cb.provisionKvDeviceWriteHook(&storage);
+    const sequence = try storage.attachSequence(storage.poolId());
+    try storage.appendTokens(sequence, 2);
+    const seed_keys: [2 * head_dim]f32 = @splat(0);
+    const seed_values: [2 * head_dim]f32 = @splat(0.125);
+    const seed_k_ct = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&seed_keys, &.{ 2, head_dim }));
+    defer cb.free(seed_k_ct);
+    const seed_v_ct = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&seed_values, &.{ 2, head_dim }));
+    defer cb.free(seed_v_ct);
+    const seed_k = try compute.borrowedMetalTensorFromCt(seed_k_ct);
+    const seed_v = try compute.borrowedMetalTensorFromCt(seed_v_ct);
+    try storage.writeLayerKvSuffixDevice(.{
+        .sequence_id = sequence,
+        .layer_index = 0,
+        .total_token_count = 2,
+        .suffix_token_count = 2,
+        .position_offset = 0,
+        .num_kv_heads = 1,
+        .head_dim = head_dim,
+        .sequence_owned_global = true,
+    }, .{ .handle = seed_k.deviceHandle().?, .byte_offset = seed_k.deviceByteOffset(), .byte_len = seed_k.deviceByteLen() }, .{
+        .handle = seed_v.deviceHandle().?,
+        .byte_offset = seed_v.deviceByteOffset(),
+        .byte_len = seed_v.deviceByteLen(),
+    });
+    const fixture: checkpoint.State = .{
+        .identity = .{ .weights = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4) },
+        .logical_length = 2,
+        .tokens = &.{ 0, 0 },
+        .logits = &.{0},
+        .layer_donors = &.{0},
+        .donors = &.{.{ .layer = 0, .heads = &.{.{
+            .dim = head_dim,
+            .compacted_until = 1,
+            .positions = &.{ 0, 1 },
+            .coverage_ends = &.{ 1, 2 },
+            .keys = &seed_keys,
+            .values = &seed_values,
+            .bias = &.{ 0, 0 },
+        }} }},
+    };
+    const backend = try compute.attentionMatchStorageBackend(&storage, owner.allocator(), checkpoint.serving_limits, budget);
+    var candidate: ?metal_attention_match_storage.DeviceState = try backend.upload(fixture, budget, .{});
+    defer if (candidate) |*value| value.deinit();
+    try compute.installAttentionMatchWithOptions(&storage, sequence, &candidate, 2, try compute.attentionMatchRevision(&storage), budget, .{}, .{ .diagnostic_only = true });
+    const installed = try compute.attentionMatchStorage(&storage);
+    try std.testing.expectEqual(@as(usize, 0), installed.slot_map.count());
+    const retired_kv_bytes = metal_runtime_mod.runtimeMemorySnapshot(runtime).attention_span_bytes;
+    const q_values: [heads * head_dim]f32 = @splat(0.5);
+    const k_values: [head_dim]f32 = @splat(0.25);
+    const v_values: [head_dim]f32 = @splat(0.125);
+    var residual_values: [width]f32 = undefined;
+    var ple_values: [ple_width]f32 = undefined;
+    for (&residual_values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) / 32;
+    for (&ple_values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) / 64;
+    const q = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&q_values, &.{ 1, heads * head_dim }));
+    defer cb.free(q);
+    const k = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&k_values, &.{ 1, head_dim }));
+    defer cb.free(k);
+    const v = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&v_values, &.{ 1, head_dim }));
+    defer cb.free(v);
+    const residual_ct = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&residual_values, &.{ 1, width }));
+    defer cb.free(residual_ct);
+    const ple_ct = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&ple_values, &.{ 1, ple_width }));
+    defer cb.free(ple_ct);
+    const scale_ct = try cb.fromFloat32Shape(&.{0.75}, &.{1});
+    defer cb.free(scale_ct);
+    const invalid_scale = try cb.fromFloat32Shape(&.{std.math.nan(f32)}, &.{1});
+    defer cb.free(invalid_scale);
+    const config: @import("../models/gpt.zig").Config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+        .hidden_size = width,
+        .num_hidden_layers = 1,
+        .num_attention_heads = heads,
+        .num_key_value_heads = 1,
+        .attention_head_dim = head_dim,
+        .intermediate_size = width,
+        .ple_hidden_size = ple_width,
+        .vocab_size = 8,
+    };
+    try compute.reserveAttentionMatchForwardScratch(&config);
+    const request: ops.RunGatedDecoderBlockRequest = .{
+        .q = q,
+        .k = k,
+        .v = v,
+        .residual = residual_ct,
+        .attention = .{ .mode = .paged_decode, .total_sequence_len = 3, .query_sequence_len = 1, .kv_sequence_len = 3, .kv_cache = .{ .sequence_id = sequence, .pool_id = storage.poolId(), .logical_block_count = 1, .tail_tokens = 3, .kv_storage = &storage }, .kv_storage = &storage, .layer_index = 0 },
+        .num_heads = heads,
+        .num_kv_heads = 1,
+        .head_dim = head_dim,
+        .attention_linear_slot = 0,
+        .attention_post_linear_rms_norm_slot = 0,
+        .hidden_size = width,
+        .eps = 1e-5,
+        .ffn_rms_norm_slot = 1,
+        .ffn_post_down_rms_norm_slot = 2,
+        .gate_ffn_linear_slot = 1,
+        .up_ffn_linear_slot = 2,
+        .down_ffn_linear_slot = 3,
+        .intermediate_size = width,
+        .activation = .gelu_new,
+        .ple = ple_ct,
+        .ple_gate_linear_slot = 4,
+        .ple_proj_linear_slot = 5,
+        .ple_post_norm_slot = 3,
+        .ple_hidden_size = ple_width,
+        .output_scale = scale_ct,
+    };
+    // Constant V makes the exact attention output analytically 0.125 in every
+    // coordinate. Compare against the independent, staged projection/MLP/PLE.
+    const attention_values: [width]f32 = @splat(0.125);
+    const attention_ct = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&attention_values, &.{ 1, width }));
+    defer cb.free(attention_ct);
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    errdefer cb.decoderRuntimeCancelFrame() catch {};
+    const block = (try compute.finishGatedDecoderBlockFromAttentionOutputMt(&request, 0, try compute.borrowedMetalTensorFromCt(attention_ct), try compute.borrowedMetalTensorFromCt(residual_ct), null)) orelse return error.TestUnexpectedResult;
+    var expected_tensor = (try compute.finishGatedLayerTailMt(&request, 0, block, null)) orelse return error.TestUnexpectedResult;
+    defer expected_tensor.deinit();
+    try cb.decoderRuntimeSubmitAndWaitFrame();
+    const expected = try a.dupe(f32, try expected_tensor.toHostSlice());
+    defer a.free(expected);
+    try storage.appendTokens(sequence, 1);
+    const previous_frame_policy = metal_runtime_mod.termite_metal_decode_runtime_native_frame_policy_state(runtime);
+    try std.testing.expect(try compute.beginAttentionMatchForwardFrame(&storage, &config, 2));
+    try std.testing.expect(compute.attention_match_frame_policy_active);
+    defer if (compute.attention_match_forward_active) compute.finishAttentionMatchForwardFrame(&storage, false) catch {};
+    compute.attention_match_ple_tail = false;
+    try std.testing.expect((try cb.runGatedDecoderBlock(&request)) == null);
+    compute.attention_match_ple_tail = true;
+    var invalid = request;
+    invalid.ple_proj_linear_slot = null;
+    try std.testing.expect((try cb.runGatedDecoderBlock(&invalid)) == null);
+    invalid = request;
+    invalid.ple_hidden_size = ple_width - 1;
+    try std.testing.expect((try cb.runGatedDecoderBlock(&invalid)) == null);
+    invalid = request;
+    invalid.ple_post_norm_slot = 31;
+    try std.testing.expect((try cb.runGatedDecoderBlock(&invalid)) == null);
+    invalid = request;
+    invalid.output_scale = invalid_scale;
+    try std.testing.expect((try cb.runGatedDecoderBlock(&invalid)) == null);
+    invalid = request;
+    invalid.output_scale_value = 0.75;
+    try std.testing.expect((try cb.runGatedDecoderBlock(&invalid)) == null);
+    var aliased_ple = (try metal_runtime_mod.decoderRuntimeBorrowActiveDirectHiddenScratch(compute.provider_impl, a, 0, 1, ple_width)) orelse return error.TestUnexpectedResult;
+    defer aliased_ple.deinit();
+    const aliased_ct = try compute.ctFromOwnedMetalTensor(try aliased_ple.retainedCopy());
+    defer cb.free(aliased_ct);
+    invalid = request;
+    invalid.ple = aliased_ct;
+    try std.testing.expect((try cb.runGatedDecoderBlock(&invalid)) == null);
+    const before = (try compute.installedAttentionMatchActivity(&storage, sequence)).?;
+    try std.testing.expectEqual(@as(usize, 0), before.attention_calls);
+    try std.testing.expectEqual(@as(usize, 0), before.donor_appends);
+    try std.testing.expect(!before.invalid);
+    const result = (try cb.runGatedDecoderBlock(&request)) orelse return error.TestUnexpectedResult;
+    defer cb.free(result);
+    try compute.finishAttentionMatchForwardFrame(&storage, true);
+    try std.testing.expect(!compute.attention_match_frame_policy_active);
+    try std.testing.expectEqual(previous_frame_policy, metal_runtime_mod.termite_metal_decode_runtime_native_frame_policy_state(runtime));
+    const actual = try cb.toFloat32(result, a);
+    defer a.free(actual);
+    for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-5);
+    const after = (try compute.installedAttentionMatchActivity(&storage, sequence)).?;
+    try std.testing.expectEqual(@as(usize, 1), after.attention_calls);
+    try std.testing.expectEqual(@as(usize, 1), after.donor_appends);
+    try std.testing.expect(!after.invalid);
+    try std.testing.expectEqual(retired_kv_bytes, metal_runtime_mod.runtimeMemorySnapshot(runtime).attention_span_bytes);
+    // A finite-admission success followed by poisoned append must invalidate
+    // the same owner at the terminal fence, without a second append attempt.
+    const bad_values: [head_dim]f32 = @splat(std.math.nan(f32));
+    const bad_v = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&bad_values, &.{ 1, head_dim }));
+    defer cb.free(bad_v);
+    try storage.appendTokens(sequence, 1);
+    try std.testing.expect(try compute.beginAttentionMatchForwardFrame(&storage, &config, 3));
+    compute.attention_match_ple_tail = true;
+    var poisoned = request;
+    poisoned.v = bad_v;
+    poisoned.attention.total_sequence_len = 4;
+    poisoned.attention.kv_sequence_len = 4;
+    poisoned.attention.kv_cache.?.tail_tokens = 4;
+    const pending = (try cb.runGatedDecoderBlock(&poisoned)) orelse return error.TestUnexpectedResult;
+    defer cb.free(pending);
+    try std.testing.expectError(error.NonFiniteAttention, compute.finishAttentionMatchForwardFrame(&storage, true));
+    try std.testing.expect(!compute.attention_match_frame_policy_active);
+    try std.testing.expectEqual(previous_frame_policy, metal_runtime_mod.termite_metal_decode_runtime_native_frame_policy_state(runtime));
+    const failed = (try compute.installedAttentionMatchActivity(&storage, sequence)).?;
+    try std.testing.expect(failed.invalid);
+    try std.testing.expectEqual(@as(usize, 2), failed.donor_appends);
+    try std.testing.expect(!metal_runtime_mod.hasActiveFrame(runtime) and !metal_runtime_mod.hasSubmittedFrame(runtime));
+    try std.testing.expectEqual(retired_kv_bytes, metal_runtime_mod.runtimeMemorySnapshot(runtime).attention_span_bytes);
+    storage.deinit();
+    storage_live = false;
+    const released = owner.release();
+    owner_live = false;
+    try std.testing.expectEqual(@as(?u64, 0), released.post_release_live_bytes);
+}
+
+test "attention_match Metal immutable V norm weights and shared KV views retain device storage" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var store = testMetalWeightStoreInit(allocator);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(allocator);
+    }
+    var compute = try MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const runtime = compute.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+    const kv_before = metal_runtime_mod.runtimeMemorySnapshot(runtime).attention_span_bytes;
+    try std.testing.expect(compute.attentionMatchValueNormOnes(256) == null);
+    try std.testing.expectError(error.InvalidAttentionShape, compute.prepareAttentionMatchValueNormOnes(128));
+    for ([_]usize{ 256, 512 }, 0..) |dim, index| {
+        try compute.prepareAttentionMatchValueNormOnes(dim);
+        const cached = compute.attention_match_value_norm_ones[index].?;
+        try compute.prepareAttentionMatchValueNormOnes(dim);
+        try std.testing.expect(cached == compute.attention_match_value_norm_ones[index].?);
+        try std.testing.expect(compute.attentionMatchValueNormOnes(dim) == null);
+        const ones: [512]f32 = @splat(1);
+        const host_weight = try cb.fromFloat32Shape(ones[0..dim], &.{@intCast(dim)});
+        defer cb.free(host_weight);
+        for ([_]usize{ 1, 2 }) |heads| {
+            const data = try allocator.alloc(f32, heads * dim);
+            defer allocator.free(data);
+            for (data, 0..) |*value, i| {
+                const scale: f32 = if (heads == 2 and i < dim) 0 else if (dim == 512) 0.00001 else 0.01;
+                value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 127)) - 63)) * scale;
+            }
+            const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(data, &.{ @intCast(heads), @intCast(dim) }));
+            defer cb.free(input);
+            try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            var active = true;
+            defer if (active) cb.decoderRuntimeCancelFrame() catch {};
+            compute.attention_match_forward_active = true;
+            compute.attention_match_frame_execution = .{ .forward_frame = true, .precomputed_tail = true, .retain_hidden = true };
+            defer {
+                compute.attention_match_forward_active = false;
+                compute.attention_match_frame_execution = .{};
+            }
+            try std.testing.expect(compute.attentionMatchValueNormOnes(dim).? == cached);
+            if (index == 0) try std.testing.expectError(error.ContextTransactionBusy, compute.prepareAttentionMatchValueNormOnes(512));
+            const eps: f32 = 1e-6;
+            const expected = try cb.rmsNorm(input, host_weight, dim, eps);
+            defer cb.free(expected);
+            const actual = try cb.rmsNorm(input, cached, dim, eps);
+            defer cb.free(actual);
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            active = false;
+            compute.attention_match_forward_active = false;
+            compute.attention_match_frame_execution = .{};
+            const expected_host = try cb.toFloat32(expected, allocator);
+            defer allocator.free(expected_host);
+            const actual_host = try cb.toFloat32(actual, allocator);
+            defer allocator.free(actual_host);
+            try std.testing.expectEqualSlices(f32, expected_host, actual_host);
+            for (0..heads) |head| {
+                var squared: f64 = 0;
+                for (data[head * dim ..][0..dim]) |value| squared += @as(f64, value) * value;
+                const denominator = @sqrt(squared / @as(f64, @floatFromInt(dim)) + @as(f64, eps));
+                for (data[head * dim ..][0..dim], actual_host[head * dim ..][0..dim]) |value, got|
+                    try std.testing.expectApproxEqAbs(@as(f64, value) / denominator, @as(f64, got), 2e-5);
+            }
+        }
+        const q_data = try allocator.alloc(f32, 8 * dim);
+        defer allocator.free(q_data);
+        for (q_data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 127)) / 73.1234567;
+        const q = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(q_data, &.{ 1, @intCast(q_data.len) }));
+        var q_live = true;
+        defer if (q_live) cb.free(q);
+        const q_handle = (try compute.borrowedMetalTensorFromCt(q)).deviceHandle();
+        const unused_k = try cb.sliceLastDim(q, 0, dim);
+        defer cb.free(unused_k);
+        const unused_v = try cb.sliceLastDim(q, 0, dim);
+        defer cb.free(unused_v);
+        try std.testing.expectEqual(q_handle, (try compute.borrowedMetalTensorFromCt(unused_k)).deviceHandle());
+        try std.testing.expectEqual(q_handle, (try compute.borrowedMetalTensorFromCt(unused_v)).deviceHandle());
+        cb.free(q);
+        q_live = false;
+        const k_host = try cb.toFloat32(unused_k, allocator);
+        defer allocator.free(k_host);
+        const v_host = try cb.toFloat32(unused_v, allocator);
+        defer allocator.free(v_host);
+        try std.testing.expectEqualSlices(f32, q_data[0..dim], k_host);
+        try std.testing.expectEqualSlices(f32, q_data[0..dim], v_host);
+    }
+    try std.testing.expectEqual(kv_before, metal_runtime_mod.runtimeMemorySnapshot(runtime).attention_span_bytes);
+}
+
+test "attention_match Metal native front scratch preserves norms projections RoPE and frame allocation bounds" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const width = 32;
+    const head_dim = 256;
+    const norm_slot = metal_runtime_mod.decoder_runtime_rms_norm_slot_capacity - 1;
+    var raws: [3][]u8 = undefined;
+    var shapes: [3][2]i64 = undefined;
+    var descriptors: [3]QuantizedStorage = undefined;
+    var initialized: usize = 0;
+    defer for (raws[0..initialized]) |raw| a.free(raw);
+    for (0..3) |slot| {
+        var weights: [width * width]f32 = undefined;
+        for (&weights, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 13 + slot * 7) % 31)) - 15)) / 97;
+        raws[slot] = try quant_codec.quantizeQ8_0FromF32(a, &weights);
+        initialized += 1;
+        shapes[slot] = .{ width, width };
+        descriptors[slot] = .{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = raws[slot], .shape = &shapes[slot], .raw_owned = false, .allocator = a };
+    }
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const runtime = compute.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+    const kv_before = metal_runtime_mod.runtimeMemorySnapshot(runtime).attention_span_bytes;
+    var tracker = metal_attention_match_storage.AllocationTracker.init(null, 0);
+    var frame_owner = try metal_attention_match_storage.Runner.init(8 * 1024 * 1024, &tracker);
+    var frame_owner_live = true;
+    defer if (frame_owner_live) frame_owner.deinit();
+    const plans = [_]metal_attention_match_storage.LayerActivationPlan{
+        .{ .widths = .{ 8 * head_dim, 2 * head_dim, 2 * head_dim, 8 * head_dim, 2 * head_dim, width } },
+        .{ .widths = .{ 8 * head_dim, 2 * head_dim, 2 * head_dim, 8 * head_dim, 2 * head_dim, width } },
+    };
+    try frame_owner.reserveLayerActivations(&plans);
+    const owner_committed = tracker.snapshot();
+    for (0..3) |slot| {
+        var bias = try MetalTensor.ownedCloneFrom(&@as([width]f32, @splat(0)), &.{width});
+        defer bias.deinit();
+        var dummy_values = [_]f32{0};
+        const dummy = MetalTensor.borrowed(&dummy_values, 1, &.{0});
+        try std.testing.expect(try metal_runtime_mod.decoderRuntimePrepareLinear(compute.provider_impl, .{
+            .slot = slot,
+            .weight = dummy,
+            .bias = bias,
+            .quantized_storage = @as(?*const QuantizedStorage, &descriptors[slot]),
+            .in_dim = width,
+            .out_dim = width,
+            .retain_dense_fallback = false,
+        }, &compute.timing_stats));
+    }
+    var norm_values: [width]f32 = undefined;
+    var input_values: [width]f32 = undefined;
+    var head_weights: [head_dim]f32 = undefined;
+    var head_values: [8 * head_dim]f32 = undefined;
+    for (&norm_values, &input_values, 0..) |*weight, *value, i| {
+        weight.* = 0.7 + @as(f32, @floatFromInt(i % 7)) / 32;
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 17) % 37)) - 18)) / 51;
+    }
+    for (&head_weights, 0..) |*weight, i| weight.* = 0.8 + @as(f32, @floatFromInt(i % 11)) / 43;
+    for (&head_values, 0..) |*value, i| value.* = if (i < head_dim) 0 else @as(f32, @floatFromInt(@as(i32, @intCast((i * 19) % 73)) - 36)) / 73.1234567;
+    const norm = try cb.fromFloat32Shape(&norm_values, &.{width});
+    defer cb.free(norm);
+    const head_norm = try cb.fromFloat32Shape(&head_weights, &.{head_dim});
+    defer cb.free(head_norm);
+    try std.testing.expect(try cb.decoderRuntimePrepareRmsNorm(&.{ .slot = norm_slot, .weight = norm, .hidden_size = width }));
+    const head_slot = (try compute.ensureDynamicRmsNormSlot(head_norm, head_dim)) orelse return error.TestUnexpectedResult;
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&input_values, &.{ 1, width }));
+    defer cb.free(input);
+    const q = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&head_values, &.{ 1, 8 * head_dim }));
+    defer cb.free(q);
+    const k = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(head_values[0 .. 2 * head_dim], &.{ 1, 2 * head_dim }));
+    defer cb.free(k);
+    const prenorm_request: ops.DecoderRuntimeApplyRmsNormRequest = .{ .slot = norm_slot, .input = input, .hidden_size = width, .eps = 1e-4 };
+    try std.testing.expect((try compute.attentionMatchPrenorm(&prenorm_request)) == null);
+    const expected_norm = (try cb.decoderRuntimeApplyRmsNorm(&prenorm_request)) orelse return error.TestUnexpectedResult;
+    defer cb.free(expected_norm);
+    var expected_separate: [3]CT = undefined;
+    for (0..3) |slot| expected_separate[slot] = (try cb.decoderRuntimeApplyLinear(&.{ .slot = slot, .input = expected_norm, .in_dim = width, .out_dim = width })) orelse return error.TestUnexpectedResult;
+    defer for (expected_separate) |tensor| cb.free(tensor);
+    const expected_triple = (try cb.decoderRuntimeApplyLinearQkv(&.{ .q_slot = 0, .k_slot = 1, .v_slot = 2, .input = expected_norm, .in_dim = width, .q_out_dim = width, .kv_out_dim = width })) orelse return error.TestUnexpectedResult;
+    defer {
+        cb.free(expected_triple.first);
+        cb.free(expected_triple.second);
+        cb.free(expected_triple.third);
+    }
+    var q_mt = try compute.ownedDeviceMetalTensorFromCt(q);
+    defer q_mt.deinit();
+    var k_mt = try compute.ownedDeviceMetalTensorFromCt(k);
+    defer k_mt.deinit();
+    const q_request = .{ .slot = head_slot, .input = q_mt, .total_heads = @as(usize, 8), .head_dim = @as(usize, head_dim), .rope_dim = @as(usize, 128), .position = @as(usize, 8191), .theta = @as(f32, 10000), .freq_scale = @as(f32, 1), .eps = @as(f32, 1e-4), .value_scale = @as(f32, 16), .consecutive_pairs = false };
+    const k_request = .{ .slot = head_slot, .input = k_mt, .total_heads = @as(usize, 2), .head_dim = @as(usize, head_dim), .rope_dim = @as(usize, 128), .position = @as(usize, 8191), .theta = @as(f32, 10000), .freq_scale = @as(f32, 1), .eps = @as(f32, 1e-4), .value_scale = @as(f32, 1), .consecutive_pairs = false };
+    var expected_q = (try metal_runtime_mod.decoderRuntimeApplyHeadRmsNormRopeBatched(compute.provider_impl, q_request, 8, 1)) orelse return error.TestUnexpectedResult;
+    defer expected_q.deinit();
+    var expected_k = (try metal_runtime_mod.decoderRuntimeApplyHeadRmsNormRopeBatched(compute.provider_impl, k_request, 2, 1)) orelse return error.TestUnexpectedResult;
+    defer expected_k.deinit();
+    try std.testing.expect(metal_runtime_mod.decoderRuntimeReservePrefillLayerScratch(compute.provider_impl, 1, 8, 2, head_dim, width, 64, 0));
+    try std.testing.expect(!metal_runtime_mod.decoderRuntimeActiveLayerProjectionScratchReady(compute.provider_impl, 5, 1, width));
+    for ([_]bool{ false, true }) |fused| {
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        var active = true;
+        defer if (active) cb.decoderRuntimeCancelFrame() catch {};
+        compute.attention_match_forward_active = true;
+        compute.attention_match_frame_execution = .{ .forward_frame = true, .precomputed_tail = true, .retain_hidden = true };
+        frame_owner.deferred_runtime = runtime;
+        compute.attention_match_forward_runner = &frame_owner;
+        try compute.enterAttentionMatchForwardLayer(@intFromBool(fused));
+        defer {
+            compute.attention_match_forward_active = false;
+            compute.attention_match_frame_execution = .{};
+            compute.attention_match_forward_runner = null;
+            frame_owner.deferred_runtime = null;
+        }
+        try std.testing.expect(!metal_runtime_mod.decoderRuntimeActiveLayerProjectionScratchReady(compute.provider_impl, 6, 1, width));
+        try std.testing.expect(!metal_runtime_mod.decoderRuntimeActiveLayerProjectionScratchReady(compute.provider_impl, 5, 1, std.math.maxInt(usize)));
+        const allocations_before = metal_tensor_mod.memoryStatsSnapshot();
+        const operations_before = compute.attention_match_front_scratch_ops;
+        const actual_norm = (try compute.attentionMatchPrenorm(&prenorm_request)) orelse return error.TestUnexpectedResult;
+        defer cb.free(actual_norm);
+        const alias_norm: ops.DecoderRuntimeApplyRmsNormRequest = .{ .slot = norm_slot, .input = actual_norm, .hidden_size = width, .eps = 1e-4 };
+        try std.testing.expect((try compute.attentionMatchPrenorm(&alias_norm)) == null);
+        var actual: [3]CT = undefined;
+        if (fused) {
+            const triple = (try cb.decoderRuntimeApplyLinearQkv(&.{ .q_slot = 0, .k_slot = 1, .v_slot = 2, .input = actual_norm, .in_dim = width, .q_out_dim = width, .kv_out_dim = width })) orelse return error.TestUnexpectedResult;
+            actual = .{ triple.first, triple.second, triple.third };
+        } else {
+            for (0..3) |slot| {
+                actual[slot] = (try compute.attentionMatchProjection(&.{ .slot = slot, .input = actual_norm, .in_dim = width, .out_dim = width }, slot)) orelse return error.TestUnexpectedResult;
+            }
+        }
+        defer for (actual) |tensor| cb.free(tensor);
+        try std.testing.expect((try compute.attentionMatchProjection(&.{ .slot = 0, .input = actual[0], .in_dim = width, .out_dim = width }, 0)) == null);
+        const actual_q = (try MetalCompute.rmsNormHeadsRopeOp(&compute, q, head_norm, 1, 8 * head_dim, head_dim, 128, 1e-4, 10000, 1, 8191, 1, false, 16)) orelse return error.TestUnexpectedResult;
+        defer cb.free(actual_q);
+        const actual_k = (try MetalCompute.rmsNormHeadsRopeOp(&compute, k, head_norm, 1, 2 * head_dim, head_dim, 128, 1e-4, 10000, 1, 8191, 1, false, 1)) orelse return error.TestUnexpectedResult;
+        defer cb.free(actual_k);
+        try std.testing.expectEqual(@as(usize, 6), compute.attention_match_front_scratch_ops - operations_before);
+        try std.testing.expectEqual(allocations_before.device_owned_buffers_created, metal_tensor_mod.memoryStatsSnapshot().device_owned_buffers_created);
+        try std.testing.expectEqual(owner_committed, tracker.snapshot());
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        active = false;
+        compute.attention_match_forward_active = false;
+        compute.attention_match_frame_execution = .{};
+        const expected_ops = if (fused) [_]CT{ expected_triple.first, expected_triple.second, expected_triple.third } else expected_separate;
+        for ([_]CT{ expected_norm, expected_ops[0], expected_ops[1], expected_ops[2] }, [_]CT{ actual_norm, actual[0], actual[1], actual[2] }) |expected, got| {
+            const lhs = try cb.toFloat32(expected, a);
+            defer a.free(lhs);
+            const rhs = try cb.toFloat32(got, a);
+            defer a.free(rhs);
+            try std.testing.expectEqualSlices(f32, lhs, rhs);
+        }
+        for ([_]MetalTensor{ expected_q, expected_k }, [_]CT{ actual_q, actual_k }) |expected, got| {
+            var expected_view = try expected.retainedCopy();
+            defer expected_view.deinit();
+            const lhs = try expected_view.toHostSlice();
+            const rhs = try cb.toFloat32(got, a);
+            defer a.free(rhs);
+            try std.testing.expectEqualSlices(f32, lhs, rhs);
+        }
+    }
+    try std.testing.expectEqual(kv_before, metal_runtime_mod.runtimeMemorySnapshot(runtime).attention_span_bytes);
+    frame_owner.deinit();
+    frame_owner_live = false;
+    try std.testing.expectEqual(@as(u64, 0), tracker.snapshot().tracked_combined_live_bytes);
 }

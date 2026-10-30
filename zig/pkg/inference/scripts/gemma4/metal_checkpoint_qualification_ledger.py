@@ -26,8 +26,13 @@ PHASE_SCHEMA = "antfly.metal-checkpoint-phase.v1"
 RELEASE_SCHEMA = "antfly.metal-checkpoint-release.v1"
 # The private test ingress pins Gemma-4 E4B. Zig derives and attests these from
 # the loaded model layout; the collector pins the qualified cell independently.
-E4B_ATTENTION_CALLS_PER_MATERIALIZED_TOKEN = 42
-E4B_DONOR_APPENDS_PER_MATERIALIZED_TOKEN = 24
+# Independently pinned from the qualified GGUF metadata: every block executes
+# attention, while only non-shared-KV blocks append donor state. E2B declares
+# block_count=35/shared_kv_layers=20; E4B declares 42/18.
+QUALIFIED_MODEL_GEOMETRY = {
+    "google/gemma-4-E2B-it-qat-q4_0-gguf": (35, 15),
+    "google/gemma-4-E4B-it-qat-q4_0-gguf": (42, 24),
+}
 KV_BOUNDARY_FIELDS = (
     "kv_materialized_tokens", "pending_sampled_tokens", "kv_boundary_proven",
     "binding_attention_calls_per_materialized_token",
@@ -67,7 +72,7 @@ def wait_ledger(path, offset, phases=("generation_committed", "final_release"),
     return rows
 
 
-def _binding_boundary_contract(ready, current):
+def _binding_boundary_contract(ready, current, expected_model):
     """Prove a sampled final token that has not undergone a subsequent forward."""
     integer_fields = (
         "kv_materialized_tokens", "pending_sampled_tokens",
@@ -106,12 +111,15 @@ def _binding_boundary_contract(ready, current):
     )
     attention_rate = current["binding_attention_calls_per_materialized_token"]
     append_rate = current["binding_donor_appends_per_materialized_token"]
+    require(expected_model in QUALIFIED_MODEL_GEOMETRY,
+            "checkpoint restore model geometry is not qualified")
+    expected_attention_rate, expected_append_rate = QUALIFIED_MODEL_GEOMETRY[expected_model]
     require(
         ready["binding_attention_calls_per_materialized_token"] ==
-            attention_rate == E4B_ATTENTION_CALLS_PER_MATERIALIZED_TOKEN and
+            attention_rate == expected_attention_rate and
         ready["binding_donor_appends_per_materialized_token"] ==
-            append_rate == E4B_DONOR_APPENDS_PER_MATERIALIZED_TOKEN,
-        "checkpoint restore KV rates differ from qualified E4B geometry",
+            append_rate == expected_append_rate,
+        "checkpoint restore KV rates differ from qualified model geometry",
     )
     require(
         materialized_delta > 0 and
@@ -122,7 +130,8 @@ def _binding_boundary_contract(ready, current):
 
 
 def generation_contract(rows, expected_route, require_binding=True,
-                        expected_representation=None):
+                        expected_representation=None, expected_model=None,
+                        expected_encoded_heads=None, expected_encoded_rows=None):
     committed = [row for row in rows if row.get("schema") == PHASE_SCHEMA and
                  row.get("phase") == "generation_committed"]
     released = [row for row in rows if row.get("schema") == RELEASE_SCHEMA and
@@ -172,14 +181,15 @@ def generation_contract(rows, expected_route, require_binding=True,
             field in row for row in (ready[0], current) for field in KV_BOUNDARY_FIELDS
         )
         if proof_fields_present:
-            _binding_boundary_contract(ready[0], current)
+            _binding_boundary_contract(ready[0], current, expected_model)
         else:
             require(current.get("binding_logical_tokens") == current["logical_tokens"],
                     "checkpoint restore binding is incomplete")
-        require(expected_representation in ("f16", "fp8") and
+        require(expected_representation in ("f16", "fp8", "rotated4") and
                 current.get("binding_representation") == expected_representation,
                 "checkpoint resident representation differs")
         for field in ("binding_fp8_heads", "binding_fp8_rows",
+                      "binding_rotated4_heads", "binding_rotated4_rows",
                       "binding_exact_resident_bytes", "binding_encoded_resident_bytes",
                       "binding_metadata_resident_bytes", "binding_allocated_bytes"):
             require(type(current.get(field)) is int and current[field] >= 0,
@@ -195,12 +205,29 @@ def generation_contract(rows, expected_route, require_binding=True,
         if expected_representation == "fp8":
             require(current["binding_fp8_heads"] > 0 and
                     current["binding_fp8_rows"] > 0 and
+                    current["binding_rotated4_heads"] == 0 and
+                    current["binding_rotated4_rows"] == 0 and
                     current["binding_encoded_resident_bytes"] > 0,
                     "FP8 restore lacks resident encoded storage proof")
+        elif expected_representation == "rotated4":
+            require(current["binding_rotated4_heads"] > 0 and
+                    current["binding_rotated4_rows"] > 0 and
+                    current["binding_fp8_heads"] == 0 and
+                    current["binding_fp8_rows"] == 0 and
+                    current["binding_encoded_resident_bytes"] > 0,
+                    "rotated4 restore lacks resident encoded storage proof")
+            require(expected_encoded_heads is None or
+                    current["binding_rotated4_heads"] == expected_encoded_heads,
+                    "rotated4 resident head count differs from checkpoint receipt")
+            require(expected_encoded_rows is None or
+                    current["binding_rotated4_rows"] == expected_encoded_rows,
+                    "rotated4 resident row count differs from checkpoint receipt")
         else:
             require(current["binding_exact_resident_bytes"] > 0 and
                     current["binding_fp8_heads"] == 0 and
                     current["binding_fp8_rows"] == 0 and
+                    current["binding_rotated4_heads"] == 0 and
+                    current["binding_rotated4_rows"] == 0 and
                     current["binding_encoded_resident_bytes"] == 0,
                     "f16 restore unexpectedly claims encoded storage")
     else:
@@ -209,6 +236,7 @@ def generation_contract(rows, expected_route, require_binding=True,
                 all(current.get(field) == 0 for field in (
                     "binding_logical_tokens", "binding_allocated_bytes",
                     "binding_fp8_heads", "binding_fp8_rows",
+                    "binding_rotated4_heads", "binding_rotated4_rows",
                     "binding_exact_resident_bytes",
                     "binding_encoded_resident_bytes",
                     "binding_metadata_resident_bytes",

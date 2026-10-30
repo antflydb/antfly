@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Strict adapter for antfly.context-release-build.v1/v2/v3 evidence.
+"""Strict adapter for antfly.context-release-build.v1/v2/v3/v4 evidence.
 
 This module never upgrades historical/scoped receipts. It delegates the complete
 archive, toolchain, command, resource, log, test, and executable audit to the
@@ -49,7 +49,7 @@ def validate(receipt_path, expected_binary_path=None, require_campaign_root=None
     _require(receipt_path.is_file() and receipt_path.stat().st_size <= 16 * 1024 * 1024,
              "invalid full release receipt path")
     receipt = json.loads(receipt_path.read_text())
-    _require(type(receipt) is dict and receipt.get("schema") in {"antfly.context-release-build.v1", "antfly.context-release-build.v2", "antfly.context-release-build.v3"} and
+    _require(type(receipt) is dict and receipt.get("schema") in {"antfly.context-release-build.v1", "antfly.context-release-build.v2", "antfly.context-release-build.v3", "antfly.context-release-build.v4"} and
              receipt.get("evidence_scope") == "full_context_release_build" and
              receipt.get("release_eligible") is True and receipt.get("serving_qualified") is False and
              receipt.get("source_verified_after_build") is True,

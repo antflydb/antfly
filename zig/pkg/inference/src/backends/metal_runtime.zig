@@ -173,6 +173,30 @@ pub const MetalDeviceInfo = extern struct {
     reserved: [7]u8 = @splat(0),
 };
 
+pub fn nativeCheckpointDestination() !@import("../runtime/kv/attention_match_release.zig").Destination {
+    var info: MetalDeviceInfo = .{};
+    if (termite_metal_device_info_get(&info) != 0) return error.UnqualifiedCompactionArtifact;
+    var name: [512]u8 = undefined;
+    const name_len = termite_metal_copy_device_name(name[0..].ptr, name.len);
+    var compiler: [1024]u8 = undefined;
+    const compiler_len = termite_metal_copy_compiler_identity(compiler[0..].ptr, compiler.len);
+    if (name_len == 0 or name_len > name.len or compiler_len == 0 or compiler_len > compiler.len)
+        return error.UnqualifiedCompactionArtifact;
+    var destination: @import("../runtime/kv/attention_match_release.zig").Destination = .{
+        .device_registry_id = info.registry_id,
+        .physical_memory_bytes = termite_metal_physical_memory_bytes(),
+        .device_name_sha256 = undefined,
+        .compiler_identity_sha256 = undefined,
+    };
+    std.crypto.hash.sha2.Sha256.hash(name[0..name_len], &destination.device_name_sha256, .{});
+    const host_compiler = @import("../runtime/kv/attention_match_compiler.zig");
+    destination.compiler_identity_sha256 = host_compiler.fingerprint(compiler[0..compiler_len], host_compiler.Profile.current());
+    try destination.validate();
+    return destination;
+}
+
+pub extern fn termite_metal_physical_memory_bytes() u64;
+
 pub const MetalGeneratedPipelineInfo = extern struct {
     static_threadgroup_memory_length: u64 = 0,
     thread_execution_width: u32 = 0,
@@ -3447,7 +3471,7 @@ pub fn decoderRuntimeApplyHeadRmsNormRopeRowsScratch(self: anytype, request: any
 pub fn decoderRuntimeApplyRmsNormScratch(self: anytype, request: anytype, output_index: usize, stats: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (request.slot >= decoder_runtime_layer_norm_slot_capacity) return null;
+    if (request.slot >= decoder_runtime_rms_norm_slot_capacity) return null;
     if (!self.raw_rms_norm_slots_prepared[request.slot]) return null;
     if (self.raw_rms_norm_slot_hidden_sizes[request.slot] != request.hidden_size) return null;
     if (request.hidden_size == 0 or request.input.ndim() != 2 or output_index >= 6) return null;
@@ -4734,6 +4758,20 @@ pub fn decoderRuntimeApplyAddLayerNormInto(
     ) == 0;
 }
 
+pub fn decoderRuntimeApplyRmsNormInto(self: anytype, request: anytype, output: MetalTensor, stats: anytype) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (!hasActiveFrame(runtime) or hasSubmittedFrame(runtime) or request.slot >= decoder_runtime_rms_norm_slot_capacity or
+        !self.raw_rms_norm_slots_prepared[request.slot] or self.raw_rms_norm_slot_hidden_sizes[request.slot] != request.hidden_size or
+        request.hidden_size == 0 or !request.input.isDevice() or !output.isDevice() or
+        request.input.ndim() != 2 or output.ndim() != 2 or request.input.dim(0) != 1 or output.dim(0) != 1 or
+        request.input.elemCount() != request.hidden_size or output.elemCount() != request.hidden_size or
+        request.input.deviceHandle() == output.deviceHandle()) return false;
+    const rc = termite_metal_decode_runtime_apply_rms_norm_device(runtime, request.slot, request.input.deviceHandle(), request.input.deviceByteOffset(), request.hidden_size, request.eps, output.deviceHandle(), output.deviceByteOffset());
+    if (rc != 0) return false;
+    stats.decoder_runtime_apply_layer_norm_calls += 1;
+    return true;
+}
+
 pub fn decoderRuntimeApplyRmsNorm(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -5705,6 +5743,30 @@ pub fn decoderRuntimeApplyPleResidualDevice(self: anytype, request: anytype) !?M
     };
 }
 
+/// Preflight the optional model-weight tail before custom attention mutates KV.
+/// Preparing a quantized linear slot here never reads or seeds an ordinary KV slot.
+pub fn decoderRuntimeAttentionOutputResidualFormat(self: anytype, linear_slot: usize, input_size: usize, hidden_size: usize, pre_norm_slot: ?usize, post_norm_slot: ?usize) ?MetalQuantFormat {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or input_size == 0 or hidden_size == 0) return null;
+    const kind = ensureQuantizedRuntimeLinearSlotPrepared(self, linear_slot, input_size, hidden_size);
+    const format = metalQuantFormatForKind(kind);
+    // Keep this in sync with the native residual-tail dispatcher. Other
+    // prepared linear formats must take the unfused path before KV append.
+    switch (format) {
+        .q8_0, .i2_s, .q4_0, .q4_k, .q5_k => {},
+        else => return null,
+    }
+    if (pre_norm_slot) |slot| {
+        if (slot >= decoder_runtime_rms_norm_slot_capacity or !self.raw_rms_norm_slots_prepared[slot] or
+            self.raw_rms_norm_slot_hidden_sizes[slot] != input_size) return null;
+    }
+    if (post_norm_slot) |slot| {
+        if (slot >= decoder_runtime_rms_norm_slot_capacity or !self.raw_rms_norm_slots_prepared[slot] or
+            self.raw_rms_norm_slot_hidden_sizes[slot] != hidden_size) return null;
+    }
+    return format;
+}
+
 pub fn decoderRuntimeApplyAttentionOutputResidualDevice(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -5719,19 +5781,7 @@ pub fn decoderRuntimeApplyAttentionOutputResidualDevice(self: anytype, request: 
     }
     if (!request.attention_output.isDevice() or !request.residual.isDevice()) return null;
     if (request.attention_output.deviceByteOffset() != 0) return null;
-    const linear_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, request.linear_slot, request.attention_input_size, request.hidden_size);
-    const linear_format = metalQuantFormatForKind(linear_kind);
-    if (linear_format == .unsupported) return null;
-    if (request.pre_linear_rms_norm_slot) |slot| {
-        if (slot >= decoder_runtime_rms_norm_slot_capacity) return null;
-        if (!self.raw_rms_norm_slots_prepared[slot]) return null;
-        if (self.raw_rms_norm_slot_hidden_sizes[slot] != request.attention_input_size) return null;
-    }
-    if (request.post_linear_rms_norm_slot) |slot| {
-        if (slot >= decoder_runtime_rms_norm_slot_capacity) return null;
-        if (!self.raw_rms_norm_slots_prepared[slot]) return null;
-        if (self.raw_rms_norm_slot_hidden_sizes[slot] != request.hidden_size) return null;
-    }
+    const linear_format = decoderRuntimeAttentionOutputResidualFormat(self, request.linear_slot, request.attention_input_size, request.hidden_size, request.pre_linear_rms_norm_slot, request.post_linear_rms_norm_slot) orelse return null;
 
     const out_shape = [_]i32{ @intCast(request.rows), @intCast(request.hidden_size) };
     var output = try MetalTensor.deviceAllocate(
@@ -5759,6 +5809,7 @@ pub fn decoderRuntimeApplyAttentionOutputResidualDevice(self: anytype, request: 
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
+    if (@import("builtin").is_test and rc != 0 and getenvBool("ANTFLY_CONTEXT_PROFILE")) std.debug.print("attention_match_residual_tail_status rc={d} format={s} input={d} hidden={d}\n", .{ rc, @tagName(linear_format), request.attention_input_size, request.hidden_size });
     return finishDeviceOutput(&output, rc);
 }
 
@@ -11172,6 +11223,11 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         return false;
     }
     if (request.in_dim == 0 or request.out_dim == 0 or request.slot >= decoder_runtime_linear_slot_capacity) return false;
+    // Native Q8_0 linear kernels address independent blocks in every input
+    // row. Flattened element alignment alone cannot admit a matrix whose
+    // row width cuts through a block; retain its original dense projection.
+    const q8_block_values = gguf_tensor_types.valuesPerBlock(.{ .known = .Q8_0 }) orelse return false;
+    const q8_row_aligned = request.in_dim % q8_block_values == 0;
     const retain_dense_fallback = if (@hasField(@TypeOf(request), "retain_dense_fallback"))
         request.retain_dense_fallback
     else
@@ -11200,7 +11256,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                 (!prefer_bf16_fallback and !prefer_f16_mps_fallback and !prefer_f32_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized))) or
             (request.quantized_storage == null and
                 (self.raw_linear_slot_kinds[request.slot] == .dense or
-                    (retain_dense_fallback and !prefer_f32_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized)))))
+                    (retain_dense_fallback and q8_row_aligned and !prefer_f32_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized)))))
     {
         return true;
     }
@@ -11525,7 +11581,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         // frame). Slots that opt in are staged to Q8_0 instead: half the
         // bytes on the planned quant-MMV route. Any failure falls back to
         // the dense-BF16 path unchanged.
-        if (prefer_q8 and retain_dense_fallback) q8: {
+        if (prefer_q8 and retain_dense_fallback and q8_row_aligned) q8: {
             const dense_f32_bytes = std.math.mul(usize, expected_bytes, @sizeOf(f32)) catch break :q8;
             if (dense_f32_bytes > runtimeQ8StagingDenseMaxBytesForRequest(request)) break :q8;
             const dense = std.heap.c_allocator.alloc(f32, expected_bytes) catch break :q8;
@@ -11668,7 +11724,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
     // An explicit F32 mirror must retain the original dense values. Its local
     // mirror budget also reaches this staging branch, even when the global Q8
     // budget is zero. Keep quantized checkpoint handling above unchanged.
-    if (retain_dense_fallback and !prefer_f32_mps_fallback and (dense_bytes <= dense_fallback_max_bytes or request_prefers_q8)) {
+    if (retain_dense_fallback and q8_row_aligned and !prefer_f32_mps_fallback and (dense_bytes <= dense_fallback_max_bytes or request_prefers_q8)) {
         if (try makeRuntimeQ8StorageFromDense(prepared_weight[0..dense_values], request.in_dim, request.out_dim)) |q8_storage| {
             errdefer {
                 q8_storage.deinit();
@@ -14703,6 +14759,29 @@ pub extern fn termite_metal_generated_dispatch_on_active_frame(
     params_bytes: usize,
     threads: usize,
 ) c_int;
+pub extern fn termite_metal_generated_dispatch_coalesced_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    threads: usize,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_accesses_coalesced_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    threads: usize,
+    write_mask: u8,
+) c_int;
 pub extern fn termite_metal_generated_dispatch_pair(
     runtime: ?*RawMetalDecodeRuntime,
     pipeline: ?*const RawMetalGeneratedPipeline,
@@ -14756,6 +14835,39 @@ pub extern fn termite_metal_generated_dispatch_threadgroups_on_active_frame(
     group_x: usize,
     group_y: usize,
     group_z: usize,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_threadgroups_coalesced_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    grid_x: usize,
+    grid_y: usize,
+    grid_z: usize,
+    group_x: usize,
+    group_y: usize,
+    group_z: usize,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_threadgroups_accesses_coalesced_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    grid_x: usize,
+    grid_y: usize,
+    grid_z: usize,
+    group_x: usize,
+    group_y: usize,
+    group_z: usize,
+    write_mask: u8,
 ) c_int;
 pub extern fn termite_metal_context_split_dispatch_pair_on_active_frame(
     runtime: ?*RawMetalDecodeRuntime,
@@ -19361,6 +19473,9 @@ pub extern fn termite_metal_decode_runtime_end_planned_compute_scope(runtime: ?*
 pub extern fn termite_metal_decode_runtime_push_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_pop_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_set_concurrent_planned_dispatch(runtime: ?*RawMetalDecodeRuntime, requested: c_int) c_int;
+pub extern fn termite_metal_decode_runtime_begin_native_frame_policy(runtime: ?*RawMetalDecodeRuntime, concurrent_requested: c_int, resource_barriers: c_int) c_int;
+pub extern fn termite_metal_decode_runtime_end_native_frame_policy(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_native_frame_policy_state(runtime: ?*const RawMetalDecodeRuntime) c_uint;
 pub extern fn termite_metal_decode_runtime_concurrent_planned_dispatch_enabled(runtime: ?*const RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_configure_a4b_dag_scheduler(runtime: ?*RawMetalDecodeRuntime, qualified_a4b_model: c_int) c_int;
 pub extern fn termite_metal_decode_runtime_begin_a4b_concurrent_ffn_scope(runtime: ?*RawMetalDecodeRuntime) c_int;
@@ -27853,6 +27968,23 @@ pub fn tryApplyDenseRuntimeLinear(
 /// Borrow one of the private, active-frame projection buffers. Callers must
 /// only use it for a value whose lifetime ends before that scratch index is
 /// reused in the same frame.
+/// Read-only capacity preflight. In particular, never grow projection
+/// storage after a native frame starts or allocate a tensor ownership record.
+pub fn decoderRuntimeActiveLayerProjectionScratchHandle(self: anytype, index: usize, rows: usize, cols: usize) ?*anyopaque {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (!hasActiveFrame(runtime) or hasSubmittedFrame(runtime) or index >= 6 or rows == 0 or cols == 0 or
+        rows > std.math.maxInt(i32) or cols > std.math.maxInt(i32)) return null;
+    const elements = std.math.mul(usize, rows, cols) catch return null;
+    const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return null;
+    var handle: ?*anyopaque = null;
+    if (termite_metal_decode_runtime_borrow_active_layer_projection_scratch_device(runtime, index, bytes, &handle) != 0) return null;
+    return handle;
+}
+
+pub fn decoderRuntimeActiveLayerProjectionScratchReady(self: anytype, index: usize, rows: usize, cols: usize) bool {
+    return decoderRuntimeActiveLayerProjectionScratchHandle(self, index, rows, cols) != null;
+}
+
 pub fn decoderRuntimeBorrowActiveLayerProjectionScratch(
     self: anytype,
     index: usize,
@@ -28723,6 +28855,87 @@ pub fn tryApplyQuantizedRuntimeLinearInto(
 /// slots share a fused format; otherwise each projection runs on its own,
 /// still in place. Returns the freshly allocated Q, or null when the slots
 /// are not quantized or the shapes do not fit.
+pub fn tryApplyQuantizedRuntimeLinearQkvAllInto(
+    self: anytype,
+    q_slot: usize,
+    k_slot: usize,
+    v_slot: usize,
+    input: MetalTensor,
+    in_dim: usize,
+    q_out_dim: usize,
+    kv_out_dim: usize,
+    q_out: MetalTensor,
+    k_out: MetalTensor,
+    v_out: MetalTensor,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (q_slot >= decoder_runtime_linear_slot_capacity or k_slot >= decoder_runtime_linear_slot_capacity or v_slot >= decoder_runtime_linear_slot_capacity) return false;
+    if (in_dim == 0 or q_out_dim == 0 or kv_out_dim == 0) return false;
+    if (self.raw_linear_slot_kinds[q_slot] != .quantized or self.raw_linear_slot_kinds[k_slot] != .quantized or self.raw_linear_slot_kinds[v_slot] != .quantized) return false;
+    if (!input.isDevice() or !q_out.isDevice() or !k_out.isDevice() or !v_out.isDevice()) return false;
+    if (input.ndim() != 2 or @as(usize, @intCast(input.dim(0))) != 1 or @as(usize, @intCast(input.dim(1))) != in_dim) return false;
+    if (q_out.ndim() != 2 or @as(usize, @intCast(q_out.dim(0))) != 1 or @as(usize, @intCast(q_out.dim(1))) != q_out_dim) return false;
+    if (q_out.deviceHandle() == input.deviceHandle() or k_out.deviceHandle() == input.deviceHandle() or v_out.deviceHandle() == input.deviceHandle() or
+        q_out.deviceHandle() == k_out.deviceHandle() or q_out.deviceHandle() == v_out.deviceHandle() or k_out.deviceHandle() == v_out.deviceHandle()) return false;
+    if (k_out.ndim() != 2 or @as(usize, @intCast(k_out.dim(0))) != 1 or @as(usize, @intCast(k_out.dim(1))) != kv_out_dim) return false;
+    if (v_out.ndim() != 2 or @as(usize, @intCast(v_out.dim(0))) != 1 or @as(usize, @intCast(v_out.dim(1))) != kv_out_dim) return false;
+    if (referenceQuantizedRuntimeLinearDebug()) return false;
+    const q_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, q_slot, in_dim, q_out_dim);
+    const k_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, k_slot, in_dim, kv_out_dim);
+    const v_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, v_slot, in_dim, kv_out_dim);
+    if (q_kind == .none or k_kind == .none or v_kind == .none) return false;
+    const fused: ?[3]MetalQuantFormat = if (q_kind == .q4_0 and k_kind == .q4_0 and v_kind == .q4_0)
+        .{ .q4_0, .q4_0, .q4_0 }
+    else if (q_kind == .q4_k and k_kind == .q4_k and v_kind == .q4_k)
+        .{ .q4_k, .q4_k, .q4_k }
+    else if (q_kind == .q5_k and k_kind == .q4_k and v_kind == .q4_k)
+        .{ .q5_k, .q4_k, .q4_k }
+    else if (q_kind == .q8_0 and k_kind == .q8_0 and v_kind == .q8_0)
+        .{ .q8_0, .q8_0, .q8_0 }
+    else
+        null;
+    if (fused) |formats| {
+        var q_mut = q_out;
+        const rc = termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
+            runtime,
+            @backingInt(formats[0]),
+            @backingInt(formats[1]),
+            @backingInt(formats[2]),
+            q_slot,
+            k_slot,
+            v_slot,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            1,
+            in_dim,
+            q_out_dim,
+            kv_out_dim,
+            q_out.deviceHandle(),
+            q_out.deviceByteOffset(),
+            k_out.deviceHandle(),
+            k_out.deviceByteOffset(),
+            v_out.deviceHandle(),
+            v_out.deviceByteOffset(),
+        );
+        if (rc == 0) {
+            var k_mut = k_out;
+            var v_mut = v_out;
+            if (applyRuntimeLinearBiasDevice(self, q_slot, &q_mut, 1, q_out_dim) and
+                applyRuntimeLinearBiasDevice(self, k_slot, &k_mut, 1, kv_out_dim) and
+                applyRuntimeLinearBiasDevice(self, v_slot, &v_mut, 1, kv_out_dim))
+            {
+                return true;
+            }
+            return false;
+        }
+    }
+    // Mixed or unfused formats: separate kernels, still into the slab rows.
+    if (!try tryApplyQuantizedRuntimeLinearInto(self, k_slot, input, 1, in_dim, kv_out_dim, k_out)) return false;
+    if (!try tryApplyQuantizedRuntimeLinearInto(self, v_slot, input, 1, in_dim, kv_out_dim, v_out)) return false;
+    return try tryApplyQuantizedRuntimeLinearInto(self, q_slot, input, 1, in_dim, q_out_dim, q_out);
+}
+
 pub fn tryApplyQuantizedRuntimeLinearQkvInto(
     self: anytype,
     q_slot: usize,

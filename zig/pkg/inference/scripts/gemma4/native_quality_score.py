@@ -18,6 +18,20 @@ import math
 from collections import Counter
 
 
+def validate_request_models(cases, model):
+    """Bind every evaluation and checkpoint request to the frozen model."""
+    if not isinstance(model, str) or not model:
+        raise ValueError("quality suite requires an expected model")
+    for case in cases:
+        for field in ("body", "checkpoint_body"):
+            if field == "checkpoint_body" and field not in case:
+                continue
+            body = case.get(field)
+            if not isinstance(body, dict) or body.get("model") != model:
+                raise ValueError(f"quality case {case.get('case_id', case.get('id'))}: "
+                                 f"{field}.model differs from frozen model")
+
+
 def unique_object(pairs):
     out = {}
     for key, value in pairs:

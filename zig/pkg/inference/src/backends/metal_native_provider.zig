@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const native_checkpoint_release = @import("../runtime/kv/attention_match_release.zig");
 const metal_runtime = @import("metal_runtime.zig");
 const kernel_jit = @import("../graph/kernel_jit.zig");
 const metal_tensor = @import("metal_tensor.zig");
@@ -94,6 +95,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     pub const image_coefficient_budget: usize = 16 * 1024 * 1024;
     raw_provider: ?*RawMetalProvider,
     raw_decode_runtime: ?*RawMetalDecodeRuntime,
+    native_checkpoint_backend_environment: ?[32]u8 = null,
     embedding_workspace_leases: [64]?memory.AdmissionLease = @splat(null),
     embedding_workspace_lease_count: usize = 0,
     embedding_workspace_bytes: usize = 0,
@@ -187,6 +189,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     }
 
     pub fn createWithKernelJitOptions(options: metal_runtime.MetalJitOptions) !MetalNativeProvider {
+        const environment_before = native_checkpoint_release.backendEnvironmentFingerprint() catch null;
         const raw_provider = metal_runtime.termite_metal_provider_create();
         const raw_decode_runtime = metal_runtime.termite_metal_decode_runtime_create();
         var result = MetalNativeProvider{
@@ -203,7 +206,21 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         // expires keep their bundled implementation; no GPU benchmark runs
         // against a published provider.
         try metal_runtime.initializeMetalKernelJitWithOptions(&result, options);
+        const environment_after = native_checkpoint_release.backendEnvironmentFingerprint() catch null;
+        if (environment_before != null and environment_after != null and
+            std.mem.eql(u8, &environment_before.?, &environment_after.?))
+            result.native_checkpoint_backend_environment = environment_after;
         return result;
+    }
+
+    pub fn nativeCheckpointObserved(self: *const MetalNativeProvider) !native_checkpoint_release.Observed {
+        const captured = self.native_checkpoint_backend_environment orelse return error.UnqualifiedCompactionArtifact;
+        // The current campaign uses bundled kernels. A later JIT profile needs
+        // its own configuration-bound qualification before it can be admitted.
+        if (self.raw_decode_runtime == null or self.jit_mode != .off) return error.UnqualifiedCompactionArtifact;
+        const current = try native_checkpoint_release.backendEnvironmentFingerprint();
+        if (!std.mem.eql(u8, &captured, &current)) return error.UnqualifiedCompactionArtifact;
+        return .{ .destination = try metal_runtime.nativeCheckpointDestination(), .backend_environment_sha256 = captured };
     }
 
     pub fn hasDecoderRuntime(self: *const MetalNativeProvider) bool {
@@ -474,3 +491,55 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         for (&self.jit_exact_pipeline_owners) |*generated| metal_runtime.termite_metal_generated_pipeline_destroy(generated.*);
     }
 } else void;
+
+test "attention_match Metal native certificate rejects backend environment drift after provider creation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const name = "TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH";
+    const previous = if (std.c.getenv(name)) |raw| try allocator.dupeSentinel(u8, std.mem.span(raw), 0) else null;
+    defer if (previous) |value| allocator.free(value);
+    defer if (previous) |value| {
+        _ = Env.setenv(name, value.ptr, 1);
+    } else {
+        _ = Env.unsetenv(name);
+    };
+    var provider = try MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const original = try provider.nativeCheckpointObserved();
+    const changed: [*:0]const u8 = if (previous != null and std.mem.eql(u8, previous.?, "1")) "0" else "1";
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(name, changed, 1));
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, provider.nativeCheckpointObserved());
+    if (previous) |value| {
+        try std.testing.expectEqual(@as(c_int, 0), Env.setenv(name, value.ptr, 1));
+    } else try std.testing.expectEqual(@as(c_int, 0), Env.unsetenv(name));
+    const restored = try provider.nativeCheckpointObserved();
+    try std.testing.expect(std.meta.eql(original, restored));
+    provider.jit_mode = .shadow;
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, provider.nativeCheckpointObserved());
+    provider.jit_mode = .off;
+}
+
+test "attention_match Metal native configuration probe" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("antfly_platform").env.getenvBool("ANTFLY_METAL_QUALITY_CONFIGURATION_PROBE")) return error.SkipZigTest;
+    var provider = try MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const observed = try provider.nativeCheckpointObserved();
+    const execution = native_checkpoint_release.Execution.diagnosticFromEnvironment();
+    try execution.validate();
+    const raw = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
+        .schema = "antfly.native-checkpoint-configuration.v1",
+        .implementation_sha256 = @import("compaction_identity").digest,
+        .observed = observed,
+        .execution = execution,
+        .configuration_sha256 = native_checkpoint_release.configurationFingerprint(execution, observed.backend_environment_sha256),
+        .backend_environment_key_count = @import("compaction_identity").backend_environment_keys.len,
+        .release_eligible = false,
+    }, .{});
+    defer std.testing.allocator.free(raw);
+    std.debug.print("native_checkpoint_configuration {s}\n", .{raw});
+}

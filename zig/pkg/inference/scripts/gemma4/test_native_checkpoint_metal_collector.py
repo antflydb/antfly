@@ -78,11 +78,19 @@ class MetalCollectorTests(unittest.TestCase):
     def test_backend_contract_is_explicit_and_rejects_unsupported_codecs(self):
         qualification.validate_backend_configuration(self.args())
         qualification.validate_backend_configuration(self.args(encoding="fp8"))
+        qualification.validate_backend_configuration(
+            self.args(encoding="rotated4", experimental_rotated4=True)
+        )
+        qualification.validate_backend_configuration(
+            self.args(model="google/gemma-4-E2B-it-qat-q4_0-gguf")
+        )
         for args in (
             self.args(backend="cuda"),
             self.args(server_kind="standalone"),
             self.args(encoding="f32"),
-            self.args(encoding="rotated4", experimental_rotated4=True),
+            self.args(encoding="rotated4", experimental_rotated4=False),
+            self.args(encoding="fp8", experimental_rotated4=True),
+            self.args(model="google/unsupported"),
         ):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 qualification.validate_backend_configuration(args)
@@ -328,6 +336,7 @@ class MetalCollectorTests(unittest.TestCase):
                 server_kind="metal-test",
                 inference_admission_capacity=1,
                 models_dir=root,
+                model="google/gemma-4-E2B-it-qat-q4_0-gguf",
                 port=8500,
                 output=root / "receipt.json",
                 server=root / "context-tests",
@@ -356,6 +365,18 @@ class MetalCollectorTests(unittest.TestCase):
                     with qualification.server(args, "importer", evidence):
                         self.fail("headroom failure cannot start importer")
             popen.assert_not_called()
+            self.assertEqual(
+                evidence["importer"]["environment_overrides"][
+                    "ANTFLY_METAL_CHECKPOINT_MODEL"
+                ],
+                args.model,
+            )
+            self.assertEqual(
+                evidence["importer"]["environment_overrides"][
+                    "ANTFLY_METAL_CHECKPOINT_MAX_CONCURRENT_REQUESTS"
+                ],
+                "1",
+            )
             self.assertFalse(evidence["importer"]["loader_headroom"]["passed"])
             self.assertIn(
                 "below 76 percent",

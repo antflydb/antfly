@@ -27,10 +27,114 @@ const server_mod = @import("server/server.zig");
 
 const allocator = std.testing.allocator;
 const io = std.testing.io;
-const model_name = "google/gemma-4-E4B-it-qat-q4_0-gguf";
+const default_model_name = "google/gemma-4-E4B-it-qat-q4_0-gguf";
+
+fn validateQualificationModel(name: []const u8) ![]const u8 {
+    for ([_][]const u8{
+        "google/gemma-4-E2B-it-qat-q4_0-gguf",
+        default_model_name,
+    }) |allowed| if (std.mem.eql(u8, name, allowed)) return name;
+    return error.UnsupportedMetalCheckpointQualificationModel;
+}
+
+fn qualificationModel() ![]const u8 {
+    return validateQualificationModel(platform.env.getenv("ANTFLY_METAL_CHECKPOINT_MODEL") orelse default_model_name);
+}
+
+test "context Metal checkpoint qualification model selection is explicit" {
+    try std.testing.expectEqualStrings(default_model_name, try validateQualificationModel(default_model_name));
+    const e2b = "google/gemma-4-E2B-it-qat-q4_0-gguf";
+    try std.testing.expectEqualStrings(e2b, try validateQualificationModel(e2b));
+    try std.testing.expectError(error.UnsupportedMetalCheckpointQualificationModel, validateQualificationModel(""));
+    try std.testing.expectError(error.UnsupportedMetalCheckpointQualificationModel, validateQualificationModel("google/gemma-4-26B-A4B-it-qat-q4_0-gguf"));
+}
 const default_max_lifetime_ns: u64 = 12 * std.time.ns_per_hour;
 const maximum_lifetime_seconds: u64 = 48 * 60 * 60 + 5 * 60;
 const metal_backends = [_]backends.BackendType{.metal};
+
+/// Admit conservative KV, fitting and mapped-weight reservations together.
+/// The collector separately enforces the unchanged 8 GiB process RSS cap;
+/// these reservation envelopes do not raise it or the 512 MiB solver bound.
+fn qualificationGenerationBudgetOverrides() server_mod.BudgetOverrides {
+    return .{
+        .host_limit_bytes = 8 * 1024 * 1024 * 1024,
+        .backend_limit_bytes = 12 * 1024 * 1024 * 1024,
+        .combined_limit_bytes = 16 * 1024 * 1024 * 1024,
+        .kv_limit_bytes = 6 * 1024 * 1024 * 1024,
+        .scratch_limit_bytes = 6 * 1024 * 1024 * 1024,
+    };
+}
+
+test "context Metal qualification budgets admit both models at 8K and 32K" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const memory = @import("runtime/tier/memory.zig");
+    const test_generation = @import("pipelines/generation.zig");
+    const GptConfig = @import("models/gpt.zig").Config;
+    const Encoding = @import("runtime/kv/attention_match_checkpoint.zig").Encoding;
+    const cases = [_]struct { config: GptConfig, weight_bytes: usize }{
+        .{ .config = .{
+            .family = .gemma,
+            .gemma4_channel_protocol = true,
+            .hidden_size = 1536,
+            .num_hidden_layers = 35,
+            .num_attention_heads = 8,
+            .num_key_value_heads = 1,
+            .attention_head_dim = 256,
+            .global_head_dim = 512,
+            .sliding_window = 512,
+            .sliding_window_pattern = 5,
+            .num_kv_shared_layers = 20,
+            .ple_hidden_size = 256,
+            .vocab_size = 262144,
+            .max_position_embeddings = 131072,
+        }, .weight_bytes = 3_349_516_256 },
+        .{ .config = .{
+            .family = .gemma,
+            .gemma4_channel_protocol = true,
+            .hidden_size = 2560,
+            .num_hidden_layers = 42,
+            .num_attention_heads = 8,
+            .num_key_value_heads = 2,
+            .attention_head_dim = 256,
+            .global_head_dim = 512,
+            .sliding_window = 512,
+            .num_kv_shared_layers = 18,
+            .ple_hidden_size = 256,
+            .vocab_size = 262144,
+            .max_position_embeddings = 131072,
+        }, .weight_bytes = 5_154_941_280 },
+    };
+    for (cases) |case| {
+        for ([_]usize{ 8192, 32768 }) |context_tokens| {
+            const output_tokens: usize = if (context_tokens == 8192) 64 else 256;
+            const prompt_tokens = context_tokens - output_tokens;
+            for ([_]Encoding{ .f16, .fp8, .rotated4 }) |encoding| {
+                const plan = try test_generation.NativeCheckpointPrepare.hostPlan(case.config, prompt_tokens, encoding, true);
+                var budget = memory.RunBudget.init(qualificationGenerationBudgetOverrides().apply(.{}));
+                try budget.reserveEstimate(.{
+                    .prompt_tokens = prompt_tokens,
+                    .retained_tokens = prompt_tokens,
+                    .kv_bytes = 0,
+                    .kv_tier = .backend,
+                    .scratch_bytes = plan.reservation_bytes,
+                    .scratch_tier = .host,
+                });
+                const components = [_]memory.GptGenerationBudgetComponent{.{
+                    .backend = .metal,
+                    .kv_dtype = .f16,
+                    .config = case.config,
+                }};
+                const admitted = try memory.reserveGptGenerationPrefill(&budget, &components, prompt_tokens, output_tokens, 1024);
+                // Model admission also accounts for mapped weights. Reserve the
+                // larger observed host-weight footprint for either model.
+                _ = try budget.tryReserveWeight(.host, 233_979_810);
+                _ = try budget.tryReserveWeight(.backend, case.weight_bytes);
+                try std.testing.expectEqual(@as(usize, 1024), admitted.max_chunk_rows);
+                try std.testing.expect(plan.fit_bytes <= test_generation.NativeCheckpointPrepare.max_transient_host_bytes);
+            }
+        }
+    }
+}
 
 fn requiredEnv(comptime name: [:0]const u8) ![]const u8 {
     const value = platform.env.getenv(name) orelse return error.MissingMetalCheckpointQualificationInput;
@@ -51,6 +155,15 @@ fn qualificationLifetimeNs() !u64 {
         return error.InvalidMetalCheckpointQualificationInput;
     return std.math.mul(u64, seconds, std.time.ns_per_s) catch
         error.InvalidMetalCheckpointQualificationInput;
+}
+
+fn qualificationMaxConcurrentRequests() !usize {
+    const raw = platform.env.getenv("ANTFLY_METAL_CHECKPOINT_MAX_CONCURRENT_REQUESTS") orelse
+        return 1;
+    const value = std.fmt.parseInt(usize, raw, 10) catch
+        return error.InvalidMetalCheckpointQualificationInput;
+    if (value == 0 or value > 64) return error.InvalidMetalCheckpointQualificationInput;
+    return value;
 }
 
 fn requireAbsent(path: []const u8) !void {
@@ -74,6 +187,7 @@ fn writeReady(
     path: []const u8,
     port: u16,
     load_generation: u64,
+    model_name: []const u8,
     identity: @import("runtime/kv/attention_match_checkpoint.zig").Identity,
 ) !void {
     if (load_generation == 0) return error.InvalidMetalCheckpointQualificationIdentity;
@@ -169,12 +283,16 @@ fn sizedPerformancePrompt(model: *server_mod.model_manager.LoadedModel, target: 
     return error.UnrepresentableMetalCheckpointPerformancePrompt;
 }
 
-fn writeExclusive(path: []const u8, data: []const u8) !void {
+fn writeExclusive(path: []const u8, data: []const u8) ![32]u8 {
     var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true, .truncate = false });
     defer file.close(io);
     try file.writeStreamingAll(io, data);
     try file.writeStreamingAll(io, "\n");
     try file.sync(io);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(data);
+    hash.update("\n");
+    return hash.finalResult();
 }
 
 fn qualificationHttpConfig(base: httpx.ServerConfig) httpx.ServerConfig {
@@ -253,6 +371,7 @@ test "context Metal native checkpoint qualification server" {
 
     const models_root = platform.env.getenv("ANTFLY_METAL_CHECKPOINT_MODELS_ROOT") orelse return error.SkipZigTest;
     if (models_root.len == 0) return error.InvalidMetalCheckpointQualificationInput;
+    const model_name = try qualificationModel();
     const port_text = try requiredEnv("ANTFLY_METAL_CHECKPOINT_PORT");
     const ready_path = try requiredEnv("ANTFLY_METAL_CHECKPOINT_READY_FILE");
     const stop_path = try requiredEnv("ANTFLY_METAL_CHECKPOINT_STOP_FILE");
@@ -269,19 +388,13 @@ test "context Metal native checkpoint qualification server" {
     var node = try server_mod.Node.init(allocator, .{
         .models_dir = models_root,
         .max_loaded_models = 1,
-        .max_concurrent_requests = 1,
+        .max_concurrent_requests = try qualificationMaxConcurrentRequests(),
         .http_max_connections = 4,
         .http_max_request_tasks = 2,
         .http_max_body_bytes = 2 * 1024 * 1024,
         .keep_alive_ms = 12 * 60 * 60 * 1000,
         .process_termination_available = true,
-        .generation_budget_overrides = .{
-            .host_limit_bytes = 8 * 1024 * 1024 * 1024,
-            .backend_limit_bytes = 8 * 1024 * 1024 * 1024,
-            .combined_limit_bytes = 10 * 1024 * 1024 * 1024,
-            .kv_limit_bytes = 4 * 1024 * 1024 * 1024,
-            .scratch_limit_bytes = 6 * 1024 * 1024 * 1024,
-        },
+        .generation_budget_overrides = qualificationGenerationBudgetOverrides(),
     });
     defer node.deinit();
     node.session_manager.preferred_backends = &metal_backends;
@@ -325,7 +438,7 @@ test "context Metal native checkpoint qualification server" {
         if (platform.time.monotonicNs() >= startup_deadline) return error.MetalCheckpointQualificationStartTimeout;
         try io.sleep(.fromMilliseconds(1), .awake);
     }
-    try writeReady(ready_path, parsed_port, loaded.load_generation, identity);
+    try writeReady(ready_path, parsed_port, loaded.load_generation, model_name, identity);
 
     const lifetime_deadline = platform.time.monotonicNs() + max_lifetime_ns;
     var observed_denied_count = logModelAdmissionDiagnostic(&node, "startup");
@@ -353,11 +466,142 @@ test "context Metal native checkpoint qualification server" {
     try std.testing.expectEqual(@as(usize, 0), runtime_stats.active_h1_cancellation_observers);
 }
 
+test "context Metal checkpoint successive installed owner model qualification" {
+    if (comptime builtin.os.tag != .macos or !build_options.enable_metal) return error.SkipZigTest;
+    if (comptime build_options.enable_cuda) return error.InvalidMetalCheckpointQualificationBuild;
+    const input_path = platform.env.getenv("ANTFLY_METAL_CHECKPOINT_CYCLE_INPUT") orelse return error.SkipZigTest;
+    var phase: []const u8 = "input";
+    errdefer std.log.err("metal_checkpoint_cycle_driver_rejected phase={s}", .{phase});
+    const output_path = try requiredEnv("ANTFLY_METAL_CHECKPOINT_CYCLE_OUTPUT");
+    const models_root = try requiredEnv("ANTFLY_METAL_CHECKPOINT_MODELS_ROOT");
+    const model_name = try qualificationModel();
+    try requireAbsolute(input_path);
+    try requireAbsolute(output_path);
+    try requireAbsolute(models_root);
+    try requireAbsent(output_path);
+    const generation = @import("pipelines/generation.zig");
+    const cycles = @import("runtime/kv/metal_checkpoint_cycles.zig");
+    const Input = struct {
+        schema: []const u8,
+        model: []const u8,
+        expected_prompt_tokens: usize,
+        messages: []const generation.Message,
+        request: cycles.Request,
+    };
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, input_path, allocator, .limited(16 * 1024 * 1024));
+    defer allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(Input, allocator, raw, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const input = parsed.value;
+    if (!std.mem.eql(u8, input.schema, "antfly.metal-checkpoint-cycles.input.v1") or
+        !std.mem.eql(u8, input.model, model_name) or input.messages.len == 0)
+        return error.InvalidMetalCheckpointQualificationInput;
+    _ = try input.request.capacity(input.expected_prompt_tokens);
+    phase = "model_load";
+    var node = try server_mod.Node.init(allocator, .{
+        .models_dir = models_root,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .process_termination_available = true,
+        .generation_budget_overrides = .{
+            .host_limit_bytes = 8 * 1024 * 1024 * 1024,
+            .backend_limit_bytes = 8 * 1024 * 1024 * 1024,
+            .combined_limit_bytes = 10 * 1024 * 1024 * 1024,
+            .kv_limit_bytes = 4 * 1024 * 1024 * 1024,
+            .scratch_limit_bytes = 6 * 1024 * 1024 * 1024,
+        },
+    });
+    defer node.deinit();
+    node.session_manager.preferred_backends = &metal_backends;
+    node.session_manager.required_backend = .metal;
+    node.model_manager.session_manager.preferred_backends = &metal_backends;
+    node.model_manager.session_manager.required_backend = .metal;
+    try node.attachIo(io);
+    const model_dir = try node.resolveModelPath(io, model_name, "generators");
+    defer allocator.free(model_dir);
+    var handle = try node.model_manager.acquireFromDirWithPreferredBackends(model_dir, &metal_backends, true);
+    defer handle.release();
+    const model = handle.get();
+    if (model.session.backend() != .metal) return error.MetalCheckpointQualificationBackendMismatch;
+    phase = "identity";
+    const identity = try model.nativeKvIdentity(.f16, null);
+    phase = "tokenization";
+    const template = model.chat_tmpl orelse return error.MissingChatTemplate;
+    const prompt = try template.applyWithOptions(allocator, input.messages, .{ .enable_thinking = false });
+    defer allocator.free(prompt);
+    var encoded = try generation.encodeNativeGenerationPrompt(model.getTokenizer(), allocator, prompt, @import("runtime/kv/attention_match_checkpoint.zig").max_context_tokens, model.manifest.add_bos_token, model.manifest.bos_token);
+    defer encoded.deinit();
+    var count: usize = 0;
+    while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
+    if (count != input.expected_prompt_tokens) return error.InvalidMetalCheckpointQualificationInput;
+    const tokens = try allocator.alloc(i64, count);
+    defer allocator.free(tokens);
+    for (tokens, encoded.ids[0..count]) |*target, token| target.* = token;
+    const factory = @import("architectures/session_factory.zig");
+    var budget = @import("runtime/tier/memory.zig").RunBudget.init(.{
+        .host_limit_bytes = 8 * 1024 * 1024 * 1024,
+        .backend_limit_bytes = 8 * 1024 * 1024 * 1024,
+        .combined_limit_bytes = 10 * 1024 * 1024 * 1024,
+        .kv_limit_bytes = 4 * 1024 * 1024 * 1024,
+        .scratch_limit_bytes = 6 * 1024 * 1024 * 1024,
+    });
+    phase = "backend";
+    var cb = try factory.getComputeBackendWithBudget(model.session, allocator, &budget);
+    defer cb.deinit();
+    var pipeline: generation.NativeGenerationPipeline = .{
+        .allocator = allocator,
+        .io = io,
+        .cb = cb,
+        .session = model.session,
+        .load_generation = model.load_generation,
+        .gpt_config = factory.getGptConfig(model.session) orelse return error.InvalidModelForGeneration,
+        .kv_dtype = .f16,
+        .attention_match_identity = identity,
+        .tokenizer = model.getTokenizer(),
+        .chat_template = model.chat_tmpl,
+        .add_bos_token = model.manifest.add_bos_token,
+        .bos_token = model.manifest.bos_token,
+        .execution_lock = model.nativeGenerationMutex(),
+    };
+    defer pipeline.deinit();
+    phase = "native_cycles";
+    const report = try pipeline.qualifyMetalCheckpointCycles(tokens, input.request);
+    var input_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &input_digest, .{});
+    var prompt_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(prompt, &prompt_digest, .{});
+    const input_hex = std.fmt.bytesToHex(input_digest, .lower);
+    const prompt_hex = std.fmt.bytesToHex(prompt_digest, .lower);
+    const token_hex = std.fmt.bytesToHex(try @import("backends/context_teacher_forced.zig").promptTokenDigest(tokens), .lower);
+    const implementation = std.fmt.bytesToHex(@import("compaction_identity").digest, .lower);
+    const body = try std.json.Stringify.valueAlloc(allocator, .{
+        .schema = "antfly.metal-checkpoint-cycles.report.v3",
+        .model_directory = model.model_dir,
+        .model = model_name,
+        .encoding = @tagName(input.request.encoding),
+        .load_generation = model.load_generation,
+        .model_identity = identity,
+        .input_sha256 = input_hex[0..],
+        .rendered_prompt_sha256 = prompt_hex[0..],
+        .prompt_tokens_sha256 = token_hex[0..],
+        .implementation_sha256 = implementation[0..],
+        .report = report,
+    }, .{ .whitespace = .indent_2 });
+    defer allocator.free(body);
+    phase = "report_write";
+    var output = try std.Io.Dir.cwd().createFile(io, output_path, .{ .exclusive = true, .truncate = false });
+    defer output.close(io);
+    try output.writeStreamingAll(io, body);
+    try output.writeStreamingAll(io, "\n");
+    try output.sync(io);
+}
+
 test "context Metal checkpoint performance requests materializer" {
     if (comptime builtin.os.tag != .macos or !build_options.enable_metal) return error.SkipZigTest;
     if (comptime build_options.enable_cuda) return error.InvalidMetalCheckpointQualificationBuild;
     const models_root = platform.env.getenv("ANTFLY_METAL_CHECKPOINT_MODELS_ROOT") orelse return error.SkipZigTest;
     const output_dir = platform.env.getenv("ANTFLY_METAL_CHECKPOINT_PERF_OUTPUT_DIR") orelse return error.SkipZigTest;
+    const model_name = try qualificationModel();
     if (models_root.len == 0 or output_dir.len == 0) return error.InvalidMetalCheckpointQualificationInput;
     try requireAbsolute(models_root);
     try requireAbsolute(output_dir);
@@ -367,7 +611,7 @@ test "context Metal checkpoint performance requests materializer" {
     var node = try server_mod.Node.init(allocator, .{
         .models_dir = models_root,
         .max_loaded_models = 1,
-        .max_concurrent_requests = 1,
+        .max_concurrent_requests = try qualificationMaxConcurrentRequests(),
         .process_termination_available = true,
         .generation_budget_overrides = .{
             .host_limit_bytes = 8 * 1024 * 1024 * 1024,
@@ -416,10 +660,9 @@ test "context Metal checkpoint performance requests materializer" {
             .chat_template_kwargs = .{ .enable_thinking = false },
         }, .{});
         defer allocator.free(body);
-        std.crypto.hash.sha2.Sha256.hash(body, &request_sha256[index], .{});
         const path = try std.fs.path.join(allocator, &.{ output_dir, spec.name });
         defer allocator.free(path);
-        try writeExclusive(path, body);
+        request_sha256[index] = try writeExclusive(path, body);
     }
     const weights = std.fmt.bytesToHex(identity.weights, .lower);
     const tokenizer = std.fmt.bytesToHex(identity.tokenizer, .lower);
@@ -448,5 +691,359 @@ test "context Metal checkpoint performance requests materializer" {
     defer allocator.free(metadata);
     const metadata_path = try std.fs.path.join(allocator, &.{ output_dir, "metadata.json" });
     defer allocator.free(metadata_path);
-    try writeExclusive(metadata_path, metadata);
+    _ = try writeExclusive(metadata_path, metadata);
+}
+test "context Metal native checkpoint paired quality qualification" {
+    if (comptime builtin.os.tag != .macos or !build_options.enable_metal) return error.SkipZigTest;
+    if (comptime build_options.enable_cuda) return error.InvalidMetalCheckpointQualificationBuild;
+    const input_path = platform.env.getenv("ANTFLY_METAL_NATIVE_QUALITY_INPUT") orelse return error.SkipZigTest;
+    const input_root = try requiredEnv("ANTFLY_METAL_NATIVE_QUALITY_INPUT_ROOT");
+    const output_root = try requiredEnv("ANTFLY_METAL_NATIVE_QUALITY_OUTPUT_ROOT");
+    const models_root = try requiredEnv("ANTFLY_METAL_CHECKPOINT_MODELS_ROOT");
+    const model_name = try qualificationModel();
+    inline for (.{ input_path, input_root, output_root, models_root }) |path| try requireAbsolute(path);
+    const driver = @import("context_native_checkpoint_quality.zig");
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, input_path, allocator, .limited(16 * 1024 * 1024));
+    defer allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(driver.Input, allocator, raw, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const input = parsed.value;
+    if (!std.mem.eql(u8, input.schema, "antfly.native-checkpoint-quality.input.v1") or
+        !std.mem.eql(u8, input.model, model_name) or input.cases.len == 0 or input.cases.len > 100)
+        return error.InvalidMetalCheckpointQualificationInput;
+    const expected_main = try driver.parseDigest(input.main_gguf_sha256);
+    var inputs = try std.Io.Dir.cwd().openDir(io, input_root, .{ .follow_symlinks = false });
+    defer inputs.close(io);
+    var outputs = try std.Io.Dir.cwd().openDir(io, output_root, .{ .follow_symlinks = false });
+    defer outputs.close(io);
+    var node = try server_mod.Node.init(allocator, .{
+        .models_dir = models_root,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .process_termination_available = true,
+        .generation_budget_overrides = .{
+            .host_limit_bytes = 8 * 1024 * 1024 * 1024,
+            .backend_limit_bytes = 8 * 1024 * 1024 * 1024,
+            .combined_limit_bytes = 10 * 1024 * 1024 * 1024,
+            .kv_limit_bytes = 4 * 1024 * 1024 * 1024,
+            .scratch_limit_bytes = 6 * 1024 * 1024 * 1024,
+        },
+    });
+    defer node.deinit();
+    node.session_manager.preferred_backends = &metal_backends;
+    node.session_manager.required_backend = .metal;
+    node.model_manager.session_manager.preferred_backends = &metal_backends;
+    node.model_manager.session_manager.required_backend = .metal;
+    try node.attachIo(io);
+    const model_dir = try node.resolveModelPath(io, model_name, "generators");
+    defer allocator.free(model_dir);
+    var handle = try node.model_manager.acquireFromDirWithPreferredBackends(model_dir, &metal_backends, true);
+    defer handle.release();
+    const model = handle.get();
+    if (model.session.backend() != .metal) return error.MetalCheckpointQualificationBackendMismatch;
+    const native = try model.nativeKvIdentity(.f16, null);
+    const factory = @import("architectures/session_factory.zig");
+    const actual_main = factory.getLoadedGgufArtifactDigest(model.session) orelse return error.UnsupportedCompactionArtifact;
+    if (!native.eql(input.native_identity) or !std.mem.eql(u8, &expected_main, &actual_main))
+        return error.ContextQualificationLoadedIdentityMismatch;
+    const generation = @import("pipelines/generation.zig");
+    var budget = @import("runtime/tier/memory.zig").RunBudget.init(.{
+        .host_limit_bytes = 8 * 1024 * 1024 * 1024,
+        .backend_limit_bytes = 8 * 1024 * 1024 * 1024,
+        .combined_limit_bytes = 10 * 1024 * 1024 * 1024,
+        .kv_limit_bytes = 4 * 1024 * 1024 * 1024,
+        .scratch_limit_bytes = 6 * 1024 * 1024 * 1024,
+    });
+    var cb = try factory.getComputeBackendWithBudget(model.session, allocator, &budget);
+    defer cb.deinit();
+    var pipeline: generation.NativeGenerationPipeline = .{
+        .allocator = allocator,
+        .io = io,
+        .cb = cb,
+        .session = model.session,
+        .load_generation = model.load_generation,
+        .gpt_config = factory.getGptConfig(model.session) orelse return error.InvalidModelForGeneration,
+        .kv_dtype = .f16,
+        .attention_match_identity = native,
+        .tokenizer = model.getTokenizer(),
+        .chat_template = model.chat_tmpl,
+        .add_bos_token = model.manifest.add_bos_token,
+        .bos_token = model.manifest.bos_token,
+        .execution_lock = model.nativeGenerationMutex(),
+    };
+    defer pipeline.deinit();
+    var manifest_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &manifest_digest, .{});
+    var session: driver.Session = .{
+        .allocator = allocator,
+        .io = io,
+        .inputs = inputs,
+        .outputs = outputs,
+        .model = model,
+        .pipeline = &pipeline,
+        .manifest_sha256 = manifest_digest,
+    };
+    for (input.cases, 0..) |case, index| {
+        for (input.cases[0..index]) |previous|
+            if (std.mem.eql(u8, previous.id, case.id) and previous.request.encoding == case.request.encoding)
+                return error.DuplicateNativeQualityCase;
+        session.execute(case, index) catch |err| {
+            const failure = try std.json.Stringify.valueAlloc(allocator, .{
+                .schema = "antfly.native-checkpoint-quality.failure.v1",
+                .release_eligible = false,
+                .case_index = index,
+                .case_id = case.id,
+                .encoding = @tagName(case.request.encoding),
+                .@"error" = @errorName(err),
+                .manifest_sha256 = manifest_digest,
+            }, .{ .whitespace = .indent_2 });
+            defer allocator.free(failure);
+            var file = try outputs.createFile(io, "failure.json", .{ .exclusive = true, .truncate = false });
+            defer file.close(io);
+            try file.writeStreamingAll(io, failure);
+            try file.sync(io);
+            return err;
+        };
+        if (!native.eql(try model.nativeKvIdentity(.f16, null)) or model.load_generation != pipeline.load_generation)
+            return error.StaleContextView;
+    }
+}
+
+test "context Metal native quality tokenizer materializer" {
+    if (!builtin.is_test or !build_options.enable_metal or
+        !platform.env.getenvBool("ANTFLY_METAL_QUALITY_MATERIALIZER")) return error.SkipZigTest;
+    const model_name = try qualificationModel();
+    const models_root = try requiredEnv("ANTFLY_METAL_CHECKPOINT_MODELS_DIR");
+    const campaign_root = try requiredEnv("ANTFLY_METAL_QUALITY_CAMPAIGN_DIR");
+    try requireAbsolute(models_root);
+    try requireAbsolute(campaign_root);
+    const session = try requiredEnv("ANTFLY_METAL_QUALITY_SESSION_ID");
+    if (session.len != 64) return error.InvalidMetalCheckpointQualificationInput;
+    var session_bytes: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&session_bytes, session);
+    const maximum = try std.fmt.parseInt(u32, try requiredEnv("ANTFLY_METAL_QUALITY_PREPARATION_CONTEXT"), 10);
+    if (maximum != 16384 and maximum != 65536) return error.InvalidMetalCheckpointQualificationInput;
+    var campaign = try std.Io.Dir.cwd().openDir(io, campaign_root, .{ .follow_symlinks = false });
+    defer campaign.close(io);
+    var node = try server_mod.Node.init(allocator, .{
+        .models_dir = models_root,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .process_termination_available = true,
+        .generation_budget_overrides = .{
+            .host_limit_bytes = 8 * 1024 * 1024 * 1024,
+            .backend_limit_bytes = 8 * 1024 * 1024 * 1024,
+            .combined_limit_bytes = 10 * 1024 * 1024 * 1024,
+            .kv_limit_bytes = 4 * 1024 * 1024 * 1024,
+            .scratch_limit_bytes = 6 * 1024 * 1024 * 1024,
+        },
+    });
+    defer node.deinit();
+    node.session_manager.preferred_backends = &metal_backends;
+    node.session_manager.required_backend = .metal;
+    node.model_manager.session_manager.preferred_backends = &metal_backends;
+    node.model_manager.session_manager.required_backend = .metal;
+    try node.attachIo(io);
+    const model_dir = try node.resolveModelPath(io, model_name, "generators");
+    defer allocator.free(model_dir);
+    var handle = try node.model_manager.acquireFromDirWithPreferredBackends(model_dir, &metal_backends, true);
+    defer handle.release();
+    const model = handle.get();
+    if (model.session.backend() != .metal) return error.MetalCheckpointQualificationBackendMismatch;
+    const native = try model.nativeKvIdentity(.f16, null);
+    // Hash the actual loaded main GGUF through its retained session, rather
+    // than treating a caller's expected file digest as an observation.
+    const factory = @import("architectures/session_factory.zig");
+    const artifact = factory.getLoadedGgufArtifactDigest(model.session) orelse return error.UnsupportedCompactionArtifact;
+    const identity: server_mod.ContextServingLoadedIdentity = .{
+        .load_generation = model.load_generation,
+        .artifact_sha256 = artifact,
+        .tokenizer_sha256 = native.tokenizer,
+        .template_sha256 = native.template,
+        .layout_sha256 = native.layout,
+        .profile_sha256 = @splat(0),
+        .implementation_sha256 = @import("compaction_identity").digest,
+    };
+    const main_hex = std.fmt.bytesToHex(artifact, .lower);
+    const implementation_hex = std.fmt.bytesToHex(@import("compaction_identity").digest, .lower);
+    const weights_hex = std.fmt.bytesToHex(native.weights, .lower);
+    const tokenizer_hex = std.fmt.bytesToHex(native.tokenizer, .lower);
+    const template_hex = std.fmt.bytesToHex(native.template, .lower);
+    const layout_hex = std.fmt.bytesToHex(native.layout, .lower);
+    const native_head_policy = platform.env.getenvBool("ANTFLY_METAL_QUALITY_NATIVE_HEAD_POLICY");
+    const fitting = @import("pipelines/generation.zig").NativeCheckpointPrepare.fittingOptions();
+    const protected_prefix: u32 = if (native_head_policy) @intCast(fitting.prefix_rows) else 512;
+    const protected_recent: u32 = if (native_head_policy) @intCast(fitting.recent_rows) else 512;
+    const ready = try std.json.Stringify.valueAlloc(allocator, .{
+        .schema = "antfly.native-quality-materializer.ready.v1",
+        .preparation_only = true,
+        .model_outputs_observed = false,
+        .model_forward_steps = @as(u32, 0),
+        .model = model_name,
+        .model_directory = model.model_dir,
+        .load_generation = model.load_generation,
+        .native_identity = .{ .weights = weights_hex[0..], .tokenizer = tokenizer_hex[0..], .template = template_hex[0..], .layout = layout_hex[0..] },
+        .main_gguf_sha256 = main_hex[0..],
+        .implementation_sha256 = implementation_hex[0..],
+        .native_head_policy = native_head_policy,
+        .protected_prefix_rows = protected_prefix,
+        .protected_recent_rows = protected_recent,
+    }, .{});
+    defer allocator.free(ready);
+    var ready_file = try campaign.createFile(io, "native-materializer-ready.json", .{ .exclusive = true, .truncate = false });
+    defer ready_file.close(io);
+    try ready_file.writeStreamingAll(io, ready);
+    try ready_file.writeStreamingAll(io, "\n");
+    try ready_file.sync(io);
+    var materializer: @import("context_native_quality_materializer.zig").Session = .{
+        .allocator = allocator,
+        .io = io,
+        .campaign_dir = campaign,
+        .model = model_name,
+        .loaded_model = model,
+        .loaded_identity = identity,
+        .expected_session_id = session[0..64].*,
+        .max_context_tokens = maximum,
+        .max_kv_tokens = maximum / 2,
+        .keep_prefix_tokens = protected_prefix,
+        .keep_recent_tokens = protected_recent,
+    };
+    try materializer.run();
+    if (model.load_generation != identity.load_generation or
+        !std.meta.eql(native, try model.nativeKvIdentity(.f16, null)))
+        return error.StaleContextView;
+}
+
+test "context Metal checkpoint persistent installed owner soak qualification" {
+    if (comptime builtin.os.tag != .macos or !build_options.enable_metal) return error.SkipZigTest;
+    if (comptime build_options.enable_cuda) return error.InvalidMetalCheckpointQualificationBuild;
+    const input_path = platform.env.getenv("ANTFLY_METAL_CHECKPOINT_SOAK_INPUT") orelse return error.SkipZigTest;
+    const output_path = try requiredEnv("ANTFLY_METAL_CHECKPOINT_SOAK_OUTPUT");
+    const journal_path = try requiredEnv("ANTFLY_METAL_CHECKPOINT_SOAK_JOURNAL");
+    const models_root = try requiredEnv("ANTFLY_METAL_CHECKPOINT_MODELS_ROOT");
+    const model_name = try qualificationModel();
+    inline for (.{ input_path, output_path, journal_path, models_root }) |path| try requireAbsolute(path);
+    try requireAbsent(output_path);
+    try requireAbsent(journal_path);
+    const checkpoint = @import("runtime/kv/attention_match_checkpoint.zig");
+    const soak = @import("runtime/kv/metal_checkpoint_soak.zig");
+    const driver = @import("context_native_checkpoint_quality.zig");
+    const Input = struct {
+        schema: []const u8,
+        model: []const u8,
+        main_gguf_sha256: []const u8,
+        native_identity: checkpoint.Identity,
+        checkpoints: [2]driver.File,
+        request: soak.Request,
+    };
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, input_path, allocator, .limited(16 * 1024 * 1024));
+    defer allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(Input, allocator, raw, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const input = parsed.value;
+    if (!std.mem.eql(u8, input.schema, "antfly.native-checkpoint-soak.input.v2") or
+        !std.mem.eql(u8, input.model, model_name)) return error.InvalidNativeSoakRequest;
+    try input.request.validate();
+    const expected_main = try driver.parseDigest(input.main_gguf_sha256);
+    var node = try server_mod.Node.init(allocator, .{
+        .models_dir = models_root,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .process_termination_available = true,
+        .generation_budget_overrides = .{
+            .host_limit_bytes = 8 * 1024 * 1024 * 1024,
+            .backend_limit_bytes = 8 * 1024 * 1024 * 1024,
+            .combined_limit_bytes = 10 * 1024 * 1024 * 1024,
+            .kv_limit_bytes = 4 * 1024 * 1024 * 1024,
+            .scratch_limit_bytes = 6 * 1024 * 1024 * 1024,
+        },
+    });
+    defer node.deinit();
+    node.session_manager.preferred_backends = &metal_backends;
+    node.session_manager.required_backend = .metal;
+    node.model_manager.session_manager.preferred_backends = &metal_backends;
+    node.model_manager.session_manager.required_backend = .metal;
+    try node.attachIo(io);
+    const model_dir = try node.resolveModelPath(io, model_name, "generators");
+    defer allocator.free(model_dir);
+    var handle = try node.model_manager.acquireFromDirWithPreferredBackends(model_dir, &metal_backends, true);
+    defer handle.release();
+    const model = handle.get();
+    if (model.session.backend() != .metal) return error.MetalCheckpointQualificationBackendMismatch;
+    const native = try model.nativeKvIdentity(.f16, null);
+    const factory = @import("architectures/session_factory.zig");
+    const actual_main = factory.getLoadedGgufArtifactDigest(model.session) orelse return error.UnsupportedCompactionArtifact;
+    if (!native.eql(input.native_identity) or !std.mem.eql(u8, &expected_main, &actual_main))
+        return error.ContextQualificationLoadedIdentityMismatch;
+    const generation = @import("pipelines/generation.zig");
+    var budget = @import("runtime/tier/memory.zig").RunBudget.init(.{
+        .host_limit_bytes = 8 * 1024 * 1024 * 1024,
+        .backend_limit_bytes = 8 * 1024 * 1024 * 1024,
+        .combined_limit_bytes = 10 * 1024 * 1024 * 1024,
+        .kv_limit_bytes = 4 * 1024 * 1024 * 1024,
+        .scratch_limit_bytes = 6 * 1024 * 1024 * 1024,
+    });
+    var cb = try factory.getComputeBackendWithBudget(model.session, allocator, &budget);
+    defer cb.deinit();
+    var pipeline: generation.NativeGenerationPipeline = .{
+        .allocator = allocator,
+        .io = io,
+        .cb = cb,
+        .session = model.session,
+        .load_generation = model.load_generation,
+        .gpt_config = factory.getGptConfig(model.session) orelse return error.InvalidModelForGeneration,
+        .kv_dtype = .f16,
+        .attention_match_identity = native,
+        .tokenizer = model.getTokenizer(),
+        .chat_template = model.chat_tmpl,
+        .add_bos_token = model.manifest.add_bos_token,
+        .bos_token = model.manifest.bos_token,
+        .execution_lock = model.nativeGenerationMutex(),
+    };
+    defer pipeline.deinit();
+    var saved: [2]checkpoint.Owned = undefined;
+    var saved_count: usize = 0;
+    defer for (saved[0..saved_count]) |*value| value.deinit();
+    for (input.checkpoints, &saved) |file_ref, *value| {
+        try requireAbsolute(file_ref.path);
+        var file = try std.Io.Dir.cwd().openFile(io, file_ref.path, .{ .mode = .read_only, .allow_directory = false, .follow_symlinks = false });
+        defer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.kind != .file or stat.size == 0 or stat.size > checkpoint.serving_limits.max_file_bytes)
+            return error.InvalidNativeSoakRequest;
+        const wire = try allocator.alloc(u8, @intCast(stat.size));
+        defer allocator.free(wire);
+        if (try file.readPositionalAll(io, wire, 0) != wire.len) return error.InvalidNativeSoakRequest;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(wire, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &try driver.parseDigest(file_ref.sha256))) return error.NativeSoakCheckpointChanged;
+        value.* = try checkpoint.decodeWithControl(allocator, wire, native, checkpoint.serving_limits, .{});
+        saved_count += 1;
+    }
+    var journal = try std.Io.Dir.cwd().createFile(io, journal_path, .{ .exclusive = true, .truncate = false });
+    defer journal.close(io);
+    const report = try pipeline.qualifyMetalCheckpointSoak(.{ saved[0].state, saved[1].state }, input.request, &journal);
+    if (!native.eql(try model.nativeKvIdentity(.f16, null)) or model.load_generation != pipeline.load_generation)
+        return error.StaleContextView;
+    var input_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &input_digest, .{});
+    const observed = try @as(*@import("ops/metal_compute.zig").MetalCompute, @ptrCast(@alignCast(cb.ptr))).provider_impl.nativeCheckpointObserved();
+    const execution = @as(*@import("ops/metal_compute.zig").MetalCompute, @ptrCast(@alignCast(cb.ptr))).attentionMatchExecution();
+    const body = try std.json.Stringify.valueAlloc(allocator, .{
+        .schema = "antfly.native-checkpoint-soak.report.v2",
+        .model = model_name,
+        .model_directory = model.model_dir,
+        .model_identity = native,
+        .main_gguf_sha256 = actual_main,
+        .load_generation = model.load_generation,
+        .input_sha256 = input_digest,
+        .implementation_sha256 = @import("compaction_identity").digest,
+        .observed = observed,
+        .execution = execution,
+        .configuration_sha256 = @import("runtime/kv/attention_match_release.zig").configurationFingerprint(execution, observed.backend_environment_sha256),
+        .encoding = @tagName(input.request.encoding),
+        .report = report,
+    }, .{ .whitespace = .indent_2 });
+    defer allocator.free(body);
+    _ = try writeExclusive(output_path, body);
 }

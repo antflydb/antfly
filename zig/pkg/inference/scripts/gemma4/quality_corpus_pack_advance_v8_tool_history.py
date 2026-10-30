@@ -72,10 +72,18 @@ def _campaign_bytes(root):
     return total
 
 
-def _initial_control(item, target):
+def _initial_control(item, target, native_head_policy=False):
     families = len(item["distractor_families"])
     insertion = min(families, ((2 * item["case"]["intended_compactable_quartile"] + 1) *
                                (families + 1)) // 8)
+    if native_head_policy:
+        position = 128 + ((2 * item["case"]["intended_compactable_quartile"] + 1) *
+                          (target - 128 - 2048)) // 8
+        # Tool-call range metadata is emitted before the selected response.
+        # This is only a starting estimate; loaded-tokenizer positions still
+        # decide every acceptance, with the same bounded search and sources.
+        framing = 1450 if item["case"]["bucket"] == "structured_tool" else 0
+        insertion = min(families, (max(0, position - framing) * (families + 1)) // (target - framing))
     maximum = item["available_source_bytes"]
     return {"target_prompt_tokens": target,
             "intended_quartile": item["case"]["intended_compactable_quartile"],
@@ -87,8 +95,14 @@ def _initial_control(item, target):
 
 def _write_candidate(root, work, item, authority, request_index, control):
     candidate = pack.compose_candidate(item, work["source_rows"], authority["source_root"],
-                                       control["byte_budget"], control["insertion_index"],
-                                       control["padding_units"])
+        control["byte_budget"], insertion_index=control["insertion_index"],
+        padding_units=control["padding_units"],
+        prefix_padding_units=control.get("prefix_padding_units", 0),
+        suffix_padding_units=control.get("suffix_padding_units", 0),
+        insertion_subpart_units=control.get("insertion_subpart_units", 0),
+        primary_prefix_limit=0 if authority.get("native_head_policy", False) and
+            item["case"]["bucket"] == "structured_tool" and
+            item["case"]["intended_compactable_quartile"] == 0 else None)
     stem = f"candidate-{request_index:04d}"
     messages_name, reference_name = stem + ".messages.json", stem + ".reference.txt"
     messages_raw = _json_bytes(candidate["messages"])
@@ -110,7 +124,7 @@ def _write_candidate(root, work, item, authority, request_index, control):
     return candidate, request_case
 
 
-def _observe(root, report, candidate, target_context, reserved):
+def _observe(root, report, candidate, target_context, reserved, native_head_policy=False):
     rendered = materialize._artifact(root, report["rendered_prompt"], "rendered prompt",
                                      32 * 1024 * 1024, 32 * 1024 * 1024)
     prompt_raw = materialize._artifact(root, report["prompt_tokens"], "prompt tokens",
@@ -141,11 +155,16 @@ def _observe(root, report, candidate, target_context, reserved):
             all(value == label for value in rendered_labels[evidence_start:evidence_end]),
             "evidence bytes lack selected provenance")
     token_start, token_end = pack.minimal_evidence_interval(offsets, evidence_start, evidence_end)
-    require(len(token_labels) == len(prompt) and
-            all(value == label for value in token_labels[token_start:token_end]),
-            "evidence tokens lack selected eligibility")
-    quartile = min(3, (2 * (token_start + token_end)) // len(prompt))
-    return {"prompt_tokens": len(prompt), "quartile": quartile,
+    require(len(token_labels) == len(prompt), "invalid selected token label count")
+    eligible = all(value == label for value in token_labels[token_start:token_end])
+    protected_prefix, protected_recent = (128, 2048) if native_head_policy else (512, 512)
+    if not eligible:
+        require(all(value in (0, label) for value in token_labels[token_start:token_end]) and
+                (token_start < protected_prefix or token_end > len(prompt) - protected_recent),
+                "evidence tokens lack selected eligibility outside protected windows")
+    quartile = pack.evidence_quartile(token_start, token_end, len(prompt),
+        protected_prefix if native_head_policy else 0, protected_recent if native_head_policy else 0)
+    return {"prompt_tokens": len(prompt), "quartile": quartile, "eligible": eligible,
             "evidence_token_start": token_start, "evidence_token_end": token_end,
             "exact": len(prompt) + reserved == target_context}
 
@@ -155,7 +174,8 @@ def _validate_authority(authority, model, length):
                 "expected_artifact_sha256", "expected_implementation_sha256",
                 "preparation_context_tokens", "reserved_output_tokens", "settings_sha256",
                 "variant_settings_sha256", "source_root"}
-    require(type(authority) is dict and set(authority) == required and authority["schema_version"] == 2,
+    require(type(authority) is dict and required <= set(authority) <= required | {"native_head_policy"} and
+            type(authority.get("native_head_policy", False)) is bool and authority["schema_version"] == 2,
             "invalid packing authority")
     require(isinstance(model, str) and model and authority["model"] == model,
             "packing authority model mismatch")
@@ -356,7 +376,7 @@ def run_cell(work, authority, campaign_root, length, bucket, driver, journal_pat
         target = length - authority["reserved_output_tokens"]
         require(target > 0, "reserved output exceeds cell context")
         for case_index, item in enumerate(cell["cases"]):
-            control = _initial_control(item, target)
+            control = _initial_control(item, target, authority.get("native_head_policy", False))
             active_case = {"case_index": case_index, "case_id": item["case"]["id"]}
             active_control = control
             solved = None
@@ -392,16 +412,19 @@ def run_cell(work, authority, campaign_root, length, bucket, driver, journal_pat
                         "packing requires labeled materialization schema 2")
                 collector.accept(report, request_case)
                 observed = _observe(root, report, candidate, length,
-                                    authority["reserved_output_tokens"])
+                                    authority["reserved_output_tokens"], authority.get("native_head_policy", False))
                 event = {"schema_version": 1, "stage": "quality_loaded_tokenizer_pack_attempt",
-                         "completed": observed["exact"] and observed["quartile"] ==
+                         "completed": observed["eligible"] and observed["exact"] and observed["quartile"] ==
                                       item["case"]["intended_compactable_quartile"],
                          "case_index": case_index, "case_id": item["case"]["id"],
                          "iteration": iteration, "request_index": request_index,
                          "messages_sha256": request_case["messages_sha256"],
                          "byte_budget": control["byte_budget"],
                          "insertion_index": control["insertion_index"],
+                         "insertion_subpart_units": control.get("insertion_subpart_units", 0),
                          "padding_units": control["padding_units"],
+                         "prefix_padding_units": control.get("prefix_padding_units", 0),
+                         "suffix_padding_units": control.get("suffix_padding_units", 0),
                          "search_phase": control["phase"],
                          "candidate": {"messages_file": request_case["messages_file"],
                              "reference_file": request_case["reference_file"],
@@ -423,7 +446,11 @@ def run_cell(work, authority, campaign_root, length, bucket, driver, journal_pat
                                     "padding_units": control["padding_units"]}]}
                     break
                 control = pack.next_candidate_control(control, observed["prompt_tokens"],
-                                                      observed["quartile"])
+                    observed["quartile"], evidence_eligible=observed["eligible"],
+                    evidence_token_start=observed["evidence_token_start"],
+                    evidence_token_end=observed["evidence_token_end"],
+                    protected_prefix=128 if authority.get("native_head_policy", False) else 512,
+                    protected_recent=2048 if authority.get("native_head_policy", False) else 512)
                 active_control = control
             require(solved is not None, "packing case exhausted bounded tokenizer search")
             results.append(solved)

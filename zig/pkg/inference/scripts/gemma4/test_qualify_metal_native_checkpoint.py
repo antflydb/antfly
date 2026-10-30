@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import contextlib
+import copy
+import hashlib
 from collections import Counter
 import io
 import json
@@ -30,7 +32,166 @@ import qualify_metal_native_checkpoint_performance as performance
 
 
 class CampaignContracts(unittest.TestCase):
-    def test_campaign_v2_defaults_to_bounded_without_claiming_reliability(self):
+    def test_registry_must_resolve_uniquely_to_the_requested_model(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / "google" / "e2b--antfly-fixture"
+            directory.mkdir(parents=True)
+            manifest = directory / ".antfly-download-complete.json"
+            value = {"version": 2, "source": {"owner": "google", "name": "e2b", "selected_format": "gguf"}}
+            manifest.write_text(json.dumps(value))
+            campaign.checked_model_registry(root, directory, "google/e2b")
+            with self.assertRaisesRegex(ValueError, "directory differs"):
+                campaign.checked_model_registry(root, directory, "google/e4b")
+            value["source"]["name"] = "e4b"
+            manifest.write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError, "manifest differs"):
+                campaign.checked_model_registry(root, directory, "google/e2b")
+            value["source"]["name"] = "e2b"
+            manifest.write_text(json.dumps(value))
+            (directory.parent / "e2b--antfly-other").mkdir()
+            with self.assertRaisesRegex(ValueError, "ambiguous"):
+                campaign.checked_model_registry(root, directory, "google/e2b")
+
+    def test_loaded_identity_receipt_binds_both_materialized_requests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "metadata.json"
+            refs = {size: {"path": str(path.parent / (size + ".json")), "sha256": str(i + 1) * 64}
+                    for i, size in enumerate(("8k", "32k"))}
+            identity = {key: chr(97 + i) * 64 for i, key in enumerate(("weights", "tokenizer", "template", "layout"))}
+            value = {"schema": "antfly.metal-checkpoint-performance-requests.v1", "backend": "metal",
+                     "model": "google/e2b", "load_generation": 1, "loaded_identity": identity,
+                     "requests": {"request_" + size: {"file": size + ".json", "sha256": ref["sha256"],
+                         "prompt_tokens": 8128 if size == "8k" else 32512,
+                         "max_tokens": 64 if size == "8k" else 256} for size, ref in refs.items()}}
+            path.write_text(json.dumps(value))
+            self.assertEqual(identity, campaign.identity_receipt_contract(path, "google/e2b", refs))
+            for size in refs:
+                changed = copy.deepcopy(value)
+                changed["requests"]["request_" + size]["sha256"] = "f" * 64
+                path.write_text(json.dumps(changed))
+                with self.assertRaisesRegex(ValueError, "frozen performance requests"):
+                    campaign.identity_receipt_contract(path, "google/e2b", refs)
+            value["loaded_identity"]["tokenizer"] = "0" * 64
+            path.write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError, "loaded model identity receipt"):
+                campaign.identity_receipt_contract(path, "google/e2b", refs)
+
+    def test_every_worker_and_checkpoint_producer_matches_frozen_bundle_identity(self):
+        identity = {key: chr(97 + i) * 64 for i, key in enumerate(("weights", "tokenizer", "template", "layout"))}
+        model = {"request_model": "google/e2b", "loaded_identity": identity}
+        ready = {"model": "google/e2b", "backend": "metal", "metal_enabled": True,
+                 "cuda_enabled": False, "loaded_identity": identity}
+        evidence = {"exporter": {"memory": {}, "ready": ready},
+                    "restorer": {"memory": {}, "ready": copy.deepcopy(ready)},
+                    "producer_ready": copy.deepcopy(ready)}
+        campaign.validate_loaded_model(evidence, model)
+        for label in ("restorer", "producer_ready"):
+            changed = copy.deepcopy(evidence)
+            target = changed[label]["ready"] if label == "restorer" else changed[label]
+            target["loaded_identity"]["tokenizer"] = "f" * 64
+            with self.assertRaisesRegex(ValueError, "frozen loaded model"):
+                campaign.validate_loaded_model(changed, model)
+        with self.assertRaisesRegex(ValueError, "missing loaded model"):
+            campaign.validate_loaded_model({}, model)
+
+    def test_predecessor_rechecks_spec_evidence_and_checkpoint_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            phase = "smoke-8k-f16"
+            spec = self.command_spec()
+            spec["campaign_profile"] = "bounded"
+            spec_path = root / "campaign-spec.json"
+            spec_path.write_text(json.dumps(spec))
+            receipt = {"schema": campaign.PHASE_SCHEMA, "phase": phase,
+                       "passed": True, "campaign_spec_sha256": campaign.sha(spec_path),
+                       "campaign_profile": "bounded",
+                       "qualification_contract": spec["qualification_contract"],
+                       "command": campaign.command(spec, phase, root)}
+            for label, suffix in (("headroom", "-headroom.json"),
+                                  ("resource", "-resource.json"), ("output", ".json"),
+                                  ("checkpoint", ".kv")):
+                file = root / (phase + suffix)
+                file.write_text("{}\n")
+                receipt[label + "_sha256"] = campaign.sha(file)
+            (root / (phase + "-phase.json")).write_text(json.dumps(receipt))
+            campaign.validate_predecessor(root, phase, spec_path, spec)
+            for suffix in ("-headroom.json", "-resource.json", ".json", ".kv"):
+                file = root / (phase + suffix)
+                original = file.read_bytes()
+                file.write_text('{"changed":true}\n')
+                with self.subTest(suffix=suffix), self.assertRaisesRegex(
+                        ValueError, "changed"):
+                    campaign.validate_predecessor(root, phase, spec_path, spec)
+                file.write_bytes(original)
+            spec_path.write_text('{"new_spec":true}\n')
+            with self.assertRaisesRegex(ValueError, "frozen campaign"):
+                campaign.validate_predecessor(root, phase, spec_path, spec)
+
+    def test_model_artifact_bytes_and_paths_are_verified(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / "model"
+            directory.mkdir()
+            artifact = directory / "weights.gguf"
+            artifact.write_bytes(b"original weights")
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            row = {"path": artifact.name, "size": artifact.stat().st_size,
+                   "sha256": digest}
+            (directory / ".antfly-download-complete.json").write_text(
+                json.dumps({"artifacts": [row]}))
+            self.assertEqual(row, campaign.checked_model_artifact(
+                directory, artifact.name, digest))
+            artifact.write_bytes(b"modified weights")  # Same length as original.
+            with self.assertRaisesRegex(ValueError, "bytes changed"):
+                campaign.checked_model_artifact(directory, artifact.name, digest)
+            artifact.unlink()
+            external = root / artifact.name
+            external.write_bytes(b"original weights")
+            artifact.symlink_to(external)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                campaign.checked_model_artifact(directory, artifact.name, digest)
+            for path in (str(external), "../weights.gguf", "./weights.gguf"):
+                with self.subTest(path=path), self.assertRaisesRegex(
+                        ValueError, "artifact path"):
+                    campaign.checked_model_artifact(directory, path, digest)
+
+    def test_quality_seals_all_deleted_checkpoints_in_frozen_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ids = ["first", "last"]
+            evidence = {"case_ids": ids, "checkpoints": [
+                {"case_id": identifier, "sha256": str(i) * 64,
+                 "metadata": {"encoding": "fp8"}}
+                for i, identifier in enumerate(ids)]}
+            binding = campaign.phase_checkpoint_binding(
+                root, "quality-8k-fp8", evidence, ids)
+            self.assertIsNone(binding["checkpoint_sha256"])
+            self.assertEqual([row["case_id"] for row in binding["case_checkpoints"]], ids)
+            for changed in (dict(evidence, checkpoints=evidence["checkpoints"][:1]),
+                            dict(evidence, checkpoints=evidence["checkpoints"][::-1])):
+                with self.assertRaisesRegex(ValueError, "checkpoint"):
+                    campaign.phase_checkpoint_binding(
+                        root, "quality-8k-fp8", changed, ids)
+            for field, value in (("sha256", "unbound"),
+                                 ("metadata", {"encoding": "f16"})):
+                changed = copy.deepcopy(evidence)
+                changed["checkpoints"][-1][field] = value
+                with self.assertRaisesRegex(ValueError, "checkpoint binding"):
+                    campaign.phase_checkpoint_binding(
+                        root, "quality-8k-fp8", changed, ids)
+            (root / "quality-8k-fp8.kv").write_bytes(b"leftover")
+            with self.assertRaisesRegex(ValueError, "left a checkpoint"):
+                campaign.phase_checkpoint_binding(root, "quality-8k-fp8", evidence, ids)
+            with self.assertRaisesRegex(ValueError, "missing retained"):
+                campaign.phase_checkpoint_binding(root, "smoke-8k-f16", {})
+            retained = root / "smoke-8k-f16.kv"
+            retained.write_bytes(b"checkpoint")
+            self.assertEqual(campaign.phase_checkpoint_binding(
+                root, "smoke-8k-f16", {}),
+                {"checkpoint_sha256": campaign.sha(retained)})
+
+    def test_campaign_v3_defaults_to_bounded_without_claiming_reliability(self):
         args = campaign.parser().parse_args([
             "init", "--campaign-root", "/campaign",
             "--build-receipt", "/receipt", "--binary", "/binary",
@@ -41,9 +202,9 @@ class CampaignContracts(unittest.TestCase):
             "--performance-request-32k", "/request32",
         ])
         self.assertEqual(campaign.SCHEMA,
-                         "antfly.metal-native-checkpoint.campaign-spec.v2")
+                         "antfly.metal-native-checkpoint.campaign-spec.v3")
         self.assertEqual(campaign.PHASE_SCHEMA,
-                         "antfly.metal-native-checkpoint.phase.v2")
+                         "antfly.metal-native-checkpoint.phase.v3")
         self.assertEqual(args.campaign_profile, "bounded")
         contract = campaign.CAMPAIGN_PROFILES[args.campaign_profile]
         self.assertFalse(contract["extended_profile"])
@@ -51,12 +212,14 @@ class CampaignContracts(unittest.TestCase):
         self.assertFalse(contract["production_ready_claim"])
 
     def test_plan_is_strictly_serial_and_metal_only(self):
-        self.assertEqual(len(campaign.PHASES), 12)
-        self.assertEqual(campaign.PHASES[:6], (
-            "smoke-8k-f16", "smoke-8k-fp8", "quality-8k-f16",
-            "quality-8k-fp8", "performance-8k-f16", "performance-8k-fp8"))
+        self.assertEqual(len(campaign.PHASES), 18)
+        self.assertEqual(campaign.PHASES[:9], (
+            "smoke-8k-f16", "smoke-8k-fp8", "smoke-8k-rotated4",
+            "quality-8k-f16", "quality-8k-fp8", "quality-8k-rotated4",
+            "performance-8k-f16", "performance-8k-fp8",
+            "performance-8k-rotated4"))
         self.assertEqual(campaign.predecessors("smoke-32k-f16"),
-                         campaign.PHASES[:6])
+                         campaign.PHASES[:9])
         self.assertNotIn("cuda", " ".join(campaign.PHASES))
 
     def command_spec(self, profile="bounded"):
@@ -90,6 +253,10 @@ class CampaignContracts(unittest.TestCase):
             self.assertIn("--server-kind metal-test", joined)
             self.assertNotIn("cuda", joined.lower())
             self.assertIn("--encoding " + phase.rsplit("-", 1)[1], joined)
+            self.assertEqual(
+                "--experimental-rotated4" in joined,
+                phase.startswith("smoke-") and phase.endswith("-rotated4"),
+            )
             if phase.startswith("quality-"):
                 self.assertIn("--quality-profile bounded", joined)
             if phase.startswith("performance-"):
@@ -150,6 +317,24 @@ class CampaignContracts(unittest.TestCase):
             path.write_text("".join(json.dumps(row) + "\n" for row in rows[:-1]))
             with self.assertRaisesRegex(ValueError, "exactly 64"):
                 campaign.suite_contract(path, "extended")
+
+    def test_suite_freeze_validates_both_request_models(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "suite.jsonl"
+            rows = [{"id": f"case-{i}", "category":
+                     ("fact", "instruction", "code", "tool_call")[i % 4],
+                     "critical": True, "body": {"model": "e2b"},
+                     "checkpoint_body": {"model": "e2b"}} for i in range(16)]
+            def save():
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            save()
+            campaign.suite_contract(path, "bounded", "e2b")
+            for field in ("body", "checkpoint_body"):
+                rows[-1][field]["model"] = "e4b"
+                save()
+                with self.assertRaisesRegex(ValueError, field + r"\.model"):
+                    campaign.suite_contract(path, "bounded", "e2b")
+                rows[-1][field]["model"] = "e2b"
 
     def test_performance_request_freezes_release_reservation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -238,7 +423,8 @@ class PerformanceContracts(unittest.TestCase):
             "suffix_prefill_ns": 0, "attention_calls": 32, "donor_appends": 0,
             "tracked_combined_live_bytes": 85, "tracked_combined_peak_bytes": 90,
             "binding_representation": "f16", "binding_fp8_heads": 0,
-            "binding_fp8_rows": 0, "binding_exact_resident_bytes": 60,
+            "binding_fp8_rows": 0, "binding_rotated4_heads": 0,
+            "binding_rotated4_rows": 0, "binding_exact_resident_bytes": 60,
             "binding_encoded_resident_bytes": 0,
             "binding_metadata_resident_bytes": 15, "binding_allocated_bytes": 75,
         }
@@ -273,7 +459,8 @@ class PerformanceContracts(unittest.TestCase):
             "suffix_prefill_ns": 0, "attention_calls": 0, "donor_appends": 0,
             "tracked_combined_live_bytes": 85, "tracked_combined_peak_bytes": 90,
             "binding_representation": "none", "binding_fp8_heads": 0,
-            "binding_fp8_rows": 0, "binding_exact_resident_bytes": 0,
+            "binding_fp8_rows": 0, "binding_rotated4_heads": 0,
+            "binding_rotated4_rows": 0, "binding_exact_resident_bytes": 0,
             "binding_encoded_resident_bytes": 0,
             "binding_metadata_resident_bytes": 0, "binding_allocated_bytes": 0,
         }
@@ -308,7 +495,8 @@ class PerformanceContracts(unittest.TestCase):
             "suffix_prefill_ns": 0, "attention_calls": 1, "donor_appends": 0,
             "tracked_combined_live_bytes": 85, "tracked_combined_peak_bytes": 90,
             "binding_representation": "f16", "binding_fp8_heads": 0,
-            "binding_fp8_rows": 0, "binding_exact_resident_bytes": 60,
+            "binding_fp8_rows": 0, "binding_rotated4_heads": 0,
+            "binding_rotated4_rows": 0, "binding_exact_resident_bytes": 60,
             "binding_encoded_resident_bytes": 0,
             "binding_metadata_resident_bytes": 15, "binding_allocated_bytes": 75,
         }

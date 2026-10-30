@@ -4746,6 +4746,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ai/v1/generate/context/resume/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resume one checkpoint and generate serial ordinary siblings
+         * @description Accepts one AFATT001 envelope whose JSON metadata is a GenerateBatchRequest
+         *     and whose single application/vnd.antfly.kv-checkpoint attachment belongs
+         *     to the first request. The remaining requests use ordinary exact generation.
+         *     All requests run serially in submission order and release their private
+         *     generation state before the next request starts. The checkpoint remains
+         *     immutable and reusable; ordinary siblings never inherit its compacted KV.
+         *
+         *     The batch must contain 2 through 16 requests with distinct nonempty
+         *     custom_id values of at most 128 bytes, the same model and backend
+         *     preference. Every item must explicitly use mode=eager and max_tokens from
+         *     1 through 256. The endpoint disables prompt caching for every item;
+         *     prompt_cache may be false or omitted. Explicit prompt_cache=true,
+         *     streaming, context policies, prompt-cache keys, draft models,
+         *     compiled targets, and context-rewriting options are rejected before any
+         *     item executes. Metadata and each item response are limited to 2 MiB;
+         *     the checkpoint is limited to 2 GiB.
+         *
+         *     The first request uses the same identity, prefix, resource and release
+         *     certificate checks as single-checkpoint resume. A failed native resume
+         *     returns its normal error and no sibling executes. Once native resume
+         *     succeeds, ordinary sibling failures are returned as indexed batch errors.
+         *     Parent cancellation and its absolute deadline apply to every item.
+         */
+        post: operations["resumeNativeKvCheckpointBatch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ai/v1/embed": {
         parameters: {
             query?: never;
@@ -39977,6 +40018,68 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["InferenceGenerateResponse"];
                     "text/event-stream": string;
+                };
+            };
+            /** @description Invalid checkpoint, prefix/model mismatch or unsupported runtime */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Checkpoint exceeds transfer or state limits */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+            /** @description Insufficient inference memory budget */
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    resumeNativeKvCheckpointBatch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/vnd.antfly.attachments.v1": string;
+            };
+        };
+        responses: {
+            /** @description Indexed serial results, with the native checkpoint result first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceGenerateBatchResponse"];
                 };
             };
             /** @description Invalid checkpoint, prefix/model mismatch or unsupported runtime */

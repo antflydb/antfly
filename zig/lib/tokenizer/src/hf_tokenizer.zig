@@ -7032,18 +7032,30 @@ pub const HfTokenizer = struct {
                 const mask = self.bpe_merge_boundaries.masks[pair / @bitSizeOf(usize)];
                 const shift: std.math.Log2Int(usize) = @intCast(pair % @bitSizeOf(usize));
                 if (mask & (@as(usize, 1) << shift) != 0) continue;
-                try self.bpeEncodeMergeSegment(allocator, word[start..end], ids, scratch);
+                try self.bpeEncodeMergeSegment(allocator, word[start..end], ids, scratch, start);
                 start = end;
             }
             if (start != 0) {
-                try self.bpeEncodeMergeSegment(allocator, word[start..], ids, scratch);
+                try self.bpeEncodeMergeSegment(allocator, word[start..], ids, scratch, start);
                 return;
             }
         }
         try self.bpeEncodeMerges(allocator, word, ids, scratch);
     }
 
-    fn bpeEncodeMergeSegment(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8, ids: *std.ArrayListUnmanaged(i32), scratch: *BpeScratch) !void {
+    fn bpeEncodeMergeSegment(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8, ids: *std.ArrayListUnmanaged(i32), scratch: *BpeScratch, offset_base: usize) !void {
+        if (scratch.offsets) |offsets| {
+            // The shared cache contains bare IDs. Provenance must use the
+            // actual merges, then map segment-local spans back into the word.
+            const first = offsets.items.len;
+            try self.bpeEncodeMerges(allocator, word, ids, scratch);
+            const base = std.math.cast(u32, offset_base) orelse return error.UnsupportedTokenizerOffsets;
+            for (offsets.items[first..]) |*span| {
+                span[0] = std.math.add(u32, span[0], base) catch return error.UnsupportedTokenizerOffsets;
+                span[1] = std.math.add(u32, span[1], base) catch return error.UnsupportedTokenizerOffsets;
+            }
+            return;
+        }
         // Segment results must not alias the whole-word vocabulary shortcut:
         // a vocab entry can exist without being reachable by BPE merges.
         if (self.bpe_profile_enabled.load(.acquire)) _ = self.bpe_profile.pretokens.fetchAdd(1, .monotonic);
@@ -12786,4 +12798,40 @@ test "context Gemma BPE provenance tracks vocab-only direct pieces and rejects u
     defer unknown.deinitSelf();
     try std.testing.expectError(error.UnsupportedTokenizerOffsets, unknown.tokenizer().encodeGenerationWithOffsets(a, "A", 1, false));
     try std.testing.expectError(error.UnsupportedTokenizerOffsets, tok.tokenizer().encodeGenerationWithOffsets(a, "\xff", 1, false));
+}
+
+test "context Gemma BPE provenance tracks long repeated segments across cold and warm caches" {
+    const a = std.testing.allocator;
+    const profile =
+        \\{"normalizer":{"type":"Replace","pattern":{"String":" "},"content":"▁"},
+        \\"pre_tokenizer":{"type":"Split","pattern":{"String":" "},"behavior":"MergedWithPrevious","invert":false},
+        \\"model":{"type":"BPE","byte_fallback":true,"vocab":{"a":0,"b":1,"ab":2,"▁":3,"▁ab":4,"<unk>":5,"<0xC3>":6,"<0xA9>":7,"\n":8},"merges":["a b","▁ ab"]},
+        \\"added_tokens":[{"id":9,"content":"<role>","special":true}]}
+    ;
+    const tok = try HfTokenizer.loadFromBytes(a, profile);
+    defer tok.deinitSelf();
+    const text = z17RepeatString("ab abé\n", 64);
+    var cold = try tok.tokenizer().encodeGenerationWithOffsets(a, text, 384, false);
+    defer cold.deinit();
+    const plain = try tok.encode(a, text);
+    defer a.free(plain);
+    try std.testing.expectEqualSlices(i32, plain, cold.ids[0..plain.len]);
+    // The ordinary path populates the ID-only segment cache. Repeated
+    // provenance calls must compute merge spans rather than reuse bare IDs.
+    for (0..2) |_| {
+        var aligned = try tok.tokenizer().encodeGenerationWithOffsets(a, text, 384, false);
+        defer aligned.deinit();
+        try std.testing.expectEqualSlices(i32, plain, aligned.ids[0..plain.len]);
+        try std.testing.expectEqual(@as(usize, 320), plain.len);
+        for (0..64) |i| {
+            const start: u32 = @intCast(i * 8);
+            const spans = [_][2]u32{
+                .{ start, start + 2 },     .{ start + 2, start + 5 },
+                .{ start + 5, start + 6 }, .{ start + 6, start + 7 },
+                .{ start + 7, start + 8 },
+            };
+            try std.testing.expectEqualSlices([2]u32, &spans, aligned.offsets.?[i * 5 ..][0..5]);
+        }
+        for (aligned.offsets.?[320..]) |span| try std.testing.expectEqual([2]u32{ 0, 0 }, span);
+    }
 }

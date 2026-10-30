@@ -769,6 +769,19 @@ pub const Client = struct {
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
+    /// Resume one checkpoint and generate serial ordinary siblings
+    /// POST /ai/v1/generate/context/resume/batch
+    pub fn resumeNativeKvCheckpointBatch(self: *@This(), body: []const u8) !ApiResponse(types.InferenceGenerateBatchResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/generate/context/resume/batch", .{self.base_url});
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "Content-Type", "application/vnd.antfly.attachments.v1" });
+        var resp = try self.http.post(url, .{ .body = body, .headers = request_headers.items });
+        return ApiResponse(types.InferenceGenerateBatchResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// List available models
     /// GET /ai/v1/models
     pub fn listModels(self: *@This()) !ApiResponse(types.InferenceModelsResponse) {

@@ -25,6 +25,8 @@ const metal_end_marker = "\nint termite_metal_generated_pipeline_info_get(";
 const registry_begin_marker = "// BEGIN RELEASE REGISTRY CONTENTS\n";
 const registry_end_marker = "// END RELEASE REGISTRY CONTENTS\n";
 const profile_tests_marker = "\ntest \"context compaction profiles reject";
+const metal_release_begin_marker = "// BEGIN METAL CHECKPOINT RELEASE REGISTRY\n";
+const metal_release_end_marker = "// END METAL CHECKPOINT RELEASE REGISTRY\n";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -32,6 +34,11 @@ pub fn main(init: std.process.Init) !void {
     var hash = Sha256.init(.{});
     hash.update(source_domain);
     updateInt(&hash, u32, identity_version);
+    var environment_keys: std.StringHashMapUnmanaged(void) = .empty;
+    // Accelerate and other BLAS implementations can read their own thread
+    // controls without passing through a runtime source helper.
+    inline for (.{ "VECLIB_MAXIMUM_THREADS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS" }) |key|
+        try environment_keys.put(allocator, key, {});
 
     var index: usize = 1;
     while (index < args.len) {
@@ -41,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
             if (index + 1 != args.len) return error.InvalidArguments;
             var digest: [Sha256.digest_length]u8 = undefined;
             hash.final(&digest);
-            try writeOutput(init, args[index], digest);
+            try writeOutput(init, args[index], digest, &environment_keys);
             return;
         }
         if (index + 2 > args.len) return error.InvalidArguments;
@@ -51,20 +58,46 @@ pub fn main(init: std.process.Init) !void {
         const source = try readSource(init, path);
         if (std.mem.eql(u8, kind, "source")) {
             updateSource(&hash, logical_name, source);
+            // Driver input/output paths do not configure the native backend.
+            // Runtime sources include all their literal environment names,
+            // including names passed through compile-time helper functions.
+            if (!std.mem.startsWith(u8, logical_name, "context_") and
+                !std.mem.startsWith(u8, logical_name, "backends/context_") and
+                !std.mem.startsWith(u8, logical_name, "tools/") and
+                !std.mem.startsWith(u8, logical_name, "build/") and
+                !std.mem.startsWith(u8, logical_name, "tokenizer/"))
+                try collectEnvironmentKeys(allocator, &environment_keys, source);
         } else if (std.mem.eql(u8, kind, "metal-section")) {
             try updateMetalSection(&hash, logical_name, source);
         } else if (std.mem.eql(u8, kind, "profile")) {
             try updateProfile(&hash, logical_name, source);
+        } else if (std.mem.eql(u8, kind, "metal-release")) {
+            try updateMetalRelease(&hash, logical_name, source);
         } else return error.InvalidArguments;
     }
     return error.MissingOutput;
+}
+
+/// Bind the complete authorization implementation while excluding only the
+/// certificate table whose entries contain this digest.
+fn updateMetalRelease(hash: *Sha256, logical_name: []const u8, source: []const u8) !void {
+    const begin_marker = try uniqueMarker(source, metal_release_begin_marker);
+    const begin = begin_marker + metal_release_begin_marker.len;
+    const end = try uniqueMarker(source, metal_release_end_marker);
+    if (end < begin) return error.InvalidMarkerOrder;
+
+    updateInt(hash, u32, @intCast(logical_name.len));
+    hash.update(logical_name);
+    updateInt(hash, u64, @intCast(source.len - (end - begin)));
+    hash.update(source[0..begin]);
+    hash.update(source[end..]);
 }
 
 fn readSource(init: std.process.Init, path: []const u8) ![]const u8 {
     return std.Io.Dir.cwd().readFileAlloc(init.io, path, init.arena.allocator(), .limited(16 * 1024 * 1024));
 }
 
-fn writeOutput(init: std.process.Init, path: []const u8, digest: [32]u8) !void {
+fn writeOutput(init: std.process.Init, path: []const u8, digest: [32]u8, environment_keys: *const std.StringHashMapUnmanaged(void)) !void {
     var output: std.Io.Writer.Allocating = .init(init.arena.allocator());
     try output.writer.writeAll("pub const digest: [32]u8 = .{");
     for (digest, 0..) |byte, i| {
@@ -72,7 +105,51 @@ fn writeOutput(init: std.process.Init, path: []const u8, digest: [32]u8) !void {
         try output.writer.print("0x{x:0>2}, ", .{byte});
     }
     try output.writer.writeAll("\n};\n");
+    var keys: std.ArrayList([]const u8) = .empty;
+    var iterator = environment_keys.keyIterator();
+    while (iterator.next()) |key| try keys.append(init.arena.allocator(), key.*);
+    std.mem.sort([]const u8, keys.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.less);
+    try output.writer.writeAll("pub const backend_environment_keys: []const [*:0]const u8 = &.{\n");
+    for (keys.items) |key| try output.writer.print("    \"{s}\",\n", .{key});
+    try output.writer.writeAll("};\n");
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = output.written() });
+}
+
+fn isBackendEnvironmentKey(key: []const u8) bool {
+    if (!std.mem.startsWith(u8, key, "ANTFLY_") and !std.mem.startsWith(u8, key, "TERMITE_")) return false;
+    for (key) |byte| if (!(byte >= 'A' and byte <= 'Z') and !(byte >= '0' and byte <= '9') and byte != '_') return false;
+    inline for (.{ "ANTFLY_METAL_CHECKPOINT_", "ANTFLY_METAL_NATIVE_QUALITY_", "ANTFLY_METAL_QUALITY_" }) |prefix|
+        if (std.mem.startsWith(u8, key, prefix)) return false;
+    // These switches are certificate-owned typed Execution fields. Ignoring
+    // their environment spelling lets serving apply the qualified settings
+    // directly, without requiring qualification-only opt-ins in deployment.
+    inline for (.{ "FORWARD_FRAME", "PRECOMPUTED_TAIL", "RETAIN_HIDDEN", "MATRIX_STAGE", "COALESCED_STAGE", "PLE_TAIL", "RESOURCE_BARRIERS", "CONCURRENT_FRAME" }) |suffix|
+        if (std.mem.eql(u8, key, "ANTFLY_METAL_ATTENTION_MATCH_" ++ suffix)) return false;
+    return true;
+}
+
+fn collectEnvironmentKeys(allocator: std.mem.Allocator, keys: *std.StringHashMapUnmanaged(void), source: []const u8) !void {
+    var pieces = std.mem.tokenizeScalar(u8, source, '"');
+    while (pieces.next()) |piece| if (isBackendEnvironmentKey(piece)) try keys.put(allocator, piece, {});
+}
+
+test "context compaction identity captures runtime environment names without driver or typed switches" {
+    var keys: std.StringHashMapUnmanaged(void) = .empty;
+    defer keys.deinit(std.testing.allocator);
+    try collectEnvironmentKeys(
+        std.testing.allocator,
+        &keys,
+        "\"TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH\" \"ANTFLY_METAL_Q8_OPTIMIZATIONS\" \"ANTFLY_METAL_Q8_OPTIMIZATIONS\" \"ANTFLY_METAL_CHECKPOINT_READY_FILE\" \"ANTFLY_METAL_NATIVE_QUALITY_INPUT\" \"ANTFLY_METAL_ATTENTION_MATCH_MATRIX_STAGE\" \"ANTFLY_lowercase\"",
+    );
+    try std.testing.expectEqual(@as(usize, 2), keys.count());
+    try std.testing.expect(keys.contains("TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH"));
+    try std.testing.expect(keys.contains("ANTFLY_METAL_Q8_OPTIMIZATIONS"));
+    try std.testing.expect(isBackendEnvironmentKey("ANTFLY_METAL_ATTENTION_MATCH_NEW_RUNTIME_SWITCH"));
+    try std.testing.expect(isBackendEnvironmentKey("TERMITE_DISABLE_SLIDING_ATTENTION"));
 }
 
 fn updateMetalSection(hash: *Sha256, logical_name: []const u8, source: []const u8) !void {
@@ -126,6 +203,16 @@ fn syntheticDigest(profile_source: []const u8, semantic_source: []const u8) ![32
     return digest;
 }
 
+fn syntheticMetalReleaseDigest(release_source: []const u8) ![32]u8 {
+    var hash = Sha256.init(.{});
+    hash.update(source_domain);
+    updateInt(&hash, u32, identity_version);
+    try updateMetalRelease(&hash, "runtime/kv/attention_match_release.zig", release_source);
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
 test "context release registry contents do not change the source identity" {
     const prefix = "const semantic = 1;\n" ++ registry_begin_marker;
     const suffix = registry_end_marker ++ "pub fn select() void {}" ++ profile_tests_marker ++ " {}\n";
@@ -141,6 +228,16 @@ test "context semantic source edits change the source identity" {
     try std.testing.expect(!std.mem.eql(u8, &before, &after));
 }
 
+test "attention_match Metal certificate enrollment is excluded but release semantics are bound" {
+    const prefix = "pub fn validate() void {}\n" ++ metal_release_begin_marker;
+    const suffix = metal_release_end_marker ++ "pub fn select() void {}\ntest \"attention_match release\" {}\n";
+    const empty = prefix ++ "const certificates = &.{};\n" ++ suffix;
+    const populated = prefix ++ "const certificates = &.{qualified};\n" ++ suffix;
+    try std.testing.expectEqual(try syntheticMetalReleaseDigest(empty), try syntheticMetalReleaseDigest(populated));
+    const changed = metal_release_end_marker ++ "pub fn select() void { enforce(); }\ntest \"attention_match release\" {}\n";
+    try std.testing.expect(!std.mem.eql(u8, &try syntheticMetalReleaseDigest(empty), &try syntheticMetalReleaseDigest(prefix ++ "const certificates = &.{};\n" ++ changed)));
+}
+
 test "profile and metal markers are unique and ordered" {
     var hash = Sha256.init(.{});
     try std.testing.expectError(error.MissingMarker, updateProfile(&hash, "profile", "no markers"));
@@ -148,4 +245,7 @@ test "profile and metal markers are unique and ordered" {
     try std.testing.expectError(error.InvalidMarkerOrder, updateProfile(&hash, "profile", registry_end_marker ++ registry_begin_marker ++ profile_tests_marker));
     try std.testing.expectError(error.MissingMarker, updateMetalSection(&hash, "metal", metal_begin_marker));
     try std.testing.expectError(error.InvalidMarkerOrder, updateMetalSection(&hash, "metal", metal_end_marker ++ metal_begin_marker));
+    try std.testing.expectError(error.MissingMarker, updateMetalRelease(&hash, "release", "no markers"));
+    try std.testing.expectError(error.DuplicateMarker, updateMetalRelease(&hash, "release", metal_release_begin_marker ++ metal_release_begin_marker ++ metal_release_end_marker));
+    try std.testing.expectError(error.InvalidMarkerOrder, updateMetalRelease(&hash, "release", metal_release_end_marker ++ metal_release_begin_marker));
 }

@@ -52,6 +52,23 @@ class CompilerProfileParser(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(RuntimeError):
                 recorder.parse_compiler_profile(raw)
 
+    def test_larger_compiler_profile_aligns_all_budgets_and_preserves_other_guards(self):
+        recorder.configure_profile(True, 16384)
+        self.assertEqual(recorder.SCHEMA, recorder.SCHEMA_V4)
+        self.assertEqual(recorder.COMMAND, release.FULL_RELEASE_16G_STRIPPED_COMMAND)
+        self.assertEqual(recorder.ENVIRONMENT, release.FULL_RELEASE_16G_ENVIRONMENT)
+        self.assertEqual(recorder.LIMITS, {
+            'timeout': 3600, 'max_rss_mib': 16384, 'min_free_percent': 15,
+            'max_swap_growth_mib': 512, 'min_disk_free_mib': 4096,
+        })
+        recorder.configure_profile(True)
+        self.assertEqual(recorder.LIMITS['max_rss_mib'], 8192)
+        for value in (True, 0, 32768):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                recorder.configure_profile(True, value)
+        with self.assertRaises(ValueError):
+            recorder.configure_profile(False, 16384)
+
 
 class FullReleaseCompilerProfile(unittest.TestCase):
     def setUp(self):
@@ -110,6 +127,48 @@ class FullReleaseCompilerProfile(unittest.TestCase):
         }
         self.fixture.refresh_receipt()
         with self.assertRaisesRegex(ValueError, 'invalid stripped compiler profile'):
+            self.fixture.audit()
+
+    def make_v4(self):
+        self.make_v2()
+        self.fixture.value['schema'] = release.FULL_RELEASE_SCHEMA_V4
+        self.fixture.command[:] = release.FULL_RELEASE_16G_STRIPPED_COMMAND
+        self.fixture.value['build'].pop('onnx')
+        self.fixture.value['build']['environment'] = release.FULL_RELEASE_16G_ENVIRONMENT
+        self.fixture.resource['limits']['max_rss_mib'] = 16384
+        self.fixture.resource['peak_group_rss_mib'] = 12288
+        self.fixture.write('resource', self.fixture.resource)
+        self.fixture.value['resource']['sha256'] = hashlib.sha256((self.fixture.root / 'resource').read_bytes()).hexdigest()
+        self.fixture.archive.unlink()
+        self.fixture.write_archive()
+        self.fixture.value['source_archive'].update(
+            sha256=hashlib.sha256(self.fixture.archive.read_bytes()).hexdigest(),
+            bytes=self.fixture.archive.stat().st_size,
+        )
+        self.fixture.refresh_receipt()
+
+    def test_v4_compiler_receipt_above_8g_binds_all_budgets(self):
+        self.make_v4()
+        got = adapter.validate(self.fixture.root / 'receipt', self.fixture.root / 'bin')
+        self.assertEqual(got['receipt']['schema'], release.FULL_RELEASE_SCHEMA_V4)
+        self.assertTrue(got['receipt']['release_eligible'])
+        self.assertFalse(got['receipt']['serving_qualified'])
+
+    def test_v4_watchdog_must_match_its_declared_compiler_budget(self):
+        self.make_v4()
+        self.fixture.resource['limits']['max_rss_mib'] = 8192
+        self.fixture.resource['peak_group_rss_mib'] = 100
+        self.fixture.write('resource', self.fixture.resource)
+        self.fixture.value['resource']['sha256'] = hashlib.sha256((self.fixture.root / 'resource').read_bytes()).hexdigest()
+        self.fixture.refresh_receipt()
+        with self.assertRaisesRegex(ValueError, 'compiler watchdog'):
+            self.fixture.audit()
+
+    def test_v4_cannot_be_relabelled_as_historical_v3(self):
+        self.make_v4()
+        self.fixture.value['schema'] = release.FULL_RELEASE_SCHEMA_V3
+        self.fixture.refresh_receipt()
+        with self.assertRaises(ValueError):
             self.fixture.audit()
 
     def test_missing_duplicate_and_numeric_observations_are_rejected(self):

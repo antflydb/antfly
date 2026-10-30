@@ -19,6 +19,7 @@
 const std = @import("std");
 const checkpoint = @import("attention_match_checkpoint.zig");
 const engine = @import("attention_match_engine.zig");
+const Control = @import("attention_match.zig").Control;
 
 /// Build a bounded self-study sequence from the saved prefix only. Repeating
 /// just its tail can calibrate exclusively on boilerplate and miss identifiers
@@ -104,6 +105,79 @@ pub const Consumer = struct {
     kv_heads: u32,
     dim: u32,
 };
+
+/// Canonical, allocation-free evidence for the exact calibration inputs. Train
+/// and held-out values have separate domains; neither role can impersonate the
+/// other. The consumer geometry includes every shared-layer query head.
+pub const Seal = struct {
+    source_length: usize,
+    repeat_length: usize,
+    consumer_count: usize,
+    batch_count: usize,
+    train_positions: usize,
+    heldout_positions: usize,
+    train_elements: usize,
+    heldout_elements: usize,
+    geometry_sha256: [32]u8,
+    train_positions_sha256: [32]u8,
+    heldout_positions_sha256: [32]u8,
+    train_values_sha256: [32]u8,
+    heldout_values_sha256: [32]u8,
+    sha256: [32]u8,
+
+    pub fn digest(self: Seal) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly.native-calibration-seal.v1\n");
+        inline for (.{ "source_length", "repeat_length", "consumer_count", "batch_count", "train_positions", "heldout_positions", "train_elements", "heldout_elements" }) |field|
+            hashInteger(&hash, @field(self, field));
+        inline for (.{ "geometry_sha256", "train_positions_sha256", "heldout_positions_sha256", "train_values_sha256", "heldout_values_sha256" }) |field|
+            hash.update(&@field(self, field));
+        return hash.finalResult();
+    }
+
+    pub fn validate(self: Seal) !void {
+        if (self.source_length == 0 or self.source_length > checkpoint.max_context_tokens or
+            self.repeat_length < 2 or self.repeat_length > checkpoint.max_context_tokens or
+            self.consumer_count == 0 or self.consumer_count > 256 or
+            self.batch_count < self.consumer_count or self.batch_count > 65536 or
+            self.train_positions == 0 or self.heldout_positions == 0 or
+            self.train_positions > 1024 or self.heldout_positions > 1024 or
+            self.train_positions + self.heldout_positions > 1024 or
+            self.train_elements == 0 or self.heldout_elements == 0 or
+            self.train_elements % self.train_positions != 0 or self.heldout_elements % self.heldout_positions != 0 or
+            self.train_elements / self.train_positions != self.heldout_elements / self.heldout_positions)
+            return error.InvalidCompactionQueries;
+        inline for (.{ "geometry_sha256", "train_positions_sha256", "heldout_positions_sha256", "train_values_sha256", "heldout_values_sha256", "sha256" }) |field|
+            if (std.mem.allEqual(u8, &@field(self, field), 0)) return error.InvalidCompactionQueries;
+        if (!std.mem.eql(u8, &self.sha256, &self.digest())) return error.InvalidCompactionQueries;
+    }
+};
+
+fn hashInteger(hash: *std.crypto.hash.sha2.Sha256, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    hash.update(&bytes);
+}
+
+fn hashFloats(hash: *std.crypto.hash.sha2.Sha256, values: []const f32, control: Control) !void {
+    var offset: usize = 0;
+    while (offset < values.len) {
+        try control.check();
+        const end = offset + @min(16384, values.len - offset);
+        const chunk = values[offset..end];
+        for (chunk) |value| if (!std.math.isFinite(value)) return error.NonFiniteAttention;
+        if (comptime @import("builtin").cpu.arch.endian() == .little) {
+            hash.update(std.mem.sliceAsBytes(chunk));
+        } else {
+            for (chunk) |value| {
+                var bytes: [4]u8 = undefined;
+                std.mem.writeInt(u32, &bytes, @bitCast(value), .little);
+                hash.update(&bytes);
+            }
+        }
+        offset = end;
+    }
+}
 
 pub const Options = struct {
     samples_per_consumer: usize = 80,
@@ -253,6 +327,54 @@ pub const Collector = struct {
         self.allocator.free(self.heldout_positions);
         self.allocator.free(self.seen);
         self.* = undefined;
+    }
+
+    pub fn seal(self: *const Collector, control: Control) !Seal {
+        const batches = try self.finish();
+        try control.check();
+        var geometry = std.crypto.hash.sha2.Sha256.init(.{});
+        geometry.update("antfly.native-calibration-geometry.v1\n");
+        hashInteger(&geometry, self.source_length);
+        hashInteger(&geometry, self.repeat_length);
+        for (self.consumers) |consumer| inline for (.{ "layer", "donor", "query_heads", "kv_heads", "dim" }) |field|
+            hashInteger(&geometry, @field(consumer, field));
+        var train_positions = std.crypto.hash.sha2.Sha256.init(.{});
+        train_positions.update("antfly.native-calibration-train-positions.v1\n");
+        for (self.train_positions) |position| hashInteger(&train_positions, position);
+        var heldout_positions = std.crypto.hash.sha2.Sha256.init(.{});
+        heldout_positions.update("antfly.native-calibration-heldout-positions.v1\n");
+        for (self.heldout_positions) |position| hashInteger(&heldout_positions, position);
+        var train = std.crypto.hash.sha2.Sha256.init(.{});
+        train.update("antfly.native-calibration-train-values.v1\n");
+        var heldout = std.crypto.hash.sha2.Sha256.init(.{});
+        heldout.update("antfly.native-calibration-heldout-values.v1\n");
+        var train_elements: usize = 0;
+        var heldout_elements: usize = 0;
+        for (batches) |batch| {
+            try hashFloats(&train, batch.train, control);
+            try hashFloats(&heldout, batch.heldout, control);
+            train_elements = try add(train_elements, batch.train.len);
+            heldout_elements = try add(heldout_elements, batch.heldout.len);
+        }
+        var result: Seal = .{
+            .source_length = self.source_length,
+            .repeat_length = self.repeat_length,
+            .consumer_count = self.consumers.len,
+            .batch_count = batches.len,
+            .train_positions = self.train_positions.len,
+            .heldout_positions = self.heldout_positions.len,
+            .train_elements = train_elements,
+            .heldout_elements = heldout_elements,
+            .geometry_sha256 = geometry.finalResult(),
+            .train_positions_sha256 = train_positions.finalResult(),
+            .heldout_positions_sha256 = heldout_positions.finalResult(),
+            .train_values_sha256 = train.finalResult(),
+            .heldout_values_sha256 = heldout.finalResult(),
+            .sha256 = @splat(0),
+        };
+        result.sha256 = result.digest();
+        try result.validate();
+        return result;
     }
 
     /// Exact signature of DecodeContext's post-RoPE query capture hook. A fused
@@ -436,4 +558,48 @@ fn studyAllocationFailure(allocator: std.mem.Allocator) !void {
 
 test "attention match bounded study unwinds every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, studyAllocationFailure, .{});
+}
+
+test "attention_match Metal calibration seal separates roles geometry positions and cancellation" {
+    var collector = try Collector.init(std.testing.allocator, &fixture, 8, 8, .{ .samples_per_consumer = 4, .max_capture_rows = 8 });
+    defer collector.deinit();
+    try std.testing.expectError(error.MissingCompactionConsumerQueries, collector.seal(.{}));
+    const input: [64]f32 = @splat(1);
+    for (fixture) |consumer| try Collector.capture(&collector, consumer.donor, consumer.layer, 8, 4, 2, &input);
+    const sealed = try collector.seal(.{});
+    try sealed.validate();
+    var tampered = sealed;
+    tampered.train_values_sha256[0] ^= 1;
+    try std.testing.expectError(error.InvalidCompactionQueries, tampered.validate());
+    collector.values[0] += 0.5;
+    const train_changed = try collector.seal(.{});
+    try std.testing.expect(!std.mem.eql(u8, &sealed.sha256, &train_changed.sha256));
+    try std.testing.expect(!std.mem.eql(u8, &sealed.train_values_sha256, &train_changed.train_values_sha256));
+    try std.testing.expectEqualSlices(u8, &sealed.heldout_values_sha256, &train_changed.heldout_values_sha256);
+    try std.testing.expectEqualSlices(u8, &sealed.geometry_sha256, &train_changed.geometry_sha256);
+    collector.values[0] -= 0.5;
+    const heldout_offset = collector.batches[0].train.len;
+    collector.values[heldout_offset] += 0.25;
+    const heldout_changed = try collector.seal(.{});
+    try std.testing.expectEqualSlices(u8, &sealed.train_values_sha256, &heldout_changed.train_values_sha256);
+    try std.testing.expect(!std.mem.eql(u8, &sealed.heldout_values_sha256, &heldout_changed.heldout_values_sha256));
+    collector.values[heldout_offset] -= 0.25;
+    collector.consumers[1].donor += 1;
+    const geometry_changed = try collector.seal(.{});
+    try std.testing.expect(!std.mem.eql(u8, &sealed.geometry_sha256, &geometry_changed.geometry_sha256));
+    collector.consumers[1].donor -= 1;
+    collector.train_positions[0] += 1;
+    const positions_changed = try collector.seal(.{});
+    try std.testing.expect(!std.mem.eql(u8, &sealed.train_positions_sha256, &positions_changed.train_positions_sha256));
+    try std.testing.expectEqualSlices(u8, &sealed.heldout_positions_sha256, &positions_changed.heldout_positions_sha256);
+    collector.train_positions[0] -= 1;
+    try std.testing.expectEqualSlices(u8, &sealed.sha256, &(try collector.seal(.{})).sha256);
+    const Stop = struct {
+        fn check(_: ?*anyopaque) anyerror!void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, collector.seal(.{ .check_fn = Stop.check }));
+    collector.values[0] = std.math.nan(f32);
+    try std.testing.expectError(error.NonFiniteAttention, collector.seal(.{}));
 }

@@ -3,6 +3,7 @@ from typing import Any
 
 import httpx
 
+from ....native_kv_transport import native_kv_request_async
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.inference_error import InferenceError
@@ -203,7 +204,7 @@ async def asyncio_detailed(
         body=body,
     )
 
-    response = await client.get_async_httpx_client().request(**kwargs)
+    response = await native_kv_request_async(client.get_async_httpx_client(), **kwargs)
 
     return _build_response(client=client, response=response)
 

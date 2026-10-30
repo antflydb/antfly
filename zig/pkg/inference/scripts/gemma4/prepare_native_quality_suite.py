@@ -239,18 +239,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--lines", type=int, default=742)
+    parser.add_argument(
+        "--quality-profile", choices=("bounded", "extended"), default="extended"
+    )
     args = parser.parse_args()
     manifest_path = args.output.with_suffix(".manifest.json")
     if args.output.exists() or manifest_path.exists():
         raise FileExistsError("preserve the frozen suite; choose a new output path")
     cases = build_cases(args.lines)
+    if args.quality_profile == "bounded":
+        cases = [case for case in cases if case["critical"]]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     encoded = "".join(json.dumps(case, separators=(",", ":")) + "\n" for case in cases)
     args.output.write_text(encoded)
     manifest = {
         "schema_version": 2,
         "cases": len(cases),
-        "cases_per_category": 16,
+        "quality_profile": args.quality_profile,
+        "cases_per_category": 4 if args.quality_profile == "bounded" else 16,
         "critical_cases": 16,
         "families_per_category": 4,
         "filler_lines": args.lines,

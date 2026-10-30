@@ -280,8 +280,12 @@ pub const Http = struct {
 pub const native_checkpoint_upload_limit: usize = 2 * 1024 * 1024 * 1024 + 2 * 1024 * 1024 + 128;
 
 pub fn nativeCheckpointResume(method: http.HttpMethod, path: []const u8) bool {
-    return method == .post and (std.mem.eql(u8, path, bridge.ai_api_prefix ++ "/generate/context/resume") or
-        std.mem.eql(u8, path, bridge.public_api_prefix ++ "/generate/context/resume"));
+    if (method != .post) return false;
+    inline for (.{ bridge.ai_api_prefix, bridge.public_api_prefix }) |prefix| {
+        inline for (.{ "/generate/context/resume", "/generate/context/resume/batch" }) |suffix|
+            if (std.mem.eql(u8, path, prefix ++ suffix)) return true;
+    }
+    return false;
 }
 
 pub const HttpResponse = struct { status: u16, headers: []const Header };
@@ -406,9 +410,13 @@ test "inference worker typed numeric responses preserve ownership under allocati
 
 test "native checkpoint worker streaming stays limited to exact POST resume routes" {
     inline for (.{ bridge.ai_api_prefix, bridge.public_api_prefix }) |prefix| {
-        try std.testing.expect(nativeCheckpointResume(.post, prefix ++ "/generate/context/resume"));
-        try std.testing.expect(!nativeCheckpointResume(.get, prefix ++ "/generate/context/resume"));
-        try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/generate/context/resume/"));
+        inline for (.{ "/generate/context/resume", "/generate/context/resume/batch" }) |suffix| {
+            try std.testing.expect(nativeCheckpointResume(.post, prefix ++ suffix));
+            try std.testing.expect(!nativeCheckpointResume(.get, prefix ++ suffix));
+            try std.testing.expect(!nativeCheckpointResume(.put, prefix ++ suffix));
+            try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ suffix ++ "/"));
+            try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ suffix ++ "/extra"));
+        }
         try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/generate/context/checkpoint"));
         try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/chat/completions"));
     }

@@ -904,6 +904,7 @@ pub fn configureMetal(
     addMacosSdkPaths(b, module, target);
     module.linkFramework("Foundation", .{});
     module.linkFramework("Metal", .{});
+    module.linkFramework("Accelerate", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
     module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.inference_root, "src/backends/metal_kernels.m")), .flags = &.{"-fobjc-arc"} });
 }

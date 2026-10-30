@@ -39,16 +39,17 @@ sys.path.insert(0, str(BASE))
 
 from context_release_build_adapter import validate as validate_build
 import native_repeat_campaign_resources as resources
+from native_quality_score import validate_request_models
 
-SCHEMA = "antfly.metal-native-checkpoint.campaign-spec.v2"
-PHASE_SCHEMA = "antfly.metal-native-checkpoint.phase.v2"
+SCHEMA = "antfly.metal-native-checkpoint.campaign-spec.v3"
+PHASE_SCHEMA = "antfly.metal-native-checkpoint.phase.v3"
 HEX = re.compile(r"[0-9a-f]{64}")
 HEADROOM = {"required_free_percent": 76, "samples": 2, "interval_seconds": 10}
 LIMITS = {"max_rss_mib": 8192, "min_free_percent": 15,
           "max_swap_growth_mib": 0,
           "min_disk_free_mib": 4096}
 SIZES = (("8k", 742), ("32k", 2975))
-ENCODINGS = ("f16", "fp8")
+ENCODINGS = ("f16", "fp8", "rotated4")
 KINDS = ("smoke", "quality", "performance")
 CAMPAIGN_PROFILES = {
     "bounded": {
@@ -119,7 +120,72 @@ def checked_ref(value, label):
     return path
 
 
-def suite_contract(path, campaign_profile):
+def checked_model_artifact(directory, artifact, expected_sha256=None):
+    relative = Path(artifact)
+    require(isinstance(artifact, str) and artifact and
+            not relative.is_absolute() and ".." not in relative.parts and
+            relative.as_posix() == artifact,
+            "invalid model artifact path")
+    path = directory
+    for part in relative.parts:
+        path = path / part
+        require(not path.is_symlink(), "model artifact path contains a symlink")
+    require(path.is_file() and path.resolve().is_relative_to(directory.resolve()),
+            "model artifact escaped registry entry")
+    manifest = directory / ".antfly-download-complete.json"
+    require(manifest.is_file() and not manifest.is_symlink(), "missing model manifest")
+    rows = [row for row in json.loads(manifest.read_text()).get("artifacts", [])
+            if row.get("path") == artifact]
+    require(len(rows) == 1 and HEX.fullmatch(rows[0].get("sha256", "")) and
+            type(rows[0].get("size")) is int and rows[0]["size"] > 0,
+            "missing model artifact binding")
+    row = rows[0]
+    require((expected_sha256 is None or row["sha256"] == expected_sha256) and
+            path.stat().st_size == row["size"] and sha(path) == row["sha256"],
+            "model artifact bytes changed")
+    return row
+
+
+def checked_model_registry(models_root, directory, model):
+    parts = model.split("/")
+    require(len(parts) == 2 and all(re.fullmatch(r"[A-Za-z0-9_.-]+", part)
+                                  for part in parts), "invalid request model")
+    namespace, name = parts
+    require(directory.parent == models_root / namespace and
+            directory.name.startswith(name + "--antfly-"),
+            "model directory differs from request model")
+    entries = sorted((models_root / namespace).glob(name + "--antfly-*"))
+    require(entries == [directory] and not directory.is_symlink(),
+            "request model registry resolution is ambiguous")
+    manifest = directory / ".antfly-download-complete.json"
+    require(manifest.is_file() and not manifest.is_symlink(), "missing model manifest")
+    value = json.loads(manifest.read_bytes())
+    source = value.get("source", {})
+    require(value.get("version") == 2 and source.get("owner") == namespace and
+            source.get("name") == name and source.get("selected_format") == "gguf",
+            "model manifest differs from request model")
+
+
+def identity_receipt_contract(path, model, requests):
+    value = json.loads(path.read_bytes())
+    identity = value.get("loaded_identity")
+    require(value.get("schema") == "antfly.metal-checkpoint-performance-requests.v1" and
+            value.get("backend") == "metal" and value.get("model") == model and
+            type(value.get("load_generation")) is int and value["load_generation"] > 0 and
+            type(identity) is dict and set(identity) == {"weights", "tokenizer", "template", "layout"} and
+            all(isinstance(digest, str) and HEX.fullmatch(digest) and digest != "0" * 64
+                for digest in identity.values()), "invalid loaded model identity receipt")
+    for size, ref in requests.items():
+        request = value.get("requests", {}).get("request_" + size, {})
+        require(request.get("sha256") == ref["sha256"] and
+                request.get("file") == Path(ref["path"]).name and
+                request.get("prompt_tokens") == (8128 if size == "8k" else 32512) and
+                request.get("max_tokens") == (64 if size == "8k" else 256),
+                "identity receipt differs from frozen performance requests")
+    return identity
+
+
+def suite_contract(path, campaign_profile, expected_model=None):
     require(campaign_profile in CAMPAIGN_PROFILES, "unknown campaign profile")
     contract = CAMPAIGN_PROFILES[campaign_profile]
     raw = path.read_bytes()
@@ -131,6 +197,8 @@ def suite_contract(path, campaign_profile):
         value = json.loads(line)
         require(type(value) is dict, "suite row must be an object")
         rows.append(value)
+    if expected_model is not None:
+        validate_request_models(rows, expected_model)
     expected_cases = contract["quality_cases_per_size"]
     require(len(rows) == expected_cases,
             f"frozen {campaign_profile} suite must contain exactly {expected_cases} cases")
@@ -172,7 +240,9 @@ def performance_request_contract(path, size, model):
 
 
 def phase_parts(name):
-    match = re.fullmatch(r"(smoke|quality|performance)-(8k|32k)-(f16|fp8)", name)
+    match = re.fullmatch(
+        r"(smoke|quality|performance)-(8k|32k)-(f16|fp8|rotated4)", name
+    )
     require(match is not None, "invalid phase")
     return match.groups()
 
@@ -208,7 +278,8 @@ def load_spec(root):
     for label, ref in value["runners"].items():
         checked_ref(ref, label + " runner")
     for size, ref in value["suites"].items():
-        observed = suite_contract(checked_ref(ref, size + " suite"), profile)
+        observed = suite_contract(checked_ref(ref, size + " suite"), profile,
+                                  value["model"]["request_model"])
         require(value.get("suite_contracts", {}).get(size) == observed,
                 "frozen suite contract changed")
     for size, ref in value["performance_requests"].items():
@@ -216,7 +287,8 @@ def load_spec(root):
                                      size, value["model"]["request_model"])
     model = value["model"]
     require(type(model) is dict and set(model) == {"models_root", "request_model",
-            "directory", "artifact", "artifact_sha256", "manifest_sha256"},
+            "directory", "artifact", "artifact_sha256", "manifest_sha256",
+            "identity_receipt", "loaded_identity"},
             "invalid model binding")
     models_root, directory = Path(model["models_root"]), Path(model["directory"])
     require(models_root.is_absolute() and directory.is_absolute() and
@@ -224,13 +296,14 @@ def load_spec(root):
             not models_root.is_symlink() and not directory.is_symlink() and
             directory.is_relative_to(models_root),
             "model registry binding changed")
+    checked_model_registry(models_root, directory, model["request_model"])
     manifest = directory / ".antfly-download-complete.json"
     require(manifest.is_file() and not manifest.is_symlink() and
             sha(manifest) == model["manifest_sha256"], "model manifest changed")
-    entries = json.loads(manifest.read_text()).get("artifacts", [])
-    require(any(row.get("path") == model["artifact"] and
-                row.get("sha256") == model["artifact_sha256"]
-                for row in entries), "model artifact identity changed")
+    checked_model_artifact(directory, model["artifact"], model["artifact_sha256"])
+    identity = identity_receipt_contract(checked_ref(model["identity_receipt"], "model identity receipt"),
+        model["request_model"], value["performance_requests"])
+    require(identity == model["loaded_identity"], "frozen loaded model identity changed")
     require(sha(__file__) == value["launcher_sha256"], "launcher changed after freeze")
     return root, path, value
 
@@ -243,27 +316,22 @@ def init(args):
     require(build["binary_path"] == args.binary.resolve(strict=True),
             "receipt does not bind selected test binary")
     models_root = args.models_dir.resolve(strict=True)
-    require(args.model == "google/gemma-4-E4B-it-qat-q4_0-gguf",
-            "campaign request model must be the pinned Gemma4 E4B ID")
+    require(args.model in {
+                "google/gemma-4-E2B-it-qat-q4_0-gguf",
+                "google/gemma-4-E4B-it-qat-q4_0-gguf",
+            }, "campaign request model must be a supported Gemma4 E2B/E4B ID")
     directory = args.model_directory.resolve(strict=True)
     require(directory.is_dir() and not directory.is_symlink() and
             directory.is_relative_to(models_root), "invalid model registry entry")
+    checked_model_registry(models_root, directory, args.model)
     manifest = directory / ".antfly-download-complete.json"
     require(manifest.is_file() and not manifest.is_symlink(), "missing model manifest")
-    manifest_value = json.loads(manifest.read_text())
-    artifact_rows = [row for row in manifest_value.get("artifacts", [])
-                     if row.get("path") == args.artifact]
-    require(len(artifact_rows) == 1 and HEX.fullmatch(
-            artifact_rows[0].get("sha256", "")), "missing model artifact binding")
-    artifact_path = directory / args.artifact
-    require(artifact_path.is_file() and not artifact_path.is_symlink() and
-            artifact_path.stat().st_size == artifact_rows[0].get("size"),
-            "model artifact size or path changed")
+    artifact_row = checked_model_artifact(directory, args.artifact)
     suite_refs = {}
     suite_contracts = {}
     for size, path in (("8k", args.suite_8k), ("32k", args.suite_32k)):
         path = path.resolve(strict=True)
-        info = suite_contract(path, args.campaign_profile)
+        info = suite_contract(path, args.campaign_profile, args.model)
         suite_refs[size] = {"path": str(path), "sha256": sha(path)}
         suite_contracts[size] = info
     performance_refs = {}
@@ -272,6 +340,10 @@ def init(args):
         path = path.resolve(strict=True)
         performance_request_contract(path, size, args.model)
         performance_refs[size] = {"path": str(path), "sha256": sha(path)}
+    identity_path = (args.identity_receipt or
+                     args.performance_request_8k.parent / "metadata.json").resolve(strict=True)
+    require(identity_path.is_file() and not identity_path.is_symlink(), "missing model identity receipt")
+    loaded_identity = identity_receipt_contract(identity_path, args.model, performance_refs)
     runner_paths = {"http": args.http_runner, "quality": args.quality_runner,
                     "performance": args.performance_runner}
     runners = {}
@@ -284,15 +356,19 @@ def init(args):
             "campaign_profile": args.campaign_profile,
             "qualification_contract": CAMPAIGN_PROFILES[args.campaign_profile],
             "launcher_sha256": sha(__file__),
-            "python": str(Path(sys.executable).resolve(strict=True)),
+            # Resolving this symlink loses virtual-environment dependency
+            # isolation when the frozen interpreter launches the collectors.
+            "python": str(Path(sys.executable).absolute()),
             "build_receipt": {"path": str(build["receipt_path"]),
                               "sha256": build["receipt_sha256"]},
             "binary": {"path": str(build["binary_path"]),
                        "sha256": build["binary_sha256"]},
             "model": {"models_root": str(models_root), "request_model": args.model,
                       "directory": str(directory), "artifact": args.artifact,
-                      "artifact_sha256": artifact_rows[0]["sha256"],
-                      "manifest_sha256": sha(manifest)},
+                      "artifact_sha256": artifact_row["sha256"],
+                      "manifest_sha256": sha(manifest),
+                      "identity_receipt": {"path": str(identity_path), "sha256": sha(identity_path)},
+                      "loaded_identity": loaded_identity},
             "runners": runners, "suites": suite_refs,
             "suite_contracts": suite_contracts,
             "performance_requests": performance_refs,
@@ -302,7 +378,7 @@ def init(args):
             "base_port": args.base_port, "phases": list(PHASES)}
     write_new(root / "campaign-spec.json", spec)
     return write_new(root / "init.json", {
-        "schema": "antfly.metal-native-checkpoint.campaign-init.v2",
+        "schema": "antfly.metal-native-checkpoint.campaign-init.v3",
         "campaign_spec_sha256": sha(root / "campaign-spec.json"),
         "serving_qualified": False, "performance_qualified": False,
         "production_ready": False})
@@ -341,7 +417,8 @@ def command(spec, phase, root):
     output = root / (phase + ".json")
     checkpoint = root / (phase + ".kv")
     if kind == "smoke":
-        return [spec["python"], spec["runners"]["http"]["path"], *common,
+        rotated = ["--experimental-rotated4"] if encoding == "rotated4" else []
+        return [spec["python"], spec["runners"]["http"]["path"], *common, *rotated,
                 "--padding-lines", str(padding), "--fixture", "fact",
                 "--expected-outcome", "compacted", "--minimum-savings", "1.5",
                 "--output", str(output), "--checkpoint", str(checkpoint)]
@@ -391,6 +468,81 @@ def validate_metal_resources(evidence):
                 "incomplete Metal server resource evidence")
 
 
+def validate_loaded_model(evidence, model):
+    readies = [value.get("ready") for value in evidence.values()
+               if isinstance(value, dict) and isinstance(value.get("memory"), dict)]
+    if "producer_ready" in evidence:
+        readies.append(evidence["producer_ready"])
+    require(readies, "missing loaded model attestation")
+    for ready in readies:
+        require(type(ready) is dict and ready.get("model") == model["request_model"] and
+                ready.get("backend") == "metal" and ready.get("metal_enabled") is True and
+                ready.get("cuda_enabled") is False and
+                ready.get("loaded_identity") == model["loaded_identity"],
+                "worker differs from frozen loaded model identity")
+
+
+def phase_checkpoint_binding(root, phase, evidence, expected_case_ids=None):
+    kind, _, encoding = phase_parts(phase)
+    checkpoint = root / (phase + ".kv")
+    if kind != "quality":
+        require(checkpoint.is_file() and not checkpoint.is_symlink(),
+                "missing retained phase checkpoint")
+        return {"checkpoint_sha256": sha(checkpoint)}
+    # The collector checks each checkpoint on resume, retains its digest in
+    # the output, and removes the file before the next case. Bind that full
+    # ordered set rather than requiring the intentionally deleted last file.
+    require(not checkpoint.exists() and not checkpoint.is_symlink(),
+            "quality collector left a checkpoint behind")
+    rows = evidence.get("checkpoints")
+    require(isinstance(expected_case_ids, list) and expected_case_ids and
+            evidence.get("case_ids") == expected_case_ids and
+            isinstance(rows, list) and len(rows) == len(expected_case_ids),
+            "incomplete per-case checkpoint evidence")
+    bindings = []
+    for identifier, row in zip(expected_case_ids, rows):
+        require(type(row) is dict and row.get("case_id") == identifier and
+                type(row.get("metadata")) is dict and
+                row["metadata"].get("encoding") == encoding and
+                isinstance(row.get("sha256"), str) and
+                HEX.fullmatch(row["sha256"]),
+                "invalid per-case checkpoint binding")
+        bindings.append({"case_id": identifier, "sha256": row["sha256"]})
+    return {"checkpoint_sha256": None, "case_checkpoints": bindings}
+
+
+def frozen_case_ids(spec, size):
+    cases = [json.loads(line) for line in
+             Path(spec["suites"][size]["path"]).read_bytes().splitlines()
+             if line.strip()]
+    return [case.get("id", case.get("case_id")) for case in cases]
+
+
+def validate_predecessor(root, phase, spec_path, spec):
+    path = root / (phase + "-phase.json")
+    require(path.is_file() and not path.is_symlink(),
+            "missing predecessor phase: " + phase)
+    receipt = json.loads(path.read_text())
+    require(receipt.get("schema") == PHASE_SCHEMA and
+            receipt.get("phase") == phase and receipt.get("passed") is True and
+            receipt.get("campaign_spec_sha256") == sha(spec_path) and
+            receipt.get("campaign_profile") == spec["campaign_profile"] and
+            receipt.get("qualification_contract") == spec["qualification_contract"] and
+            receipt.get("command") == command(spec, phase, root),
+            "predecessor did not bind frozen campaign: " + phase)
+    for label, suffix in (("headroom", "-headroom.json"),
+                          ("resource", "-resource.json"), ("output", ".json")):
+        checked_ref({"path": str(root / (phase + suffix)),
+                     "sha256": receipt.get(label + "_sha256")},
+                    "predecessor " + label)
+    evidence = json.loads((root / (phase + ".json")).read_text())
+    kind, size, _ = phase_parts(phase)
+    binding = phase_checkpoint_binding(root, phase, evidence,
+        frozen_case_ids(spec, size) if kind == "quality" else None)
+    require(all(receipt.get(key) == value for key, value in binding.items()),
+            "predecessor checkpoint changed: " + phase)
+
+
 def run_phase(args):
     root, spec_path, spec = load_spec(args.campaign_root)
     phase = args.phase
@@ -398,12 +550,7 @@ def run_phase(args):
     # Every earlier phase must be explicitly sealed.  This makes 8K precede
     # 32K and smoke precede quality/performance without auto-running anything.
     for previous in predecessors(phase):
-        path = root / (previous + "-phase.json")
-        require(path.is_file() and not path.is_symlink(),
-                "missing predecessor phase: " + previous)
-        value = json.loads(path.read_text())
-        require(value.get("schema") == PHASE_SCHEMA and value.get("passed") is True,
-                "predecessor did not pass: " + previous)
+        validate_predecessor(root, previous, spec_path, spec)
     output = root / (phase + ".json")
     checkpoint = root / (phase + ".kv")
     resource = root / (phase + "-resource.json")
@@ -443,7 +590,9 @@ def run_phase(args):
             "phase lacks Metal test-ingress evidence")
     kind, size, _ = phase_parts(phase)
     contract = spec["qualification_contract"]
+    expected_case_ids = None
     if kind == "quality":
+        expected_case_ids = frozen_case_ids(spec, size)
         require(evidence.get("quality_profile") == contract["quality_profile"] and
                 evidence.get("size") == size and
                 evidence.get("suite_sha256") == spec["suites"][size]["sha256"] and
@@ -457,9 +606,12 @@ def run_phase(args):
                 evidence.get("qualification_sized") is True,
                 "performance evidence differs from frozen campaign profile")
     validate_metal_resources(evidence)
+    validate_loaded_model(evidence, spec["model"])
     if phase.startswith("performance-"):
         require(evidence.get("performance_qualified") is True,
                 "matched performance or physical-savings gate failed")
+    checkpoint_binding = phase_checkpoint_binding(root, phase, evidence,
+                                                   expected_case_ids)
     return write_new(phase_path, {"schema": PHASE_SCHEMA, "phase": phase,
         "passed": True, "diagnostic_only": True, "production_ready": False,
         "campaign_profile": spec["campaign_profile"],
@@ -469,7 +621,7 @@ def run_phase(args):
         "campaign_spec_sha256": sha(spec_path), "command": argv,
         "headroom_sha256": sha(root / (phase + "-headroom.json")),
         "resource_sha256": sha(resource), "output_sha256": sha(output),
-        "checkpoint_sha256": sha(root / (phase + ".kv"))})
+        **checkpoint_binding})
 
 
 def parser():
@@ -489,6 +641,8 @@ def parser():
     setup.add_argument("--suite-32k", type=Path, required=True)
     setup.add_argument("--performance-request-8k", type=Path, required=True)
     setup.add_argument("--performance-request-32k", type=Path, required=True)
+    setup.add_argument("--identity-receipt", type=Path,
+                       help="Loaded identity metadata from the request materializer; defaults to the 8K request's sibling metadata.json")
     setup.add_argument("--http-runner", type=Path,
                        default=BASE / "qualify_native_checkpoint_http.py")
     setup.add_argument("--quality-runner", type=Path,
