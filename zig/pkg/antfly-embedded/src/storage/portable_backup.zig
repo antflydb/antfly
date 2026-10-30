@@ -2445,6 +2445,13 @@ fn PortableArchiveReader(comptime RawReader: type) type {
 
 pub const default_schema_cache_bytes: usize = 16 * 1024 * 1024;
 
+/// Options shared by direct and independently compiled staged restore decoders.
+pub const RestoreImportOptions = struct {
+    identity_namespace: ?doc_identity.Namespace = null,
+    embedding_source_fields: []const ImportOptions.EmbeddingSourceField = &.{},
+    cancellation: @import("db/types.zig").CancellationToken = .none,
+};
+
 pub const ImportOptions = struct {
     pub const EmbeddingSourceField = struct {
         index_name: []const u8,

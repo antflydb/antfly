@@ -259,6 +259,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .sanitize_thread = sanitize_thread,
     });
     production_antfly_imports.configure(b, antfly_mod, link_libc);
+    antfly_mod.addImport("antfly_storage_root", antfly_mod);
     antfly_mod.addImport("vopr", vopr_mod);
     antfly_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 

@@ -63,6 +63,16 @@ pub const Owner = struct {
             return;
         };
     }
+    /// Accepted control work must not wait for the next five-second audit.
+    /// Preserve the registration/lifetime and run()'s existing repair backoff.
+    /// Notifications coalesce and survive a callback already in flight.
+    pub fn notify(self: *Owner) void {
+        self.lock();
+        defer self.lifecycle_mutex.unlock();
+        if (self.stopping.load(.acquire) or self.future == null) return;
+        const scheduler = self.port.runtime.maintenanceScheduler() catch return;
+        scheduler.wake(self);
+    }
     pub fn stop(self: *Owner, runtime: *runtime_mod.BackendRuntime) void {
         self.lock();
         self.stopping.store(true, .release);
@@ -240,4 +250,65 @@ test "independent maintenance joins callbacks outside its lifecycle lock" {
     owner.stop(runtime.ptr());
     try std.testing.expect(fixture.unlocked.load(.acquire));
     try std.testing.expect(owner.future == null);
+}
+
+test "independent maintenance admission wakes its existing registration during a pass" {
+    const builtin = @import("builtin");
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var runtime = try runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const io = runtime.ptr().io().?;
+    var owner: Owner = .{ .repair_retry_after_ns = 17 };
+    owner.notify(); // No registration yet: notification cannot create a worker.
+    const Fixture = struct {
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        repeated: std.Io.Event = .unset,
+        calls: usize = 0,
+        fn now(_: *anyopaque) u64 {
+            return 0;
+        }
+        fn ready(_: *anyopaque) bool {
+            return true;
+        }
+        fn run(ptr: *anyopaque, work: Owner.Work) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (work == .upload) {
+                self.calls += 1;
+                if (self.calls == 1) {
+                    self.entered.set(self.io);
+                    self.release.waitUncancelable(self.io);
+                } else self.repeated.set(self.io);
+            }
+            return false;
+        }
+        fn failed(_: *anyopaque, _: Owner.Work) void {}
+        fn activity(_: *anyopaque) Owner.Activity {
+            return .{};
+        }
+    };
+    var fixture: Fixture = .{ .io = io };
+    defer {
+        fixture.release.set(io);
+        owner.stop(runtime.ptr());
+    }
+    const port: Owner.Port = .{ .ptr = &fixture, .runtime = runtime.ptr(), .now = Fixture.now, .ready = Fixture.ready, .run = Fixture.run, .failed = Fixture.failed, .activity = Fixture.activity };
+    owner.start(port);
+    try fixture.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    const registration = owner.future.?.task;
+    for (0..8) |_| owner.notify();
+    try std.testing.expect(owner.future.?.task == registration);
+    const scheduler = try runtime.ptr().maintenanceScheduler();
+    {
+        scheduler.mutex.lockUncancelable(io);
+        defer scheduler.mutex.unlock(io);
+        // This is the deterministic assertion: new work must remain notified
+        // while the first callback is blocked, before its idle delay is set.
+        try std.testing.expect(registration.notified);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.tasks.items.len);
+    }
+    fixture.release.set(io);
+    try fixture.repeated.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expectEqual(@as(u64, 17), owner.repair_retry_after_ns);
 }

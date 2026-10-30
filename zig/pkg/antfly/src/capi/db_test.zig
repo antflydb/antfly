@@ -6502,13 +6502,17 @@ test "capi native replacement wait observes its background owner without rebuild
     };
     const before = try Reservation.bytes(a, handle);
     defer a.free(before);
+    const rounds_before = owner.publication_stats.maintenance_rounds;
     try std.testing.expectEqual(capi.ErrorCode.busy, antfly_db_add_index_json(handle, .fromSlice(
         \\{"name":"new","type":"graph","replaces":"old","wait":{"timeout_ms":1000},"edge_types":[{"name":"R","field":"links"}]}
     )));
     const after = try Reservation.bytes(a, handle);
     defer a.free(after);
     try std.testing.expectEqualStrings(before, after);
+    // Foreground status/waits do not impersonate a background scheduler round.
+    try std.testing.expectEqual(rounds_before, owner.publication_stats.maintenance_rounds);
     for (0..32) |_| if (!try owner.maintenanceTurnForTest()) break;
+    try std.testing.expect(owner.publication_stats.maintenance_rounds > rounds_before);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
         \\{"name":"new","type":"graph","replaces":"old","wait":{"timeout_ms":0},"edge_types":[{"name":"R","field":"links"}]}
     )));

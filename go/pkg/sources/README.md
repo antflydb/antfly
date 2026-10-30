@@ -335,3 +335,52 @@ through GoogleCredentialsForServices. This preserves verified service-account
 JWT scope provenance when token response scopes are omitted. Custom OAuth clients
 must expose an oauth2.Transport with actual token scope extras; opaque transports
 or authorized-user tokens without scope proof cannot authorize cached Drive data.
+
+## Local native end-to-end qualification
+
+The regular Go suite uses HTTP protocol fixtures. To exercise the real database,
+first build `antfly` and `antfly-grep` from the same checkout, start a dedicated
+loopback-only standalone, and pass its API to the opt-in test:
+
+```sh
+# From zig/, using the repository's supported compiler and worktree caches:
+make build
+zig build grep -Dgrep-only=true
+# Start in a separate terminal; keep all server state inside this worktree.
+source_e2e_dir="$PWD/../.cache/source-e2e"
+mkdir -p "$source_e2e_dir"
+cat > "$source_e2e_dir/config.json" <<EOF
+{"public_inference":{"enabled":false},"inference":{"models_dir":"$source_e2e_dir/models"},"secrets":{"native":{"name":"native","path":"$source_e2e_dir/secrets.json"},"environment":true}}
+EOF
+./zig-out/bin/antfly standalone --config "$source_e2e_dir/config.json" \
+  --host 127.0.0.1 --port 18080 --control-tick-ms 5 \
+  --data-dir "$source_e2e_dir/data" \
+  --replica-root-dir "$source_e2e_dir/replicas" \
+  --replica-catalog-path "$source_e2e_dir/catalog.txt" \
+  --snapshot-root-dir "$source_e2e_dir/snapshots" --auth false --health false
+
+# From go/pkg/sources/:
+ANTFLY_SOURCES_E2E_URL=http://127.0.0.1:18080/db/v1 \
+ANTFLY_GREP_TEST_BINARY="$PWD/../../../zig/zig-out/bin/antfly-grep" \
+GOWORK=off GOEXPERIMENT=simd go test -v -run '^TestLocalAntflySourcePipeline$' -timeout 20m
+```
+
+Use a fresh standalone data directory. The test refuses non-loopback endpoints
+and creates uniquely named synthetic tables in the supplied database. It runs the
+actual source CLI against a local S3 fixture, publishes 475 records plus another
+source sharing the table, and invokes native grep through file and table catalogs.
+It checks no-op synchronization, changed records, post-commit connection loss,
+cleanup recovery, upstream access failure, and preservation of foreign records.
+`ANTFLY_SOURCES_E2E_RECORDS=4` selects a short smoke run; the default is 475.
+`ANTFLY_SOURCE_TEST_BINARY` may select an already-built source CLI.
+
+Native GCS PDF artifact fetching has a separate opt-in test in
+`examples/grepstein/local_e2e_test.go`. From that example directory, set
+`ANTFLY_GREPSTEIN_E2E_BINARY` to the same Antfly binary and run
+`go test -v -run '^TestLocalNativeGCSExtraction$' -timeout 10m` with `GOWORK=off`
+and `GOEXPERIMENT=simd`. It starts its own isolated standalone with a scoped GCS
+connection and a local storage fixture, then verifies generation-bound PDF text
+extraction, the qualification gate, and owner-side bucket/prefix/version rejection.
+These tests do not qualify real Google identity exchange or model-based OCR,
+embeddings, relationship extraction, or production GPU capacity. They are
+explicitly opt-in and do not make normal source-module tests build Antfly.

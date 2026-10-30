@@ -39,7 +39,7 @@ const HelperContext = hbs.HelperContext;
 const HelperMap = hbs.HelperMap;
 
 /// Named credential argument consumed by the remote-content helpers.
-pub const remote_credentials_argument = "credentials";
+pub const remote_credentials_argument = @import("template_inspection.zig").remote_credentials_argument;
 
 /// Render a Handlebars template against a JSON document.
 /// The document is parsed as JSON and its top-level fields become template variables.
@@ -272,17 +272,7 @@ fn eqHelper(ctx: HelperContext) anyerror!Value {
 
 /// GenKit dotprompt media directive: {{media url=imageDataURI}}
 /// Returns: <<<dotprompt:media:url {url}>>>
-pub fn mediaHelper(ctx: HelperContext) anyerror!Value {
-    const url = ctx.hash.get("url") orelse return .{ .string = "" };
-    const url_str = switch (url) {
-        .string => |s| s,
-        else => return .{ .string = "" },
-    };
-    if (url_str.len == 0) return .{ .string = "" };
-
-    const result = try std.fmt.allocPrint(ctx.arena, "<<<dotprompt:media:url {s}>>>", .{url_str});
-    return .{ .safe_string = result };
-}
+pub const mediaHelper = @import("template_inspection.zig").mediaHelper;
 
 // ============================================================================
 // Error Directives
@@ -295,17 +285,7 @@ pub fn mediaHelper(ctx: HelperContext) anyerror!Value {
 //   <<<error:status=404 message=Not Found>>>
 //   <<<error:message=connection refused>>>
 
-pub const ErrorDirective = struct {
-    status: u16, // HTTP status code, or 0 for non-HTTP errors
-    message: []const u8,
-
-    /// Returns true if the status indicates the resource is permanently
-    /// unavailable and should not be retried.
-    pub fn isPermanent(self: ErrorDirective) bool {
-        return self.status == 401 or self.status == 403 or
-            self.status == 404 or self.status == 410 or self.status == 413;
-    }
-};
+pub const ErrorDirective = @import("template_inspection.zig").ErrorDirective;
 
 /// Format an error directive for embedding in rendered output.
 /// If status is 0, the status field is omitted.
@@ -336,69 +316,8 @@ fn sanitizeDirectiveMessage(alloc: Allocator, msg: []const u8) ![]const u8 {
 
 /// Parse all error directives from a string.
 /// Caller owns the returned slice and each message within.
-pub fn parseErrorDirectives(alloc: Allocator, text: []const u8) ![]ErrorDirective {
-    var directives = std.ArrayListUnmanaged(ErrorDirective).empty;
-    const prefix_with_status = "<<<error:status=";
-    const prefix_no_status = "<<<error:message=";
-    const suffix = ">>>";
-
-    var pos: usize = 0;
-    while (pos < text.len) {
-        if (pos + prefix_with_status.len <= text.len and
-            std.mem.eql(u8, text[pos..][0..prefix_with_status.len], prefix_with_status))
-        {
-            // Parse: <<<error:status=NNN message=...>>>
-            const after_prefix = pos + prefix_with_status.len;
-            const space_idx = std.mem.indexOfScalarPos(u8, text, after_prefix, ' ') orelse {
-                pos += 1;
-                continue;
-            };
-            const status_str = text[after_prefix..space_idx];
-            const status = std.fmt.parseInt(u16, status_str, 10) catch {
-                pos += 1;
-                continue;
-            };
-
-            const msg_prefix = "message=";
-            if (space_idx + 1 + msg_prefix.len > text.len or
-                !std.mem.eql(u8, text[space_idx + 1 ..][0..msg_prefix.len], msg_prefix))
-            {
-                pos += 1;
-                continue;
-            }
-            const msg_start = space_idx + 1 + msg_prefix.len;
-            const end_idx = std.mem.indexOfPos(u8, text, msg_start, suffix) orelse {
-                pos += 1;
-                continue;
-            };
-            const message = try alloc.dupe(u8, text[msg_start..end_idx]);
-            try directives.append(alloc, .{ .status = status, .message = message });
-            pos = end_idx + suffix.len;
-        } else if (pos + prefix_no_status.len <= text.len and
-            std.mem.eql(u8, text[pos..][0..prefix_no_status.len], prefix_no_status))
-        {
-            // Parse: <<<error:message=...>>>
-            const msg_start = pos + prefix_no_status.len;
-            const end_idx = std.mem.indexOfPos(u8, text, msg_start, suffix) orelse {
-                pos += 1;
-                continue;
-            };
-            const message = try alloc.dupe(u8, text[msg_start..end_idx]);
-            try directives.append(alloc, .{ .status = 0, .message = message });
-            pos = end_idx + suffix.len;
-        } else {
-            pos += 1;
-        }
-    }
-
-    return try directives.toOwnedSlice(alloc);
-}
-
-/// Free directives returned by parseErrorDirectives.
-pub fn freeErrorDirectives(alloc: Allocator, directives: []const ErrorDirective) void {
-    for (directives) |d| alloc.free(@constCast(d.message));
-    alloc.free(directives);
-}
+pub const parseErrorDirectives = @import("template_inspection.zig").parseErrorDirectives;
+pub const freeErrorDirectives = @import("template_inspection.zig").freeErrorDirectives;
 
 /// Returns true if the string contains any error directive.
 pub fn containsErrorDirective(text: []const u8) bool {
@@ -407,34 +326,7 @@ pub fn containsErrorDirective(text: []const u8) bool {
 
 /// Remove all error directives from a string.
 /// Caller owns the returned slice.
-pub fn stripErrorDirectives(alloc: Allocator, text: []const u8) ![]const u8 {
-    var result = std.ArrayListUnmanaged(u8).empty;
-    const prefix_with_status = "<<<error:status=";
-    const prefix_no_status = "<<<error:message=";
-    const suffix = ">>>";
-
-    var pos: usize = 0;
-    while (pos < text.len) {
-        if ((pos + prefix_with_status.len <= text.len and
-            std.mem.eql(u8, text[pos..][0..prefix_with_status.len], prefix_with_status)) or
-            (pos + prefix_no_status.len <= text.len and
-                std.mem.eql(u8, text[pos..][0..prefix_no_status.len], prefix_no_status)))
-        {
-            // Find the closing >>>
-            const end_idx = std.mem.indexOfPos(u8, text, pos + 9, suffix) orelse {
-                try result.append(alloc, text[pos]);
-                pos += 1;
-                continue;
-            };
-            pos = end_idx + suffix.len;
-        } else {
-            try result.append(alloc, text[pos]);
-            pos += 1;
-        }
-    }
-
-    return try result.toOwnedSlice(alloc);
-}
+pub const stripErrorDirectives = @import("template_inspection.zig").stripErrorDirectives;
 
 // ============================================================================
 // Content Parts (DocumentToParts)
@@ -447,32 +339,7 @@ pub const ContentPart = @import("antfly_template_content").ContentPart;
 
 /// Borrowed text/media segmentation before inline payload decoding. Callers
 /// strip error directives first, just as textToParts does.
-pub const TextPartIterator = struct {
-    text: []const u8,
-    pos: usize = 0,
-
-    pub fn next(self: *@This()) ?ContentPart {
-        const prefix = "<<<dotprompt:media:url ";
-        while (self.pos < self.text.len) {
-            const start = std.mem.indexOfPos(u8, self.text, self.pos, prefix) orelse self.text.len;
-            if (start > self.pos) {
-                const segment = std.mem.trim(u8, self.text[self.pos..start], &std.ascii.whitespace);
-                self.pos = start;
-                if (segment.len > 0) return .{ .text = segment };
-                continue;
-            }
-            const begin = start + prefix.len;
-            const end = std.mem.indexOfPos(u8, self.text, begin, ">>>") orelse {
-                const segment = std.mem.trim(u8, self.text[self.pos..], &std.ascii.whitespace);
-                self.pos = self.text.len;
-                return .{ .text = segment };
-            };
-            self.pos = end + 3;
-            return .{ .media_url = self.text[begin..end] };
-        }
-        return null;
-    }
-};
+pub const TextPartIterator = @import("template_inspection.zig").TextPartIterator;
 
 /// Parse a rendered template string into content parts.
 /// Splits on <<<dotprompt:media:url ...>>> directives.
@@ -660,39 +527,7 @@ fn transcribeAudioHelper(ctx: HelperContext) anyerror!Value {
 // ============================================================================
 
 /// Convert JSON without consuming the call stack for nested model output.
-pub fn jsonToValue(arena: Allocator, json: std.json.Value) Allocator.Error!Value {
-    const Work = struct { source: std.json.Value, target: *Value };
-    var result: Value = undefined;
-    var pending: std.ArrayList(Work) = .empty;
-    defer pending.deinit(arena);
-    try pending.append(arena, .{ .source = json, .target = &result });
-    while (pending.pop()) |work| {
-        work.target.* = switch (work.source) {
-            .null => .null,
-            .bool => |b| .{ .boolean = b },
-            .integer => |n| .{ .integer = n },
-            .float => |n| .{ .float = n },
-            .number_string => |raw| .{ .number_string = raw },
-            .string => |text| .{ .string = text },
-            .array => |array| blk: {
-                const items = try arena.alloc(Value, array.items.len);
-                for (array.items, items) |source, *target| try pending.append(arena, .{ .source = source, .target = target });
-                break :blk .{ .array = items };
-            },
-            .object => |object| blk: {
-                var map: hbs.ValueMap = .{};
-                for (object.keys()) |key| {
-                    if (key.len > 0 and key[0] == '_') continue;
-                    try map.put(arena, key, .undefined);
-                }
-                // Finish map growth before taking pointers to its values.
-                for (map.keys(), map.values()) |key, *target| try pending.append(arena, .{ .source = object.get(key).?, .target = target });
-                break :blk .{ .map = map };
-            },
-        };
-    }
-    return result;
-}
+pub const jsonToValue = @import("template_inspection.zig").jsonToValue;
 
 // ============================================================================
 // Tests

@@ -507,7 +507,7 @@ pub const Config = struct {
     pub const S3AddressingStyle = enum { path, virtual_hosted };
     pub const BucketProvisioning = enum { require_existing, create_if_missing };
     pub const AwsCredentialSource = enum { default, static, profile, web_identity };
-    pub const GcsCredentialSource = @import("objectstore").Gcs.CredentialSource;
+    pub const GcsCredentialSource = scraping.GcsCredentialSource;
 
     pub const AwsCredentialConfig = struct {
         source: AwsCredentialSource = .default,
@@ -535,7 +535,7 @@ pub const Config = struct {
         }
     };
 
-    pub const GcsCredentialConfig = @import("objectstore").Gcs.Credentials;
+    pub const GcsCredentialConfig = scraping.GcsCredentialConfig;
 
     pub const ConnectionConfig = struct {
         display_name: ?[]u8 = null,

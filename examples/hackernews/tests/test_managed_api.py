@@ -160,3 +160,30 @@ def test_redirect_does_not_forward_credentials_or_replay_write():
         backend.shutdown()
         backend.server_close()
         thread.join()
+
+
+def test_managed_client_identifies_itself_and_preserves_explicit_agent():
+    seen = []
+
+    class Backend(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            seen.append(self.headers.get("User-Agent"))
+            self.send_response(200)
+            self.end_headers()
+
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), Backend)
+    thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{backend.server_port}/"
+        for request in (url, Request(url, headers={"User-Agent": "custom-client/2"})):
+            with open_request(request, timeout=2) as response:
+                assert response.status == 200
+        assert seen == ["antfly-hackernews/1", "custom-client/2"]
+    finally:
+        backend.shutdown()
+        backend.server_close()
+        thread.join()

@@ -22,12 +22,12 @@ const codec = @import("../backup_codec.zig");
 const portable = @import("../portable_backup.zig");
 const artifact_ids = @import("../db/artifact_ids.zig");
 const canonical = @import("../db/document_content_hash.zig");
-const staging = @import("restore_staging.zig");
+const portable_metadata = @import("portable_metadata.zig");
 const resolver_catalog = @import("../db/catalog/resolver_catalog.zig");
 const ProducerType = @import("../db/enrichment/asset_producer.zig").ProducerType;
 const enrichment_types = @import("../db/enrichment/enrichment_types.zig");
 const hbs = @import("handlebars");
-const template_runtime = @import("../../template.zig");
+const template_runtime = if (@import("builtin").is_test) @import("../../template.zig") else @import("../../template_inspection.zig");
 const chunking_types = @import("../../chunking/types.zig");
 
 pub const report_version = 1;
@@ -348,7 +348,7 @@ pub const Inspector = struct {
                 while (try reader.next()) |e| {
                     self.report.metadata_records += 1;
                     if (std.mem.endsWith(u8, e.key, ":indexes")) {
-                        const json = try staging.tableIndexesJsonFromPortableMetadata(self.allocator, e.value, null);
+                        const json = try portable_metadata.tableIndexesJsonFromPortableMetadata(self.allocator, e.value, null);
                         defer self.allocator.free(json);
                         try self.indexCatalogJson(json);
                     } else if (std.mem.endsWith(u8, e.key, ":replication_sources")) {
@@ -1078,7 +1078,7 @@ pub const Inspector = struct {
             try output.appendSlice(self.allocator, fragment);
             strip_next = strip.close;
         }
-        @import("../../template_remote.zig").validateRenderedTemplate(self.allocator, output.items) catch |err| {
+        @import("../../template_inspection.zig").validateRenderedTemplate(self.allocator, output.items) catch |err| {
             if (err == error.OutOfMemory) return err;
             try self.report.add(self.options, .source_unresolved, "template_error", doc, field, 0);
             return;

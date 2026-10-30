@@ -170,7 +170,7 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
         const selector = request.object.get("model") orelse return error.ModelRequired;
         if (selector != .string) return error.InvalidInferenceRequest;
         const named = try gateway.view(server);
-        const task = if (operation == .read) sources.common_provider_registry.gateway.Task.read else .extract;
+        const task = if (operation == .read) sources.common_inference_gateway.Task.read else .extract;
         const local = if (std.mem.indexOfScalar(u8, selector.string, '/') == null or named.contains(task, selector.string)) try gateway.localModels(a, server, task) else &.{};
         const resolved = try named.resolve(task, selector.string, local);
         var connection: []const u8 = if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id;
@@ -185,7 +185,7 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
                     const cfg = try named.readers.?.getConfig(value.name);
                     if (cfg.provider != .antfly) return error.DocumentStorageNotConfigured;
                     if (cfg.resolvedUrl() != null) connection = try std.fmt.allocPrint(a, "readers/{s}", .{value.name});
-                    request = try std.json.parseFromSliceLeaky(V, a, try sources.common_provider_registry.tasks.readingBody(a, cfg, request), .{ .parse_numbers = false });
+                    request = try std.json.parseFromSliceLeaky(V, a, try sources.common_inference_tasks.readingBody(a, cfg, request), .{ .parse_numbers = false });
                     break :blk cfg.model orelse return error.ModelRequired;
                 }
                 const binding = named.providers.extractor_configs.get(value.name) orelse return error.ModelNotFound;

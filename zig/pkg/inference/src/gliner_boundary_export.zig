@@ -22,7 +22,10 @@ const policy = @import("models/gliner_boundary_artifact.zig");
 const access_mod = @import("models/tensor_access.zig");
 const c_file = @import("util/c_file.zig");
 const gguf = @import("gguf/root.zig");
-const registry = @import("registry/registry.zig");
+const registry = if (@import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi)
+    struct {}
+else
+    @import("registry/registry.zig");
 const Control = @import("execution_control.zig").InferenceExecutionControl;
 const Allocator = std.mem.Allocator;
 
@@ -189,6 +192,7 @@ fn writeTensor(allocator: Allocator, sink: *Sink, bytes: []const u8, kind: gguf.
 }
 
 pub fn exportBundle(allocator: Allocator, io: std.Io, source_dir: []const u8, output_dir: []const u8, options: Options) !Result {
+    if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi) return error.UnsupportedPlatform;
     try check(options.control);
     if (output_dir.len == 0 or std.mem.eql(u8, std.fs.path.basename(output_dir), ".") or std.mem.eql(u8, std.fs.path.basename(output_dir), "..")) return error.InvalidOutputPath;
     const cwd = std.Io.Dir.cwd();

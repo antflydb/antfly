@@ -87,6 +87,13 @@ current is managed writable Iceberg. Index/source placement uses the instance's
 recorded artifact connection, separate from source credentials. Do not use the
 convenience Cloud default-table API or substitute a standalone database.
 
+The generated relational index names include `hn_archive_` or `hn_current_`:
+these names share the SQL namespace across tables. Copying an archive schema
+without renaming its relational indexes causes a catalog conflict when creating
+the current table, even though the current table does not exist yet. For an
+existing archive, keep its definition intact and generate unique current index
+names before creating the missing table.
+
 Supply `ANTFLY_API_BASE` including the complete tenant `/cloud/v1/UUID/db/v1` path.
 Use either `ANTFLY_AUTHORIZATION` (the complete header value) or `ANTFLY_API_KEY`
 (a bare key); never both. Authenticated destinations require HTTPS. The gateway

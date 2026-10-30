@@ -433,7 +433,7 @@ pub fn invokeInferenceConnectionWithRequest(
         return .{ .status = @intCast(final.header.code), .body = response_body, .content_type = try alloc.dupe(u8, "application/json") };
     }
     if (stream.start != null and stream.write != null and stream.close != null) {
-        var writer = @import("antfly_local_sources").common_provider_registry.tasks.StreamWriter{ .sink = stream };
+        var writer = @import("antfly_local_sources").common_inference_tasks.StreamWriter{ .sink = stream };
         var response = try (http orelse return error.InferenceTransportUnavailable).requestToWriter(switch (method) {
             .get => .GET,
             .post => .POST,
@@ -607,7 +607,7 @@ fn inferenceCapability(operation: []const u8) ?[]const u8 {
 // Named transcription URLs are API bases; a configured custom path must not
 // acquire another /ai/v1 suffix when sharing the connection transport.
 fn inferenceApiBaseAlloc(alloc: Allocator, remote: RemoteInferenceConnection) ![]u8 {
-    if (remote.preserve_api_path) return @import("antfly_local_sources").common_provider_registry.gateway.apiBaseAlloc(alloc, remote.url);
+    if (remote.preserve_api_path) return @import("antfly_local_sources").common_inference_gateway.apiBaseAlloc(alloc, remote.url);
     const base = std.mem.trimEnd(u8, remote.url, "/");
     if (std.mem.endsWith(u8, base, "/ai/v1")) return alloc.dupe(u8, base);
     return std.fmt.allocPrint(alloc, "{s}/ai/v1", .{base});
@@ -948,13 +948,12 @@ pub fn buildConnectionsResponse(
     }
 
     if (kinds.contains(.inference)) if (sources.node_config) |config| {
-        const registry = @import("antfly_local_sources").common_provider_registry;
-        const view = registry.gateway.View{ .providers = &config.registry, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
+        const view = @import("antfly_local_sources").common_inference_gateway.View{ .providers = &config.registry, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
         const targets = try view.catalog(arena);
         if (targets.len > 0) {
             var models = std.json.ArrayHashMap([]const ConnectedModel){};
             if (opts.include_models) {
-                inline for (std.meta.tags(registry.gateway.Task)) |task| {
+                inline for (std.meta.tags(@import("antfly_local_sources").common_inference_gateway.Task)) |task| {
                     var items: std.ArrayList(ConnectedModel) = .empty;
                     for (targets) |target| {
                         if (target.configured.task != task) continue;
