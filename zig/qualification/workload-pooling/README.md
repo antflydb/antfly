@@ -1880,3 +1880,55 @@ now distinguishes implemented scheduler/remote-ledger primitives from missing
 production integration and stale evidence. Normal SQL bounded-read eligibility
 and guarded DB mutation CPU-lending integration remain concrete unfinished
 capabilities. Full GNU qualification remains waived; the full goal stays open.
+
+### Prepared scalar SQL through shared bounded capacity
+
+`sql_read_lane.zig` now qualifies a source-free scalar program from compiler IR
+rather than a client hint. The proof bounds columns/parameters (16), visited
+expression nodes (128), depth (16) and primitive input/text footprints. It rejects
+providers, scans, functions, sets, aggregates, pattern/array payloads and expansive
+operations. Preparation and original authority checks remain ordinary. Unsupported
+host capabilities, explicit legacy admission and retained input too large for the
+bounded metadata partition keep the existing execution path.
+
+A qualified stage transfers the original parked root, preserving operation/input
+charges, clock and cancellation. Its 512 KiB private heap reserves a physical
+transition before publication, and its independent node worker executes the
+existing SQL runtime. The result heap retains no worker/request stack pointers.
+Original context and root lifetime checks apply inside the stage; provider and
+mutation callbacks fail closed. The worker physically joins before general
+transfer can wait. Result addresses/charges survive that transfer; output uses
+ordinary authority again. Stage-only cleanup authority and resource callbacks
+retire without changing a caller's preexisting cleanup reservation. A refused
+worker publication or query error fences foreground use while charges remain
+until the owning finish; no query is automatically replayed.
+
+Focused verification is complete for this first family. The v13 receipt records
+seven passing scalar cases, including refusal at all four observed private
+checkpoints for both cancellation and deadline, context-only cancellation while
+general capacity stays full, private-worker/control progress during transfer,
+legacy-host compatibility, maximum proof envelopes and normal HTTP/pgwire results.
+The overflow envelope preserves the same error as ordinary execution. The v12
+mixed-protocol regression passed both storage/control cases and all 180 array
+contracts; production definitions are unchanged by the later fixture repairs.
+The v16 compiled API suite passes all 13 cases through the opaque production
+bridge, including authenticated TCP calls with actual bounded grants, portals,
+queued cancellation at connection capacity, timeout and session reuse. These
+selected suites have no skips or leaks and unchanged inputs during their runs.
+
+The compiled fixtures now use the current connector, canonical scheduler byte
+budget and separate service/control worker accounting. Live-snapshot fixtures
+use real 256-row native pages and 1 KiB projected cells to reach the ordinary
+output boundary before EOF. Their finite request-memory budget is 64 MiB: the
+old 16 MiB setting left 1.75 MiB of general-read capacity and correctly refused
+the wider workload. The passing cases retain 3,607,930 and 3,625,954 read bytes
+within 7 MiB, with zero read-memory refusals, and preserve exactly two live
+captures through queued refusal. Snapshot, row-value and cleanup assertions
+remain intact. Earlier failed receipts remain failed evidence; v14 is a failed
+diagnostic compilation and v15 records the measured memory refusal.
+
+This qualifies one bounded operator family when its complete resource envelope
+is available. Ordinary backend scans, vendor work, sessions and other operators
+retain their existing paths and remain in the full-design inventory. It adds no
+all-engine throughput, deployed workload or installed CLI rebuild claim. Full
+GNU qualification remains waived and the full design remains open.

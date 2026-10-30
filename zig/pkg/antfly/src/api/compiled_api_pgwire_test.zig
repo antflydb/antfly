@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Real TCP scalar and native-table parked portals through the compiled API.
 //! Remote streams and process-restart proofs remain separate.
@@ -103,15 +103,8 @@ fn runFixture(mode: Mode) !void {
     // connection deadline still also covers authentication and query I/O.
     const connector = @import("antfly_local_sources").common_threaded_connect_io;
     var client_threads = std.Io.Threaded.init(allocator, .{ .concurrent_limit = .limited(16) });
-    const client_vtable = connector.createVTable(allocator, &client_threads) catch |err| {
-        client_threads.deinit();
-        return err;
-    };
-    defer {
-        client_threads.deinit();
-        allocator.destroy(client_vtable);
-    }
-    const client_io = connector.io(&client_threads, client_vtable);
+    defer client_threads.deinit();
+    const client_io = connector.io(&client_threads);
     var store = usermgr.MemoryStore.init(allocator);
     defer store.deinit();
     var policy = casbin.MemoryAdapter.init(allocator);
@@ -130,7 +123,10 @@ fn runFixture(mode: Mode) !void {
     var native_table: NativeTable = .{};
     if (native_tables) try native_table.init(allocator, runtime.ptr());
     defer if (native_tables) native_table.deinit();
-    if (streaming) try native_table.addContinuationRows(allocator);
+    if (streaming) {
+        native_table.maximum_page_rows = 256;
+        try native_table.addContinuationRows(allocator);
+    }
     var token: u8 = 0;
     const Status = struct {
         fn get(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
@@ -160,11 +156,14 @@ fn runFixture(mode: Mode) !void {
         .backend_runtime = runtime.ptr(),
         .user_manager = &manager,
         .auth_enabled = true,
-        .request_memory_bytes = 16 << 20,
+        // Wide live-snapshot pages need projection scratch as well as retained
+        // output. The 16 MiB scalar fixture leaves only 1.75 MiB for general
+        // reads and rejects this working set before portal suspension.
+        .request_memory_bytes = if (streaming) 64 << 20 else 16 << 20,
         .retained_memory_bytes = 16 << 20,
         .query_max_concurrent_requests = 2,
         .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 65536, .max_wait_ms = 5000 },
-        .runnable_policy = .{ .slots = 4, .cleanup_slots = 1, .max_operations = 16, .read_isolation = true, .max_wait_ms = 5000, .control_bytes = @import("antfly_local_sources").common_config.default_runnable_policy.control_bytes },
+        .runnable_policy = .{ .slots = 4, .cleanup_slots = 1, .max_operations = 16, .read_isolation = true, .max_wait_ms = 5000, .max_bytes = @import("antfly_local_sources").common_config.default_runnable_policy.max_bytes, .control_bytes = @import("antfly_local_sources").common_config.default_runnable_policy.control_bytes },
         .pgwire = .{ .enabled = true, .bind_port = 0, .max_connections = if (cancel_mode) 6 else 8, .max_session_bytes = 8 << 20, .max_retained_bytes = if (mode != .idle) 4 << 20 else 512 << 10, .retained_bytes_per_connection = if (mode != .idle) 512 << 10 else 64 << 10 },
     }, if (native_tables) try native_table.statusSource() else .{ .ptr = &token, .vtable = &.{ .status = Status.get, .system_catalog = Status.catalog, .supports_query_definitions = true } }, if (native_tables) native_table.readSource() else null, null);
     var api_live = true;
@@ -172,6 +171,12 @@ fn runFixture(mode: Mode) !void {
     const port = (try api.pgwireBoundPort()) orelse return error.PgwireFixtureMissingListener;
     if (port == 0) return error.PgwireFixtureMissingListener;
     {
+        var telemetry = try bridge.createHandler(&api);
+        defer bridge.deinitHandler(&telemetry);
+        errdefer if (streaming) {
+            const stats = bridge.handlerStats(&telemetry);
+            std.debug.print("live snapshot fixture failure: read memory={any}; memory={any}\n", .{ stats.read_memory, stats.memory });
+        };
         var clients: [6]?*Client = @splat(null);
         defer for (clients) |client| if (client) |value| value.close();
         for (&clients) |*client| client.* = try Client.connect(allocator, client_io, port, "local-test-password");
@@ -180,10 +185,14 @@ fn runFixture(mode: Mode) !void {
         if (mode == .portals or mode == .native_portals) try portalProgress(&api, clients, native_tables);
         if (cancel_mode) {
             if (deadline_mode) try clients[2].?.command("SET statement_timeout = '100ms'", "SET\x00");
-            const stream_query = "SELECT id + $1 AS x FROM usage_records";
+            // A narrow 302-row scan now fits one execution batch and may
+            // correctly retire storage before portal suspension. Real 256-row
+            // pages plus 1 KiB output stop at the normal output-byte boundary,
+            // leaving an actual native continuation/snapshot for this fixture.
+            const stream_query = "SELECT lpad((id + $1)::text, 1024, '0') AS x FROM usage_records";
             if (streaming) {
-                try clients[0].?.suspendPortalQueryExpected('0', stream_query, '4');
-                try clients[1].?.suspendPortalQueryExpected('1', stream_query, '5');
+                try clients[0].?.suspendPortalQueryExpectedWidth('0', stream_query, '4', 1024);
+                try clients[1].?.suspendPortalQueryExpectedWidth('1', stream_query, '5', 1024);
             } else {
                 try clients[0].?.suspendPortalQuery('7', native_query);
                 try clients[1].?.suspendPortalQuery('4', native_query);
@@ -200,6 +209,10 @@ fn runFixture(mode: Mode) !void {
                 try std.testing.expectEqual(@as(usize, 2), captured);
                 try std.testing.expectEqual(@as(usize, 2), live);
                 try std.testing.expectEqual(@as(usize, 0), closed);
+                const memory = bridge.handlerStats(&telemetry).read_memory;
+                try std.testing.expectEqual(@as(u64, 0), memory.rejected);
+                try std.testing.expect(memory.used_bytes[0] > 0);
+                std.debug.print("live snapshot fixture parked read bytes={d}; capacity={d}\n", .{ memory.used_bytes[0], memory.capacity_bytes[0] });
             }
             try std.testing.expect(captured >= 2);
             try std.testing.expectEqual(captured, closed + live);
@@ -237,7 +250,7 @@ fn runFixture(mode: Mode) !void {
                 for (remaining[1..], 0..) |*value, index| value.* = @intCast(index + 101);
                 try clients[1].?.finishIntegerPortal(&remaining);
                 try waitNoQueries(&api);
-                try clients[2].?.suspendPortalQueryExpected('0', stream_query, '4');
+                try clients[2].?.suspendPortalQueryExpectedWidth('0', stream_query, '4', 1024);
                 remaining[0] = 7;
                 for (remaining[1..], 0..) |*value, index| value.* = @intCast(index + 100);
                 try clients[2].?.finishIntegerPortal(&remaining);
@@ -305,6 +318,8 @@ fn runFixture(mode: Mode) !void {
     // The opaque producer must claim the host's shared physical roles, rather
     // than alias raw general IO or create a private pool per connection.
     try std.testing.expectEqual(@as(usize, 12), runtime.ptr().sharedSqlStats(.execution).retained_capacity);
+    // Actual TCP queries must use bounded service, beyond reserving its worker.
+    try std.testing.expect(api.runnableSchedulingStats().read_lane_grants[@backingInt(native.RunnableScheduler.ReadLane.bounded)] > 0);
     const bounded_workers = runtime.ptr().sharedSqlStats(.bounded_read);
     try std.testing.expectEqual(@as(usize, 1), bounded_workers.retained_capacity);
     try std.testing.expectEqual(@as(usize, 1), bounded_workers.borrowers);

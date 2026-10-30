@@ -1597,6 +1597,66 @@ pub const Scheduler = struct {
         e.read_resource_transfer = transfer;
     }
 
+    /// A trusted prepared stage may transfer an existing parked root. The
+    /// caller has joined preparation, reserved its physical bounded/transition
+    /// footprint and independent cleanup, and has not published stage work.
+    /// This is never ordinary plan classification or a second operation.
+    pub fn prepareBoundedRead(self: *Scheduler, e: *Entry, budget: ReadTransitionBudget, transfer: ReadResourceTransfer) !void {
+        try self.checkAuthority(e);
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return error.SchedulerClosed;
+        if (!self.config.readIsolation() or e.scheduler != self or e.state != .resource_blocked or
+            e.class != .query or e.read_lane == .bounded or e.slots != 1 or e.parent != null or e.children != 0 or
+            e.retainedPhase() or e.publication_active or e.completion_options != null or e.cleanup_options == null or
+            e.cpu_borrow_budget != null or e.pending_resources != null or e.read_transition_budget != null or
+            e.read_transition_active or e.read_resource_transfer != null)
+            return error.InvalidRunnableTransition;
+        if (budget.max_retained_bytes < e.bytes or budget.max_wait_ms == 0 or
+            budget.max_wait_ms > self.config.max_wait_ms or budget.estimated_work_ns == 0)
+            return error.InvalidRunnableDemand;
+        const count_used = self.metrics.bounded_read_operations + self.metrics.read_transition_reserved_operations;
+        const bytes_used = self.metrics.bounded_read_bytes + self.metrics.read_transition_reserved_bytes;
+        if (count_used + 2 > self.boundedCountLimit() or
+            e.bytes > self.boundedByteLimit() -| bytes_used or
+            budget.max_retained_bytes > self.boundedByteLimit() -| bytes_used -| e.bytes)
+        {
+            self.metrics.rejected +|= 1;
+            return error.SchedulerFull;
+        }
+        self.metrics.bounded_read_operations += 1;
+        self.metrics.bounded_read_bytes += e.bytes;
+        self.metrics.read_transition_reserved_operations += 1;
+        self.metrics.read_transition_reserved_bytes += budget.max_retained_bytes;
+        e.read_lane = .bounded;
+        e.read_transition_budget = budget;
+        e.read_resource_transfer = transfer;
+        e.measured_read_work_ns = 0;
+        e.bounded_service_paid = 0;
+    }
+
+    /// The stage's physical owner can retire after general transfer and join.
+    /// Its callbacks must never remain borrowed from a returned stack frame.
+    pub fn detachReadResources(self: *Scheduler, e: *Entry, release_cleanup: bool) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self or (e.state != .stopped and
+            (e.read_lane == .bounded or e.read_transition_active or e.read_transition_budget != null)))
+            return error.InvalidRunnableTransition;
+        if (release_cleanup and (e.cleanup_active or e.children != 0)) return error.InvalidRunnableTransition;
+        e.read_resource_transfer = null;
+        if (release_cleanup) {
+            e.cleanup_options = null;
+            e.cleanup_duration_ns = null;
+        }
+    }
+
+    /// The prepared worker has physically joined. Fence further foreground
+    /// use while retaining the original root's charges until owning finish.
+    pub fn stopPreparedRead(self: *Scheduler, e: *Entry, cause: anyerror) void {
+        self.failWait(e, cause, true);
+    }
+
     /// Trusted caller has reached a verified yield point and joined helpers.
     /// Actual ownership moves once; reserved capacity is not another live copy.
     pub fn beginReadDemotion(self: *Scheduler, e: *Entry, target: ReadLane) !void {
@@ -2267,19 +2327,34 @@ pub const Execution = struct {
     }
 
     pub fn demoteRead(self: *Execution, target: ReadLane) !void {
+        return self.demoteReadWithCheck(target, null);
+    }
+
+    /// Additional original caller restrictions remain live during physical
+    /// destination waiting and CPU reentry. They can only narrow authority.
+    pub fn demoteReadWithCheck(self: *Execution, target: ReadLane, restriction: ?AdmissionCheck) !void {
         if (self.child_pending or self.borrowed != null) return error.InvalidRunnableTransition;
         const e = if (self.entry) |*entry| entry else return error.InvalidRunnableTransition;
         const owner = try schedulerFor(e, true);
+        if (restriction) |check| check.check(check.context) catch |err| {
+            owner.failWait(e, err, true);
+            return err;
+        };
         self.measureReadWork(owner, e);
         try owner.beginReadDemotion(e, target);
-        while (!(try owner.tryCompleteReadDemotion(e))) {
+        while (true) {
+            if (restriction) |check| check.check(check.context) catch |err| {
+                owner.failWait(e, err, true);
+                return err;
+            };
+            if (try owner.tryCompleteReadDemotion(e)) break;
             e.options.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
                 owner.failWait(e, err, true);
                 return err;
             };
         }
         try owner.unblock(e);
-        try owner.waitRetained(e);
+        try owner.waitRetainedWithCheck(e, restriction);
         self.quantum_start_ns = e.options.now();
         self.read_sample_ns = self.quantum_start_ns;
         self.checkpoints = 0;

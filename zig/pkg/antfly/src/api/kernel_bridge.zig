@@ -1280,9 +1280,10 @@ test "remote attempt owner bootstrap crosses opaque API and never recreates miss
         api = try Server.initWithConfig(alloc, api_config, status_source, null, null);
         live = true;
         {
-            // Five ordinary control workers and the first exclusive consumer
-            // fit; the second exclusive worker must fail without publication.
-            var pressure = try runtime.ptr().acquireWorkers(.{ .capacity = 10 });
+            // Shared SQL control workers have their own partition. Leave one
+            // service worker for the first exclusive consumer; the second
+            // must fail without publication and unwind the first consumer.
+            var pressure = try runtime.ptr().acquireWorkers(.{ .capacity = runtime.ptr().lane_limits.worker_capacity - 1 });
             defer pressure.release();
             try std.testing.expectError(if (use_opaque) error.Unavailable else error.WorkerCapacityExceeded, api.bootstrapRemoteAttempts(config));
             try std.testing.expect(!(try api.remoteAttemptOwnerStats()).initialized);

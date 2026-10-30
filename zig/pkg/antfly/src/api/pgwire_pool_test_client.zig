@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Bounded real TCP client shared by focused pooling integration fixtures.
 const std = @import("std");
@@ -209,6 +209,10 @@ pub const Client = struct {
         return self.suspendPortalQueryExpected(digit, query, digit);
     }
     pub fn suspendPortalQueryExpected(self: *Client, digit: u8, query: []const u8, expected: u8) !void {
+        return self.suspendPortalQueryExpectedWidth(digit, query, expected, 1);
+    }
+    pub fn suspendPortalQueryExpectedWidth(self: *Client, digit: u8, query: []const u8, expected: u8, width: usize) !void {
+        if (width == 0 or width > 1024) return error.PgwireFixtureBadParameter;
         if (digit < '0' or digit > '8' or query.len > 1024 or std.mem.indexOfScalar(u8, query, 0) != null) return error.PgwireFixtureBadParameter;
         var parse_bytes: [1041]u8 = undefined;
         var parse = std.Io.Writer.fixed(&parse_bytes);
@@ -218,13 +222,13 @@ pub const Client = struct {
         try parse.writeInt(u16, 1, .big);
         try parse.writeInt(u32, 20, .big);
         try self.send('P', parse.buffered());
-        return self.bindAndSuspend(digit, true, expected);
+        return self.bindAndSuspend(digit, true, expected, width);
     }
     pub fn suspendPreparedPortal(self: *Client, digit: u8) !void {
         if (digit < '0' or digit > '8') return error.PgwireFixtureBadParameter;
-        return self.bindAndSuspend(digit, false, digit);
+        return self.bindAndSuspend(digit, false, digit, 1);
     }
-    fn bindAndSuspend(self: *Client, digit: u8, expect_parse: bool, expected: u8) !void {
+    fn bindAndSuspend(self: *Client, digit: u8, expect_parse: bool, expected: u8, width: usize) !void {
         var bytes: [64]u8 = undefined;
         var bind = std.Io.Writer.fixed(&bytes);
         try bind.writeAll("session-held\x00session-p\x00");
@@ -258,7 +262,14 @@ pub const Client = struct {
                     described = true;
                 },
                 'D' => {
-                    try expectInteger(frame.body, expected);
+                    if (width == 1) {
+                        try expectInteger(frame.body, expected);
+                    } else {
+                        if (frame.body.len != width + 6 or std.mem.readInt(u16, frame.body[0..2], .big) != 1 or
+                            std.mem.readInt(i32, frame.body[2..6], .big) != width or frame.body[frame.body.len - 1] != expected)
+                            return error.PgwireFixtureUnexpectedPortalValue;
+                        for (frame.body[6 .. frame.body.len - 1]) |byte| if (byte != '0') return error.PgwireFixtureUnexpectedPortalValue;
+                    }
                     rows += 1;
                 },
                 's' => {

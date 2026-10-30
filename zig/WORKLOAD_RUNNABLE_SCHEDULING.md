@@ -1299,13 +1299,15 @@ default to no isolation. `read_isolation: false` explicitly disables the reserve
 `true` requires enough CPU/registry capacity, including managed cleanup. General
 writes and background teams use the remaining general capacity.
 
-This is a scheduling reservation, not a bound on all backend allocations. No
-production SQL operator currently qualifies for the bounded lane: even constant
-queries pass through catalog/provider setup. Trusted bounded entries prohibit
-input growth, child fanout and mutation promotion. The verified operator
-inventory, physical worker/application-memory reserves, measured work debt,
-backend/application-owner integration for demotion, safe unused-capacity
-borrowing and production lane integration under overload remain required.
+This is a scheduling reservation, not a bound on all backend allocations.
+Source-free prepared scalar programs now have a production bounded stage in
+`api/sql_read_lane.zig`. Ordinary preparation and authority checks run first;
+a verified IR footprint then transfers the same request root to the private
+worker/heap. Worker join precedes checked demotion and output. Trusted bounded
+entries prohibit input growth, child fanout and mutation promotion. Backend
+scans, provider calls, sessions and other unqualified operators keep ordinary
+classification. Their complete work/continuation/worker proofs and safe stage
+integration remain required; a small LIMIT alone establishes none of them.
 
 Lane metrics expose effective capacity, parked ownership and CPU grants through
 the versioned runtime snapshot. API kernel ABI 48 rejects older layout contracts;
@@ -1500,22 +1502,24 @@ An insufficient configured queue envelope refuses publication.
 
 Focused worker/API tests cover full foreground/cleanup saturation, 32 consumers,
 protected IO progress, failed publication/retry and final retirement. Actual
-compiled API role integration remains pending. Reserving this executor does not
-qualify a production operator or prove its private stack/heap/work bounds; stage
-wiring and those resource proofs remain necessary.
+compiled API role integration is exercised by the prepared scalar path and TCP
+fixture assertions for actual bounded grants. Reserving this executor alone does
+not qualify another operator. Each additional family still needs complete
+private stack/heap/work bounds and stage wiring.
 
 ### Operator eligibility inventory
 
 | Path | Established execution boundary | Retained continuation | Remaining bounded-lane proof | Current policy |
 | --- | --- | --- | --- | --- |
 | SQL preparation/cache (`api/sql_preparation.zig`) | Controlled compilation and cache waits retain original authority; verified waits lend CPU | Request capsule and plan lease | Maximum non-yielding work, fixed continuation footprint and private worker/heap floor | General |
-| Constant SQL (`api/sql_execution.zig`) | Existing read fences and catalog/provider setup | Adapter, plan, parameters and result owner | Catalog/provider setup and all required allocations lack a verified bounded work/transfer contract | General |
+| Source-free scalar SQL (`api/sql_execution.zig`, `api/sql_read_lane.zig`) | Ordinary authority/setup precedes a private pure stage; no provider/scan/mutation callback is published | Original root, bounded heap, finite transition credit and independently retained result heap | IR limits: 16 columns/parameters, 128 visited nodes, depth 16, bounded primitive text/numeric inputs; 512 KiB private heap. Compatibility and maximum-envelope fixtures accompany the stage. No unchecked operator/time-preemption claim | Bounded for the qualified stage, checked general transfer before output; unsupported hosts/plans retain ordinary execution |
 | SQL scans (`sql/read_stream.zig`) | Controlled scan callbacks and the worker-ready barrier lend/reacquire CPU | Snapshot, pages and physically joined worker children | Backend non-yielding maximum and a verified transition/cleanup bound | Unbounded plans analytical; remaining unverified plans general |
 | Typed SQL vector expressions (`sql/typed_kernel.zig`, `sql/vector_eval.zig`) | Prepared numeric chunks run on the original coordinator with node-charged fixed scratch and owner checkpoints; serial coordinator scope is separate from parallel authority | Immutable program, input page, result and fixed prepared scratch | Qualify non-yielding time and complete continuation/worker bounds; bind checked prepared CPU phases and protected-arrival proof; exclude preparation/fallback from borrowing | Ordinary general/analytical execution; no production borrowing or bounded eligibility |
 | SQL grouping/join/order | Existing cooperative operator scopes and resource/output wait owners | Aggregate/join/sort state and separately owned spill resources | Complete continuation accounting, measured debt and bounded demotion transfer | Analytical |
 | JSON/graph query ingress | Shared query root and existing resource owners | Backend-specific query and child/result owners | Trusted plan classification and each operator's maximum non-yielding/continuation bounds | General |
 
-No row currently establishes production bounded eligibility. These are source
+The source-free scalar row establishes the first production bounded family.
+Other rows do not inherit that eligibility. These are source
 boundaries and missing predicates, not a replacement for matching production
 fixtures. The minimum cleanup/transition allocation for each demotable operator
 must be verified before it can enter the bounded lane.

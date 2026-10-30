@@ -1551,6 +1551,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-remote-attempt-test", "Verify remote uncertainty accounting, duplicate rejection and generation gate state machines")
         .dependOn(&b.addRunArtifact(remote_attempt_tests).step);
 
+    const prepared_scalar_tests = b.addTest(.{
+        .name = "sql-prepared-scalar-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &.{"SQL prepared scalar"},
+        .max_rss = 8 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-sql-prepared-scalar-test", "Verify prepared scalar ownership through the production SQL adapter")
+        .dependOn(&addFilteredTestRunArtifact(b, prepared_scalar_tests).step);
+
     const sql_protocol_pooling_tests = b.addTest(.{
         .name = "sql-protocol-pooling-tests",
         .root_module = options.api_http_runtime_test_mod,

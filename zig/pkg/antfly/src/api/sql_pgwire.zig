@@ -500,6 +500,10 @@ const OwnedRead = struct {
         var plan = server.sqlPlanCache().acquireControlled(server.sqlPlanCacheIo(), .{ .statement = request.statement, .principal = credential.principal, .database = request.database orelse "default", .namespace = request.namespace orelse "public" }, &diagnostic, preparation_owner.control()) catch |err| return preparation_owner.original(err);
         defer if (!moved) plan.release(server.sqlPlanCacheIo());
         if (plan.compiled().statement != .select) return null;
+        // A source-free fixed scalar stage uses ordinary materialized delivery.
+        // Decline before stream setup or row execution; the fallback owns the
+        // checked result, including portal suspension, without replaying rows.
+        if (request.session_id == null and @import("sql_read_lane.zig").preparedScalar(plan.compiled(), request.parameters, .{ .parameter_cells = request.parameter_cells })) return null;
         preparation.release();
         try @import("sql_read_lane.zig").apply(&self.runnable, plan.compiled());
         var admission = try server.acquireSqlExecutionUnderRunnable(&self.runnable, false, false, preparation_options);

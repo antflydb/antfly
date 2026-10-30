@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Host-owned native table callbacks for the actual compiled API consumer.
 //! The immutable local fixture does not certify Raft or process recovery.
@@ -98,6 +98,7 @@ pub const Fixture = struct {
     pages: std.atomic.Value(usize) = .init(0),
     refusals: std.atomic.Value(usize) = .init(0),
     nested_calls: std.atomic.Value(usize) = .init(0),
+    maximum_page_rows: u32 = std.math.maxInt(u32),
     pub const FaultStage = enum(u8) { capture = 1, page = 2, after_page = 3 };
     pub const FaultReason = enum(u8) { memory = 1, canceled = 2, unavailable = 3 };
 
@@ -266,7 +267,10 @@ pub const Fixture = struct {
         fn read(self: *@This(), allocator: std.mem.Allocator, limit: u32, control: ?local.common_read_admission.Port) !read_contract.RelationalReadView.Page {
             _ = self.fixture.nested_calls.fetchAdd(1, .acq_rel);
             try self.fixture.takeFault(.page);
-            var page = if (control) |port| try self.native.nextWithAdmission(allocator, limit, port) else try self.native.next(allocator, limit);
+            // Exercise an actual smaller native page without forging EOF or
+            // cursor position. The storage owner supplies its real continuation.
+            const wanted = @min(limit, self.fixture.maximum_page_rows);
+            var page = if (control) |port| try self.native.nextWithAdmission(allocator, wanted, port) else try self.native.next(allocator, wanted);
             errdefer page.deinit();
             _ = self.fixture.pages.fetchAdd(1, .acq_rel);
             try self.fixture.takeFault(.after_page);

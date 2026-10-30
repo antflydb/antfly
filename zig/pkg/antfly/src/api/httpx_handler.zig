@@ -24553,3 +24553,80 @@ test "httpx write admission schedules batch workers and inline fallback under or
         try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().operations);
     }
 }
+
+test "SQL prepared scalar normal HTTP and pgwire callers preserve results and retire private resources" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const wire = @import("../pgwire/backend.zig");
+    var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var auth = try initTestAuthManager(a);
+    defer auth.store.deinit();
+    defer auth.policy_store.deinit();
+    try bindTestAuthManager(a, &auth);
+    defer auth.manager.deinit();
+    var permission = try usermgr.Permission.initOwned(a, .namespace, "*", .read);
+    defer permission.deinit(a);
+    var user = try auth.manager.createUser("scalar-reader", "secret", &.{permission});
+    defer user.deinit(a);
+    var server = try ApiHttpServer.initWithConfig(a, .{
+        .backend_runtime = runtime.ptr(),
+        .request_memory_bytes = 16 << 20,
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+        .runnable_policy = .{ .slots = 4, .cleanup_slots = 1, .read_isolation = true, .max_operations = 64 },
+    }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &server };
+    const authorization = try encodeBasicAuthorization(a, "scalar-reader", "secret");
+    defer a.free(authorization);
+    {
+        var request = try httpx.Request.init(a, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        try request.headers.append("authorization", authorization);
+        request.body = "{\"statement\":\"SELECT $1 + 1 AS n, 'bounded' AS label\",\"parameters\":[41]}";
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.executeSQL(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        var parsed = try std.json.parseFromSlice(sql_wire.SQLResponse, a, response.body.?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("42", parsed.value.rows[0][0].string);
+        try std.testing.expectEqualStrings("bounded", parsed.value.rows[0][1].string);
+    }
+    const after_http = server.runnableSchedulingStats();
+    const bounded = @backingInt(http_server_mod.RunnableScheduler.ReadLane.bounded);
+    try std.testing.expect(after_http.read_lane_grants[bounded] > 0);
+    var pg: @import("sql_pgwire.zig").Adapter = .{ .server = &server };
+    const backend = pg.backend();
+    const identity = try backend.vtable.authenticate(backend.context, a, "scalar-reader", "secret");
+    defer identity.release(identity.context, a);
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const request: wire.Request = .{
+        .statement = "SELECT $1 + 1 AS n, 'bounded' AS label",
+        .parameters = &.{.{ .integer = 41 }},
+        .parameter_types = &.{.integer},
+        .limit = 128,
+        .io = std.testing.io,
+        .cancel_requested = &canceled,
+        .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } },
+    };
+    if (backend.vtable.open_stream) |open| try std.testing.expect((try open(backend.context, arena.allocator(), identity, request)) == null);
+    var result = try backend.vtable.execute(backend.context, arena.allocator(), identity, request);
+    defer result.deinit();
+    var encoded: std.Io.Writer.Allocating = .init(a);
+    defer encoded.deinit();
+    try @import("../pgwire/values.zig").encodeCellInto(a, &encoded.writer, result.columns[0], 0, try result.cell(arena.allocator(), 0, 0), 1024);
+    try std.testing.expectEqualStrings("42", encoded.written());
+    try std.testing.expectEqualStrings("bounded", (try result.cell(arena.allocator(), 0, 1)).value.string);
+    try std.testing.expect(server.runnableSchedulingStats().read_lane_grants[bounded] > after_http.read_lane_grants[bounded]);
+    result.deinit();
+    try std.testing.expectEqual(@as(u64, 0), server.runnableSchedulingStats().operations);
+    const memory = server.readMemoryStats();
+    for (memory.used_bytes) |used| try std.testing.expectEqual(@as(u64, 0), used);
+    for (memory.groups) |groups| try std.testing.expectEqual(@as(u64, 0), groups);
+    try std.testing.expectEqual(@as(u64, 0), memory.transition_reserved_bytes);
+}

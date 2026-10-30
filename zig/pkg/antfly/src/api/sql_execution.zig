@@ -615,6 +615,20 @@ pub const Adapter = struct {
         var statement_backend = guarded_backend orelse self.backend();
         statement_backend.decision_provider = self.decision_provider;
         if (compiled.uses_current_setting and statement_backend.setting_capture == null) statement_backend.setting_capture = self.settingCapture();
+        if (self.session_id == null and self.connection_id == null) if (self.runnable) |execution| {
+            // All ordinary authorization/preparation remains outside the private
+            // scalar stage. Revalidate after checked demotion before delivery.
+            if (@import("sql_read_lane.zig").preparedScalar(compiled, parameters, limits)) {
+                try statement_backend.vtable.checkpoint(statement_backend.ptr);
+                if (try @import("sql_read_lane.zig").executePreparedScalar(self.server, execution, compiled, parameters, limits, statement_backend, self.context)) |prepared_result| {
+                    var result = prepared_result;
+                    errdefer result.deinit();
+                    try statement_backend.vtable.checkpoint(statement_backend.ptr);
+                    try self.validateReadFence(true);
+                    return result;
+                }
+            }
+        };
         if (self.read_delivery) |delivery| if (self.session_id == null and compiled.statement == .select) {
             if (try @import("antfly_local_sources").sql_read_stream.Stream.openOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), statement_backend, compiled, parameters, limits)) |stream| {
                 defer stream.close();
