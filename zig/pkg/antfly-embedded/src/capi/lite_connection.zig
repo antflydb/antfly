@@ -378,7 +378,7 @@ pub const PreparedPublication = struct {
 // a stream of short reads from starving queued writers and maintenance.
 const QueuedMutex = struct {
     state: std.Io.Mutex = .init,
-    ready: std.Io.Condition = .init,
+    ready: @import("antfly_platform").sync.BroadcastCondition = .init,
     next: u64 = 0,
     serving: u64 = 0,
 
@@ -2968,4 +2968,97 @@ test "capi native allocator proof refuses admission on a moving tip" {
     owner.test_after_allocator_capture = null;
     const root = try connection.refresh(&lease, .mutation);
     try std.testing.expect(root.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+}
+
+test "capi native allocator proof queue retains eligible wake after spurious competitor" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const io = h.handleLockIo();
+    var gate: QueuedMutex = .{};
+    const Schedule = struct {
+        const Outcome = enum(u8) { none, entered, reblocked };
+        first_parked: std.Io.Event = .unset,
+        second_parked: std.Io.Event = .unset,
+        second_held: std.Io.Event = .unset,
+        release_first: std.Io.Event = .unset,
+        release_second: std.Io.Event = .unset,
+        outcome_ready: std.Io.Event = .unset,
+        first_entered: std.Io.Event = .unset,
+        outcome: std.atomic.Value(Outcome) = .init(.none),
+    };
+    var schedule: Schedule = .{};
+    const Waiter = struct {
+        base: std.Io,
+        gate: *QueuedMutex,
+        schedule: *Schedule,
+        first: bool,
+        calls: usize = 0,
+        fn wait(ptr: ?*anyopaque, word: *const u32, expected: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (word != &self.gate.ready.epoch.raw) return self.base.futexWaitUncancelable(u32, word, expected);
+            self.calls += 1;
+            if (self.calls == 1) {
+                const parked = if (self.first) &self.schedule.first_parked else &self.schedule.second_parked;
+                parked.set(self.base);
+            }
+            if (self.first and self.calls == 2) {
+                self.schedule.outcome.store(.reblocked, .release);
+                self.schedule.outcome_ready.set(self.base);
+            }
+            if (!self.first and self.calls == 2) {
+                // A legal spurious wake lets a competitor recheck before the
+                // eligible waiter resumes. It must not consume that waiter's
+                // remaining broadcast signal and leave its ticket asleep.
+                return;
+            }
+            if (!self.first and self.calls == 3) {
+                self.schedule.second_held.set(self.base);
+                self.schedule.release_second.waitUncancelable(self.base);
+            }
+            self.base.futexWaitUncancelable(u32, word, expected);
+            if (self.first and self.calls == 1) self.schedule.release_first.waitUncancelable(self.base);
+        }
+        fn wake(ptr: ?*anyopaque, word: *const u32, count: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.base.futexWake(u32, word, count);
+        }
+        fn run(self: *@This()) void {
+            // QueuedMutex only uses futex operations on its supplied Io.
+            var vtable = self.base.vtable.*;
+            vtable.futexWaitUncancelable = wait;
+            vtable.futexWake = wake;
+            const controlled: std.Io = .{ .userdata = self, .vtable = &vtable };
+            self.gate.lockUncancelable(controlled);
+            if (self.first) {
+                self.schedule.outcome.store(.entered, .release);
+                self.schedule.outcome_ready.set(self.base);
+                self.schedule.first_entered.set(self.base);
+            }
+            self.gate.unlock(controlled);
+        }
+    };
+    var first: Waiter = .{ .base = io, .gate = &gate, .schedule = &schedule, .first = true };
+    var second: Waiter = .{ .base = io, .gate = &gate, .schedule = &schedule, .first = false };
+    gate.lockUncancelable(io);
+    const first_thread = try std.Thread.spawn(.{}, Waiter.run, .{&first});
+    schedule.first_parked.waitUncancelable(io);
+    const second_thread = try std.Thread.spawn(.{}, Waiter.run, .{&second});
+    schedule.second_parked.waitUncancelable(io);
+    gate.unlock(io);
+    schedule.second_held.waitUncancelable(io);
+    schedule.release_first.set(io);
+    schedule.outcome_ready.waitUncancelable(io);
+    const initial = schedule.outcome.load(.acquire);
+    // Repair the old implementation's lost wake only to join every thread
+    // before reporting the regression. The fixed implementation needs none.
+    if (initial == .reblocked) {
+        gate.state.lockUncancelable(io);
+        gate.ready.broadcast(io);
+        gate.state.unlock(io);
+    }
+    schedule.first_entered.waitUncancelable(io);
+    schedule.release_second.set(io);
+    first_thread.join();
+    second_thread.join();
+    try std.testing.expectEqual(Schedule.Outcome.entered, initial);
+    try std.testing.expectEqual(gate.next, gate.serving);
 }
