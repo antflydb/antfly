@@ -87,6 +87,8 @@ pub const common_index_repair_status = @import("common/index_repair_status.zig")
 pub const common_process_memory_budget = @import("common/process_memory_budget.zig");
 pub const common_prometheus = @import("common/prometheus.zig");
 pub const common_provider_limits = @import("common/provider_limits.zig");
+pub const common_inference_gateway = @import("common/inference_gateway.zig");
+pub const common_inference_tasks = @import("common/inference_tasks.zig");
 pub const common_provider_registry = @import("common/provider_registry.zig");
 pub const common_secret_contract = @import("common/secret_contract.zig");
 pub const common_secret_record = @import("common/secret_record.zig");
@@ -855,3 +857,6 @@ pub const storage_db_group_source_transfer = @import("storage/db/group_source_tr
 pub const storage_db_enrichment_media_output = @import("storage/db/enrichment/media_output.zig");
 
 pub const storage_db_enrichment_media_output_counts = @import("storage/db/enrichment/media_output_counts.zig");
+
+pub const storage_db_field_projection_source = @import("storage/db/field_projection_source.zig");
+pub const storage_source_value_identity = @import("storage/source_value_identity.zig");

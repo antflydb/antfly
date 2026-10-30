@@ -29,8 +29,9 @@ import {
   DialogHeader,
   DialogTitle,
   DialogTrigger,
+  Field,
+  FieldLabel,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
@@ -273,7 +274,7 @@ export function SecretsPage() {
     <DashboardPage>
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Secrets</DashboardPageTitle>
+          <DashboardPageTitle>Secrets</DashboardPageTitle>
           <DashboardPageDescription>
             Manage API keys and credentials for AI providers.
           </DashboardPageDescription>
@@ -310,8 +311,8 @@ export function SecretsPage() {
                       </p>
                     </Alert>
                   )}
-                  <div className="space-y-2">
-                    <Label>Provider</Label>
+                  <Field className="gap-2">
+                    <FieldLabel>Provider</FieldLabel>
                     <Select value={selectedPreset} onValueChange={handlePresetChange}>
                       <SelectTrigger>
                         <SelectValue placeholder="Select a provider or enter custom..." />
@@ -325,20 +326,20 @@ export function SecretsPage() {
                         <SelectItem value="custom">Custom...</SelectItem>
                       </SelectContent>
                     </Select>
-                  </div>
+                  </Field>
                   {(selectedPreset === "custom" || !selectedPreset) && (
-                    <div className="space-y-2">
-                      <Label htmlFor="secret-key">Key</Label>
+                    <Field className="gap-2">
+                      <FieldLabel htmlFor="secret-key">Key</FieldLabel>
                       <Input
                         id="secret-key"
                         value={newKey}
                         onChange={(e) => setNewKey(e.target.value)}
                         placeholder="e.g., openai.api_key"
                       />
-                    </div>
+                    </Field>
                   )}
-                  <div className="space-y-2">
-                    <Label htmlFor="secret-value">Value</Label>
+                  <Field className="gap-2">
+                    <FieldLabel htmlFor="secret-value">Value</FieldLabel>
                     <div className="relative">
                       <Input
                         id="secret-value"
@@ -362,7 +363,7 @@ export function SecretsPage() {
                         )}
                       </Button>
                     </div>
-                  </div>
+                  </Field>
                 </div>
                 <DialogFooter>
                   <Button variant="outline" onClick={() => setAddDialogOpen(false)}>

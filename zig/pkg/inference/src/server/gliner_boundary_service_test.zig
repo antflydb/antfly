@@ -451,7 +451,7 @@ test "gliner boundary v2 upgrades a plain extraction request without schema_vers
 // (host.linkedInferenceInvokeProvider in inference/src/host/host.zig)
 // calls Node.extractDirectWithControl directly, never through extractJSON.
 // It sends a typed extracting_api.Request built from the enrichment runtime's
-// producer_json config (examples/dogfood/index_config.go's
+// producer_json config (examples/antfly-docs-knowledge-base/index_config.go's
 // knowledgeGraphIndexJSON: {"provider":"antfly","model":...,"schema":
 // {"entities":[...],"relations":[{"type":...}]},"options":{...}}, rendered
 // by zig/lib/extracting without ever setting "schema_version"), so
@@ -499,7 +499,7 @@ test "gliner boundary provider extractDirect upgrades a plain request for the qu
 }
 
 // Follow-up: closing the gap between the in-process provider rate (measured
-// at ~1.8 sections/s during a real examples/dogfood ingest, which also runs
+// at ~1.8 sections/s during a real examples/antfly-docs-knowledge-base ingest, which also runs
 // the Qwen3 embedder concurrently on the same Metal device -- a confound) and
 // the standalone-server HTTP rate (~4.5 sections/s, GLINER25.md's long-document
 // throughput section). This isolates the provider entry itself
@@ -558,7 +558,7 @@ fn throughputCorpusShape(backend: enum { auto, native, metal }, environment: [:0
     const sections = parsed_corpus.value;
 
     // Same 11-entity/6-relation dogfood schema and window.mode as
-    // GLINER25.md's throughput section and examples/dogfood's
+    // GLINER25.md's throughput section and examples/antfly-docs-knowledge-base's
     // knowledgeGraphIndexJSON, so this measures the identical request shape.
     const schema_json =
         \\{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}
@@ -632,7 +632,7 @@ fn throughputCorpusShape(backend: enum { auto, native, metal }, environment: [:0
 }
 
 // Long-document probe inputs: frozen, byte-for-byte snapshots (at commit
-// 3ce5aff4ea) of two real design-doc sections, cut exactly as examples/dogfood's
+// 3ce5aff4ea) of two real design-doc sections, cut exactly as examples/antfly-docs-knowledge-base's
 // docsaf.MarkdownProcessor would cut them (from the heading line up to, but
 // excluding, the next line starting with '#'). Frozen as fixtures so editing
 // or slimming zig/VOPR.md and zig/PDF.md never changes these tests' inputs.
@@ -681,7 +681,7 @@ fn resolveModelDirectoryFromEnv(a: Allocator, environment: [:0]const u8) !?Resol
 // that merge path end to end, through the real HTTP handler, on a real
 // design-doc section large enough to require more than one window (the
 // zig/GRAPH.md-documented extraction_relation source parser consumes exactly
-// this shape, via examples/dogfood's knowledgeGraphIndexJSON).
+// this shape, via examples/antfly-docs-knowledge-base's knowledgeGraphIndexJSON).
 test "gliner boundary long executor HTTP canonical schema_version 2 shape for a real multi-window document with relations native" {
     try longExecutorHttpCanonicalShape(false, "ANTFLY_GLINER25_BASE_MODEL_DIR");
 }
@@ -844,7 +844,7 @@ fn longExecutorProviderCanonicalShape(metal: bool, environment: [:0]const u8) !v
     }
     try node.attachIo(std.testing.io);
 
-    // Uses examples/dogfood's real 11-entity/6-relation production schema
+    // Uses examples/antfly-docs-knowledge-base's real 11-entity/6-relation production schema
     // (not the narrower 3-entity repro schema from GLINER25.md's earlier
     // single-window evidence): the qualified long-document row's measured
     // padded_sequence_tokens floor (106) was measured against this wider
@@ -901,12 +901,12 @@ fn longExecutorProviderCanonicalShape(metal: bool, environment: [:0]const u8) !v
 // "Review findings and required fixes" (frozen as
 // testdata/gliner25/long_document_probe/pdf_review_findings.txt at commit
 // 3ce5aff4ea) was the largest single section
-// examples/dogfood's real docsaf.MarkdownProcessor splitting produced across the whole ingest corpus (measured directly in
+// examples/antfly-docs-knowledge-base's real docsaf.MarkdownProcessor splitting produced across the whole ingest corpus (measured directly in
 // extractors/gliner_boundary_qualification.zig's long-document geometry
 // test: ~92KB body, 15 windows at the wire's 1024-word default), so this
 // exercises the merge path at real production scale through both entries a
 // caller can reach it from -- the HTTP handler and the in-process provider
-// entry (Node.extractDirect, as examples/dogfood's embedded worker calls
+// entry (Node.extractDirect, as examples/antfly-docs-knowledge-base's embedded worker calls
 // it) -- rather than only the ~37KB section the tests above already cover.
 test "gliner boundary long executor HTTP canonical schema_version 2 shape for the corpus-maximum real section" {
     try corpusMaximumHttpCanonicalShape("ANTFLY_GLINER25_BASE_MODEL_DIR");
@@ -1047,7 +1047,7 @@ fn corpusMaximumProviderCanonicalShape(environment: [:0]const u8) !void {
 }
 
 // Corpus-minimum companion to the corpus-maximum tests above: zig/SCHEMA.md's
-// "Related Docs" section is the smallest section examples/dogfood's real
+// "Related Docs" section is the smallest section examples/antfly-docs-knowledge-base's real
 // docsaf.MarkdownProcessor splitting produces across the whole ingest corpus
 // (the two link targets with their markup stripped and no whitespace between
 // them -- 20 bytes, one word). The ingest embeds and full-text indexes that
@@ -1095,7 +1095,7 @@ fn corpusMinimumProviderShape(metal: bool, environment: [:0]const u8) !void {
     }
     try node.attachIo(std.testing.io);
 
-    // Exactly what examples/dogfood sends for doc:zig/SCHEMA.md#schema-related-docs.
+    // Exactly what examples/antfly-docs-knowledge-base sends for doc:zig/SCHEMA.md#schema-related-docs.
     const documents = [_][]const u8{ "TODO.mdSERVERLESS.md", "a" };
     for (documents) |document| {
         const content_json = try std.json.Stringify.valueAlloc(a, document, .{});

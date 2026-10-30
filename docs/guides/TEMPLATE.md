@@ -1,11 +1,14 @@
 # Docs authoring standard
 
-Every page under `docs/guides/` is one of two kinds. A **guide** takes a reader who has
+Every page under `docs/guides/` is one of four kinds. A **guide** takes a reader who has
 finished the [Quickstart](quickstart.mdx) to one named outcome. A **concept** page explains
-how one part of Antfly works so the reader can make good decisions with it. Both are
+how one part of Antfly works so the reader can make good decisions with it. A **provider**
+page (`providers/`) describes one inference provider, and a **model** page (`models/`)
+describes one model Antfly runs locally. Both are
 written for people steering an agent-assisted workflow: the agent gets its knowledge from
 the `antfly-skills` skill, so the page's job is judgment and context, not exhaustive
-reference. (This file is `.md`, not `.mdx`, so it never syncs to the docs site.)
+reference. Everything under `docs/guides/` publishes to the docs site, `.md` files as unlisted
+pages; the site's sync skips only this file by name.
 
 The bar for every sentence: it earns its place or it goes. Nothing stays because it was
 there before.
@@ -125,6 +128,37 @@ sections vary by subject; the bookends do not.
    No closing recap. A section that restates the page as a list of rules ("Decisions",
    "Summary", "Key Takeaways") is deleted; the guidance belongs in the section that
    explains the mechanism.
+
+## Provider anatomy
+
+Target 30 to 130 lines, one page per provider in `providers/`. Keep the same h2
+headings in this order so provider pages compare side by side:
+
+1. The opener, no heading: what the provider is and which components it offers.
+2. **`## What It Provides`**: a table with one row per component (embedder, reranker,
+   reader, transcriber, speech, generator, extractor, decider, web search) and the
+   inputs that component accepts (text, image, audio, video, PDF). Inputs come from the
+   adapter code, not the provider's marketing; when they depend on the model, name an
+   example model.
+3. **`## Credentials`**: the `${secret:...}` or environment variable names the code
+   reads. Never a literal key.
+4. **`## Example`** (or one h2 per component when the provider has several distinct
+   setups): the smallest working configuration for the main component.
+5. **`## Limits`**, when there are any: request caps, rate limits, unsupported inputs.
+6. **`## Related`**: two or three links.
+
+The component and provider matrix lives in `inference-providers.mdx` and is generated
+by `scripts/generate_provider_matrix.py`; update the specs, not the table.
+
+## Model anatomy
+
+Target 60 to 250 lines, one page per model in `models/`, for a model with its own
+setup, prompts, or limits beyond a row in `supported-models.mdx`. Start with what
+the model does and why to pick it, then: how to pull it (the full owner-qualified
+reference, pinned to a revision when the registry does), a working request, how to
+use it in an enrichment, and the user-facing limits. Benchmarks, kernel switches, and
+qualification evidence belong in `docs/design/` or its `history/`, linked once at the
+end.
 
 ## Facts
 

@@ -3969,7 +3969,18 @@ fn embedDenseBatchAttempt(dense_embedder: embedder_mod.DenseEmbedder, runtime: *
 }
 
 fn embedDenseBatchAttemptLimits(dense_embedder: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32, limits: ?DenseBatchLimits) ![]const []const f32 {
-    if (limits) |bounded| return plannedDenseBatches(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, assetProviderRequestContext(runtime), bounded);
+    if (limits) |bounded| {
+        // Foreground calls promise an interruptible provider. Background
+        // publication also uses a context for deadline/progress fences, but
+        // must continue to support legacy synchronous providers.
+        if (!denseProviderSupportsContext(dense_embedder)) {
+            if (foregroundProviderRequestContext(runtime)) |context| {
+                try context.check();
+                return error.UncancellableInferenceProvider;
+            }
+        }
+        return plannedDenseBatches(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, assetProviderRequestContext(runtime), bounded);
+    }
     // Context-aware callbacks still require an explicit reentrancy guarantee.
     // Custom and legacy providers retain their serial path by default.
     const parallelism = @min(@min(generatedEmbedParallelBatches(), @max(@as(usize, 1), dense_embedder.dense_batch_concurrency)), texts.len);
@@ -4017,6 +4028,12 @@ fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbe
 
 const DenseBatchLimits = struct { items: usize, bytes: usize };
 
+fn denseProviderSupportsContext(provider: embedder_mod.DenseEmbedder) bool {
+    return provider.dense_embed_batch_with_context_fn != null or
+        provider.dense_embed_with_context_fn != null or
+        (provider.part_lease != null and provider.dense_embed_batch_planned_fn != null);
+}
+
 fn denseBatchParallelism(provider: embedder_mod.DenseEmbedder) usize {
     if (provider.dense_embed_batch_with_context_fn == null) return 1;
     return @min(generatedEmbedParallelBatches(), @max(@as(usize, 1), provider.dense_batch_concurrency));
@@ -4061,7 +4078,18 @@ fn parallelDenseBatchPlanned(alloc: Allocator, io: Io, provider: embedder_mod.De
         dims: u32,
         context: inference_request_context.RequestContext,
         fn run(self: *@This()) anyerror![]const []const f32 {
-            return self.provider.embedDenseBatchWithContext(self.alloc, self.name, self.texts, self.dims, self.context);
+            if (denseProviderSupportsContext(self.provider))
+                return self.provider.embedDenseBatchWithContext(self.alloc, self.name, self.texts, self.dims, self.context);
+            // Legacy providers are serialized by denseBatchParallelism. Keep
+            // limits and cancellation fences around their synchronous call,
+            // without claiming the provider itself can be interrupted.
+            try self.context.check();
+            const vectors = try self.provider.embedDenseBatch(self.alloc, self.name, self.texts, self.dims);
+            self.context.check() catch |err| {
+                embedder_mod.freeDenseEmbeddingBatch(self.alloc, vectors);
+                return err;
+            };
+            return vectors;
         }
     };
     const vectors = try alloc.alloc([]const f32, texts.len);
@@ -4120,6 +4148,95 @@ fn parallelDenseBatchPlanned(alloc: Allocator, io: Io, provider: embedder_mod.De
     }
     try context.check();
     return vectors;
+}
+
+test "bounded dense legacy providers remain serial and obey item byte and cancellation fences" {
+    const Harness = struct {
+        calls: usize = 0,
+        batches: usize = 0,
+        largest_items: usize = 0,
+        largest_bytes: usize = 0,
+        cancel_on_return: bool = false,
+        cancelled: bool = false,
+        fn isCancelled(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            return self.cancelled;
+        }
+        fn batch(ptr: *anyopaque, alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batches += 1;
+            self.largest_items = @max(self.largest_items, texts.len);
+            self.largest_bytes = @max(self.largest_bytes, textBatchByteStats(texts).total_bytes);
+            const out = try alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |vector| alloc.free(vector);
+                alloc.free(out);
+            }
+            for (texts, out) |text, *vector| {
+                vector.* = try embed(ptr, alloc, name, text, dims);
+                initialized += 1;
+            }
+            if (self.cancel_on_return) self.cancelled = true;
+            return out;
+        }
+        fn embed(ptr: *anyopaque, alloc: Allocator, _: []const u8, text: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const vector = try alloc.alloc(f32, dims);
+            @memset(vector, @as(f32, @floatFromInt(try std.fmt.parseUnsigned(u32, text, 10))));
+            return vector;
+        }
+    };
+    var harness: Harness = .{};
+    const provider: embedder_mod.DenseEmbedder = .{ .ptr = &harness, .dense_embed_fn = Harness.embed, .dense_embed_batch_fn = Harness.batch, .dense_batch_concurrency = 4 };
+    try std.testing.expectEqual(@as(usize, 1), denseBatchParallelism(provider));
+    const alloc = std.testing.allocator;
+    const context: inference_request_context.RequestContext = .{ .io = std.testing.io, .deadline_ns = null };
+    const texts = [_][]const u8{ "1", "2", "3", "4", "5" };
+    const vectors = try plannedDenseBatches(alloc, std.testing.io, provider, "model", &texts, 1, context, .{ .items = 2, .bytes = 2 });
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+    for (vectors, 1..) |vector, value| try std.testing.expectEqual(@as(f32, @floatFromInt(value)), vector[0]);
+    try std.testing.expectEqual(@as(usize, 5), harness.calls);
+    try std.testing.expectEqual(@as(usize, 3), harness.batches);
+    try std.testing.expectEqual(@as(usize, 2), harness.largest_items);
+    try std.testing.expectEqual(@as(usize, 2), harness.largest_bytes);
+    const byte_limited = try plannedDenseBatches(alloc, std.testing.io, provider, "model", &texts, 1, context, .{ .items = 4, .bytes = 2 });
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, byte_limited);
+    try std.testing.expectEqual(@as(usize, 6), harness.batches);
+    try std.testing.expectEqual(@as(usize, 2), harness.largest_items);
+    try std.testing.expectError(error.InferenceEncodedBytesExceeded, plannedDenseBatches(alloc, std.testing.io, provider, "model", &.{"123"}, 1, context, .{ .items = 2, .bytes = 2 }));
+    var expired = context;
+    expired.deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, plannedDenseBatches(alloc, std.testing.io, provider, "model", &texts, 1, expired, .{ .items = 2, .bytes = 2 }));
+    try std.testing.expectEqual(@as(usize, 10), harness.calls);
+    var cancelled = context;
+    cancelled.cancellation = .{ .ptr = &harness, .is_cancelled_fn = Harness.isCancelled };
+    harness.cancel_on_return = true;
+    // Cancellation arriving inside an uninterruptible callback must release
+    // all returned vectors and stop before a second bounded batch is issued.
+    try std.testing.expectError(error.Cancelled, plannedDenseBatches(alloc, std.testing.io, provider, "model", &texts, 1, cancelled, .{ .items = 2, .bytes = 2 }));
+    try std.testing.expectEqual(@as(usize, 7), harness.batches);
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .io = std.testing.io },
+        .ownership = undefined,
+        .active_provider_guard = .{ .deadline_ns = std.math.maxInt(u64) },
+    };
+    // An explicit foreground cancellation contract still requires a
+    // controlled callback; bounding a batch must not weaken that contract.
+    try std.testing.expectError(error.UncancellableInferenceProvider, embedDenseBatchAttemptLimits(provider, &runtime, "model", &texts, 1, .{ .items = 2, .bytes = 2 }));
+    try std.testing.expectEqual(@as(usize, 7), harness.batches);
 }
 
 test "parallel dense inference preserves order drains failures and bounds provider concurrency" {
@@ -10825,7 +10942,10 @@ test "shared PDF enrollment skips completed metadata and byte fingerprints befor
     defer cache.deinit();
     var lease = try cache.adoptOwned(url, null, .{ .content_type = try alloc.dupe(u8, "application/pdf"), .data = try alloc.dupe(u8, source) });
     defer lease.deinit();
-    for ([_][]const u8{ "{}", "{\"etag\":\"revision-one\"}" }) |config_json| {
+    for ([_][]const u8{
+        "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}",
+        "{\"etag\":\"revision-one\",\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}",
+    }) |config_json| {
         const producer_json = try std.fmt.allocPrint(alloc, "{{\"type\":\"document_extraction\",\"config\":{s}}}", .{config_json});
         defer alloc.free(producer_json);
         const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .doc_key = "source", .index_name = "reader", .artifact_name = "reader", .source_field = "url", .producer_json = producer_json };
@@ -15956,6 +16076,7 @@ fn processDocumentExtractionAsset(
         .prepared_pdf_session = if (prepared_pdf_session) |*session| session else null,
     };
     defer collect_ctx.deinit();
+    var prepared_marking = document_extraction_mod.UnconfiguredGeneratedTextSink{ .alloc = document_extraction_alloc, .config = &extraction_config, .inner = collect_ctx.sink() };
     const extraction_result = if (prepared_pdf_session) |*session|
         document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
             document_extraction_alloc,
@@ -15963,7 +16084,7 @@ fn processDocumentExtractionAsset(
             if (extraction_config.content_type.len > 0) extraction_config.content_type else downloaded.content_type,
             extraction_config.ocr_mode,
             extraction_config.ocr_quality,
-            collect_ctx.sink(),
+            prepared_marking.sink(),
             if (page_text_spool) |*spool| spool.cache() else null,
         )
     else

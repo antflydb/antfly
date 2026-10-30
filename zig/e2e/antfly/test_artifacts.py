@@ -445,12 +445,9 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
     asset_enrichment = _document_units_asset_enrichment()
     extraction_config = asset_enrichment["producer_json"]["config"]
     extraction_config["ocr"] = {
-        "enabled": True,
         "mode": "always",
-        "render_dpi": 150,
-        "max_rendered_pixels": 4_000_000,
-        "max_rendered_dimension": 2048,
-        "config": {
+        "render": {"dpi": 150, "max_pixels": 4_000_000, "max_dimension": 2048},
+        "reader": {
             "provider": "antfly",
             "model": "antflydb/Florence-2-base",
             "api_url": pdf_ocr_e2e_server.reader_api_url,
@@ -679,7 +676,8 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
         sum(image["kind"] == "png" for image in request["images"]) > 1
         for request in png_requests
     ), reader_stats
-    assert all(request["prompt"] == "<OCR>" for request in png_requests)
+    # A local reader runs its own OCR task, so extraction sends no prompt.
+    assert all(request["prompt"] == "" for request in png_requests)
     assert all(
         "Render tables as Markdown" not in request["prompt"] for request in png_requests
     )
@@ -701,12 +699,9 @@ def test_pdf_auto_ocr_only_renders_pages_without_usable_embedded_text_e2e(
     asset_enrichment = _document_units_asset_enrichment()
     extraction_config = asset_enrichment["producer_json"]["config"]
     extraction_config["ocr"] = {
-        "enabled": True,
         "mode": "auto",
-        "render_dpi": 150,
-        "max_rendered_pixels": 4_000_000,
-        "max_rendered_dimension": 2048,
-        "config": {
+        "render": {"dpi": 150, "max_pixels": 4_000_000, "max_dimension": 2048},
+        "reader": {
             "provider": "antfly",
             "model": "antflydb/Florence-2-base",
             "api_url": pdf_ocr_e2e_server.reader_api_url,
@@ -1331,7 +1326,7 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
                     "producer_json": json.dumps(
                         {
                             "type": "document_extraction",
-                            "config": {"ocr": {"enabled": False}},
+                            "config": {},
                         },
                         separators=(",", ":"),
                     ),

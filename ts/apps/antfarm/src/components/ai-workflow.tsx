@@ -13,16 +13,9 @@ import {
   DashboardPageTitle,
   FileUpload,
   type FileUploadProps,
-  MonoLabel,
+  Spinner,
 } from "@antfly/design-system";
-import {
-  AlertCircle,
-  ChevronDown,
-  CircleStop,
-  LoaderCircle,
-  RotateCcw,
-  Sparkles,
-} from "lucide-react";
+import { AlertCircle, ChevronDown, CircleStop, RotateCcw, Sparkles } from "lucide-react";
 import type * as React from "react";
 import { cn } from "@/lib/utils";
 
@@ -51,7 +44,9 @@ export function AIWorkflowHeader({
   return (
     <DashboardPageHeader className={cn("af-ai-workflow-header", className)} {...props}>
       <div className="space-y-2">
-        {eyebrow ? <MonoLabel>{eyebrow}</MonoLabel> : null}
+        {eyebrow ? (
+          <span className="text-xs font-medium text-muted-foreground">{eyebrow}</span>
+        ) : null}
         <DashboardPageTitle>{title}</DashboardPageTitle>
         {description ? <DashboardPageDescription>{description}</DashboardPageDescription> : null}
       </div>
@@ -89,7 +84,7 @@ export function AIWorkflowPanel({
       {title || description || actions ? (
         <div className="af-ai-panel-header">
           <div className="min-w-0 space-y-1">
-            {title ? <h2 className="font-display text-base font-medium">{title}</h2> : null}
+            {title ? <h2 className="text-base font-medium">{title}</h2> : null}
             {description ? <p className="text-sm text-muted-foreground">{description}</p> : null}
           </div>
           {actions ? (
@@ -122,9 +117,7 @@ export function AIWorkflowSettings({
     <Collapsible className={cn("af-ai-settings", className)} {...props}>
       <CollapsibleTrigger className="af-ai-settings-trigger">
         <span className="min-w-0 text-left">
-          <span className="block font-mono text-xs font-medium uppercase tracking-[0.08em]">
-            {title}
-          </span>
+          <span className="block text-xs font-medium text-muted-foreground">{title}</span>
           {description ? (
             <span className="mt-0.5 block text-xs text-muted-foreground">{description}</span>
           ) : null}
@@ -214,7 +207,7 @@ export function AIWorkflowEmpty({
         {icon}
       </div>
       <div className="space-y-1">
-        <h3 className="font-display text-base font-medium">{title}</h3>
+        <h3 className="text-base font-medium">{title}</h3>
         {description ? (
           <p className="max-w-md text-sm text-muted-foreground">{description}</p>
         ) : null}
@@ -247,7 +240,7 @@ export function AIWorkflowSubmitButton({
   }
   return (
     <Button disabled={disabled || running} {...props}>
-      {running ? <LoaderCircle className="size-4 animate-spin" /> : null}
+      {running ? <Spinner className="size-4" /> : null}
       {running ? runningLabel : children}
     </Button>
   );

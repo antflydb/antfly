@@ -21,7 +21,7 @@ class InferenceReadRequest:
     """Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
 
     Attributes:
-        model (str): Name of reader model from models_dir/readers/ Example: microsoft/trocr-base-printed.
+        model (str): Name of reader model from models_dir/readers/ Example: lightonai/LightOnOCR-3-0.8B.
         retain_artifact (bool | Unset): Request an opaque, process-local reading handle for extraction reuse. Retention
             is best effort; inspect document.artifact_id and artifact_ttl_ms. Default: False.
         documents (list[DocumentSource] | Unset): Complete documents, mutually exclusive with images. Each source is
@@ -31,7 +31,6 @@ class InferenceReadRequest:
             - URLs (if content_security allows)
              Example: [{'url': 'data:image/png;base64,iVBORw0KGgo...'}].
         prompt (str | Unset): Optional task prompt for document understanding models.
-            - TrOCR: Not used (pure OCR)
             - Donut CORD: "<s_cord-v2>" for receipt parsing
             - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>"
             - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
