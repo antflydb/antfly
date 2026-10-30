@@ -59,7 +59,7 @@ pub const single = [_]Weight{.{ .buf = "weight", .acc = "acc" }};
 pub const gate_up = [_]Weight{ .{ .buf = "weight_gate", .acc = "gate", .sfx = "_gate", .pre = "gate_" }, .{ .buf = "weight_up", .acc = "up", .sfx = "_up", .pre = "up_" } };
 
 /// For every weight, `t` with ${w} ${acc} ${s} ${pre} filled, joined by spaces.
-fn per(comptime ws: []const Weight, comptime t: []const u8) []const u8 {
+pub fn per(comptime ws: []const Weight, comptime t: []const u8) []const u8 {
     var parts: []const []const u8 = &.{};
     for (ws, 0..) |x, i| {
         if (i != 0) parts = parts ++ .{" "};

@@ -21,6 +21,7 @@ const wrap = @import("../quant_metal_wrap.zig");
 const gemv = @import("../quant_metal_gemv.zig");
 const q4_0 = @import("../quant_metal_q4_0.zig");
 const dense = @import("../quant_metal_dense.zig");
+const q4_k = @import("../quant_metal_q4_k.zig");
 
 pub const regions = [_]Region{
     msl.raw("rows", @import("../quant_metal_rows.zig").region()),
@@ -50,8 +51,8 @@ pub const regions = [_]Region{
     msl.metal("gemv_q8_0", &.{gemv.scalar("q8_0")}),
     msl.metal("gemv_q8_1", &.{ gemv.scalar("q8_1"), gemv.reduce("q8_1") }),
     msl.metal("gemv_q8_k", &.{ gemv.scalar("q8_k"), gemv.reduce("q8_k") }),
-    msl.metal("gemv_q2_k", &.{ gemv.scalar("q2_k"), gemv.scalar("q3_k"), gemv.scalar("q4_k") }),
-    msl.metal("gemv_q5_k", &.{gemv.scalar("q5_k")}),
+    msl.metal("gemv_q2_k", &.{ gemv.scalar("q2_k"), gemv.scalar("q3_k"), gemv.scalar("q4_k"), q4_k.linear }),
+    msl.metal("q4_k_pair", &[_]msl.Item{q4_k.pair_linear} ++ q4_k.pair_activation ++ .{gemv.scalar("q5_k")}),
     msl.metal("gemv_q6_k", &.{gemv.scalar("q6_k")}),
     msl.metal("gemv_iq4_nl", &.{ gemv.scalar("iq4_nl"), gemv.reduce("iq4_nl"), gemv.scalar("iq4_xs"), gemv.reduce("iq4_xs"), gemv.scalar("mxfp4"), gemv.reduce("mxfp4") }),
     msl.metal("gemv_nvfp4", &.{gemv.scalar("nvfp4")}),
