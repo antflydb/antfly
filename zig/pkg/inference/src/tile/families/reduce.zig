@@ -19,6 +19,7 @@ const r = @import("../region.zig");
 const gather = @import("../reduce_gather.zig");
 const rope = @import("../reduce_rope.zig");
 const rows = @import("../reduce_rows.zig");
+const sample = @import("../reduce_sample.zig");
 
 fn metal(comptime family: []const u8, comptime msl: []const u8) r.Region {
     return r.metal(family, r.metalLines(r.metal_indent, msl));
@@ -32,4 +33,5 @@ pub const regions = [_]r.Region{
     metal("reduce.scan", rows.scanRegion()),
     metal("reduce.qwen35_norm", rows.qwen35NormRegion()),
     metal("reduce.lightonocr3_norm", rows.lightonocr3NormRegion()),
+    metal("reduce.sample", sample.metalRegion()),
 };
