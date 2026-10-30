@@ -306,3 +306,35 @@ test('conditional mutable ROOT is never admitted to immutable or edge caches',as
   assert.equal(isImmutableObjectKey(base+'/artifacts/graph/'+'b'.repeat(64)+'/'+'c'.repeat(32)+'/'+'d'.repeat(64),{includeCommitLog}),true);
  }
 });
+
+test('bounded journal commits reopen, cross kernel pools, and fence stale writers',async()=>{
+ const bucket=new Bucket(),env={DATABASE:bucket,ANTFLY_INCARNATION:'native-coordinator'};
+ const authority=await openAuthority(env,'r2-bounded');
+ const make=()=>{const store=storeFor(bucket);store.configureAuthority(authority.descriptor);return store;};
+ const first=make();await first.transaction(tx=>{tx.put('left',1);tx.put('right',2);});
+ assert.ok(first.journalProof?.auth);
+ assert.equal((await first.readOnly(tx=>tx.get('left'))),1);
+ const second=make();assert.deepEqual(await second.transaction(tx=>tx.getMany(['left','right'])),[1,2]);
+ await second.transaction(tx=>tx.put('right',3));
+ await assert.rejects(first.transaction(tx=>tx.put('left',9)),/ImmutableLogFenced|PreconditionFailed/);
+ assert.deepEqual(await make().transaction(tx=>tx.getMany(['left','right'])),[1,3]);
+ assert.ok([...bucket.objects.keys()].some(key=>key.includes('/coord-v1/')&&key.includes('/epochs/')));
+ assert.ok(![...bucket.objects.keys()].some(key=>key.endsWith('/ROOT')));
+});
+
+test('bounded journal makes progress under a frozen per-key overwrite limit',async()=>{
+ const bucket=new Bucket(),put=bucket.put.bind(bucket);
+ bucket.put=async(key,body,options={})=>{
+  if(bucket.objects.has(key)&&options.onlyIf?.etagDoesNotMatch!=='*'){
+   const error=new Error('Too Many Requests (10058)');error.code=10058;throw error;
+  }
+  return put(key,body,options);
+ };
+ const authority=await openAuthority({DATABASE:bucket,ANTFLY_INCARNATION:'native-coordinator'},'r2-bounded'),store=storeFor(bucket);store.configureAuthority(authority.descriptor);
+ for(let i=0;i<80;i++)await retry(store,tx=>tx.put('latest',i));
+ assert.equal(await store.transaction(tx=>tx.get('latest')),79);
+ assert.ok(![...bucket.objects.keys()].some(key=>key.endsWith('/ROOT')));
+ // A rate-limited best-effort checkpoint may defer; accepted commits use new
+ // slot keys and remain recoverable through the original seal protocol.
+ const reopened=storeFor(bucket);reopened.configureAuthority(authority.descriptor);assert.equal(await retry(reopened,tx=>tx.get('latest')),79);
+});

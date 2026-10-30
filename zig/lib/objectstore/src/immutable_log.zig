@@ -49,6 +49,68 @@ pub fn rootFits(a: A, source: State, root: []const u8) !bool {
     defer a.free(bytes);
     return bytes.len <= 15360;
 }
+/// Short native certificates are valid only for namespaces whose collector
+/// persists a >=60-second grace. Anchor before observation/PUT; never renew a
+/// certificate merely because an old source was presented again.
+pub const ProofTime = struct { wall_ms: u64, mono_ms: u64 };
+pub const WriteProof = struct { anchor: ProofTime, auth: [32]u8 };
+pub const ProofAuthority = struct {
+    key: [32]u8,
+    scope: [16]u8,
+    clock_ptr: ?*const anyopaque = null,
+    clock_fn: ?*const fn (*const anyopaque) ProofTime = null,
+    pub const lifetime_ms = 30000;
+    pub fn now(self: ProofAuthority) ProofTime {
+        if (self.clock_fn) |read_| return read_(self.clock_ptr.?);
+        const time = @import("antfly_platform").time;
+        return .{ .wall_ms = time.realtimeNs() / std.time.ns_per_ms, .mono_ms = time.monotonicNs() / std.time.ns_per_ms };
+    }
+    fn current(self: ProofAuthority, anchor: ProofTime) !void {
+        const sample = self.now();
+        if (std.mem.allEqual(u8, &self.scope, 0) or anchor.wall_ms == 0 or anchor.mono_ms == 0 or sample.wall_ms < anchor.wall_ms or sample.mono_ms < anchor.mono_ms or sample.wall_ms - anchor.wall_ms >= lifetime_ms or sample.mono_ms - anchor.mono_ms >= lifetime_ms) return error.ImmutableLogProofExpired;
+    }
+    fn field(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
+        var n: [8]u8 = undefined;
+        std.mem.writeInt(u64, &n, bytes.len, .little);
+        hash.update(&n);
+        hash.update(bytes);
+    }
+    fn signature(self: ProofAuthority, log: Log, state: State, anchor: ProofTime) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        field(&hash, "antfly-bounded-journal-v1");
+        field(&hash, &self.scope);
+        field(&hash, log.bucket);
+        field(&hash, log.prefix);
+        field(&hash, &state.owner);
+        field(&hash, &state.epoch);
+        field(&hash, state.root);
+        var counters: [33]u8 = undefined;
+        counters[0] = state.format;
+        std.mem.writeInt(u64, counters[1..9], state.next, .little);
+        std.mem.writeInt(u64, counters[9..17], state.revision, .little);
+        std.mem.writeInt(u64, counters[17..25], anchor.wall_ms, .little);
+        std.mem.writeInt(u64, counters[25..33], anchor.mono_ms, .little);
+        hash.update(&counters);
+        var result: [32]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&result, &hash.finalResult(), &self.key);
+        return result;
+    }
+    pub fn issue(self: ProofAuthority, log: Log, state: State, anchor: ProofTime) !WriteProof {
+        try Log.validate(state);
+        try self.current(anchor);
+        return .{ .anchor = anchor, .auth = self.signature(log, state, anchor) };
+    }
+    pub fn authenticate(self: ProofAuthority, log: Log, state: State, proof: WriteProof) !void {
+        try Log.validate(state);
+        if (std.mem.allEqual(u8, &self.scope, 0) or proof.anchor.wall_ms == 0 or proof.anchor.mono_ms == 0) return error.InvalidImmutableLogProof;
+        if (!std.crypto.timing_safe.eql([32]u8, proof.auth, self.signature(log, state, proof.anchor))) return error.InvalidImmutableLogProof;
+    }
+    pub fn check(self: ProofAuthority, log: Log, state: State, proof: WriteProof) !void {
+        try self.authenticate(log, state, proof);
+        try self.current(proof.anchor);
+    }
+};
+pub const CertifiedRecovery = struct { recovery: Recovery, proof: WriteProof };
 pub const Log = struct {
     client: Client,
     bucket: []const u8,
@@ -296,6 +358,80 @@ pub const Log = struct {
         // still applies, and hint failure never replaces an accepted commit.
         if (result.next % self.checkpoint_commits == 0) _ = self.writeCheckpoint(a, result, false) catch false;
         return result;
+    }
+    /// An old MAC still authenticates accepted bytes, never freshness. Before
+    /// reusing it, read the CURRENT durable GC floor. This avoids rereading the
+    /// original frame after idle expiry while preserving retirement fencing.
+    pub fn refreshCertificate(self: Log, a: A, source: State, authority: ProofAuthority, proof: WriteProof) !WriteProof {
+        try authority.authenticate(self, source, proof);
+        const anchor = authority.now();
+        if (anchor.wall_ms < proof.anchor.wall_ms or anchor.mono_ms < proof.anchor.mono_ms) return error.ImmutableLogProofExpired;
+        const cp = try self.checkpoint(a);
+        if (cp) |floor| {
+            if (floor.state.revision > source.revision) return error.ImmutableLogProofRequiresRecovery;
+            if (floor.state.revision == source.revision and !same(floor.state, source)) return error.InvalidImmutableLog;
+        }
+        return authority.issue(self, source, anchor);
+    }
+    /// The seal competes for this exact next slot. A valid bounded source
+    /// therefore needs no cross-object floor probes. The collector grace keeps
+    /// all competing slots alive until the proof expires. Check AFTER PUT too:
+    /// a delayed upload may recreate a retired orphan, but can never be acked.
+    pub fn appendCertified(self: Log, a: A, source: State, root: []const u8, authority: ProofAuthority, proof: WriteProof) !CertifiedRecovery {
+        try authority.check(self, source, proof);
+        if (!std.mem.eql(u8, &source.owner, &self.owner)) return error.ImmutableLogFenced;
+        if (source.next >= epoch_commits) return error.ImmutableLogRotationRequired;
+        const anchor = authority.now();
+        const next = State{ .epoch = source.epoch, .owner = source.owner, .next = source.next + 1, .revision = try std.math.add(u64, source.revision, 1), .root = root };
+        try validate(next);
+        const bytes = try std.json.Stringify.valueAlloc(a, Frame{ .kind = .commit, .epoch = source.epoch, .slot = source.next, .parent_revision = source.revision, .state = next }, .{});
+        defer a.free(bytes);
+        if (bytes.len > 16384) return error.InvalidImmutableLog;
+        const k = try self.key(a, source.epoch, source.next);
+        defer a.free(k);
+        var client = self.client;
+        client.allocator = a;
+        // Identical pre-existing bytes are NOT a fresh acceptance. An ambiguous
+        // acknowledgement must recover; it must not renew an old certificate.
+        var receipt = try client.putObject(self.bucket, k, bytes, .{ .if_none_match = true, .content_type = "application/json", .cancellation = self.cancellation });
+        defer receipt.deinit(a);
+        try authority.check(self, source, proof);
+        return .{ .recovery = .{ .state = next }, .proof = try authority.issue(self, next, anchor) };
+    }
+    /// One fresh next-slot probe suffices within a protected epoch: every seal
+    /// is first linearized in that same slot, before its recovery marker.
+    pub fn observeCertified(self: Log, result_alloc: A, source: State, authority: ProofAuthority, proof: WriteProof, follow_owners: bool) !CertifiedRecovery {
+        try authority.check(self, source, proof);
+        const anchor = authority.now();
+        var arena = std.heap.ArenaAllocator.init(result_alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var root_buffer: [max_root_bytes]u8 = undefined;
+        var state = source;
+        for (0..max_steps) |_| {
+            std.mem.copyForwards(u8, root_buffer[0..state.root.len], state.root);
+            state.root = root_buffer[0..state.root.len];
+            _ = arena.reset(.retain_capacity);
+            try authority.check(self, source, proof);
+            if (!follow_owners and !std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;
+            const stored = try self.read(a, try self.key(a, state.epoch, state.next));
+            try authority.check(self, source, proof);
+            const item = stored orelse {
+                state.root = try result_alloc.dupe(u8, state.root);
+                return .{ .recovery = .{ .state = state }, .proof = try authority.issue(self, state, anchor) };
+            };
+            const next = try frame(a, item.body, state.epoch, state.next);
+            if (next.parent_revision != state.revision) return error.InvalidImmutableLog;
+            if (next.kind == .seal) {
+                if (!std.mem.eql(u8, next.state.root, state.root)) return error.InvalidImmutableLog;
+            } else if (!std.mem.eql(u8, &next.state.owner, &state.owner)) return error.InvalidImmutableLog;
+            state = next.state;
+        }
+        if (!follow_owners and !std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;
+        state.root = try result_alloc.dupe(u8, state.root);
+        // Intermediate roots may already be retired. Carry the old deadline;
+        // only the fresh absence of a next slot permits a new observation lease.
+        return .{ .recovery = .{ .state = state, .has_more = true }, .proof = try authority.issue(self, state, proof.anchor) };
     }
     pub fn retirable(self: Log, a: A, keys: []const []const u8, before: u64) ![]const []const u8 {
         if (keys.len > 32) return error.ImmutableLogBatchExceeded;
@@ -555,4 +691,202 @@ test "immutable log recovery bounds scratch memory across a full tail of large r
     // Output owns its root after scratch teardown, including escaped JSON.
     try std.testing.expectEqual(@as(u8, '"'), observed.state.root[0]);
     try std.testing.expect(bounded.end_index < buffer.len);
+}
+
+const ProofTestBackend = struct {
+    memory: *@import("memory.zig").MemoryClient,
+    time: ProofTime = .{ .wall_ms = 100000, .mono_ms = 1000 },
+    delay_and_retire: ?Log = null,
+    lost_ack: bool = false,
+    fn clock(raw: *const anyopaque) ProofTime {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        return self.time;
+    }
+    fn get(raw: *anyopaque, a: A, bucket: []const u8, name: []const u8, opts: types.GetOptions) !types.GetResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var base = self.memory.client();
+        base.allocator = a;
+        return base.getObject(bucket, name, opts);
+    }
+    fn put(raw: *anyopaque, a: A, bucket: []const u8, name: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var base = self.memory.client();
+        base.allocator = a;
+        if (self.delay_and_retire) |winner| {
+            self.delay_and_retire = null;
+            const accepted = (try winner.recover(a, null, true)).state;
+            // Advance the fixture's checkpoint write clock without sleeping.
+            // Collection is legal only after its durable floor covers the seal.
+            var old = (try winner.checkpoint(a)).?;
+            old.written_ms = 0;
+            const checkpoint_key = try std.fmt.allocPrint(a, "{s}/CHECKPOINT", .{winner.prefix});
+            const checkpoint_body = try std.json.Stringify.valueAlloc(a, old, .{});
+            var reset = try base.putObject(bucket, checkpoint_key, checkpoint_body, .{});
+            reset.deinit(a);
+            if (!try winner.writeCheckpoint(a, accepted, true)) return error.FixtureCheckpointMissing;
+            try base.deleteObject(bucket, name, .{});
+            const epoch_prefix = name[0..std.mem.lastIndexOfScalar(u8, name, '/').?];
+            try base.deleteObject(bucket, try std.fmt.allocPrint(a, "{s}/SEALED", .{epoch_prefix}), .{});
+            try base.deleteObject(bucket, try std.fmt.allocPrint(a, "{s}/START", .{epoch_prefix}), .{});
+            self.time.wall_ms += 60001;
+            self.time.mono_ms += 60001;
+        }
+        var result = try base.putObject(bucket, name, body, opts);
+        if (self.lost_ack) {
+            self.lost_ack = false;
+            result.deinit(a);
+            return error.InjectedLostAck;
+        }
+        return result;
+    }
+    fn client(self: *@This(), table: *Client.VTable) Client {
+        const base = self.memory.client();
+        table.* = base.vtable.*;
+        table.get_object = get;
+        table.put_object = put;
+        return .{ .allocator = base.allocator, .ptr = self, .vtable = table };
+    }
+};
+
+test "immutable log bounded certificates use one fresh slot write and one fresh observation probe" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var base = memory.client();
+    try base.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory };
+    var table: Client.VTable = undefined;
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "proof", .owner = @splat(1), .io = std.testing.io };
+    const authority = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    var state = (try log.recover(m, null, true)).state;
+    var proof = try authority.issue(log, state, authority.now());
+    for (0..64) |i| {
+        memory.resetOperationCount();
+        const root = try std.fmt.allocPrint(m, "root-{d}", .{i});
+        const next = try log.appendCertified(m, state, root, authority, proof);
+        state = next.recovery.state;
+        proof = next.proof;
+        try std.testing.expectEqual(@as(u64, 1), memory.operationCount());
+    }
+    memory.resetOperationCount();
+    const observed = try log.observeCertified(m, state, authority, proof, true);
+    try std.testing.expectEqual(@as(u64, 1), memory.operationCount());
+    try std.testing.expectEqualStrings(state.root, observed.recovery.state.root);
+    try std.testing.expectError(error.ImmutableLogRotationRequired, log.appendCertified(m, state, "overflow", authority, proof));
+    const rotated = (try log.recover(m, state, false)).state;
+    try std.testing.expectEqual(@as(u64, 0), rotated.next);
+    const followed = try log.observeCertified(m, state, authority, proof, true);
+    try std.testing.expectEqual(rotated.revision, followed.recovery.state.revision);
+}
+
+test "immutable log bounded certificates bind source clocks scope and ownership without authority IO" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var base = memory.client();
+    try base.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory };
+    var table: Client.VTable = undefined;
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "proof", .owner = @splat(1), .io = std.testing.io };
+    const authority = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const state = (try log.recover(m, null, true)).state;
+    const proof = try authority.issue(log, state, authority.now());
+    var forged = state;
+    forged.root = "forged";
+    memory.resetOperationCount();
+    try std.testing.expectError(error.InvalidImmutableLogProof, log.appendCertified(m, forged, "new", authority, proof));
+    var other = authority;
+    other.scope = @splat(10);
+    try std.testing.expectError(error.InvalidImmutableLogProof, log.appendCertified(m, state, "new", other, proof));
+    backend.time.wall_ms -= 1;
+    try std.testing.expectError(error.ImmutableLogProofExpired, log.appendCertified(m, state, "new", authority, proof));
+    backend.time.wall_ms = 100000;
+    backend.time.mono_ms += 30000;
+    try std.testing.expectError(error.ImmutableLogProofExpired, log.appendCertified(m, state, "new", authority, proof));
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
+}
+
+test "immutable log bounded certificate cannot acknowledge a delayed recreated slot after takeover and collection" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var base = memory.client();
+    try base.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory };
+    var table: Client.VTable = undefined;
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "proof", .owner = @splat(1), .io = std.testing.io };
+    const authority = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const state = (try log.recover(m, null, true)).state;
+    const proof = try authority.issue(log, state, authority.now());
+    var winner = log;
+    winner.owner = @splat(2);
+    backend.delay_and_retire = winner;
+    try std.testing.expectError(error.ImmutableLogProofExpired, log.appendCertified(m, state, "orphan", authority, proof));
+    const recovered = try winner.recover(m, null, false);
+    try std.testing.expectEqualStrings("", recovered.state.root);
+    try std.testing.expectEqualSlices(u8, &winner.owner, &recovered.state.owner);
+}
+
+test "immutable log bounded certificates reject ambiguous replay and preserve accepted receipts through recovery" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var base = memory.client();
+    try base.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory };
+    var table: Client.VTable = undefined;
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "proof", .owner = @splat(1), .io = std.testing.io };
+    const authority = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const state = (try log.recover(m, null, true)).state;
+    const proof = try authority.issue(log, state, authority.now());
+    backend.lost_ack = true;
+    try std.testing.expectError(error.InjectedLostAck, log.appendCertified(m, state, "accepted", authority, proof));
+    try std.testing.expectError(error.PreconditionFailed, log.appendCertified(m, state, "accepted", authority, proof));
+    const recovered = try log.observeCertified(m, state, authority, proof, true);
+    try std.testing.expectEqualStrings("accepted", recovered.recovery.state.root);
+    var winner = log;
+    winner.owner = @splat(2);
+    _ = try winner.recover(m, null, true);
+    try std.testing.expectError(error.PreconditionFailed, log.appendCertified(m, recovered.recovery.state, "stale", authority, recovered.proof));
+}
+
+test "immutable log bounded certificate idle refresh authenticates the current GC floor without replay" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var base = memory.client();
+    try base.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory };
+    var table: Client.VTable = undefined;
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "proof", .owner = @splat(1), .io = std.testing.io };
+    const authority = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const state = (try log.recover(m, null, true)).state;
+    const proof = try authority.issue(log, state, authority.now());
+    backend.time.wall_ms += 30000;
+    backend.time.mono_ms += 30000;
+    memory.resetOperationCount();
+    const renewed = try log.refreshCertificate(m, state, authority, proof);
+    try std.testing.expectEqual(@as(u64, 1), memory.operationCount());
+    const observed = try log.observeCertified(m, state, authority, renewed, true);
+    try std.testing.expectEqual(@as(u64, 2), memory.operationCount());
+    try std.testing.expectEqual(state.revision, observed.recovery.state.revision);
+    backend.time.wall_ms = proof.anchor.wall_ms - 1;
+    memory.resetOperationCount();
+    try std.testing.expectError(error.ImmutableLogProofExpired, log.refreshCertificate(m, state, authority, proof));
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
 }

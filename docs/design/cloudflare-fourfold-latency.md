@@ -49,7 +49,7 @@ fresh authentication. Every query retains native namespace, visibility,
 integrity and lease validation; expiry and new fences remain mandatory misses.
 The published cut must represent accepted state, never uncommitted preparation.
 
-Investigate a transport-neutral conditional metadata root using existing opaque
+New namespaces can select a transport-neutral conditional metadata root using existing opaque
 provider write revisions (R2/S3 ETags, GCS generations). A native authenticated
 continuation binds namespace, owner, metadata root, semantic dependencies and
 its exact revision. All metadata changes and receipts publish through one
@@ -67,6 +67,41 @@ bounded root lifetime/retirement contract or an equally strong atomic guard.
 A directly conditional metadata root is an alternative that avoids cross-object
 fencing dependencies. Do not remove existing fencing reads until fault tests
 prove the replacement across takeover, GC and ambiguous responses.
+
+## Provider throughput constraint and selected immutable path
+
+Cloudflare documents [one write per second to the same R2 key](https://developers.cloudflare.com/r2/platform/limits/).
+GCS documents the same [one-write-per-second object limit](https://docs.cloud.google.com/storage/quotas).
+A permanent conditional ROOT cannot be the high-throughput default on either provider. It is
+retained as an explicit local/provider comparison, not selected for hosted
+qualification. Local binding timings do not simulate this provider throttle.
+The existing journal and its one-second checkpoint throttle remain the default.
+
+The R2 scaling path is `METADATA_ROOT_BACKEND=bounded-journal` for **new**
+namespaces. Its persisted `r2-bounded` authority requires policy v2. Commits keep
+using different immutable next-slot keys; ownership seals compete for that same
+slot. Native HMAC certificates bind bucket/prefix, source state, owner, private
+binding scope and both wall/monotonic anchors. They live at most 30 seconds under
+the persisted >=60-second collector grace. Native code validates before AND
+after PUT. A delayed write may recreate an old orphan after collection, but it
+cannot receive a successful acknowledgement. Identical pre-existing bytes are
+not a fresh commit and cannot renew a certificate.
+
+A valid protected source needs one create-only slot PUT for a warm commit and
+one fresh next-slot GET for a warm observation. Native code follows and validates
+commit/seal frames; a partial replay carries the original proof deadline. Only a
+freshly observed end of the accepted prefix can renew observation protection.
+Epoch rotation and cold/key-rotated recovery retain the original protocol.
+Checkpoints remain bounded background hints and GC barriers remain fresh,
+rate-limited storage checks.
+
+After idle expiry, the MAC authenticates past accepted bytes only. Native code
+reads the CURRENT checkpoint floor before reusing that source; a newer floor
+forces ordinary recovery. A reusable floor plus the next-slot probe takes two
+reads without replaying the source frame. Clock regression cannot reset the
+anchors. No periodic keep-warm work or TTL extension substitutes for this proof.
+The primitives live in the shared native object-store engine and do not require
+R2-specific database logic.
 
 ## Immutable point and write plans
 
@@ -113,7 +148,7 @@ Do not run hour-long qualification until short trials meet their latency and
 complete-diagnostic checks. Live mail activation, DNS and real email sending are
 separate from this performance work.
 
-## Native authority prototype status
+## Native authority implementation status
 
 `zig/lib/objectstore/src/conditional_root.zig` now supplies bounded observation,
 bootstrap, ownership transfer, conditional append and permanent retirement over
@@ -127,8 +162,8 @@ unavailable conditional capability never falls back to an unconditional write.
 Tests cover 100 consecutive commits, proof-cache loss, fabricated continuations,
 stale owners, retirement, oversized escaped roots, lost accepted acknowledgements,
 and absent response revisions. Opaque generation strings above JavaScript's safe
-integer range survive unchanged. The native object-store suite reports 167
-passed, two live-provider tests skipped. The transactional-store adapter and Worker coordinator now select this protocol
+integer range survive unchanged. The native fault tests also cover signed continuations crossing pooled kernels,
+key rotation, and transactional KV/fused-read integration. The transactional-store adapter and Worker coordinator now select this protocol
 explicitly with `METADATA_ROOT_BACKEND=conditional`. It creates a distinct
 `coord-v2` namespace and persists authority mode `r2-conditional`; mismatched
 configuration fails instead of forking or upgrading an existing database.
@@ -163,8 +198,8 @@ and final commit. Native decoding still verifies each page; root hints never
 authorize a write. Large or packed roots stay on the existing bounded path.
 
 The local experiment `qualification/local-worker-latency.mjs --conditional-root`
-compares journal, conditional, conditional plus canonical bodies, and conditional
-plus canonical bodies plus overlapping WAL roots. Every case uses the same
+compares ordinary journal, bounded journal, canonical bodies and overlapping
+WAL roots, with optional permanent conditional-root comparisons. Every case uses the same
 frozen native modules and limits, disables completed-view reuse, and opens a
 fresh cut for each read so a hot old fence cannot hide authority dependency cost. It verifies body bytes, newer visibility
 fences, publication and counts. This is a local dependency experiment, not a
@@ -187,3 +222,71 @@ roots before its existing 20,000-root guard. Full immutable window indexing and
 separation of verbose archives from canonical proof remain necessary before a
 large hosted qualification; these changes do not certify lost deliveries or
 increase the 64 MiB source capture budget.
+
+
+Latest main was merged at `5ff70fbd90` (main tip `c912271651`), retaining the mail
+integration already merged at `63b51ef148`. The GCS append-only test conflict was
+resolved by keeping both generation-conditional publication tests and main's
+credential allocation/deadline regressions.
+
+An actual-workerd regression reproduces and fixes the initial short-cut renewal
+conflict. It verifies native mutation plans, newer fenced reads, receipt replay,
+publication/counts and reopening after erased platform storage, with platform
+SQL and KV access forbidden. Cursor-producing lists/searches and exact generation
+requests explicitly retain durable pins; their cohorts cannot coalesce with
+short point-cut admissions. The original failed workerd report is retained.
+
+
+The shared object-store suite now passes 177 tests with two live-provider tests
+skipped (179 total). The bounded-journal cases cover 64 consecutive one-PUT
+commits, one-GET warm observation, rotation/following seals, forged state and
+binding scopes, expired/regressed clocks, a delayed recreated slot after actual
+checkpoint/collection, lost acknowledgements, stale owners, two-read idle
+revalidation, and transactional KV/fused-read/GC-barrier integration. Checkpoint
+deferral within its one-second window is preserved and tested.
+
+
+## Local comparison after main integration
+
+Actual workerd and the same frozen WASMs, four tenants with 512 1 KiB documents
+each, 20 ms injected binding delay, 128 fenced reads and 64 writes per case.
+Every read opens a fresh cut; completed-view reuse is disabled. All cases verify
+returned body bytes, newer fences after writes, publication and exact counts.
+The module hash is
+`044efc02e89e4fecce3b7e624527cedcdebb32687f918cec18e1c46e88f2312b`.
+Limits and capacities are unchanged. These are dependency-depth experiments,
+not Cloudflare SLOs or a fourfold result.
+
+| Forward order | Read p95 | Write p95 | Measured read GETs |
+| --- | ---: | ---: | ---: |
+| Ordinary journal | 57.92 ms | 194.34 ms | 512 |
+| Bounded journal | 58.09 ms | 101.10 ms | 256 |
+| Bounded + canonical bodies | 35.56 ms | 98.79 ms | 196 |
+| Bounded + canonical + overlap | 35.46 ms | 105.05 ms | 196 |
+
+The reverse-order repeat measures bounded/canonical at 37.21/105.96 ms versus
+ordinary journal at 59.72/197.78 ms. Thus the selected profile lowers local read
+p95 38–39%, write p95 46–49%, and read GETs 61.7%. The extra planning wave adds
+CPU/dispatch overhead on this warm workload, so it remains opt-in and is not
+selected. The default existing namespace protocol remains unchanged; new bounded
+namespaces require explicit compatible activation.
+
+Reports are `worker-latency-1793327738736.json` and
+`worker-latency-1793328092125.json` under the example's
+`dist/qualification/latency-lab/`. Both reference copied native modules. Earlier
+failed native/workerd/timing attempts remain preserved rather than replaced.
+
+The fourfold hosted targets and complete-diagnostic gate still require fresh
+provider qualification. Compact/window-indexed evidence retrieval and exhaustive
+provider allocator coverage remain open; the root-population fix and fixed
+rejection causes do not certify a complete larger capture. No new paid Cloudflare
+resources were created for these local comparisons.
+
+
+Final merged-source checks pass 430 Node tests, 41 workerd tests, the separate
+mail workerd integration, and all 11 native publication/read-plan tests, in
+addition to the 177 shared object-store tests above. The earlier concurrent
+build run hit an existing three-second timing assertion; the unchanged assertion
+passes in the focused 120-test repeat and in the final serial Node suite. Mail
+still emits the pre-existing RPC-result-disposal warning seen before this work;
+its correctness integration passes, but that warning is not claimed resolved.

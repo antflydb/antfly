@@ -304,3 +304,21 @@ test('conditional ROOT supports native plans, bounded read cuts and reopen witho
   assert.ok(objects.some(o=>o.key.endsWith('/ROOT')));assert.ok(!objects.some(o=>o.key.includes('/epochs/')));
  }finally{await f.close();}
 });
+
+test('bounded immutable journal supports native plans, bounded read cuts and reopen without platform SQL or KV',{timeout:120000},async()=>{
+ const f=await fixture('bounded-journal-end-to-end',false,true);
+ try{
+  Object.assign(f.options.bindings,{METADATA_ROOT_BACKEND:'bounded-journal',NATIVE_WRITE_PLAN:'true',NATIVE_WRITE_READ_AHEAD:'true',NATIVE_READ_PLAN:'true',FUSED_READ_ADMISSION:'true',NATIVE_READ_STATE:'true',WAL_DOCUMENT_INDEX:'true',CANONICAL_POINT_BODIES:'true'});await f.reopen();
+  const mutation={op:'mutate',operation_id:'conditional-first',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"conditional durable body"}'}]},first=await f.call(mutation);
+  while((await f.call({op:'publish'})).has_more){}
+  assert.equal((await f.call({op:'lookup',doc_id:'one',required_visibility:first.visibility})).body,mutation.mutations[0].body);
+  const updated=await f.call({op:'mutate',operation_id:'conditional-second',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"new fence"}'}]});
+  assert.equal((await f.call({op:'lookup',doc_id:'one',required_visibility:updated.visibility})).body,'{"text":"new fence"}');
+  await f.call({},'/wipe-platform');await f.reopen();
+  assert.equal((await f.call(mutation)).visibility,first.visibility);
+  assert.equal((await f.call({op:'lookup',doc_id:'one'})).body,'{"text":"new fence"}');
+  while((await f.call({op:'publish'})).has_more){}assert.equal((await f.call({op:'count'})).count,'1');
+  const bucket=await f.bucket(),objects=(await bucket.list({prefix:'antfly/coord-v1/',limit:1000})).objects;
+  assert.ok(objects.some(o=>o.key.includes('/epochs/')));assert.ok(!objects.some(o=>o.key.endsWith('/ROOT')));
+ }finally{await f.close();}
+});

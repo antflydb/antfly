@@ -35,6 +35,7 @@ pub const Command = struct {
 pub const Request = struct {
     root_backend: RootBackend = .journal,
     root_cursor: ?conditional.Cursor = null,
+    journal_proof: ?journal.WriteProof = null,
     root_proof_scope: [16]u8 = @splat(0),
     root_proof_key: ?[32]u8 = null,
     action: enum { begin, observe, observe_committed, observe_read, read, commit, commit_wal, checkpoint, trace, retire_logs },
@@ -303,11 +304,13 @@ pub const Context = struct {
         const base = try std.fmt.allocPrint(m, "{s}/{s}/{s}", .{ self.prefix, if (req.root_backend == .conditional) "coord-v2" else "coord-v1", std.fmt.bytesToHex(digest, .lower) });
         const domain = Pages.domainForNamespace(base);
         const journal_log = journal.Log{ .client = self.client, .bucket = self.bucket, .prefix = base, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .checkpoint_commits = req.checkpoint_commits };
-        var log = authority.Authority{ .log = journal_log, .cursor = req.root_cursor, .root = if (req.root_backend == .conditional) conditional.Context{ .client = self.client, .bucket = self.bucket, .prefix = base, .namespace = self.namespace, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .proofs = &conditional_proofs, .proof_scope = req.root_proof_scope, .proof_key = req.root_proof_key } else null };
+        var log = authority.Authority{ .log = journal_log, .cursor = req.root_cursor, .journal_proof = req.journal_proof, .journal_auth = if (req.root_backend == .bounded_journal and req.root_proof_key != null) journal.ProofAuthority{ .key = req.root_proof_key.?, .scope = req.root_proof_scope } else null, .root = if (req.root_backend == .conditional) conditional.Context{ .client = self.client, .bucket = self.bucket, .prefix = base, .namespace = self.namespace, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .proofs = &conditional_proofs, .proof_scope = req.root_proof_scope, .proof_key = req.root_proof_key } else null };
+        if (req.root_backend == .bounded_journal and req.action != .read and log.journal_auth == null) return error.ImmutableLogProofRequired;
         const observing = req.action == .begin or req.action == .observe or req.action == .observe_committed or req.action == .observe_read;
         const observed = if (observing) blk: {
             const recovered = if (req.action == .observe_committed or (req.action == .observe_read and !req.observe_owned)) try log.observeCommitted(m, req.state) else if (req.action == .observe or req.action == .observe_read) try log.observe(m, req.state orelse return error.CoordinatorSessionRequired) else try log.recover(m, req.state, req.state == null or !std.mem.eql(u8, &req.state.?.owner, &req.owner));
             if (req.action != .observe_read or recovered.has_more) {
+                if (req.root_backend == .bounded_journal) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .journal_proof = log.journal_proof, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
                 if (req.root_backend == .conditional) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .root_cursor = log.cursor, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
                 if (req.action != .observe_read or recovered.has_more) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
             }
@@ -357,6 +360,7 @@ pub const Context = struct {
                 };
             }
             if (selected) |row| try read_budget.charge(row);
+            if (req.root_backend == .bounded_journal) return read_budget.encode(self.alloc, .{ .state = state, .journal_proof = log.journal_proof, .has_more = false, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }), .results = output.items, .selected = selected });
             if (req.root_backend == .conditional) return read_budget.encode(self.alloc, .{ .state = state, .root_cursor = log.cursor, .has_more = false, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }), .results = output.items, .selected = selected });
             return read_budget.encode(self.alloc, .{ .state = state, .has_more = false, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }), .results = output.items, .selected = selected });
         }
@@ -457,6 +461,7 @@ pub const Context = struct {
             const encoded = try root.encodeBounded(m, state);
             try uploads.flush();
             const next = try log.append(m, state, encoded);
+            if (req.root_backend == .bounded_journal) return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = true, .state = next, .journal_proof = log.journal_proof, .publication = .{ .id = publication.id, .enqueue = enqueue } }, .{});
             if (req.root_backend == .conditional) return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = true, .state = next, .root_cursor = log.cursor, .publication = .{ .id = publication.id, .enqueue = enqueue } }, .{});
             return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = true, .state = next, .publication = .{ .id = publication.id, .enqueue = enqueue } }, .{});
         }
@@ -499,6 +504,7 @@ pub const Context = struct {
         const encoded = try root.encodeBounded(m, state);
         try uploads.flush();
         const next = try log.append(m, state, encoded);
+        if (req.root_backend == .bounded_journal) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = next, .journal_proof = log.journal_proof, .base = base }, .{});
         if (req.root_backend == .conditional) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = next, .root_cursor = log.cursor, .base = base }, .{});
         return std.json.Stringify.valueAlloc(self.alloc, .{ .state = next, .base = base }, .{});
     }
@@ -938,6 +944,40 @@ test "conditional metadata transactions retain KV, fused read, ownership and GC 
     try std.testing.expectError(error.PreconditionFailed, ctx.execute(.{ .action = .commit, .root_backend = .conditional, .root_proof_scope = @splat(1), .owner = @splat(1), .state = committed.state, .root_cursor = committed.root_cursor, .commands = &.{.{ .kind = .put, .key = "head", .value = "fork" }} }));
     try std.testing.expectError(error.ImmutableLogFenced, ctx.execute(.{ .action = .begin, .root_backend = .conditional, .owner = @splat(1), .state = committed.state, .root_cursor = committed.root_cursor }));
     const retired = try ctx.execute(.{ .action = .retire_logs, .root_backend = .conditional, .owner = @splat(2), .state = claimed.state, .root_cursor = claimed.root_cursor, .before = "0", .keys = &.{"test/ROOT"} });
+    const keys = (try std.json.parseFromSlice(struct { keys: []const []const u8 }, m, retired, .{})).value;
+    try std.testing.expectEqual(@as(usize, 0), keys.keys.len);
+}
+
+test "bounded journal metadata transactions retain KV fused reads ownership and GC barriers" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = objects.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    const ctx = Context{ .alloc = m, .client = client, .bucket = "db", .prefix = "test", .namespace = "bounded-transactions", .io = std.testing.io };
+    const Header = struct { state: journal.State, journal_proof: journal.WriteProof, base: ?[]const u8 = null };
+    const first = (try std.json.parseFromSlice(Header, m, try ctx.execute(.{ .action = .begin, .root_backend = .bounded_journal, .root_proof_key = @splat(42), .root_proof_scope = @splat(1), .owner = @splat(1) }), .{ .ignore_unknown_fields = true })).value;
+    try std.testing.expect(std.mem.indexOf(u8, first.base.?, "/coord-v1/") != null);
+    const committed = (try std.json.parseFromSlice(Header, m, try ctx.execute(.{ .action = .commit, .root_backend = .bounded_journal, .root_proof_key = @splat(42), .root_proof_scope = @splat(1), .journal_proof = first.journal_proof, .owner = @splat(1), .state = first.state, .inline_read_set = .{ .keys = &.{"head"}, .prefix = "pins/" }, .commands = &.{ .{ .kind = .put, .key = "head", .value = "committed" }, .{ .kind = .put, .key = "pins/1", .value = "clock" } } }), .{ .ignore_unknown_fields = true })).value;
+    const fused = try ctx.execute(.{ .action = .observe_read, .root_backend = .bounded_journal, .root_proof_key = @splat(42), .root_proof_scope = @splat(2), .owner = @splat(8), .commands = &.{.{ .kind = .get, .key = "head" }}, .read_prefix = "pins/" });
+    const Read = struct { state: journal.State, journal_proof: journal.WriteProof, results: [][]Row, selected: ?Row };
+    const read = (try std.json.parseFromSlice(Read, m, fused, .{ .ignore_unknown_fields = true })).value;
+    try std.testing.expectEqualStrings("committed", read.results[0][0].value);
+    try std.testing.expectEqualStrings("clock", read.selected.?.value);
+    try std.testing.expectEqual(committed.state.revision, read.state.revision);
+    const checkpointed = (try std.json.parseFromSlice(struct { checkpointed: bool }, m, try ctx.execute(.{ .action = .checkpoint, .root_backend = .bounded_journal, .root_proof_key = @splat(42), .owner = @splat(1), .state = committed.state, .journal_proof = committed.journal_proof }), .{})).value;
+    // R2's existing one-second checkpoint throttle remains authoritative.
+    // A deferred barrier is retried by GC rather than forcing a hot-key write.
+    const durable_floor = (try (journal.Log{ .client = client, .bucket = "db", .prefix = committed.base.?, .owner = @splat(1), .io = std.testing.io }).checkpoint(m)).?;
+    try std.testing.expect(durable_floor.state.revision <= committed.state.revision);
+    if (checkpointed.checkpointed) try std.testing.expectEqual(committed.state.revision, durable_floor.state.revision);
+    const claimed = (try std.json.parseFromSlice(Header, m, try ctx.execute(.{ .action = .begin, .root_backend = .bounded_journal, .root_proof_key = @splat(42), .root_proof_scope = @splat(3), .owner = @splat(2) }), .{ .ignore_unknown_fields = true })).value;
+    try std.testing.expectError(error.PreconditionFailed, ctx.execute(.{ .action = .commit, .root_backend = .bounded_journal, .root_proof_key = @splat(42), .root_proof_scope = @splat(1), .owner = @splat(1), .state = committed.state, .journal_proof = committed.journal_proof, .commands = &.{.{ .kind = .put, .key = "head", .value = "fork" }} }));
+    try std.testing.expectError(error.ImmutableLogFenced, ctx.execute(.{ .action = .begin, .root_backend = .bounded_journal, .root_proof_key = @splat(42), .owner = @splat(1), .state = committed.state, .journal_proof = committed.journal_proof }));
+    const retired = try ctx.execute(.{ .action = .retire_logs, .root_backend = .bounded_journal, .root_proof_key = @splat(42), .owner = @splat(2), .state = claimed.state, .journal_proof = claimed.journal_proof, .before = "0", .keys = &.{"test/ROOT"} });
     const keys = (try std.json.parseFromSlice(struct { keys: []const []const u8 }, m, retired, .{})).value;
     try std.testing.expectEqual(@as(usize, 0), keys.keys.len);
 }

@@ -47,7 +47,7 @@ export class NativeReadViews {
    return this.store.readOnly(async tx=>{
     const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,keys.hints]);
     if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||authority.descriptor.mode!==coordinatorAuthorityMode(this.env))throw Error("CoordinatorMigrationRequired");
-    const view=await captureReadView(tx,keys,{...options,lease_observed_at_ms:observedAt,allow_ephemeral_pin:this.store.rootBackend==="conditional",read_lease_policy:this.leaseCapacity||this.store.rootBackend==="conditional"?authority.descriptor.read_lease_policy:undefined},this.clock);publish(view);return view;
+    const view=await captureReadView(tx,keys,{...options,lease_observed_at_ms:observedAt,allow_ephemeral_pin:this.store.rootBackend!=="journal",read_lease_policy:this.leaseCapacity||this.store.rootBackend!=="journal"?authority.descriptor.read_lease_policy:undefined},this.clock);publish(view);return view;
    },{traceId:options.trace_id,traceIds,onAdmission:close,background:options.background??this.background,deadlineMs:options.deadlineMs,...(this.env.FUSED_READ_ADMISSION==="true"?{readKeys:[MIGRATION,keys.head,keys.wal,keys.floor,keys.hints],readPrefix:keys.progress+"READ_PINS/"}:{})});
   },options.trace_id,{untilAdmission:true,onPrepared:options.onPrepared,onAdmitted:options.onAdmitted});
  }
