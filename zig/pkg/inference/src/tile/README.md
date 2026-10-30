@@ -101,6 +101,13 @@ scalar types are folded into MSL templates with
 `scripts/tile/verify_msl_templates.py <old> <new>` expands every instance
 and requires it to equal the old kernel text exactly.
 
+CUDA kernels can't be `extern "C"` templates, so near-copy CUDA kernels
+keep their exact signatures as one-line wrappers around a
+`__device__ __forceinline__` `*_impl` template.
+`scripts/tile/verify_cuda_templates.py <old> <new>` checks each wrapper
+expands to its old body; the compiled PTX is also identical apart from the
+mangled names of `__shared__` arrays.
+
 Changing CUDA source means regenerating the checked-in PTX/fatbin/cubin
 with the pinned toolkit (CUDA 13.2, V13.2.86). Without a local install, the
 PyPI wheels reproduce the checked-in artifacts byte for byte:
