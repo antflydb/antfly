@@ -4651,6 +4651,18 @@ mutations, normalization and postimage authorization. These runs exercise the
 rebuilt executable; they do not rerun or clear the enrichment fault-campaign
 caveat below.
 
+Main advanced during qualification and was fetched and merged again through
+`c0705f1264` in `5d49f54003`. The browser merge retains both the Cypher module
+and upstream's shared inference schema import. All 37 source-boundary and
+local-test-ownership contracts pass on this snapshot.
+The rebuilt merged CLI again passes both public regressions: the expanded
+property-plan/SQL-overlay case in 29.17 seconds and the replicated-owner
+qualification in 164.18 seconds.
+The combined native gate also succeeds in all 147 steps on this merge,
+including the portable embedded host; all reported native cases have zero
+leaks. Unchanged core and callback ABI test results are reused from the
+successful access-path qualification above.
+
 The distributed enrichment caveat above remains open. Two combined public
 campaigns passed 19 cases but the owner-loss case ended with a durable
 `committed_repair_required` receipt; all three data owners exhausted retries on
