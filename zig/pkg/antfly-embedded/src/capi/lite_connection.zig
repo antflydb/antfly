@@ -1086,7 +1086,8 @@ pub const Owner = struct {
     // checkpoint has left the retained slots. Its old page IDs are then unsafe
     // to traverse. Instead adopt only this turn's fenced housekeeping result,
     // while the serving handle and its entry header are still unchanged.
-    fn adoptIdleMaintenanceCheckpoint(self: *Owner, foreground: *h.Handle, entry_header: native.Header, maintenance: *NativeStore) !void {
+    fn adoptIdleMaintenanceCheckpoint(self: *Owner, foreground: *h.Handle, entry_header: native.Header, maintenance_entry_header: native.Header, maintenance: *NativeStore) !void {
+        if (!std.meta.eql(entry_header, maintenance_entry_header)) return;
         if (self.current != foreground or foreground.maintenance_references != 0 or needsOutcomeReconciliation(foreground)) return;
         const store = foreground.owned_lite_backend.?.native_docstore.?;
         if (!std.meta.eql(store.file.header, entry_header)) return;
@@ -1110,9 +1111,16 @@ pub const Owner = struct {
         after.page_count = 0;
         before.catalog_root_page = 0;
         after.catalog_root_page = 0;
+        before.index_catalog_root_page = 0;
+        after.index_catalog_root_page = 0;
         // This turn ran no DB work. Reclamation admission never rebases over
-        // external commits, so only lease metadata and allocator state may
-        // differ. Primary, namespace and immutable index roots must all match.
+        // external commits, so only lease metadata, its allocator certificate,
+        // and allocator state may differ. A certificate updates the physical
+        // index catalog even though no immutable index bytes changed. Requiring
+        // that catalog root to match would discard our own fenced cleanup,
+        // reopen the runtime, and create another set of artifact leases.
+        // Primary and namespace roots must still match. The inode and exact
+        // maintenance-tip checks above reject every external publication.
         if (!std.meta.eql(before, after) or store.file.header.page_size != probe.header.page_size or
             store.file.header.packed_records != probe.header.packed_records or
             store.file.header.indexed_reclamation != probe.header.indexed_reclamation) return;
@@ -1327,6 +1335,7 @@ pub const Owner = struct {
         root.maintenance_publication = &publication;
         const store = root.owned_lite_backend.?.native_docstore.?;
         const foreground_header = foreground.owned_lite_backend.?.native_docstore.?.file.header;
+        const maintenance_entry_header = store.file.header;
         if (run_database) if (database.enrichment_runtime) |runtime| {
             if (self.embedding_memo == null) self.embedding_memo = memo_mod.QueryEmbeddingCache.init(alloc, io, .{ .max_bytes = embedding_memo_bytes, .ttl_ns = std.time.ns_per_min });
             runtime.dense_result_cache = .{ .ptr = self, .lookup = lookupEmbedding, .remember = rememberEmbedding };
@@ -1407,7 +1416,7 @@ pub const Owner = struct {
             self.current != root;
         // Retaining the serving runtime does not hide physical progress. Run
         // another bounded storage turn before declaring cleanup quiescent.
-        if (independent and !run_database) try self.adoptIdleMaintenanceCheckpoint(foreground, foreground_header, store);
+        if (independent and !run_database) try self.adoptIdleMaintenanceCheckpoint(foreground, foreground_header, maintenance_entry_header, store);
         if (independent and run_database) self.maintenance_storage_pending = true;
         // A moved physical tip requires a prompt refresh, not another DB
         // replay pass. Reader leases/index housekeeping also move that tip;
@@ -1457,6 +1466,7 @@ pub const Owner = struct {
         const entry_header = foreground.owned_lite_backend.?.native_docstore.?.file.header;
         const root = try self.refreshMaintenanceSnapshot(foreground, false);
         const store = root.owned_lite_backend.?.native_docstore.?;
+        const maintenance_entry_header = store.file.header;
         root.maintenance_references += 1;
         root.maintenance_owner = self;
         root.maintenance_publication = null;
@@ -1472,7 +1482,7 @@ pub const Owner = struct {
         root.maintenance_owner = null;
         root.maintenance_references -= 1;
         inheritReclamationTelemetry(self.current.?.owned_lite_backend.?.native_docstore.?, store);
-        try self.adoptIdleMaintenanceCheckpoint(foreground, entry_header, store);
+        try self.adoptIdleMaintenanceCheckpoint(foreground, entry_header, maintenance_entry_header, store);
         try result;
         return true;
     }

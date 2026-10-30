@@ -340,6 +340,14 @@ integrity checks still traverse the graph. The handoff adds metadata records and
 fingerprinting proportional to the loaded ledger counters and pending entries;
 qualification must measure that cost alongside contending-writer progress.
 
+Storage-only maintenance can also replace a live certificate while deleting
+orphan artifact leases. The foreground may adopt that housekeeping only when
+both captures started at the same header, the current foreground is unchanged,
+and the published inode and complete checkpoint still match the maintenance
+result. Reclamation admission never rebases across an external publication.
+These fences allow the certificate catalog root to advance without reopening
+the database runtime and creating another set of leases.
+
 Opening an immutable artifact publishes an inode-local lease alias. These
 metadata-only commits have their own allocation policy. Mixed groups retain
 ordinary authored-write validation and batching. An unbounded owner with an
