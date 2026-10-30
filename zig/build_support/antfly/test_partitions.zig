@@ -41,6 +41,10 @@ pub fn setMemoryProfile(b: *std.Build, profile: runtime_memory.TestPartitionProf
     memory_profiles.put(b.allocator, b, profile) catch @panic("OOM");
 }
 
+pub fn memoryProfile(b: *std.Build) runtime_memory.TestPartitionProfile {
+    return memory_profiles.get(b) orelse .{};
+}
+
 fn testObject(artifact: *std.Build.Step.Compile) ?*std.Build.Step.Compile {
     if (artifact.kind == .@"test" or artifact.kind == .test_obj) return artifact;
     if (artifact.kind != .exe or artifact.root_module.root_source_file != null) return null;

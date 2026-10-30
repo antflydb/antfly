@@ -23,7 +23,7 @@ pub fn inferenceCompileMaxRss(os: std.Target.Os.Tag, shared: bool, measured_darw
     const gib = 1024 * 1024 * 1024;
     // Linux -> macOS SDK 26.1: 11G rounded MaxRSS, plus a GiB and 10%.
     if (os == .macos and shared and measured_cross) return 14 * gib;
-    // Native SDK 26.6.2 / Zig 0.17 cold fast build: 24,912,183,296 bytes.
+    // Native macOS 26.6.2 / SDK 27.0 / Zig 0.17 cold fast build: 24,912,183,296 bytes.
     // Keep more than 10% margin on unqualified native Darwin SDKs.
     if (os == .macos and shared) return (if (measured_darwin) @as(u64, 12) else 26) * gib;
     return (if (os == .macos and measured_darwin) @as(u64, 8) else 12) * gib;
