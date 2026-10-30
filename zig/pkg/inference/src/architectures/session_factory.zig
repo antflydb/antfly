@@ -33,6 +33,7 @@ const InferenceExecutionControl = @import("../execution_control.zig").InferenceE
 const bert = @import("../models/bert.zig");
 const t5_mod = @import("../models/t5.zig");
 const gpt_mod = @import("../models/gpt.zig");
+const qwen35_execution = @import("qwen35_execution.zig");
 const embedding_gemma2_model = @import("../models/embedding_gemma2.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const whisper_mod = @import("../models/whisper.zig");
@@ -2003,10 +2004,28 @@ fn createCudaSessionWithRequiredProfile(
     else
         runtime.tier.memory.Limits{};
     const decision_identity_handoff = unsealedGlinerDecisionIdentityHandoff(native_impl);
+    var resolved_arch_config = native_impl.arch_config;
+    const recurrent_execution: ?qwen35_execution.Decision = if (resolved_arch_config == .gpt and
+        resolved_arch_config.gpt.isQwen35() and resolved_arch_config.gpt.qwen35_has_linear_attention)
+    blk: {
+        const decision = qwen35_execution.apply(&resolved_arch_config.gpt, cuda_compute.ctx.info.compute_major, qwen35_execution.cudaCoreEnabled());
+        const placement_format = "inference recurrent placement backend=cuda placement={s} reason={s} compute={d}.{d}";
+        const placement_args = .{
+            @tagName(decision.placement), @tagName(decision.reason), cuda_compute.ctx.info.compute_major, cuda_compute.ctx.info.compute_minor,
+        };
+        // The native benchmark runner suppresses info logs. Keep its placement
+        // evidence explicit instead of inferring execution from a backend name.
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print(placement_format ++ "\n", placement_args)
+        else
+            std.log.info(placement_format, placement_args);
+        break :blk decision;
+    } else null;
     const impl = try allocator.create(ArchSession);
     impl.* = .{
         .allocator = allocator,
-        .arch_config = native_impl.arch_config,
+        .arch_config = resolved_arch_config,
+        .recurrent_execution = recurrent_execution,
         .task = native_impl.task,
         .gliner_span_encoder_family = native_impl.gliner_span_encoder_family,
         .gliner_decision_identity = decision_identity_handoff.identity,
@@ -6845,6 +6864,7 @@ const ArchSession = struct {
     video_coefficient_suspended: bool = false,
     allocator: std.mem.Allocator,
     arch_config: ArchConfig,
+    recurrent_execution: ?qwen35_execution.Decision = null,
     boundary_identity: ?boundary_bundle.Identity = null,
     gliner_decision_identity: ?gliner_decide_qualification.Identity = null,
     gliner_decision_identity_sealed: bool = false,
@@ -7535,6 +7555,14 @@ fn makeComputeBackend(
         } else return error.CudaNotEnabled,
         .wasm => return error.WasmNotSupportedHere,
     };
+}
+
+/// The placement resolved at model load; read-only diagnostics never re-resolve
+/// mutable environment flags or alter an existing recurrent history.
+pub fn getRecurrentExecution(session: Session) ?qwen35_execution.Decision {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return self.recurrent_execution;
 }
 
 /// Get GPT config from a session, if it's a GPT model. Returns null for non-GPT architectures.

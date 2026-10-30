@@ -1303,24 +1303,26 @@ test "boundary qualification Transformers wrapper has exactly the original fp32 
     try std.testing.expectEqual(identity.sidecars[0].sha256, std.fmt.bytesToHex(digest, .lower));
     try std.testing.expectEqual(identity.sidecars[0].size_bytes, bytes.len);
     try std.testing.expect(hasQualifiedIdentity(identity));
-    var count: usize = 0;
-    for (publishedProfiles()) |entry| {
-        if (!equalIdentity(entry.identity, fastino_gliner25_base_v1)) continue;
-        try require(identity, entry.backend, entry.features, entry.lengths);
-        var expected = entry;
-        expected.identity = identity;
-        const mirrored = for (publishedProfiles()) |candidate| {
-            if (std.meta.eql(expected, candidate)) break true;
-        } else false;
-        try std.testing.expect(mirrored);
-        count += 1;
-    }
+    var original_count: usize = 0;
     var wrapper_count: usize = 0;
     for (publishedProfiles()) |entry| {
-        if (equalIdentity(entry.identity, identity)) wrapper_count += 1;
+        const original = equalIdentity(entry.identity, fastino_gliner25_base_v1);
+        const wrapper = equalIdentity(entry.identity, identity);
+        if (!original and !wrapper) continue;
+        if (original) original_count += 1 else wrapper_count += 1;
+        const peer_identity = if (original) identity else fastino_gliner25_base_v1;
+        var exact_peers: usize = 0;
+        for (publishedProfiles()) |peer| {
+            if (equalIdentity(peer.identity, peer_identity) and peer.backend == entry.backend and
+                std.meta.eql(peer.features, entry.features) and std.meta.eql(peer.lengths, entry.lengths)) exact_peers += 1;
+        }
+        // Include grouped CUDA/Metal rows, and reject extra wrapper grants as
+        // well as missing ones. A stale row count cannot prove equivalence.
+        try std.testing.expectEqual(@as(usize, 1), exact_peers);
+        try require(peer_identity, entry.backend, entry.features, entry.lengths);
     }
-    try std.testing.expect(count > 0);
-    try std.testing.expectEqual(count, wrapper_count);
+    try std.testing.expect(original_count > 0);
+    try std.testing.expectEqual(original_count, wrapper_count);
     for (0..4) |index| {
         var changed = identity;
         changed.sidecars[index].sha256[0] = 'f';

@@ -41,6 +41,7 @@ const lib_chunker = @import("inference_chunker");
 const hf_tokenizer_mod = @import("inference_hf_tokenizer");
 const backends_mod = @import("../backends/backends.zig");
 const session_factory = @import("../architectures/session_factory.zig");
+const qwen35_execution = @import("../architectures/qwen35_execution.zig");
 const registry_mod = @import("../registry/registry.zig");
 const extractors_mod = @import("../extractors/extractor.zig");
 const cache_mod = @import("../cache/cache.zig");
@@ -8497,7 +8498,7 @@ pub const Node = struct {
         cfg.compact_qwen35_kv = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_COMPACT_KV");
         const backend: runtime.kv.pool.BackendKind = if (model.session.backend() == .cuda) .cuda else .metal;
         cfg.qwen35_device_only_state = cfg.hasQwen35VisionArchitectureContract() and
-            ((backend == .cuda and cudaLightOnBatchProfileEnabled()) or
+            ((backend == .cuda and cfg.qwen35_device_only_state) or
                 (metal_runtime.appleSimdgroupDeviceDefault() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE")));
         cfg.qwen35_metal_resident_vision = metal_runtime.appleSimdgroupDeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
             qwen3vl_projector.supportsResidentVisionBudget(cfg) and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET");
@@ -24950,6 +24951,18 @@ pub const Node = struct {
         var loaded_snapshot = try self.model_manager.acquireLoadedModelSnapshot(ctx.allocator);
         defer loaded_snapshot.deinit();
 
+        var recurrent_cuda: u64 = 0;
+        var recurrent_host: u64 = 0;
+        for (loaded_snapshot.handles) |handle| {
+            if (session_factory.getRecurrentExecution(handle.get().session)) |decision| {
+                switch (decision.placement) {
+                    .cuda => recurrent_cuda += 1,
+                    .host => recurrent_host += 1,
+                }
+            }
+        }
+        try appendPromMetric(&writer.writer, "antfly_inference_recurrent_cuda_models", "gauge", "Loaded CUDA models whose recurrent state executes on device", recurrent_cuda);
+        try appendPromMetric(&writer.writer, "antfly_inference_recurrent_host_models", "gauge", "Loaded CUDA models using an explicit host recurrent fallback", recurrent_host);
         // Derive gauges from live owners rather than an increment-only cache.
         self.metrics.models_loaded.set(@intCast(loaded_snapshot.handles.len));
         // Core metrics via prometheus lib
@@ -28432,7 +28445,7 @@ fn effectiveLightOnReadRows() usize {
 
 fn cudaLightOnBatchProfileEnabled() bool {
     return build_options.enable_cuda and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_BATCH") and
-        platform.env.getenvBool("TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE");
+        qwen35_execution.cudaCoreEnabled();
 }
 
 fn effectiveLightOnReadWindow() usize {
@@ -44701,6 +44714,7 @@ test "LightOnOCR3 decoder peak ownership preserves caps across failed growth and
     var model: model_manager_mod.LoadedModel = undefined;
     model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
     var ctx: Context = undefined;
+    ctx.cb = null;
     ctx.features = .{};
     ctx.cfg = .{};
     ctx.auxiliary_ready = .init(true);
@@ -44853,6 +44867,7 @@ test "LightOnOCR3 epoch admission owns shared scratch across page retirement and
     var model: model_manager_mod.LoadedModel = undefined;
     model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
     var ctx: Context = undefined;
+    ctx.cb = null;
     ctx.features = features;
     ctx.cfg = .{};
     ctx.auxiliary_lease = null;
@@ -45223,7 +45238,8 @@ test "LightOnOCR3 CUDA sixteen prefix admission keeps all per page state and res
     }
     try group.add(cfg, 662, 256, decoder, .{});
     try std.testing.expectEqual(decoder.backend_kv_bytes, group.amounts.backend_kv_bytes);
-    const working = (try runtime.tier.memory.estimateGptGeneration(.cuda, .f16, cfg, 662, 256, 256)).scratch_bytes;
+    const working = (try runtime.tier.memory.estimateGptGeneration(.cuda, .f16, cfg, 662, 256, 256)).scratch_bytes -
+        try runtime.tier.memory.gptRecurrentBackendStateBytes(.cuda, cfg);
     try std.testing.expect(group.decoder_backend_peak >= working * 2 * 16 + 128 * cfg.vocab_size * @sizeOf(f32));
     const complete = try group.finish();
     const cap = complete.hostTotalBytes() + complete.backendTotalBytes();
@@ -47317,4 +47333,23 @@ test "Whisper HTTP pipelines inherit narrowed output policy and preserve typed f
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 413), response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "OUTPUT_TOKEN_LIMIT_EXCEEDED") != null);
+}
+
+test "LightOnOCR3 serial and cohort CUDA admission charge persistent recurrent state exactly once" {
+    var cfg = try gpt_model_mod.parseConfig(std.testing.allocator, @embedFile("../models/testdata/lightonocr3/config-4b.json"));
+    cfg.qwen35_device_only_state = true;
+    const memory = runtime.tier.memory;
+    const estimate = try memory.estimateGptGeneration(.cuda, .f16, cfg, 128, 64, 128);
+    const decoder = memory.AdmissionAmounts.fromEstimate(estimate);
+    var serial = Node.LightOnCohortMemory{ .backend = .cuda };
+    try serial.add(cfg, 128, 64, decoder, .{});
+    try std.testing.expectEqual(decoder.backend_scratch_bytes + 128 * cfg.hidden_size * @sizeOf(f32), serial.amounts.backend_scratch_bytes);
+    var cohort = Node.LightOnCohortMemory{ .backend = .cuda, .share_decoder_scratch = true, .decoder_rows = 2 };
+    try cohort.add(cfg, 128, 64, decoder, .{});
+    const first = cohort.amounts;
+    const peak = cohort.decoder_backend_peak;
+    try cohort.add(cfg, 128, 64, decoder, .{});
+    try std.testing.expectEqual(first.backend_scratch_bytes * 2, cohort.amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(first.backend_kv_bytes * 2, cohort.amounts.backend_kv_bytes);
+    try std.testing.expectEqual(peak, cohort.decoder_backend_peak);
 }
