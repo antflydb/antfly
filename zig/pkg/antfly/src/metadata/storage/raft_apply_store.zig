@@ -28708,6 +28708,7 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
     var fields: [8][]const u8 = undefined;
     var count: usize = 0;
     var storage: @import("antfly_local_sources").common_table_storage.Settings = .{};
+    var object_storage_generation: u64 = 0;
     var lake_index_catalog_json: []const u8 = "";
     while (pos < encoded.len and count < fields.len) : (count += 1) {
         const length = try readInt(encoded, &pos, u32);
@@ -28723,7 +28724,9 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
             pos += length;
         }
         lake_index_catalog_json = try readLakeIndexCatalogExtension(encoded, &pos);
-        storage = (try readTableStorageExtension(encoded, &pos)).storage;
+        const extension = try readTableStorageExtension(encoded, &pos);
+        storage = extension.storage;
+        object_storage_generation = extension.object_storage_generation;
     }
     // Legacy, read-schema, and restore-intent records respectively. Borrow all
     // framed fields to validate the encoding, but copy only query-owned data.
@@ -28731,6 +28734,7 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
     return .{ .table_id = table_id, .name = name, .query_definition = if (mode != .identity) system_catalog.QueryDefinition{
         .table_id = table_id,
         .storage_engine = storage.engine,
+        .object_storage_generation = object_storage_generation,
         .schema_json = fields[1],
         .read_schema_json = if (mode == .schema or count == 5) "" else fields[2],
         .indexes_json = if (mode == .schema) "" else fields[if (count == 5) 2 else 3],
@@ -41008,6 +41012,11 @@ test "metadata.lake index object table engine framing preserves empty topology a
     const projection = try decodeTableQueryProjection(a, table_bytes, true);
     defer projection.deinit(a);
     try std.testing.expectEqual(.object, projection.query_definition.?.storage_engine);
+    try std.testing.expectEqual(table.object_storage_generation, projection.query_definition.?.object_storage_generation);
+    for ([_]TableProjectionMode{ .schema, .query }) |mode| {
+        const borrowed = try borrowTableProjection(table_bytes, mode);
+        try std.testing.expectEqual(table.object_storage_generation, borrowed.query_definition.?.object_storage_generation);
+    }
     var roundtrip = (try decodeTransitionCommand(a, wire)).?;
     defer roundtrip.deinit(a);
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, roundtrip.apply_table_topology.create.table));
