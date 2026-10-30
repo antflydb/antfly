@@ -2122,3 +2122,310 @@ The evidence does not establish a universal improvement. These ownership and
 admission changes are retained for their directly tested quota/lifetime and
 bounded-work contracts, not described as a CPU win for these regressing cases.
 Independent Linux hardware, cold storage and live providers remain unqualified.
+
+
+### Borrowed selected points and verified native media (2026-10-29)
+
+The follow-up merges main `c912271651` in `8a6bcad577` before qualification.
+The baseline is the exact previous PR runtime with that merge, built using the
+pinned Zig 0.17.0 stripped ReleaseFast flags. Its executable is
+`21427ed8a500dda4f14d3789fb01ef9a2ddd274d4803baeefdbeda8baad8c453`
+(234,373,864 bytes). It is independent of the earlier comparison against the
+previous main revision; those earlier observations are retained above.
+
+The LSM range path now treats its full point value as a temporary loan. It can
+borrow the pinned transaction's memtables and adopt one decoded local block,
+then copy only the coalesced selected spans into the output owner. The loan
+retains its existing working-set/cache reservation. This includes uncached and
+oversized local blocks, which ordinary bounded result pins deliberately decline.
+A wide owned result can transfer into a temporary shared owner after admission;
+optional admission denial preserves the compact-copy fallback. Metadata capacity
+and the numeric L0 hint are reusable across range batches; payloads and pins
+retire after every document. Full-value APIs, physical I/O windows and per-row
+cancellation retain their contracts. This does not introduce sparse LSM I/O.
+
+Native tests cover cache enabled/disabled, 32 KiB and over-1-MiB values, an 8 KiB
+output budget, a working-set limit sized for one value, exact copy counts and
+zero retained working-set credit after each call. The tests also cover output
+stability after cache eviction, normal/private snapshots, concurrent replacement
+and deletion, and a 4 KiB working budget reading selected memtable spans.
+
+Source media resolution can retain its already verified codec bytes in a
+request-owned lease. A lazy policy enables this only for compatible linked
+native generation, including named generated deciders. Ordinary requests do
+not resolve this policy. Reuse has a 1 MiB soft codec budget after reference
+deduplication; exceeding it keeps ordinary verification and execution, rather
+than retaining a maximum-sized request or rejecting it for reuse. The source
+URLs and all content checks remain unchanged. Hosted, remote, chained, raw generated-envelope and
+non-default-detail paths keep their existing representation. No remote
+attachment capability is assumed and no model routing choice changes.
+
+The invocation's `RequestContext` borrows immutable URL/codec/MIME views; durable
+execution environments do not own them. Every source authorization, revision,
+digest, MIME, size and per-reference pixel check still runs. Identical verified
+payloads can share codec bytes within this invocation. The lease survives the
+last provider read and is released on success, cancellation and failure.
+
+The linked JSON generation adapter replaces compatible canonical image parts
+with references into the existing binary attachment envelope. The typed linked
+adapter uses the existing borrowed-attachment ABI. JSON frames and parsing
+scratch use reclaiming allocators: their credit returns after every synchronous
+provider invocation even when an outer request arena spans many decisions.
+A regression sends 32 frames through one live request arena under a 512 KiB
+budget and verifies exact content and restored credit after each invocation.
+Repeated occurrences have
+separate transport slots pointing to the same retained buffer. Existing
+attachments, non-default detail and unrelated parts preserve their meaning;
+opaque tools and schemas are not traversed. JSON number spellings are preserved
+losslessly while rewriting metadata. Native consumers continue their own MIME,
+pixel, resource and model admission checks. The attachment request carries the
+caller's generation budget and cancellation/deadline control through native
+admission; older internal attachment requests retain their 256-token default.
+A configured remote default for decisions disables retention even when a linked
+callback exists, following the decision runtime's effective routing precedence.
+
+Regression checks verify that a source image reaches a named generated decider
+with its bytes live through the native callback, then releases its source owner
+exactly once. Separate checks cover lazy policy evaluation, deduplicated buffers,
+failed verification cleanup, typed aliases, mixed media, attachment indices,
+opaque tool/schema values, and large/tiny/signed-zero numeric spellings. Shared
+execution-context tests are included in the inference contract gate.
+
+
+The transport microbenchmark is `zig/tools/bench_verified_media.zig`. Build from
+repository root, using worktree-local caches (all imported modules use the same
+optimization mode):
+
+```sh
+zig build-exe -OReleaseFast -fstrip --dep media --dep httpx \
+  -Mroot=zig/tools/bench_verified_media.zig \
+  -OReleaseFast -fstrip --dep antfly_inference_execution_control --dep httpx \
+  -Mmedia=zig/pkg/antfly-embedded/src/inference/execution_context.zig \
+  -OReleaseFast -fstrip \
+  -Mantfly_inference_execution_control=zig/pkg/inference/src/host/execution_control.zig \
+  -OReleaseFast -fstrip -Mhttpx=zig/lib/httpx/src/httpx.zig \
+  --cache-dir zig/.zig-cache --global-cache-dir zig/.zig-cache/global \
+  -femit-bin=zig/zig-out/bin/bench-verified-media
+zig/zig-out/bin/bench-verified-media
+```
+
+This measures the JSON transport adapter after source verification, including
+framing, native parsing and byte equality. It does not measure authorization,
+source verification, model inference or the typed attachment path. The inline
+control parses JSON and decodes base64 again; the candidate retains verified
+codec input and constructs a binary envelope. Framing can allocate more than
+the inline control even when decoding costs fall. Retained codec input is
+reported separately from transport allocations, and every trial checks that all
+measured allocations were freed. This is not a process-RSS or provider-cost
+benchmark. The 64-byte control is retained alongside 256-KiB and 1-MiB payloads.
+
+
+#### Matched qualification of selected loans and native media
+
+The final stripped ReleaseFast candidate is
+`8b6774236c6d97b3e629b510c54527006270a75572b432b143eef6ccabd39818`
+(234,407,192 bytes), compared with the merged prior PR head `8a6bcad577`:
+`21427ed8a500dda4f14d3789fb01ef9a2ddd274d4803baeefdbeda8baad8c453`
+(234,373,864 bytes). Both include main `c912271651` and use pinned Zig 0.17.0,
+`-Doptimize=ReleaseFast -Dstrip=true -j2`. The binary grows 33,328 bytes.
+The compiler executable SHA-256 is
+`1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523`.
+Measurements use a shared Apple M4 Max, 14 logical CPUs, 36 GiB RAM,
+macOS 27.0.1 ARM64. No task compiler runs overlap these server timing trials.
+
+The full native check passed 102 build steps and 190 standard-runner tests,
+plus 212 query-contract, 91 logical-field, 31 provider, 72 gateway and 24 catalog
+cases, with one optional logical-field skip. Subsequent source-only media
+refinements passed the 71-step gateway/contract check; the final gateway suite
+executes 73 cases, including the repeated-frame budget regression. All report
+zero failures and leaks. The final release passes 71 steps. Real-server indexed
+HTTP integration passes 57 cases, with seven optional profile cases skipped.
+License/header/boundary, storage-control catalog, provenance/asset tests, Zig
+formatting and benchmark-driver Ruff checks also pass.
+
+The following table retains all 44 initial controls: five source corpora with
+six phases each, five projection batches and nine media cases. Each uses five
+alternating baseline/candidate rounds and exact output comparisons. Source
+and media trials run 50 reads per phase; projection batches run 100. Source
+corpora contain eight documents. Large ASCII values are 1 MiB, escaped values
+256 KiB, and wide-small ASCII values 64 KiB. The wide and small64 cases request
+60 extra computed metadata outputs; small64 has short content. Projection
+batches contain 64 documents with scalar or nested metadata and the indicated
+16 KiB, 64 KiB or 1 MiB unrelated values. Media fixture names identify distinct,
+shared, repeated and skewed 256/512-pixel inputs.
+
+CPU and elapsed columns are milliseconds per operation; RSS is sampled MiB.
+Ingest is per fixture insertion. Reference phases deliberately materialize
+content and are retained as controls, not presented as optimized paths.
+Whole-server CPU includes background work; sampled RSS includes allocator and
+cache retention and is not an allocation bound. Media materialization fixtures
+finish with `ModelRequired` after verifying sources: these are retrieval
+controls, not model-inference or codec-reuse quality/billing measurements.
+
+
+**Source delivery**
+
+| Workload/phase | CPU ms baseline → candidate | Elapsed ms baseline → candidate | RSS MiB baseline → candidate |
+|---|---:|---:|---:|
+| escaped / ingest | 130.179 → 130.578 | 117.142 → 112.255 | 199.078 → 199.266 |
+| escaped / ordinary | 7.848 → 7.725 | 9.516 → 9.380 | 205.258 → 206.047 |
+| escaped / full | 15.484 → 15.471 | 16.926 → 17.002 | 211.797 → 216.297 |
+| escaped / reference_full | 28.715 → 28.812 | 29.746 → 29.906 | 210.688 → 215.312 |
+| escaped / conditional | 0.734 → 0.849 | 1.307 → 1.648 | 214.375 → 216.344 |
+| escaped / reference | 15.441 → 15.644 | 15.787 → 16.026 | 214.391 → 216.344 |
+| large / ingest | 143.326 → 144.395 | 138.017 → 135.913 | 276.578 → 274.938 |
+| large / ordinary | 13.949 → 14.176 | 17.923 → 18.159 | 480.641 → 465.977 |
+| large / full | 18.379 → 18.427 | 22.067 → 22.227 | 747.328 → 747.969 |
+| large / reference_full | 30.747 → 30.389 | 34.137 → 33.693 | 740.172 → 740.594 |
+| large / conditional | 0.879 → 0.887 | 1.490 → 1.519 | 739.672 → 741.359 |
+| large / reference | 14.911 → 14.732 | 15.310 → 15.100 | 739.797 → 742.266 |
+| small64 / ingest | 22.599 → 23.092 | 13.212 → 12.908 | 152.016 → 152.047 |
+| small64 / ordinary | 0.340 → 0.409 | 0.810 → 0.973 | 155.844 → 155.688 |
+| small64 / full | 1.612 → 1.670 | 2.291 → 2.448 | 159.609 → 160.062 |
+| small64 / reference_full | 1.692 → 1.714 | 2.367 → 2.461 | 159.094 → 159.375 |
+| small64 / conditional | 1.719 → 1.695 | 2.465 → 2.432 | 159.984 → 160.094 |
+| small64 / reference | 1.723 → 1.742 | 2.451 → 2.449 | 160.406 → 160.141 |
+| wide-large / ingest | 150.590 → 149.175 | 143.485 → 151.581 | 278.094 → 276.938 |
+| wide-large / ordinary | 14.139 → 14.198 | 18.294 → 18.302 | 484.969 → 477.352 |
+| wide-large / full | 19.458 → 19.055 | 23.277 → 22.884 | 755.398 → 746.438 |
+| wide-large / reference_full | 31.632 → 31.692 | 34.923 → 35.068 | 743.797 → 741.281 |
+| wide-large / conditional | 2.024 → 1.966 | 2.763 → 2.641 | 739.859 → 738.641 |
+| wide-large / reference | 15.977 → 16.032 | 16.404 → 16.470 | 741.906 → 738.641 |
+| wide-small / ingest | 35.766 → 35.349 | 18.436 → 18.870 | 160.984 → 160.641 |
+| wide-small / ordinary | 1.245 → 1.299 | 2.091 → 2.167 | 166.922 → 166.500 |
+| wide-small / full | 2.799 → 2.752 | 3.760 → 3.649 | 172.266 → 172.344 |
+| wide-small / reference_full | 3.563 → 3.611 | 4.500 → 4.558 | 170.594 → 170.156 |
+| wide-small / conditional | 1.770 → 1.742 | 2.444 → 2.368 | 176.438 → 177.125 |
+| wide-small / reference | 2.736 → 2.690 | 3.426 → 3.365 | 176.500 → 177.188 |
+
+**Projection batches**
+
+| Workload/phase | CPU ms baseline → candidate | Elapsed ms baseline → candidate | RSS MiB baseline → candidate |
+|---|---:|---:|---:|
+| nested-large / read | 3.689 → 3.770 | 4.515 → 4.575 | 480.094 → 492.125 |
+| nested-medium / read | 2.345 → 2.325 | 3.179 → 3.159 | 181.188 → 178.828 |
+| nested-small / read | 2.349 → 2.307 | 3.287 → 3.216 | 166.469 → 166.359 |
+| scalar-large / read | 3.262 → 3.357 | 3.908 → 4.027 | 461.781 → 457.203 |
+| scalar-small / read | 1.807 → 1.808 | 2.434 → 2.419 | 165.125 → 164.922 |
+
+**Media materialization**
+
+| Workload/phase | CPU ms baseline → candidate | Elapsed ms baseline → candidate | RSS MiB baseline → candidate |
+|---|---:|---:|---:|
+| large_distinct_unique / read | 13.130 → 12.747 | 5.871 → 5.707 | 218.062 → 219.242 |
+| large_distinct_unique_eight / read | 28.663 → 29.797 | 13.019 → 19.899 | 257.797 → 262.273 |
+| skewed_distinct_eight / read | 15.185 → 15.240 | 12.077 → 12.316 | 224.461 → 220.766 |
+| large_512_distinct_unique_eight / read | 86.292 → 86.541 | 47.520 → 47.506 | 406.766 → 407.172 |
+| large_shared_duplicates / read | 11.292 → 10.676 | 12.984 → 11.459 | 193.609 → 190.469 |
+| large_distinct_repeated_refs / read | 12.210 → 11.818 | 7.927 → 7.512 | 206.078 → 206.891 |
+| large_512_distinct_repeated_refs / read | 43.134 → 43.304 | 42.683 → 42.866 | 320.906 → 322.695 |
+| tiny_shared_duplicates / read | 0.396 → 0.395 | 1.035 → 1.060 | 154.312 → 154.188 |
+| medium_shared_duplicates / read | 1.022 → 0.983 | 1.638 → 1.550 | 157.828 → 157.844 |
+
+Reproduce the server comparisons from repository root with the pinned baseline
+and candidate executables. Run each case serially; use the table's corpus sizes,
+metadata shape and extra-output settings for the remaining cases:
+
+```sh
+grep_candidate=output/projection-followup/next-candidate/antfly
+grep_baseline=output/projection-followup/next-baseline/antfly
+python3 zig/e2e/antfly/bench_source_projection.py "$grep_candidate" \
+  --baseline "$grep_baseline" --rounds 5 --queries-per-phase 50 \
+  --workload ascii --value-bytes 1048576 --output output/source-large.json
+python3 zig/e2e/antfly/bench_projection_batches.py "$grep_candidate" \
+  --baseline "$grep_baseline" --rounds 5 --queries-per-phase 100 \
+  --documents 64 --metadata-shape nested --value-bytes 65536 \
+  --output output/batches-nested-medium.json
+python3 zig/e2e/antfly/bench_media_materialization.py "$grep_candidate" \
+  --baseline "$grep_baseline" --rounds 5 --queries-per-phase 50 \
+  --workload large_shared_duplicates --workload large_distinct_unique_eight \
+  --output output/media-controls.json
+```
+
+For source cases, add `--metadata-outputs 60` for wide-large, wide-small and
+small64; use `--workload small` for small64 and `--workload escaped` for escaped.
+Batch scalar cases use 16 KiB/1 MiB values; nested cases use 16 KiB/64 KiB/1 MiB.
+The media driver accepts repeated `--workload` arguments using the exact names
+in the table. Driver reports include corpus and executable hashes; require the
+recorded matching baseline/candidate identities when comparing these results.
+An older same-binary driver preflight with a different hash is explicitly
+excluded from this matrix. All raw reports, logs and manifests remain ignored
+under `output/projection-followup/`.
+
+
+#### Independent repeats and native codec tradeoffs
+
+Longer independent runs use seven alternating rounds and 100 reads per phase.
+The initial small ordinary-read CPU regression (0.340 to 0.409 ms) does not
+reproduce: the repeat is 0.348 to 0.329 ms. Escaped conditional reads similarly
+change from an initial 0.734 to 0.849 ms to 0.656 to 0.588 ms in the repeat.
+The distinct-media latency outlier shrinks from 13.019 to 19.899 ms initially
+to 9.168 to 9.452 ms in the repeat. The initial shared-media CPU gain also does
+not reproduce: 10.357 to 10.378 ms is effectively flat. Both sets are retained;
+these observations do not establish a general query-throughput improvement.
+
+| Independent repeat / phase | CPU ms baseline → candidate | Elapsed ms baseline → candidate | RSS MiB baseline → candidate |
+|---|---:|---:|---:|
+| small64 / ingest | 25.646 → 19.109 | 14.359 → 10.847 | 152.125 → 151.953 |
+| small64 / ordinary | 0.348 → 0.329 | 0.817 → 0.831 | 155.844 → 155.719 |
+| small64 / full | 1.516 → 1.542 | 2.098 → 2.163 | 159.656 → 160.312 |
+| small64 / reference_full | 1.542 → 1.597 | 2.131 → 2.256 | 159.391 → 159.609 |
+| small64 / conditional | 1.629 → 1.626 | 2.259 → 2.292 | 162.531 → 165.625 |
+| small64 / reference | 1.712 → 1.629 | 2.406 → 2.246 | 166.578 → 165.953 |
+| escaped / ingest | 127.193 → 126.582 | 111.060 → 109.738 | 198.797 → 198.766 |
+| escaped / ordinary | 7.857 → 7.750 | 9.451 → 9.321 | 210.281 → 206.062 |
+| escaped / full | 15.394 → 15.340 | 16.787 → 16.766 | 215.672 → 216.422 |
+| escaped / reference_full | 28.608 → 28.966 | 29.575 → 29.931 | 215.422 → 214.742 |
+| escaped / conditional | 0.656 → 0.588 | 1.183 → 1.068 | 215.766 → 216.469 |
+| escaped / reference | 15.340 → 15.515 | 15.691 → 15.860 | 215.781 → 216.484 |
+| large_shared_duplicates / read | 10.357 → 10.378 | 10.861 → 10.888 | 192.188 → 194.453 |
+| large_distinct_unique_eight / read | 23.873 → 24.286 | 9.168 → 9.452 | 261.078 → 257.258 |
+
+
+The standalone native JSON transport benchmark uses the final production
+allocation policy: both the temporary parser and the binary frame use
+reclaiming allocation. Each run has five alternating rounds of 64 iterations
+per variant and payload. A second independent run is shown rather than
+selecting the more favorable first run. Times are **elapsed microseconds**,
+including exact byte comparison; they are not process-CPU measurements.
+
+| Codec bytes | First elapsed µs inline → verified | Repeat elapsed µs inline → verified | Allocated bytes/op inline → verified | Allocations/op inline → verified |
+|---|---:|---:|---:|---:|
+| 64 | 0.640 → 2.023 | 0.616 → 1.914 | 3,044 → 9,562 | 3 → 9 |
+| 262,144 | 539.594 → 428.782 | 455.354 → 455.344 | 791,802 → 1,057,546 | 4 → 9 |
+| 1,048,576 | 2013.040 → 1633.524 | 2179.157 → 1951.566 | 3,151,098 → 4,203,274 | 4 → 9 |
+
+
+The 1 MiB transport stage is about 10–19% faster across these two runs;
+256 KiB varies from flat to about 21% faster. The 64-byte control is about
+three times slower, an absolute increase of roughly 1.3–1.4 µs. Frame transport
+allocates about 33% more bytes than the inline control for the larger payloads.
+It additionally borrows the retained 64/262,144/1,048,576 codec bytes from the
+caller; those inputs, source authorization/verification and model work are
+outside the measured allocation scope. This is not a whole-query, model-quality,
+RSS or provider-billing result. Typed borrowed attachments avoid constructing
+this JSON frame, but that path is verified by alias/lifetime tests rather than
+timed by this transport tool.
+
+The standalone tool was aligned with the production reclaiming allocator after
+the server was captured. It is not a server dependency: all frozen server source
+hashes and the server executable remain unchanged. Tool source SHA-256 is
+`be0e26b534e6db3c537c1583a3e12a663c08fff0257fa559c484f8fb17ca2250`; executable SHA-256 is
+`4be4d8784ed99e23c957c8949b05f4d0093752d114d6387b9986f420075d4d0b`. The earlier arena-output control and its
+original source/executable identities remain separately recorded in the ignored
+manifest, along with both production-policy runs.
+
+A rejected borrowed-view experiment used the native JSON library to borrow
+message/part spans instead of copying dynamic strings. It reduced allocation
+volume by about 66% against its inline control. It required repeated validation
+scans and measured about 49%/36% slower at 256 KiB/1 MiB. It is not shipped. A future
+single-pass adapter would need to demonstrate gains without those rescans before
+replacing the current encoder.
+
+The retained improvements are the directly tested contracts: selected outputs
+do not require retaining whole payload copies; one admitted point loan retires
+after copying its spans; optional codec retention is capped; frame credit
+returns between invocations; native token budgets and cancellation survive
+adaptation. Timings vary across controls, so this is not described as universally
+faster, sparse LSM I/O, a process RSS bound, or zero inference cost. Independent
+Linux hardware, cold storage and live-provider quality/cost remain unqualified.

@@ -26358,43 +26358,108 @@ test "lsm cold optimization writer reuses mutable probe metadata across short li
 test "logical value native LSM ranges retain selected copies and release payload pins" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |cache_enabled| {
+        for ([_]usize{ 32768, 1024 * 1024 + 256 }) |size| {
+            var budgets = resource_manager_mod.Options.defaultBudgets();
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_read_working_set)] = .{ .hard_limit_bytes = size + 8192 };
+            var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+            defer manager.deinit(a);
+            var backing = storage_io.MemoryStorage.init(a);
+            defer backing.deinit();
+            var backend = try Backend.open(a, "/selected-range-ownership", .{ .storage = backing.storage(), .resource_manager = &manager, .flush_threshold = 1, .table_block_compression = .none, .local_block_cache_enabled = cache_enabled });
+            defer backend.close();
+            var store = try backend.runtimeStore(a, .{ .name = "docs" });
+            defer store.deinit();
+            const body = try a.alloc(u8, size);
+            defer a.free(body);
+            @memset(body, 'x');
+            var write = try store.beginWrite();
+            try write.put("a", body);
+            const other = try a.dupe(u8, body);
+            defer a.free(other);
+            @memset(other, 'y');
+            try write.put("b", other);
+            try write.commit();
+            var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "docs" });
+            defer read.abort();
+            var result_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 8192 };
+            var scope = try read.openReadScope(result_budget.allocator());
+            defer scope.close();
+            try std.testing.expectEqual(backend_erased.RangeReadMode.selected_copy, @TypeOf(scope).range_read_mode);
+            var metadata_read = try store.beginRead();
+            defer metadata_read.abort();
+            try std.testing.expectEqual(backend_erased.RangeReadMode.selected_copy, metadata_read.readScopeRangeMode().?);
+            const before = backend.snapshotReadStats();
+            const first = try scope.getRange("a", 0, 16);
+            const second = try scope.getRange("b", size - 16, 16);
+            const after = backend.snapshotReadStats();
+            try std.testing.expectEqual(@as(u64, 2), after.point_value_copies - before.point_value_copies);
+            try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+            try std.testing.expectEqual(@as(usize, 0), scope.held_blocks.items.len);
+            try std.testing.expect(scope.held_values.items.len > 0);
+            while (backend.run_block_cache.items.len != 0) {
+                const cached = backend.run_block_cache.items[0];
+                backend.evictCachedRunBlocksForRun(cached.path, cached.run_id);
+            }
+            try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", first);
+            try std.testing.expectEqualStrings("yyyyyyyyyyyyyyyy", second);
+            try std.testing.expectError(error.EndOfStream, scope.getRange("a", size, 1));
+            scope.reset();
+            try std.testing.expect(result_budget.live < 8192);
+        }
+    }
+}
+
+test "logical value native LSM selected memtable reads avoid full copies across mutation" {
+    const a = std.testing.allocator;
+    defer runtime_mod.test_private_read_versions = false;
+    for ([_]bool{ false, true }) |private| {
+        runtime_mod.test_private_read_versions = private;
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@backingInt(resource_manager_mod.Slice.lsm_read_working_set)] = .{ .hard_limit_bytes = 4096 };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer manager.deinit(a);
         var backing = storage_io.MemoryStorage.init(a);
         defer backing.deinit();
-        var backend = try Backend.open(a, "/selected-range-ownership", .{ .storage = backing.storage(), .flush_threshold = 1, .table_block_compression = .none, .local_block_cache_enabled = cache_enabled });
+        var backend = try Backend.open(a, "/selected-memtable-borrow", .{ .storage = backing.storage(), .resource_manager = &manager, .flush_threshold = 64 * 1024 * 1024 });
         defer backend.close();
-        var store = try backend.runtimeStore(a, .{ .name = "docs" });
+        const ns: backend_types.Namespace = .{ .name = "docs", .own_source_point_results = true };
+        var store = try backend.runtimeStore(a, ns);
         defer store.deinit();
         const body = try a.alloc(u8, 32768);
         defer a.free(body);
         @memset(body, 'x');
         var write = try store.beginWrite();
         try write.put("a", body);
-        const other = try a.dupe(u8, body);
-        defer a.free(other);
-        @memset(other, 'y');
-        try write.put("b", other);
+        try write.put("b", body);
         try write.commit();
-        var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "docs" });
+        var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, ns);
         defer read.abort();
-        var result_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 8192 };
-        var scope = try read.openReadScope(result_budget.allocator());
+        var scope = try read.openReadScope(a);
         defer scope.close();
-        try std.testing.expectEqual(backend_erased.RangeReadMode.selected_copy, @TypeOf(scope).range_read_mode);
-        var metadata_read = try store.beginRead();
-        defer metadata_read.abort();
-        try std.testing.expectEqual(backend_erased.RangeReadMode.selected_copy, metadata_read.readScopeRangeMode().?);
+        var update = try store.beginWrite();
+        try update.put("a", "new");
+        try update.delete("b");
+        try update.commit();
+        const before = backend.snapshotReadStats();
         const first = try scope.getRange("a", 0, 16);
         const second = try scope.getRange("b", 32752, 16);
-        try std.testing.expectEqual(@as(usize, 0), scope.held_blocks.items.len);
-        try std.testing.expect(scope.held_values.items.len > 0);
-        while (backend.run_block_cache.items.len != 0) {
-            const cached = backend.run_block_cache.items[0];
-            backend.evictCachedRunBlocksForRun(cached.path, cached.run_id);
-        }
+        const after = backend.snapshotReadStats();
+        try std.testing.expectEqual(@as(u64, 2), after.point_value_copies - before.point_value_copies);
         try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", first);
-        try std.testing.expectEqualStrings("yyyyyyyyyyyyyyyy", second);
-        try std.testing.expectError(error.EndOfStream, scope.getRange("a", 32768, 1));
-        scope.reset();
-        try std.testing.expect(result_budget.live < 8192);
+        try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", second);
+        var output: [2][1][]const u8 = undefined;
+        try scope.getRangesMany(&.{
+            .{ .key = "a", .ranges = &.{.{ .offset = 16, .length = 16 }}, .output = &output[0] },
+            .{ .key = "b", .ranges = &.{.{ .offset = 0, .length = 16 }}, .output = &output[1] },
+        });
+        for (output) |value| try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", value[0]);
+        try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", first);
+        // The latest view must not resurrect the deleted row from an older
+        // immutable state, while the original pinned view remains readable.
+        var latest = try runtime_mod.BoundReadTxn(Backend).open(&backend, ns);
+        defer latest.abort();
+        var latest_scope = try latest.openReadScope(a);
+        defer latest_scope.close();
+        try std.testing.expectError(error.NotFound, latest_scope.getRange("b", 0, 1));
     }
 }

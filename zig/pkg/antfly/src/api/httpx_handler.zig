@@ -21033,3 +21033,82 @@ test "httpx inference gateway payload lease outlives rolling scratch and refunds
     lease.deinit();
     try std.testing.expectEqual(@as(usize, 0), budget.live);
 }
+
+test "httpx inference gateway carries verified source bytes through generated decisions" {
+    const a = std.testing.allocator;
+    const Work = @import("antfly_inference_work");
+    const Execution = @import("antfly_inference_execution_context");
+    const Source = inference_gateway.source_media;
+    const Fake = struct {
+        url: []const u8,
+        urls: [1][]const u8 = undefined,
+        calls: usize = 0,
+        releases: usize = 0,
+        fn caps(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: Work.Task) !Work.InferenceCapabilities {
+            return .{ .task = .generate, .input_modalities = .{ .text = true, .image = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true, .batch = .{ .max_media_parts_per_item = 8, .max_decoded_pixels = 4 } };
+        }
+        fn generate(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, ctx: ?Execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 0), self.releases);
+            try std.testing.expect(ctx != null);
+            try std.testing.expectEqual(@as(usize, 1), ctx.?.verified_media.len);
+            const media = ctx.?.verified_media[0];
+            try std.testing.expectEqualStrings(self.url, media.url);
+            try std.testing.expectEqual(@as(usize, 68), media.bytes.len);
+            try std.testing.expectEqualSlices(u8, "\x89PNG\r\n\x1a\n", media.bytes[0..8]);
+            self.calls += 1;
+            return alloc.dupe(u8, "{\"choices\":[{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"item\\\":0,\\\"value\\\":{\\\"answer\\\":true}}]}\"}}]}");
+        }
+        fn lookup(raw: *anyopaque, _: std.mem.Allocator, _: Source.Reference) ![]const u8 {
+            return @as(*@This(), @ptrCast(@alignCast(raw))).url;
+        }
+        fn owned(raw: *anyopaque, _: std.mem.Allocator, refs: []const Source.Reference) !Source.PayloadLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), refs.len);
+            try std.testing.expectEqualStrings("docs", refs[0].table);
+            try std.testing.expectEqualStrings("row", refs[0].document_id);
+            self.urls[0] = self.url;
+            return .{ .urls = &self.urls, .owner = self, .release = release };
+        }
+        fn release(raw: *anyopaque) void {
+            @as(*@This(), @ptrCast(@alignCast(raw))).releases += 1;
+        }
+    };
+    const encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7S8AAAAASUVORK5CYII=";
+    var bytes: [68]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&bytes, encoded);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    var fake = Fake{ .url = try std.fmt.allocPrint(a, "data:image/png;base64,{s}", .{encoded}) };
+    defer a.free(fake.url);
+    var config = try common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    config.public_inference.enabled = true;
+    try config.registry.registerDeciderConfig("vision", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only, .max_image_input_tokens = 100 });
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config }, source.iface(), null, null);
+    defer server.deinit();
+    server.antfly_provider = .{ .ptr = &fake, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate, .model_capabilities = Fake.caps };
+    var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/decisions");
+    defer request.deinit();
+    const reference = Source.Reference{ .table = "docs", .document_id = "row", .field = "image", .revision_field = "revision", .revision = "r1", .sha256 = &hex, .mime_type = "image/png", .byte_length = bytes.len, .max_pixels = 4 };
+    const body = try std.json.Stringify.valueAlloc(a, .{ .model = "deciders/vision", .input = .{.{ .role = "user", .content = .{.{ .type = "input_image", .source = reference }} }}, .questions = .{.{ .name = "answer", .type = "predicate", .instructions = "Present?" }} }, .{});
+    defer a.free(body);
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try inference_gateway.executeOperationWithSources(&server, &ctx, .decide, null, .{ .ptr = &fake, .lookup = Fake.lookup, .lookup_owned = Fake.owned });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.releases);
+}
+
+test "httpx inference gateway verified typed media preserves aliases and unrelated parts" {
+    try @import("antfly_local_sources").storage_inference_provider.testVerifiedGenerateMessages();
+}
+
+test "httpx inference gateway native JSON frames release budget between invocations" {
+    try @import("antfly_local_sources").storage_inference_provider.testVerifiedGenerateJsonScratch();
+}

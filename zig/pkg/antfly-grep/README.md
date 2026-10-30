@@ -5066,3 +5066,22 @@ These changes bound retained selected buffers and remove concurrent media
 completion copies; they do not establish universal throughput gains, sparse
 LSM reads, a process RSS bound or zero provider cost. Public API and ASCH25
 remain unchanged.
+
+
+The [borrowed-point and native-media follow-up](../../../docs/design/antfly-grep.md#borrowed-selected-points-and-verified-native-media-2026-10-29)
+merges main `c912271651`. Selected LSM reads can borrow one admitted point until
+selected spans are copied, while batches reuse bounded metadata scratch.
+Compatible named native generators and generated deciders reuse verified codec
+bytes with a 1 MiB soft retention cap. Native token budgets and cancellation
+survive attachment adaptation, and temporary JSON frames refund allocation
+credit after every invocation.
+
+Qualification includes the 102-step native check, subsequent 71-step media
+checks with 73 gateway cases, the 71-step release build, and 57 real-server
+indexed tests (seven optional profiles skipped). The design records all 44
+paired controls and independent repeats. Whole-query timings are mostly flat;
+initial large regressions and a shared-media gain did not reproduce. The
+isolated 1 MiB JSON transport stage measures about 10–19% lower elapsed time,
+with about 33% more allocated bytes; tiny transport inputs are slower.
+Ownership and budget guarantees are directly tested. These measurements do not
+establish universal speed, process RSS or provider-cost improvements.

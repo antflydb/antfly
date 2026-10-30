@@ -57,6 +57,7 @@ pub const Phase = execution_control.Phase;
 pub const Progress = execution_control.Progress;
 pub const ProgressSink = execution_control.ProgressSink;
 pub const RequestContext = execution_control.RequestContext;
+pub const VerifiedMedia = execution_control.VerifiedMedia;
 
 /// Durable, task-neutral execution environment. Provider owners may retain
 /// this value; each invocation derives a short-lived `RequestContext` from it.
@@ -197,4 +198,91 @@ test "request context preserves absolute deadlines and cancellation" {
     expired.cancellation = null;
     expired.deadline_ns = 0;
     try std.testing.expectError(error.Timeout, expired.remainingTimeoutMs());
+}
+
+/// Native generation keeps verified media binary until the model consumes it.
+/// Only canonical message media is adapted; tools, schemas and arbitrary text
+/// remain opaque. Hosted providers keep their original data-URL representation.
+pub const MediaEncoding = struct {
+    bytes: []const u8,
+    content_type: []const u8 = "application/json",
+    owned: bool = false,
+    pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        if (self.owned) a.free(self.bytes);
+        self.* = .{ .bytes = &.{} };
+    }
+};
+pub fn encodeVerifiedGenerate(a: std.mem.Allocator, temporary: std.mem.Allocator, body: []const u8, existing: ?[]const httpx.attachment_envelope.Attachment, media: []const VerifiedMedia) !MediaEncoding {
+    if (media.len == 0) return if (existing) |items| .{ .bytes = try httpx.attachment_envelope.encodeAlloc(a, body, items), .content_type = httpx.attachment_envelope.content_type, .owned = true } else .{ .bytes = body };
+    var arena = std.heap.ArenaAllocator.init(temporary);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, body, .{ .parse_numbers = false, .duplicate_field_behavior = .@"error" });
+    var attachments: std.ArrayList(httpx.attachment_envelope.Attachment) = .empty;
+    if (existing) |items| try attachments.appendSlice(scratch, items);
+    var changed = false;
+    if (value == .object) if (value.object.get("messages")) |messages| if (messages == .array) for (messages.array.items) |message| {
+        if (message != .object) continue;
+        const content = message.object.get("content") orelse continue;
+        if (content != .array) continue;
+        media_parts: for (content.array.items) |*part| {
+            if (part.* != .object) continue;
+            const kind = part.object.get("type") orelse continue;
+            if (kind != .string or !std.mem.eql(u8, kind.string, "image_url")) continue;
+            const image = part.object.get("image_url") orelse continue;
+            if (image != .object) continue;
+            for (part.object.keys()) |key| if (!std.mem.eql(u8, key, "type") and !std.mem.eql(u8, key, "image_url")) continue :media_parts;
+            for (image.object.keys()) |key| if (!std.mem.eql(u8, key, "url") and !std.mem.eql(u8, key, "detail")) continue :media_parts;
+            const url = image.object.get("url") orelse continue;
+            if (url != .string) continue;
+            if (image.object.get("detail")) |detail| if (detail != .string or !std.mem.eql(u8, detail.string, "auto")) continue;
+            const found = for (media) |item| {
+                if (item.matches(url.string)) break item;
+            } else continue;
+            var replacement: std.json.ObjectMap = .empty;
+            try replacement.put(scratch, "type", .{ .string = "media" });
+            try replacement.put(scratch, "mime_type", .{ .string = found.mime_type });
+            try replacement.put(scratch, "data", .{ .string = try std.fmt.allocPrint(scratch, "attachment:{d}", .{attachments.items.len}) });
+            try attachments.append(scratch, .{ .mime_type = found.mime_type, .data = found.bytes });
+            part.* = .{ .object = replacement };
+            changed = true;
+        }
+    };
+    if (!changed) return if (existing) |items| .{ .bytes = try httpx.attachment_envelope.encodeAlloc(a, body, items), .content_type = httpx.attachment_envelope.content_type, .owned = true } else .{ .bytes = body };
+    const metadata = try std.json.Stringify.valueAlloc(scratch, value, .{});
+    return .{ .bytes = try httpx.attachment_envelope.encodeAlloc(a, metadata, attachments.items), .content_type = httpx.attachment_envelope.content_type, .owned = true };
+}
+
+test "httpx inference gateway verified media encodes native attachments without rewriting tools or detail" {
+    const a = std.testing.allocator;
+    const url = "data:image/png;base64,aW1hZ2U=";
+    const body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,aW1hZ2U=\"}},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,aW1hZ2U=\",\"detail\":\"high\"}},{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"attachment:0\"}]}],\"tools\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,aW1hZ2U=\"}}]}";
+    var encoded = try encodeVerifiedGenerate(a, a, body, &.{.{ .mime_type = "image/png", .data = "original" }}, &.{.{ .url = url, .mime_type = "image/png", .bytes = "image" }});
+    defer encoded.deinit(a);
+    try std.testing.expectEqualStrings(httpx.attachment_envelope.content_type, encoded.content_type);
+    var framed = try httpx.attachment_envelope.parseAlloc(a, encoded.bytes, .{});
+    defer framed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), framed.attachments.len);
+    try std.testing.expectEqualStrings("original", framed.attachments[0].data);
+    try std.testing.expectEqualStrings("image", framed.attachments[1].data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, framed.metadata, .{});
+    defer parsed.deinit();
+    const parts = parsed.value.object.get("messages").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("attachment:1", parts[0].object.get("data").?.string);
+    try std.testing.expectEqualStrings(url, parts[1].object.get("image_url").?.object.get("url").?.string);
+    try std.testing.expectEqualStrings(url, parsed.value.object.get("tools").?.array.items[0].object.get("image_url").?.object.get("url").?.string);
+    var untouched = try encodeVerifiedGenerate(a, a, body, null, &.{.{ .url = "different", .mime_type = "image/png", .bytes = "other" }});
+    defer untouched.deinit(a);
+    try std.testing.expect(!untouched.owned);
+    try std.testing.expect(untouched.bytes.ptr == @as([]const u8, body).ptr);
+}
+
+test "httpx inference gateway verified attachment encoding preserves opaque number spellings" {
+    const a = std.testing.allocator;
+    const body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"verified\"}}]}],\"tools\":[{\"schema\":{\"large\":18446744073709551617,\"tiny\":1e-400,\"negative_zero\":-0}}]}";
+    var encoded = try encodeVerifiedGenerate(a, a, body, null, &.{.{ .url = "verified", .mime_type = "image/png", .bytes = "image" }});
+    defer encoded.deinit(a);
+    var framed = try httpx.attachment_envelope.parseAlloc(a, encoded.bytes, .{});
+    defer framed.deinit();
+    inline for (.{ "18446744073709551617", "1e-400", ":-0" }) |number| try std.testing.expect(std.mem.indexOf(u8, framed.metadata, number) != null);
 }

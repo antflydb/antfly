@@ -457,6 +457,7 @@ const GenerateMessagesWithAttachmentsRequest = struct {
     model: []const u8,
     messages: []const inference_types.ChatMessage,
     attachment_count: usize,
+    options: inference_types.GenerationOptions = .{},
 };
 
 const ModelCapabilitiesRequest = struct {
@@ -1267,6 +1268,8 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 parsed.value.model,
                 parsed.value.messages,
                 attachments,
+                parsed.value.options,
+                execution_control,
             );
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
@@ -2733,13 +2736,17 @@ fn localAntflyGenerateMessagesWithAttachments(
     model: []const u8,
     messages: []const inference_types.ChatMessage,
     attachments: []const inference_work.Attachment,
+    options: inference_types.GenerationOptions,
+    control: inference.InferenceExecutionControl,
 ) anyerror![]u8 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     if (messages.len == 0) return error.InvalidGenerationRequest;
     const capabilities = try localModelCapabilities(node, io, model, .generate);
     const preflight = try preflightLocalGenerateMessagesInternal(messages, attachments, capabilities);
-    try validateLocalGenerateCapabilities(capabilities, preflight, 0, 256);
-    var admission = try node.beginDirectGenerateAdmission(preflight, 256);
+    const max_tokens = std.math.cast(usize, options.max_tokens) orelse return error.InvalidGeneratorConfig;
+    try validateLocalGenerateCapabilities(capabilities, preflight, 0, max_tokens);
+    var admission = try node.beginDirectGenerateAdmission(preflight, options.max_tokens);
+    admission.execution_control = control;
     defer admission.deinit();
 
     var converted = try convertLocalGenerateMessagesInternal(alloc, messages, preflight.decoded_media_bytes, attachments);
@@ -2748,7 +2755,7 @@ fn localAntflyGenerateMessagesWithAttachments(
         capabilities,
         preflight,
         try localGenerateDecodedPixels(converted.messages),
-        256,
+        max_tokens,
     );
     return try node.generateMessagesDirectAdmitted(alloc, model, converted.messages, &admission);
 }
@@ -3887,4 +3894,14 @@ test "native checkpoint route manifest preserves binary upload and export stream
         try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, resume_request.request_body);
         try std.testing.expect(resume_request.streaming_response);
     }
+}
+
+test "provider attachment generation preserves explicit budgets and legacy defaults" {
+    const a = std.testing.allocator;
+    var legacy = try std.json.parseFromSlice(GenerateMessagesWithAttachmentsRequest, a, "{\"model\":\"vision\",\"messages\":[],\"attachment_count\":0}", .{});
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(i32, 256), legacy.value.options.max_tokens);
+    var explicit = try std.json.parseFromSlice(GenerateMessagesWithAttachmentsRequest, a, "{\"model\":\"vision\",\"messages\":[],\"attachment_count\":0,\"options\":{\"max_tokens\":37}}", .{});
+    defer explicit.deinit();
+    try std.testing.expectEqual(@as(i32, 37), explicit.value.options.max_tokens);
 }

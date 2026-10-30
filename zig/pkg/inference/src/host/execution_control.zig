@@ -51,6 +51,17 @@ pub const ProgressSink = struct {
 /// Invocation-local control plane shared by all model families and checked
 /// callback boundaries. It borrows its cancellation and progress targets for
 /// the duration of one admitted invocation.
+/// Invocation-owned, verified encoded media. This is a reuse hint, never an
+/// authorization grant. Consumers still validate MIME, pixels and admission.
+/// Neither providers nor durable execution environments may retain these views.
+pub const VerifiedMedia = struct {
+    url: []const u8,
+    bytes: []const u8,
+    mime_type: []const u8,
+    pub fn matches(self: @This(), url: []const u8) bool {
+        return self.url.len == url.len and (self.url.ptr == url.ptr or std.mem.eql(u8, self.url, url));
+    }
+};
 pub const RequestContext = struct {
     io: std.Io,
     deadline_ns: ?u64,
@@ -60,6 +71,8 @@ pub const RequestContext = struct {
     /// Notified immediately before request bytes may reach an upstream.
     /// A notification means the upstream outcome may be unknown on timeout.
     submission: ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } = null,
+
+    verified_media: []const VerifiedMedia = &.{},
 
     pub fn check(self: RequestContext) !void {
         if (self.cancellation) |value| if (value.isCancelled()) return error.Cancelled;

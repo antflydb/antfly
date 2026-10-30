@@ -1276,6 +1276,8 @@ pub fn inferenceProviderGenerateJson(
     const lifetime: *EmbeddedInferenceProviderLifetime = @ptrCast(@alignCast(ptr));
     var guard = try lifetime.acquire();
     defer guard.deinit();
+    var encoded = try verifiedGenerateJson(alloc, body, if (request) |context| context.verified_media else &.{});
+    defer encoded.deinit();
     var target = LocalInferenceConnectionContext{ .handle = lifetime.handle };
     var abi_alloc = inference_connection_abi.Allocator.fromStd(&alloc);
     var response: inference_connection_abi.InvokeResponse = .{};
@@ -1285,7 +1287,8 @@ pub fn inferenceProviderGenerateJson(
         .target_context = &target,
         .allocator = &abi_alloc,
         .operation = .init("generate"),
-        .body = .init(body),
+        .body = .init(encoded.value.bytes),
+        .content_type = .init(encoded.value.content_type),
         .deadline_ns = if (request) |context| context.deadline_ns orelse 0 else platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
         .cancellation = .{ .context = &request, .is_cancelled = struct {
             pub fn cancelled(raw: ?*const anyopaque) callconv(.c) u8 {
@@ -1350,6 +1353,11 @@ pub fn inferenceProviderGenerateMessagesWithContext(
     options: inference.GenerationOptions,
     context: inference.RequestContext,
 ) anyerror![]u8 {
+    if (try verifiedGenerateMessages(alloc, messages, context.verified_media)) |value| {
+        var adapted = value;
+        defer adapted.deinit();
+        return generateMessagesWithAttachmentsOptions(handle, alloc, model, adapted.messages, adapted.attachments, options, context);
+    }
     return try invokeInferenceProvider([]u8, alloc, handle, .generate_messages, inference.types.GenerateMessagesRequest{
         .model = model,
         .messages = messages,
@@ -1404,6 +1412,18 @@ pub fn inferenceProviderGenerateMessagesWithAttachmentsControlled(
     attachments: []const inference.work.Attachment,
     request_context: ?inference.RequestContext,
 ) anyerror![]u8 {
+    return generateMessagesWithAttachmentsOptions(handle, alloc, model, messages, attachments, .{}, request_context);
+}
+
+fn generateMessagesWithAttachmentsOptions(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    messages: []const inference.ChatMessage,
+    attachments: []const inference.work.Attachment,
+    options: inference.GenerationOptions,
+    request_context: ?inference.RequestContext,
+) anyerror![]u8 {
     const payloads = try alloc.alloc(inference_bridge.ProviderBinaryPayload, attachments.len);
     defer alloc.free(payloads);
     const refs = try alloc.alloc(inference_bridge.ProviderAttachmentRef, attachments.len);
@@ -1428,7 +1448,7 @@ pub fn inferenceProviderGenerateMessagesWithAttachmentsControlled(
         alloc,
         handle,
         .generate_messages_with_attachments,
-        .{ .model = model, .messages = messages, .attachment_count = attachments.len },
+        .{ .model = model, .messages = messages, .attachment_count = attachments.len, .options = options },
         request_context,
         payloads,
         refs,
@@ -2020,4 +2040,117 @@ fn inferenceProviderDocumentJson(ptr: *anyopaque, a: std.mem.Allocator, bytes: [
         }
     };
     return invokeInferenceProvider([]u8, a, ptr, if (extract) .document_extract else .document_read, Raw{ .bytes = bytes }, context);
+}
+
+const VerifiedMessages = struct {
+    arena: std.heap.ArenaAllocator,
+    messages: []const inference.ChatMessage,
+    attachments: []const inference.work.Attachment,
+    fn deinit(self: *@This()) void {
+        self.arena.deinit();
+    }
+};
+// Move already verified codec bytes over the existing typed binary boundary.
+// Each occurrence has a transport slot while duplicate slots borrow one buffer.
+fn verifiedGenerateMessages(a: std.mem.Allocator, messages: []const inference.ChatMessage, media: []const inference.execution_context.VerifiedMedia) !?VerifiedMessages {
+    if (media.len == 0) return null;
+    // An unrelated invalid empty media part must not acquire a new attachment.
+    for (messages) |message| if (message.content) |content| if (content == .parts) for (content.parts) |part| {
+        if (part == .media and part.media.url == null and part.media.data.len == 0) return null;
+    };
+    var arena = std.heap.ArenaAllocator.init(@import("../sql/memory_budget.zig").reclaimingAllocator(a));
+    var moved = false;
+    defer if (!moved) arena.deinit();
+    const scratch = arena.allocator();
+    const copied = try scratch.dupe(inference.ChatMessage, messages);
+    var attachments: std.ArrayList(inference.work.Attachment) = .empty;
+    for (copied) |*message| if (message.content) |content| if (content == .parts) {
+        const parts = try scratch.dupe(inference.ContentPart, content.parts);
+        for (parts) |*part| {
+            if (part.* != .image_url) continue;
+            if (part.image_url.detail) |detail| if (!std.mem.eql(u8, detail, "auto")) continue;
+            const found = for (media) |item| {
+                if (item.matches(part.image_url.url)) break item;
+            } else continue;
+            try attachments.append(scratch, .{ .bytes = found.bytes, .content_type = found.mime_type });
+            part.* = .{ .media = .{ .mime_type = found.mime_type, .data = "" } };
+        }
+        message.content = .{ .parts = parts };
+    };
+    if (attachments.items.len == 0) return null;
+    moved = true;
+    return .{ .arena = arena, .messages = copied, .attachments = attachments.items };
+}
+
+test "provider registry verified generation messages borrow attachments and preserve mixed media" {
+    try testVerifiedGenerateMessages();
+}
+pub fn testVerifiedGenerateMessages() !void {
+    const a = std.testing.allocator;
+    const url = "data:image/png;base64,aW1hZ2U=";
+    const parts = [_]inference.ContentPart{
+        .{ .text = "inspect" },
+        .{ .image_url = .{ .url = url } },
+        .{ .image_url = .{ .url = url } },
+        .{ .image_url = .{ .url = url, .detail = "high" } },
+        .{ .image_url = .{ .url = "https://example.org/other.png" } },
+    };
+    const messages = [_]inference.ChatMessage{.{ .role = .user, .content = .{ .parts = &parts } }};
+    const bytes = "image";
+    var adapted = (try verifiedGenerateMessages(a, &messages, &.{.{ .url = url, .mime_type = "image/png", .bytes = bytes }})).?;
+    defer adapted.deinit();
+    try std.testing.expectEqual(@as(usize, 2), adapted.attachments.len);
+    for (adapted.attachments) |attachment| try std.testing.expect(attachment.bytes.ptr == @as([]const u8, bytes).ptr);
+    const result = adapted.messages[0].content.?.parts;
+    try std.testing.expect(result[1] == .media and result[1].media.data.len == 0);
+    try std.testing.expectEqualStrings("high", result[3].image_url.detail.?);
+    try std.testing.expectEqualStrings("https://example.org/other.png", result[4].image_url.url);
+    try std.testing.expect(parts[1] == .image_url);
+    try std.testing.expect(try verifiedGenerateMessages(a, &messages, &.{}) == null);
+}
+
+const VerifiedJson = struct {
+    allocator: std.mem.Allocator,
+    value: inference.execution_context.MediaEncoding,
+    fn deinit(self: *@This()) void {
+        self.value.deinit(self.allocator);
+    }
+};
+fn verifiedGenerateJson(a: std.mem.Allocator, body: []const u8, media: []const inference.execution_context.VerifiedMedia) !VerifiedJson {
+    // The synchronous bridge borrows this frame only until invocation returns.
+    // Both frame and parser scratch must refund admission even when the caller
+    // uses an arena spanning many decisions or agent turns.
+    const scratch = @import("../sql/memory_budget.zig").reclaimingAllocator(a);
+    return .{ .allocator = scratch, .value = try inference.execution_context.encodeVerifiedGenerate(scratch, scratch, body, null, media) };
+}
+
+test "provider registry native JSON frames release budget between invocations" {
+    try testVerifiedGenerateJsonScratch();
+}
+pub fn testVerifiedGenerateJsonScratch() !void {
+    const a = std.testing.allocator;
+    var fixture = std.heap.ArenaAllocator.init(a);
+    defer fixture.deinit();
+    const f = fixture.allocator();
+    const bytes = try f.alloc(u8, 65536);
+    @memset(bytes, 'x');
+    const base64 = try f.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+    _ = std.base64.standard.Encoder.encode(base64, bytes);
+    const url = try std.fmt.allocPrint(f, "data:image/png;base64,{s}", .{base64});
+    const body = try std.json.Stringify.valueAlloc(f, .{ .messages = .{.{ .role = "user", .content = .{.{ .type = "image_url", .image_url = .{ .url = url } }} }} }, .{});
+    var budget: @import("../sql/memory_budget.zig") = .{ .backing = a, .limit = 512 * 1024 };
+    var request = std.heap.ArenaAllocator.init(budget.allocator());
+    defer request.deinit();
+    _ = try request.allocator().alloc(u8, 4096);
+    const retained = budget.live;
+    for (0..32) |_| {
+        var encoded = try verifiedGenerateJson(request.allocator(), body, &.{.{ .url = url, .bytes = bytes, .mime_type = "image/png" }});
+        defer encoded.deinit();
+        try std.testing.expect(encoded.value.owned);
+        try std.testing.expect(std.mem.indexOf(u8, encoded.value.bytes, bytes) != null);
+        try std.testing.expect(budget.live > retained);
+        encoded.deinit();
+        try std.testing.expectEqual(retained, budget.live);
+    }
+    try std.testing.expect(!budget.exhausted);
 }

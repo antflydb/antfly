@@ -545,6 +545,18 @@ spans use the caller's allocation budget and remain valid until scope reset or
 close. Ordinary full-value reads keep their ownership contract. Revision proofs,
 directories and primary bytes come from the same pinned transaction.
 
+The selected-copy point reader borrows pinned memtables and temporarily adopts
+one decoded block instead of copying its complete value. The transient namespace
+hint is excluded from namespace identity and cannot alter the caller's normal
+full-value API. An adopted local block keeps its existing cache or working-set
+reservation, including when it exceeds the cache's admission ceiling. A wide
+uncached owned result can transfer into a temporary shared owner after admission;
+if that optional reservation is denied, the compact-copy fallback remains valid.
+No second payload may join that transient pin owner. Each document copies its
+selected spans before retiring the loan; multi-range reads reuse metadata
+capacity while releasing payloads and pins between documents. Cache admission,
+snapshot/version checks and selected-span authentication remain unchanged.
+
 Projection windows share a bounded plan between admission and execution,
 including explicit selected-read and full-read decisions. Estimates include
 coalesced spans, reconstruction and setup; logical work still charges original
