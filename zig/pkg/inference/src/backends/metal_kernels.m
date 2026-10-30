@@ -52998,6 +52998,7 @@ static NSString *termite_metal_deberta_training_attention_v1_source(void) {
     "using namespace metal;\n"
     "#pragma clang fp contract(off)\n"
     "\n"
+    // tile-codegen:begin model.deberta_attention family (do not edit; run: zig build tile-kernel-codegen -- --write)
     "// Mirrors DebertaTrainingAttentionV1Params in metal_runtime.zig and the host\n"
     "// typedef in metal_kernels.m. V1 has fixed 64-key tiles and 64..256 lanes.\n"
     "struct DTParams {\n"
@@ -53323,7 +53324,9 @@ static NSString *termite_metal_deberta_training_attention_v1_source(void) {
     "        dt_finite(qr, status); dt_finite(kr, status);\n"
     "        output[offset + tid] = qr; output[offset + relsize + tid] = kr;\n"
     "    }\n"
-    "}\n";
+    "}\n"
+    // tile-codegen:end model.deberta_attention family
+    ;
 }
 
 

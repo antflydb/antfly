@@ -3,6 +3,7 @@
 // Versioned replay attention, sharing its host schedule and admission with Metal.
 // Every reduction has one output owner; no floating point atomic accumulation.
 #pragma once
+// tile-codegen:begin model.deberta_attention family (do not edit; run: zig build tile-kernel-codegen -- --write)
 using uint = unsigned int;
 using dt_u64 = unsigned long long;
 
@@ -357,3 +358,4 @@ const int* order, unsigned int* status, DTParams p) {
         output[offset + tid] = qr; output[offset + relsize + tid] = kr;
     }
 }
+// tile-codegen:end model.deberta_attention family
