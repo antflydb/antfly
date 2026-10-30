@@ -2536,3 +2536,48 @@ checks a cold 128-column, 32-row covering pack: **nine range GETs become one** f
 the same 72,622 bytes. A warm projection performs zero GETs; sparse projection
 reads only identity and required stripes. These are provider-call counts, not
 measured cloud latency or whole-query throughput.
+
+### Adaptive spill residency and completion-driven joins
+
+Wide sorted payloads use a statement-owned, byte-budgeted LRU rather than a
+four-entry, 64-KiB cache. Root and physical-address indexes provide constant-time
+lookups. The owner graph counts each retained block once, including shared
+bodies, while separately decoded allocations at the same physical offset keep
+their own accounting and address aliases. Lazy scalar growth is refreshed on
+access, periodically across the owner graph, and before cache growth. Metadata
+is individually reclaimable and charged to the same statement allocator.
+
+A reader targets at most 16 MiB and half of its retained bytes plus current
+statement headroom, less its pending output reservation. The target contracts
+as sibling work consumes memory. Unknown allocator headroom retains a 64-KiB
+fallback. Known arena/monotonic backings keep that conservative target and four
+root slots, and stay outside shared reclamation. Cache metadata uses independently
+reclaimable scratch allocation without bypassing enclosing quotas. Root entries and unique-owner metadata are separately bounded at 1024
+and 4096. One required indivisible block may exceed the optional target; required
+allocations can reclaim that cache reference. Pins retain their data until the
+borrower releases them. No statement, disk, scheduler or response quota grows.
+
+Scoped spill managers share a round-robin reclamation registry. Before required
+allocation, they reclaim idle sibling cache roots until admission fits or no
+reclaimable root remains. Known budget and synchronization wrappers preflight
+before their locks; a thread-local guard prevents nested allocator calls from
+re-entering an enclosing budget during reclamation. Busy cache metadata is skipped without waiting for its
+lock; no provider work runs under the registry lock. Cache metadata admission
+can decline without losing the required row or poisoning its budget. Genuine
+allocator and integrity errors still propagate. Cache teardown unregisters its
+stable owner before retiring every retained block and metadata allocation.
+
+Covering-directory preparation, covering payloads and raw range waves share a
+notified join. It observes whichever job completes, and joins/cancels every
+sibling before releasing callback storage when any job fails or the caller is
+canceled. An inline failure also cancels pending jobs immediately. This removes
+the outer wave's ordered-await gap, where an immediate later failure could be
+hidden behind a blocked earlier read and replaced by that read's timeout.
+Scoped deadline and authority checks remain authoritative on failure.
+
+Runtime ABI **78** fences the changed in-process spill owner layouts. Reader
+protocol **97** and persisted artifact formats remain unchanged. Qualification
+compares fixed and adaptive cache policies in the same binary, with equal
+statement limits, independently checked keys and values, and unchanged spill
+writes. Spill byte counters and thread CPU samples describe that native drain;
+real-file E2E qualification is recorded separately from kernel measurements.

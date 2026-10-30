@@ -40,18 +40,27 @@ pub const LockedAllocator = struct {
     }
     fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
+        @import("spill.zig").Manager.prepareAllocator(self.allocator(), len);
+        @import("memory_budget.zig").AllocationGuard.enter();
+        defer @import("memory_budget.zig").AllocationGuard.leave();
         self.lock();
         defer self.unlock();
         return self.backing.rawAlloc(len, alignment, ra);
     }
     fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
+        @import("spill.zig").Manager.prepareAllocator(self.allocator(), len -| bytes.len);
+        @import("memory_budget.zig").AllocationGuard.enter();
+        defer @import("memory_budget.zig").AllocationGuard.leave();
         self.lock();
         defer self.unlock();
         return self.backing.rawResize(bytes, alignment, len, ra);
     }
     fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
+        @import("spill.zig").Manager.prepareAllocator(self.allocator(), len -| bytes.len);
+        @import("memory_budget.zig").AllocationGuard.enter();
+        defer @import("memory_budget.zig").AllocationGuard.leave();
         self.lock();
         defer self.unlock();
         return self.backing.rawRemap(bytes, alignment, len, ra);
@@ -434,6 +443,32 @@ pub fn Task(comptime Result: type) type {
         }
     };
 }
+/// Join notified void jobs in completion order. Failures and caller cancellation
+/// retire every sibling before the coordinator can release callback storage.
+/// Every active task must use submit*Notified with this same readiness event.
+pub fn joinNotified(io: std.Io, ready: *std.Io.Event, tasks: []?Task(anyerror!void)) anyerror!void {
+    errdefer for (tasks) |*task| if (task.*) |*held| {
+        _ = held.cancel(io) catch {};
+        task.* = null;
+    };
+    while (true) {
+        ready.reset();
+        var pending = false;
+        for (tasks) |*task| if (task.*) |*held| {
+            std.debug.assert(held.transient != null and held.transient.?.done == ready);
+            if (!held.isComplete()) {
+                pending = true;
+                continue;
+            }
+            const outcome = held.await(io);
+            task.* = null;
+            try outcome;
+        };
+        if (!pending) return;
+        try ready.wait(io);
+    }
+}
+
 test "SQL shared scheduling bounds overlapping operators and releases canceled admissions" {
     const Worker = struct {
         fn run() anyerror!usize {
@@ -772,4 +807,39 @@ test "external lake Parquet pull coordinators leave execution and required state
         try std.testing.expectEqual(@as(usize, 0), scheduler.pull_workers);
         try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
     }
+}
+
+test "SQL shared notified joins cancel parked siblings before callback teardown" {
+    const State = struct {
+        scheduler: Scheduler = .{ .max_io_workers = 2 },
+        gate: std.Io.Event = .unset,
+        entered: [2]std.Io.Event = @splat(.unset),
+        joining: std.Io.Event = .unset,
+        live: std.atomic.Value(usize) = .init(0),
+        fn child(self: *@This(), index: usize) anyerror!void {
+            _ = self.live.fetchAdd(1, .acq_rel);
+            defer _ = self.live.fetchSub(1, .acq_rel);
+            self.entered[index].set(std.testing.io);
+            try self.gate.wait(std.testing.io);
+        }
+        fn coordinator(self: *@This()) anyerror!void {
+            const io = std.testing.io;
+            var ready: std.Io.Event = .unset;
+            var tasks: [2]?Task(anyerror!void) = @splat(null);
+            defer for (&tasks) |*task| if (task.*) |*held| {
+                _ = held.cancel(io) catch {};
+            };
+            for (&tasks, 0..) |*task, i| task.* = self.scheduler.submitIoNotified(io, 1, &ready, child, .{ self, i }) orelse return error.TestUnexpectedSaturation;
+            for (&self.entered) |*event| try event.wait(io);
+            self.joining.set(io);
+            try joinNotified(io, &ready, &tasks);
+        }
+    };
+    var state: State = .{};
+    var parent = try std.testing.io.concurrent(State.coordinator, .{&state});
+    try state.joining.wait(std.testing.io);
+    try std.testing.expectError(error.Canceled, parent.cancel(std.testing.io));
+    try std.testing.expectEqual(@as(usize, 0), state.live.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), state.scheduler.io_workers);
+    try std.testing.expectEqual(@as(usize, 0), state.scheduler.io_bytes);
 }

@@ -861,6 +861,7 @@ const CoveringWave = struct {
     }
     fn runJobs(self: *CoveringWave, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, comptime run: fn (*Job) anyerror!void) !void {
         const scheduler = local.sql_parallel_scheduler;
+        var ready: std.Io.Event = .unset;
         var tasks: [4]?scheduler.Task(anyerror!void) = @splat(null);
         defer if (cached.context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
             held.cancel(io) catch {};
@@ -869,19 +870,17 @@ const CoveringWave = struct {
         for (self.jobs[0..self.count], 0..) |*job, i| {
             if (failure != null) break;
             if (cached.context.io) |io| if (self.count > 1) {
-                tasks[i] = self.scheduler.submitIo(io, if (run == Job.prepare) cover_columns.directory_limit else job.limit, run, .{job});
+                tasks[i] = self.scheduler.submitIoNotified(io, if (run == Job.prepare) cover_columns.directory_limit else job.limit, &ready, run, .{job});
             };
             if (tasks[i] == null) run(job) catch |err| {
                 failure = err;
             };
         }
-        if (cached.context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
-            held.await(io) catch |err| {
-                if (failure == null) failure = err;
-            };
-            task.* = null;
-        };
         if (failure) |err| return err;
+        if (cached.context.io) |io| scheduler.joinNotified(io, &ready, &tasks) catch |err| {
+            try cached.context.ensureActive();
+            return err;
+        };
     }
 };
 
@@ -3018,4 +3017,40 @@ test "external lake bounded window profiles covering directory waves overlap reu
         try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
         std.debug.print("COVER_DIRECTORY_WAVE lanes={d} peak={d} warm_raw_empty_gets=0\n", .{ lanes, probe.peak.load(.acquire) });
     }
+}
+
+test "external lake bounded window profiles covering wave observes later failure before parked sibling" {
+    const Probe = struct {
+        var active: *@This() = undefined;
+        entered: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        live: std.atomic.Value(usize) = .init(0),
+        fn run(job: *CoveringWave.Job) anyerror!void {
+            const self = active;
+            _ = self.live.fetchAdd(1, .acq_rel);
+            defer _ = self.live.fetchSub(1, .acq_rel);
+            if (job.width == 0) {
+                self.entered.set(std.testing.io);
+                try self.gate.waitTimeout(std.testing.io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } });
+                return error.UnexpectedGateRelease;
+            }
+            try self.entered.wait(std.testing.io);
+            return error.InjectedLaterCoverFailure;
+        }
+    };
+    var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_io_workers = 2 };
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &cache, .scope = @splat(9), .context = .{ .io = std.testing.io } };
+    var state: Probe = .{};
+    Probe.active = &state;
+    var wave: CoveringWave = .{ .scheduler = &scheduler, .count = 2 };
+    defer wave.deinit();
+    for (wave.jobs[0..2], 0..) |*job, index| job.* = .{ .a = std.testing.allocator, .cached = cached, .store = undefined, .cover = undefined, .columns = &.{}, .width = index, .token = .none, .limit = 64 * 1024 };
+    const start = @import("antfly_platform").time.monotonicNs();
+    const outcome = wave.runJobs(cached, Probe.run);
+    const elapsed = @import("antfly_platform").time.monotonicNs() - start;
+    if (outcome) |_| return error.ExpectedInjectedFailure else |err| std.debug.print("COVER_FAILURE error={} elapsed_ms={} providers_live={}\n", .{ err, elapsed / 1000000, state.live.load(.acquire) });
+    try std.testing.expectEqual(@as(usize, 0), state.live.load(.acquire));
+    try std.testing.expectError(error.InjectedLaterCoverFailure, outcome);
 }

@@ -17,6 +17,26 @@
 //! The owner must have a stable address and outlive every allocated object.
 const std = @import("std");
 const Budget = @This();
+/// Reclamation must run before allocator locks. Nested allocator calls share
+/// this thread-local guard so a cache free cannot re-enter an enclosing budget.
+pub const AllocationGuard = struct {
+    threadlocal var depth: usize = 0;
+    pub fn active() bool {
+        return depth != 0;
+    }
+    pub fn enter() void {
+        depth += 1;
+    }
+    pub fn leave() void {
+        depth -= 1;
+    }
+};
+pub fn parentAllocator(a: std.mem.Allocator) ?std.mem.Allocator {
+    if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return null;
+    const self: *Budget = @ptrCast(@alignCast(a.ptr));
+    return if (a.vtable.alloc == scratchAlloc) reclaimingAllocator(self.backing) else self.backing;
+}
+
 /// Transport-neutral classification of shared host admission. This callback
 /// never raises local limits and runs outside the budget's accounting lock.
 pub const Pressure = struct {
@@ -255,6 +275,9 @@ fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?
 }
 fn allocate(comptime scratch: bool, ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
     const self: *Budget = @ptrCast(@alignCast(ptr));
+    @import("spill.zig").Manager.prepareAllocator(if (scratch) reclaimingAllocator(self.allocator()) else self.allocator(), len);
+    AllocationGuard.enter();
+    defer AllocationGuard.leave();
     self.lock();
     defer self.mutex.unlock();
     const backing = if (scratch) reclaimingAllocator(self.backing) else self.backing;
@@ -271,6 +294,9 @@ fn resize(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize
 }
 fn resizeMode(comptime scratch: bool, ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
     const self: *Budget = @ptrCast(@alignCast(ptr));
+    @import("spill.zig").Manager.prepareAllocator(if (scratch) reclaimingAllocator(self.allocator()) else self.allocator(), len -| bytes.len);
+    AllocationGuard.enter();
+    defer AllocationGuard.leave();
     self.lock();
     defer self.mutex.unlock();
     const backing = if (scratch) reclaimingAllocator(self.backing) else self.backing;
@@ -288,6 +314,9 @@ fn remap(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize,
 }
 fn remapMode(comptime scratch: bool, ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
     const self: *Budget = @ptrCast(@alignCast(ptr));
+    @import("spill.zig").Manager.prepareAllocator(if (scratch) reclaimingAllocator(self.allocator()) else self.allocator(), len -| bytes.len);
+    AllocationGuard.enter();
+    defer AllocationGuard.leave();
     self.lock();
     defer self.mutex.unlock();
     const backing = if (scratch) reclaimingAllocator(self.backing) else self.backing;
@@ -313,6 +342,8 @@ fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) v
 }
 fn freeMode(comptime scratch: bool, ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
     const self: *Budget = @ptrCast(@alignCast(ptr));
+    AllocationGuard.enter();
+    defer AllocationGuard.leave();
     self.lock();
     defer self.mutex.unlock();
     const backing = if (scratch) reclaimingAllocator(self.backing) else self.backing;

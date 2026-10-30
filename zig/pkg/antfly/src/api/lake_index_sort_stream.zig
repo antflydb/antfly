@@ -413,3 +413,97 @@ test "external lake leased publication wide covering ranges coalesce before deco
     try std.testing.expectEqual(@as(usize, 1), probe.calls - uncached_calls);
     for (0..32) |row| for (0..128) |col| try std.testing.expectEqual(@as(i64, @intCast(row * 128 + col)), (try uncached.block.cell(row, col)).value.integer);
 }
+
+test "external lake leased publication adaptive spill cache reduces wide drain reads within unchanged admission" {
+    const Probe = struct {
+        fn check(_: *anyopaque) !void {}
+        const Measurement = struct { read: u64, written: u64, drain: u64, payload_reads: usize, cpu: i96 };
+        fn now() i96 {
+            var stamp: std.c.timespec = undefined;
+            if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &stamp) != 0) @panic("CPU clock unavailable");
+            return @as(i96, stamp.sec) * std.time.ns_per_s + stamp.nsec;
+        }
+        fn run(compressed: bool, fixed: bool) !Measurement {
+            var budget: local.sql_memory_budget = .{ .backing = std.heap.smp_allocator, .limit = 32 << 20 };
+            const a = budget.allocator();
+            var marker: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = check, .compression = if (compressed) .snappy else .none, .async_writes = false };
+            defer manager.deinit();
+            var sort = spill.Sort.init(a, &manager, &.{.{}}, 4096);
+            defer sort.deinit();
+            sort.encoded_bytes = true;
+            sort.shared_runs = true;
+            sort.parallel_runs = false;
+            const count = 8192;
+            var bodies: [64][8][128]u8 = @splat(@splat(@splat('v')));
+            var keys: [64][20]u8 = undefined;
+            var cells: [64][8]local.sql_scalar.Datum = undefined;
+            var key_cells: [64][1]local.sql_scalar.Datum = undefined;
+            var rows: [64][]const local.sql_scalar.Datum = undefined;
+            var key_rows: [64][]const local.sql_scalar.Datum = undefined;
+            var ordinals: [64]u64 = undefined;
+            for (0..count / 64) |batch| {
+                for (0..64) |i| {
+                    const ordinal = batch * 64 + i;
+                    const rank = i * (count / 64) + batch;
+                    for (0..8) |column| {
+                        std.mem.writeInt(u64, bodies[i][column][0..8], ordinal * 8 + column, .little);
+                        cells[i][column] = local.sql_scalar.Datum.json(.{ .string = &bodies[i][column] });
+                    }
+                    const key = try std.fmt.bufPrint(&keys[i], "key-{d:0>16}", .{rank});
+
+                    key_cells[i][0] = local.sql_scalar.Datum.json(.{ .string = key });
+                    rows[i] = &cells[i];
+                    key_rows[i] = &key_cells[i];
+                    ordinals[i] = ordinal;
+                }
+                try sort.addBatch(.{ .rows = &rows }, &key_rows, &ordinals);
+            }
+            try sort.finish();
+            const reader = try sort.payloadReader();
+            if (fixed) {
+                reader.cache.max_bytes = 64 * 1024;
+                reader.cache.max_entries = 4;
+            }
+            const reads_before_delivery = manager.read_bytes;
+            budget.limit = budget.live + (32 << 20);
+            const started = now();
+            var seen: usize = 0;
+            var window: Window = .{ .sort = &sort };
+            defer window.deinit();
+            while (true) {
+                const n = try window.read(256, 512 * 1024);
+                if (n == 0) break;
+                for (window.rows) |lease| {
+                    var expected: [20]u8 = undefined;
+                    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "key-{d:0>16}", .{seen}), (try lease.keyCell(0)).value.string);
+                    const ordinal = (seen % (count / 64)) * 64 + seen / (count / 64);
+                    for (0..8) |column| {
+                        const bytes = (try lease.cell(column)).value.string;
+                        try std.testing.expectEqual(@as(u64, ordinal * 8 + column), std.mem.readInt(u64, bytes[0..8], .little));
+                    }
+                    seen += 1;
+                }
+            }
+            const cpu = now() - started;
+            std.debug.print("ADAPTIVE_SPILL codec={} fixed={} rows={} payload_reads={} drain_read_bytes={} total_read_bytes={} written_bytes={} cpu_ns={} budget_peak={} budget_limit={}\n", .{ manager.compression, fixed, seen, sort.payload_reads, manager.read_bytes - reads_before_delivery, manager.read_bytes, manager.written_bytes, cpu, budget.peak, budget.limit });
+            try std.testing.expectEqual(@as(usize, count), seen);
+            try std.testing.expect(budget.peak <= budget.limit);
+            return .{ .read = manager.read_bytes, .written = manager.written_bytes, .drain = manager.read_bytes - reads_before_delivery, .payload_reads = sort.payload_reads, .cpu = cpu };
+        }
+    };
+    for ([_]bool{ false, true }) |compressed| {
+        const before = try Probe.run(compressed, true);
+        const after = try Probe.run(compressed, false);
+        try std.testing.expectEqual(before.written, after.written);
+        try std.testing.expect(after.drain < before.drain / 2);
+        try std.testing.expect(after.payload_reads < before.payload_reads / 2);
+    }
+    if (std.c.getenv("ANTFLY_LAKE_ADAPTIVE_CACHE_BENCH") != null) {
+        for (0..6) |sample| {
+            std.debug.print("ADAPTIVE_SAMPLE sample={}\n", .{sample});
+            _ = try Probe.run(true, sample % 2 == 0);
+            _ = try Probe.run(true, sample % 2 != 0);
+        }
+    }
+}

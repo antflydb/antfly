@@ -238,25 +238,12 @@ fn loadInto(a: A, store: stores.ArtifactStore, refs: []const Unit, values: []?[]
                 failure = err;
             };
         }
-        // Drain whichever read completes first. A later failing request must
-        // cancel earlier parked reads before joining their provider contexts.
-        if (io) |active| while (failure == null) {
-            ready.reset();
-            var pending = false;
-            for (&tasks) |*task| if (task.*) |*held| {
-                if (!held.isComplete()) {
-                    pending = true;
-                    continue;
-                }
-                held.await(active) catch |err| {
-                    if (failure == null) failure = err;
-                };
-                task.* = null;
-            };
-            if (failure != null or !pending) break;
-            try ready.wait(active);
-        };
         if (failure) |err| return err;
+        if (io) |active| local.sql_parallel_scheduler.joinNotified(active, &ready, &tasks) catch |err| {
+            if (cached) |cache| try cache.context.ensureActive();
+            try token.check();
+            return err;
+        };
         const Loader = struct {
             data: []const u8,
             fn read(raw: *anyopaque, alloc: A) ![]u8 {
