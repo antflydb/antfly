@@ -791,7 +791,7 @@ pub fn ImplementationFor(comptime D: type) type {
             transaction_recovery_identity_context: *@FieldType(Execution, "transaction_recovery_identity_context"),
             transaction_recovery_local_context: *@FieldType(Execution, "transaction_recovery_local_context"),
             text_merge_runtime: *@FieldType(Execution, "text_merge_runtime"),
-            sparse_compaction_runtime: *@FieldType(Execution, "sparse_compaction_runtime"),
+            indexes: *@FieldType(Execution, "indexes"),
             last_run_until_idle_no_progress: *@FieldType(Execution, "last_run_until_idle_no_progress"),
             shadow: *@FieldType(Execution, "shadow"),
             bulk_identity: *@FieldType(Execution, "bulk_identity"),
@@ -943,7 +943,7 @@ pub fn ImplementationFor(comptime D: type) type {
             transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
             transaction_recovery_local_context: ?*TransactionRecoveryLocalContext,
             text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
-            sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
+            indexes: @import("indexes/mod.zig").Indexes,
             last_run_until_idle_no_progress: ?execution_resources.NoProgressDiagnostic = null,
             shadow: ?*ShadowState,
             bulk_identity: @import("bulk_ingest_session.zig").IdentityScratch = .{},
@@ -1130,7 +1130,7 @@ pub fn ImplementationFor(comptime D: type) type {
                     .transaction_recovery_identity_context = S.ownerField(self, "transaction_recovery_identity_context").*,
                     .transaction_recovery_local_context = null,
                     .text_merge_runtime = S.ownerField(self, "async_context").*.text_merge_runtime,
-                    .sparse_compaction_runtime = S.ownerField(self, "async_context").*.sparse_compaction_runtime,
+                    .indexes = .{ .sparse = .{ .compaction_runtime = S.ownerField(self, "async_context").*.sparse_compaction_runtime } },
                     .shadow = null,
                 };
             }

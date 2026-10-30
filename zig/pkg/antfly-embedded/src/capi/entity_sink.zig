@@ -2231,8 +2231,8 @@ test "capi resolver failed replacement permits portable backup and cancellation"
     try handle.db.batch(.{ .writes = rows.items });
     try runUntilIdle(handle);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(replacement)));
-    _ = try handle.db.advanceGraphReplacement();
-    const jobs = try handle.db.graphReplacementStatusAlloc(a);
+    _ = try handle.db.indexes.graph.advanceReplacement();
+    const jobs = try handle.db.indexes.graph.replacementStatusAlloc(a);
     defer jobs.deinit();
     try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
     var job = jobs.value[0];

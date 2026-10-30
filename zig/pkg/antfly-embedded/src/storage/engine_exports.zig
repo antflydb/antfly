@@ -151,7 +151,7 @@ fn runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation(
 }
 
 fn finishBackgroundGraphReplacement(self: *DB, name: []const u8, generation: u64) engine.Outcome(bool) {
-    return .{ .value = self.finishBackgroundGraphReplacement(name, generation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.finishBackgroundReplacement(name, generation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runUntilIdleWithGroupSourceState(self: *DB, state: *DB.GroupSourceMaintenanceState) engine.Outcome(void) {
@@ -468,7 +468,7 @@ fn artifactInventoryCommand(self: *DB, alloc: std.mem.Allocator) engine.Outcome(
 }
 
 fn advanceDocumentAuthorityBackfillPage(self: *DB) engine.Outcome(bool) {
-    return .{ .value = self.advanceDocumentAuthorityBackfillPage() catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.documents.advanceAuthorityBackfillPage() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 fn advanceArtifactFootprintPage(self: *DB) engine.Outcome(bool) {
     return .{ .value = self.advanceArtifactFootprintPage() catch |err| return .{ .failure = .init(@errorName(err)) } };
@@ -519,7 +519,7 @@ fn initOptionalTextMergeRuntime(self: *DB, cfg: @import("db/maintenance/text_mer
 }
 
 fn initOptionalSparseCompactionRuntime(self: *DB, cfg: @import("db/maintenance/sparse_compaction_runtime.zig").Config) engine.Outcome(void) {
-    return .{ .value = self.initOptionalSparseCompactionRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.sparse.initCompactionRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn initOptionalGraphMetricRuntime(self: *DB, cfg: @import("db/maintenance/graph_metric_runtime.zig").Config) engine.Outcome(void) {
@@ -694,7 +694,7 @@ fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: std.mem.Allocator)
 }
 
 fn advanceGraphReplacement(self: *DB) engine.Outcome(bool) {
-    return .{ .value = self.advanceGraphReplacement() catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.advanceReplacement() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn replaceGraphIndex(self: *DB, old: []const u8, cfg: types.IndexConfig) engine.Outcome(u64) {

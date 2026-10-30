@@ -137,7 +137,7 @@ pub const PreparedPublication = struct {
             if (table_id != dependency.table_id or !std.meta.eql(head, dependency.head)) return error.EnrichmentSourceChanged;
         }
         if (self.shadow_scopes.len != 0) {
-            const jobs = try database.graphReplacementStatusAlloc(alloc);
+            const jobs = try database.indexes.graph.replacementStatusAlloc(alloc);
             defer jobs.deinit();
             for (self.shadow_scopes) |scope| {
                 const matches = for (jobs.value) |job| {
@@ -857,7 +857,7 @@ pub const Owner = struct {
     }
 
     fn hasPendingReplay(database: *h.db_mod.DB) !bool {
-        if (database.hasPendingGraphReplacements()) return true;
+        if (database.indexes.graph.hasPendingReplacements()) return true;
         const target = database.core.nextDerivedSequence();
         const indexes = try database.listDerivedReplayDebt(alloc);
         defer {
@@ -1263,13 +1263,13 @@ pub const Owner = struct {
         const turn_alloc = turn_arena.allocator();
         var shadow_scopes: std.ArrayList(ShadowScope) = .empty;
         if (run_database and schedule.shadow_next) {
-            const jobs = try database.graphReplacementStatusAlloc(turn_alloc);
+            const jobs = try database.indexes.graph.replacementStatusAlloc(turn_alloc);
             defer jobs.deinit();
             for (jobs.value) |job| if (job.phase == .catching_up) {
                 // Construction remains detached. Cutover uses the live
                 // coordinator under this short owner/path fence, so its tail
                 // target and catalog swap exclude foreground appends together.
-                _ = try database.finishBackgroundGraphReplacement(job.name, job.generation);
+                _ = try database.indexes.graph.finishBackgroundReplacement(job.name, job.generation);
                 schedule.shadow_next = false;
                 self.notifyMutation();
                 return true;

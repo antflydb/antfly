@@ -80,7 +80,7 @@ pub fn exportTables(handle: *h.Handle, out: *std.ArrayList(u8), selected: ?[]con
     }
     // Portable exports include serving catalogs, never an unpublished shadow.
     // Finish accepted replacements before freezing the logical image.
-    for (owners) |owner| if (owner.hasPendingGraphReplacements()) try owner.runUntilIdle();
+    for (owners) |owner| if (owner.indexes.graph.hasPendingReplacements()) try owner.runUntilIdle();
     // Reserve all native capture leases before exporting any table. API
     // serialization excludes embedded commits; these leases also exclude
     // background mutations. Native intents are excluded from the image.
@@ -105,7 +105,7 @@ pub fn exportTables(handle: *h.Handle, out: *std.ArrayList(u8), selected: ?[]con
     try integer(out, handle.alloc, u32, @intCast(count));
     try integer(out, handle.alloc, u64, handle.embedded_next_table_id);
     for (owners, names) |db, name| {
-        const jobs = try db.graphReplacementStatusAlloc(handle.alloc);
+        const jobs = try db.indexes.graph.replacementStatusAlloc(handle.alloc);
         defer jobs.deinit();
         var policy = try db.local_execution.row_policy_gate.enterRaw();
         defer policy.release();

@@ -3389,7 +3389,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (S.ownerField(self, "text_merge_runtime").*) |runtime| {
                 runtime.notify();
             }
-            if (S.ownerField(self, "sparse_compaction_runtime").*) |runtime| runtime.notify();
+            if (S.ownerField(self, "indexes").sparse.compaction_runtime) |runtime| runtime.notify();
         }
 
         pub fn applyDerivedBatchTargetsContextProfiled(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile) !void {
@@ -3443,7 +3443,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (S.ownerField(self, "text_merge_runtime").*) |runtime| {
                 runtime.notify();
             }
-            if (S.ownerField(self, "sparse_compaction_runtime").*) |runtime| runtime.notify();
+            if (S.ownerField(self, "indexes").sparse.compaction_runtime) |runtime| runtime.notify();
         }
 
         pub fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {

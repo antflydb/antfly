@@ -6494,7 +6494,7 @@ test "capi native replacement wait observes its background owner without rebuild
         fn bytes(allocator: std.mem.Allocator, id: ?*anyopaque) ![]u8 {
             const guard = public.enterHandle(id, .read).?;
             defer guard.leave();
-            const jobs = try guard.handle.database().graphReplacementStatusAlloc(allocator);
+            const jobs = try guard.handle.database().indexes.graph.replacementStatusAlloc(allocator);
             defer jobs.deinit();
             try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
             return std.json.Stringify.valueAlloc(allocator, jobs.value, .{});
@@ -7820,13 +7820,13 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
                 defer txn.abort();
                 break :blk try revisions.load(&txn, legacy_key);
             };
-            try std.testing.expect(database.document_authority_backfill_requested.load(.acquire));
+            try std.testing.expect(database.documents.authority.backfill_requested.load(.acquire));
             // Manual owners drive the independent authority worker explicitly;
             // runUntilIdle drains replay/index work, not this cache migration.
             var maintenance_pages: usize = 0;
-            while (database.document_authority_backfill_active.load(.acquire) or database.document_authority_backfill_requested.load(.acquire)) : (maintenance_pages += 1) {
+            while (database.documents.authority.backfill_active.load(.acquire) or database.documents.authority.backfill_requested.load(.acquire)) : (maintenance_pages += 1) {
                 try std.testing.expect(maintenance_pages < 256);
-                _ = try database.advanceDocumentAuthorityBackfillPage();
+                _ = try database.documents.advanceAuthorityBackfillPage();
             }
             {
                 var txn = try database.core.store.beginReadTxn();

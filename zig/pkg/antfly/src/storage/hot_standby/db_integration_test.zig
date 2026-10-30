@@ -3050,7 +3050,7 @@ test "storage.hot_standby db standby role suppresses mutating background runtime
     try std.testing.expect(db.ttl_runtime == null);
     try std.testing.expect(db.transaction_runtime == null);
     try std.testing.expect(db.text_merge_runtime == null);
-    try std.testing.expect(db.sparse_compaction_runtime == null);
+    try std.testing.expect(db.indexes.sparse.compaction_runtime == null);
 }
 
 test "db graph ttl HA carries primary effects and duplicate receipt across reopen" {

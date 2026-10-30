@@ -4930,7 +4930,7 @@ fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Valu
     }
     const debt_json = try std.json.Stringify.valueAlloc(a, debt, .{});
     try value.object.put(a, "index_replay_debt", try std.json.parseFromSliceLeaky(std.json.Value, a, debt_json, .{}));
-    const jobs = try database.graphReplacementStatusAlloc(a);
+    const jobs = try database.indexes.graph.replacementStatusAlloc(a);
     defer jobs.deinit();
     var rows: std.ArrayList(std.json.Value) = .empty;
     for (jobs.value) |job| {
@@ -4940,7 +4940,7 @@ fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Valu
         const producer_pending = replaying or waiting;
         const blocked_reason: ?[]const u8 = if (replaying) "replaying_producer_sources" else if (waiting) "waiting_for_producer_enrichment" else null;
         // A malformed failed declaration must not hide its retry/error status.
-        const producers = database.graphReplacementProducerNamesAlloc(a, job) catch |err| switch (err) {
+        const producers = database.indexes.graph.replacementProducerNamesAlloc(a, job) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => try a.alloc([]u8, 0),
         };
@@ -8827,7 +8827,7 @@ pub fn antfly_db_add_index_json(handle_ptr: ?*anyopaque, config_json: capi.Slice
             // its captured inputs. Observe that owner's generation instead;
             // manual/hosted and directory runtimes retain their inline driver.
             const quantum_ms = if (background_owner) 0 else @min(@as(u64, 100), (deadline -| now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
-            database.waitGraphReplacement(name, generation, quantum_ms) catch |err| switch (err) {
+            database.indexes.graph.waitReplacement(name, generation, quantum_ms) catch |err| switch (err) {
                 error.Busy => break :blk true,
                 else => return capi.mapError(err),
             };
@@ -8910,7 +8910,7 @@ fn addIndexJsonRegistered(
     // catalog instead of leaving durably changed producers behind a caller
     // who was told the AddIndex failed.
     {
-        const jobs = handle.database().graphReplacementStatusAlloc(handle.alloc) catch |err| return capi.mapError(err);
+        const jobs = handle.database().indexes.graph.replacementStatusAlloc(handle.alloc) catch |err| return capi.mapError(err);
         defer jobs.deinit();
         for (jobs.value) |job| {
             if (!std.mem.eql(u8, job.name, parsed.value.name)) continue;
@@ -9029,7 +9029,7 @@ pub fn antfly_db_cancel_replacement(
     const out = out_deleted orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = false;
     const handle = guard.handle;
-    out.* = handle.database().*.cancelReplacement(name.bytes()) catch |err| return capi.mapError(err);
+    out.* = handle.database().*.indexes.graph.cancelReplacement(name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -10013,7 +10013,7 @@ test "capi resolver replacement public waits retain admission generation across 
                     defer guard.leave();
                     if (guard.entry_error != null) return error.TestUnexpectedResult;
                     const database = guard.handle.database();
-                    const jobs = try database.graphReplacementStatusAlloc(guard.handle.alloc);
+                    const jobs = try database.indexes.graph.replacementStatusAlloc(guard.handle.alloc);
                     defer jobs.deinit();
                     try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
                     original_generation = jobs.value[0].generation;
