@@ -1616,7 +1616,7 @@ const max_chunk_results = lib_chunker.max_chunk_results;
 const max_chunk_target_tokens = lib_chunker.max_chunk_target_tokens;
 const max_chunk_audio_window_ms = lib_chunker.max_chunk_audio_window_ms;
 const default_read_admission_max_tokens: usize = 256;
-const max_read_tokens: usize = 1024;
+const max_read_tokens: usize = 8192;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 const default_max_request_media_bytes: usize = 100 * 1024 * 1024;
 const read_admission_bytes_per_unit: usize = 16 * 1024 * 1024;
@@ -8177,6 +8177,26 @@ pub const Node = struct {
         io: std.Io,
         control: InferenceExecutionControl,
 
+        /// The epoch backend carries no request control, so its per-layer
+        /// vision checks never fire. A page encoding alone checks its own
+        /// deadline at each command-buffer boundary and then frees the gate.
+        fn pageBackend(request: *const @This()) ops.ComputeBackend {
+            var cb = request.ctx.cb.?;
+            cb.execution_control = request.control;
+            return cb;
+        }
+
+        /// Conservative epochs have no vision broker. Encode one page under
+        /// the step lock, exactly as generation does without a hook.
+        fn encodeSerial(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            try request.control.check();
+            try request.ctx.lockStep(request.control);
+            defer request.ctx.unlockStep();
+            var cb = request.pageBackend();
+            return qwen3vl_projector.encodeProjectedImagesResident(&cb, allocator, request.ctx.cfg, images, limits);
+        }
+
         fn encodeCpuPrepared(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, original_limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
             const request: *@This() = @ptrCast(@alignCast(raw));
             try request.control.check();
@@ -8187,7 +8207,8 @@ pub const Node = struct {
             if (images.len != 1) {
                 try ctx.lockStep(request.control);
                 defer ctx.unlockStep();
-                return qwen3vl_projector.encodeProjectedImagesResident(&ctx.cb.?, allocator, ctx.cfg, images, limits);
+                var cb = request.pageBackend();
+                return qwen3vl_projector.encodeProjectedImagesResident(&cb, allocator, ctx.cfg, images, limits);
             }
             const started = platform.time.monotonicNs();
             var prepared = try qwen3vl_projector.prepareProjectedImageResident(allocator, ctx.cfg, images[0], limits, request.control.imageWorkControl());
@@ -8219,12 +8240,13 @@ pub const Node = struct {
             defer ctx.unlockStep();
             ctx.cpu_preprocess_items += 1;
             ctx.cpu_preprocess_ns +|= elapsed;
+            var cb = request.pageBackend();
             if (ctx.features.device_vision_features) {
-                const result = try qwen3vl_projector.encodePreparedProjectedImagesDeviceBatched(&ctx.cb.?, allocator, ctx.cfg, &.{&prepared}, limits);
+                const result = try qwen3vl_projector.encodePreparedProjectedImagesDeviceBatched(&cb, allocator, ctx.cfg, &.{&prepared}, limits);
                 defer allocator.free(result);
                 return result[0];
             }
-            return qwen3vl_projector.encodePreparedProjectedImageResident(&ctx.cb.?, allocator, ctx.cfg, &prepared, limits);
+            return qwen3vl_projector.encodePreparedProjectedImageResident(&cb, allocator, ctx.cfg, &prepared, limits);
         }
 
         fn encode(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
@@ -8241,7 +8263,8 @@ pub const Node = struct {
             if (geometry == 0) {
                 try ctx.lockStep(request.control);
                 defer ctx.unlockStep();
-                return qwen3vl_projector.encodeProjectedImagesResident(&ctx.cb.?, allocator, ctx.cfg, images, limits);
+                var cb = request.pageBackend();
+                return qwen3vl_projector.encodeProjectedImagesResident(&cb, allocator, ctx.cfg, images, limits);
             }
             const Cancel = struct {
                 fn check(ptr: *const anyopaque) bool {
@@ -8514,6 +8537,20 @@ pub const Node = struct {
         if (image.len > @min(readInlineSourceByteCap(self), contract.batch.max_encoded_media_bytes) or
             (try measureExecutorDecodedImages(&model.manifest, &.{image})) > (contract.batch.max_decoded_pixels orelse std.math.maxInt(u64)))
             return error.MicrobatchResourceLimitExceeded;
+        // Admission below waits for peers to retire, but this page's own
+        // shared peaks stay leased while it waits. Reject a plan that cannot
+        // fit even alone instead of returning retryable capacity errors.
+        const solo = try features.soloPagePlan(
+            amounts,
+            try std.math.add(usize, if (share_vision_peak) shared_vision_bytes else 0, memory.decoder_backend_peak),
+            if (share_vision_peak) shared_vision_host_bytes else 0,
+        );
+        if (!(solo.fitsLimits(limits) catch false)) {
+            std.log.warn("LightOnOCR3 read page exceeds the generation budget even when admitted alone scratch_bytes={d} scratch_limit_bytes={d}; raise --scratch-budget-mb or the other generation budgets", .{
+                solo.host_scratch_bytes +| solo.backend_scratch_bytes, limits.scratch_limit_bytes,
+            });
+            return error.ResourceLimitExceeded;
+        }
         const extended_epoch = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_EXTENDED_EPOCH");
         // Refill completed slots in the same resident epoch. The simultaneous
         // window and every GPU forward retain their existing independent caps.
@@ -8640,7 +8677,7 @@ pub const Node = struct {
         var vision_request = LightOnVisionRequest{ .ctx = ctx, .io = page_io, .control = control };
         var pipeline = generation.NativeGenerationPipeline{
             .qwen_prefill_batch = if (ctx.features.prefill_batch or ctx.features.packed_mixed) .{ .ptr = &vision_request, .run_fn = batchLightOnPreparedPrefill } else null,
-            .qwen_vision_batch = if (ctx.features.cpu_preprocess) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encodeCpuPrepared } else if (vision_batch_enabled) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encode } else null,
+            .qwen_vision_batch = if (ctx.features.cpu_preprocess) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encodeCpuPrepared } else if (vision_batch_enabled) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encode } else .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encodeSerial },
             .allocator = a,
             .io = page_io,
             .cb = ctx.cb.?,
@@ -20757,7 +20794,7 @@ pub const Node = struct {
         var max_tokens = validateReadMaxTokens(body.max_tokens) catch
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
-                .message = "'max_tokens' must be between 1 and 1024",
+                .message = "'max_tokens' must be between 1 and 8192",
             });
         const inline_source_cap = readInlineSourceByteCap(self);
         var inline_source_bytes: usize = 0;
@@ -29255,7 +29292,6 @@ test "standalone inference model catalog publishes resolved native reader batchi
     try std.testing.expectEqual(@as(i64, 32 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_encoded_media_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, 8 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_decoded_pixels").?.integer);
     const task_limits = resolved.object.get("task_limits").?.object;
-    try std.testing.expectEqual(@as(i64, max_read_tokens), task_limits.get("max_output_tokens_per_item").?.integer);
     try std.testing.expect(task_limits.get("max_candidates_per_request").? == .null);
     const transform = resolved.object.get("image_transform").?.object;
     try std.testing.expectEqual(@as(i64, 768), transform.get("target_width").?.integer);
@@ -33120,7 +33156,8 @@ test "read admission units scale with image batch and decode length" {
     try std.testing.expectEqual(@as(usize, 1), estimateReadAdmissionUnits(1, null));
     try std.testing.expectEqual(@as(usize, 4), estimateReadAdmissionUnits(4, null));
     try std.testing.expectEqual(@as(usize, 8), estimateReadAdmissionUnits(4, default_read_admission_max_tokens + 1));
-    try std.testing.expectEqual(@as(usize, 16), estimateReadAdmissionUnits(4, max_read_tokens));
+    try std.testing.expectEqual(@as(usize, 16), estimateReadAdmissionUnits(4, 1024));
+    try std.testing.expectEqual(@as(usize, 128), estimateReadAdmissionUnits(4, 8192));
 }
 
 test "Qwen3-VL read admission includes one serial multimodal generation" {
@@ -33193,16 +33230,16 @@ test "Qwen3-VL direct read rejects insufficient generation capacity before fetch
 }
 
 test "direct extraction validates read max tokens" {
-    var valid = try parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":1024}");
+    var valid = try parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":8192}");
     defer valid.deinit();
-    try std.testing.expectEqual(@as(?usize, max_read_tokens), valid.max_tokens);
+    try std.testing.expectEqual(@as(?usize, 8192), valid.max_tokens);
     try std.testing.expectError(
         error.InvalidMaxTokens,
         parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":-1}"),
     );
     try std.testing.expectError(
         error.InvalidMaxTokens,
-        parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":1025}"),
+        parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":8193}"),
     );
 }
 

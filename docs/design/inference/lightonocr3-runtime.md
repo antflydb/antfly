@@ -39,7 +39,6 @@ memory.
 
 ## Resolution, vision, and decoder execution
 
-
 The shared Qwen vision path supplies learned image-position embeddings and
 two-axis vision rotary positions. Qwen3.5's full-attention layers use three-axis
 M-RoPE on the first 64 channels of each 256-channel head, preserving the tail;
@@ -59,6 +58,13 @@ Other shapes retain the existing dispatch. The CPU fallback uses vectorized
 recurrence and activations. Measure release-build latency on deployment
 hardware before setting an SLO; this does not qualify CUDA or vLLM throughput.
 
+The qualified Qwen Metal image-attention path supports up to 16,384 unmerged
+patches, matching the runtime cap of 4096 merged vision tokens. Qualified
+LightOn single-token split attention supports contexts of 192 through 16,384
+tokens, including image, prompt, and generated tokens. Longer contexts retain
+the generic fallback and need separate latency measurements. The numerical
+checks cover the 2048- and 4096-token boundaries, the 16,384-token limit,
+batched pages with different lengths, and independent CPU reference values.
 The Metal `/read` throughput profile requires
 `ANTFLY_LIGHTONOCR3_THROUGHPUT=1`,
 `ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE=1`, and

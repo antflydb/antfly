@@ -269,6 +269,19 @@ pub fn Features(comptime Hooks: type) type {
         pub fn needsAuxiliary(features: @This()) bool {
             return features.epoch_auxiliary and (features.prepared or features.activation_pool or features.worker or features.shared_core_weights or features.stream_first_layers != 0 or features.batch_attention);
         }
+        /// Resources one page holds when admitted alone: its own lease plus
+        /// the epoch auxiliary and shared peaks, which stay leased while it
+        /// waits. If this exceeds the limits, waiting can never admit it.
+        pub fn soloPagePlan(features: @This(), page: runtime.tier.memory.AdmissionAmounts, shared_backend_scratch: usize, shared_host_scratch: usize) !runtime.tier.memory.AdmissionAmounts {
+            var plan = try page.merge(.{ .backend_scratch_bytes = shared_backend_scratch, .host_scratch_bytes = shared_host_scratch });
+            if (features.needsAuxiliary()) plan = try plan.merge(features.auxiliaryAmounts());
+            return plan;
+        }
+        /// Prepared-plan workspace capacity to configure on the backend.
+        /// Conservative epochs have no prepared plan and keep the default.
+        pub fn preparedRowCapacity(features: @This()) ?usize {
+            return if (features.prepared) features.prepared_rows else null;
+        }
     };
 }
 
@@ -296,6 +309,57 @@ test "LightOnOCR3 supported reader profiles isolate models backends and conserva
         try std.testing.expectEqual(F.Profile.conservative, F.selectProfile(cfg, .cuda, true, true, true));
     }
     try std.testing.expectEqual(F.Profile.conservative, F.selectProfile(.{}, .cuda, true, true, true));
+}
+
+test "LightOnOCR3 conservative reader leaves Metal prepared capacity unconfigured" {
+    const Hooks = struct {
+        pub fn effectiveLightOnReadRows() usize {
+            return 16;
+        }
+        pub fn cudaLightOnBatchProfileEnabled() bool {
+            return false;
+        }
+    };
+    const F = Features(Hooks);
+    const cfg = gpt_model_mod.Config{ .qwen35_device_only_state = true, .qwen35_metal_resident_vision = true };
+    // Metal accepts only 16, 32 or 64 prepared rows. The default profile
+    // must not configure capacity it never uses.
+    try std.testing.expectEqual(@as(?usize, null), F.forProfile(.conservative, cfg, 1).preparedRowCapacity());
+    for ([_]F.Profile{ .metal_lighton08, .metal_lighton4b }) |profile| {
+        for ([_]usize{ 0, 1, 16, 17, 33, 64, 999 }) |requested| {
+            const rows = F.forProfile(profile, cfg, requested).preparedRowCapacity() orelse return error.TestUnexpectedResult;
+            try std.testing.expect(rows == 16 or rows == 32 or rows == 64);
+        }
+    }
+}
+
+test "LightOnOCR3 solo page plan includes the shared peaks a waiting page keeps leased" {
+    const Hooks = struct {
+        pub fn effectiveLightOnReadRows() usize {
+            return 16;
+        }
+        pub fn cudaLightOnBatchProfileEnabled() bool {
+            return false;
+        }
+    };
+    const F = Features(Hooks);
+    const cfg = gpt_model_mod.Config{ .qwen35_device_only_state = true, .qwen35_metal_resident_vision = true };
+    const throughput = F.forProfile(.metal_lighton08, cfg, 16);
+    const page = runtime.tier.memory.AdmissionAmounts{ .backend_scratch_bytes = 66 * 1024 * 1024 };
+    const shared_peaks: usize = 1460 * 1024 * 1024;
+    // Measured on an M5 Pro: automatic limits admitted the shared peaks, then
+    // denied every page as temporarily unavailable until its wait expired.
+    const automatic = runtime.tier.memory.Limits{ .scratch_limit_bytes = 1536 * 1024 * 1024 };
+    const plan = try throughput.soloPagePlan(page, shared_peaks, 0);
+    try std.testing.expect(!try plan.fitsLimits(automatic));
+    try std.testing.expect(try plan.fitsLimits(.{ .scratch_limit_bytes = 6144 * 1024 * 1024 }));
+    const auxiliary = throughput.auxiliaryAmounts();
+    try std.testing.expectEqual(page.backend_scratch_bytes + shared_peaks + auxiliary.backend_scratch_bytes, plan.backend_scratch_bytes);
+    try std.testing.expectEqual(auxiliary.host_scratch_bytes, plan.host_scratch_bytes);
+    // Conservative epochs lease no auxiliary state.
+    const conservative = try F.forProfile(.conservative, cfg, 1).soloPagePlan(page, shared_peaks, 4096);
+    try std.testing.expectEqual(page.backend_scratch_bytes + shared_peaks, conservative.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 4096), conservative.host_scratch_bytes);
 }
 
 test "LightOnOCR3 selected reader profiles retain admission ownership row caps and CUDA chunking" {
