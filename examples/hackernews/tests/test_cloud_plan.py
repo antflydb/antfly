@@ -29,7 +29,10 @@ def test_separate_object_tables_and_scoped_cloud_keys():
     for name in ("archive-table.json", "current-table.json"):
         assert tables[name]["storage"] == {"engine": "object"}
         assert "num_shards" not in tables[name]
-        assert tables[name]["indexes"]["body_text"]["field"] == "body"
+        assert tables[name]["indexes"]["body_text"] == {
+            "type": "full_text",
+            "store_source": True,
+        }
         props = tables[name]["schema"]["document_schemas"]["row"]["schema"][
             "properties"
         ]

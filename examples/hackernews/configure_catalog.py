@@ -99,7 +99,9 @@ def table_definition(args):
             },
         },
         "indexes": {
-            "body_text": {"type": "full_text", "field": "body", "store_source": True}
+            # Keep sortable metadata in the text corpus's typed doc values.
+            # Queries still select the body field for matching/highlighting.
+            "body_text": {"type": "full_text", "store_source": True}
         },
     }
 
