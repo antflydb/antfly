@@ -15,21 +15,28 @@ order: 1
 
 ## The Result
 
-You write a document whose `url` points to a PDF or an image, and Antfly extracts each page. Pages with a usable text layer keep their native text; scanned pages, photos, and images are read by an OCR model. The text is chunked and searchable:
+You write a document whose `url` points to a PDF or an image, and Antfly extracts each page. Pages with a usable text layer keep their native text; scanned pages, photos, and images are read by an OCR model. The text is chunked into full-text search, and each hit names the document and the page that matched:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/db/v1/tables/scans/query \
   -H 'Content-Type: application/json' \
-  -d '{"full_text_search": {"query": "invoice total"}, "limit": 3}'
+  -d '{"full_text_search": {"query": "grid"}, "fields": ["_id"], "limit": 3}'
 ```
 
 ```json
 {
   "responses": [{
     "hits": {
-      "hits": [
-        {"_source": {"text": "INVOICE ... Total due: $1,280.00"}, "hierarchy": {"parent_doc_key": "receipt-1"}}
-      ]
+      "total": {"value": 1, "relation": "exact"},
+      "hits": [{
+        "_id": "scan-1",
+        "_score": 2.17,
+        "hierarchy": {
+          "level": "source",
+          "parent_doc_key": "scan-1",
+          "matched_artifact": {"name": "document_chunks_v1", "kind": "chunk", "chunk_id": 0, "unit_id": "page:000001"}
+        }
+      }]
     }
   }]
 }
@@ -96,7 +103,7 @@ curl -fsS -X PUT http://127.0.0.1:8080/db/v1/tables/scans/artifacts/document_chu
 ```bash
 curl -fsS -X POST http://127.0.0.1:8080/db/v1/tables/scans/batch \
   -H 'Content-Type: application/json' \
-  -d "{\"inserts\": {\"receipt-1\": {\"url\": \"data:application/pdf;base64,$(base64 < receipt.pdf | tr -d '\n')\"}}, \"sync_level\": \"write\"}"
+  -d "{\"inserts\": {\"scan-1\": {\"url\": \"data:application/pdf;base64,$(base64 < scan.pdf | tr -d '\n')\"}}, \"sync_level\": \"write\"}"
 ```
 
 PNG and JPEG images work the same way with a `data:image/png;base64,...` or `data:image/jpeg;base64,...` URL.
@@ -109,17 +116,17 @@ Each page becomes a unit under its source document. List them:
 curl -fsS -X POST http://127.0.0.1:8080/db/v1/tables/scans/query \
   -H 'Content-Type: application/json' \
   -d '{
-    "fields": ["unit_type", "method", "extraction_status", "text", "provenance.page_number"],
-    "hierarchy": {"children": {"parent": {"level": "source", "id": "receipt-1"}, "level": "unit"}},
+    "fields": ["unit_type", "extraction_status", "text", "provenance.page_number"],
+    "hierarchy": {"children": {"parent": {"level": "source", "id": "scan-1"}, "level": "unit"}},
     "order_by": [{"field": "_hierarchy.position"}]
   }'
 ```
 
-`method` is `pdf_text` for pages that kept their text layer and `ocr_text` for pages the reader transcribed. While OCR runs, `extraction_status` is `pending_ocr`.
+Each unit's `text` holds the page's native text or the reader's transcription, and `extraction_status` reports where it is: `pending_ocr` while the reader runs, `completed` when the text is ready, `failed_ocr` if the reader failed, and `ocr_not_configured` if the page needed OCR but the enrichment has no `ocr` block. LightOnOCR returns Markdown, so a scanned table comes back as a table and a figure as a short description.
 
 ### 5. Search the Text
 
-Query the table as shown in [The Result](#the-result). OCR output is chunked and indexed like any other text, so it also works with [hybrid search](/docs/guides/hybrid-search) once you add an embeddings index over `document_chunks_v1`.
+Query the table as shown in [The Result](#the-result). A hit is the source document, and `hierarchy.matched_artifact.unit_id` names the page whose chunk matched; read that page's text with the query in step 4. Keep `fields` narrow, because the source document includes its `url`, which for an inline upload is the whole file. OCR output is chunked and indexed like any other text, so it also works with [hybrid search](/docs/guides/hybrid-search) once you add an embeddings index over `document_chunks_v1`.
 
 ### OCR Options
 
