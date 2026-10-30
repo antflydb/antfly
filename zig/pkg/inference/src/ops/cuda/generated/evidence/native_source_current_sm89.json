@@ -1,5 +1,7 @@
 {
   "original_entries": 2,
+  "compared_entries": 2,
+  "retired": [],
   "candidate_entries": 2,
   "architectures": [
     "sm_89"
@@ -8,7 +10,7 @@
   "changed_instructions": [],
   "changed_resources": [],
   "original_image_sha256": "0cc41e211289f4415649458aa8fd5322221f8b567e98b682212f02eedd77850d",
-  "candidate_image_sha256": "0f5eb5d48e9dd62015605aacf25de11970fd1409937716486a3c342ee06b217e",
+  "candidate_image_sha256": "6808bf313d8d24fbeed4666e971d19025c2ff40a79cfe052ca5d0ee4cf5f493c",
   "programs": [
     {
       "arch": "sm_89",

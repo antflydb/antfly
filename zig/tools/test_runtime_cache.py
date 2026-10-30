@@ -1737,6 +1737,8 @@ class RuntimeCacheTest(unittest.TestCase):
                 native_templates.append(
                     self.own("zig/pkg/inference/src/graph/kernel_source_owner.zig")
                 )
+                if backend == "cuda":
+                    native_templates.append(self.own("zig/pkg/inference/src/ops/cuda/embedding_gemma2.zig"))
                 native_templates.append(self.own("zig/pkg/inference/src/tile/whisper_logits.zig"))
                 if backend == "metal":
                     native_templates.append(self.own("zig/pkg/inference/src/ops/metal/generated/tile_whisper_logits_partials.msl.h"))
@@ -1819,6 +1821,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/cuda/bf16_fusions.zig",
                     "src/ops/cuda/vision_fusions.zig",
                     "src/ops/cuda/encoder_decoder_fusions.zig",
+                    "src/ops/cuda/embedding_gemma2.zig",
                     "src/ops/cuda/lighton_recurrent.ptx",
                     "src/ops/cuda/lighton_attention.ptx",
                     "src/ops/cuda/lighton_activation.ptx",

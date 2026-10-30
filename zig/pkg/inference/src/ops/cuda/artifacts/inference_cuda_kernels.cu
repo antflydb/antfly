@@ -9507,26 +9507,8 @@ extern "C" __global__ void termite_linear_q4_0_f32_tc_hmma(
     termite_qtc_hmma_tile<0u, TERMITE_QTC_FMT_Q4_0>(dst, input, packed_weight, nullptr, nullptr, rows, in_dim, out_dim);
 }
 
-extern "C" __global__ void termite_linear_q4_0_bias_f32_tc_hmma(ANTFLY_CUDA_PACKED_LINEAR_BIAS_PARAMS) {
-    termite_qtc_hmma_tile<1u, TERMITE_QTC_FMT_Q4_0>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
-}
 
-extern "C" __global__ void termite_linear_q4_0_bias_gelu_f32_tc_hmma(ANTFLY_CUDA_PACKED_LINEAR_BIAS_PARAMS) {
-    termite_qtc_hmma_tile<2u, TERMITE_QTC_FMT_Q4_0>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
-}
 
-extern "C" __global__ void termite_linear_q4_0_bias_add_f32_tc_hmma(
-    float* dst,
-    const float* input,
-    const unsigned char* packed_weight,
-    const float* bias,
-    const float* residual,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim
-) {
-    termite_qtc_hmma_tile<3u, TERMITE_QTC_FMT_Q4_0>(dst, input, packed_weight, bias, residual, rows, in_dim, out_dim);
-}
 // tile-codegen:end quant_cuda.tc_hmma.0 family
 
 // BF16 tensor-core mirror of the Q4_0 tc_hmma linear set. Same signatures and

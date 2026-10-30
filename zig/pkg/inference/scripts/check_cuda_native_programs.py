@@ -52,7 +52,14 @@ def select_programs(parsed, functions):
     return selected
 
 
-def compare(tool, original, candidate, output, functions=None):
+def retired_programs(original, candidate, retired):
+    removed = original.keys() - candidate.keys()
+    assert {key[1] for key in removed} == set(retired), "unexpected or unverified retired entrypoints"
+    assert not any(key[1] in retired for key in candidate), "retired entrypoint remains"
+    return removed
+
+
+def compare(tool, original, candidate, output, functions=None, retired=()):
     reports = []
     for label, image in (("original", original), ("candidate", candidate)):
         parsed = []
@@ -71,9 +78,15 @@ def compare(tool, original, candidate, output, functions=None):
         )
         reports.append(select_programs(parsed, functions) if functions else parsed)
     (old_code, old_resources), (new_code, new_resources) = reports
+    original_entries = len(old_code)
+    removed = retired_programs(old_code, new_code, retired)
+    old_code = {key: value for key, value in old_code.items() if key not in removed}
+    old_resources = {key: value for key, value in old_resources.items() if key not in removed}
     assert old_code.keys() <= new_code.keys(), "missing existing entrypoints"
     result = {
-        "original_entries": len(old_code),
+        "original_entries": original_entries,
+        "compared_entries": len(old_code),
+        "retired": [list(key) for key in sorted(removed)],
         "candidate_entries": len(new_code),
         "architectures": sorted({arch for arch, _ in old_code}),
         "added": [list(k) for k in sorted(new_code.keys() - old_code.keys())],
@@ -117,9 +130,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--function", action="append", help="Bind a historical proof to these exact exported programs")
+    parser.add_argument("--retired-function", action="append", default=[], help="Require exactly these intentional removals; keep every other entrypoint")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    result = compare(args.cuobjdump, args.original, args.candidate, args.output, args.function)
+    result = compare(args.cuobjdump, args.original, args.candidate, args.output, args.function, args.retired_function)
     print(json.dumps(result))
     if args.strict:
         assert not result["changed_instructions"] and not result["changed_resources"], (

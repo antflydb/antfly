@@ -19,6 +19,7 @@ set -euo pipefail
 usage() {
   printf 'usage: %s [--check|--write|--check-source-policy] [--portable|--fatbin|--sm89|--all]\n' "$0"
   printf 'Regenerates checked-in CUDA artifacts with the pinned CUDA 13.2 toolkit contract.\n'
+  printf 'Fatbin uses fast compression for every image and requires CUDA 12.4+ drivers.\n'
 }
 
 mode="check"
@@ -151,7 +152,7 @@ if [ ! -x "$zig_bin" ]; then
 fi
 (
   cd "$pkg_dir"
-  "$zig_bin" build quant-kernel-codegen -- --check
+  "$zig_bin" build quant-kernel-codegen tile-kernel-codegen -- --check
 )
 
 cuda_home="${CUDA_HOME:-}"
@@ -192,11 +193,14 @@ else
   cuobjdump="$(command -v cuobjdump || true)"
 fi
 
-tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/inference_cuda_kernels.XXXXXX")"
+scratch_root="$repo_dir/.zig-cache/cuda-artifacts"
+mkdir -p "$scratch_root"
+tmp_root="$(mktemp -d "$scratch_root/profile.XXXXXX")"
+export TMPDIR="$tmp_root"
 tmp_ptx="$tmp_root/kernels.ptx"
 tmp_fatbin="$tmp_root/kernels.fatbin"
 tmp_sm89="$tmp_root/kernels.sm89.cubin"
-trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"; rmdir "$tmp_root"' EXIT
+trap 'rm -rf "$tmp_root"' EXIT
 
 required_symbols=(
   antfly_audio_logmel_f32
@@ -240,7 +244,6 @@ required_symbols=(
   termite_embedding_gemma2_f32_to_bf16
   termite_embedding_gemma2_scale_bf16
   termite_embedding_gemma2_scale_device_bf16
-  termite_embedding_gemma2_gelu_ple_bf16
   termite_embedding_gemma2_residual_bf16
   termite_embedding_gemma2_residual_vjp_f32
   termite_embedding_gemma2_contrastive_prob_f32
@@ -437,9 +440,6 @@ required_symbols=(
   termite_linear_q8_0_bias_gelu_f32_tc_hmma
   termite_linear_q8_0_bias_add_f32_tc_hmma
   termite_linear_q4_0_f32_tc_hmma
-  termite_linear_q4_0_bias_f32_tc_hmma
-  termite_linear_q4_0_bias_gelu_f32_tc_hmma
-  termite_linear_q4_0_bias_add_f32_tc_hmma
   termite_linear_q4_0_f32_tc_hmma_bf16
   antfly_linear_q4_0_bf16_staged
   termite_activation_multiply_fused_gate_up_f32
@@ -514,9 +514,13 @@ required_symbols=(
   antfly_q4_0_down_q8_1_mmv_v1
 )
 
-# These BF16 epilogues had no host launch slots. Keep them out of every
-# canonical image; the reachable no-bias BF16 and FP16 epilogues remain.
+# Retire unreachable epilogues and the duplicate GELU export. Model adapters
+# share one GELU product; no-bias and Q4_K/Q8 epilogues remain reachable.
 retired_symbols=(
+  termite_embedding_gemma2_gelu_ple_bf16
+  termite_linear_q4_0_bias_f32_tc_hmma
+  termite_linear_q4_0_bias_gelu_f32_tc_hmma
+  termite_linear_q4_0_bias_add_f32_tc_hmma
   termite_linear_q4_0_bias_f32_tc_hmma_bf16
   termite_linear_q4_0_bias_gelu_f32_tc_hmma_bf16
   termite_linear_q4_0_bias_add_f32_tc_hmma_bf16
@@ -524,14 +528,29 @@ retired_symbols=(
 
 check_required_symbols() {
   local file="$1"
+  local symbols
+  case "$file" in
+    *.ptx)
+      symbols="$(sed -nE 's/^[[:space:]]*\.visible[[:space:]]+\.entry[[:space:]]+([[:alnum:]_]+).*/\1/p' "$file")"
+      ;;
+    *)
+      if [ -z "$cuobjdump" ]; then
+        printf 'error: cuobjdump is required to verify binary CUDA exports\n' >&2
+        exit 1
+      fi
+      # Raw byte searches cannot inspect compressed images. Decode the symbol
+      # table once and match exact exported kernel entry names.
+      symbols="$("$cuobjdump" --dump-elf-symbols "$file" | awk '$1 == "STT_FUNC" && ($2 == "STB_GLOBAL" || $2 == "STB_WEAK") && $3 == "STO_ENTRY" {print $NF}' | sort -u)"
+      ;;
+  esac
   for symbol in "${required_symbols[@]}"; do
-    if ! grep -a -q "$symbol" "$file"; then
+    if ! grep -F -x -q "$symbol" <<<"$symbols"; then
       printf 'error: generated CUDA artifact is missing symbol %s\n' "$symbol" >&2
       exit 1
     fi
   done
   for symbol in "${retired_symbols[@]}"; do
-    if grep -a -q "$symbol" "$file"; then
+    if grep -F -x -q "$symbol" <<<"$symbols"; then
       printf 'error: generated CUDA artifact retains retired symbol %s\n' "$symbol" >&2
       exit 1
     fi
@@ -574,7 +593,9 @@ build_portable_ptx() {
 }
 
 build_fatbin() {
-  "$nvcc" -fatbin "$src" -o "$tmp_fatbin" \
+  # Compress every embedded image, favoring fast module decompression.
+  # Native instructions are unchanged; this format needs CUDA 12.4+ drivers.
+  "$nvcc" -fatbin --compress-mode=speed -Xfatbin=-compress-all "$src" -o "$tmp_fatbin" \
     -gencode=arch=compute_75,code=sm_75 \
     -gencode=arch=compute_80,code=sm_80 \
     -gencode=arch=compute_89,code=sm_89 \
@@ -590,13 +611,17 @@ build_fatbin() {
   fi
   check_required_symbols "$tmp_fatbin"
   if [ -n "$cuobjdump" ]; then
-    dump="$("$cuobjdump" --dump-elf "$tmp_fatbin" 2>/dev/null || true)"
+    dump="$("$cuobjdump" --list-elf "$tmp_fatbin" 2>/dev/null || true)"
     for arch in sm_75 sm_80 sm_89 sm_90 sm_100 sm_110 sm_120; do
       if ! grep -q "$arch" <<<"$dump"; then
         printf 'error: generated fatbin is missing %s\n' "$arch" >&2
         exit 1
       fi
     done
+    if ! "$cuobjdump" --list-ptx "$tmp_fatbin" | grep -q 'sm_75'; then
+      printf 'error: generated fatbin is missing compute_75 fallback PTX\n' >&2
+      exit 1
+    fi
   fi
   write_or_check "$tmp_fatbin" "$fatbin_dst" "fatbin"
 }

@@ -646,14 +646,13 @@ __device__ __forceinline__ __nv_bfloat16 antfly_bf16_gelu_product(const __nv_bfl
     g = __bfloat162float(__float2bfloat16_rn(g));
     return __float2bfloat16_rn(g * __bfloat162float(*right));
 }
-#define ANTFLY_BF16_GELU_PRODUCT(Kernel) \
-extern "C" __global__ void Kernel(__nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfloat16* right, unsigned int count) { \
-    unsigned int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=count)return; \
-    out[i]=antfly_bf16_gelu_product(gate+i,right+i); \
+// Historical export; both model adapter calls bind this one native product.
+extern "C" __global__ void termite_embedding_gemma2_gelu_mul_bf16(
+    __nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfloat16* right,
+    unsigned int count) {
+    unsigned int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=count)return;
+    out[i]=antfly_bf16_gelu_product(gate+i,right+i);
 }
-ANTFLY_BF16_GELU_PRODUCT(termite_embedding_gemma2_gelu_ple_bf16)
-ANTFLY_BF16_GELU_PRODUCT(termite_embedding_gemma2_gelu_mul_bf16)
-#undef ANTFLY_BF16_GELU_PRODUCT
 
 extern "C" __global__ void termite_embedding_gemma2_gelu_mul_vjp_f32(
     float* dgate, float* dup, const float* dy, const __nv_bfloat16* gate,

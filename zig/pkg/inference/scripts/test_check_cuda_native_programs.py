@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from check_cuda_native_programs import records, select_programs
+from check_cuda_native_programs import records, select_programs, retired_programs
 
 
 class NativeRecordsTest(unittest.TestCase):
@@ -33,6 +33,14 @@ class NativeRecordsTest(unittest.TestCase):
             select_programs([rows, {}], ["qualified"])
         with self.assertRaisesRegex(AssertionError, "missing requested"):
             select_programs([rows, rows], ["absent"])
+
+    def test_retirement_requires_exact_removal_across_every_architecture(self):
+        original = {(arch, name): [] for arch in ("sm_75", "sm_120") for name in ("live", "retired")}
+        candidate = {key: value for key, value in original.items() if key[1] == "live"}
+        self.assertEqual(retired_programs(original, candidate, ["retired"]), {("sm_75", "retired"), ("sm_120", "retired")})
+        for rows, names in (({}, ["retired"]), (candidate, []), (original, ["retired"]), ({**candidate, ("sm_75", "retired"): []}, ["retired"]), (candidate, ["absent"])):
+            with self.subTest(rows=rows, names=names), self.assertRaises(AssertionError):
+                retired_programs(original, rows, names)
 
     def test_empty_malformed_and_duplicate_reports_are_errors(self):
         for text in [

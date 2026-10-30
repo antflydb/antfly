@@ -112,12 +112,16 @@ class RegenCudaArtifactsTest(unittest.TestCase):
                 self.assertEqual(native, wires, f"stale native wire layout: {symbol}")
         self.assertGreater(checked, 20)
 
-    def test_retired_unreachable_bf16_epilogues_have_no_source_slot_or_image(self) -> None:
+    def test_retired_unreachable_epilogues_have_no_source_slot_or_image(self) -> None:
         source = (ARTIFACTS / "inference_cuda_kernels.cu").read_text()
         slots = (ARTIFACTS.parent / "kernels.zig").read_text()
         script = SCRIPT.read_text()
         required = re.search(r"required_symbols=\(\n(.*?)\n\)", script, re.DOTALL).group(1).split()
         for symbol in (
+            "termite_embedding_gemma2_gelu_ple_bf16",
+            "termite_linear_q4_0_bias_f32_tc_hmma",
+            "termite_linear_q4_0_bias_gelu_f32_tc_hmma",
+            "termite_linear_q4_0_bias_add_f32_tc_hmma",
             "termite_linear_q4_0_bias_f32_tc_hmma_bf16",
             "termite_linear_q4_0_bias_gelu_f32_tc_hmma_bf16",
             "termite_linear_q4_0_bias_add_f32_tc_hmma_bf16",
@@ -127,7 +131,7 @@ class RegenCudaArtifactsTest(unittest.TestCase):
                 self.assertNotRegex(slots, rf"(?m)^    {symbol.removeprefix('termite_')}: driver_mod.CUfunction")
                 self.assertNotIn(symbol, required)
                 for filename in ("inference_cuda_kernels.ptx", "inference_cuda_kernels.fatbin", "inference_cuda_kernels_sm89.cubin"):
-                    self.assertNotIn(symbol.encode(), (ARTIFACTS / filename).read_bytes())
+                    self.assertFalse(symbol.encode() in (ARTIFACTS / filename).read_bytes(), f"{filename} retains {symbol}")
 
     def test_artifact_modes_require_fresh_codegen_before_nvcc(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -152,9 +156,78 @@ class RegenCudaArtifactsTest(unittest.TestCase):
 
         self.assertEqual(37, completed.returncode)
         self.assertIn(
-            "zig-args:build quant-kernel-codegen -- --check", completed.stdout
+            "zig-args:build quant-kernel-codegen tile-kernel-codegen -- --check", completed.stdout
         )
         self.assertNotIn("nvcc not found", completed.stderr)
+
+    def test_binary_export_checks_decode_compressed_symbol_tables(self) -> None:
+        checker = re.search(r"(?ms)^check_required_symbols\(\) \{\n.*?^\}", SCRIPT.read_text()).group()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            image = root / "compressed.fatbin"
+            image.write_bytes(b"opaque compressed payload, live name is not an export")
+            tool = root / "cuobjdump"
+            shell = root / "check.sh"
+            shell.write_text('set -eu\nrequired_symbols=(live)\nretired_symbols=(retired)\ncuobjdump="$1"\n' + checker + '\ncheck_required_symbols "$2"\n')
+            for table, succeeds in (
+                ("STT_FUNC STB_GLOBAL STO_ENTRY live", True),
+                ("STT_OBJECT STB_GLOBAL STV_DEFAULT live", False),
+                ("STT_FUNC STB_GLOBAL STV_DEFAULT live", False),
+                ("STT_FUNC STB_LOCAL STO_ENTRY live", False),
+                ("STT_FUNC STB_GLOBAL STO_ENTRY other", False),
+                ("STT_FUNC STB_GLOBAL STO_ENTRY live\nSTT_FUNC STB_GLOBAL STO_ENTRY retired", False),
+            ):
+                tool.write_text("#!/bin/sh\ncat <<'SYMBOLS'\n" + table + "\nSYMBOLS\n")
+                tool.chmod(0o755)
+                result = subprocess.run(["bash", str(shell), str(tool), str(image)], capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+            result = subprocess.run(["bash", str(shell), "", str(image)], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cuobjdump is required", result.stderr)
+            ptx = root / "portable.ptx"
+            ptx.write_text("// live\n.visible .entry other() {}\n")
+            result = subprocess.run(["bash", str(shell), "", str(ptx)], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            ptx.write_text(".visible .entry live() {}\n")
+            result = subprocess.run(["bash", str(shell), "", str(ptx)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fatbin_build_compresses_all_profiles_and_decodes_exports(self) -> None:
+        source = SCRIPT.read_text()
+        required = re.search(r"required_symbols=\(\n(.*?)\n\)", source, re.DOTALL).group(1).split()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            capture = root / "nvcc-args"
+            scratch = root / "nvcc-scratch"
+            zig = root / "zig"
+            zig.write_text("#!/bin/sh\nexit 0\n")
+            compiler = root / "nvcc"
+            compiler.write_text(
+                '#!/bin/sh\nif [ "$1" = --version ]; then echo "release 13.2"; exit 0; fi\n'
+                + 'printf "%s\\n" "$@" > "' + str(capture) + '"\n'
+                + 'printf "%s\\n" "$TMPDIR" > "' + str(scratch) + '"\n'
+                + 'while [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then shift; printf opaque > "$1"; exit 0; fi; shift; done\n'
+            )
+            dump = root / "cuobjdump"
+            table = "\n".join("STT_FUNC STB_GLOBAL STO_ENTRY " + symbol for symbol in required)
+            arches = "\n".join("ELF sm_" + arch for arch in ("75", "80", "89", "90", "100", "110", "120"))
+            dump.write_text('#!/bin/sh\ncase "$1" in\n--dump-elf-symbols) cat <<EOF\n' + table + '\nEOF\n;;\n--list-elf) cat <<EOF\n' + arches + '\nEOF\n;;\n--list-ptx) echo "PTX sm_75" ;;\n*) exit 42 ;;\nesac\n')
+            for tool in (zig, compiler, dump):
+                tool.chmod(0o755)
+            env = os.environ.copy()
+            env.update(ZIG_BIN=str(zig), NVCC=str(compiler), CUOBJDUMP=str(dump))
+            result = subprocess.run([str(SCRIPT), "--check", "--fatbin"], capture_output=True, text=True, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("fatbin artifact is stale", result.stderr)
+            args = capture.read_text().splitlines()
+            self.assertIn("--compress-mode=speed", args)
+            self.assertIn("-Xfatbin=-compress-all", args)
+            profiles = [arg for arg in args if arg.startswith("-gencode=")]
+            self.assertEqual(len(profiles), 8)
+            for arch in ("75", "80", "89", "90", "100", "110", "120"):
+                self.assertIn(f"-gencode=arch=compute_{arch},code=sm_{arch}", profiles)
+            self.assertIn("-gencode=arch=compute_75,code=compute_75", profiles)
+            pathlib.Path(scratch.read_text().strip()).relative_to(SCRIPT.parents[4] / ".zig-cache" / "cuda-artifacts")
 
     def test_default_zig_resolution_prefers_the_repo_pinned_toolchain(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")

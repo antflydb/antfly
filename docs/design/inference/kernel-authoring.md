@@ -136,3 +136,21 @@ prototype Metal kernels and checks the actual opt-in catalog hook against an
 independent logits reference, canaries and optional AA/AB/BA timing controls.
 Moving existing programs into generated regions earns no reduction credit; all
 Tile renderer and native specialization sources remain authored production code.
+
+## CUDA artifact size and export ownership
+
+Source sharing and binary size are separate measurements: templates can still
+instantiate every original program. Before removing an export, inspect computed
+host lookups and planner/benchmark identities as well as textual call sites.
+Consolidate identical programs only after checking parameter layouts, native
+instructions and resources on every supported architecture. Preserve public
+model adapters around operation-named launch ownership when needed.
+
+`regen-cuda-artifacts.sh` preserves all seven native targets and compute75 PTX,
+and uses fast compression for every fatbin image. That format requires CUDA
+12.4-compatible or newer drivers and trades about 1 ms of measured module
+loading/first-launch time for a substantially smaller packaged image. Validate
+exports through `cuobjdump` entry symbol tables; compressed blobs cannot be
+checked reliably with raw byte searches. Portable PTX and standalone SM89 remain
+separate profiles. Record packaged size, native code/resource identity and
+startup cost separately; see `unified-execution-bk-outcomes.md`.
