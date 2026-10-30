@@ -65,7 +65,7 @@ pub const Window = struct {
         if (maximum == 0 or maximum > 256 or bytes == 0) return error.InvalidSqlLimit;
         self.clear();
         errdefer self.clear();
-        self.page = try self.sort.nextPageLeased(maximum, bytes);
+        self.page = try self.sort.nextPublicationPageLeased(maximum, bytes);
         const rows = self.page.?.rows;
         self.rows = rows;
         self.count = rows.len;
@@ -272,12 +272,14 @@ test "external lake leased publication pressure preserves every pending key and 
             if (mode == 1) {
                 var window: Window = .{ .sort = &sort };
                 defer window.deinit();
+                var shortened = false;
                 while (true) {
                     const n = window.read(256, 512 * 1024) catch |err| {
                         std.debug.print("PIN_WINDOW leased={} seen={} partial={} error={} page_limit={}\n", .{ mode, seen, window.count, err, manager.page_residency_bytes });
                         return err;
                     };
                     if (n == 0) break;
+                    shortened = shortened or n < @min(256, count - seen);
                     for (window.rows) |lease| {
                         var expected: [20]u8 = undefined;
                         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "key-{d:0>16}", .{seen}), (try lease.keyCell(0)).value.string);
@@ -289,6 +291,7 @@ test "external lake leased publication pressure preserves every pending key and 
                         seen += 1;
                     }
                 }
+                try std.testing.expect(shortened);
             } else if (mode == 2) {
                 while (true) {
                     const page = try sort.nextPageLeased(256, 512 * 1024);

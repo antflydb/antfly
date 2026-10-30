@@ -2492,9 +2492,10 @@ reader protocol **97** and stored formats remain unchanged.
 Index publication consumes leased sort records and bounded leased windows.
 Builders finish consuming borrowed record bytes before the next advance, and
 covering stripes encode physical/frozen columns directly through the shared
-batch encoder. Publication is single-pass: independent replay or layout comparisons build
-independent input streams. Each window owns one pressure-aware keyed sort page,
-with at most 64 rows and the existing caller's 512-KiB ceiling. The spill engine's
+batch encoder. Publication is single-pass: independent replay or layout
+comparisons build independent input streams. Each window owns one pressure-aware keyed sort page,
+with at most 256 rows and the existing caller's 512-KiB ceiling. Ordinary result
+delivery retains its separate 64-row/128-KiB target. The shared spill engine's
 physical target and current allocation headroom can return a shorter productive
 prefix. Unread indirect references remain in the sort's bounded backlog; an
 allocation refusal must never skip a key. Direct resident/spilled rows and
@@ -2506,10 +2507,9 @@ The aggregate fallback drains variable physical batches through EOF. Its output
 pins survive stream closure until synchronous consumption finishes. EOF,
 cancellation, allocation failures and publisher teardown retire every lease.
 No leased payload or sort owner escapes publication. Identity witnesses,
-ordinals and covering stripe version retain the owning publisher's semantics;
-identical logical batches produce identical artifact bytes even when admission
-changes batch boundaries.
-
+ordinals and covering stripe version retain the owning publisher's semantics.
+Each returned batch matches the owning encoder's artifact bytes for those rows;
+admission may change where publication splits batches.
 
 ### Covering ranges across logical decode batches
 

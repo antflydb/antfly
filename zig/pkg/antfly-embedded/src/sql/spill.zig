@@ -3825,7 +3825,10 @@ pub const PayloadReader = struct {
         }
     };
     pub fn target(self: *PayloadReader, byte_limit: usize) usize {
-        var limit = @min(@max(1, byte_limit), 128 * 1024);
+        return self.targetBounded(byte_limit, 128 * 1024);
+    }
+    fn targetBounded(self: *PayloadReader, byte_limit: usize, preferred_bytes: usize) usize {
+        var limit = @min(@max(1, byte_limit), preferred_bytes);
         if (@import("memory_budget.zig").headroom(self.pages.file.manager.alloc)) |available| limit = @min(limit, available);
         return limit;
     }
@@ -3909,13 +3912,16 @@ pub const PayloadReader = struct {
     // shrinks. Native/replay delivery has no such backlog. Account for the
     // caller's fixed backlog separately from each candidate's output arrays.
     fn gatherForDelivery(self: *PayloadReader, storage: []Payload, references: []const Reference, byte_limit: usize, output_row_bytes: usize, extra_bytes: usize, backlog_bytes: usize) !Gathered {
-        if (references.len > 64 or storage.len < references.len) return error.InvalidSqlLimit;
+        return self.gatherBounded(64, storage, references, byte_limit, 128 * 1024, output_row_bytes, extra_bytes, backlog_bytes);
+    }
+    fn gatherBounded(self: *PayloadReader, comptime capacity: usize, storage: []Payload, references: []const Reference, byte_limit: usize, preferred_bytes: usize, output_row_bytes: usize, extra_bytes: usize, backlog_bytes: usize) !Gathered {
+        if (references.len > capacity or storage.len < references.len) return error.InvalidSqlLimit;
         var count = references.len;
         const previous_reserve = self.reserve_bytes;
         defer self.reserve_bytes = previous_reserve;
         while (true) {
             self.reserve_bytes = previous_reserve + backlog_bytes + count * output_row_bytes + extra_bytes;
-            const gathered = self.gather(storage[0..count], references[0..count], byte_limit) catch |err| {
+            const gathered = self.gather(capacity, storage[0..count], references[0..count], byte_limit, preferred_bytes) catch |err| {
                 if (err != error.SqlPayloadWindowFull) return err;
                 if (count <= 1) return error.SqlProgramLimitExceeded;
                 self.window_reductions += 1;
@@ -3943,8 +3949,8 @@ pub const PayloadReader = struct {
     const Gathered = struct { storage: []Payload, count: usize };
     // Preserve a completed rank prefix instead of discarding decoded pages
     // when allocation/byte admission ends a physically ordered gather early.
-    fn completedPrefix(output: []Payload, order: []const usize, done: usize) ?Gathered {
-        var ready: [64]bool = @splat(false);
+    fn completedPrefix(comptime capacity: usize, output: []Payload, order: []const usize, done: usize) ?Gathered {
+        var ready: [capacity]bool = @splat(false);
         for (order[0..done]) |index| ready[index] = true;
         var count: usize = 0;
         while (count < output.len and ready[count]) count += 1;
@@ -3952,7 +3958,7 @@ pub const PayloadReader = struct {
         for (order[0..done]) |index| if (index >= count) output[index].release();
         return .{ .storage = output, .count = count };
     }
-    fn ownerBytes(block: *Sequential.OwnedBlock, owners: *[128]*Sequential.OwnedBlock, count: *usize) usize {
+    fn ownerBytes(block: *Sequential.OwnedBlock, owners: []*Sequential.OwnedBlock, count: *usize) usize {
         for (owners[0..count.*]) |prior| if (prior == block) return 0;
         // Overflow falls back to conservative accounting, never undercounting.
         if (count.* < owners.len) {
@@ -3963,9 +3969,9 @@ pub const PayloadReader = struct {
         for (block.dependencies.items) |body| bytes +|= ownerBytes(body, owners, count);
         return bytes;
     }
-    fn gather(self: *PayloadReader, output: []Payload, references: []const Reference, byte_limit: usize) !Gathered {
-        std.debug.assert(output.len == references.len and references.len <= 64);
-        var order: [64]usize = undefined;
+    fn gather(self: *PayloadReader, comptime capacity: usize, output: []Payload, references: []const Reference, byte_limit: usize, preferred_bytes: usize) !Gathered {
+        std.debug.assert(output.len == references.len and references.len <= capacity);
+        var order: [capacity]usize = undefined;
         for (order[0..references.len], 0..) |*index, i| index.* = i;
         std.mem.sort(usize, order[0..references.len], references, struct {
             fn less(refs: []const Reference, left: usize, right: usize) bool {
@@ -3976,19 +3982,19 @@ pub const PayloadReader = struct {
         errdefer for (order[0..done]) |index| output[index].release();
         var bytes: usize = 0;
         var previous: ?u64 = null;
-        var owners: [128]*Sequential.OwnedBlock = undefined;
+        var owners: [capacity * 2]*Sequential.OwnedBlock = undefined;
         var owner_count: usize = 0;
-        const target_bytes = self.target(byte_limit);
+        const target_bytes = self.targetBounded(byte_limit, preferred_bytes);
         for (order[0..references.len]) |index| {
             const payload = self.readWindow(references[index]) catch |err| {
-                if (err == error.SqlPayloadWindowFull) if (completedPrefix(output, order[0..references.len], done)) |prefix_| return prefix_;
+                if (err == error.SqlPayloadWindowFull) if (completedPrefix(capacity, output, order[0..references.len], done)) |prefix_| return prefix_;
                 return err;
             };
             if (previous == null or previous.? != references[index].offset) {
                 const cost = ownerBytes(payload.block, &owners, &owner_count);
                 if (done != 0 and cost > target_bytes -| bytes) {
                     payload.release();
-                    if (completedPrefix(output, order[0..references.len], done)) |prefix_| return prefix_;
+                    if (completedPrefix(capacity, output, order[0..references.len], done)) |prefix_| return prefix_;
                     return error.SqlPayloadWindowFull;
                 }
                 bytes +|= cost;
@@ -5374,11 +5380,11 @@ pub const Sort = struct {
     /// A productive prefix is returned before the next block needs more room;
     /// no failed hydration can consume an unread indirect reference. Resident
     /// rows borrow typed stores: retain the sort until the returned page releases.
-    fn nextDirectPageLeased(self: *Sort, maximum: usize, byte_limit: usize) anyerror!Page {
-        var rows: [64]RowLease = undefined;
+    fn nextDirectPageLeased(self: *Sort, comptime capacity: usize, maximum: usize, byte_limit: usize) anyerror!Page {
+        var rows: [capacity]RowLease = undefined;
         var count: usize = 0;
         errdefer for (rows[0..count]) |lease| lease.release();
-        var owners: [128]*Sequential.OwnedBlock = undefined;
+        var owners: [capacity * 2]*Sequential.OwnedBlock = undefined;
         var owner_count: usize = 0;
         var retained: usize = 0;
         var logical: usize = 0;
@@ -5417,14 +5423,22 @@ pub const Sort = struct {
         return .{ .rows = output, .a = stable, .values = view.batch(if (count == 0) 0 else rows[0].width()) };
     }
     pub fn nextPageLeased(self: *Sort, maximum: usize, byte_limit: usize) anyerror!Page {
+        return self.nextKeyedPageLeased(64, maximum, byte_limit, 128 * 1024);
+    }
+    /// Publication keeps larger caller-bounded packs when memory permits,
+    /// sharing delivery's admission and unread-reference backlog machinery.
+    pub fn nextPublicationPageLeased(self: *Sort, maximum: usize, byte_limit: usize) anyerror!Page {
+        return self.nextKeyedPageLeased(256, maximum, byte_limit, byte_limit);
+    }
+    fn nextKeyedPageLeased(self: *Sort, comptime capacity: usize, maximum: usize, byte_limit: usize, preferred_bytes: usize) anyerror!Page {
         if (maximum == 0 or byte_limit == 0) return error.InvalidSqlLimit;
         try self.finishDelivery(@sizeOf(RowLease) + @sizeOf(PageView));
-        if (self.order_sort == null) return self.nextDirectPageLeased(maximum, byte_limit);
+        if (self.order_sort == null) return self.nextDirectPageLeased(capacity, maximum, byte_limit);
         const reader = try self.payloadReader();
-        const limit = reader.target(byte_limit);
-        var keys: [64]?RowLease = @splat(null);
+        const limit = reader.targetBounded(byte_limit, preferred_bytes);
+        var keys: [capacity]?RowLease = @splat(null);
         defer for (keys) |lease| if (lease) |value| value.release();
-        var references: [64]PayloadReader.Reference = undefined;
+        var references: [capacity]PayloadReader.Reference = undefined;
         var count: usize = 0;
         var bytes: usize = 0;
         const logical_rows = @max(1, byte_limit / @max(1, self.max_payload_bytes));
@@ -5457,8 +5471,8 @@ pub const Sort = struct {
         }
         const pending = count + self.deferred_count - self.deferred_index;
         const backlog_bytes = if (pending > self.deferred_references.len) pending * @sizeOf(?RowLease) else 0;
-        var storage: [64]PayloadReader.Payload = undefined;
-        const gathered = try reader.gatherForDelivery(&storage, references[0..count], byte_limit, @sizeOf(RowLease), @sizeOf(PageView), backlog_bytes);
+        var storage: [capacity]PayloadReader.Payload = undefined;
+        const gathered = try reader.gatherBounded(capacity, &storage, references[0..count], byte_limit, preferred_bytes, @sizeOf(RowLease), @sizeOf(PageView), backlog_bytes);
         const payloads = gathered.storage[0..gathered.count];
         errdefer for (payloads) |payload| payload.release();
         const stable = self.manager.allocator();

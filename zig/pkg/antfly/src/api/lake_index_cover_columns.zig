@@ -583,6 +583,9 @@ test "external lake leased publication covering stripes match owning bytes for t
         var seen: usize = 0;
         while (try window.read(256, 512 << 10) != 0) {
             const batch = window.count;
+            // No pressure in this fixture: retain the complete pack rather
+            // than inheriting the smaller result-delivery target.
+            try std.testing.expectEqual(@as(usize, count), batch);
             const owned = try publish(a, store, scope, rows[seen..][0..batch], .none, &writes);
             defer a.free(owned.artifact_id);
             const leased = try publishLeased(a, store, scope, &window, .none, &writes);
