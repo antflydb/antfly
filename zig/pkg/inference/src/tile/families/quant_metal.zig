@@ -25,6 +25,7 @@ const q4_k = @import("../quant_metal_q4_k.zig");
 const q8_0 = @import("../quant_metal_q8_0.zig");
 const mm_sg = @import("../quant_metal_mm_sg.zig");
 const io = @import("../quant_metal_io.zig");
+const q4_0_id = @import("../quant_metal_q4_0_id.zig");
 
 pub const regions = [_]Region{
     msl.metal("q4_0_shared", wrap.q4_0Shared()),
@@ -50,7 +51,33 @@ pub const regions = [_]Region{
     msl.metal("q8_0_pair_activation", &[_]msl.Item{q8_0.pair_reduce4} ++ q8_0.pair_ext1r),
     msl.metal("q8_0_activation_rhs_rows", wrap.q4_0_pair_activation_multiply_r_ext ++ .{ q8_0.rhs_ext1r, q8_0.rhs_reduce4 } ++ @import("../quant_metal_rows.zig").items() ++ .{ gemv.scalar("q8_k"), gemv.reduce("q8_k") }),
     msl.metal("q6_k_nbodd", wrap.q6_kNbOdd()),
-    msl.metal("gemv_q1_0", &.{ gemv.scalar("q1_0"), gemv.scalar("i8_s"), gemv.scalar("q4_0") }),
+    msl.metal("gemv_q1_0", &.{
+        gemv.scalar("q1_0"),
+        gemv.scalar("i8_s"),
+        gemv.scalar("q4_0"),
+        q4_0_id.linear_id,
+        msl.comment(&.{
+            "Exact Gemma4 26B-A4B decode shapes. Keeping the route count,",
+            "dimensions, row strides, and shared-input rule compile-time",
+            "constant removes the dynamic address arithmetic from the two",
+            "bandwidth-dominant MUL_MV_ID dispatches. These kernels are",
+            "selected only by the high-memory A4B feature gate and retain the",
+            "generic kernel as an immediate rollback.",
+        }),
+        q4_0_id.a4b_gate_up,
+        q4_0_id.a4b_down,
+    }),
+    msl.metal("q4_0_id", &.{
+        q4_0_id.a4b_down_reduce,
+        q4_0_id.pair_linear_id,
+        msl.comment(&.{
+            "A4B decode specialization. The route index selects the expert but",
+            "input rows are shared by each token's top-k routes, so this kernel",
+            "consumes the original hidden state directly. Gate and up use one",
+            "dispatch and materialize only their activated product.",
+        }),
+        q4_0_id.pair_activation_id,
+    }),
     msl.metal("gemv_q8_0", &.{gemv.scalar("q8_0")}),
     msl.metal("gemv_q8_1", &[_]msl.Item{ gemv.scalar("q8_1"), gemv.reduce("q8_1") } ++ gemv.q8_0_mmv),
     msl.metal("gemv_q2_k", &.{ gemv.scalar("q2_k"), gemv.scalar("q3_k"), gemv.scalar("q4_k"), q4_k.linear }),
