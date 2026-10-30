@@ -314,7 +314,7 @@ export class R2CommitCoordinator extends DurableObject {
     const refresh=()=>trace.span("write_refresh",()=>this.transaction(async()=>{},{deadlineMs:deadline,traceId:trace.id,ioBudget}));
     if(!this.store.state||this.store.recovering||this.store.needsWriteRefresh())await refresh();
     const transport=this.store.dataCache.wrap(edgeCacheForEnv(this.env,{background:promise=>this.ctx.waitUntil(promise),budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical)),this.env.ANTFLY_INCARNATION,{preserveProtected:this.env.FOREGROUND_CACHE_POLICY==="true"});
-    let prepared,prepareAttempts=0;
+    let prepared,prepareAttempts=0,finalizeAttempts=0;
     for(let attempt=0;attempt<3;attempt++){
       if(Date.now()>=deadline)throw Error("DeadlineExceeded");
       if(ioBudget.operations>=1024||ioBudget.bytes>=32*1024*1024)throw Error("CoordinatorIoBudgetExceeded");
@@ -337,12 +337,12 @@ export class R2CommitCoordinator extends DurableObject {
       // Authority refreshes do not invalidate immutable preparation. The native
       // finalizer rechecks WAL/head/GC dependencies against the refreshed root;
       // only a semantic dependency conflict requires rebuilding the plan.
-      let committed;
+      let committed;finalizeAttempts++;
       try{committed=await trace.span("native_wal_finalize",()=>this.store.commitWal({...prepared.__write_plan,migration_required:this.env.COORDINATOR_MIGRATION_REQUIRED==="true"},{deadlineMs:deadline,traceId:trace.id,nativePlan:true,ioBudget}));}
       catch(error){if(!["PreconditionFailed","ImmutableLogRotationRequired","ImmutableLogProofExpired"].includes(error?.message))throw error;await refresh();continue;}
       if(!committed.applied){prepared=null;await refresh();continue;}
       trace.publicationId=committed.publication.id;
-      if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",trace_id:trace.id,trace_ids:inputs.map(input=>input.__trace_id).filter(Boolean),callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started,native_write_plan:true,prepare_attempts:prepareAttempts,finalize_attempts:attempt+1,operations:ioBudget.operations,transferred_bytes:ioBudget.bytes,physical_r2:physical}));
+      if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",trace_id:trace.id,trace_ids:inputs.map(input=>input.__trace_id).filter(Boolean),callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started,native_write_plan:true,prepare_attempts:prepareAttempts,finalize_attempts:finalizeAttempts,operations:ioBudget.operations,transferred_bytes:ioBudget.bytes,physical_r2:physical}));
       return prepared.results.map((item,i)=>({...item,__publication:i===0?committed.publication:{...committed.publication,enqueue:false}}));
     }
     throw Error("WalCommitContended");
