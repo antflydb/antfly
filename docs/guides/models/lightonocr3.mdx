@@ -52,10 +52,10 @@ are not converted into pixel-coordinate `regions`.
 On Metal, and on CUDA with the LightOn batch profile, `/read` batches pages from
 the same request and from concurrent requests on the GPU.
 
-`/read` accepts at most 1024 output tokens
-per page and rejects truncated output. Use `/generate` with a larger budget
-for dense pages; its content should contain the image and either no text or
-the exact `grounding` keyword, with thinking disabled.
+`/read` accepts up to 8192 output tokens per page and rejects truncated output.
+Use this endpoint for repeated page extraction so the reader can reuse its
+prepared execution state. The default output budget remains 256 tokens;
+request a larger budget explicitly for dense pages.
 
 ## Read documents during ingestion
 
