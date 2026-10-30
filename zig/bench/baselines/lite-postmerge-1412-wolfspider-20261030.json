@@ -9362,6 +9362,24 @@
   },
   "schema_version": 1,
   "validation": {
+    "affected_build_targets": {
+      "exit_code": 0,
+      "revision": "724bf2d980",
+      "scope": "warm-cache build-graph verification of scoped native Darwin Debug claims; not a new cold-peak measurement",
+      "targets": [
+        "install-api-http-runtime-tests",
+        "unit-storage-compile"
+      ]
+    },
+    "api_runtime_recheck": {
+      "exit_code": 0,
+      "expected_error_logs": 5,
+      "failed": 0,
+      "leaks": 0,
+      "passed": 503,
+      "skipped": 0,
+      "unexpected_error_logs": 0
+    },
     "beads_cli_smoke": {
       "binary_sha256": "6177be8fee1e1cbb9b5ec024248cc344d37a2fd38b66c46962e5993263915f92",
       "exit_code": 0,
@@ -9411,6 +9429,7 @@
       "allocation_failure_sweep": "passed",
       "focused_build_exit_code": 0,
       "full_unit_rerun": false,
+      "merged_revision": "b99a9d3a70d79758a831da733cb541138a6851b9",
       "passed_tests": 1,
       "pr": 1424,
       "prior_binary_exit_code": 134,
@@ -9425,6 +9444,15 @@
       "optional_skips": 3,
       "passed": 268,
       "runtime_revision": "ced99336b8"
+    },
+    "optimized_candidate_initial_build": {
+      "final_status": "pending",
+      "reservation_overrun": {
+        "corrected_unqualified_native_darwin_claim_gib": 28,
+        "owner": "antfly-storage-engine",
+        "peak_bytes": 26889633792,
+        "reservation_bytes": 25769803776
+      }
     },
     "public_c_api_smoke": {
       "exit_code": 0,

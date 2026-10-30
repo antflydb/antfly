@@ -42,7 +42,9 @@ test "qualified inference core keeps peak margin and fits beside API compilation
 pub fn storageCompileMaxRss(os: std.Target.Os.Tag, measured_sdk27: bool, measured_darwin: bool, measured_cross: bool) u64 {
     const gib = 1024 * 1024 * 1024;
     // Linux -> macOS SDK 26.1: 13G rounded MaxRSS, plus a GiB and 10%.
-    return @as(u64, if (os == .macos and measured_cross) 16 else if (measured_sdk27) 14 else if (os == .macos and !measured_darwin) 24 else 16) * gib;
+    // Native macOS 26.6.2 / SDK 27.0 / Zig 0.17 cold fast storage reached
+    // 26,889,633,792 bytes. Keep >10% headroom for unqualified profiles.
+    return @as(u64, if (os == .macos and measured_cross) 16 else if (measured_sdk27) 14 else if (os == .macos and !measured_darwin) 28 else 16) * gib;
 }
 
 test "cross Darwin provider claims retain peak margins and admit storage with inference" {
@@ -52,7 +54,10 @@ test "cross Darwin provider claims retain peak margins and admit storage with in
     try std.testing.expect(storage >= 14 * gib + 14 * gib / 10);
     try std.testing.expect(inference >= 12 * gib + 12 * gib / 10);
     try std.testing.expect(storage + inference <= 32 * gib);
-    try std.testing.expectEqual(24 * gib, storageCompileMaxRss(.macos, false, false, false));
+    const native_storage_peak: u64 = 26_889_633_792;
+    const native_storage = storageCompileMaxRss(.macos, false, false, false);
+    try std.testing.expect(native_storage >= native_storage_peak + native_storage_peak / 10);
+    try std.testing.expect(native_storage <= 36 * gib * 4 / 5);
     const native_peak: u64 = 24_912_183_296;
     const native_inference = inferenceCompileMaxRss(.macos, true, false, false);
     try std.testing.expect(native_inference >= native_peak + native_peak / 10);
