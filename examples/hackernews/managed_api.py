@@ -19,7 +19,7 @@ import ipaddress
 import os
 import re
 from urllib.parse import unquote, urlsplit
-from urllib.request import HTTPRedirectHandler, build_opener
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -32,6 +32,12 @@ _opener = build_opener(NoRedirect())
 
 
 def open_request(request, *, timeout):
+    if isinstance(request, str):
+        request = Request(request)
+    # Identify this supported client explicitly. The Cloud front door rejects
+    # urllib's generic Python-urllib agent before requests reach the tenant API.
+    if not request.has_header("User-agent"):
+        request.add_header("User-Agent", "antfly-hackernews/1")
     return _opener.open(request, timeout=timeout)
 
 
