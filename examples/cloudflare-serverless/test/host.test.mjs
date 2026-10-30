@@ -1199,3 +1199,22 @@ test('native receipt replay recovers an R2 internal error after its conditional 
  const failed=(await setup(bucket)).host;await assert.rejects(failed.request(append('recover')),/ObjectStoreTransportFailed/);
  const reopened=(await setup(bucket)).host,receipt=await reopened.request(append('recover'));assert.equal(ambiguous,1);assert.equal(receipt.visibility.slice(-16),'0000000000000002');const rows=await reopened.request(request('read'));assert.deepEqual(rows.records.map(payloadText),['before','recover']);
 });
+
+test('native bounded idle revalidation overlaps reads and charges every child to the original budget',async()=>{
+ const bucket=new Bucket(),raw=createR2Transport({database:bucket});let wall=100000,active=0,peak=0,seen=[],last;
+ const transport=async(request,body)=>{seen.push(request.key);peak=Math.max(peak,++active);await new Promise(r=>setTimeout(r,2));try{return await raw(request,body);}finally{active--;}};
+ const host=await instantiateHost(module,transport,{clock:()=>wall,onMetrics:value=>last=value});
+ const request=coordinate=>({op:'coordinate',bucket:'database',prefix:'batch',namespace:'batch-proof',coordinate:{root_backend:'bounded_journal',root_proof_key:Array(32).fill(42),root_proof_scope:Array(16).fill(9),owner:Array(16).fill(1),...coordinate}});
+ const first=await host.request(request({action:'begin'}));
+ const committed=await host.request(request({action:'commit',state:first.state,journal_proof:first.journal_proof,commands:[{kind:'put',key:'value',value:'accepted'}]}));
+ wall+=31000;seen=[];peak=0;
+ const observed=await host.request(request({action:'observe_committed',state:committed.state,journal_proof:committed.journal_proof}),{maxTransferBytes:65536});
+ assert.equal(observed.state.revision,committed.state.revision);assert.equal(seen.length,2);assert.equal(peak,2);assert.equal(last.operations,2);
+ wall+=31000;seen=[];peak=0;
+ const serial=await host.request(request({action:'observe_committed',state:observed.state,journal_proof:observed.journal_proof,journal_read_batch:false}),{maxTransferBytes:65536});
+ assert.equal(serial.state.revision,observed.state.revision);assert.equal(seen.length,2);assert.equal(peak,1);assert.equal(last.operations,2);
+ wall+=31000;seen=[];
+ const expired=request({action:'observe_committed',state:serial.state,journal_proof:serial.journal_proof});
+ await assert.rejects(host.request(expired,{maxOperations:1,maxTransferBytes:65536}),/ObjectIoBudgetExceeded/);assert.equal(seen.length,0);
+ await assert.rejects(host.request(expired,{maxOperations:8,maxTransferBytes:1024}),/ObjectIoBudgetExceeded/);assert.equal(seen.length,0);
+});

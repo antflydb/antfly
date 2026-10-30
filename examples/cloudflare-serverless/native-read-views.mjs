@@ -30,7 +30,7 @@ export class NativeReadViews {
   this.env=env;this.clock=clock;this.cohorts=new FreshReadAdmissions({delayMs:cohortDelayMs});this.authorityAdmission=new AuthorityAdmission(()=>openAuthority(env,coordinatorAuthorityMode(env),{allowCreate:false}));
   const observation={request:(input,options)=>kernel.request(input,{...options,kernelVariant:"observe",memoryReservationBytes:8*1024*1024,reservationClass:"authority"})};
   this.background=background;this.leaseCapacity=env.FENCED_READ_LEASES==="false"?0:32768;
-  this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,rowBudgetBytes:512*1024-this.leaseCapacity,readKernel:observation,cache,onMetrics,proofBudget:env.DETACHED_METADATA_PROOFS==="true"&&kernel.slots?.length?readAheadBudgetFor(kernel,Math.min(4,kernel.slots.length)):undefined,remoteCache:edgeCacheForEnv(env,{background})});
+  this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,readBatch:env.NATIVE_METADATA_READ_BATCH!=="false",rowBudgetBytes:512*1024-this.leaseCapacity,readKernel:observation,cache,onMetrics,proofBudget:env.DETACHED_METADATA_PROOFS==="true"&&kernel.slots?.length?readAheadBudgetFor(kernel,Math.min(4,kernel.slots.length)):undefined,remoteCache:edgeCacheForEnv(env,{background})});
  }
  async leaseCache(){if(!this.leaseCapacity)return null;if(!this.leases){const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);this.leases??=new FencedReadLeases({scope:keys.wal.match(/wal-v1\/([a-f0-9]{64})\/HEAD$/)[1],clock:this.clock,maxBytes:this.leaseCapacity});}return this.leases;}
  async open(options={}){const cache=options.allow_cached?await this.leaseCache():null;try{return cache?await cache.run(options.required_visibility,'native',()=>this.freshOpen(options),options.onLease):await this.freshOpen(options);}catch(error){if(!/^(ReadSnapshotNeeds(?:Admission|Pin)|CoordinatorAuthorityMissing|CoordinatorRecovering)$/.test(error.message))this.leases?.clear();throw error;}}
@@ -40,15 +40,24 @@ export class NativeReadViews {
  metrics(){return{read_view_lease_bytes:this.leases?.bytes??0,read_view_lease_hits:this.leases?.hits??0,read_view_lease_joins:this.leases?.joins??0};}
  freshOpen(options={}){const observedAt=this.clock();
   return this.cohorts.run(JSON.stringify([options.version??"latest",options.durable_pin===true]),async(traceIds,close,publish)=>{
-   const authority=await this.authorityAdmission.get();
-   if(authority.descriptor.mode!==coordinatorAuthorityMode(this.env)){this.authorityAdmission.value=null;throw Error("CoordinatorMigrationRequired");}
-   this.store.configureAuthority(authority.descriptor);
-   const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);
-   return this.store.readOnly(async tx=>{
-    const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,keys.hints]);
-    if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||authority.descriptor.mode!==coordinatorAuthorityMode(this.env))throw Error("CoordinatorMigrationRequired");
-    const view=await captureReadView(tx,keys,{...options,lease_observed_at_ms:observedAt,allow_ephemeral_pin:this.store.rootBackend!=="journal",read_lease_policy:this.leaseCapacity||this.store.rootBackend!=="journal"?authority.descriptor.read_lease_policy:undefined},this.clock);publish(view);return view;
-   },{traceId:options.trace_id,traceIds,onAdmission:close,background:options.background??this.background,deadlineMs:options.deadlineMs,...(this.env.FUSED_READ_ADMISSION==="true"?{readKeys:[MIGRATION,keys.head,keys.wal,keys.floor,keys.hints],readPrefix:keys.progress+"READ_PINS/"}:{})});
+   const mode=coordinatorAuthorityMode(this.env),loading=this.authorityAdmission.get(),parallel=mode==="r2-bounded"&&!this.authorityAdmission.value;
+   // This speculative observation is GET-only. Verify the persisted authority
+   // before using rows, granting a read lease, or publishing a prepared view.
+   // Join both lifetimes on failure too; no request-owned I/O survives unseen.
+   loading.catch(()=>{});
+   const verified=authority=>{if(authority.descriptor.mode!==mode){this.authorityAdmission.value=null;throw Error("CoordinatorMigrationRequired");}this.store.configureAuthority(authority.descriptor);return authority;};
+   let authority;
+   if(parallel)this.store.configureAuthority({mode});else authority=verified(await loading);
+   try{
+    const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);
+    return await this.store.readOnly(async tx=>{
+     authority??=verified(await loading);
+     const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,keys.hints]);
+     if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||authority.descriptor.mode!==mode)throw Error("CoordinatorMigrationRequired");
+     const view=await captureReadView(tx,keys,{...options,lease_observed_at_ms:observedAt,allow_ephemeral_pin:this.store.rootBackend!=="journal",read_lease_policy:this.leaseCapacity||this.store.rootBackend!=="journal"?authority.descriptor.read_lease_policy:undefined},this.clock);publish(view);return view;
+    },{traceId:options.trace_id,traceIds,onAdmission:close,background:options.background??this.background,deadlineMs:options.deadlineMs,...(this.env.FUSED_READ_ADMISSION==="true"?{readKeys:[MIGRATION,keys.head,keys.wal,keys.floor,keys.hints],readPrefix:keys.progress+"READ_PINS/"}:{})});
+   }catch(error){if(!authority){this.store.observedState=null;this.store.observedProof=null;this.leases?.clear();}throw error;}
+   finally{if(parallel)await Promise.allSettled([loading]);}
   },options.trace_id,{untilAdmission:true,onPrepared:options.onPrepared,onAdmitted:options.onAdmitted});
  }
 }

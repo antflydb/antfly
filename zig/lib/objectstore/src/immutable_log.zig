@@ -373,6 +373,53 @@ pub const Log = struct {
         }
         return authority.issue(self, source, anchor);
     }
+    /// A fresh checkpoint already authenticates its accepted source state.
+    /// Under the bounded namespace contract, follow the exact next-slot chain
+    /// without a redundant SEALED-marker probe. Never return an intermediate
+    /// root as a completed data observation.
+    pub fn observeFromCheckpointCertified(self: Log, a: A, authority: ProofAuthority) !CertifiedRecovery {
+        const anchor = authority.now();
+        const cp = (try self.checkpoint(a)) orelse return error.ImmutableLogProofRequiresRecovery;
+        const proof = try authority.issue(self, cp.state, anchor);
+        return self.observeCertified(a, cp.state, authority, proof, true);
+    }
+    /// Capture both independent proof objects in one native I/O wave. The
+    /// certificate anchor precedes the batch; late responses cannot reset it.
+    pub fn refreshAndObserveCertified(self: Log, a: A, source: State, authority: ProofAuthority, proof: WriteProof, follow_owners: bool) !CertifiedRecovery {
+        try authority.authenticate(self, source, proof);
+        const anchor = authority.now();
+        if (anchor.wall_ms < proof.anchor.wall_ms or anchor.mono_ms < proof.anchor.mono_ms) return error.ImmutableLogProofExpired;
+        try authority.current(anchor);
+        const checkpoint_key = try std.fmt.allocPrint(a, "{s}/CHECKPOINT", .{self.prefix});
+        defer a.free(checkpoint_key);
+        const next_key = try self.key(a, source.epoch, source.next);
+        defer a.free(next_key);
+        var client = self.client;
+        client.allocator = a;
+        const results = try client.getObjects(self.bucket, &.{
+            .{ .key = checkpoint_key, .options = .{ .skip_metadata_probe = true, .max_response_bytes = 16384, .cancellation = self.cancellation } },
+            .{ .key = next_key, .options = .{ .skip_metadata_probe = true, .max_response_bytes = 16384, .cancellation = self.cancellation } },
+        });
+        defer {
+            for (results) |*result| if (result.*) |*value| value.deinit(a);
+            a.free(results);
+        }
+        if (results[0]) |value| {
+            const parsed = try std.json.parseFromSlice(Checkpoint, a, value.body, .{});
+            defer parsed.deinit();
+            const cp = parsed.value;
+            if (cp.format != 1) return error.InvalidImmutableLog;
+            try validate(cp.state);
+            if (cp.state.revision > source.revision) return error.ImmutableLogProofRequiresRecovery;
+            if (cp.state.revision == source.revision and !same(cp.state, source)) return error.InvalidImmutableLog;
+        } else {
+            const required = try std.fmt.allocPrint(a, "{s}/CHECKPOINT_REQUIRED", .{self.prefix});
+            defer a.free(required);
+            if (try self.read(a, required)) |_| return error.ImmutableLogCheckpointMissing;
+        }
+        const renewed = try authority.issue(self, source, anchor);
+        return self.observeCertifiedMode(a, source, authority, renewed, follow_owners, &results[1]);
+    }
     /// The seal competes for this exact next slot. A valid bounded source
     /// therefore needs no cross-object floor probes. The collector grace keeps
     /// all competing slots alive until the proof expires. Check AFTER PUT too:
@@ -401,20 +448,23 @@ pub const Log = struct {
     /// One fresh next-slot probe suffices within a protected epoch: every seal
     /// is first linearized in that same slot, before its recovery marker.
     pub fn observeCertified(self: Log, result_alloc: A, source: State, authority: ProofAuthority, proof: WriteProof, follow_owners: bool) !CertifiedRecovery {
+        return self.observeCertifiedMode(result_alloc, source, authority, proof, follow_owners, null);
+    }
+    fn observeCertifiedMode(self: Log, result_alloc: A, source: State, authority: ProofAuthority, proof: WriteProof, follow_owners: bool, first: ?*const ?types.GetResult) !CertifiedRecovery {
         try authority.check(self, source, proof);
-        const anchor = authority.now();
+        const anchor = if (first != null) proof.anchor else authority.now();
         var arena = std.heap.ArenaAllocator.init(result_alloc);
         defer arena.deinit();
         const a = arena.allocator();
         var root_buffer: [max_root_bytes]u8 = undefined;
         var state = source;
-        for (0..max_steps) |_| {
+        for (0..max_steps) |step| {
             std.mem.copyForwards(u8, root_buffer[0..state.root.len], state.root);
             state.root = root_buffer[0..state.root.len];
             _ = arena.reset(.retain_capacity);
             try authority.check(self, source, proof);
             if (!follow_owners and !std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;
-            const stored = try self.read(a, try self.key(a, state.epoch, state.next));
+            const stored = if (step == 0 and first != null) first.?.* else try self.read(a, try self.key(a, state.epoch, state.next));
             try authority.check(self, source, proof);
             const item = stored orelse {
                 state.root = try result_alloc.dupe(u8, state.root);
@@ -698,6 +748,7 @@ const ProofTestBackend = struct {
     time: ProofTime = .{ .wall_ms = 100000, .mono_ms = 1000 },
     delay_and_retire: ?Log = null,
     lost_ack: bool = false,
+    read_batch_delay_ms: u64 = 0,
     fn clock(raw: *const anyopaque) ProofTime {
         const self: *const @This() = @ptrCast(@alignCast(raw));
         return self.time;
@@ -739,10 +790,20 @@ const ProofTestBackend = struct {
         }
         return result;
     }
+    fn getMany(raw: *anyopaque, a: A, bucket: []const u8, items: []const types.GetObjectRequest) ![]?types.GetResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var base = self.memory.client();
+        base.allocator = a;
+        const results = try base.getObjects(bucket, items);
+        self.time.wall_ms += self.read_batch_delay_ms;
+        self.time.mono_ms += self.read_batch_delay_ms;
+        return results;
+    }
     fn client(self: *@This(), table: *Client.VTable) Client {
         const base = self.memory.client();
         table.* = base.vtable.*;
         table.get_object = get;
+        table.get_objects = if (self.read_batch_delay_ms > 0) getMany else null;
         table.put_object = put;
         return .{ .allocator = base.allocator, .ptr = self, .vtable = table };
     }
@@ -889,4 +950,65 @@ test "immutable log bounded certificate idle refresh authenticates the current G
     memory.resetOperationCount();
     try std.testing.expectError(error.ImmutableLogProofExpired, log.refreshCertificate(m, state, authority, proof));
     try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
+}
+
+test "immutable log bounded batch revalidation anchors before storage and rejects late proof renewal" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var base = memory.client();
+    try base.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory, .read_batch_delay_ms = 30000 };
+    var table: Client.VTable = undefined;
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "proof", .owner = @splat(1), .io = std.testing.io };
+    const authority = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const state = (try log.recover(m, null, true)).state;
+    const proof = try authority.issue(log, state, authority.now());
+    backend.time.wall_ms += 30000;
+    backend.time.mono_ms += 30000;
+    memory.resetOperationCount();
+    try std.testing.expectError(error.ImmutableLogProofExpired, log.refreshAndObserveCertified(m, state, authority, proof, true));
+    try std.testing.expectEqual(@as(u64, 2), memory.operationCount());
+    backend.read_batch_delay_ms = 1;
+    const fresh = try log.refreshAndObserveCertified(m, state, authority, proof, true);
+    try std.testing.expectEqual(state.revision, fresh.recovery.state.revision);
+    try std.testing.expectEqual(backend.time.wall_ms - 1, fresh.proof.anchor.wall_ms);
+}
+
+test "immutable log bounded cold observation follows the checkpoint chain without ownership writes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var base = memory.client();
+    try base.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory };
+    var table: Client.VTable = undefined;
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "cold", .owner = @splat(1), .io = std.testing.io };
+    const authority = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const initial = (try log.recover(m, null, true)).state;
+    memory.resetOperationCount();
+    const empty = try log.observeFromCheckpointCertified(m, authority);
+    try std.testing.expectEqual(@as(u64, 2), memory.operationCount());
+    try std.testing.expectEqual(initial.revision, empty.recovery.state.revision);
+    var state = initial;
+    for (0..63) |_| state = try log.append(m, state, "committed");
+    var replacement = log;
+    replacement.owner = @splat(2);
+    state = try replacement.seal(m, state, replacement.owner);
+    state = try replacement.append(m, state, "new owner");
+    const partial = try log.observeFromCheckpointCertified(m, authority);
+    try std.testing.expect(partial.recovery.has_more);
+    try std.testing.expectEqual(@as(u64, 0), partial.recovery.state.next);
+    const observed = try log.observeCertified(m, partial.recovery.state, authority, partial.proof, true);
+    try std.testing.expect(!observed.recovery.has_more);
+    try std.testing.expectEqual(state.revision, observed.recovery.state.revision);
+    try std.testing.expectEqualStrings("new owner", observed.recovery.state.root);
+    try std.testing.expectEqual(state.owner, observed.recovery.state.owner);
+    try authority.check(log, observed.recovery.state, observed.proof);
 }

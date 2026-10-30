@@ -41,9 +41,9 @@ function rootMetrics(state){try{const root=JSON.parse(state?.root??'null');retur
 export const encode = value => JSON.stringify(value, (_, v) => v instanceof Uint8Array || v instanceof ArrayBuffer ? {__antfly_bytes: Array.from(new Uint8Array(v.buffer ?? v, v.byteOffset ?? 0, v.byteLength))} : v);
 const decode = value => JSON.parse(value, (_, v) => v && Object.keys(v).length === 1 && Array.isArray(v.__antfly_bytes) ? Uint8Array.from(v.__antfly_bytes) : v);
 export class R2CoordinatorStore {
-  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, inlineReadSet,transport,kernel,readKernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8,remoteCache=transport=>transport,proofBudget,rowBudgetBytes=512*1024} = {}) {
+  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, inlineReadSet,transport,kernel,readKernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8,remoteCache=transport=>transport,proofBudget,rowBudgetBytes=512*1024,readBatch=true} = {}) {
     if(!Number.isSafeInteger(rowBudgetBytes)||rowBudgetBytes<32768||rowBudgetBytes>512*1024)throw Error("InvalidCoordinatorRowBudget");this.rowBudgetBytes=rowBudgetBytes;
-    this.rootBackend="journal";this.rootCursor=null;this.journalProof=null;
+    this.rootBackend="journal";this.rootCursor=null;this.journalProof=null;this.readBatch=readBatch;
     this.module = module; this.bucket = bucket; this.namespace = namespace; this.prefix = prefix; this.clock = clock; this.onMetrics = onMetrics; this.background = background;
     this.kernel=kernel;this.boundRows=boundRows;this.checkpointCommits=checkpointCommits;this.recoveryWindow=recoveryWindow;
     const copyOwner=value=>{if(!Array.isArray(value)&&!(value instanceof Uint8Array)||value.length!==16||!Array.from(value).every(v=>Number.isInteger(v)&&v>=0&&v<=255))throw Error("InvalidCoordinatorOwner");return Array.from(value);};
@@ -66,7 +66,15 @@ export class R2CoordinatorStore {
     if(this.rootBackend!==backend){if(this.state||this.observedState||this.acquired||this.running||this.pending.length)throw Error("CoordinatorMigrationRequired");this.rootBackend=backend;this.rootCursor=null;this.journalProof=null;this.rootProofScope=Array.from(crypto.getRandomValues(new Uint8Array(16)));this.rootProofKey=Array.from(crypto.getRandomValues(new Uint8Array(32)));if(backend==="conditional")this.idleCheckpoint=null;}
     this.readLeasePolicy=descriptor.read_lease_policy;
   }
-  rootOptions(){return this.rootBackend!=="journal"?{root_backend:this.rootBackend,...(this.rootBackend==="conditional"?{root_cursor:this.rootCursor}:{journal_proof:this.journalProof}),root_proof_scope:this.rootProofScope,root_proof_key:this.rootProofKey}:{};}
+  // Scheduling hint only: native MAC, clocks, floor and slot checks remain
+  // mandatory. Refresh before preparation when an idle certificate cannot
+  // cover the likely storage round trips; never renew authority in JavaScript.
+  needsWriteRefresh(){
+    if(this.rootBackend!=="bounded_journal")return false;
+    const anchor=this.journalProof?.anchor,wall=this.clock(),mono=performance.now();
+    return !anchor||![anchor.wall_ms,anchor.mono_ms,wall,mono].every(Number.isFinite)||wall<anchor.wall_ms||mono<anchor.mono_ms||Math.max(wall-anchor.wall_ms,mono-anchor.mono_ms)>=25000;
+  }
+  rootOptions(){return this.rootBackend!=="journal"?{root_backend:this.rootBackend,...(this.rootBackend==="conditional"?{root_cursor:this.rootCursor}:{journal_proof:this.journalProof,journal_read_batch:this.readBatch}),root_proof_scope:this.rootProofScope,root_proof_key:this.rootProofKey}:{};}
   // Publish a captured, already committed recovery floor on the existing
   // observation pool. Foreground transactions never await this hint or share
   // its mutable accounting. Native authentication/CAS rejects stale owners and
@@ -165,7 +173,7 @@ export class R2CoordinatorStore {
   async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background,deadlineMs:outerDeadlineMs=Infinity,readKeys,readPrefix}={}){
     if(this.ownerReady)await this.ownerReady;
     if(this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");
-    const owned=this.acquired,captured=structuredClone(owned?this.state:(this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=Math.min(this.clock()+5000,outerDeadlineMs),started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false,capsuleMetrics={};
+    const owned=this.acquired,captured=structuredClone(owned?this.state:(this.rootBackend==="bounded_journal"||this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=Math.min(this.clock()+5000,outerDeadlineMs),started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false,capsuleMetrics={};
     const monotonicDeadline=started+Math.max(0,Math.min(5000,deadlineMs-this.clock()));
     let proofPermit,failure,finalization;
     const reserve=(operations,bytes)=>{if(usedOperations+operations>=254||usedBytes+bytes>=8*1024*1024){admissionBudgetExceeded=true;throw Error("ReadSnapshotNeedsAdmission");}usedOperations+=operations;usedBytes+=bytes;};
@@ -218,9 +226,10 @@ export class R2CoordinatorStore {
       for(let attempt=0;attempt<4;attempt++){
         observed=await native(state,readKeys?{action:"observe_read",observe_owned:owned,commands:readKeys.map(key=>({kind:"get",key})),read_prefix:readPrefix??null}:{action:owned?"observe":"observe_committed"});state=observed.state;
         if(!observed.has_more)break;
-        // A sealed epoch may lack START after a partial hint upload. An
-        // unowned observer cannot authenticate that continuation independently.
-        if(!owned&&state.next===0)throw Error("ReadSnapshotNeedsAdmission");
+        // A sealed epoch may lack START after a partial hint upload. A
+        // legacy unowned observer cannot authenticate that continuation independently.
+        // A bounded observer carries the native MAC and original deadline.
+        if(!owned&&this.rootBackend==="journal"&&state.next===0)throw Error("ReadSnapshotNeedsAdmission");
       }
       if(observed.has_more)throw Error("ReadSnapshotNeedsAdmission");
       if(readKeys){

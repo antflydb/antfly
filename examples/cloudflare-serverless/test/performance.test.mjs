@@ -944,3 +944,20 @@ test('typed provider wrappers retain resource causes and cannot make them replay
  for(const code of ['OutOfMemory','MemoryLimitExceeded','CPULimitExceeded','SQLITE_NOMEM']){const error=r2BindingFailure(Error(code+' (10001)'));assert.equal(resourceFailureCode(error),code);assert.equal(retryableRuntimeFailure(error),code==='SQLITE_NOMEM');}
  const cycle=Error('not a resource failure');cycle.cause=cycle;assert.equal(resourceFailureCode(cycle),null);
 });
+
+
+for(const mismatch of [false,true])test(`bounded cold metadata overlaps authority GET but verifies it before serving (mismatch=${mismatch})`,async()=>{
+ const{NativeReadViews}=await import('../native-read-views.mjs'),{openAuthority}=await import('../coordinator-authority.mjs'),{inlineReadSet}=await import('../read-view.mjs'),{RequestPool}=await import('../request-pool.mjs'),{instantiateHost}=await import('../../../zig/lib/objectstore/wasm/asyncify.mjs');
+ const bucket=new Bucket(),namespace='cold-authority-'+mismatch,keys=await metadataKeys(namespace),env={DATABASE:bucket,ANTFLY_INCARNATION:namespace,COORDINATOR_BACKEND:'r2',METADATA_ROOT_BACKEND:'bounded-journal'},authority=await openAuthority(env,'r2-bounded');
+ const writer=new R2CoordinatorStore(module,bucket,namespace,{inlineReadSet:inlineReadSet(namespace)});writer.configureAuthority(authority.descriptor);
+ await writer.transaction(tx=>{tx.put(keys.head,record('7'));tx.put(keys.wal,record('{"latest_lsn":1}'));tx.put(keys.floor,record('0'));});
+ if(mismatch)await bucket.put(authority.key,JSON.stringify({...authority.descriptor,storage_id:'wrong-storage'}));
+ let release,checkpoint;const held=new Promise(r=>release=r),observed=new Promise(r=>checkpoint=r),get=bucket.get.bind(bucket),writes=bucket.writes;
+ bucket.get=async(key,options)=>{if(key===authority.key)await held;if(key.endsWith('/CHECKPOINT'))checkpoint();return get(key,options);};
+ const small=await WebAssembly.compile(await readFile(new URL('../dist/antfly-serverless-observe.wasm',import.meta.url))),pool=new RequestPool(()=>instantiateHost(small,null),2,{reservationBytes:8*1024*1024,maxReservedBytes:16*1024*1024}),reader=new NativeReadViews(small,env,{kernel:pool,cohortDelayMs:0});
+ let completed=false;const opening=reader.open().finally(()=>{completed=true;});opening.catch(()=>{});
+ let timer;try{await Promise.race([observed,new Promise((_,reject)=>timer=setTimeout(()=>reject(Error('metadata observation did not overlap authority loading')),3000))]);assert.equal(completed,false);assert.equal(bucket.writes,writes);}finally{clearTimeout(timer);release();}
+ if(mismatch){await assert.rejects(opening,/CoordinatorAuthorityMismatch/);assert.equal(reader.store.observedState,null);assert.equal(reader.store.observedProof,null);}
+ else{assert.equal((await opening).version,'7');assert.equal(reader.store.acquired,false);assert.equal((await reader.open()).version,'7');}
+ assert.equal(bucket.writes,writes);
+});

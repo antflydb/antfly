@@ -49,8 +49,13 @@ fresh authentication. Every query retains native namespace, visibility,
 integrity and lease validation; expiry and new fences remain mandatory misses.
 The published cut must represent accepted state, never uncommitted preparation.
 
-New namespaces can select a transport-neutral conditional metadata root using existing opaque
-provider write revisions (R2/S3 ETags, GCS generations). A native authenticated
+The selected high-throughput R2/GCS design is the explicitly activated bounded
+immutable journal described below. Its short native certificates and persisted
+collector grace remove redundant fencing reads without overwriting a hot root
+for every commit. Existing namespaces retain their original protocol.
+
+The optional conditional-root comparison uses existing opaque provider write
+revisions (R2/S3 ETags, GCS generations). A native authenticated
 continuation binds namespace, owner, metadata root, semantic dependencies and
 its exact revision. All metadata changes and receipts publish through one
 conditional root replacement. Cold reconstruction reads that root directly.
@@ -301,3 +306,104 @@ All 1,144 artifacts in the eight earlier closures remain hash-valid. The cache
 collector was run and honored its active-native-build guard. Local test resource
 stacks were disposed; no new paid Cloudflare resources were created for this
 comparison.
+
+
+## Cold and idle admission without extra authority writes
+
+The next increment preserves the same immutable journal and thirty-second proof
+contract. Cold bounded observers read the current checkpoint and follow its exact
+next-slot chain to a fresh absence. They skip the redundant legacy seal-marker
+probe; a checkpoint root alone is never a completed data cut. This still follows
+ownership seals, validates every parent/revision, and preserves the bounded
+replay continuation and original proof deadline.
+
+A new `Client.getObjects` capability expresses independent bounded reads in the
+shared native object-store layer. It is deliberately not an atomic snapshot.
+Providers without the capability use ordinary serial `getObject` calls with
+their existing retry/cancellation behavior. The WASM implementation overlaps at
+most four children, accepts at most eight objects and 4 MiB of total declared
+response bodies, and joins every started child before returning failure. Native
+callers continue to validate typed contents and opaque provider revisions.
+
+Idle bounded-journal observation reads the fresh checkpoint floor and known next
+slot in that single native batch. Its clock anchor is captured before either
+read starts. A newer checkpoint floor forces normal recovery; delayed reads
+cannot renew an expired proof. The original request pays every physical GET and
+reserves the full bounded response allowance before I/O. Insufficient operation
+or transfer budgets reject the batch before starting children. Diagnostics retain
+each child's resource failure even when another child fails first. The explicit
+`NATIVE_METADATA_READ_BATCH=false` comparison keeps identical modules and proof
+semantics while selecting the serial path.
+
+App cold admission overlaps immutable authority-descriptor loading with GET-only
+native observation for explicitly configured bounded namespaces. It must verify
+the persisted mode, namespace, storage identity and lease policy before using
+rows, issuing a lease, or returning a view. Failure clears unverified observation
+state. No speculative authority or ownership writes are allowed. Existing modes
+retain their admission order. Idle writers use proof age only as a scheduling
+hint to refresh before expensive preparation; native authentication, clocks,
+checkpoint floor and competing-slot fencing remain mandatory.
+
+The latency driver now records the first four post-idle reads/writes separately,
+can wait a real thirty-one seconds, and can use the selected hosted configuration
+rather than enabling all experimental flags. Its namespace-first read sample is
+only four observations, is taken before injected binding delay, and is not a
+physical cold-isolate qualification. Warm p95 and these small first-use samples
+must not be combined into a cold-start SLO claim.
+
+
+Regression validation for this increment passes 436 Node tests, 41 actual-workerd
+tests, the separate mail workerd integration, and 180 shared native object-store
+tests (two live-provider tests skipped). The added cold tests hold authority
+loading while native observation starts, then verify both successful admission
+and storage-identity mismatch rejection with no writes. Native replay tests stop
+exactly at an ownership seal, preserve the authenticated zero-slot continuation,
+and follow the remaining committed frame before returning a completed cut.
+
+
+### Same-module idle and leased-read comparisons
+
+All four reports below use native module SHA-256
+`2f2ac2ba34bf5b0e4e2fa8cd1b99dcd23d28a1459da9f076d5fef08952047129`,
+the hosted configuration, four tenants of 512 documents, unchanged memory
+limits, 20 ms injected binding delay, 128 reads and 64 writes per case.
+
+The real 31-second-idle comparison uses **no completed-view reuse**. Post-idle
+read medians decrease in both orders, but the first-use population is only four
+per case and does not establish a tail SLO:
+
+| Order | Path | First four read p50 / p95 | Warm read p95 | Write p95 |
+| --- | --- | ---: | ---: | ---: |
+| Forward | Serial | 58.54 / 66.78 ms | 38.38 ms | 231.81 ms |
+| Forward | Batched | 45.30 / 67.39 ms | 42.81 ms | 205.09 ms |
+| Reverse | Batched | 48.95 / 69.63 ms | 41.69 ms | 211.91 ms |
+| Reverse | Serial | 65.98 / 75.23 ms | 43.51 ms | 223.97 ms |
+
+Both paths perform 200 physical GETs. Batching reduces dependency depth, not
+object count. Warm results and first-write outliers vary with host load; there
+is no claim of a consistent all-metric latency win. The deterministic native
+host test independently proves two concurrent GETs versus two serial GETs,
+original-budget accounting, and rejection before I/O for insufficient budgets.
+Reports: `worker-latency-1793334909963.json` and
+`worker-latency-1793335028258.json` in `dist/qualification/latency-lab/`.
+
+A separate no-idle comparison enables the existing validated cut reuse while
+retaining the required visibility fence and original thirty-second lifetime:
+
+| Order | Fresh admission read p95 | Leased admission read p95 | GETs fresh / leased |
+| --- | ---: | ---: | ---: |
+| Forward | 38.07 ms | 31.61 ms | 196 / 72 |
+| Reverse | 39.27 ms | 29.32 ms | 196 / 72 |
+
+This lowers read p95 17–25% and GETs 63.3% on this burst population. Write results
+vary in direction and do not demonstrate an effect from read-cut reuse. One
+forward leased read reaches 234.79 ms; the original report retains that outlier.
+Reports: `worker-latency-1793335175129.json` and
+`worker-latency-1793335240828.json`. These reports explicitly distinguish reused
+cuts from fresh admission. No older report is relabeled as a leased experiment.
+
+Remaining body fetches, native execution and cold admission still matter. The
+hosted workload's thirty-second rounds and advancing fences cannot be repaired
+by extending a stale lease; fresh admission must remain cheap. These local
+samples do not establish a fourfold improvement, provider placement latency,
+physical cold-isolate qualification, or complete provider diagnostics.

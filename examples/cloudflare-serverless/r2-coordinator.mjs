@@ -56,7 +56,7 @@ export class R2CommitCoordinator extends DurableObject {
     if(env.ANTFLY_TENANTS){const binding=env.COMMITS;env=tenantEnvs(env).find(candidate=>binding.idFromName(candidate.ANTFLY_INCARNATION).equals(ctx.id));if(!env)throw new Error("UnknownTenant");}
     this.env = env;
     const instanceId=crypto.randomUUID(),owner=actorOwner(ctx.id.toString(),env.WORKER_VERSION?.id,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION);
-    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{owner,inlineReadSet:env.INLINE_METADATA_ROOTS==="true"?inlineReadSet(env.ANTFLY_INCARNATION):undefined,remoteCache:edgeCacheForEnv(env,{background:promise=>ctx.waitUntil(promise)}),kernel:metadataKernel,readKernel:readObservationKernel(),cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics(),actor_instance_id:instanceId}));}});
+    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{readBatch:env.NATIVE_METADATA_READ_BATCH!=="false",owner,inlineReadSet:env.INLINE_METADATA_ROOTS==="true"?inlineReadSet(env.ANTFLY_INCARNATION):undefined,remoteCache:edgeCacheForEnv(env,{background:promise=>ctx.waitUntil(promise)}),kernel:metadataKernel,readKernel:readObservationKernel(),cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics(),actor_instance_id:instanceId}));}});
     this.serviceStore = Object.create(this.store);
     this.serviceStore.transaction = run => this.transaction(run);
     this.maintenanceStore=Object.create(this.store);this.maintenanceStore.transaction=run=>this.transaction(run,{priority:"maintenance"});
@@ -310,7 +310,7 @@ export class R2CommitCoordinator extends DurableObject {
     if(!isObjectStoreAuthority(this.authority.descriptor.mode))throw Error("CoordinatorMigrationRequired");
     const ioBudget={operations:0,bytes:0},physical={};
     const refresh=()=>trace.span("write_refresh",()=>this.transaction(async()=>{},{deadlineMs:deadline,traceId:trace.id,ioBudget}));
-    if(!this.store.state||this.store.recovering)await refresh();
+    if(!this.store.state||this.store.recovering||this.store.needsWriteRefresh())await refresh();
     const transport=this.store.dataCache.wrap(edgeCacheForEnv(this.env,{background:promise=>this.ctx.waitUntil(promise),budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical)),this.env.ANTFLY_INCARNATION,{preserveProtected:this.env.FOREGROUND_CACHE_POLICY==="true"});
     for(let attempt=0;attempt<3;attempt++){
       if(Date.now()>=deadline)throw Error("DeadlineExceeded");

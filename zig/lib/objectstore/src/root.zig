@@ -41,6 +41,7 @@ pub const PutOptions = types.PutOptions;
 pub const PutObjectRequest = types.PutObjectRequest;
 pub const BucketOptions = types.BucketOptions;
 pub const GetOptions = types.GetOptions;
+pub const GetObjectRequest = types.GetObjectRequest;
 pub const StatOptions = types.StatOptions;
 pub const CancellationToken = types.CancellationToken;
 pub const DeleteOptions = types.DeleteOptions;

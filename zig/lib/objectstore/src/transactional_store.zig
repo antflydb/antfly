@@ -36,6 +36,7 @@ pub const Request = struct {
     root_backend: RootBackend = .journal,
     root_cursor: ?conditional.Cursor = null,
     journal_proof: ?journal.WriteProof = null,
+    journal_read_batch: bool = true,
     root_proof_scope: [16]u8 = @splat(0),
     root_proof_key: ?[32]u8 = null,
     action: enum { begin, observe, observe_committed, observe_read, read, commit, commit_wal, checkpoint, trace, retire_logs },
@@ -304,7 +305,7 @@ pub const Context = struct {
         const base = try std.fmt.allocPrint(m, "{s}/{s}/{s}", .{ self.prefix, if (req.root_backend == .conditional) "coord-v2" else "coord-v1", std.fmt.bytesToHex(digest, .lower) });
         const domain = Pages.domainForNamespace(base);
         const journal_log = journal.Log{ .client = self.client, .bucket = self.bucket, .prefix = base, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .checkpoint_commits = req.checkpoint_commits };
-        var log = authority.Authority{ .log = journal_log, .cursor = req.root_cursor, .journal_proof = req.journal_proof, .journal_auth = if (req.root_backend == .bounded_journal and req.root_proof_key != null) journal.ProofAuthority{ .key = req.root_proof_key.?, .scope = req.root_proof_scope } else null, .root = if (req.root_backend == .conditional) conditional.Context{ .client = self.client, .bucket = self.bucket, .prefix = base, .namespace = self.namespace, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .proofs = &conditional_proofs, .proof_scope = req.root_proof_scope, .proof_key = req.root_proof_key } else null };
+        var log = authority.Authority{ .log = journal_log, .cursor = req.root_cursor, .journal_proof = req.journal_proof, .journal_read_batch = req.journal_read_batch, .journal_auth = if (req.root_backend == .bounded_journal and req.root_proof_key != null) journal.ProofAuthority{ .key = req.root_proof_key.?, .scope = req.root_proof_scope } else null, .root = if (req.root_backend == .conditional) conditional.Context{ .client = self.client, .bucket = self.bucket, .prefix = base, .namespace = self.namespace, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .proofs = &conditional_proofs, .proof_scope = req.root_proof_scope, .proof_key = req.root_proof_key } else null };
         if (req.root_backend == .bounded_journal and req.action != .read and log.journal_auth == null) return error.ImmutableLogProofRequired;
         const observing = req.action == .begin or req.action == .observe or req.action == .observe_committed or req.action == .observe_read;
         const observed = if (observing) blk: {

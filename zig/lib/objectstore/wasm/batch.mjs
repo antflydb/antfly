@@ -50,3 +50,38 @@ export async function executePutBatch(transport, request, body, check = () => {}
   check();
   return {json: {results}};
 }
+
+// Independent bounded reads. The native caller anchors any authority proof
+// BEFORE suspending; this host only overlaps transport and preserves ordering.
+export function validateGetBatch(request,bodyLength=0){
+ if(bodyLength!==0||!Array.isArray(request.items)||request.items.length<1||request.items.length>8)throw new ObjectStoreError(3,'invalid read batch');
+ let total=0;
+ for(const item of request.items){
+  if(typeof item.key!=='string'||!item.key.length||item.key.length>4096||!Number.isSafeInteger(item.max_response_bytes)||item.max_response_bytes<1||item.max_response_bytes>4*1024*1024||item.if_match_etag!=null&&typeof item.if_match_etag!=='string')throw new ObjectStoreError(3,'invalid read batch item');
+  total+=item.max_response_bytes;if(total>4*1024*1024)throw new ObjectStoreError(3,'read batch exceeds retained input budget');
+ }
+ return request.items.length;
+}
+export async function executeGetBatch(transport,request,check=()=>{},concurrency=4,onError=()=>{}){
+ validateGetBatch(request);
+ if(!Number.isInteger(concurrency)||concurrency<1||concurrency>4)throw new ObjectStoreError(3,'invalid read concurrency');
+ const results=Array(request.items.length);let next=0,failure;
+ async function read(){
+  while(!failure&&next<request.items.length){
+   const index=next++,item=request.items[index];
+   try{
+    check();const value=await transport({...item,op:'get',bucket:request.bucket},new Uint8Array());
+    if(!(value.body instanceof Uint8Array)||value.body.byteLength>item.max_response_bytes||new TextEncoder().encode(JSON.stringify(value.json??{})).byteLength>4096)throw new ObjectStoreError(4,'read batch response exceeds budget');
+    results[index]=value;
+   }catch(error){if(error instanceof ObjectStoreError&&error.status===1)results[index]=null;else{try{onError(error);}catch{}failure??=error instanceof Error?error:new Error(String(error));}}
+  }
+ }
+ await Promise.all(Array.from({length:Math.min(concurrency,request.items.length)},read));
+ if(failure)throw failure;check();
+ const total=results.reduce((n,value)=>n+(value?.body.byteLength??0),0),body=new Uint8Array(total);let offset=0;
+ const headers=results.map(value=>{
+  if(value===null)return{missing:true,offset,length:0,metadata:null};
+  const result={missing:false,offset,length:value.body.byteLength,metadata:value.json};body.set(value.body,offset);offset+=value.body.byteLength;return result;
+ });
+ return{json:{results:headers},body};
+}

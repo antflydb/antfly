@@ -26,6 +26,7 @@ pub const Authority = struct {
     cursor: ?conditional.Cursor = null,
     journal_auth: ?journal.ProofAuthority = null,
     journal_proof: ?journal.WriteProof = null,
+    journal_read_batch: bool = true,
     fn acceptJournal(self: *Authority, result: journal.CertifiedRecovery) journal.Recovery {
         self.journal_proof = result.proof;
         return result.recovery;
@@ -35,14 +36,25 @@ pub const Authority = struct {
         self.journal_proof = try auth.issue(self.log, result.state, anchor);
         return result;
     }
+    fn refreshObserved(self: *Authority, a: A, state: journal.State, auth: journal.ProofAuthority, proof: journal.WriteProof, follow_owners: bool) !journal.CertifiedRecovery {
+        if (self.journal_read_batch) return self.log.refreshAndObserveCertified(a, state, auth, proof, follow_owners);
+        const refreshed = try self.log.refreshCertificate(a, state, auth, proof);
+        return self.log.observeCertified(a, state, auth, refreshed, follow_owners);
+    }
     fn observedJournal(self: *Authority, a: A, state: ?journal.State, takeover: bool, follow_owners: bool, read_only: bool) !journal.Recovery {
         const auth = self.journal_auth orelse return if (follow_owners) self.log.observeCommitted(a, state) else if (read_only) self.log.observe(a, state.?) else self.log.recover(a, state, takeover);
         const anchor = auth.now();
+        if (state == null and follow_owners) {
+            if (self.log.observeFromCheckpointCertified(a, auth)) |cold| return self.acceptJournal(cold) else |failure| switch (failure) {
+                error.ImmutableLogProofRequiresRecovery => {},
+                else => return failure,
+            }
+        }
         if (!takeover and state != null and (follow_owners or read_only or state.?.next < journal.Log.epoch_commits)) {
             if (self.journal_proof) |proof| {
                 if (self.log.observeCertified(a, state.?, auth, proof, follow_owners)) |value| return self.acceptJournal(value) else |err| switch (err) {
                     error.ImmutableLogProofExpired => {
-                        if (self.log.refreshCertificate(a, state.?, auth, proof)) |refreshed| return self.acceptJournal(try self.log.observeCertified(a, state.?, auth, refreshed, follow_owners)) else |failure| switch (failure) {
+                        if (self.refreshObserved(a, state.?, auth, proof, follow_owners)) |refreshed| return self.acceptJournal(refreshed) else |failure| switch (failure) {
                             error.ImmutableLogProofRequiresRecovery => {},
                             else => return failure,
                         }

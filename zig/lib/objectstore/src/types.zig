@@ -281,6 +281,9 @@ pub const PutObjectRequest = struct {
     options: PutOptions = .{},
 };
 
+/// Independent reads; missing objects are returned as null entries.
+pub const GetObjectRequest = struct { key: []const u8, options: GetOptions = .{} };
+
 pub const PutResult = struct {
     etag: ?[]u8 = null,
     version_id: ?[]u8 = null,

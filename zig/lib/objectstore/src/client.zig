@@ -55,6 +55,7 @@ pub const Client = struct {
         get_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!void = null,
         get_file_with_options: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8, types.GetOptions) anyerror!void = null,
         get_prefix: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!usize = null,
+        get_objects: ?*const fn (*anyopaque, Allocator, []const u8, []const types.GetObjectRequest) anyerror![]?types.GetResult = null,
         get_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, types.GetOptions) anyerror!types.GetResult,
         get_object_attributes: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!types.ObjectAttributes,
         stat_object: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!types.ObjectMetadata,
@@ -232,6 +233,38 @@ pub const Client = struct {
             if (opts.cancellation) |token| try token.check();
             return result;
         }
+    }
+
+    /// No cross-object atomicity. Every started read settles before an error;
+    /// callers own all returned bodies and metadata. Providers without a batch
+    /// capability preserve the normal getObject retry/cancellation semantics.
+    pub fn getObjects(self: *Client, bucket: []const u8, items: []const types.GetObjectRequest) ![]?types.GetResult {
+        if (items.len == 0 or items.len > 8) return error.InvalidObjectBatch;
+        for (items) |item| if (item.options.cancellation) |token| try token.check();
+        if (self.vtable.get_objects) |call| {
+            const results = try call(self.ptr, self.allocator, bucket, items);
+            errdefer {
+                for (results) |*result| if (result.*) |*value| value.deinit(self.allocator);
+                self.allocator.free(results);
+            }
+            if (results.len != items.len) return error.InvalidObjectBatch;
+            for (items) |item| if (item.options.cancellation) |token| try token.check();
+            return results;
+        }
+        const results = try self.allocator.alloc(?types.GetResult, items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |*result| if (result.*) |*value| value.deinit(self.allocator);
+            self.allocator.free(results);
+        }
+        for (items, results) |item, *result| {
+            result.* = self.getObject(bucket, item.key, item.options) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            initialized += 1;
+        }
+        return results;
     }
 
     pub fn getFile(self: *Client, bucket: []const u8, key: []const u8, dest_path: []const u8, opts: types.GetOptions) !void {
@@ -566,4 +599,29 @@ test "revision conditional publication is atomic and unsupported generation neve
     var unchanged = try client.getObject("db", "HEAD", .{});
     defer unchanged.deinit(a);
     try std.testing.expectEqualStrings("two", unchanged.body);
+}
+
+test "object read batches preserve misses and release every allocation on fallback failure" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            var memory = @import("memory.zig").MemoryClient.init(std.testing.allocator);
+            defer memory.deinit();
+            var base = memory.client();
+            try base.makeBucket("db");
+            var stored = try base.putObject("db", "one", "first", .{});
+            stored.deinit(std.testing.allocator);
+            stored = try base.putObject("db", "two", "second", .{});
+            stored.deinit(std.testing.allocator);
+            base.allocator = a;
+            const results = try base.getObjects("db", &.{ .{ .key = "one" }, .{ .key = "missing" }, .{ .key = "two" } });
+            defer {
+                for (results) |*result| if (result.*) |*value| value.deinit(a);
+                a.free(results);
+            }
+            try std.testing.expectEqualStrings("first", results[0].?.body);
+            try std.testing.expectEqual(null, results[1]);
+            try std.testing.expectEqualStrings("second", results[2].?.body);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

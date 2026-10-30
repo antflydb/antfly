@@ -16,7 +16,7 @@
 // A single suspended stack per instance. I/O completes exactly once; rewind
 // restores the original computation instead of re-executing writes or queries.
 import { ObjectStoreError } from "./r2.mjs";
-import { validatePutBatch, executePutBatch } from "./batch.mjs";
+import { validatePutBatch, executePutBatch, validateGetBatch, executeGetBatch } from "./batch.mjs";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 export async function instantiateHost(module, transport, { batchConcurrency = 4, stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, onMetrics = () => {}, clock = Date.now, refreshClock = (delayMs = 0) => new Promise(resolve => setTimeout(resolve, delayMs)) } = {}) {
@@ -52,10 +52,12 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
       if (clock() >= activeOptions.deadlineMs) return 9;
       const request = JSON.parse(decoder.decode(bytes(ptr, len)));
       const batch = objectOperation && request.op === "put_many";
+      const readBatch = objectOperation && request.op === "get_many";
       let count = 1;
-      if (batch) { try { count = validatePutBatch(request, bodyLen); } catch { return 3; } }
+      if (batch||readBatch) { try { count = readBatch?validateGetBatch(request,bodyLen):validatePutBatch(request, bodyLen); } catch { return 3; } }
       operations += count;
-      if (operations > activeOptions.maxOperations || bodyLen + len > activeOptions.maxTransferBytes - transferred) return 8;
+      const responseReservation=readBatch?request.items.reduce((n,item)=>n+item.max_response_bytes+4096+128,128):0;
+      if (operations > activeOptions.maxOperations || bodyLen + len + responseReservation > activeOptions.maxTransferBytes - transferred) return 8;
       transferred += bodyLen + len;
       // The WASM memory may grow while preparing a completion. Do not retain
       // views across the async boundary, including upload bodies.
@@ -65,9 +67,11 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
         if (options.signal?.aborted) throw new ObjectStoreError(5, "canceled upload batch");
         if (clock() >= options.deadlineMs) throw new ObjectStoreError(9, "upload batch deadline");
       };
-      pending = Promise.resolve().then(() => batch ? executePutBatch(handler, request, body, check, batchConcurrency) : handler(request, body)).then(
+      let childErrorReported=false;
+      const reportChildError=error=>{if(!(error instanceof ObjectStoreError)||error.status>=6){childErrorReported=true;onTransportError(error,"get");}};
+      pending = Promise.resolve().then(() => batch ? executePutBatch(handler, request, body, check, batchConcurrency) : readBatch ? executeGetBatch(handler,request,check,batchConcurrency,reportChildError) : handler(request, body)).then(
         value => ({ status: 0, value }),
-        error => { if (!(error instanceof ObjectStoreError) || error.status >= 6) onTransportError(error, request.op); return { status: error instanceof ObjectStoreError ? error.status : /10058/.test(String(error)) ? 6 : 7, value: {} }; },
+        error => { if (!childErrorReported && (!(error instanceof ObjectStoreError) || error.status >= 6)) onTransportError(error, request.op); return { status: error instanceof ObjectStoreError ? error.status : /10058/.test(String(error)) ? 6 : 7, value: {} }; },
       );
       wasm.asyncify_start_unwind(stackDescriptor);
       return 0;

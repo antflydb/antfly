@@ -162,6 +162,48 @@ pub const Host = struct {
         } else try a.dupe(u8, response.body);
         return .{ .body = body, .metadata = metadata, .conditional_etag_verified = opts.if_match_etag != null };
     }
+    fn getMany(raw: *anyopaque, a: A, bucket: []const u8, items: []const types.GetObjectRequest) ![]?types.GetResult {
+        if (items.len == 0 or items.len > 8) return error.InvalidObjectBatch;
+        const Header = struct { key: []const u8, range: ?types.ByteRange, if_match_etag: ?[]const u8, max_response_bytes: usize };
+        var headers: [8]Header = undefined;
+        var budget: usize = 0;
+        for (items, headers[0..items.len]) |item, *header| {
+            if (item.options.version_id != null or item.options.part_number != null) return error.ObjectOperationUnsupported;
+            const maximum = item.options.max_response_bytes orelse return error.InvalidObjectBatch;
+            if (maximum == 0 or maximum > 4 * 1024 * 1024 or budget > 4 * 1024 * 1024 - maximum) return error.InvalidObjectBatch;
+            budget += maximum;
+            header.* = .{ .key = item.key, .range = item.options.range, .if_match_etag = item.options.if_match_etag, .max_response_bytes = maximum };
+        }
+        var response = try owner(raw).call(.{ .op = "get_many", .bucket = bucket, .items = headers[0..items.len] }, "");
+        defer response.deinit();
+        const parsed = try response.parse(struct { results: []const struct { missing: bool, offset: usize, length: usize, metadata: ?types.ObjectMetadata } });
+        defer parsed.deinit();
+        if (parsed.value.results.len != items.len or response.body.len > budget) return error.InvalidObjectBatch;
+        const results = try a.alloc(?types.GetResult, items.len);
+        var initialized: usize = 0;
+        var offset: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |*result| if (result.*) |*value| value.deinit(a);
+            a.free(results);
+        }
+        for (parsed.value.results, items, results) |header, item, *result| {
+            if (header.offset != offset or header.length > response.body.len - offset or header.length > item.options.max_response_bytes.?) return error.InvalidObjectBatch;
+            if (header.missing) {
+                if (header.length != 0 or header.metadata != null) return error.InvalidObjectBatch;
+                result.* = null;
+            } else {
+                const captured = header.metadata orelse return error.InvalidObjectBatch;
+                if (!std.mem.eql(u8, captured.bucket, bucket) or !std.mem.eql(u8, captured.key, item.key)) return error.InvalidObjectBatch;
+                const body = try a.dupe(u8, response.body[offset..][0..header.length]);
+                errdefer a.free(body);
+                result.* = .{ .body = body, .metadata = try cloneMetadata(a, captured), .conditional_etag_verified = item.options.if_match_etag != null };
+            }
+            offset += header.length;
+            initialized += 1;
+        }
+        if (offset != response.body.len) return error.InvalidObjectBatch;
+        return results;
+    }
     fn stat(raw: *anyopaque, a: A, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
         var response = try owner(raw).call(.{ .op = "head", .bucket = bucket, .key = key }, "");
         defer response.deinit();
@@ -245,6 +287,7 @@ pub const Host = struct {
         .put_object = put,
         .put_objects = putMany,
         .get_object = get,
+        .get_objects = getMany,
         .stat_object = stat,
         .stat_object_with_options = statWithOptions,
         .get_object_attributes = attributes,

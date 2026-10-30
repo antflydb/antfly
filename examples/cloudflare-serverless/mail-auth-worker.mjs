@@ -44,6 +44,7 @@ export class MailAuth extends DurableObject {
       throw Error("AuthConfigurationRequired");
     const nativeStore = new R2CoordinatorStore(module, env.AUTH_DATA, env.AUTH_STORAGE_ID, {
         kernel,
+        readBatch: env.NATIVE_METADATA_READ_BATCH !== "false",
         owner: actorOwner(ctx.id.toString(), env.WORKER_VERSION?.id, env.AUTH_STORAGE_ID),
       }),
       authority = new AuthorityAdmission(() =>
