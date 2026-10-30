@@ -344,8 +344,9 @@ pub const q4_k_tile = [_]Wrapper{
 
 // ---------------------------------------------------------------- text variants
 
-/// Renders `src` for one variant. A line starting with `?flag ` is kept
-/// only when the bool field `flag` of `vars` is true (`?!flag ` when false);
+/// Renders `src` for one variant. A line starting with `?flag ` (or a bare
+/// `?flag`, an empty line) is kept only when the bool field `flag` of
+/// `vars` is true (`?!flag` when false), without the prefix and one space;
 /// `$(name)` is replaced by the string field `name`.
 pub fn fill(comptime src: []const u8, vars: anytype) []const u8 {
     comptime {
@@ -355,11 +356,11 @@ pub fn fill(comptime src: []const u8, vars: anytype) []const u8 {
         while (lines.next()) |raw| {
             var line = raw;
             if (line.len > 0 and line[0] == '?') {
-                const sp = std.mem.indexOfScalar(u8, line, ' ').?;
+                const sp = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
                 const neg = line[1] == '!';
                 const flag = line[(if (neg) 2 else 1)..sp];
                 if (@field(vars, flag) == neg) continue;
-                line = line[sp + 1 ..];
+                line = line[@min(sp + 1, line.len)..];
             }
             var i: usize = 0;
             while (std.mem.indexOfPos(u8, line, i, "$(")) |a| {
@@ -828,4 +829,354 @@ pub const argmax_stage1 = fillAll(argmax_stage1_src, .{
     argmaxStage1("q4_k", "256", q4_k_cols4_loop, false),
     argmaxStage1("q8_0", "32", q8_0_cols4_loop, true),
     argmaxStage1("q4_k", "256", q4_k_cols4_loop, true),
+});
+
+// ---------------------------------------------------------------- Q4_0 cols4 warps
+
+/// Four Q4_0 columns per block, block-strided over the input row, then a
+/// warp sum over `warps` warps; the input is `input` or `act(gate) * up`.
+/// The `slice` epilogue multiplies `act(y)` into a column slice of `source`.
+const q4_0_cols4_src =
+    \\extern "C" __global__ void $(name)(
+    \\$(sig)) {
+    \\    unsigned int col_tile = blockIdx.x * 4u;
+    \\    unsigned int row = blockIdx.y;
+    \\    if (row >= rows) return;
+    \\    unsigned int tid = threadIdx.x;
+    \\    unsigned int lane = tid & 31u;
+    \\    unsigned int warp = tid >> 5;
+    \\    unsigned int row_blocks = in_dim / 32u;
+    \\    __shared__ float warp_partial[4][$(warps)];
+    \\    float acc[4];
+    \\    #pragma unroll
+    \\    for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
+    \\
+    \\    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
+    \\?!gated         float x = input[row * in_dim + i];
+    \\?gated         unsigned int input_idx = row * in_dim + i;
+    \\?gated         float x = termite_decoder_activation_f32(gate[input_idx], activation) * up[input_idx];
+    \\        unsigned int block = i / 32u;
+    \\        unsigned int lane = i - block * 32u;
+    \\        unsigned int q_offset = 2u + (lane & 15u);
+    \\        unsigned int high_nibble = lane >> 4u;
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0; c < 4u; ++c) {
+    \\            unsigned int col = col_tile + c;
+    \\            if (col < out_dim) {
+    \\                const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
+    \\                acc[c] += x * termite_q4_0_value_nibble(bp, q_offset, high_nibble);
+    \\            }
+    \\        }
+    \\    }
+    \\?!slice     termite_store_q4_0_cols_warp_sum_warps<4u, 4u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
+    \\?slice
+    \\?slice     #pragma unroll
+    \\?slice     for (unsigned int c = 0; c < 4u; ++c) {
+    \\?slice         float sum = termite_warp_reduce_sum(acc[c]);
+    \\?slice         if (lane == 0u$(warp_guard)) warp_partial[c][warp] = sum;
+    \\?slice     }
+    \\?slice     __syncthreads();
+    \\?slice     if (tid == 0u) {
+    \\?slice         #pragma unroll
+    \\?slice         for (unsigned int c = 0; c < 4u; ++c) {
+    \\?slice             unsigned int col = col_tile + c;
+    \\?slice             if (col < out_dim) {
+    \\?slice                 float y = 0.0f;
+    \\?slice                 #pragma unroll
+    \\?slice                 for (unsigned int w = 0; w < $(warps)u; ++w) y += warp_partial[c][w];
+    \\?slice                 dst[row * out_dim + col] =
+    \\?slice                     termite_decoder_activation_f32(y, activation) *
+    \\?slice                     source[row * source_cols + source_start + col];
+    \\?slice             }
+    \\?slice         }
+    \\?slice     }
+    \\}
+    \\
+;
+
+const slice_sig = [_][]const u8{ dst, input, weight, "const float* source" } ++ shape ++
+    .{ "unsigned int source_cols", "unsigned int source_start", "unsigned int activation" };
+
+pub const q4_0_cols4 = fillAll(q4_0_cols4_src, .{
+    .{ .name = "termite_linear_q4_0_f32_tile4_w4", .sig = sigText(&linear_sig), .warps = "4", .gated = false, .slice = false },
+    .{ .name = "termite_linear_q4_0_activation_slice_last_dim_f32_tile4", .sig = sigText(&slice_sig), .warps = "8", .gated = false, .slice = true, .warp_guard = "" },
+    .{ .name = "termite_linear_q4_0_activation_slice_last_dim_f32_tile4_w4", .sig = sigText(&slice_sig), .warps = "4", .gated = false, .slice = true, .warp_guard = " && warp < 4u" },
+    .{ .name = "termite_linear_q4_0_gated_down_f32_tile4_w4", .sig = sigText(&gated_down_sig), .warps = "4", .gated = true, .slice = false },
+});
+
+// ---------------------------------------------------------------- Q8_1 activations
+
+/// Rows of f32 (or `act(gate) * up`) quantized to Q8_1 blocks, one warp
+/// per 32-value block.
+const quantize_q8_1_src =
+    \\extern "C" __global__ void $(name)(
+    \\$(sig)) {
+    \\    unsigned int tid = threadIdx.x;
+    \\    unsigned int lane = tid & 31u;
+    \\    unsigned int warp = tid >> 5;
+    \\    unsigned int warps_per_block = blockDim.x >> 5;
+    \\    unsigned int row_blocks = in_dim / 32u;
+    \\    unsigned int q8_block = blockIdx.x * warps_per_block + warp;
+    \\    unsigned int total_blocks = rows * row_blocks;
+    \\    if (q8_block >= total_blocks) return;
+    \\
+    \\    unsigned int row = q8_block / row_blocks;
+    \\    unsigned int block = q8_block - row * row_blocks;
+    \\?!gated     float x = input[row * in_dim + block * 32u + lane];
+    \\?gated     unsigned int index = row * in_dim + block * 32u + lane;
+    \\?gated     float x = termite_decoder_activation_f32(gate[index], activation) * up[index];
+    \\    float amax = termite_warp_reduce_max_f32(fabsf(x));
+    \\    float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+    \\    int q = 0;
+    \\    if (d > 0.0f) {
+    \\        q = __float2int_rn(x / d);
+    \\        q = max(-127, min(127, q));
+    \\    }
+    \\    unsigned char* bp = dst + q8_block * 36u;
+    \\    bp[4u + lane] = (unsigned char)(signed char)q;
+    \\    if (lane == 0u) {
+    \\        termite_store_half_bytes(bp, d);
+    \\        bp[2u] = 0u;
+    \\        bp[3u] = 0u;
+    \\    }
+    \\}
+    \\
+;
+
+pub const quantize_q8_1 = fillAll(quantize_q8_1_src, .{
+    .{ .name = "termite_quantize_f32_q8_1_rows", .sig = sigText(&.{ "unsigned char* dst", input, rows, in_dim }), .gated = false },
+    .{ .name = "termite_quantize_gated_f32_q8_1_rows", .sig = sigText(&.{ "unsigned char* dst", "const float* gate", "const float* up", rows, in_dim, "unsigned int activation" }), .gated = true },
+});
+
+/// `act(gate) * up` of two Q4_0 projections of one Q8_1 row, 4 columns per
+/// block, `warps` warps.
+const pair_act_q8_1_src =
+    \\extern "C" __global__ void $(name)(
+    \\$(sig)) {
+    \\    const unsigned int cols = 4u;
+    \\    unsigned int tiles = (out_dim + cols - 1u) / cols;
+    \\    unsigned int global = blockIdx.x;
+    \\    unsigned int row = global / tiles;
+    \\    if (row >= rows) return;
+    \\    unsigned int col_tile = (global - row * tiles) * cols;
+    \\    unsigned int tid = threadIdx.x;
+    \\    unsigned int lane = tid & 31u;
+    \\    unsigned int warp = tid >> 5;
+    \\    unsigned int row_blocks = in_dim / 32u;
+    \\?early     bool full_tile = col_tile + 3u < out_dim;
+    \\    __shared__ float gate_partial[4][$(warps)];
+    \\    __shared__ float up_partial[4][$(warps)];
+    \\    float gate_acc[4];
+    \\    float up_acc[4];
+    \\?!early     bool full_tile = col_tile + 3u < out_dim;
+    \\    #pragma unroll
+    \\    for (unsigned int c = 0; c < 4u; ++c) {
+    \\        gate_acc[c] = 0.0f;
+    \\        up_acc[c] = 0.0f;
+    \\    }
+    \\
+    \\    unsigned int iqs = (tid & 1u) * 2u;
+    \\    for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
+    \\        const unsigned char* q8_bp = q8_input + (row * row_blocks + block) * 36u;
+    \\        unsigned short q8_d_h = (unsigned short)q8_bp[0] | ((unsigned short)q8_bp[1] << 8);
+    \\        float q8_d = termite_half_to_float(q8_d_h);
+    \\        const signed char* q8_values = (const signed char*)(q8_bp + 4u);
+    \\        unsigned int q8_base0 = iqs * 4u;
+    \\        unsigned int q8_base1 = q8_base0 + 4u;
+    \\        int q8_low0 = termite_load_i8x4_aligned(q8_values + q8_base0);
+    \\        int q8_high0 = termite_load_i8x4_aligned(q8_values + q8_base0 + 16u);
+    \\        int q8_low1 = termite_load_i8x4_aligned(q8_values + q8_base1);
+    \\        int q8_high1 = termite_load_i8x4_aligned(q8_values + q8_base1 + 16u);
+    \\
+    \\        if (full_tile) {
+    \\            #pragma unroll
+    \\            for (unsigned int c = 0u; c < 4u; ++c) {
+    \\                unsigned int col = col_tile + c;
+    \\                const unsigned char* gate_bp = weight_gate + (col * row_blocks + block) * 18u;
+    \\                const unsigned char* up_bp = weight_up + (col * row_blocks + block) * 18u;
+    \\                gate_acc[c] += termite_q4_0_q8_1_partial_mmvq2(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+    \\                up_acc[c] += termite_q4_0_q8_1_partial_mmvq2(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+    \\            }
+    \\        } else {
+    \\            #pragma unroll
+    \\            for (unsigned int c = 0u; c < 4u; ++c) {
+    \\                unsigned int col = col_tile + c;
+    \\                if (col < out_dim) {
+    \\                    const unsigned char* gate_bp = weight_gate + (col * row_blocks + block) * 18u;
+    \\                    const unsigned char* up_bp = weight_up + (col * row_blocks + block) * 18u;
+    \\                    gate_acc[c] += termite_q4_0_q8_1_partial_mmvq2(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+    \\                    up_acc[c] += termite_q4_0_q8_1_partial_mmvq2(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+    \\                }
+    \\            }
+    \\        }
+    \\    }
+    \\
+    \\    #pragma unroll
+    \\    for (unsigned int c = 0; c < 4u; ++c) {
+    \\        float gate_sum = termite_warp_reduce_sum(gate_acc[c]);
+    \\        float up_sum = termite_warp_reduce_sum(up_acc[c]);
+    \\        if (lane == 0u && warp < $(warps)u) {
+    \\            gate_partial[c][warp] = gate_sum;
+    \\            up_partial[c][warp] = up_sum;
+    \\        }
+    \\    }
+    \\    __syncthreads();
+    \\    if (tid == 0u) {
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0; c < 4u; ++c) {
+    \\            unsigned int col = col_tile + c;
+    \\            if (full_tile || col < out_dim) {
+    \\                float gate_y = 0.0f;
+    \\                float up_y = 0.0f;
+    \\                #pragma unroll
+    \\                for (unsigned int w = 0; w < $(warps)u; ++w) {
+    \\                    gate_y += gate_partial[c][w];
+    \\                    up_y += up_partial[c][w];
+    \\                }
+    \\                dst[row * out_dim + col] = termite_decoder_activation_f32(gate_y, activation) * up_y;
+    \\            }
+    \\        }
+    \\    }
+    \\}
+    \\
+;
+
+const pair_act_rows_sig = [_][]const u8{ dst, q8_input, "const unsigned char* weight_gate", "const unsigned char* weight_up" } ++ shape ++ .{"unsigned int activation"};
+
+pub const pair_activation_q8_1 = fillAll(pair_act_q8_1_src, .{
+    .{ .name = "termite_linear_q4_0_pair_activation_q8_1_f32_tile4", .sig = sigText(&pair_act_rows_sig), .warps = "4", .early = false },
+    .{ .name = "termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8", .sig = sigText(&pair_act_rows_sig), .warps = "8", .early = true },
+});
+
+// ---------------------------------------------------------------- pair / QKV projections
+
+/// Two projections of one f32 row, 4 columns per 256-thread block
+/// (blockIdx.x = (row * 2 + projection) * tiles + tile), tree-reduced.
+const pair_cols4_src =
+    \\extern "C" __global__ void $(name)(
+    \\$(sig)) {
+    \\    const unsigned int cols = 4u;
+    \\    unsigned int tiles = (out_dim + cols - 1u) / cols;
+    \\    unsigned int tiles_per_row = tiles * 2u;
+    \\    unsigned int global = blockIdx.x;
+    \\    unsigned int row = global / tiles_per_row;
+    \\    if (row >= rows) return;
+    \\    unsigned int tile_local = global - row * tiles_per_row;
+    \\    unsigned int projection = tile_local / tiles;
+    \\    unsigned int col_tile = (tile_local - projection * tiles) * cols;
+    \\    const unsigned char* weight = projection == 0u ? weight_a : weight_b;
+    \\    float* dst = projection == 0u ? dst_a : dst_b;
+    \\    unsigned int tid = threadIdx.x;
+    \\    unsigned int row_blocks = in_dim / $(block)u;
+    \\    __shared__ float partial[4][256];
+    \\    float acc[4];
+    \\    #pragma unroll
+    \\    for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
+    \\
+    \\$(loop)    __syncthreads();
+    \\    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+    \\        if (tid < stride) {
+    \\            #pragma unroll
+    \\            for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] += partial[c][tid + stride];
+    \\        }
+    \\        __syncthreads();
+    \\    }
+    \\    if (tid == 0u) {
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0; c < 4u; ++c) {
+    \\            unsigned int col = col_tile + c;
+    \\            if (col < out_dim) dst[row * out_dim + col] = partial[c][0];
+    \\        }
+    \\    }
+    \\}
+    \\
+;
+
+const partial_store =
+    \\#pragma unroll
+    \\for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] = acc[c];
+    \\
+;
+
+pub const pair_nobias_cols4 = fillAll(pair_cols4_src, .{
+    .{ .name = "termite_linear_q8_0_pair_nobias_f32_tile4", .sig = sigText(&pair_sig), .block = "32", .loop = indent("    ", q8_0_cols4_loop ++ partial_store) },
+    .{ .name = "termite_linear_q4_k_pair_nobias_f32_tile4", .sig = sigText(&pair_sig), .block = "256", .loop = "    if (tid < 256u) {\n" ++ indent("        ", q4_k_cols4_loop ++ partial_store) ++ "    }\n" },
+});
+
+/// Q, K and V projections of one Q8_1 row: tiles of `cols` columns over
+/// q_out_dim then twice kv_out_dim, a `cols`-warp sum per tile.
+const qkv_q8_1_src =
+    \\extern "C" __global__ void $(name)(
+    \\$(sig)) {
+    \\    const unsigned int cols = $(cols)u;
+    \\    unsigned int q_tiles = (q_out_dim + cols - 1u) / cols;
+    \\    unsigned int kv_tiles = (kv_out_dim + cols - 1u) / cols;
+    \\    unsigned int tiles_per_row = q_tiles + kv_tiles * 2u;
+    \\    unsigned int global = blockIdx.x;
+    \\    unsigned int row = global / tiles_per_row;
+    \\    if (row >= rows) return;
+    \\    unsigned int tile = global - row * tiles_per_row;
+    \\
+    \\    const unsigned char* weight;
+    \\    float* dst;
+    \\    unsigned int out_dim;
+    \\    unsigned int col_tile;
+    \\    if (tile < q_tiles) {
+    \\        weight = weight_q;
+    \\        dst = dst_q;
+    \\        out_dim = q_out_dim;
+    \\        col_tile = tile * cols;
+    \\    } else if (tile < q_tiles + kv_tiles) {
+    \\        weight = weight_k;
+    \\        dst = dst_k;
+    \\        out_dim = kv_out_dim;
+    \\        col_tile = (tile - q_tiles) * cols;
+    \\    } else {
+    \\        weight = weight_v;
+    \\        dst = dst_v;
+    \\        out_dim = kv_out_dim;
+    \\        col_tile = (tile - q_tiles - kv_tiles) * cols;
+    \\    }
+    \\
+    \\    unsigned int tid = threadIdx.x;
+    \\    unsigned int lane = tid & 31u;
+    \\    unsigned int warp = tid >> 5;
+    \\    unsigned int row_blocks = in_dim / 32u;
+    \\    __shared__ float warp_partial[$(cols)][$(cols)];
+    \\    float acc[$(cols)];
+    \\    #pragma unroll
+    \\    for (unsigned int c = 0; c < $(bound); ++c) acc[c] = 0.0f;
+    \\
+    \\    unsigned int iqs = (tid & 1u) * 2u;
+    \\    for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
+    \\        const unsigned char* q8_bp = q8_input + (row * row_blocks + block) * 36u;
+    \\        unsigned short q8_d_h = (unsigned short)q8_bp[0] | ((unsigned short)q8_bp[1] << 8);
+    \\        float q8_d = termite_half_to_float(q8_d_h);
+    \\        const signed char* q8_values = (const signed char*)(q8_bp + 4u);
+    \\        unsigned int q8_base0 = iqs * 4u;
+    \\        unsigned int q8_base1 = q8_base0 + 4u;
+    \\        int q8_low0 = termite_load_i8x4_aligned(q8_values + q8_base0);
+    \\        int q8_high0 = termite_load_i8x4_aligned(q8_values + q8_base0 + 16u);
+    \\        int q8_low1 = termite_load_i8x4_aligned(q8_values + q8_base1);
+    \\        int q8_high1 = termite_load_i8x4_aligned(q8_values + q8_base1 + 16u);
+    \\
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0u; c < $(bound); ++c) {
+    \\            unsigned int col = col_tile + c;
+    \\            if (col < out_dim) {
+    \\                const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
+    \\                acc[c] += termite_q4_0_q8_1_partial_mmvq2(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+    \\            }
+    \\        }
+    \\    }
+    \\    termite_store_q4_0_cols_warp_sum_warps<$(cols)u, $(cols)u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
+    \\}
+    \\
+;
+
+const qkv_q8_1_sig = [_][]const u8{ "float* dst_q", "float* dst_k", "float* dst_v", q8_input, "const unsigned char* weight_q", "const unsigned char* weight_k", "const unsigned char* weight_v", rows, in_dim, "unsigned int q_out_dim", "unsigned int kv_out_dim" };
+
+pub const qkv_q8_1 = fillAll(qkv_q8_1_src, .{
+    .{ .name = "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile4", .sig = sigText(&qkv_q8_1_sig), .cols = "4", .bound = "4u" },
+    .{ .name = "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8", .sig = sigText(&qkv_q8_1_sig), .cols = "8", .bound = "cols" },
 });
