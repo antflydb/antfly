@@ -297,7 +297,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             try checkpoint(ptr);
             return .{ .items = try nodes.toOwnedSlice(a), .next = next, .examined = found.documents.len, .unfiltered = true };
         }
-        const PropertyCursor = struct { branch: usize = 0, index: ?[]const u8 = null, after: ?[]const u8 = null, key: ?[]const u8 = null, schema_version: ?u32 = null, primary: bool = false, planned: bool = false, domain_filter: ?usize = null, domain_length: usize = 0 };
+        const PropertyCursor = struct { branch: usize = 0, index: ?[]const u8 = null, after: ?[]const u8 = null, key: ?[]const u8 = null, schema_version: ?u32 = null, primary: bool = false, planned: bool = false, domain_filter: ?usize = null, domain_length: usize = 0, prefix_filters: []const usize = &.{}, prefix_lengths: []const usize = &.{} };
         fn propertyFallback(ptr: *anyopaque, a: A, table: []const u8, cursor: PropertyCursor, limit: usize) !b.Page(*const v.Node) {
             const page = try scan(ptr, a, table, cursor.key, limit);
             return .{ .items = page.items, .examined = page.examined, .unfiltered = page.unfiltered, .next = if (page.next) |key| try std.json.Stringify.valueAlloc(a, PropertyCursor{ .key = key, .primary = true }, .{}) else null };
@@ -849,7 +849,9 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         }
 
         const Domain = struct { filter: usize, values: []const v.Value, certified: bool, total: usize, max_string_bytes: ?usize = null };
+        const PrefixDomain = struct { domain: usize, position: usize };
         const SeekPlan = struct {
+            prefix_domains: []PrefixDomain = &.{},
             index: []const u8,
             domain: ?usize = null,
             prefix: []std.json.Value = &.{},
@@ -857,6 +859,26 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             complete: bool = false,
             cost: usize = std.math.maxInt(usize),
         };
+        fn branchCount(plan: SeekPlan, domains: []const Domain, samples: bool) usize {
+            const primary = plan.domain orelse return 1;
+            var count = if (samples) domains[primary].values.len else domains[primary].total;
+            for (plan.prefix_domains) |axis| count *= if (samples) domains[axis.domain].values.len else domains[axis.domain].total;
+            return count;
+        }
+        fn branchPrefix(plan: *SeekPlan, domains: []const Domain, branch: usize, offset: usize, samples: bool) void {
+            const primary = plan.domain.?;
+            const size = if (samples) domains[primary].values.len else domains[primary].total;
+            plan.prefix[plan.prefix.len - 1] = jsonOperand(domains[primary].values[branch % size - offset]);
+            var rank = branch / size;
+            var i = plan.prefix_domains.len;
+            while (i != 0) {
+                i -= 1;
+                const axis = plan.prefix_domains[i];
+                const length = if (samples) domains[axis.domain].values.len else domains[axis.domain].total;
+                plan.prefix[axis.position] = jsonOperand(domains[axis.domain].values[rank % length]);
+                rank /= length;
+            }
+        }
         fn jsonOperand(value: v.Value) std.json.Value {
             return switch (value) {
                 .null => .null,
@@ -907,7 +929,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     if (filter.value != .list) continue;
                     const source = filter.value.list;
                     if (filter.plan) |proof| {
-                        if (encoded != null or filter.domain == null or proof.length <= 128 or proof.length > 4096 or source.len != 3) return error.CypherInvalidBackendCursor;
+                        if (encoded != null or filter.domain == null or proof.length <= 3 or proof.length > 4096 or source.len != 3) return error.CypherInvalidBackendCursor;
                         for (source) |value| if (value == .string and value.string.len > proof.max_string_bytes) return error.CypherInvalidBackendCursor;
                     }
                     if (source.len > (if (filter.domain != null) @as(usize, 4096) else 256)) continue;
@@ -945,7 +967,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         if (index_only) return 0;
                         return .{ .items = &.{} };
                     }
-                    try domains.append(temporary, .{ .filter = ordinal, .values = values, .certified = filter.domain != null, .total = if (filter.plan) |proof| proof.length else values.len, .max_string_bytes = if (filter.plan) |proof| proof.max_string_bytes else null });
+                    try domains.append(temporary, .{ .filter = ordinal, .values = values, .certified = filter.domain != null, .total = if (filter.plan) |proof| proof.length else if (cursor.planned and cursor.domain_filter == ordinal) cursor.domain_length else values.len, .max_string_bytes = if (filter.plan) |proof| proof.max_string_bytes else null });
                     continue;
                 }
                 if (fixed.items.len == 256) continue;
@@ -983,7 +1005,18 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 const domain = if (cursor.domain_filter) |ordinal| for (domains.items, 0..) |domain, i| {
                     if (domain.filter == ordinal) break @as(?usize, i);
                 } else return error.CatalogGenerationChanged else @as(?usize, null);
-                try plans.append(temporary, .{ .index = cursor.index orelse return error.CypherInvalidBackendCursor, .domain = domain });
+                if (cursor.prefix_filters.len != cursor.prefix_lengths.len or cursor.prefix_filters.len > 3 or (cursor.prefix_filters.len != 0 and domain == null)) return error.CypherInvalidBackendCursor;
+                const axes = try temporary.alloc(PrefixDomain, cursor.prefix_filters.len);
+                var combinations: usize = if (domain) |d| domains.items[d].total else 1;
+                for (axes, cursor.prefix_filters, cursor.prefix_lengths) |*axis, ordinal, length| {
+                    const d = for (domains.items, 0..) |candidate, i| {
+                        if (candidate.filter == ordinal) break i;
+                    } else return error.CatalogGenerationChanged;
+                    if (!domains.items[d].certified or domains.items[d].total != length or domains.items[d].values.len != length or length == 0 or combinations > 128 / length) return error.CypherInvalidBackendCursor;
+                    combinations *= length;
+                    axis.* = .{ .domain = d, .position = std.math.maxInt(usize) };
+                }
+                try plans.append(temporary, .{ .index = cursor.index orelse return error.CypherInvalidBackendCursor, .domain = domain, .prefix_domains = axes });
             } else if (domains.items.len == 0) {
                 try plans.append(temporary, .{ .index = "" }); // Ordinary SQL auto-index selection.
             }
@@ -997,6 +1030,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     for (view.plan.boundIndexes()) |index| {
                         if (self.work) |work| try work.charge(work.ptr, 1);
                         var prefix: std.ArrayList(std.json.Value) = .empty;
+                        var axes: std.ArrayList(PrefixDomain) = .empty;
+                        var combinations = domain.total;
                         var found = false;
                         for (index.tuple.keys) |key| {
                             if (prefix.items.len == 32 or key.expression != null or key.fold_ascii) break;
@@ -1011,12 +1046,34 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                             if (std.mem.eql(u8, name, filters[domain.filter].property)) {
                                 try prefix.append(temporary, .null);
                                 found = true;
+                                break;
+                            }
+                            const other = for (domains.items, 0..) |candidate, i| {
+                                if (candidate.certified and candidate.values.len == candidate.total and std.mem.eql(u8, name, filters[candidate.filter].property)) break @as(?usize, i);
+                            } else @as(?usize, null);
+                            if (other) |d| {
+                                const length = domains.items[d].total;
+                                if (!domain.certified or axes.items.len == 3 or length == 0 or combinations > 128 / length) break;
+                                combinations *= length;
+                                try axes.append(temporary, .{ .domain = d, .position = prefix.items.len });
+                                try prefix.append(temporary, .null);
+                                continue;
                             }
                             break;
                         }
                         if (!found) continue;
                         if (kept == 4 or plans.items.len == 32) break;
-                        try plans.append(temporary, .{ .index = index.name, .domain = domain_id, .prefix = prefix.items });
+                        if (axes.items.len != 0) {
+                            const ordinals = try temporary.alloc(usize, axes.items.len);
+                            for (ordinals, axes.items) |*ordinal, axis| ordinal.* = domains.items[axis.domain].filter;
+                            const pinned = try @import("sparse_seek.zig").retain(temporary, filters, domain.filter, ordinals);
+                            var bytes = std.Io.Writer.Discarding.init(&.{});
+                            try std.json.Stringify.value(.{ .filters = pinned, .table = table, .read_fields = self.read_fields }, .{}, &bytes.writer);
+                            // Composite domains stay whole (at most 128 tuples).
+                            // Leave room for escaped row cursors and envelopes.
+                            if (bytes.fullCount() > 256 << 10) continue;
+                        }
+                        try plans.append(temporary, .{ .index = index.name, .domain = domain_id, .prefix = prefix.items, .prefix_domains = axes.items });
                         kept += 1;
                     }
                 };
@@ -1054,11 +1111,22 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         try prefix.append(temporary, .null);
                         break;
                     }
+                    var varying = false;
+                    for (plans.items[0].prefix_domains) |*axis| if (std.mem.eql(u8, name, filters[domains.items[axis.domain].filter].property)) {
+                        axis.position = prefix.items.len;
+                        varying = true;
+                        break;
+                    };
+                    if (varying) {
+                        try prefix.append(temporary, .null);
+                        continue;
+                    }
                     const value = for (fixed.items) |condition| {
                         if ((condition.op == .eq or condition.op == .is_not_distinct) and std.mem.eql(u8, condition.column, name)) break condition.value orelse .null;
                     } else return error.CatalogGenerationChanged;
                     try prefix.append(temporary, value);
                 }
+                for (plans.items[0].prefix_domains) |axis| if (axis.position == std.math.maxInt(usize)) return error.CatalogGenerationChanged;
                 plans.items[0].prefix = prefix.items;
             }
             if (!cursor.planned and plans.items.len > 1) candidates: for (plans.items) |*plan| {
@@ -1079,16 +1147,16 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 };
                 defer sample.deinit();
                 sample.reader.now_ns = self.ttl_now_ns;
-                const branches = if (plan.domain) |d| domains.items[d].total else 1;
+                const branches = branchCount(plan.*, domains.items, false);
                 const samples = @min(branches, 3);
                 var visits: usize = 0;
                 var complete = true;
                 for (0..samples) |i| {
                     if (self.work) |work| try work.charge(work.ptr, 8);
-                    if (plan.domain) |d| {
-                        const available = domains.items[d].values.len;
+                    if (plan.domain != null) {
+                        const available = branchCount(plan.*, domains.items, true);
                         const ordinal = if (samples == 1) 0 else i * (available - 1) / (samples - 1);
-                        plan.prefix[plan.prefix.len - 1] = jsonOperand(domains.items[d].values[ordinal]);
+                        branchPrefix(plan, domains.items, ordinal, 0, true);
                         sample.seekPrefix(plan.prefix, null) catch |err| {
                             if (unusableSeek(err)) {
                                 plan.usable = false;
@@ -1132,9 +1200,9 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 session.reader.now_ns = self.ttl_now_ns;
                 const domain: ?Domain = if (plan.domain) |d| domains.items[d] else null;
                 if (!cursor.planned) if (domain) |d| {
-                    for (d.values) |value| {
+                    for (0..branchCount(plan.*, domains.items, true)) |ordinal| {
                         if (self.work) |work| try work.charge(work.ptr, 1);
-                        plan.prefix[plan.prefix.len - 1] = jsonOperand(value);
+                        branchPrefix(plan, domains.items, ordinal, 0, true);
                         session.seekPrefix(plan.prefix, null) catch |err| {
                             if (unusableSeek(err)) {
                                 plan.usable = false;
@@ -1164,28 +1232,36 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     };
                     cursor.domain_length = d.total;
                 };
+                const prefix_filters = try temporary.alloc(usize, plan.prefix_domains.len);
+                const prefix_lengths = try temporary.alloc(usize, plan.prefix_domains.len);
+                for (prefix_filters, prefix_lengths, plan.prefix_domains) |*ordinal, *length, axis| {
+                    ordinal.* = domains.items[axis.domain].filter;
+                    length.* = domains.items[axis.domain].total;
+                }
                 if (planning) {
                     if (index_only or probe) return null;
                     try session.checkpoint();
                     try checkpoint(ptr);
-                    const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .planned = true, .index = session.reader.index.?.name, .schema_version = session.reader.active.version(), .domain_filter = if (domain) |d| d.filter else null, .domain_length = if (domain) |d| d.total else 0 }, .{});
-                    return .{ .items = &.{}, .examined = 0, .next = next, .seek_window = .{ .filter = if (domain) |d| d.filter else null } };
+                    const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .planned = true, .index = session.reader.index.?.name, .schema_version = session.reader.active.version(), .domain_filter = if (domain) |d| d.filter else null, .domain_length = if (domain) |d| d.total else 0, .prefix_filters = prefix_filters, .prefix_lengths = prefix_lengths }, .{});
+                    return .{ .items = &.{}, .examined = 0, .next = next, .seek_window = .{ .filter = if (domain) |d| d.filter else null, .prefix_filters = try a.dupe(usize, prefix_filters) } };
                 }
                 var nodes: std.ArrayList(*const v.Node) = .empty;
                 var examined: usize = 0;
                 var count: usize = 0;
                 var branch = cursor.branch;
-                const total = if (domain != null) cursor.domain_length else 1;
+                const total = branchCount(plan.*, domains.items, false);
+                if (domain != null and cursor.domain_length != domains.items[plan.domain.?].total and cursor.planned) return error.CypherInvalidBackendCursor;
                 if (total == 0 or branch >= total) return error.CypherInvalidBackendCursor;
-                const offset = if (domain) |d| if (d.certified and d.values.len != total) branch else @as(usize, 0) else @as(usize, 0);
-                if (domain) |d| if (offset != 0 and d.values.len != @min(@import("sparse_seek.zig").width, total - offset)) return error.CypherInvalidBackendCursor;
-                const end = if (domain != null) @min(total, branch + @import("sparse_seek.zig").width) else 1;
+                const partitioned = plan.prefix_domains.len == 0 and domain != null and domain.?.certified and domain.?.values.len != domain.?.total;
+                const offset = if (partitioned) branch else @as(usize, 0);
+                if (partitioned and (domain.?.values.len == 0 or domain.?.values.len > @min(@import("sparse_seek.zig").width, total - offset))) return error.CypherInvalidBackendCursor;
+                const end = if (partitioned) @min(total, offset + domain.?.values.len) else @min(total, branch + @import("sparse_seek.zig").width);
                 while (true) {
                     try session.checkpoint();
                     if (self.work) |work| try work.charge(work.ptr, 1);
-                    if (domain) |d| {
-                        if (branch - offset >= d.values.len) return error.CypherInvalidBackendCursor;
-                        plan.prefix[plan.prefix.len - 1] = jsonOperand(d.values[branch - offset]);
+                    if (domain != null) {
+                        if (partitioned and branch - offset >= domain.?.values.len) return error.CypherInvalidBackendCursor;
+                        branchPrefix(plan, domains.items, branch, offset, false);
                         try session.seekPrefix(plan.prefix, if (branch == cursor.branch) cursor.after else null);
                     }
                     var page_arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
@@ -1209,8 +1285,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     if (page.more or examined >= limit or count >= limit or branch + 1 == end) {
                         if (index_only) return null;
                         const next_branch = if (page.more) branch else branch + 1;
-                        const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .planned = true, .index = session.reader.index.?.name, .schema_version = session.reader.active.version(), .branch = next_branch, .after = if (page.more) page.next_cursor else null, .domain_filter = if (domain) |d| d.filter else null, .domain_length = if (domain != null) total else 0 }, .{});
-                        return .{ .items = nodes.items, .examined = examined, .next = next, .seek_window = if (domain) |d| if (d.certified) b.SeekWindow{ .filter = d.filter, .offset = next_branch } else null else b.SeekWindow{ .filter = null } };
+                        const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .planned = true, .index = session.reader.index.?.name, .schema_version = session.reader.active.version(), .branch = next_branch, .after = if (page.more) page.next_cursor else null, .domain_filter = if (domain) |d| d.filter else null, .domain_length = if (domain) |d| d.total else 0, .prefix_filters = prefix_filters, .prefix_lengths = prefix_lengths }, .{});
+                        return .{ .items = nodes.items, .examined = examined, .next = next, .seek_window = if (domain) |d| if (d.certified) b.SeekWindow{ .filter = d.filter, .offset = next_branch, .prefix_filters = try a.dupe(usize, prefix_filters) } else null else b.SeekWindow{ .filter = null } };
                     }
                     branch += 1;
                 }

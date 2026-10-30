@@ -456,3 +456,134 @@ test "bounded owner reads preserve ordering routing quotas and controller affini
         for (f.owners) |owner| try std.testing.expectEqual(meter.work().ptr, owner.work.?.ptr);
     };
 }
+
+test "parallel probes join charge and preserve EOF encounter order under skew and declines" {
+    const Fixture = struct {
+        activity: Activity,
+        controller: std.Thread.Id,
+        mode: enum { normal, skew, empty, incomplete, unsupported, malformed, fatal, revoked, deadline, canceled, quota, work },
+        stop: std.atomic.Value(bool) = .init(false),
+        const This = @This();
+        const Owner = struct {
+            fixture: *This,
+            index: usize,
+            calls: usize = 0,
+            work: ?b.Work = null,
+            key: [8]u8 = undefined,
+            fn check(ptr: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.index == 0) try std.testing.expectEqual(self.fixture.controller, std.Thread.getCurrentId());
+                try This.check(self.fixture);
+            }
+            fn configure(ptr: *anyopaque, work: ?b.Work) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.index == 0) std.testing.expectEqual(self.fixture.controller, std.Thread.getCurrentId()) catch @panic("local probe moved");
+                self.work = work;
+            }
+            fn probe(ptr: *anyopaque, a: A, _: []const u8, _: []const b.PropertyFilter, limit: usize) !?b.Probe {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.calls += 1;
+                try @This().check(ptr);
+                try self.fixture.activity.enter();
+                defer self.fixture.activity.leave();
+                if (self.index == 1) switch (self.fixture.mode) {
+                    .fatal => return error.Forbidden,
+                    .revoked, .deadline, .canceled => self.fixture.stop.store(true, .release),
+                    else => {},
+                };
+                const population: usize = switch (self.fixture.mode) {
+                    .empty => 0,
+                    .skew => if (self.index == 1) 12 else 0,
+                    .incomplete => if (self.index == 1) limit + 2 else 0,
+                    else => 1,
+                };
+                const used = @min(population, limit + 1);
+                if (self.work) |work| try work.charge(work.ptr, if (self.fixture.mode == .work and self.index == 1) 5000 else used + 1);
+                if (self.fixture.mode == .unsupported and self.index == 1) return null;
+                if (self.fixture.mode == .malformed and self.index == 1) return .{ .page = .{ .items = &.{}, .examined = limit + 2 }, .complete = true };
+                if (used > limit) return .{ .page = .{ .items = &.{}, .examined = used }, .complete = false };
+                const nodes = try a.alloc(*const v.Node, used);
+                for (nodes, 0..) |*out, i| {
+                    const node = try a.create(v.Node);
+                    node.* = .{ .identity = .{ .table = "docs", .key = try std.fmt.allocPrint(a, "{s}-{d:0>2}", .{ self.key[0..3], i }) } };
+                    if (self.fixture.mode == .quota) {
+                        const bytes = try a.alloc(u8, 300_000);
+                        @memset(bytes, 'x');
+                        const properties = try a.alloc(v.Entry, 1);
+                        properties[0] = .{ .name = "wide", .value = .{ .string = bytes } };
+                        node.properties = properties;
+                    }
+                    out.* = node;
+                }
+                return .{ .page = .{ .items = nodes, .examined = used }, .complete = true };
+            }
+            fn backend(self: *@This()) b.Backend {
+                return .{ .ptr = self, .vtable = &.{ .bind = undefined, .checkpoint = @This().check, .scan = undefined, .get = undefined, .expand = undefined, .probe_where = probe, .set_work = configure } };
+            }
+        };
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.stop.load(.acquire)) return switch (self.mode) {
+                .deadline => error.DeadlineExceeded,
+                .canceled => error.Canceled,
+                else => error.Forbidden,
+            };
+        }
+    };
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(4) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    for (std.enums.values(@FieldType(Fixture, "mode"))) |mode| {
+        var fixture: Fixture = .{ .activity = .{ .io = io }, .controller = std.Thread.getCurrentId(), .mode = mode };
+        var owners: [12]Fixture.Owner = undefined;
+        var targets: [12]d.Target = undefined;
+        var ranges: [12][1]d.KeyRange = undefined;
+        var snapshots: [12]d.Snapshot = undefined;
+        for (&owners, &targets, &snapshots, 0..) |*owner, *target, *snapshot, i| {
+            owner.* = .{ .fixture = &fixture, .index = i };
+            const key = try std.fmt.bufPrint(&owner.key, "k{d:0>2}", .{i});
+            target.* = .{ .table = "docs", .table_id = 1, .group_id = i + 1, .parallel = i != 0 };
+            snapshot.* = .{ .backend = owner.backend(), .ptr = owner, .validate = Fixture.Owner.check, .close = undefined };
+            ranges[i] = .{.{ .start = key }};
+        }
+        for (&targets, &ranges, 0..) |*target, *range, i| {
+            range[0].end = if (i + 1 < owners.len) owners[i + 1].key[0..3] else null;
+            target.ranges = range;
+        }
+        var read: d.ReadSet = .{ .a = std.testing.allocator, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &fixture, .checkpoint = Fixture.check, .admit = undefined, .capture = undefined, .fanout_io = io, .fanout_width = 4 } };
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const backend = read.backend();
+        var meter: b.Meter = .{ .a = a, .backend = backend, .limit = if (mode == .work) 20_000 else 100_000 };
+        backend.vtable.set_work.?(backend.ptr, meter.work());
+        const result = backend.vtable.probe_where.?(backend.ptr, a, "docs", &.{}, 12);
+        const expected: ?anyerror = switch (mode) {
+            .fatal, .revoked => error.Forbidden,
+            .deadline => error.DeadlineExceeded,
+            .canceled => error.Canceled,
+            .malformed => error.CypherInvalidBackendPage,
+            else => null,
+        };
+        if (expected) |err| try std.testing.expectError(err, result) else {
+            const page = (try result).?;
+            const complete = mode != .incomplete and mode != .unsupported and mode != .quota;
+            try std.testing.expectEqual(complete, page.complete);
+            if (complete) {
+                try std.testing.expectEqual(@as(usize, if (mode == .empty) 0 else 12), page.page.items.len);
+                try std.testing.expectEqual(page.page.items.len, page.page.examined.?);
+                for (page.page.items, 0..) |node, i| {
+                    const key = try std.fmt.allocPrint(a, "k{d:0>2}-{d:0>2}", .{ if (mode == .skew) @as(usize, 1) else i, if (mode == .skew) i else 0 });
+                    try std.testing.expectEqualStrings(key, node.identity.key);
+                }
+            } else try std.testing.expectEqual(@as(usize, 0), page.page.items.len);
+        }
+        try std.testing.expectEqual(@as(usize, 0), fixture.activity.active.load(.monotonic));
+        try std.testing.expect(fixture.activity.peak.load(.monotonic) > 1);
+        try std.testing.expect(fixture.activity.peak.load(.monotonic) <= 4);
+        try std.testing.expect(meter.units > 0 and meter.units <= meter.limit);
+        if (mode == .skew or mode == .work) try std.testing.expectEqual(@as(usize, 2), owners[1].calls);
+        if (mode == .skew) try std.testing.expect(meter.units > 24);
+        for (owners) |owner| try std.testing.expectEqual(meter.work().ptr, owner.work.?.ptr);
+    }
+}

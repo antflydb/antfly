@@ -26,6 +26,34 @@ const A = std.mem.Allocator;
 // compiled runtimes. Anonymous enum/struct type names contain local IDs.
 pub const Operation = enum { validate, scan, scan_ordered, estimate, population, get, get_many, expand, search, observe, observe_ranges, normalize, project, probe };
 pub const Filter = struct { property: []const u8, value: std.json.Value, op: b.FilterOp = .eq, domain: ?b.ScalarDomain = null, plan: ?b.DomainPlan = null };
+// Borrow immutable scalar/string payloads through one owner call. Avoid the
+// stringify/parse round trip (and arena growth) for already typed filter data.
+fn filterValue(a: A, value: v.Value) anyerror!std.json.Value {
+    return switch (value) {
+        .null => .null,
+        .boolean => |item| .{ .bool = item },
+        .integer => |item| .{ .integer = item },
+        .number => |item| .{ .float = item },
+        .string => |item| .{ .string = item },
+        .list => |items| block: {
+            var array = std.array_list.Managed(std.json.Value).init(a);
+            try array.ensureTotalCapacity(items.len);
+            for (items) |item| array.appendAssumeCapacity(try filterValue(a, item));
+            break :block .{ .array = array };
+        },
+        .map => |items| block: {
+            var object: std.json.ObjectMap = .empty;
+            for (items) |item| try object.put(a, item.name, try filterValue(a, item.value));
+            break :block .{ .object = object };
+        },
+        else => try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{ .parse_numbers = false }),
+    };
+}
+fn encodeFilters(a: A, filters: []const b.PropertyFilter) ![]Filter {
+    const out = try a.alloc(Filter, filters.len);
+    for (filters, out) |input, *filter| filter.* = .{ .property = input.property, .op = input.op, .domain = input.domain, .plan = input.plan, .value = try filterValue(a, input.value) };
+    return out;
+}
 pub const OrderAfter = struct { value: std.json.Value };
 pub const Order = struct { property: []const u8, descending: bool = false, exclude_null: bool = false, after: ?OrderAfter = null };
 pub const BudgetFailure = enum { work, anchors };
@@ -98,6 +126,7 @@ pub const Reply = struct {
             out.cursors = copied;
         }
         if (self.cursor_trace) |trace| out.cursor_trace = (try trace.clone(a)).*;
+        if (out.seek_window) |*window| window.prefix_filters = try a.dupe(usize, window.prefix_filters);
         return out;
     }
 };
@@ -233,7 +262,7 @@ pub const Client = struct {
         var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        const encoded = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), temporary, try std.json.Stringify.valueAlloc(temporary, filters, .{}), .{ .parse_numbers = false });
+        const encoded = try encodeFilters(temporary, filters);
         // The estimator's demand is independent of the owner's bounded sample
         // contract. A saturated sample cannot justify a larger full-pass plan.
         if (limit == 0) return null;
@@ -250,7 +279,7 @@ pub const Client = struct {
         var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        const encoded_filters = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), temporary, try std.json.Stringify.valueAlloc(temporary, filters, .{}), .{ .parse_numbers = false });
+        const encoded_filters = try encodeFilters(temporary, filters);
         const encoded_order = try temporary.alloc(@typeInfo(@FieldType(Request, "order")).pointer.child, order.len);
         for (order, encoded_order) |input, *out| out.* = .{ .property = input.property, .descending = input.descending, .exclude_null = input.exclude_null, .after = if (input.after) |key| .{ .value = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, key, .{}), .{ .parse_numbers = false }) } else null };
         const reply = try self.invoke(temporary, .{ .filters = encoded_filters, .order = encoded_order, .operation = .scan_ordered, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = after, .limit = limit, .max_examined = max_examined });
@@ -280,8 +309,12 @@ pub const Client = struct {
         var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        const input = if (self.channel.owner_local) try @import("sparse_seek.zig").prepare(temporary, filters, after) else @import("sparse_seek.zig").Input{ .filters = filters, .after = after };
+        var envelope = std.Io.Writer.Discarding.init(&.{});
+        try std.json.Stringify.value(.{ .table = table, .read_fields = self.read_fields }, .{}, &envelope.writer);
+        const bytes_budget = ((1 << 20) - 2048) -| envelope.fullCount();
+        const input = if (self.channel.owner_local) try @import("sparse_seek.zig").prepareBounded(temporary, filters, after, bytes_budget) else @import("sparse_seek.zig").Input{ .filters = filters, .after = after };
         var selected = input.filters;
+        var primary = input.primary;
         if (self.channel.owner_local and after == null) {
             // Count before allocating. Include variable projection/table bytes;
             // fixed request fields fit within the reserved header allowance.
@@ -289,10 +322,17 @@ pub const Client = struct {
             try std.json.Stringify.value(.{ .filters = input.filters, .table = table, .read_fields = self.read_fields }, .{}, &count.writer);
             if (count.fullCount() > (1 << 20) - 2048)
                 selected = try @import("sparse_seek.zig").planning(temporary, input.filters);
+            var planned_size = std.Io.Writer.Discarding.init(&.{});
+            try std.json.Stringify.value(.{ .filters = selected, .after = input.after }, .{}, &planned_size.writer);
+            if (planned_size.fullCount() > bytes_budget) {
+                // Hints are optional. Decline before any rows escape rather
+                // than rejecting a small public query with large derived keys.
+                selected = &.{};
+                primary = true;
+            }
         }
-        const filter_bytes = try std.json.Stringify.valueAlloc(temporary, selected, .{});
-        const encoded_filters = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), temporary, filter_bytes, .{ .parse_numbers = false });
-        const reply = try self.invoke(temporary, .{ .filters = encoded_filters, .operation = .scan, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = input.after, .primary = input.primary, .limit = limit });
+        const encoded_filters = try encodeFilters(temporary, selected);
+        const reply = try self.invoke(temporary, .{ .filters = encoded_filters, .operation = .scan, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = input.after, .primary = primary, .limit = limit });
         const nodes = try a.alloc(*const v.Node, reply.values.len);
         for (reply.values, nodes) |item, *out| {
             const value = try item.value.clone(a);
@@ -308,7 +348,7 @@ pub const Client = struct {
         var arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer arena.deinit();
         const scratch = arena.allocator();
-        const encoded = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), scratch, try std.json.Stringify.valueAlloc(scratch, filters, .{}), .{ .parse_numbers = false });
+        const encoded = try encodeFilters(scratch, filters);
         const reply = try self.invoke(scratch, .{ .operation = .probe, .filters = encoded, .table = table, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .limit = limit });
         if (!reply.probe_supported) return null;
         const used = reply.examined orelse reply.values.len;
@@ -913,6 +953,8 @@ test "wide sparse domains plan bounded samples before sending original value win
     const Fixture = struct {
         calls: usize = 0,
         delivered: usize = 0,
+        count: usize,
+        length: usize,
         fn call(ptr: *anyopaque, a: A, body: []const u8) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(body.len <= 1 << 20);
@@ -920,41 +962,53 @@ test "wide sparse domains plan bounded samples before sending original value win
             self.calls += 1;
             const filter = request.filters[0];
             if (self.calls == 1) {
-                try std.testing.expectEqual(@as(usize, 400), filter.plan.?.length);
+                try std.testing.expectEqual(self.count, filter.plan.?.length);
                 try std.testing.expectEqual(@as(usize, 3), filter.value.array.items.len);
-                try std.testing.expect(filter.plan.?.max_string_bytes >= 3000);
+                try std.testing.expect(filter.plan.?.max_string_bytes >= self.length);
             } else {
                 try std.testing.expect(filter.plan == null);
                 try std.testing.expect(filter.value.array.items.len <= 128);
+                if (request.filters.len == 2) try std.testing.expect(request.filters[1].value == .null);
                 self.delivered += filter.value.array.items.len;
             }
             return std.json.Stringify.valueAlloc(a, Reply{
-                .next = if (self.delivered < 400) "native" else null,
-                .seek_window = if (self.delivered < 400) .{ .filter = 0, .offset = self.delivered } else null,
+                .next = if (self.delivered < self.count) "native" else null,
+                .seek_window = if (self.delivered < self.count) .{ .filter = 0, .offset = self.delivered } else null,
             }, .{});
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const prefix = try a.alloc(u8, 3000);
-    @memset(prefix, 'x');
-    const values = try a.alloc(v.Value, 400);
-    for (values, 0..) |*value, i| value.* = .{ .string = try std.fmt.allocPrint(a, "{s}{d}", .{ prefix, i }) };
-    var fixture: Fixture = .{};
-    var client: Client = .{ .channel = .{ .ptr = &fixture, .call = Fixture.call }, .incarnation = 1, .revision = 1 };
-    const backend = client.backend();
-    var after: ?[]const u8 = null;
-    while (true) {
-        var quota: @import("budget.zig") = .{ .backing = b.reclaimingAllocator(a), .limit = 256 << 10 };
-        var packet_arena = std.heap.ArenaAllocator.init(quota.allocator());
-        defer packet_arena.deinit();
-        const page = try backend.vtable.scan_where.?(backend.ptr, if (after == null) packet_arena.allocator() else a, "docs", &.{.{ .property = "id", .op = .in, .value = .{ .list = values }, .domain = .string }}, after, 128);
-        after = if (page.next) |next| try a.dupe(u8, next) else null;
-        if (after == null) break;
+    for ([_]struct { length: usize, count: usize, domains: usize }{
+        .{ .length = 3000, .count = 400, .domains = 1 },
+        .{ .length = 3000, .count = 400, .domains = 2 },
+        .{ .length = 12000, .count = 400, .domains = 1 },
+        .{ .length = 12000, .count = 128, .domains = 1 },
+    }) |case| {
+        const prefix = try a.alloc(u8, case.length);
+        @memset(prefix, 'x');
+        const values = try a.alloc(v.Value, case.count);
+        for (values, 0..) |*value, i| value.* = .{ .string = try std.fmt.allocPrint(a, "{s}{d}", .{ prefix, i }) };
+        var fixture: Fixture = .{ .count = case.count, .length = case.length };
+        var client: Client = .{ .channel = .{ .ptr = &fixture, .call = Fixture.call }, .incarnation = 1, .revision = 1 };
+        const filters = [_]b.PropertyFilter{
+            .{ .property = "id", .op = .in, .value = .{ .list = values }, .domain = .string },
+            .{ .property = "other", .op = .in, .value = .{ .list = values }, .domain = .string },
+        };
+        const backend = client.backend();
+        var after: ?[]const u8 = null;
+        while (true) {
+            var quota: @import("budget.zig") = .{ .backing = b.reclaimingAllocator(a), .limit = 256 << 10 };
+            var packet_arena = std.heap.ArenaAllocator.init(quota.allocator());
+            defer packet_arena.deinit();
+            const page = try backend.vtable.scan_where.?(backend.ptr, if (after == null) packet_arena.allocator() else a, "docs", filters[0..case.domains], after, 128);
+            after = if (page.next) |next| try a.dupe(u8, next) else null;
+            if (after == null) break;
+        }
+        try std.testing.expect(fixture.calls >= 1 + (case.count + 127) / 128);
+        try std.testing.expectEqual(case.count, fixture.delivered);
     }
-    try std.testing.expectEqual(@as(usize, 5), fixture.calls);
-    try std.testing.expectEqual(@as(usize, 400), fixture.delivered);
 }
 
 test "sampled domains pin unsupported owner fallback to its primary cursor" {
@@ -986,4 +1040,13 @@ test "sampled domains pin unsupported owner fallback to its primary cursor" {
     const last = try owner.executeTyped(a, .{ .operation = .scan, .graph_incarnation = 1, .graph_revision = 1, .table = "docs", .after = resumed.after, .primary = resumed.primary });
     try std.testing.expect(last.next == null);
     try std.testing.expectEqual(@as(usize, 2), fixture.scans);
+}
+
+test "typed reply clones own composite seek window ordinals" {
+    var ordinals = [_]usize{ 2, 5 };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const reply = try (Reply{ .seek_window = .{ .filter = 7, .prefix_filters = &ordinals } }).clone(arena.allocator());
+    ordinals[0] = 99;
+    try std.testing.expectEqualSlices(usize, &.{ 2, 5 }, reply.seek_window.?.prefix_filters);
 }

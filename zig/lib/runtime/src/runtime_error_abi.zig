@@ -3425,7 +3425,9 @@ test "merged runtime error details preserve the common prefix under ABI two" {
     try std.testing.expectEqual(@as(c_int, 782), @backingInt(Detail.document_storage_not_configured));
     try std.testing.expectEqual(@as(c_int, 825), @backingInt(Detail.document_token_limit_exceeded));
     try std.testing.expectEqual(@as(c_int, 826), @backingInt(Detail.hierarchy_cursor_stale));
-    try std.testing.expectEqual(@as(c_int, 827), @backingInt(Detail.cypher_aggregate_scope));
+    try std.testing.expectEqual(@as(c_int, 827), @backingInt(Detail.read_transient_failure));
+    try std.testing.expectEqual(@as(c_int, 832), @backingInt(Detail.invalid_connection_credentials));
+    try std.testing.expectEqual(@as(c_int, 833), @backingInt(Detail.cypher_aggregate_scope));
 }
 
 test "logical query work and scan policy failures retain their identities" {

@@ -4594,6 +4594,45 @@ and the C API catalog/execution gate. All reported native cases have zero
 leaks. The unchanged 504-case core suite and independent callback ABI gate
 reuse their successful cached results. The merged CLI build also succeeds.
 
+The next access-path follow-up merges main through `e5aad86397` in
+`07695c25b3`. Main's appended runtime detail values remain unchanged; Cypher
+additions follow them in both error domains, with explicit numeric contracts.
+
+Sparse owner continuations now budget encoded bytes, including escaped native
+cursors, table names and projected fields. Windows contain at most 128 values
+but can be smaller for long strings. Unused IN hints become inactive operands
+without renumbering the pinned owner's filter ordinals. Large derived domains
+use bounded planning samples even below 128 values; hints that cannot fit even
+then decline to one pinned primary scan before any rows escape. Typed filter
+conversion borrows immutable payloads instead of serializing and reparsing them.
+Composite prefix ordinals are copied across callback ownership boundaries.
+
+Native composite access paths combine up to four primitive IN columns in one
+mixed-radix prefix plan, capped at 128 combinations and 256 KiB of retained
+request hints. Fixed equalities can occur between the varying keys. Costing
+compares these paths with the existing scalar and fixed-predicate paths; every
+chosen bound is validated before output. Continuations pin schema, index,
+filter ordinals, dimension lengths, tuple position and native row position.
+Larger products keep the existing bounded single-domain plans and residual
+Cypher checks. The regression fixture has only a composite `(tenant,id)` index:
+two tenant values and two identifiers previously visited 1,000 anchors for two
+results; the new contract permits exactly two anchors across four tuple seeks.
+
+Adjacency reads use retained source-owner ranges. Outgoing traversals route by
+the known source identity; pair-restricted incoming traversals route by their
+known peer source. Undirected pairs use the union of possible source owners,
+and unrestricted incoming traversals still visit every possible source owner.
+Legacy capabilities without certified ranges retain their original fan-out.
+Continuations skip only owners proved irrelevant at the retained statement cut.
+
+Correlated probes share the bounded owner-read scheduler. Remote waves use
+isolated work meters and join before copying results or reclaiming scratch;
+local capabilities keep controller-thread affinity. Complete leaves reserve
+their exact populations before a skewed incomplete leaf retries against the
+remaining global population allowance. Discarded attempts remain charged as
+work, never query bindings or logical anchors. Encounter order, trailing empty
+EOF proofs, cancellation and the 2 MiB aggregate capture quota are preserved.
+
 The distributed enrichment caveat above remains open. Two combined public
 campaigns passed 19 cases but the owner-loss case ended with a durable
 `committed_repair_required` receipt; all three data owners exhausted retries on

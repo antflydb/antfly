@@ -63,7 +63,7 @@ pub fn Page(comptime T: type) type {
 /// later requests may send only this certified domain suffix (at most 128 items).
 /// Null filter means the chosen path does not partition an IN domain: its IN
 /// hints may be omitted, while the runtime retains every authoritative predicate.
-pub const SeekWindow = struct { filter: ?usize, offset: usize = 0, primary: bool = false };
+pub const SeekWindow = struct { filter: ?usize, offset: usize = 0, primary: bool = false, prefix_filters: []const usize = &.{} };
 /// A bounded indexed probe never falls back to a primary scan. Null means the
 /// capability is unsupported. Incomplete probes are costing evidence, never query
 /// bindings: their record/seek work must remain charged through Work, including

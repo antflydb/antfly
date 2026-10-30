@@ -161,6 +161,101 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             incompatible
         )
         assert incompatible["stats"]["scanned_anchors"] <= 2000, incompatible
+        # Only a composite index exists: each complete (tenant,id) prefix
+        # must avoid the 1,000-row scan of the two tenant-only prefixes.
+        composite = table + "_composite"
+        call("/sql", {"statement": f"CREATE TABLE {composite} (tenant BIGINT,id TEXT)"})
+        call(
+            "/sql",
+            {"statement": f"CREATE INDEX {composite}_keys ON {composite}(tenant,id)"},
+        )
+        call(
+            f"/tables/{composite}/batch",
+            {
+                "inserts": {
+                    f"n{i}": {"tenant": i % 4, "id": f"n{i}"} for i in range(2000)
+                },
+                "sync_level": "full_index",
+            },
+        )
+        call(
+            f"/graphs/{composite}",
+            {"labels": [{"name": "C", "table": composite}], "relationships": []},
+        )
+        call(
+            f"/graphs/{composite}/query",
+            {
+                "query": "MATCH(n:C {tenant:1,id:'n1997'}) RETURN n.id",
+                "limits": {"scanned_anchors": 1},
+            },
+            wait_for_index=True,
+        )
+        for predicate in (
+            "n.tenant IN [1,2] AND n.id IN ['n1997','n1998']",
+            "n.id IN ['n1997','n1998'] AND n.tenant IN [1,2]",
+            "n.tenant IN [1,1,null,2] AND n.id IN ['n1997','n1998','n1997']",
+        ):
+            precise_composite = call(
+                f"/graphs/{composite}/query",
+                {
+                    "query": f"MATCH(n:C) WHERE {predicate} RETURN count(*)",
+                    "limits": {"scanned_anchors": 2},
+                },
+            )
+            assert precise_composite["rows"] == [[{"type": "integer", "value": "2"}]], (
+                precise_composite
+            )
+            assert precise_composite["stats"]["scanned_anchors"] == 2, precise_composite
+        # Public requests remain small while derived owner domains exceed the
+        # private packet ceiling. Both matches are in the last value window.
+        for length, domains in ((3000, 2), (12000, 1)):
+            strings = table + f"_strings_{length}"
+            prefix = "x" * length
+            call("/sql", {"statement": f"CREATE TABLE {strings} (id TEXT,other TEXT)"})
+            call("/sql", {"statement": f"CREATE INDEX {strings}_id ON {strings}(id)"})
+            call(
+                "/sql",
+                {"statement": f"CREATE INDEX {strings}_other ON {strings}(other)"},
+            )
+            call(
+                f"/tables/{strings}/batch",
+                {
+                    "inserts": {
+                        f"n{i}": {"id": prefix + str(i), "other": prefix + str(i)}
+                        for i in (398, 399)
+                    },
+                    "sync_level": "full_index",
+                },
+            )
+            call(
+                f"/graphs/{strings}",
+                {"labels": [{"name": "S", "table": strings}], "relationships": []},
+            )
+            call(
+                f"/graphs/{strings}/query",
+                {
+                    "query": "MATCH(n:S {id:$key}) RETURN n.id",
+                    "parameters": {"key": prefix + "399"},
+                    "limits": {"scanned_anchors": 1},
+                },
+                wait_for_index=True,
+            )
+            collection = "[i IN range(0,399) | $prefix+toString(i)]"
+            predicate = f"n.id IN {collection}"
+            if domains == 2:
+                predicate += f" AND n.other IN {collection}"
+            long_membership = call(
+                f"/graphs/{strings}/query",
+                {
+                    "query": f"MATCH(n:S) WHERE {predicate} RETURN count(*)",
+                    "parameters": {"prefix": prefix},
+                    "limits": {"scanned_anchors": 2, "intermediate_states": 1000000},
+                },
+            )
+            assert long_membership["rows"] == [[{"type": "integer", "value": "2"}]], (
+                long_membership
+            )
+            assert long_membership["stats"]["scanned_anchors"] == 2, long_membership
         # A later out-of-range integer must invalidate DOUBLE seek coercion
         # for the whole domain before any earlier window can emit candidates.
         floating = table + "_floating"

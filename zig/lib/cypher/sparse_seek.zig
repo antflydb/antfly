@@ -22,7 +22,23 @@ const A = std.mem.Allocator;
 pub const width = 128;
 pub const Cursor = struct { sparse_seek: struct { window: b.SeekWindow, after: []const u8 } };
 pub const Input = struct { filters: []const b.PropertyFilter, after: ?[]const u8, primary: bool = false };
+/// Unused IN hints are inactive NULL operands, retaining the original ordinal
+/// space of the owner's opaque plan. The Cypher predicate stays authoritative.
+pub fn retain(a: A, filters: []const b.PropertyFilter, primary: usize, prefix: []const usize) ![]b.PropertyFilter {
+    const selected = try a.dupe(b.PropertyFilter, filters);
+    for (selected, 0..) |*filter, ordinal| if (filter.op == .in and ordinal != primary and std.mem.indexOfScalar(usize, prefix, ordinal) == null) {
+        filter.value = .null;
+        filter.domain = null;
+        filter.plan = null;
+    };
+    return selected;
+}
 pub fn prepare(a: A, filters: []const b.PropertyFilter, after: ?[]const u8) !Input {
+    return prepareBounded(a, filters, after, (1 << 20) - 4096);
+}
+/// The envelope budget includes filters and the escaped native continuation.
+/// Keep ordinals stable while omitting unused membership hints.
+pub fn prepareBounded(a: A, filters: []const b.PropertyFilter, after: ?[]const u8, bytes_budget: usize) !Input {
     const bytes = after orelse return .{ .filters = filters, .after = null };
     // Unmodified cursors from backends without this capability stay opaque.
     if (bytes.len == 0 or bytes[0] != '{') return .{ .filters = filters, .after = after };
@@ -30,14 +46,33 @@ pub fn prepare(a: A, filters: []const b.PropertyFilter, after: ?[]const u8) !Inp
     if (object != .object or !object.object.contains("sparse_seek")) return .{ .filters = filters, .after = after };
     const cursor = try std.json.parseFromSliceLeaky(Cursor, a, bytes, .{});
     const window = cursor.sparse_seek.window;
+    if (window.primary) return .{ .filters = &.{}, .after = cursor.sparse_seek.after, .primary = true };
     if (window.filter) |index| {
         if (index >= filters.len) return error.CypherInvalidBackendCursor;
         const source = filters[index];
         if (source.op != .in or source.domain == null or source.value != .list) return error.CypherInvalidBackendCursor;
         if (source.value.list.len > 4096) return error.CypherOwnerBudgetExceeded;
+        const selected = try retain(a, filters, index, window.prefix_filters);
+        if (window.prefix_filters.len != 0) {
+            if (window.prefix_filters.len > 3) return error.CypherInvalidBackendCursor;
+            for (window.prefix_filters) |ordinal| if (ordinal >= selected.len or selected[ordinal].op != .in or selected[ordinal].domain == null or selected[ordinal].value != .list) return error.CypherInvalidBackendCursor;
+            var size = std.Io.Writer.Discarding.init(&.{});
+            try std.json.Stringify.value(.{ .filters = selected, .after = cursor.sparse_seek.after }, .{}, &size.writer);
+            if (size.fullCount() > bytes_budget) return error.CypherRequestTooLarge;
+            return .{ .filters = selected, .after = cursor.sparse_seek.after };
+        }
         if (window.offset >= source.value.list.len) return error.CypherInvalidBackendCursor;
-        const selected = try a.dupe(b.PropertyFilter, filters);
-        selected[index].value = .{ .list = source.value.list[window.offset..@min(source.value.list.len, window.offset + width)] };
+        var low: usize = 0;
+        var high: usize = @min(source.value.list.len - window.offset, width);
+        while (low < high) {
+            const count = low + (high - low + 1) / 2;
+            selected[index].value = .{ .list = source.value.list[window.offset..][0..count] };
+            var size = std.Io.Writer.Discarding.init(&.{});
+            try std.json.Stringify.value(.{ .filters = selected, .after = cursor.sparse_seek.after }, .{}, &size.writer);
+            if (size.fullCount() <= bytes_budget) low = count else high = count - 1;
+        }
+        if (low == 0) return error.CypherRequestTooLarge;
+        selected[index].value = .{ .list = source.value.list[window.offset..][0..low] };
         return .{ .filters = selected, .after = cursor.sparse_seek.after };
     }
     var selected: std.ArrayList(b.PropertyFilter) = .empty;
@@ -49,8 +84,15 @@ pub fn prepare(a: A, filters: []const b.PropertyFilter, after: ?[]const u8) !Inp
 pub fn planning(a: A, filters: []const b.PropertyFilter) ![]const b.PropertyFilter {
     const selected = try a.dupe(b.PropertyFilter, filters);
     for (selected) |*filter| {
-        if (filter.op != .in or filter.domain == null or filter.value != .list or filter.value.list.len <= width) continue;
+        if (filter.op != .in or filter.domain == null or filter.value != .list or filter.value.list.len <= 3) continue;
         const source = filter.value.list;
+        // Cheap complete domains can still form a bounded composite prefix
+        // alongside another domain that needs a sampled planning handoff.
+        if (source.len <= width) {
+            var size = std.Io.Writer.Discarding.init(&.{});
+            try std.json.Stringify.value(source, .{}, &size.writer);
+            if (size.fullCount() <= 16 << 10) continue;
+        }
         if (source.len > 4096) return error.CypherOwnerBudgetExceeded;
         var maximum: usize = 0;
         for (source) |value| if (value == .string) {

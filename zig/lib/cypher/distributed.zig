@@ -286,17 +286,20 @@ pub const ReadSet = struct {
         operation: union(enum) {
             ordered: struct { table: []const u8, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, after: ?[]const u8 = null, limit: usize = 0 },
             get_many: []const v.Identity,
+            probe: struct { table: []const u8, filters: []const b.PropertyFilter, limit: usize },
         },
         arena: std.heap.ArenaAllocator = undefined,
         meter: ?b.Meter = null,
         maximum: usize = 0,
         page: ?b.Page(*const v.Node) = null,
         nodes: []const ?*const v.Node = &.{},
+        probe: ?b.Probe = null,
         err: ?anyerror = null,
         fn invoke(self: *@This(), read: *ReadSet) !void {
             const owner = read.snapshots[self.owner].backend;
             const a = self.arena.allocator();
             switch (self.operation) {
+                .probe => |input| self.probe = if (owner.vtable.probe_where) |callback| try callback(owner.ptr, a, input.table, input.filters, input.limit) else null,
                 .ordered => |input| self.page = try (owner.vtable.scan_ordered orelse return error.CypherInvalidBackendPage)(owner.ptr, a, input.table, input.filters, input.order, input.after, input.limit, self.maximum),
                 .get_many => |ids| self.nodes = if (owner.vtable.get_many) |batch| try batch(owner.ptr, a, ids) else blk: {
                     const nodes = try a.alloc(?*const v.Node, ids.len);
@@ -744,32 +747,64 @@ pub const ReadSet = struct {
         try checkpoint(ptr);
         return if (found) total else null;
     }
+    fn probeUsage(result: b.Probe, limit: usize) !usize {
+        const used = result.page.examined orelse result.page.items.len;
+        if (used > limit + 1 or result.page.next != null or result.page.unfiltered or
+            (result.complete and (used > limit or used < result.page.items.len)) or
+            (!result.complete and result.page.items.len != 0)) return error.CypherInvalidBackendPage;
+        return used;
+    }
     fn probeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?b.Probe {
         const self = cast(ptr);
         if (limit == 0 or limit > 128) return null;
         var quota: @import("budget.zig") = .{ .backing = b.reclaimingAllocator(a), .limit = 2 << 20 };
         var collected = std.heap.ArenaAllocator.init(quota.allocator());
         defer collected.deinit();
+        var inventory = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer inventory.deinit();
+        var owners: std.ArrayList(usize) = .empty;
+        // Preserve original owner encounter order, even when local owners split
+        // remote waves. Every started probe joins and charges its isolated work.
+        for (self.targets, 0..) |target, owner| if (std.mem.eql(u8, target.table, table)) try owners.append(inventory.allocator(), owner);
         var nodes: std.ArrayList(*const v.Node) = .empty;
         var examined: usize = 0;
         var found = false;
-        for (self.targets, self.snapshots) |target, snapshot| {
-            if (!std.mem.eql(u8, target.table, table)) continue;
+        var start: usize = 0;
+        while (start < owners.items.len) {
             try checkpoint(ptr);
-            const callback = snapshot.backend.vtable.probe_where orelse return if (found) b.Probe{ .page = .{ .items = &.{}, .examined = examined }, .complete = false } else null;
-            // Consume the leaf's reply/work before copying into the aggregate
-            // quota. A quota decline cannot refund work already done remotely.
-            var page_arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
-            defer page_arena.deinit();
-            const remaining = limit - examined;
-            const result = (try callback(snapshot.backend.ptr, page_arena.allocator(), table, filters, @max(1, remaining))) orelse return if (found) b.Probe{ .page = .{ .items = &.{}, .examined = examined }, .complete = false } else null;
-            found = true;
-            const used = result.page.examined orelse result.page.items.len;
-            if (used > @max(1, remaining) + 1 or (result.complete and (result.page.next != null or result.page.unfiltered or used < result.page.items.len))) return error.CypherInvalidBackendPage;
-            examined += used;
-            if (!result.complete or examined > limit) return .{ .page = .{ .items = &.{}, .examined = @min(examined, limit + 1) }, .complete = false };
-            for (result.page.items) |node| {
-                if (!std.mem.eql(u8, node.identity.table, table) or !target.owns(node.identity)) return error.CypherInvalidBackendPage;
+            const width = self.readWidth(owners.items[start..], null);
+            const reservation = @max(1, (limit - examined) / width);
+            var single: ReadJob = undefined;
+            var wave: ReadWave = undefined;
+            if (width > 1) wave = .{ .read = self, .shared = .{ .backing = b.reclaimingAllocator(a), .io = self.source.fanout_io.? }, .count = width };
+            defer if (width > 1) wave.deinit() else single.arena.deinit();
+            const jobs = if (width > 1) wave.jobs[0..width] else @as(*[1]ReadJob, @ptrCast(&single))[0..];
+            for (jobs, owners.items[start..][0..width]) |*job, owner| job.* = .{ .owner = owner, .operation = .{ .probe = .{ .table = table, .filters = filters, .limit = reservation } } };
+            if (width > 1) try wave.run(0) else {
+                single.arena = .init(b.reclaimingAllocator(a));
+                try single.invoke(self);
+            }
+            // Complete leaves reserve their exact populations before a skewed
+            // leaf retries. Discarded advisory attempts charge work, not anchors.
+            for (jobs) |job| {
+                const result = job.probe orelse return if (found) b.Probe{ .page = .{ .items = &.{}, .examined = examined }, .complete = false } else null;
+                found = true;
+                const used = try probeUsage(result, reservation);
+                if (result.complete) examined += used;
+            }
+            if (examined > limit) return .{ .page = .{ .items = &.{}, .examined = limit + 1 }, .complete = false };
+            for (jobs) |*job| if (!job.probe.?.complete) {
+                if (width == 1) return .{ .page = .{ .items = &.{}, .examined = @min(limit + 1, examined + try probeUsage(job.probe.?, reservation)) }, .complete = false };
+                _ = job.arena.reset(.free_all);
+                job.operation.probe.limit = @max(1, limit - examined);
+                try job.invoke(self);
+                const result = job.probe orelse return .{ .page = .{ .items = &.{}, .examined = examined }, .complete = false };
+                const used = try probeUsage(result, job.operation.probe.limit);
+                if (!result.complete or used > limit - examined) return .{ .page = .{ .items = &.{}, .examined = @min(limit + 1, examined + used) }, .complete = false };
+                examined += used;
+            };
+            for (jobs) |job| for (job.probe.?.page.items) |node| {
+                if (!std.mem.eql(u8, node.identity.table, table) or !self.targets[job.owner].owns(node.identity)) return error.CypherInvalidBackendPage;
                 const owned = (v.Value{ .node = node }).clone(collected.allocator()) catch |err| {
                     if (err == error.OutOfMemory and quota.exhausted) return .{ .page = .{ .items = &.{}, .examined = examined }, .complete = false };
                     return err;
@@ -778,7 +813,8 @@ pub const ReadSet = struct {
                     if (err == error.OutOfMemory and quota.exhausted) return .{ .page = .{ .items = &.{}, .examined = examined }, .complete = false };
                     return err;
                 };
-            }
+            };
+            start += width;
         }
         if (!found) return null;
         try checkpoint(ptr);
@@ -879,30 +915,51 @@ pub const ReadSet = struct {
             result[index] = (try (v.Value{ .node = value }).clone(a)).node;
         };
     }
+    fn adjacencyOwner(self: *ReadSet, owner: usize, mapping: catalog.Relationship, identity: v.Identity, peer: ?v.Identity, direction: ast.Direction) bool {
+        const graph = self.graph orelse return false;
+        const source = graph.label(mapping.source_label).?.table;
+        const target = graph.label(mapping.target_label).?.table;
+        const shard = self.targets[owner];
+        if (!std.mem.eql(u8, shard.table, source)) return false;
+        const outgoing = direction != .in and std.mem.eql(u8, identity.table, source) and (peer == null or std.mem.eql(u8, peer.?.table, target));
+        const incoming = direction != .out and std.mem.eql(u8, identity.table, target) and (peer == null or std.mem.eql(u8, peer.?.table, source));
+        return (outgoing and shard.owns(identity)) or (incoming and (peer == null or shard.owns(peer.?)));
+    }
+    fn adjacencyPosition(self: *ReadSet, a: A, mapping: catalog.Relationship, identity: v.Identity, peer: ?v.Identity, direction: ast.Direction, encoded: ?[]const u8, start: usize) !?Cursor {
+        if (encoded) |bytes| {
+            const position = try self.cursor(a, self.mappingSource(mapping) orelse return error.UndefinedGraphTable, bytes);
+            if (!self.adjacencyOwner(position.owner, mapping, identity, peer, direction)) return error.CypherInvalidBackendCursor;
+            return position;
+        }
+        for (start..self.targets.len) |owner| if (self.adjacencyOwner(owner, mapping, identity, peer, direction)) return .{ .owner = owner };
+        return null;
+    }
+    fn adjacencyNext(self: *ReadSet, a: A, mapping: catalog.Relationship, identity: v.Identity, peer: ?v.Identity, direction: ast.Direction, position: Cursor, after: ?[]const u8) !?[]const u8 {
+        const next_position = if (after) |bytes| Cursor{ .owner = position.owner, .after = bytes } else (try self.adjacencyPosition(a, mapping, identity, peer, direction, null, position.owner + 1)) orelse return null;
+        return try std.json.Stringify.valueAlloc(a, next_position, .{});
+    }
     fn expand(ptr: *anyopaque, a: A, mapping: catalog.Relationship, identity: v.Identity, direction: ast.Direction, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
         const self = cast(ptr);
         // Physical adjacency, including incoming adjacency, belongs to source
         // owners. Resolve the label from the statement-bound graph at bind.
-        const table = self.mappingSource(mapping) orelse return error.UndefinedGraphTable;
         try checkpoint(ptr);
-        const position = try self.cursor(a, table, encoded);
+        const position = (try self.adjacencyPosition(a, mapping, identity, null, direction, encoded, 0)) orelse return .{ .items = &.{} };
         const owner = self.snapshots[position.owner].backend;
         const page = try owner.vtable.expand(owner.ptr, a, mapping, identity, direction, position.after, limit);
         try checkpoint(ptr);
-        return .{ .items = page.items, .examined = page.examined, .next = try self.next(a, table, position, page.next) };
+        return .{ .items = page.items, .examined = page.examined, .next = try self.adjacencyNext(a, mapping, identity, null, direction, position, page.next) };
     }
     fn expandBetween(ptr: *anyopaque, a: A, mapping: catalog.Relationship, identity: v.Identity, peer: v.Identity, direction: ast.Direction, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize, max_examined: usize) !b.Page(*const v.Relationship) {
         const self = cast(ptr);
-        const table = self.mappingSource(mapping) orelse return error.UndefinedGraphTable;
         try checkpoint(ptr);
-        const position = try self.cursor(a, table, encoded);
+        const position = (try self.adjacencyPosition(a, mapping, identity, peer, direction, encoded, 0)) orelse return .{ .items = &.{} };
         const owner = self.snapshots[position.owner].backend;
         const page = if (owner.vtable.expand_between) |between|
             try between(owner.ptr, a, mapping, identity, peer, direction, filters, position.after, limit, max_examined)
         else
             try owner.vtable.expand(owner.ptr, a, mapping, identity, direction, position.after, limit);
         try checkpoint(ptr);
-        return .{ .items = page.items, .examined = page.examined, .next = try self.next(a, table, position, page.next) };
+        return .{ .items = page.items, .examined = page.examined, .next = try self.adjacencyNext(a, mapping, identity, peer, direction, position, page.next) };
     }
     const SearchMerge = struct {
         read: *ReadSet,
@@ -1778,4 +1835,62 @@ test "distributed probes prove EOF across trailing owners and decline fanout wit
     try std.testing.expectEqual(@as(?usize, 3), declined.page.examined);
     owners[1].revoked = true;
     try std.testing.expectError(error.Forbidden, probe_where(backend.ptr, a, "docs", &.{}, 2));
+}
+
+test "adjacency routing prunes only catalog certified source owners and preserves continuations" {
+    const Fixture = struct {
+        calls: [2]usize = .{ 0, 0 },
+        pages: bool = false,
+        const This = @This();
+        const Owner = struct {
+            fixture: *This,
+            index: usize,
+            fn check(_: *anyopaque) !void {}
+            fn expand(ptr: *anyopaque, _: A, _: catalog.Relationship, _: v.Identity, _: ast.Direction, after: ?[]const u8, _: usize) !b.Page(*const v.Relationship) {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.fixture.calls[self.index] += 1;
+                return .{ .items = &.{}, .next = if (self.fixture.pages and after == null) "more" else null };
+            }
+            fn between(ptr: *anyopaque, a: A, mapping: catalog.Relationship, identity: v.Identity, _: v.Identity, direction: ast.Direction, _: []const b.PropertyFilter, after: ?[]const u8, limit: usize, _: usize) !b.Page(*const v.Relationship) {
+                return expand(ptr, a, mapping, identity, direction, after, limit);
+            }
+        };
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: Fixture = .{};
+    var owners = [_]Fixture.Owner{ .{ .fixture = &fixture, .index = 0 }, .{ .fixture = &fixture, .index = 1 } };
+    var snapshots: [2]Snapshot = undefined;
+    for (&owners, &snapshots) |*owner, *snapshot| snapshot.* = .{ .ptr = owner, .validate = Fixture.Owner.check, .close = undefined, .backend = .{ .ptr = owner, .vtable = &.{ .bind = undefined, .checkpoint = Fixture.Owner.check, .scan = undefined, .get = undefined, .expand = Fixture.Owner.expand, .expand_between = Fixture.Owner.between } } };
+    var targets = [_]Target{
+        .{ .table = "docs", .table_id = 1, .group_id = 1, .ranges = &.{.{ .end = "m" }} },
+        .{ .table = "docs", .table_id = 1, .group_id = 2, .ranges = &.{.{ .start = "m" }} },
+    };
+    const mapping: catalog.Relationship = .{ .name = "R", .stored_type = "R", .index = "links", .source_label = "D", .target_label = "D" };
+    var set: ReadSet = .{ .a = a, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &fixture, .checkpoint = Fixture.Owner.check, .admit = undefined, .capture = undefined }, .graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{ .{ .name = "D", .table = "docs" }, .{ .name = "Other", .table = "other" } }, .relationships = &.{mapping} } };
+    const backend = set.backend();
+    for ([_]bool{ false, true }) |legacy| for ([_]bool{ false, true }) |pages| for ([_]bool{ false, true }) |pair| for ([_]ast.Direction{ .out, .in, .both }) |direction| {
+        fixture.calls = .{ 0, 0 };
+        fixture.pages = pages;
+        if (legacy) {
+            for (&targets) |*target| target.ranges = &.{};
+        }
+        var after: ?[]const u8 = null;
+        while (true) {
+            const page = if (pair) try backend.vtable.expand_between.?(backend.ptr, a, mapping, .{ .table = "docs", .key = "a" }, .{ .table = "docs", .key = "z" }, direction, &.{}, after, 1, 8) else try backend.vtable.expand(backend.ptr, a, mapping, .{ .table = "docs", .key = "a" }, direction, after, 1);
+            after = page.next orelse break;
+        }
+        const visits: usize = if (pages) 2 else 1;
+        try std.testing.expectEqual(if (legacy or direction != .in or !pair) visits else 0, fixture.calls[0]);
+        try std.testing.expectEqual(if (legacy or direction != .out) visits else 0, fixture.calls[1]);
+    };
+    // A known source in the other physical table cannot have outgoing rows in
+    // this mapping. Incoming rows must still query every declared source owner.
+    var cross = mapping;
+    cross.target_label = "Other";
+    fixture.pages = false;
+    fixture.calls = .{ 0, 0 };
+    _ = try backend.vtable.expand(backend.ptr, a, cross, .{ .table = "other", .key = "a" }, .out, null, 1);
+    try std.testing.expectEqual([2]usize{ 0, 0 }, fixture.calls);
 }

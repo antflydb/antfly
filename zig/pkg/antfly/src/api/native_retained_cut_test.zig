@@ -712,15 +712,15 @@ test "external lake Cypher execution reads immutable native document and graph c
     var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .start_index_workers = false, .start_optional_runtime_workers = false });
     defer db.close();
     try db.setSchemaJson(a,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"by_id","keys":[{"column":"id"}]},{"name":"by_bucket","keys":[{"column":"bucket"}]},{"name":"by_large","keys":[{"column":"large"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"string"},"bucket":{"type":"integer"},"large":{"type":"number"}},"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"by_id","keys":[{"column":"id"}]},{"name":"by_bucket","keys":[{"column":"bucket"}]},{"name":"by_large","keys":[{"column":"large"}]},{"name":"by_bucket_code","keys":[{"column":"bucket"},{"column":"code"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"string"},"code":{"type":"string"},"bucket":{"type":"integer"},"large":{"type":"number"}},"additionalProperties":false}}}}
     );
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const temporary = arena.allocator();
     const writes = try temporary.alloc(local.storage_db_types.BatchWrite, 2000);
-    for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(temporary, "n{d}", .{i}), .value = try std.fmt.allocPrint(temporary, "{{\"id\":\"n{d}\",\"bucket\":{d},\"large\":{d}}}", .{ i, i % 4, @as(u64, 9007199254740994) + i * 2 }) };
+    for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(temporary, "n{d}", .{i}), .value = try std.fmt.allocPrint(temporary, "{{\"id\":\"n{d}\",\"code\":\"n{d}\",\"bucket\":{d},\"large\":{d}}}", .{ i, i, i % 4, @as(u64, 9007199254740994) + i * 2 }) };
     try db.batch(.{ .writes = writes });
-    for ([_][]const u8{ "by_id", "by_bucket", "by_large" }) |name| for (0..128) |_| {
+    for ([_][]const u8{ "by_id", "by_bucket", "by_large", "by_bucket_code" }) |name| for (0..128) |_| {
         if ((try db.relationalIndexBuildStatus(name)).state == .ready) break;
         try db.buildRelationalIndexStep(name, .{});
     } else return error.TestIndexNotReady;
@@ -738,6 +738,9 @@ test "external lake Cypher execution reads immutable native document and graph c
         }
         fn typed(ptr: *anyopaque, alloc: std.mem.Allocator, request: cypher.rpc.Request) !cypher.rpc.Reply {
             const port: *local.storage_statement_read_fence.GraphRead = @ptrCast(@alignCast(ptr));
+            var bytes = std.Io.Writer.Discarding.init(&.{});
+            try std.json.Stringify.value(request, .{}, &bytes.writer);
+            try std.testing.expect(bytes.fullCount() <= 1 << 20);
             return port.invokeTyped(alloc, request);
         }
     };
@@ -780,11 +783,54 @@ test "external lake Cypher execution reads immutable native document and graph c
         after = page.next;
     }
     try std.testing.expectEqual(@as(usize, 400), count);
+    // A composite IN plan must resume one-row pages in mixed-radix order.
+    // No independent index exists on code, so a prefix-only scan would visit
+    // 1,000 rows and cannot satisfy this two-anchor contract.
+    const composite = [_]cypher.backend.PropertyFilter{
+        .{ .property = "bucket", .op = .in, .domain = .integer, .value = .{ .list = &.{ .{ .integer = 1 }, .{ .integer = 2 } } } },
+        .{ .property = "code", .op = .in, .domain = .string, .value = .{ .list = &.{ .{ .string = "n1997" }, .{ .string = "n1998" } } } },
+    };
+    after = null;
+    var composite_rows: usize = 0;
+    var composite_anchors: usize = 0;
+    while (true) {
+        const page = try backend.vtable.scan_where.?(backend.ptr, temporary, "docs", &composite, after, 1);
+        composite_rows += page.items.len;
+        composite_anchors += page.examined orelse page.items.len;
+        after = page.next orelse break;
+    }
+    try std.testing.expectEqual(@as(usize, 2), composite_rows);
+    try std.testing.expectEqual(@as(usize, 2), composite_anchors);
+    // An unrelated oversized domain must not destroy the cheap complete
+    // prefix domains needed by the selected composite plan.
+    const long_prefix = try temporary.alloc(u8, 3000);
+    @memset(long_prefix, 'x');
+    const irrelevant = try temporary.alloc(cypher.value.Value, 400);
+    for (irrelevant, 0..) |*value, i| value.* = .{ .string = try std.fmt.allocPrint(temporary, "{s}{d}", .{ long_prefix, i }) };
+    const sampled_composite = [_]cypher.backend.PropertyFilter{
+        .{ .property = "absent", .op = .in, .domain = .string, .value = .{ .list = irrelevant } },
+        .{ .property = "bucket", .op = .in, .domain = .integer, .value = .{ .list = &.{ .{ .integer = 0 }, .{ .integer = 1 }, .{ .integer = 2 }, .{ .integer = 3 } } } },
+        composite[1],
+    };
+    after = null;
+    composite_rows = 0;
+    composite_anchors = 0;
+    while (true) {
+        const page = try backend.vtable.scan_where.?(backend.ptr, temporary, "docs", &sampled_composite, after, 1);
+        composite_rows += page.items.len;
+        composite_anchors += page.examined orelse page.items.len;
+        after = page.next orelse break;
+    }
+    try std.testing.expectEqual(@as(usize, 2), composite_rows);
+    try std.testing.expectEqual(@as(usize, 2), composite_anchors);
     const graph: cypher.catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{} };
     for ([_]struct { query: []const u8, count: i64, anchors: usize }{
         .{ .query = "MATCH(n:D) WHERE n.bucket IN [0,1,2,3] AND n.id='n1999' RETURN count(*)", .count = 1, .anchors = 1 },
         .{ .query = "MATCH(n:D) WHERE n.bucket IN [0,1,2,3] AND n.id IN ['n1999','n1998'] RETURN count(*)", .count = 2, .anchors = 2 },
         .{ .query = "MATCH(n:D) WHERE n.id IN ['n1999','n1998'] AND n.bucket IN [0,1,2,3] RETURN count(*)", .count = 2, .anchors = 2 },
+        .{ .query = "MATCH(n:D) WHERE n.bucket IN [1,2] AND n.code IN ['n1997','n1998'] RETURN count(*)", .count = 2, .anchors = 2 },
+        .{ .query = "MATCH(n:D) WHERE n.code IN ['n1997','n1998'] AND n.bucket IN [1,2] RETURN count(*)", .count = 2, .anchors = 2 },
+        .{ .query = "MATCH(n:D) WHERE n.bucket IN [1,1,null,2] AND n.code IN ['n1997','n1998','n1997'] RETURN count(*)", .count = 2, .anchors = 2 },
         .{ .query = "MATCH(n:D) WHERE n.large=9007199254740994 RETURN count(*)", .count = 1, .anchors = 1 },
         .{ .query = "MATCH(n:D) WHERE n.missing IN [1,2] AND n.large=9007199254740994 RETURN count(*)", .count = 0, .anchors = 1 },
         .{ .query = "MATCH(n:D) WHERE n.large=9007199254740993 AND n.id='n1999' RETURN count(*)", .count = 0, .anchors = 1 },
