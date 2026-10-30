@@ -21904,7 +21904,7 @@ pub const ApiHttpServer = struct {
     pub fn executeMemoryService(self: *ApiHttpServer, space: []const u8, input: @import("memory.zig").Request, borrowed_identity: ?AuthenticatedIdentity, borrowed_context: api_operation.RequestContext) !contextual_operations.OwnedResponse {
         return self.executeMemoryServiceInner(space, input, borrowed_identity, borrowed_context) catch |err| {
             const status_code = @import("memory.zig").status(err);
-            return contextual_operations.jsonWithStatus(status_code, try std.json.Stringify.valueAlloc(self.alloc, .{ .code = @errorName(err), .@"error" = @errorName(err), .retryable = status_code == 503 or status_code == 429 }, .{}), false);
+            return contextual_operations.jsonWithStatus(status_code, try std.json.Stringify.valueAlloc(self.alloc, .{ .code = @errorName(err), .@"error" = @import("memory.zig").errorMessage(err), .retryable = status_code == 503 or status_code == 429 }, .{}), false);
         };
     }
     fn executeMemoryServiceInner(self: *ApiHttpServer, space: []const u8, input: @import("memory.zig").Request, borrowed_identity: ?AuthenticatedIdentity, borrowed_context: api_operation.RequestContext) !contextual_operations.OwnedResponse {
