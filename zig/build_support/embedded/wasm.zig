@@ -333,6 +333,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_scraping_mod.addImport("antfly_source_reference", embedded_support_wasm_mod.import_table.get("antfly_source_reference").?);
     wasm_scraping_mod.addImport("objectstore", wasm_objectstore_mod);
     wasm_scraping_mod.addImport("httpx", httpx_mod);
+    wasm_scraping_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_scraping_mod.addImport("antfly_data_uri", wasm_data_uri_mod);
     embedded_support_wasm_mod.addImport("antfly_scraping", wasm_scraping_mod);
     const apple_options = b.addOptions();
