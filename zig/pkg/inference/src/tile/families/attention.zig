@@ -15,6 +15,10 @@
 
 //! Generated kernel regions of the `attention` families.
 
-const Region = @import("../region.zig").Region;
+const r = @import("../region.zig");
+const split = @import("../attention_split.zig");
 
-pub const regions = [_]Region{};
+pub const regions = [_]r.Region{
+    r.metal("attention.gqa_split", split.split_region),
+    r.metal("attention.gqa_batch", split.batch_region),
+};
