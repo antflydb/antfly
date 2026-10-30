@@ -1088,13 +1088,18 @@ pub const Session = struct {
             self.mutex.unlock();
             break;
         }
-        errdefer self.failed(stage);
+        var cleanup_stage = true;
+        errdefer if (cleanup_stage) self.failed(stage);
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
         const work = scratch.allocator();
         try self.reserve(stage, upper);
         const output: Output = invoke(context, work) catch |err| {
             if (isPreDispatchRefusal(err)) {
+                // released() retires this worker's slot and handles storage
+                // failures itself. A replacement can claim the same key as
+                // soon as it is removed; unwinding must not fail that worker.
+                cleanup_stage = false;
                 self.released(stage, upper);
                 return err;
             }
@@ -1844,6 +1849,61 @@ test "document durable admission never waits for failed or untracked reservation
         try std.testing.expectEqual(upper, reclaimed.used);
         try std.testing.expectEqual(upper, reclaimed.uncertain);
     }
+}
+
+test "document refused worker cleanup preserves a replacement stage" {
+    const a = std.testing.allocator;
+    var memory = TestStore{ .a = a };
+    defer memory.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const store = memory.interface();
+    const identity: Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try store.create(.{ .run_id = "race", .owner = "alice", .identity = identity, .limits = .{ .calls = 1, .tokens = 10 }, .inputs = &.{} });
+    const Clock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 1;
+        }
+    };
+    const Hook = struct {
+        session: ?*Session = null,
+        armed: bool = false,
+        retried: bool = false,
+        fn allocator(self: *@This()) A {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = A.noResize, .remap = A.noRemap, .free = free } };
+        }
+        fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            return std.testing.allocator.rawAlloc(len, alignment, ret);
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Schedule another worker after released() removes the old slot,
+            // while its scratch arena unwinds, before execute's errdefer runs.
+            if (self.armed and !self.session.?.stages.contains(@splat(1))) {
+                self.armed = false;
+                self.session.?.beginIntent(@splat(1), .{ .calls = 1, .tokens = 10 }) catch unreachable;
+                self.retried = true;
+            }
+            std.testing.allocator.rawFree(bytes, alignment, ret);
+        }
+        fn busy(self: *@This(), _: A) !Session.Output {
+            self.armed = true;
+            return error.QueueFull;
+        }
+    };
+    var hook = Hook{};
+    const lease = try store.claim(work, "race", "alice", identity, 1, 10);
+    var session = try Session.init(hook.allocator(), store, lease, identity, .{ .now_fn = Clock.now }, 16, 32768);
+    defer session.deinit();
+    hook.session = &session;
+    try std.testing.expectError(error.QueueFull, session.execute(work, @splat(1), .{ .calls = 1, .tokens = 10 }, 0, &hook, Hook.busy));
+    try std.testing.expect(hook.retried);
+    const after = try store.load(work, "race", "alice");
+    try std.testing.expectEqual(@as(usize, 1), after.pending.len);
+    try std.testing.expectEqual(Charge{}, after.uncertain);
+    try std.testing.expect(!session.stages.get(@splat(1)).?.failed);
+    _ = try session.commitIntent(work, @splat(1), .{ .calls = 1, .tokens = 3 }, "", "");
 }
 
 test "document durable refusals before dispatch refund their reservation" {

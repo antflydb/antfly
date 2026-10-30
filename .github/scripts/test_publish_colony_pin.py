@@ -198,6 +198,77 @@ class PublisherTests(unittest.TestCase):
         )
         self.assertNotIn("SENTINEL_TOKEN", str(second.call_args))
 
+    def test_api_failure_reports_only_safe_status_and_permission_area(self):
+        api = p.GitHub("SENTINEL_TOKEN")
+        response = io.BytesIO(b'{"private_body":"MUST_NOT_APPEAR"}')
+        error = urllib.error.HTTPError(
+            "https://api.github.com/secret-url", 403, "PRIVATE_REASON", {}, response
+        )
+        with patch.object(api.opener, "open", side_effect=error):
+            with self.assertRaises(p.PublicationError) as caught:
+                api.request(
+                    "repos/antflydb/colony/actions/workflows/update-antfly-submodule.yml/runs"
+                )
+        message = str(caught.exception)
+        self.assertIn("Actions read", message)
+        self.assertIn("HTTP 403", message)
+        for secret in (
+            "SENTINEL_TOKEN",
+            "MUST_NOT_APPEAR",
+            "PRIVATE_REASON",
+            "secret-url",
+        ):
+            self.assertNotIn(secret, message)
+
+    def test_refusal_classification_never_prints_provider_body_or_urls(self):
+        cases = [
+            (
+                {
+                    "X-GitHub-Request-Id": "id",
+                    "X-Accepted-GitHub-Permissions": "actions=read",
+                },
+                "Resource not accessible by personal access token",
+                "token-permissions",
+            ),
+            ({"X-RateLimit-Remaining": "0"}, "secret response", "rate-limit"),
+            (
+                {"X-GitHub-SSO": "required; url=https://example.com/PRIVATE"},
+                "secret response",
+                "sso-authorization",
+            ),
+            ({}, "Invalid User-Agent", "user-agent"),
+            (
+                {"X-Mitmproxy-Blocked-Reason": "PRIVATE"},
+                "secret response",
+                "network-policy",
+            ),
+            ({}, "organization IP allowlist rejected request", "ip-allowlist"),
+            (
+                {},
+                "personal access token blocked by organization policy",
+                "token-policy",
+            ),
+        ]
+        for headers, body, expected in cases:
+            with self.subTest(expected=expected):
+                error = urllib.error.HTTPError(
+                    "https://example.com/PRIVATE",
+                    403,
+                    "PRIVATE",
+                    headers,
+                    io.BytesIO((body + " SENTINEL_TOKEN PRIVATE").encode()),
+                )
+                summary = p.refusal_summary(error)
+                self.assertIn("reason=" + expected, summary)
+                for private in ("SENTINEL_TOKEN", "PRIVATE", "https://", body):
+                    self.assertNotIn(private, summary)
+
+    def test_requests_identify_the_publisher_and_keep_credentials_off_redirects(self):
+        api = p.GitHub("SENTINEL_TOKEN")
+        with patch.object(api.opener, "open", return_value=io.BytesIO(b"{}")) as send:
+            self.assertEqual(api.request("repos/antflydb/colony"), {})
+        self.assertEqual(send.call_args.args[0].get_header("User-agent"), p.USER_AGENT)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,7 +18,55 @@ COLONY = "antflydb/colony"
 UPSTREAM = "antflydb/antfly"
 WORKFLOW = "update-antfly-submodule.yml"
 API_ROOT = "https://api.github.com/"
+USER_AGENT = "antfly-colony-pin-publisher"
 SHA = re.compile(r"[0-9a-f]{40}")
+
+
+class PublicationError(ValueError):
+    """Only deliberately sanitized, public-safe diagnostics use this type."""
+
+
+def refusal_summary(error):
+    """Classify known provider refusals without printing any response text/URL."""
+    try:
+        body = error.read(8192).decode("utf-8", errors="replace").lower()
+    finally:
+        error.close()
+    headers = error.headers or {}
+    if (
+        error.code == 429
+        or headers.get("X-RateLimit-Remaining") == "0"
+        or "rate limit" in body
+        or "abuse detection" in body
+    ):
+        reason = "rate-limit"
+    elif headers.get("X-GitHub-SSO") or "saml" in body or "single sign-on" in body:
+        reason = "sso-authorization"
+    elif "user-agent" in body or "user agent" in body:
+        reason = "user-agent"
+    elif headers.get("X-Mitmproxy-Blocked-Reason"):
+        reason = "network-policy"
+    elif "ip allow" in body:
+        reason = "ip-allowlist"
+    elif error.code == 401 or "bad credentials" in body:
+        reason = "invalid-credential"
+    elif "resource not accessible" in body or "insufficient permission" in body:
+        reason = "token-permissions"
+    elif "personal access token" in body and any(
+        word in body for word in ("blocked", "policy", "not allowed")
+    ):
+        reason = "token-policy"
+    else:
+        reason = "unclassified"
+    origin = "github" if headers.get("X-GitHub-Request-Id") else "unverified"
+    accepted = headers.get("X-Accepted-GitHub-Permissions", "")
+    required = [
+        permission
+        for permission in ("actions=read", "contents=read", "contents=write")
+        if permission
+        in [value.strip() for value in accepted.replace(";", ",").split(",")]
+    ]
+    return f"reason={reason}; origin={origin}; required={','.join(required) or 'not-reported'}"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -38,6 +86,7 @@ class GitHub:
             data=json.dumps(body).encode() if body is not None else None,
             headers={
                 "Authorization": "Bearer " + self.token,
+                "User-Agent": USER_AGENT,
                 "Accept": "application/vnd.github+json",
                 "Content-Type": "application/json",
                 "X-GitHub-Api-Version": "2022-11-28",
@@ -47,8 +96,9 @@ class GitHub:
             with self.opener.open(request, timeout=30) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
-            raise ValueError(
-                f"GitHub {method} failed with HTTP {exc.code}; no token/body logged"
+            area = "Actions read" if "/actions/" in path else "repository contents"
+            raise PublicationError(
+                f"GitHub {method} {area} failed with HTTP {exc.code}; {refusal_summary(exc)}; no token/body logged"
             ) from None
 
     def archive(self, artifact_id):
@@ -56,6 +106,7 @@ class GitHub:
             API_ROOT + f"repos/{COLONY}/actions/artifacts/{int(artifact_id)}/zip",
             headers={
                 "Authorization": "Bearer " + self.token,
+                "User-Agent": USER_AGENT,
                 "Accept": "application/vnd.github+json",
             },
         )
@@ -63,22 +114,24 @@ class GitHub:
             response = self.opener.open(request, timeout=30)
         except urllib.error.HTTPError as exc:
             if exc.code != 302:
-                raise ValueError(f"Artifact download failed: HTTP {exc.code}") from None
+                raise PublicationError(
+                    f"Artifact download failed: HTTP {exc.code}; {refusal_summary(exc)}"
+                ) from None
             location = exc.headers.get("Location", "")
             if not location.startswith("https://"):
-                raise ValueError("Artifact redirect must use HTTPS")
+                raise PublicationError("Artifact redirect must use HTTPS")
             # Deliberately a new unauthenticated request, never forwarding the PAT.
             response = urllib.request.urlopen(location, timeout=30)
         with response:
             data = response.read(65537)
         if len(data) > 65536:
-            raise ValueError("Unexpectedly large validation artifact")
+            raise PublicationError("Unexpectedly large validation artifact")
         return data
 
 
 def require(condition, message):
     if not condition:
-        raise ValueError(message)
+        raise PublicationError(message)
 
 
 def read_manifest(data):
@@ -153,7 +206,9 @@ def wait_for_validation(api, request, timeout=2100):
                 )
                 return run, manifest
         time.sleep(15)
-    raise ValueError("Timed out waiting for private Colony validation; main unchanged")
+    raise PublicationError(
+        "Timed out waiting for private Colony validation; main unchanged"
+    )
 
 
 def entries(tree):
@@ -241,6 +296,8 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except PublicationError as exc:
+        raise SystemExit("Automatic pin publication stopped: " + str(exc)) from None
     except (ValueError, KeyError, OSError, zipfile.BadZipFile):
         # API bodies/redirect URLs and private repository contents stay out of public logs.
         raise SystemExit(

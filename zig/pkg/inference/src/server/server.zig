@@ -7728,8 +7728,9 @@ pub const Node = struct {
             item.source_fingerprint = if (image.source_fingerprint) |value| try allocator.dupe(u8, value) else null;
             item.page_number = image.page_number;
         }
+        const usage = try readers_api.measuredUsage(out);
         const execution = try qwenReadExecution(allocator, results);
-        return .{ .items = out, .execution = execution };
+        return .{ .items = out, .execution = execution, .usage = usage };
     }
 
     const ConcurrentOcrBenchTask = struct {
@@ -11413,7 +11414,7 @@ pub const Node = struct {
         // tokens, so plan its encoder bytes from the exact prepared request.
         const reference_encoder_bytes: ?usize = if ((backend == .metal or backend == .cuda) and execution_options.metal_execution_policy != .optimized_v2) bytes: {
             failure.* = .{ .stage = "tokenizing" };
-            const planned = try boundary_executor.referenceEncoderDeviceBytes(scratch, &config, loaded.getTokenizer(), &request, execution_options);
+            const planned = try boundary_executor.referenceEncoderDeviceBytes(if (backend == .cuda) .cuda else .metal, scratch, &config, loaded.getTokenizer(), &request, execution_options);
             failure.* = .{ .stage = "model" };
             break :bytes planned;
         } else null;
@@ -33193,6 +33194,7 @@ test "Qwen3-VL encoded read results own page identities and report serial execut
             defer batch.deinit(allocator);
             try std.testing.expectEqual(@as(i64, 21), batch.usage.?.prompt_tokens);
             try std.testing.expectEqual(@as(i64, 4), batch.usage.?.completion_tokens);
+            try std.testing.expectEqual(@as(i64, 25), batch.usage.?.total_tokens);
             try std.testing.expectEqual(readers_api.Completion.complete, batch.items[0].completion);
             try std.testing.expectEqual(readers_api.Completion.length, batch.items[1].completion);
             try std.testing.expectEqual(@as(?usize, 11), batch.items[1].prompt_tokens);
