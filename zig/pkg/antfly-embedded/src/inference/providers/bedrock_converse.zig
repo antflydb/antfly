@@ -17,10 +17,12 @@
 //! from model IDs: the gateway's capability declaration owns that admission.
 const std = @import("std");
 const inference = @import("antfly_inference_types");
+const api = @import("bedrock_api");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 
 pub const Options = struct {
+    streaming: bool = false,
     max_tokens: i64 = 256,
     temperature: ?f32 = null,
     top_p: ?f32 = null,
@@ -182,6 +184,13 @@ pub fn requestJsonAlloc(alloc: Allocator, messages: []const inference.ChatMessag
         }
         try root.object.put(a, "toolConfig", tool_config);
     } else if (options.tool_choice_json != null) return error.InvalidGeneratorConfig;
+    // Validate the native wire body before signing; keep the original tree so
+    // signed reasoning blocks and document-valued tool schemas are preserved.
+    if (options.streaming) {
+        _ = std.json.parseFromValueLeaky(api.ConverseStreamRequestBody, a, root, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceRequest;
+    } else {
+        _ = std.json.parseFromValueLeaky(api.ConverseRequestBody, a, root, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceRequest;
+    }
     return std.json.Stringify.valueAlloc(alloc, root, .{});
 }
 
@@ -247,7 +256,11 @@ pub fn finishReason(native: []const u8) !inference.GenerationFinishReason {
 pub fn responseAlloc(alloc: Allocator, body: []const u8) !inference.GenerateResult {
     var parsed = try std.json.parseFromSlice(Value, alloc, body, .{});
     defer parsed.deinit();
-    const message = try field(try field(parsed.value, "output"), "message");
+    var envelope = std.json.parseFromValue(api.ConverseResponse, alloc, parsed.value, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBedrockResponse;
+    defer envelope.deinit();
+    const native_output = try field(parsed.value, "output");
+    if (native_output != .object or native_output.object.count() != 1) return error.InvalidBedrockResponse;
+    const message = try field(native_output, "message");
     if (!std.mem.eql(u8, try string(try field(message, "role")), "assistant")) return error.InvalidBedrockResponse;
     const parts = try field(message, "content");
     if (parts != .array or parts.array.items.len == 0) return error.InvalidBedrockResponse;
@@ -260,7 +273,7 @@ pub fn responseAlloc(alloc: Allocator, body: []const u8) !inference.GenerateResu
         calls.deinit(alloc);
     }
     for (parts.array.items) |part| {
-        if (part != .object) return error.InvalidBedrockResponse;
+        if (part != .object or part.object.count() != 1) return error.InvalidBedrockResponse;
         if (part.object.get("text")) |value| {
             try output.appendSlice(alloc, try string(value));
         } else if (part.object.get("toolUse")) |use| {
@@ -310,7 +323,7 @@ pub fn testConverseWire() !void {
     try std.testing.expectEqualStrings("aW1hZ2U=", parts[1].object.get("image").?.object.get("source").?.object.get("bytes").?.string);
     try std.testing.expectEqualStrings("call-1", turns[2].object.get("content").?.array.items[0].object.get("toolResult").?.object.get("toolUseId").?.string);
     var result = try responseAlloc(a,
-        \\{"output":{"message":{"role":"assistant","content":[{"reasoningContent":{"reasoningText":{"text":"private","signature":"signed"}}},{"reasoningContent":{"redactedContent":"cmVkYWN0ZWQ="}},{"text":"Compared"},{"toolUse":{"toolUseId":"call-2","name":"lookup","input":{"id":8}}}]}},"stopReason":"tool_use","usage":{"inputTokens":100,"outputTokens":5,"totalTokens":105}}
+        \\{"metrics":{"latencyMs":1},"output":{"message":{"role":"assistant","content":[{"reasoningContent":{"reasoningText":{"text":"private","signature":"signed"}}},{"reasoningContent":{"redactedContent":"cmVkYWN0ZWQ="}},{"text":"Compared"},{"toolUse":{"toolUseId":"call-2","name":"lookup","input":{"id":8}}}]}},"stopReason":"tool_use","usage":{"inputTokens":100,"outputTokens":5,"totalTokens":105}}
     );
     defer result.deinit();
     try std.testing.expectEqual(inference.GenerationFinishReason.tool_calls, result.finish_reason.?);
@@ -337,14 +350,14 @@ pub fn testConverseWire() !void {
     try std.testing.expectError(error.InvalidInferenceRequest, requestJsonAlloc(a, &.{replay}, .{}));
     // AWS signatures are optional, and a present signature must still be a string.
     var unsigned = try responseAlloc(a,
-        \\{"output":{"message":{"role":"assistant","content":[{"reasoningContent":{"reasoningText":{"text":"private"}}},{"text":"ok"}]}},"stopReason":"end_turn"}
+        \\{"metrics":{"latencyMs":1},"output":{"message":{"role":"assistant","content":[{"reasoningContent":{"reasoningText":{"text":"private"}}},{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":1,"outputTokens":1,"totalTokens":2}}
     );
     defer unsigned.deinit();
     const unsigned_replay = try requestJsonAlloc(a, &.{.{ .role = .assistant, .content = .{ .parts = &.{ .{ .text = "o" }, .{ .text = "k" } } }, .bedrock_content_json = unsigned.bedrock_content_json }}, .{});
     defer a.free(unsigned_replay);
     try std.testing.expect(std.mem.indexOf(u8, unsigned_replay, "signature") == null);
     try std.testing.expectError(error.InvalidBedrockResponse, responseAlloc(a,
-        \\{"output":{"message":{"role":"assistant","content":[{"reasoningContent":{"reasoningText":{"text":"private","signature":7}}}]}},"stopReason":"end_turn"}
+        \\{"metrics":{"latencyMs":1},"output":{"message":{"role":"assistant","content":[{"reasoningContent":{"reasoningText":{"text":"private","signature":7}}}]}},"stopReason":"end_turn","usage":{"inputTokens":1,"outputTokens":1,"totalTokens":2}}
     ));
     // Completed and streaming adapters share the same stop-reason mapping.
     const cases = .{
@@ -357,13 +370,42 @@ pub fn testConverseWire() !void {
         .{ "content_filtered", inference.GenerationFinishReason.content_filter },
     };
     inline for (cases) |case| {
-        const body = try std.fmt.allocPrint(a, "{{\"output\":{{\"message\":{{\"role\":\"assistant\",\"content\":[{{\"text\":\"partial\"}}]}}}},\"stopReason\":\"{s}\"}}", .{case[0]});
+        const body = try std.fmt.allocPrint(a, "{{\"metrics\":{{\"latencyMs\":1}},\"usage\":{{\"inputTokens\":1,\"outputTokens\":1,\"totalTokens\":2}},\"output\":{{\"message\":{{\"role\":\"assistant\",\"content\":[{{\"text\":\"partial\"}}]}}}},\"stopReason\":\"{s}\"}}", .{case[0]});
         defer a.free(body);
         var finished = try responseAlloc(a, body);
         defer finished.deinit();
         try std.testing.expectEqual(case[1], finished.finish_reason.?);
     }
     try std.testing.expectError(error.InvalidBedrockResponse, finishReason("unknown_future_reason"));
+    // The generated contract catches malformed native fields that the public
+    // tool-options translator otherwise copies through without inspecting.
+    inline for (.{ false, true }) |streaming| {
+        try std.testing.expectError(error.InvalidInferenceRequest, requestJsonAlloc(a, &.{.{ .role = .user, .content = .{ .text = "hi" } }}, .{
+            .streaming = streaming,
+            .tools_json = "[{\"function\":{\"name\":7,\"parameters\":{}}}]",
+        }));
+        const native_tools = try requestJsonAlloc(a, &.{.{ .role = .user, .content = .{ .text = "hi" } }}, .{
+            .streaming = streaming,
+            .tools_json = "[{\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\"},\"strict\":true}}]",
+            .tool_choice_json = "\"required\"",
+            .response_format_json = "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"answer\",\"schema\":{\"type\":\"object\"}}}",
+        });
+        defer a.free(native_tools);
+        try std.testing.expect(std.mem.indexOf(u8, native_tools, "\"strict\":true") != null);
+    }
+    // Required AWS envelopes and tagged content types must validate before
+    // projection; future unrelated envelope fields remain compatible.
+    const valid_response =
+        \\{"output":{"message":{"role":"assistant","content":[{"text":"hi"}]}},"stopReason":"end_turn","usage":{"inputTokens":1,"outputTokens":1,"totalTokens":2},"metrics":{"latencyMs":1},"futureField":true}
+    ;
+    var valid = try responseAlloc(a, valid_response);
+    defer valid.deinit();
+    var malformed = try std.json.parseFromSlice(Value, a, valid_response, .{});
+    defer malformed.deinit();
+    _ = malformed.value.object.swapRemove("metrics");
+    const missing_metrics = try std.json.Stringify.valueAlloc(a, malformed.value, .{});
+    defer a.free(missing_metrics);
+    try std.testing.expectError(error.InvalidBedrockResponse, responseAlloc(a, missing_metrics));
 }
 
 test "Bedrock Converse preserves images text tool identities and usage" {

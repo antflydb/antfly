@@ -1050,6 +1050,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    inference_bedrock_mod.addAnonymousImport("bedrock_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/bedrock_api/root.zig") });
     inference_bedrock_mod.addImport("antfly_cancellation", cancellation_mod);
     inference_bedrock_mod.addImport("httpx", httpx_mod);
     inference_bedrock_mod.addImport("antfly_hash", hash_mod);
