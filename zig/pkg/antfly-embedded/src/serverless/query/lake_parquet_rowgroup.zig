@@ -11263,10 +11263,11 @@ test "external lake Parquet speculative pull phases preserve CPU headroom and dr
         inventory: external_source.Inventory,
         names: []const []const u8,
         speculative: bool,
+        input_limit: usize = 256 * 1024 * 1024,
         fn execute(self: *@This()) !i64 {
             var budget: @import("../../sql/memory_budget.zig") = .{ .backing = std.heap.page_allocator, .limit = 6 * 1024 * 1024 };
             defer std.debug.assert(budget.live == 0);
-            var cursor = try Cursor.init(budget.allocator(), .{ .ctx = self.reader, .read_range_alloc = Reader.read }, self.inventory, "data", 0, self.names, .{});
+            var cursor = try Cursor.init(budget.allocator(), .{ .ctx = self.reader, .read_range_alloc = Reader.read }, self.inventory, "data", 0, self.names, .{ .max_input_bytes = self.input_limit });
             defer cursor.deinit();
             cursor.shared_reader = self.shared;
             cursor.scheduler = self.shared.scheduler;
@@ -11282,22 +11283,24 @@ test "external lake Parquet speculative pull phases preserve CPU headroom and dr
     var memory = storage.MemoryObjectStorage.init(a);
     defer memory.deinit();
     var nonce: u8 = 0;
-    const Mode = enum { success, cancel, cpu_full, io_full };
-    for (1..3) |width| for ([_]Mode{ .success, .cancel, .cpu_full, .io_full }) |mode| {
+    const Mode = enum { success, cancel, cpu_full, io_full, cpu_input_full, input_full };
+    for (1..3) |width| for ([_]Mode{ .success, .cancel, .cpu_full, .io_full, .cpu_input_full, .input_full }) |mode| {
+        const tight_input = mode == .cpu_input_full or mode == .input_full;
+        const busy_cpu = mode == .cpu_full or mode == .cpu_input_full;
         var scheduler: scheduling.Scheduler = .{ .max_workers = 1, .max_io_workers = if (mode == .io_full) 0 else 2 };
         var cache = caching.Cache.init(a);
         defer cache.deinit();
-        var shared: caching.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(memory.client()), .scope = @splat(nonce), .context = .{ .io = io }, .scheduler = &scheduler };
+        var shared: caching.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(memory.client()), .scope = @splat(nonce), .context = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s }, .scheduler = &scheduler };
         defer shared.drain(true);
         nonce += 1;
-        var reader: Reader = .{ .bytes = bytes.items, .width = width };
+        var reader: Reader = .{ .bytes = bytes.items, .width = if (tight_input) 1 else width };
         var cpu_gate: std.Io.Event = .unset;
-        var busy: ?scheduling.Task(anyerror!usize) = if (mode == .cpu_full) scheduler.submit(io, 1, Reader.cpu, .{@as(?*std.Io.Event, &cpu_gate)}) else null;
+        var busy: ?scheduling.Task(anyerror!usize) = if (busy_cpu) scheduler.submit(io, 1, Reader.cpu, .{@as(?*std.Io.Event, &cpu_gate)}) else null;
         defer if (busy) |*task| {
             _ = task.cancel(io) catch {};
         };
         const names = [_][]const u8{ "a", "b" };
-        var run: Run = .{ .reader = &reader, .shared = &shared, .inventory = inventory, .names = names[0..width], .speculative = true };
+        var run: Run = .{ .reader = &reader, .shared = &shared, .inventory = inventory, .names = names[0..width], .speculative = true, .input_limit = if (tight_input) split else 256 * 1024 * 1024 };
         var task = scheduler.submitPullTransient(io, 6 * 1024 * 1024, Run.execute, .{&run}).?;
         defer if (task.future != null) {
             _ = task.cancel(io) catch {};
@@ -11312,9 +11315,15 @@ test "external lake Parquet speculative pull phases preserve CPU headroom and dr
             const ios = scheduler.io_workers;
             const pulls = scheduler.pull_workers;
             scheduler.mutex.unlock();
-            try std.testing.expectEqual(@as(usize, @intFromBool(mode == .cpu_full)), cpus);
-            try std.testing.expectEqual(width, ios);
-            try std.testing.expectEqual(@as(usize, 1), pulls);
+            try std.testing.expectEqual(@as(usize, @intFromBool(busy_cpu)), cpus);
+            if (tight_input) {
+                // A nonblocking input decline may already have drained the
+                // other phase before this observer resumes from the gate.
+                try std.testing.expect(ios <= width and pulls <= 1);
+            } else {
+                try std.testing.expectEqual(width, ios);
+                try std.testing.expectEqual(@as(usize, 1), pulls);
+            }
             if (mode == .success) {
                 var unrelated = scheduler.submit(io, 1, Reader.cpu, .{@as(?*std.Io.Event, null)}).?;
                 try std.testing.expectEqual(@as(usize, 7), try unrelated.await(io));
@@ -11323,16 +11332,23 @@ test "external lake Parquet speculative pull phases preserve CPU headroom and dr
                 try std.testing.expectError(error.Canceled, task.cancel(io));
             } else {
                 reader.gate.set(io);
-                if (mode == .cpu_full) {
+                if (busy_cpu) {
+                    // Complete while the unrelated CPU task is still blocked.
+                    // A retained encoded page must never wait on an I/O phase
+                    // whose input reservation depends on that same page.
                     try std.testing.expectError(error.ConcurrencyUnavailable, task.await(io));
                     try std.testing.expectEqual(@as(usize, 0), cache.decoded.entries.count());
+                } else if (tight_input) {
+                    if (task.await(io)) |sum| {
+                        try std.testing.expectEqual(@as(i64, if (width == 1) 11 else 33), sum);
+                    } else |err| try std.testing.expectEqual(error.ConcurrencyUnavailable, err);
                 } else try std.testing.expectEqual(@as(i64, if (width == 1) 11 else 33), try task.await(io));
             }
         }
         try std.testing.expectEqual(@as(usize, 0), scheduler.pull_workers);
         try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
         try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
-        if (mode == .cpu_full or mode == .io_full) {
+        if (busy_cpu or mode == .io_full or tight_input) {
             // Optional admission failure never rejects the authoritative pull.
             reader.gate.set(io);
             run.speculative = false;

@@ -29,6 +29,7 @@ const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const rows = local.storage_rowsource_types;
 pub const metadata_version: u16 = 11;
 const cover_columns = @import("lake_index_cover_columns.zig");
+const sort_stream = @import("lake_index_sort_stream.zig");
 pub const file_dictionary = @import("lake_index_ordered_files.zig");
 // Distinct checkpoint metadata lets older workers safely discard derived runs
 // instead of mistaking a partial forest for a complete serving index.
@@ -283,28 +284,26 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         cancellation: Cancellation,
         write_bytes: *u64,
         scratch: std.heap.ArenaAllocator,
-        pending: []const local.sql_operators.Row = &.{},
+        window: ?sort_stream.Window = null,
         position: usize = 0,
         block: ?[52]u8 = null,
         value: [70]u8 = undefined,
+        fn deinit(self: *@This()) void {
+            if (self.window) |*window| window.deinit();
+            self.scratch.deinit();
+        }
         pub fn next(self: *@This()) !?tree.Cursor.Record {
-            if (self.position == self.pending.len) {
+            if (self.window == null) self.window = .{ .sort = self.sort };
+            const window = &self.window.?;
+            if (self.position == window.count) {
+                window.clear();
+                self.position = 0;
                 _ = self.scratch.reset(.retain_capacity);
                 const scratch_alloc = self.scratch.allocator();
-                var batch: std.ArrayList(local.sql_operators.Row) = .empty;
-                var retained_bytes: usize = 0;
-                while (batch.items.len < 256 and retained_bytes < 512 * 1024) {
-                    const row = try self.sort.next(scratch_alloc) orelse break;
-                    for (row.values) |value| retained_bytes +|= try local.sql_operators.datumBytes(value);
-                    for (row.keys) |key| retained_bytes +|= try local.sql_operators.datumBytes(key);
-                    try batch.append(scratch_alloc, row);
-                }
-                if (batch.items.len == 0) return null;
-                self.pending = batch.items;
-                self.position = 0;
+                if (try window.read(256, 512 * 1024) == 0) return null;
                 self.block = null;
-                if (batch.items[0].values.len != 0) {
-                    const ref = try cover_columns.publish(scratch_alloc, self.store.*, self.scope, batch.items, self.cancellation, self.write_bytes);
+                if (window.width != 0) {
+                    const ref = try cover_columns.publishLeased(scratch_alloc, self.store.*, self.scope, window, self.cancellation, self.write_bytes);
                     var encoded: [52]u8 = undefined;
                     @memcpy(encoded[0..32], &try stores.sha256DigestFromChecksum(ref.checksum));
                     @memcpy(encoded[32..48], &self.scope.attempt);
@@ -312,11 +311,13 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                     self.block = encoded;
                 }
             }
-            const row = self.pending[self.position];
+            const row = window.leases.items[self.position];
             const ordinal = self.position;
             self.position += 1;
-            if (row.keys.len != 1 or row.keys[0].sql_null or row.keys[0].value != .string) return error.InvalidNativeLakeRowIndex;
-            const key = row.keys[0].value.string;
+            if (window.key_width != 1) return error.InvalidNativeLakeRowIndex;
+            const key_cell = try row.keyCell(0);
+            if (key_cell.sql_null or key_cell.value != .string) return error.InvalidNativeLakeRowIndex;
+            const key = key_cell.value.string;
             if (key.len < 16) return error.InvalidNativeLakeRowIndex;
             if (self.block) |block| {
                 @memcpy(self.value[0..16], key[key.len - 16 ..]);
@@ -328,7 +329,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         }
     };
     var sorted: Sorted = .{ .sort = sort, .store = store, .scope = scope, .cancellation = cancellation, .write_bytes = &write_bytes, .scratch = .init(a) };
-    defer sorted.scratch.deinit();
+    defer sorted.deinit();
     const Merge = struct {
         sorted: *Sorted,
         cursor: ?RunSource = null,
@@ -515,7 +516,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         page = try tree.buildSortedWithOptions(a, pages.store(), &collect, .{ .target_bytes = tree.bulk_target_page_bytes });
         ties = if (delta.run_only) null else try tie_builder.finish(pages.store());
         var reverse_sorted: Sorted = .{ .sort = &reverse_sort, .store = store, .scope = scope, .cancellation = cancellation, .write_bytes = &write_bytes, .scratch = .init(a) };
-        defer reverse_sorted.scratch.deinit();
+        defer reverse_sorted.deinit();
         const ReverseSource = struct {
             sorted: *Sorted,
             pub fn next(self: *@This()) !?tree.Cursor.Record {
@@ -527,18 +528,8 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         reverse = if (delta.run_only) null else if (delta.reverse_built) delta.built_reverse else try tree.buildSortedWithOptions(a, reverse_storage, &reverse_source, .{ .target_bytes = tree.bulk_target_page_bytes });
         if (!delta.run_only and delta.reverse_built and (page != null) != (reverse != null)) return error.InvalidNativeLakeRowIndex;
         if (cover.len != 0 and !delta.run_only) {
-            const Source = struct {
-                sort: *local.sql_spill.Sort,
-                scratch: std.heap.ArenaAllocator,
-                pub fn next(self: *@This()) !?tree.Cursor.Record {
-                    _ = self.scratch.reset(.retain_capacity);
-                    const row = try self.sort.next(self.scratch.allocator()) orelse return null;
-                    if (row.keys.len != 1 or row.values.len != 1 or row.keys[0].value != .string or row.values[0].value != .string) return error.InvalidNativeLakeRowIndex;
-                    return .{ .key = row.keys[0].value.string, .value = row.values[0].value.string };
-                }
-            };
-            var source: Source = .{ .sort = &cover_sort, .scratch = .init(a) };
-            defer source.scratch.deinit();
+            var source: sort_stream.Records = .{ .sort = &cover_sort };
+            defer source.deinit();
             covering = try tree.buildSortedWithOptions(a, pages.store(), &source, .{ .target_bytes = tree.bulk_target_page_bytes });
         }
     }

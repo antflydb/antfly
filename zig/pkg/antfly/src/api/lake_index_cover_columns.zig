@@ -72,37 +72,87 @@ fn put(a: A, store: stores.ArtifactStore, scope: stores.UploadScope, bytes: []co
 /// At most two objects per batch, independent of projection width. The pack
 /// holds independently verified stripes; its small directory is authenticated
 /// by the row-index leaf. No complete ordered key is stored in the pack.
+const Input = union(enum) {
+    rows: []const local.sql_operators.Row,
+    leased: *@import("lake_index_sort_stream.zig").Window,
+    fn count(self: Input) usize {
+        return switch (self) {
+            .rows => |v| v.len,
+            .leased => |v| v.count,
+        };
+    }
+    fn width(self: Input) usize {
+        return switch (self) {
+            .rows => |v| if (v.len == 0) 0 else v[0].values.len,
+            .leased => |v| v.width,
+        };
+    }
+    fn key(self: Input, row: usize) ![]const u8 {
+        const value = switch (self) {
+            .rows => |v| blk: {
+                if (v[row].values.len != self.width() or v[row].keys.len != 1) return error.InvalidNativeLakeRowIndex;
+                break :blk v[row].keys[0];
+            },
+            .leased => |v| blk: {
+                if (v.key_width != 1) return error.InvalidNativeLakeRowIndex;
+                break :blk try v.leases.items[row].keyCell(0);
+            },
+        };
+        if (value.sql_null or value.value != .string or value.value.string.len < 16) return error.InvalidNativeLakeRowIndex;
+        return value.value.string;
+    }
+    fn ordinal(self: Input, row: usize) u64 {
+        return switch (self) {
+            .rows => |v| v[row].ordinal,
+            .leased => |v| v.leases.items[row].row.ordinal,
+        };
+    }
+    fn values(self: Input, a: A) !local.sql_execution_batch.Batch {
+        return switch (self) {
+            .leased => |v| v.values(a),
+            .rows => |v| blk: {
+                const values_ = try a.alloc([]const local.sql_scalar.Datum, v.len);
+                for (v, values_) |row, *out| out.* = row.values;
+                break :blk .{ .rows = values_ };
+            },
+        };
+    }
+};
 pub fn publish(a: A, store: stores.ArtifactStore, scope: stores.UploadScope, rows: []const local.sql_operators.Row, token: Token, writes: *u64) !Ref {
+    return publishInput(a, store, scope, .{ .rows = rows }, token, writes);
+}
+pub fn publishLeased(a: A, store: stores.ArtifactStore, scope: stores.UploadScope, window: *@import("lake_index_sort_stream.zig").Window, token: Token, writes: *u64) !Ref {
+    return publishInput(a, store, scope, .{ .leased = window }, token, writes);
+}
+fn publishInput(a: A, store: stores.ArtifactStore, scope: stores.UploadScope, input: Input, token: Token, writes: *u64) !Ref {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const ref = try publishScratch(arena.allocator(), store, scope, rows, token, writes);
+    const ref = try publishScratch(arena.allocator(), store, scope, input, token, writes);
     const id = try a.dupe(u8, ref.artifact_id);
     return .{ .artifact_id = id, .checksum = id[7..71], .byte_len = ref.byte_len };
 }
-fn publishScratch(a: A, store: stores.ArtifactStore, scope: stores.UploadScope, rows: []const local.sql_operators.Row, token: Token, writes: *u64) !Ref {
-    if (rows.len == 0 or rows.len > 256 or rows[0].values.len == 0 or rows[0].values.len > 1024) return error.InvalidNativeLakeRowIndex;
-    const width = rows[0].values.len;
-    const hashes = try a.alloc([32]u8, rows.len);
-    const keys = try a.alloc([2]local.sql_scalar.Datum, rows.len);
-    const values = try a.alloc([1]local.sql_scalar.Datum, rows.len);
-    const batch = try a.alloc(local.sql_operators.Row, rows.len);
-    for (rows, hashes, keys, batch) |row, *hash, *key, *out| {
-        if (row.values.len != width or row.keys.len != 1 or row.keys[0].sql_null or row.keys[0].value != .string or row.keys[0].value.string.len < 16) return error.InvalidNativeLakeRowIndex;
-        hash.* = witness(scope.domain, row.keys[0].value.string);
+fn publishScratch(a: A, store: stores.ArtifactStore, scope: stores.UploadScope, input: Input, token: Token, writes: *u64) !Ref {
+    const count = input.count();
+    const width = input.width();
+    if (count == 0 or count > 256 or width == 0 or width > 1024) return error.InvalidNativeLakeRowIndex;
+    const hashes = try a.alloc([32]u8, count);
+    const keys = try a.alloc([2]local.sql_scalar.Datum, count);
+    const identities = try a.alloc(local.sql_operators.Row, count);
+    const ordinals = try a.alloc(u64, count);
+    for (hashes, keys, identities, ordinals, 0..) |*hash, *key, *out, *ordinal, i| {
+        const tuple = try input.key(i);
+        hash.* = witness(scope.domain, tuple);
         key[0] = local.sql_scalar.Datum.fromJson(.{ .string = hash });
-        const tuple = row.keys[0].value.string;
         key[1] = local.sql_scalar.Datum.fromJson(.{ .string = tuple[tuple.len - 16 ..] });
-        out.* = .{ .keys = key, .values = &.{}, .ordinal = row.ordinal };
+        ordinal.* = input.ordinal(i);
+        out.* = .{ .keys = key, .values = &.{}, .ordinal = ordinal.* };
     }
+    const values = try input.values(a);
     var pack: std.ArrayList(u8) = .empty;
     const sections = try a.alloc(Section, width + 1);
     for (sections, 0..) |*section, index| {
         try token.check();
-        if (index != 0) for (batch, rows, values) |*out, row, *value| {
-            value[0] = row.values[index - 1];
-            out.* = .{ .values = value, .keys = &.{}, .ordinal = row.ordinal };
-        };
-        const encoded = try local.sql_spill.encodeColumnarBlockAlloc(a, batch, artifacts.max_block_bytes);
+        const encoded = if (index == 0) try local.sql_spill.encodeColumnarBlockAlloc(a, identities, artifacts.max_block_bytes) else try local.sql_spill.encodeColumnarBatchVersionAlloc(a, try values.project(a, index - 1), ordinals, artifacts.max_block_bytes, .v1);
         defer a.free(encoded);
         if (encoded.len > artifacts.max_block_bytes -| pack.items.len) return error.InvalidNativeLakeRowIndex;
         section.* = .{ .offset = @intCast(pack.items.len), .bytes = @intCast(encoded.len), .digest = undefined };
@@ -110,7 +160,7 @@ fn publishScratch(a: A, store: stores.ArtifactStore, scope: stores.UploadScope, 
         try pack.appendSlice(a, encoded);
     }
     const pack_ref = try put(a, store, scope, pack.items, token, writes);
-    const directory: Directory = .{ .rows = @intCast(rows.len), .pack = pack_ref, .sections = sections };
+    const directory: Directory = .{ .rows = @intCast(count), .pack = pack_ref, .sections = sections };
     try directory.validate();
     return put(a, store, scope, try std.json.Stringify.valueAlloc(a, directory, .{}), token, writes);
 }
@@ -487,4 +537,58 @@ test "external lake bounded window profiles covering stripes prune wide columns 
     corrupt.sections = bad;
     try std.testing.expectError(error.InvalidNativeLakeRowIndex, corrupt.validate());
     std.debug.print("COVER_COLUMNS rows={d} pack_bytes={d} selected_bytes={d}\n", .{ count, parsed.pack.byte_len, prepared.bytes });
+}
+
+test "external lake leased publication covering stripes match owning bytes for typed JSON null and exact numeric cells" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("cover-leased");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const scope: stores.UploadScope = .{ .domain = @splat(7), .attempt = @splat(3) };
+    store.upload_scope = scope;
+    var inputs = std.heap.ArenaAllocator.init(a);
+    defer inputs.deinit();
+    const ia = inputs.allocator();
+    const count = 32;
+    var rows: [count]local.sql_operators.Row = undefined;
+    const json = try std.json.parseFromSliceLeaky(std.json.Value, ia, "{\"nested\":[null,9007199254740993,\"value\"]}", .{ .parse_numbers = false });
+    const payload: [1024]u8 = @splat('w');
+    for (&rows, 0..) |*row, i| {
+        const key = try ia.alloc(local.sql_scalar.Datum, 1);
+        key[0] = local.sql_scalar.Datum.json(.{ .string = try std.fmt.allocPrint(ia, "row-with-physical-{d:0>16}", .{i}) });
+        const cells = try ia.alloc(local.sql_scalar.Datum, 5);
+        cells[0..5].* = .{ local.sql_scalar.Datum.json(.{ .integer = @intCast(i) }), local.sql_scalar.Datum.json(.{ .integer = 9007199254740993 }), local.sql_scalar.Datum.json(.{ .string = &payload }), local.sql_scalar.Datum.json(json), local.sql_scalar.Datum{} };
+        row.* = .{ .keys = key, .values = cells, .ordinal = i };
+    }
+    var writes: u64 = 0;
+    const owned = try publish(a, store, scope, &rows, .none, &writes);
+    defer a.free(owned.artifact_id);
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for ([_]usize{ 8 << 20, 8 << 10 }) |memory| {
+        var marker: u8 = 0;
+        var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Hook.check, .compression = .none, .async_writes = false };
+        defer manager.deinit();
+        var sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, memory);
+        defer sort.deinit();
+        sort.parallel_runs = false;
+        var i: usize = count;
+        while (i != 0) {
+            i -= 1;
+            try sort.add(rows[i]);
+        }
+        var window: @import("lake_index_sort_stream.zig").Window = .{ .sort = &sort };
+        defer window.deinit();
+        try std.testing.expectEqual(@as(usize, count), try window.read(256, 512 << 10));
+        const leased = try publishLeased(a, store, scope, &window, .none, &writes);
+        defer a.free(leased.artifact_id);
+        // Content addresses cover the pack, directory, identities, ordinals,
+        // exact values and null provenance: no persistent format migration.
+        try std.testing.expectEqualStrings(owned.artifact_id, leased.artifact_id);
+        try std.testing.expectEqual(owned.byte_len, leased.byte_len);
+        try std.testing.expectEqual(@as(usize, 0), try window.read(256, 512 << 10));
+    }
 }

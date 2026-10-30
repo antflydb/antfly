@@ -1114,9 +1114,7 @@ const Owner = struct {
             const lease: Decoded.Lease = .{ .cache = @ptrCast(@alignCast(owner)), .item = @ptrCast(@alignCast(item)) };
             lease.release();
         }
-        fn acquireDecoded(raw: *anyopaque, request: local.segment_source.DecodeRequest) !?local.segment_source.Decoded {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            try checkContext(self);
+        fn decodedKey(self: *Query, request: local.segment_source.DecodeKey) ?[32]u8 {
             const cached = self.capability.cache orelse return null;
             const reference = self.owner.directory_ref orelse return null;
             var hash = std.crypto.hash.Blake3.init(.{});
@@ -1130,6 +1128,31 @@ const Owner = struct {
             hash.update(&bounds);
             hash.update(&request.interpretation);
             hash.update(&.{@backingInt(request.class)});
+            var key: [32]u8 = undefined;
+            hash.final(&key);
+            return key;
+        }
+        fn lookupDecoded(raw: *anyopaque, request: local.segment_source.DecodeKey) !?local.segment_source.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checkContext(self);
+            const cached = self.capability.cache orelse return null;
+            try cached.context.ensureActive();
+            const key = self.decodedKey(request) orelse return null;
+            const lane = switch (request.class) {
+                .navigation => &cached.cache.decoded,
+                .text_page => &cached.cache.text_pages,
+            };
+            const held = lane.lookup(key) orelse return null;
+            errdefer held.release();
+            try checkContext(self);
+            try cached.context.ensureActive();
+            return .{ .value = held.item.payload.extension, .owner = held.cache, .item = held.item, .release_fn = releaseDecoded, .retained_bytes = held.item.budget.live };
+        }
+        fn acquireDecoded(raw: *anyopaque, request: local.segment_source.DecodeRequest) !?local.segment_source.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checkContext(self);
+            const cached = self.capability.cache orelse return null;
+            const key = self.decodedKey(request.key()) orelse return null;
             const Loader = struct {
                 request: local.segment_source.DecodeRequest,
                 fn load(context: *anyopaque, item: *Decoded.Item) !void {
@@ -1154,8 +1177,6 @@ const Owner = struct {
             var context = cached.context;
             context.checkpoint = .{ .ptr = &guard, .check = Guard.check };
             context.additional_checkpoint = null;
-            var key: [32]u8 = undefined;
-            hash.final(&key);
             const lane = switch (request.class) {
                 .navigation => &cached.cache.decoded,
                 .text_page => &cached.cache.text_pages,
@@ -1217,7 +1238,7 @@ const Owner = struct {
         try capability.check();
         const query = try a.create(Query);
         query.* = .{ .a = a, .owner = owner, .capability = capability, .io = capability.context.io };
-        return .{ .ranges = .{ .ptr = query, .length = owner.directory_bytes, .read_into = Query.read, .close = Query.close, .prefetch = Query.prefetch, .quiesce_read_context = Query.quiesce, .resource_manager = capability.resource_manager orelse owner.resource_manager, .read_io = capability.context.io, .check_read_context = Query.checkContext, .acquire_decoded = Query.acquireDecoded } };
+        return .{ .ranges = .{ .ptr = query, .length = owner.directory_bytes, .read_into = Query.read, .close = Query.close, .prefetch = Query.prefetch, .quiesce_read_context = Query.quiesce, .resource_manager = capability.resource_manager orelse owner.resource_manager, .read_io = capability.context.io, .check_read_context = Query.checkContext, .acquire_decoded = Query.acquireDecoded, .lookup_decoded = Query.lookupDecoded } };
     }
     fn containing(pieces: []const Piece, offset: usize) ?usize {
         var low: usize = 0;

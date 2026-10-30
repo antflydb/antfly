@@ -185,7 +185,9 @@ pub const Cursor = struct {
     }
     fn read(self: *Cursor, offset: u64, len: usize) !ranges.RangeLease {
         const context: @import("lake_read_context.zig").Context = if (self.shared_reader) |reader| reader.context else .{};
-        try self.admission.reserveInput(len, context);
+        if (self.speculative) {
+            if (!try self.admission.tryReserveInput(len, context)) return error.ConcurrencyUnavailable;
+        } else try self.admission.reserveInput(len, context);
         errdefer self.admission.releaseInput(len, context);
         const lease = try self.reader.readPlannedLease(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = len }, .purpose = .parquet_column_chunk });
         errdefer lease.release();
@@ -935,10 +937,17 @@ pub const Cursor = struct {
             // retry with identical raw/resident policy. Never increase a quota
             // or discard the encoded input needed to retry without another GET.
             var decoding = false;
-            for (pending) |task| if (task != null and task.? == .decode) {
-                decoding = true;
-                break;
+            var waiting_decode = false;
+            for (pending) |task| if (task) |phase| switch (phase) {
+                .decode => decoding = true,
+                .decode_wait => waiting_decode = true,
+                else => {},
             };
+            // Only our own decoder completion can wake a CPU-admission retry.
+            // A provider/input waiter is not evidence of runnable CPU progress;
+            // parking here can otherwise strand I/O even after foreign CPU work
+            // releases its slot. Optional warming declines and drains instead.
+            if (self.speculative and waiting_decode and !decoding) return error.ConcurrencyUnavailable;
             if (!decoding) for (&pending, &columns) |*slot, *column_slot| {
                 if (slot.* == null or slot.*.? != .retry) continue;
                 const fetched = slot.*.?.retry;

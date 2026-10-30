@@ -317,6 +317,15 @@ pub const Text = struct {
     };
     /// Decode into cache-owned memory once. Only immutable bytes survive the
     /// synchronous loader; neither a source nor a query callback is retained.
+    fn pageKey(self: Text, index: usize) @import("../segment_source.zig").DecodeKey {
+        const entry = self.pages[index * 32 ..][0..16];
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("source-text-page-snappy-v1");
+        hash.update(entry[12..16]);
+        var interpretation: [32]u8 = undefined;
+        hash.final(&interpretation);
+        return .{ .class = .text_page, .offset = self.view.offset + std.mem.readInt(u64, entry[0..8], .little), .length = std.mem.readInt(u32, entry[8..12], .little), .interpretation = interpretation };
+    }
     fn page(self: Text, a: A, index: usize, control: Token) !PageBytes {
         try control.check();
         const entry = self.pages[index * 32 ..][0..16];
@@ -345,12 +354,8 @@ pub const Text = struct {
             }
         };
         var loader: Loader = .{ .text = self, .offset = offset, .wire = wire, .raw = raw };
-        var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("source-text-page-snappy-v1");
-        hash.update(entry[12..16]);
-        var interpretation: [32]u8 = undefined;
-        hash.final(&interpretation);
-        if (try self.view.source.acquireDecoded(.{ .class = .text_page, .offset = self.view.offset + offset, .length = wire, .interpretation = interpretation, .context = &loader, .decode = Loader.decode })) |lease| {
+        const key = self.pageKey(index);
+        if (try self.view.source.acquireDecoded(.{ .class = key.class, .offset = key.offset, .length = key.length, .interpretation = key.interpretation, .context = &loader, .decode = Loader.decode })) |lease| {
             errdefer lease.release();
             try control.check();
             const value: *const DecodedPage = @ptrCast(@alignCast(lease.value));
@@ -393,6 +398,10 @@ pub const Text = struct {
             if (index % 4 == 0) {
                 const through = @min(self.pages.len / 32, @as(usize, index) + 5);
                 for (@as(usize, index) + 1..through) |future| {
+                    if (try self.view.source.lookupDecoded(self.pageKey(future))) |resident| {
+                        resident.release();
+                        continue;
+                    }
                     const entry = self.pages[future * 32 ..][0..16];
                     self.view.source.prefetch(self.view.offset + std.mem.readInt(u64, entry[0..8], .little), std.mem.readInt(u32, entry[8..12], .little));
                 }
@@ -899,6 +908,10 @@ test "highlight shared decoded text pages retain immutable chunks and fence auth
         bytes: []const u8,
         cache: Decoded.Cache,
         reads: usize = 0,
+        hints: usize = 0,
+        lookups: usize = 0,
+        decline_lookup: ?[32]u8 = null,
+        deny_after_lookup: bool = false,
         decodes: usize = 0,
         denied: bool = false,
         missing: bool = false,
@@ -908,20 +921,36 @@ test "highlight shared decoded text pages retain immutable chunks and fence auth
             self.reads += 1;
             @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
         }
+        fn prefetch(raw: *anyopaque, _: u64, _: u64) void {
+            @as(*@This(), @ptrCast(@alignCast(raw))).hints += 1;
+        }
         fn close(_: *anyopaque) void {}
         fn check(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.denied) return error.Canceled;
         }
-        fn acquire(raw: *anyopaque, request: source_module.DecodeRequest) !?source_module.Decoded {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            if (request.class != .text_page) return null;
+        fn cacheKey(request: source_module.DecodeKey) [32]u8 {
             var hash = std.crypto.hash.Blake3.init(.{});
             hash.update(&request.interpretation);
             hash.update(std.mem.asBytes(&request.offset));
             hash.update(std.mem.asBytes(&request.length));
             var key: [32]u8 = undefined;
             hash.final(&key);
+            return key;
+        }
+        fn lookup(raw: *anyopaque, request: source_module.DecodeKey) !?source_module.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.lookups += 1;
+            const key = cacheKey(request);
+            if (self.decline_lookup) |excluded| if (std.mem.eql(u8, &excluded, &key)) return null;
+            const lease = self.cache.lookup(key) orelse return null;
+            if (self.deny_after_lookup) self.denied = true;
+            return .{ .value = lease.item.payload.extension, .owner = &self.cache, .item = lease.item, .release_fn = release, .retained_bytes = lease.item.budget.live };
+        }
+        fn acquire(raw: *anyopaque, request: source_module.DecodeRequest) !?source_module.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (request.class != .text_page) return null;
+            const key = cacheKey(request.key());
             const Loader = struct {
                 provider: *Self,
                 request: source_module.DecodeRequest,
@@ -973,7 +1002,7 @@ test "highlight shared decoded text pages retain immutable chunks and fence auth
     try std.testing.expect(try writer.finish());
     var provider: Provider = .{ .bytes = memory.out.items, .cache = .{ .a = a } };
     defer provider.cache.deinit();
-    var cursor = Cursor.init(try Reader.init(a, try View.init(.{ .ranges = .{ .ptr = &provider, .length = provider.bytes.len, .read_into = Provider.read, .close = Provider.close, .check_read_context = Provider.check, .acquire_decoded = Provider.acquire } }, 0, provider.bytes.len)));
+    var cursor = Cursor.init(try Reader.init(a, try View.init(.{ .ranges = .{ .ptr = &provider, .length = provider.bytes.len, .read_into = Provider.read, .close = Provider.close, .check_read_context = Provider.check, .acquire_decoded = Provider.acquire, .lookup_decoded = Provider.lookup, .prefetch = Provider.prefetch } }, 0, provider.bytes.len)));
     defer cursor.deinit();
     const text = (try cursor.text(0)).?;
     var output = std.heap.ArenaAllocator.init(a);
@@ -982,6 +1011,8 @@ test "highlight shared decoded text pages retain immutable chunks and fence auth
     defer pins.deinit();
     const chunks = try text.readChunksRetained(output.allocator(), .none, .{ .ptr = &pins, .adopt = Pins.adopt });
     try std.testing.expectEqual(@as(usize, 3), provider.decodes);
+    try std.testing.expectEqual(@as(usize, 2), provider.hints);
+    const hints_before = provider.hints;
     const read_count = provider.reads;
     provider.missing = true;
     // Warm pages need neither source I/O nor a second decompression. Pins own
@@ -989,6 +1020,17 @@ test "highlight shared decoded text pages retain immutable chunks and fence auth
     const again = try text.readChunksRetained(output.allocator(), .none, .{ .ptr = &pins, .adopt = Pins.adopt });
     try std.testing.expectEqual(@as(usize, 3), provider.decodes);
     try std.testing.expectEqual(read_count, provider.reads);
+    try std.testing.expectEqual(hints_before, provider.hints);
+    try std.testing.expectEqual(@as(usize, 4), provider.lookups);
+    // A residency decline issues only the missing hint; lookup itself never
+    // performs required acquisition, decoding or provider reads.
+    provider.decline_lookup = Provider.cacheKey(text.pageKey(1));
+    _ = try text.readChunksRetained(output.allocator(), .none, .{ .ptr = &pins, .adopt = Pins.adopt });
+    try std.testing.expectEqual(hints_before + 1, provider.hints);
+    try std.testing.expectEqual(read_count, provider.reads);
+    try std.testing.expectEqual(@as(usize, 3), provider.decodes);
+    provider.decline_lookup = null;
+    std.debug.print("WARM_TEXT_PREFETCH pages=3 warm_hints=0 partial_hints=1 demand_reads=0\n", .{});
     for (chunks, again) |before, after| try std.testing.expectEqualStrings(before, after);
     try std.testing.expect(chunks[0].ptr == again[0].ptr);
     var at: usize = 0;
@@ -998,6 +1040,12 @@ test "highlight shared decoded text pages retain immutable chunks and fence auth
         at += part.len;
     }
     try std.testing.expectEqual(body.items.len, at);
+    const cached_item: *Decoded.Item = @ptrCast(@alignCast(pins.items.items[0].item));
+    const refs_before_lookup = cached_item.refs;
+    provider.deny_after_lookup = true;
+    try std.testing.expectError(error.Canceled, text.view.source.lookupDecoded(text.pageKey(0)));
+    try std.testing.expectEqual(refs_before_lookup, cached_item.refs);
+    provider.deny_after_lookup = false;
     provider.denied = true;
     try std.testing.expectError(error.Canceled, text.readChunksRetained(output.allocator(), .none, .{ .ptr = &pins, .adopt = Pins.adopt }));
     provider.denied = false;

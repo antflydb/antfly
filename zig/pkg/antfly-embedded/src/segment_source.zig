@@ -63,6 +63,14 @@ pub const Decoded = struct {
     }
 };
 pub const DecodeClass = enum { navigation, text_page };
+/// A resident-only probe cannot invoke a loader or start provider I/O.
+/// Its identity is identical to the corresponding required decode request.
+pub const DecodeKey = struct {
+    class: DecodeClass = .navigation,
+    offset: u64,
+    length: u64,
+    interpretation: [32]u8,
+};
 pub const DecodeRequest = struct {
     /// Payload pages have separate residency from compact navigation.
     class: DecodeClass = .navigation,
@@ -73,6 +81,9 @@ pub const DecodeRequest = struct {
     decode: *const fn (*anyopaque, std.mem.Allocator) anyerror!*const anyopaque,
     dispatch: callback_abi.CallbackDispatch = DecodeBoundary.local_dispatch,
     const DecodeBoundary = callback_abi.Boundary(struct { decode: *const fn (*anyopaque, std.mem.Allocator) anyerror!*const anyopaque });
+    pub fn key(self: @This()) DecodeKey {
+        return .{ .class = self.class, .offset = self.offset, .length = self.length, .interpretation = self.interpretation };
+    }
     pub fn invoke(self: @This(), a: std.mem.Allocator) !*const anyopaque {
         return DecodeBoundary.call("decode", self.dispatch, self.decode, .{ self.context, a });
     }
@@ -80,6 +91,7 @@ pub const DecodeRequest = struct {
 const SourceBoundary = callback_abi.Boundary(struct {
     read_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
     acquire_decoded: ?*const fn (*anyopaque, DecodeRequest) anyerror!?Decoded,
+    lookup_decoded: ?*const fn (*anyopaque, DecodeKey) anyerror!?Decoded,
     checksum: ?*const fn (*anyopaque, u64, u64) anyerror!u32,
     read_authenticated: ?*const fn (*anyopaque, u64, u64, usize, []u8, ?u32) anyerror!void,
     visit_range: ?*const fn (*anyopaque, u64, u64, SourceVisitor) anyerror!void,
@@ -119,6 +131,9 @@ pub const Source = union(enum) {
         read_io: ?std.Io = null,
         check_read_context: ?*const fn (*anyopaque) anyerror!void = null,
         acquire_decoded: ?*const fn (*anyopaque, DecodeRequest) anyerror!?Decoded = null,
+        /// Optional no-load lookup, with the same live authority checks as a
+        /// required acquisition. A miss never starts decoding or provider I/O.
+        lookup_decoded: ?*const fn (*anyopaque, DecodeKey) anyerror!?Decoded = null,
         /// Opt-in idle expiry for source caches. A successful acquisition
         /// protects all source operations until its matching release.
         acquire_use: ?*const fn (*anyopaque) bool = null,
@@ -126,6 +141,16 @@ pub const Source = union(enum) {
         enable_idle_expiry: ?*const fn (*anyopaque) void = null,
     };
 
+    pub fn lookupDecoded(self: Source, key: DecodeKey) !?Decoded {
+        if (key.offset > self.len() or key.length > self.len() - key.offset) return error.EndOfStream;
+        if (self != .ranges) return null;
+        const lookup = self.ranges.lookup_decoded orelse return null;
+        try self.checkReadContext();
+        const value = (try SourceBoundary.call("lookup_decoded", self.ranges.boundary_dispatch, lookup, .{ self.ranges.ptr, key })) orelse return null;
+        errdefer value.release();
+        try self.checkReadContext();
+        return value;
+    }
     pub fn acquireDecoded(self: Source, request: DecodeRequest) !?Decoded {
         if (request.offset > self.len() or request.length > self.len() - request.offset) return error.EndOfStream;
         if (self != .ranges) return null;

@@ -2469,3 +2469,35 @@ numeric evaluation, and cover allocation failures. A single 8192-row PLAIN i64
 page now needs only its 64-KiB final vector in the decoder allocator; a borrowed
 payload consumes no allocation there. Compressed codecs and retained projection
 payloads keep their existing ownership costs.
+
+### Pressure-safe speculation and leased publication
+
+Speculative Parquet reads try to reserve encoded-input capacity once. They do
+not park a provider task waiting for another optional page to release input.
+A decode waiting for CPU admission retries after a live sibling decoder finishes;
+a pending provider read alone is not a CPU wakeup source. If no decoder can
+supply that progress, optional work declines and joins its phases. Required
+reads keep their existing wait and bounded inline fallback. This prevents a
+CPU/input dependency cycle without enlarging either admission limit.
+
+Decoded text-page residency is checked before issuing raw lookahead hints.
+The resident-only source capability accepts a decode identity, never a loader,
+and acquires a short lease with the same artifact, scope, interpretation and
+live authority checks as required decoding. A hit suppresses only that page's
+hint; misses retain ordinary bounded prefetch and required reads. The lookup
+lease is released immediately, so the optimization does not pin future pages
+or assume they remain resident. Runtime ABI **77** fences this callback boundary;
+reader protocol **97** and stored formats remain unchanged.
+
+Index publication consumes leased sort records and bounded leased windows.
+Builders finish consuming borrowed record bytes before the next advance, and
+covering stripes encode physical/frozen columns directly through the shared
+batch encoder. Windows retain at most 256 rows and the existing 512-KiB raw
+quantum, including one indivisible oversized row, under statement admission.
+JSON size accounting can inspect frozen frames without constructing a DOM.
+The aggregate fallback retains its established 256-complete-row input contract;
+its output pins survive stream closure until synchronous consumption finishes.
+EOF, cancellation, allocation failures and publisher teardown retire all leases.
+No leased payload or sort owner escapes publication. Identity witnesses,
+ordinals, covering stripe version and content-addressed artifact bytes retain
+the owning publisher's semantics.

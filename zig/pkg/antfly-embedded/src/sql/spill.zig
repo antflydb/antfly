@@ -5086,6 +5086,25 @@ pub const Sort = struct {
         key_index: ?usize = null,
         values: ?*const @import("typed_store.zig").Store = null,
         keys: ?*const @import("typed_store.zig").Store = null,
+        pub fn width(self: RowLease) usize {
+            return if (self.block) |block| block.width() else if (self.values) |values| values.columns.len else self.row.values.len;
+        }
+        pub fn keyWidth(self: RowLease) usize {
+            return if (self.key_block) |block| block.keyWidth() else if (self.keys) |keys| keys.columns.len else if (self.block) |block| block.keyWidth() else self.row.keys.len;
+        }
+        /// Publication quanta account for frozen JSON without building a DOM.
+        pub fn cellBytes(self: RowLease, column: usize) !usize {
+            if (self.block) |block| {
+                if (block.encoded) |encoded| {
+                    if (try encoded.frozenJson(self.index, column, false)) |value| return @sizeOf(Datum) +| value.bytes.len;
+                    if (try encoded.encodedJson(self.index, column, false)) |value| return @sizeOf(Datum) +| value.len;
+                }
+            } else if (self.values) |values| {
+                if (try values.frozenJson(self.index, column)) |value| return @sizeOf(Datum) +| value.bytes.len;
+                if (try values.encodedJson(self.index, column)) |value| return @sizeOf(Datum) +| value.len;
+            }
+            return operators.datumBytes(try self.cell(column));
+        }
         pub fn cell(self: RowLease, column: usize) !Datum {
             return if (self.block) |block| block.cell(self.index, column) else if (self.values) |values| values.cell(values.a, self.index, column) else self.row.values[column];
         }

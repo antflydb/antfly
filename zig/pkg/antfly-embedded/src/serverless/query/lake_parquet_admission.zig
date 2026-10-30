@@ -167,6 +167,24 @@ pub const Loading = struct {
     }
 };
 
+/// Optional phases never wait while another parked phase owns their input
+/// capacity. Required readers retain reserveInput's cooperative wait policy.
+pub fn tryReserveInput(self: *Self, len: usize, context: Context) !bool {
+    try context.ensureActive();
+    if (len > self.input_limit) return error.ParquetPageTooLarge;
+    if (context.io) |io| {
+        try self.input_mutex.lock(io);
+        defer self.input_mutex.unlock(io);
+        try context.ensureActive();
+        if (len > self.input_limit -| self.input) return false;
+        self.input += len;
+        return true;
+    }
+    if (len > self.input_limit -| self.input) return false;
+    self.input += len;
+    return true;
+}
+
 pub fn reserveInput(self: *Self, len: usize, context: Context) !void {
     try context.ensureActive();
     if (len > self.input_limit) return error.ParquetPageTooLarge;
