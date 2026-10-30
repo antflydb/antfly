@@ -23,11 +23,18 @@ const journal = @import("immutable_log.zig");
 const A = std.mem.Allocator;
 const Hash = std.crypto.hash.sha2.Sha256;
 
+pub const Cursor = struct { revision: ?T.ObjectRevision, nonce: [16]u8, retired: bool = false, auth: ?[32]u8 = null };
+
 pub const Snapshot = struct {
     state: journal.State,
     revision: ?T.ObjectRevision,
     nonce: [16]u8,
     retired: bool = false,
+    auth: ?[32]u8 = null,
+
+    pub fn cursor(self: Snapshot) Cursor {
+        return .{ .revision = self.revision, .nonce = self.nonce, .retired = self.retired, .auth = self.auth };
+    }
 
     pub fn deinit(self: *Snapshot, a: A) void {
         a.free(self.state.root);
@@ -83,6 +90,9 @@ pub const Context = struct {
     /// An independently generated identity for the host's store/binding
     /// capability. Zero disables continuation reuse. Never take it from users.
     proof_scope: [16]u8 = @splat(0),
+    /// Private host capability key. Never persisted or returned. It permits
+    /// authenticated cursors to cross pooled kernels for this same binding.
+    proof_key: ?[32]u8 = null,
 
     fn check(self: Context) !void {
         if (self.cancellation) |token| try token.check();
@@ -104,18 +114,20 @@ pub const Context = struct {
         hash.update(&size);
         hash.update(bytes);
     }
-    fn digest(self: Context, snapshot: Snapshot) ?[32]u8 {
+    fn digest(self: Context, snapshot: Snapshot, physical: bool) ?[32]u8 {
         const revision = snapshot.revision orelse return null;
         var hash = Hash.init(.{});
         field(&hash, self.bucket);
         field(&hash, self.prefix);
         field(&hash, self.namespace);
         field(&hash, &self.proof_scope);
-        var pointer: [8]u8 = undefined;
-        std.mem.writeInt(u64, &pointer, @intFromPtr(self.client.ptr), .little);
-        field(&hash, &pointer);
-        std.mem.writeInt(u64, &pointer, @intFromPtr(self.client.vtable), .little);
-        field(&hash, &pointer);
+        if (physical) {
+            var pointer: [8]u8 = undefined;
+            std.mem.writeInt(u64, &pointer, @intFromPtr(self.client.ptr), .little);
+            field(&hash, &pointer);
+            std.mem.writeInt(u64, &pointer, @intFromPtr(self.client.vtable), .little);
+            field(&hash, &pointer);
+        }
         field(&hash, &snapshot.state.owner);
         field(&hash, &snapshot.state.epoch);
         field(&hash, &snapshot.nonce);
@@ -139,12 +151,28 @@ pub const Context = struct {
     }
     fn remember(self: Context, snapshot: Snapshot) void {
         if (std.mem.allEqual(u8, &self.proof_scope, 0)) return;
-        if (self.proofs) |proofs| if (self.digest(snapshot)) |value| proofs.remember(value);
+        if (self.proofs) |proofs| if (self.digest(snapshot, true)) |value| proofs.remember(value);
     }
     fn known(self: Context, snapshot: Snapshot) bool {
         if (std.mem.allEqual(u8, &self.proof_scope, 0)) return false;
+        if (self.proof_key) |capability_key| {
+            const supplied = snapshot.auth orelse return false;
+            const message = self.digest(snapshot, false) orelse return false;
+            var expected: [32]u8 = undefined;
+            std.crypto.auth.hmac.sha2.HmacSha256.create(&expected, &message, &capability_key);
+            return std.crypto.timing_safe.eql([32]u8, supplied, expected);
+        }
+        if (std.mem.allEqual(u8, &self.proof_scope, 0)) return false;
         const proofs = self.proofs orelse return false;
-        return if (self.digest(snapshot)) |value| proofs.contains(value) else false;
+        return if (self.digest(snapshot, true)) |value| proofs.contains(value) else false;
+    }
+    fn sign(self: Context, snapshot: *Snapshot) void {
+        if (std.mem.allEqual(u8, &self.proof_scope, 0)) return;
+        const capability_key = self.proof_key orelse return;
+        const message = self.digest(snapshot.*, false) orelse return;
+        var signature: [32]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&signature, &message, &capability_key);
+        snapshot.auth = signature;
     }
     pub fn observe(self: Context, a: A) !?Snapshot {
         try self.check();
@@ -166,7 +194,8 @@ pub const Context = struct {
         const revision = object.metadata.writeRevision() orelse return error.ConditionalReadUnsupported;
         var owned_revision = try revision.clone(a);
         errdefer owned_revision.deinit(a);
-        const snapshot = Snapshot{ .state = .{ .format = stored.state.format, .epoch = stored.state.epoch, .owner = stored.state.owner, .next = stored.state.next, .revision = stored.state.revision, .root = try a.dupe(u8, stored.state.root) }, .revision = owned_revision, .nonce = stored.nonce, .retired = stored.retired };
+        var snapshot = Snapshot{ .state = .{ .format = stored.state.format, .epoch = stored.state.epoch, .owner = stored.state.owner, .next = stored.state.next, .revision = stored.state.revision, .root = try a.dupe(u8, stored.state.root) }, .revision = owned_revision, .nonce = stored.nonce, .retired = stored.retired };
+        self.sign(&snapshot);
         self.remember(snapshot);
         return snapshot;
     }
@@ -205,10 +234,16 @@ pub const Context = struct {
         if (self.known(expected)) return;
         var actual = (try self.observe(a)) orelse return error.ConditionalRootMissing;
         defer actual.deinit(a);
-        const wanted = self.digest(expected) orelse return error.ConditionalRootRevisionRequired;
-        const found = self.digest(actual) orelse return error.ConditionalRootRevisionRequired;
+        const wanted = self.digest(expected, false) orelse return error.ConditionalRootRevisionRequired;
+        const found = self.digest(actual, false) orelse return error.ConditionalRootRevisionRequired;
         if (!std.mem.eql(u8, &wanted, &found)) return error.PreconditionFailed;
     }
+    /// Authenticate a source for a subsequent conditional operation. This does
+    /// not assert that a cached source remains the latest root.
+    pub fn verifySource(self: Context, a: A, expected: Snapshot) !void {
+        try self.authenticate(a, expected);
+    }
+
     pub fn append(self: Context, a: A, expected: Snapshot, root: []const u8) !Snapshot {
         try self.authenticate(a, expected);
         return self.replace(a, expected, root, false, false);
@@ -249,7 +284,8 @@ pub const Context = struct {
                 break :blk .{ .generation = value };
             } else null,
         };
-        const result = Snapshot{ .state = state, .revision = next_token, .nonce = nonce, .retired = retired };
+        var result = Snapshot{ .state = state, .revision = next_token, .nonce = nonce, .retired = retired };
+        self.sign(&result);
         self.remember(result);
         return result;
     }
@@ -469,4 +505,49 @@ test "conditional root rejects oversized encodings before any write" {
     @memset(oversized, '"');
     try std.testing.expectError(error.CoordinatorRootBudgetExceeded, ctx.append(a, first, oversized[0..journal.max_root_bytes]));
     try std.testing.expectEqual(puts, backend.puts);
+}
+
+test "signed native continuations cross pooled kernels but never certify fabricated state" {
+    const a = std.testing.allocator;
+    var backend = TestBackend{ .memory = @import("memory.zig").MemoryClient.init(a) };
+    defer backend.memory.deinit();
+    var base = backend.memory.client();
+    try base.makeBucket("db");
+    var table: Client.VTable = undefined;
+    var proofs = ProofCache{};
+    const ctx = Context{ .client = backend.wrap(&table, false), .bucket = "db", .prefix = "signed", .namespace = "one", .owner = @splat(1), .io = std.testing.io, .proofs = &proofs, .proof_scope = @splat(10), .proof_key = @splat(42) };
+    var first = try ctx.begin(a);
+    defer first.deinit(a);
+    try std.testing.expect(first.auth != null);
+    const encoded = try std.json.Stringify.valueAlloc(a, first.cursor(), .{});
+    defer a.free(encoded);
+    var parsed = try std.json.parseFromSlice(Cursor, a, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualSlices(u8, &first.auth.?, &parsed.value.auth.?);
+    const reads = backend.gets;
+    proofs.clear();
+    var cold_cache = ProofCache{};
+    const other_table = table;
+    var pooled = ctx;
+    pooled.client.vtable = &other_table;
+    pooled.proofs = &cold_cache;
+    var next = try pooled.append(a, first, "portable");
+    defer next.deinit(a);
+    try std.testing.expectEqual(reads, backend.gets);
+    var forged = next;
+    forged.state.root = "not committed";
+    const before_forgery = backend.puts;
+    try std.testing.expectError(error.PreconditionFailed, pooled.append(a, forged, "must not publish"));
+    try std.testing.expectEqual(before_forgery, backend.puts);
+    try std.testing.expectEqual(reads + 1, backend.gets);
+    var rotated = pooled;
+    rotated.proof_key = @splat(43);
+    const before_rotation = backend.gets;
+    var reauthenticated = try rotated.append(a, next, "freshly verified after key rotation");
+    defer reauthenticated.deinit(a);
+    try std.testing.expectEqual(before_rotation + 1, backend.gets);
+    var stored = try base.getObject("db", "signed/ROOT", .{});
+    defer stored.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, stored.body, "\"proof_key\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stored.body, "\"auth\"") == null);
 }

@@ -18,6 +18,10 @@
 const std = @import("std");
 const objects = @import("root.zig");
 const journal = objects.immutable_log;
+const conditional = @import("conditional_root.zig");
+const authority = @import("metadata_authority.zig");
+pub const RootBackend = authority.Backend;
+var conditional_proofs: conditional.ProofCache = .{};
 const tree = @import("ordered_tree.zig");
 const Pages = @import("ordered_pages.zig").Pages;
 const A = std.mem.Allocator;
@@ -29,6 +33,10 @@ pub const Command = struct {
     limit: usize = 128,
 };
 pub const Request = struct {
+    root_backend: RootBackend = .journal,
+    root_cursor: ?conditional.Cursor = null,
+    root_proof_scope: [16]u8 = @splat(0),
+    root_proof_key: ?[32]u8 = null,
     action: enum { begin, observe, observe_committed, observe_read, read, commit, commit_wal, checkpoint, trace, retire_logs },
     owner: [16]u8,
     state: ?journal.State = null,
@@ -292,13 +300,17 @@ pub const Context = struct {
         const m = metadata.allocator();
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(self.namespace, &digest, .{});
-        const base = try std.fmt.allocPrint(m, "{s}/coord-v1/{s}", .{ self.prefix, std.fmt.bytesToHex(digest, .lower) });
+        const base = try std.fmt.allocPrint(m, "{s}/{s}/{s}", .{ self.prefix, if (req.root_backend == .conditional) "coord-v2" else "coord-v1", std.fmt.bytesToHex(digest, .lower) });
         const domain = Pages.domainForNamespace(base);
-        const log = journal.Log{ .client = self.client, .bucket = self.bucket, .prefix = base, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .checkpoint_commits = req.checkpoint_commits };
+        const journal_log = journal.Log{ .client = self.client, .bucket = self.bucket, .prefix = base, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .checkpoint_commits = req.checkpoint_commits };
+        var log = authority.Authority{ .log = journal_log, .cursor = req.root_cursor, .root = if (req.root_backend == .conditional) conditional.Context{ .client = self.client, .bucket = self.bucket, .prefix = base, .namespace = self.namespace, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .proofs = &conditional_proofs, .proof_scope = req.root_proof_scope, .proof_key = req.root_proof_key } else null };
         const observing = req.action == .begin or req.action == .observe or req.action == .observe_committed or req.action == .observe_read;
         const observed = if (observing) blk: {
             const recovered = if (req.action == .observe_committed or (req.action == .observe_read and !req.observe_owned)) try log.observeCommitted(m, req.state) else if (req.action == .observe or req.action == .observe_read) try log.observe(m, req.state orelse return error.CoordinatorSessionRequired) else try log.recover(m, req.state, req.state == null or !std.mem.eql(u8, &req.state.?.owner, &req.owner));
-            if (req.action != .observe_read or recovered.has_more) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
+            if (req.action != .observe_read or recovered.has_more) {
+                if (req.root_backend == .conditional) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .root_cursor = log.cursor, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
+                if (req.action != .observe_read or recovered.has_more) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
+            }
             break :blk recovered;
         } else null;
         const state = if (observed) |value| value.state else req.state orelse return error.CoordinatorSessionRequired;
@@ -345,6 +357,7 @@ pub const Context = struct {
                 };
             }
             if (selected) |row| try read_budget.charge(row);
+            if (req.root_backend == .conditional) return read_budget.encode(self.alloc, .{ .state = state, .root_cursor = log.cursor, .has_more = false, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }), .results = output.items, .selected = selected });
             return read_budget.encode(self.alloc, .{ .state = state, .has_more = false, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }), .results = output.items, .selected = selected });
         }
         if (req.action == .read) {
@@ -444,6 +457,7 @@ pub const Context = struct {
             const encoded = try root.encodeBounded(m, state);
             try uploads.flush();
             const next = try log.append(m, state, encoded);
+            if (req.root_backend == .conditional) return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = true, .state = next, .root_cursor = log.cursor, .publication = .{ .id = publication.id, .enqueue = enqueue } }, .{});
             return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = true, .state = next, .publication = .{ .id = publication.id, .enqueue = enqueue } }, .{});
         }
         if (req.action != .commit) return error.CoordinatorWriteRequired;
@@ -485,6 +499,7 @@ pub const Context = struct {
         const encoded = try root.encodeBounded(m, state);
         try uploads.flush();
         const next = try log.append(m, state, encoded);
+        if (req.root_backend == .conditional) return std.json.Stringify.valueAlloc(self.alloc, .{ .state = next, .root_cursor = log.cursor, .base = base }, .{});
         return std.json.Stringify.valueAlloc(self.alloc, .{ .state = next, .base = base }, .{});
     }
 };
@@ -895,4 +910,34 @@ test "object-native fused observation reads one fresh root and selected pin with
     const absent = (try std.json.parseFromSlice(struct { selected: ?Row }, m, wrong, .{ .ignore_unknown_fields = true })).value;
     try std.testing.expectEqual(null, absent.selected);
     try std.testing.expectError(error.CoordinatorReadRequired, ctx.execute(.{ .action = .observe_read, .owner = @splat(9), .commands = &.{.{ .kind = .delete, .key = "head" }} }));
+}
+
+test "conditional metadata transactions retain KV, fused read, ownership and GC barriers" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = objects.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    const ctx = Context{ .alloc = m, .client = client, .bucket = "db", .prefix = "test", .namespace = "conditional-transactions", .io = std.testing.io };
+    const Header = struct { state: journal.State, root_cursor: conditional.Cursor, base: ?[]const u8 = null };
+    const first = (try std.json.parseFromSlice(Header, m, try ctx.execute(.{ .action = .begin, .root_backend = .conditional, .root_proof_scope = @splat(1), .owner = @splat(1) }), .{ .ignore_unknown_fields = true })).value;
+    try std.testing.expect(std.mem.indexOf(u8, first.base.?, "/coord-v2/") != null);
+    const committed = (try std.json.parseFromSlice(Header, m, try ctx.execute(.{ .action = .commit, .root_backend = .conditional, .root_proof_scope = @splat(1), .root_cursor = first.root_cursor, .owner = @splat(1), .state = first.state, .inline_read_set = .{ .keys = &.{"head"}, .prefix = "pins/" }, .commands = &.{ .{ .kind = .put, .key = "head", .value = "committed" }, .{ .kind = .put, .key = "pins/1", .value = "clock" } } }), .{ .ignore_unknown_fields = true })).value;
+    const fused = try ctx.execute(.{ .action = .observe_read, .root_backend = .conditional, .root_proof_scope = @splat(2), .owner = @splat(8), .commands = &.{.{ .kind = .get, .key = "head" }}, .read_prefix = "pins/" });
+    const Read = struct { state: journal.State, root_cursor: conditional.Cursor, results: [][]Row, selected: ?Row };
+    const read = (try std.json.parseFromSlice(Read, m, fused, .{ .ignore_unknown_fields = true })).value;
+    try std.testing.expectEqualStrings("committed", read.results[0][0].value);
+    try std.testing.expectEqualStrings("clock", read.selected.?.value);
+    try std.testing.expectEqual(committed.state.revision, read.state.revision);
+    const checkpointed = (try std.json.parseFromSlice(struct { checkpointed: bool }, m, try ctx.execute(.{ .action = .checkpoint, .root_backend = .conditional, .owner = @splat(1), .state = committed.state, .root_cursor = committed.root_cursor }), .{})).value;
+    try std.testing.expect(checkpointed.checkpointed);
+    const claimed = (try std.json.parseFromSlice(Header, m, try ctx.execute(.{ .action = .begin, .root_backend = .conditional, .root_proof_scope = @splat(3), .owner = @splat(2) }), .{ .ignore_unknown_fields = true })).value;
+    try std.testing.expectError(error.PreconditionFailed, ctx.execute(.{ .action = .commit, .root_backend = .conditional, .root_proof_scope = @splat(1), .owner = @splat(1), .state = committed.state, .root_cursor = committed.root_cursor, .commands = &.{.{ .kind = .put, .key = "head", .value = "fork" }} }));
+    try std.testing.expectError(error.ImmutableLogFenced, ctx.execute(.{ .action = .begin, .root_backend = .conditional, .owner = @splat(1), .state = committed.state, .root_cursor = committed.root_cursor }));
+    const retired = try ctx.execute(.{ .action = .retire_logs, .root_backend = .conditional, .owner = @splat(2), .state = claimed.state, .root_cursor = claimed.root_cursor, .before = "0", .keys = &.{"test/ROOT"} });
+    const keys = (try std.json.parseFromSlice(struct { keys: []const []const u8 }, m, retired, .{})).value;
+    try std.testing.expectEqual(@as(usize, 0), keys.keys.len);
 }

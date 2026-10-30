@@ -74,3 +74,28 @@ test('retained leases project protocol bytes and reject unchargeable metadata',a
  const f=fixture(),view=await f.cache.run(fence(7),'native',()=>({...f.view(),ctx:{promise:Promise.resolve()},extra:new Uint8Array(1024*1024)}));view.lease.ctx={promise:Promise.resolve()};view.entries[0][1].extra=new Uint8Array(1024*1024);assert.equal(f.cache.confirm(view,fence(7)),true);const hit=f.cache.get(fence(7));assert.equal(hit.ctx,undefined);assert.equal(hit.extra,undefined);assert.equal(hit.lease.ctx,undefined);assert.equal(hit.entries[0][1].extra,undefined);assert.ok(f.cache.bytes<32768);
  f.cache.clear();for(const change of[v=>v.entries[0][1].contentType={length:NaN},v=>v.version='invalid',v=>v.format=99]){const candidate=await f.cache.run(fence(7),'native',()=>f.view());change(candidate);assert.equal(f.cache.confirm(candidate,fence(7)),false);assert.equal(f.cache.bytes,0);}
 });
+
+
+test('conditional current-head cuts use bounded GC grace while historical reads persist pins',async()=>{
+ const {captureReadView}=await import('../read-view.mjs');
+ const {conditionalReadLeasePolicy}=await import('../../../zig/lib/objectstore/wasm/read-view-lease.mjs');
+ const keys={head:'head',wal:'antfly/wal-v1/'+scope+'/HEAD',floor:'floor',progress:'progress/'};
+ const row=value=>({etag:'e',body:utf8.encode(value),contentType:null});
+ const values=[row('3'),row('{"format":4,"latest_lsn":7}'),row('0')];let gets=0,puts=0,wall=100000;
+ const tx={getMany:async()=>values,get:async()=>{gets++;return undefined;},put(){puts++;}};
+ const options={read_lease_policy:conditionalReadLeasePolicy,allow_ephemeral_pin:true,lease_observed_at_ms:100000};
+ const current=await captureReadView(tx,keys,options,()=>wall);
+ assert.equal(gets,0);assert.equal(puts,0);assert.equal(current.lease.expires_at_ms,130000);
+ wall+=20000;const delayed=await captureReadView(tx,keys,options,()=>wall);assert.equal(delayed.lease.expires_at_ms,130000);
+ await captureReadView(tx,keys,{...options,version:'2'},()=>wall);assert.equal(gets,1);assert.equal(puts,1);
+ await captureReadView(tx,keys,{...options,read_lease_policy:readLeasePolicy},()=>wall);assert.equal(gets,2);assert.equal(puts,2);
+ await captureReadView(tx,keys,{...options,durable_pin:true},()=>wall);assert.equal(gets,3);assert.equal(puts,3);
+ wall=130000;await assert.rejects(captureReadView(tx,keys,options,()=>wall),/ReadSnapshotNeedsAdmission/);
+ wall=99999;await assert.rejects(captureReadView(tx,keys,options,()=>wall),/ReadSnapshotNeedsAdmission/);
+});
+
+test('conditional cursor-producing and exact-generation reads request durable protection',async()=>{
+ const options=[],views={open:async o=>{options.push(o);return{format:1,entries:[]};}};
+ for(const op of['lookup','count','list','search'])await prepareReadAdmission({COORDINATOR_BACKEND:'r2',METADATA_ROOT_BACKEND:'conditional'},{op,required_visibility:fence(7)},new CriticalPath(),views);
+ assert.deepEqual(options.map(o=>o.durable_pin),[false,false,true,true]);assert.deepEqual(options.map(o=>o.allow_cached),[true,true,false,false]);
+});

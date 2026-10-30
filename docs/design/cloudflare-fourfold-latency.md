@@ -128,8 +128,47 @@ Tests cover 100 consecutive commits, proof-cache loss, fabricated continuations,
 stale owners, retirement, oversized escaped roots, lost accepted acknowledgements,
 and absent response revisions. Opaque generation strings above JavaScript's safe
 integer range survive unchanged. The native object-store suite reports 167
-passed, two live-provider tests skipped. This prototype is not yet connected to
-the Worker transaction coordinator or enabled for existing databases.
+passed, two live-provider tests skipped. The transactional-store adapter and Worker coordinator now select this protocol
+explicitly with `METADATA_ROOT_BACKEND=conditional`. It creates a distinct
+`coord-v2` namespace and persists authority mode `r2-conditional`; mismatched
+configuration fails instead of forking or upgrading an existing database.
+The default remains the journal protocol. All roles, including mail auth, must
+use the same setting for a new deployment.
+
+A private host capability key signs native continuation state, revision, nonce,
+namespace, binding scope and owner. The key never enters ROOT, responses or
+telemetry. Signatures let pooled kernels authenticate accepted source state
+without relying on a particular kernel's cache. Key rotation falls back to a
+fresh observation. A signed source is not a freshness certificate: its exact
+opaque revision still guards every atomic replacement. GC checkpoint barriers
+always reobserve ownership, and ROOT is never a collectible log object.
+
+Conditional namespaces persist read policy v2 with 30-second operation roots
+and at least 60-second manifest/WAL/metadata collector grace. Only a freshly
+observed current manifest head can use an ephemeral pin; historical versions
+and exact generation requests retain durable pins. Native query sessions use
+request-local bounded manifest acquisition for these read operations, observing
+the supplied deadline and GC floor without renewal or the ten-minute pin cache;
+maintenance and ordinary long-lived native readers keep their existing leases. The deadline starts before
+observation, cannot be extended, and fails on clock regression. Existing policy
+v1 and namespaces remain unchanged.
+
+`NATIVE_WRITE_READ_AHEAD=true` opts into a native-derived plan for at most three
+independent immutable WAL roots. Each response is at most 16 KiB with 4 KiB of
+header allowance, covered by the existing pool read-ahead reservation. The host
+releases the planning kernel before issuing the wave, never waits for a busy
+permit, and closes retained bytes after mutation. Original operation, byte and
+deadline budgets span planning, physical prefetch, mutation, retries, refresh
+and final commit. Native decoding still verifies each page; root hints never
+authorize a write. Large or packed roots stay on the existing bounded path.
+
+The local experiment `qualification/local-worker-latency.mjs --conditional-root`
+compares journal, conditional, conditional plus canonical bodies, and conditional
+plus canonical bodies plus overlapping WAL roots. Every case uses the same
+frozen native modules and limits, disables completed-view reuse, and opens a
+fresh cut for each read so a hot old fence cannot hide authority dependency cost. It verifies body bytes, newer visibility
+fences, publication and counts. This is a local dependency experiment, not a
+hosted qualification result.
 
 The completed hosted attempt is sealed separately under
 `examples/cloudflare-serverless/dist/qualification/fenced-hosted-1793322083103/evidence.json`:
@@ -138,3 +177,13 @@ The completed hosted attempt is sealed separately under
 Independent cleanup verified all eleven Workers, namespaces, four Queues, three
 buckets and two destinations absent; generated test keys were removed. All
 collected failures and the original interrupted driver report remain preserved.
+
+
+Diagnostic corrections now retain a fixed underlying cause on Tail rejection
+markers (including recovered `SQLITE_NOMEM`), retain resource causes on ingestion
+rejections, and expose receiver rejection presence independently of the first
+eight sampled payload shapes. The per-minute counter reconciler filters terminal
+roots before its existing 20,000-root guard. Full immutable window indexing and
+separation of verbose archives from canonical proof remain necessary before a
+large hosted qualification; these changes do not certify lost deliveries or
+increase the 64 MiB source capture budget.

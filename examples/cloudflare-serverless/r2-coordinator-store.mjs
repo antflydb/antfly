@@ -43,6 +43,7 @@ const decode = value => JSON.parse(value, (_, v) => v && Object.keys(v).length =
 export class R2CoordinatorStore {
   constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, inlineReadSet,transport,kernel,readKernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8,remoteCache=transport=>transport,proofBudget,rowBudgetBytes=512*1024} = {}) {
     if(!Number.isSafeInteger(rowBudgetBytes)||rowBudgetBytes<32768||rowBudgetBytes>512*1024)throw Error("InvalidCoordinatorRowBudget");this.rowBudgetBytes=rowBudgetBytes;
+    this.rootBackend="journal";this.rootCursor=null;
     this.module = module; this.bucket = bucket; this.namespace = namespace; this.prefix = prefix; this.clock = clock; this.onMetrics = onMetrics; this.background = background;
     this.kernel=kernel;this.boundRows=boundRows;this.checkpointCommits=checkpointCommits;this.recoveryWindow=recoveryWindow;
     const copyOwner=value=>{if(!Array.isArray(value)&&!(value instanceof Uint8Array)||value.length!==16||!Array.from(value).every(v=>Number.isInteger(v)&&v>=0&&v<=255))throw Error("InvalidCoordinatorOwner");return Array.from(value);};
@@ -60,12 +61,18 @@ export class R2CoordinatorStore {
     this.rows=new Map();this.rowBytes=0;this.hintBytes=0;this.readHints=null;this.rowRevision=null;this.acquired=false;
     if(background)this.idleCheckpoint=new IdleCheckpoint({revision:()=>this.state?.revision??0,isIdle:()=>this.acquired&&!this.recovering,background,onError:error=>{try{this.onMetrics?.({event:"antfly.checkpoint_deferred",error:String(error)});}catch{}},checkpoint:()=>this.checkpointHint()});
   }
+  configureAuthority(descriptor){
+    if(!["r2","r2-conditional","sqlite"].includes(descriptor?.mode))throw Error("CoordinatorAuthorityMismatch");const backend=descriptor.mode==="r2-conditional"?"conditional":"journal";
+    if(this.rootBackend!==backend){if(this.state||this.observedState||this.acquired||this.running||this.pending.length)throw Error("CoordinatorMigrationRequired");this.rootBackend=backend;this.rootCursor=null;this.rootProofScope=Array.from(crypto.getRandomValues(new Uint8Array(16)));this.rootProofKey=Array.from(crypto.getRandomValues(new Uint8Array(32)));this.idleCheckpoint=null;}
+    this.readLeasePolicy=descriptor.read_lease_policy;
+  }
+  rootOptions(){return this.rootBackend==="conditional"?{root_backend:"conditional",root_cursor:this.rootCursor,root_proof_scope:this.rootProofScope,root_proof_key:this.rootProofKey}:{};}
   // Publish a captured, already committed recovery floor on the existing
   // observation pool. Foreground transactions never await this hint or share
   // its mutable accounting. Native authentication/CAS rejects stale owners and
   // preserves a newer checkpoint; the native one-second write limit applies.
   async checkpointHint() {
-    if(!this.acquired||this.recovering||this.ioDrain||!this.state)return{busy:true};
+    if(this.rootBackend==="conditional"||!this.acquired||this.recovering||this.ioDrain||!this.state)return{busy:true};
     const state=structuredClone(this.state),physical={};
     const transport=this.cache.wrap(instrumentTransport(this.rawTransport,physical),`coordinator/${this.namespace}`);
     const result=await this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{action:"checkpoint",owner:this.owner,state,checkpoint_commits:this.checkpointCommits}},{transport,fairKey:this.namespace,priority:"maintenance",deadlineMs:this.clock()+10000,maxOperations:32,maxTransferBytes:1024*1024,onMetrics:sample=>{try{this.onMetrics?.({event:"antfly.checkpoint_hint",...sample,physical_r2:physical});}catch{}}});
@@ -77,7 +84,7 @@ export class R2CoordinatorStore {
     if(!this.kernel)this.host ??= await instantiateHost(this.module, this.transport, {clock:this.clock,onMetrics:sample=>this.chargeMetrics(sample)});
     const cursor=Object.hasOwn(coordinate,"state")?coordinate.state:this.state??(coordinate.action==="begin"&&this.observedState?.next>0?this.observedState:null);
     let transport=this.transport,cleanup=async()=>{},abandoned=false;
-    if(coordinate.action==="retire_logs"&&this.base&&Array.isArray(coordinate.keys)&&coordinate.keys.length<=32){
+    if(this.rootBackend!=="conditional"&&coordinate.action==="retire_logs"&&this.base&&Array.isArray(coordinate.keys)&&coordinate.keys.length<=32){
       const prefix=this.base+"/epochs/",keys=[...new Set(coordinate.keys.filter(key=>typeof key==="string"&&key.startsWith(prefix)&&/^[a-f0-9]{32}\/(?:START|SEALED|[0-9]{20}\.json)$/.test(key.slice(prefix.length))))];
       if((this.usedOperations??0)+keys.length>=1024||(this.usedBytes??0)+keys.length*16384>=32*1024*1024)throw Error("CoordinatorIoBudgetExceeded");
       // Reserve speculation conservatively in addition to native accounting.
@@ -99,9 +106,9 @@ export class R2CoordinatorStore {
         if(!pending)return this.transport(request,body);
         results.delete(request.key);const result=await pending;if(result.error)throw result.error;return result.value;
       };
-    }else if(coordinate.action==="begin"&&this.recoveryWindow>0&&(!cursor||this.recovering)){
+    }else if(this.rootBackend!=="conditional"&&coordinate.action==="begin"&&this.recoveryWindow>0&&(!cursor||this.recovering)){
       transport=recoveryReadAhead(this.transport,{window:this.recoveryWindow,reserve:(operations,bytes)=>{if((this.usedOperations??0)+operations>=1024||(this.usedBytes??0)+bytes>=32*1024*1024)throw new Error("CoordinatorIoBudgetExceeded");this.usedOperations+=operations;this.usedBytes+=bytes;this.prefetchReservedBytes+=bytes;}});
-    }else if(coordinate.action==="begin"&&cursor&&this.base&&(this.usedOperations??0)+2<1024&&(this.usedBytes??0)+34816<32*1024*1024){
+    }else if(this.rootBackend!=="conditional"&&coordinate.action==="begin"&&cursor&&this.base&&(this.usedOperations??0)+2<1024&&(this.usedBytes??0)+34816<32*1024*1024){
       // Prefetch only within this recovery request. Negative results are never
       // retained, and append's before/after floor checks use the base transport.
       this.usedOperations=(this.usedOperations??0)+2;this.usedBytes=(this.usedBytes??0)+34816;this.prefetchReservedBytes=(this.prefetchReservedBytes??0)+34816;
@@ -119,7 +126,9 @@ export class R2CoordinatorStore {
     }
     try {
       if ((this.usedOperations ?? 0) >= 1024 || (this.usedBytes ?? 0) >= 32*1024*1024) throw new Error("CoordinatorIoBudgetExceeded");
-      return await (this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {checkpoint_commits:this.checkpointCommits,owner: this.owner, state: cursor, inline_read_set:this.inlineReadSet, ...coordinate}}, {transport,drainTransport:()=>cleanup(),background:this.background,onIoSettled:sample=>this.onMetrics?.(sample),fairKey:this.namespace,priority:this.groupPriority==="maintenance"?"maintenance":"commit",onStage:sample=>this.trace?.stage(sample),onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
+      const result=await (this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {...this.rootOptions(),checkpoint_commits:this.checkpointCommits,owner: this.owner, state: cursor, inline_read_set:this.inlineReadSet, ...coordinate}}, {transport,drainTransport:()=>cleanup(),background:this.background,onIoSettled:sample=>this.onMetrics?.(sample),fairKey:this.namespace,priority:this.groupPriority==="maintenance"?"maintenance":"commit",onStage:sample=>this.trace?.stage(sample),onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
+      if(this.rootBackend==="conditional"&&Object.hasOwn(result,"root_cursor"))this.rootCursor=result.root_cursor;
+      return result;
     } catch(error) {
       if(error?.ioSettled){abandoned=true;const draining=error.ioSettled;this.ioDrain=draining;draining.then(()=>{if(this.ioDrain===draining)this.ioDrain=null;});}
       throw error;
@@ -163,16 +172,16 @@ export class R2CoordinatorStore {
     const raw=(request,body)=>{onAdmission?.();return cached(request,body);};
     const guarded=async(request,body)=>{if(request.op!=="get")throw Error("ReadSnapshotWriteForbidden");return raw(request,body);};
     let transport,proofTransport=guarded;
-    if(captured&&this.base){
+    if(this.rootBackend!=="conditional"&&captured&&this.base){
       proofTransport=warmRecoveryReadAhead(guarded,{base:this.base,cursor:captured,reserve});
     }
     // An authenticated warm cursor identifies the three initial proof keys.
     // Fetch them in one wave; native recovery still selects and validates the
     // checkpoint/epoch, and unused speculation remains charged to this call.
-    transport=owned&&captured&&this.base?proofTransport:recoveryReadAhead(proofTransport,{window:this.recoveryWindow||1,initialWindow:1,reserve,cursor:captured,followSeals:!owned});
+    transport=this.rootBackend==="conditional"?proofTransport:owned&&captured&&this.base?proofTransport:recoveryReadAhead(proofTransport,{window:this.recoveryWindow||1,initialWindow:1,reserve,cursor:captured,followSeals:!owned});
     const native=(state,coordinate)=>{
       if(usedOperations>=254||usedBytes>=8*1024*1024)throw Error("ReadSnapshotNeedsAdmission");
-      return this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{owner:coordinate.action==="read"?state.owner:this.owner,state,...coordinate}},{transport,background:background??this.background,onIoSettled:sample=>this.onMetrics?.(sample),fairKey:this.namespace,priority,onStage:sample=>{if(sample.name==="kernel_queue")onAdmission?.();},deadlineMs,maxOperations:254-usedOperations,maxTransferBytes:8*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,action:coordinate.action,...sample});}catch{}}});
+      return this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{...this.rootOptions(),owner:coordinate.action==="read"?state.owner:this.owner,state,...coordinate}},{transport,background:background??this.background,onIoSettled:sample=>this.onMetrics?.(sample),fairKey:this.namespace,priority,onStage:sample=>{if(sample.name==="kernel_queue")onAdmission?.();},deadlineMs,maxOperations:254-usedOperations,maxTransferBytes:8*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,action:coordinate.action,...sample});}catch{}}});
     };
     this.snapshotReaders++;
     const finish=()=>{
@@ -231,7 +240,7 @@ export class R2CoordinatorStore {
       const result=await run(tx);outcome="ok";return result;
     }catch(error){
       failure=error;
-      if(admissionBudgetExceeded||["ObjectIoBudgetExceeded","HostedWorkingSetBudgetExceeded","ReadAheadCapacityExceeded"].includes(error?.message)){outcome="needs_admission";failure=Error("ReadSnapshotNeedsAdmission");if(error.ioSettled)Object.defineProperty(failure,"ioSettled",{value:error.ioSettled});throw failure;}
+      if(admissionBudgetExceeded||["ConditionalRootMissing","ObjectIoBudgetExceeded","HostedWorkingSetBudgetExceeded","ReadAheadCapacityExceeded"].includes(error?.message)){outcome="needs_admission";failure=Error("ReadSnapshotNeedsAdmission");if(error.ioSettled)Object.defineProperty(failure,"ioSettled",{value:error.ioSettled});throw failure;}
       throw error;
     }finally{
       const settlement=finish();
@@ -301,7 +310,7 @@ export class R2CoordinatorStore {
       // retained root is authenticated by append's before/after floor and seal
       // checks, then linearized by its immutable conditional journal slot.
       // Stale slots fail closed and force ordinary recovery before a retry.
-      const warmCommit=this.pending[0]?.kind==="commit_wal"&&this.pending[0].nativePlan&&this.acquired&&!this.recovering&&this.state?.next<64;
+      const warmCommit=this.pending[0]?.kind==="commit_wal"&&this.pending[0].nativePlan&&this.acquired&&!this.recovering&&this.state?.next<64&&(this.rootBackend!=="conditional"||this.rootCursor?.revision!=null);
       const recovered = warmCommit?{state:this.state,base:this.base,page_prefix:this.pagePrefix,has_more:false}:await this.trace.span("recovery",()=>this.native({action: "begin"}));
       beginMs=performance.now()-started;
       if(this.acquired&&hex(recovered.state.owner)!==hex(this.owner))throw new Error("ImmutableLogFenced");

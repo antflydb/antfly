@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import{issueReadLease,readLeaseRemaining}from"../../zig/lib/objectstore/wasm/read-view-lease.mjs";
+import{issueReadLease,readLeaseRemaining,validReadLeasePolicy}from"../../zig/lib/objectstore/wasm/read-view-lease.mjs";
 import {normalizeReadHints,decodeReadHints} from "./publication-read-hints.mjs";
 import {unsupportedRpc} from "./performance.mjs";
 import {ObjectStoreError} from "../../zig/lib/objectstore/wasm/r2.mjs";
@@ -32,7 +32,7 @@ export async function openReadView(store,namespace,{version,trace_id,immutable}=
  const keys=await metadataKeys(namespace);
  return store.transaction(tx=>captureReadView(tx,keys,{version,immutable},now),{traceId:trace_id});
 }
-export async function captureReadView(tx,keys,{version,immutable=true,read_lease_policy,lease_observed_at_ms}={},now=Date.now){
+export async function captureReadView(tx,keys,{version,immutable=true,read_lease_policy,lease_observed_at_ms,allow_ephemeral_pin=false,durable_pin=false}={},now=Date.now){
   const values=await tx.getMany([keys.head,keys.wal,keys.floor,...(immutable&&keys.hints?[keys.hints]:[])]);
   const head=values[0]?text.decode(values[0].body).trim():"0";
   const selected=version??head;
@@ -40,9 +40,15 @@ export async function captureReadView(tx,keys,{version,immutable=true,read_lease
   const floor=values[2]?BigInt(text.decode(values[2].body).trim()):0n;
   const entries=[[keys.head,values[0]],[keys.wal,values[1]],[keys.floor,values[2]]];
   if(BigInt(selected)>0n&&BigInt(selected)>=floor){
-   const key=keys.progress+"READ_PINS/"+selected,prior=await tx.get(key),clock=BigInt(now())*1000000n;
+   const key=keys.progress+"READ_PINS/"+selected;
+   // Only the freshly observed current head is protected by the persisted v2
+   // collector grace. Historical generations still require a durable pin.
+   const ephemeral=immutable&&allow_ephemeral_pin&&!durable_pin&&selected===head&&validReadLeasePolicy(read_lease_policy)&&read_lease_policy.format===2;
+   const observed=lease_observed_at_ms??now(),current=now();
+   if(ephemeral&&(!Number.isSafeInteger(observed)||current<observed||current-observed>=30000))throw Error("ReadSnapshotNeedsAdmission");
+   const prior=ephemeral?{etag:"gc-grace",body:utf8.encode(String(BigInt(observed+30000)*1000000n)),contentType:null}:await tx.get(key),clock=BigInt(current)*1000000n;
    let pin=prior;
-   if(!prior||BigInt(text.decode(prior.body).trim())-clock<300000000000n){
+   if(!ephemeral&&(!prior||BigInt(text.decode(prior.body).trim())-clock<300000000000n)){
     pin={etag:crypto.randomUUID(),body:utf8.encode(String(clock+600000000000n)),contentType:null};tx.put(key,pin);
    }
    entries.push([key,pin]);
@@ -66,7 +72,7 @@ export function withReadView(transport,coordinator,namespace,{onMetrics=()=>{},i
   }
   if((request.op==="get"||request.op==="head")&&(request.key?.startsWith(progress)||/\/wal-v1\/[a-f0-9]{64}\/HEAD$/.test(request.key??""))){
    if(performance.now()-started>=30000)throw new ObjectStoreError(8,"read view deadline exceeded");
-   pending??=coordinator.openReadView(hint==null?{}:{version:hint}).then(mapView).catch(error=>{if(unsupportedRpc(error,"openReadView"))return null;throw error;});
+   pending??=coordinator.openReadView({durable_pin:true,...(hint==null?{}:{version:hint})}).then(mapView).catch(error=>{if(unsupportedRpc(error,"openReadView"))return null;throw error;});
    const records=(await pending)?.records;checkLease();
    if(records?.has(request.key)){
     const record=records.get(request.key);onMetrics({snapshot_reads:1});

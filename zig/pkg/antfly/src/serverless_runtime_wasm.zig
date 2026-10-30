@@ -152,7 +152,9 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         pack_small_bodies: bool = false,
         inline_point_bodies: bool = false,
         canonical_point_bodies: bool = false,
+        bounded_manifest_reads: bool = false,
         native_write_plan: ?@import("serverless/wal/write_plan.zig").Input = null,
+        native_write_read_ahead: bool = false,
         native_read_plan_mode: bool = false,
         native_read_state: bool = false,
         wal_document_index: bool = false,
@@ -242,6 +244,11 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         if (req.op != .mutate) return error.InvalidNativeWritePlan;
         write_plan = try @import("serverless/wal/write_plan.zig").Plan.init(a, data_client, req.bucket, req.prefix, req.namespace, input, host_io);
         data_client = write_plan.?.client(a);
+        if (req.native_write_read_ahead) {
+            var indexed = try @import("serverless/wal/indexed_object_store.zig").IndexedObjectStore.init(a, data_client, req.bucket, req.prefix);
+            defer indexed.deinit();
+            return std.json.Stringify.valueAlloc(a, .{ .reads = try indexed.writeReadAhead(a, req.namespace) }, .{});
+        }
     }
     const artifact_prefix = try std.fmt.allocPrint(a, "{s}/artifacts", .{req.prefix});
     defer a.free(artifact_prefix);
@@ -446,6 +453,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     defer runtime.deinit();
     prepareServingScope(req.bucket, req.prefix);
     runtime.shared_read_leases = &shared_read_leases;
+    runtime.bounded_manifest_reads = req.bounded_manifest_reads;
     runtime.decoded_manifests = &decoded_manifests;
     runtime.decoded_manifest_allocator = wasm_allocator;
     if (req.op == .status) {

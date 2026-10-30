@@ -14,6 +14,7 @@
 // limitations under the License.
 
 // Diagnostic only. Source identities and delivery completeness are not assumed.
+import{resourceFailureCode}from'../performance.mjs';
 import{sanitizeTailEvent}from'./metrics-tail.mjs';
 import{sanitizeOtel}from'./otel-evidence.mjs';
 const encoder=new TextEncoder(),uuid=value=>typeof value==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
@@ -98,5 +99,5 @@ export default {async fetch(request,env){
   }
   if(path==='/drain'&&request.method==='POST'){const page=await env.LOGS.list({prefix,limit:1000});if(page.objects.length)await env.LOGS.delete(page.objects.map(o=>o.key));return Response.json({deleted:page.objects.length,done:page.objects.length===0});}
   return new Response('not found',{status:404});
- }catch(error){const code=/^Telemetry[A-Za-z]+$/.test(error?.message??'')?error.message:'TelemetryIngestionFailed';if(['/ingest','/v1/traces','/v1/logs'].includes(path)){try{await env.LOGS.put(prefix+'rejections/'+crypto.randomUUID()+'.json',JSON.stringify({schema:1,qualification:false,rejection:code,collector_version:env.WORKER_VERSION?.id??null,...(error.attribute_key?{attribute_conflict:['service.name','faas.name','faas.version','faas.invocation_id','cloudflare.handler_type','cloudflare.outcome','cloudflare.cpu_time_ms','cloudflare.wall_time_ms','cloudflare.invocation.sequence.number','cloudflare.execution_model'].includes(error.attribute_key)?error.attribute_key:'other'}:{}),...(rejectionShape?{shape:rejectionShape}:{}),encoding:['gzip','identity'].includes(request.headers.get('Content-Encoding'))?request.headers.get('Content-Encoding'):request.headers.has('Content-Encoding')?'other':'absent'}));}catch{}}return Response.json({error:code},{status:code.includes('Exceeded')?413:code==='TelemetryIngestionFailed'?503:400});}
+ }catch(error){const code=/^Telemetry[A-Za-z]+$/.test(error?.message??'')?error.message:'TelemetryIngestionFailed';if(['/ingest','/v1/traces','/v1/logs'].includes(path)){try{await env.LOGS.put(prefix+'rejections/'+crypto.randomUUID()+'.json',JSON.stringify({schema:1,qualification:false,rejection:code,...(resourceFailureCode(error)?{failure_code:resourceFailureCode(error)}:{}),collector_version:env.WORKER_VERSION?.id??null,...(error.attribute_key?{attribute_conflict:['service.name','faas.name','faas.version','faas.invocation_id','cloudflare.handler_type','cloudflare.outcome','cloudflare.cpu_time_ms','cloudflare.wall_time_ms','cloudflare.invocation.sequence.number','cloudflare.execution_model'].includes(error.attribute_key)?error.attribute_key:'other'}:{}),...(rejectionShape?{shape:rejectionShape}:{}),encoding:['gzip','identity'].includes(request.headers.get('Content-Encoding'))?request.headers.get('Content-Encoding'):request.headers.has('Content-Encoding')?'other':'absent'}));}catch{}}return Response.json({error:code},{status:code.includes('Exceeded')?413:code==='TelemetryIngestionFailed'?503:400});}
 }};

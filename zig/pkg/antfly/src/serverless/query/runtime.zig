@@ -263,6 +263,7 @@ pub const QueryRuntime = struct {
     namespace_metrics: std.StringHashMapUnmanaged(QueryExecutionMetrics) = .empty,
     read_leases: read_lease.Cache = .{},
     shared_read_leases: ?*read_lease.Cache = null,
+    bounded_manifest_reads: bool = false,
     decoded_manifests: ?*manifest_mod.decoded_cache.Cache = null,
     decoded_manifest_allocator: ?Allocator = null,
 
@@ -321,7 +322,7 @@ pub const QueryRuntime = struct {
         for (manifest.artifacts) |artifact| {
             if (artifact.kind == .document_facts or (artifact.kind == .graph_segment and artifact.metadata_version == graph_segment_mod.page_graph.Root.metadata_version)) {
                 try cancellation.check();
-                lease = try (self.shared_read_leases orelse &self.read_leases).acquire(self.progress, namespace, version);
+                lease = if (self.bounded_manifest_reads) try read_lease.acquireBoundedAt(self.progress, namespace, version, @import("antfly_platform").time.realtimeNs(), @import("antfly_platform").time.authorityNs()) else try (self.shared_read_leases orelse &self.read_leases).acquire(self.progress, namespace, version);
                 break;
             }
         }

@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {immutableReadWave} from "../../zig/lib/objectstore/wasm/immutable-read-wave.mjs";
+import {readAheadBudgetFor} from "../../zig/lib/objectstore/wasm/read-ahead.mjs";
 import {edgeCacheForEnv} from "./edge-immutable-cache.mjs";
 import {actorOwner} from "./actor-owner.mjs";
 import {writeReadHints} from "./publication-read-hints.mjs";
@@ -37,7 +39,7 @@ import {tenantEnvs} from "./tenants.mjs";
 import {captureReadView,inlineReadSet} from "./read-view.mjs";
 import {createR2Transport} from "../../zig/lib/objectstore/wasm/r2.mjs";
 import {withCommitCoordinator} from "../../zig/lib/objectstore/wasm/coordinated.mjs";
-import {openAuthority, activateR2} from "./coordinator-authority.mjs";
+import {openAuthority, activateR2,coordinatorAuthorityMode,isObjectStoreAuthority} from "./coordinator-authority.mjs";
 import {DurableObject} from "cloudflare:workers";
 import module from "./dist/antfly-serverless.wasm";
 import {AuthorityAdmission} from "./authority-admission.mjs";
@@ -61,10 +63,10 @@ export class R2CommitCoordinator extends DurableObject {
     this.publication=new PublicationScheduler(this.maintenanceStore,env.ANTFLY_INCARNATION);
     this.maintenance=new MaintenanceTickets(this.maintenanceStore);
     this.journal = new R2CollectionJournal(this.maintenanceStore);
-    this.authorityAdmission=new AuthorityAdmission(async()=>{if(this.store.ownerReady)await this.store.ownerReady;return openAuthority(env,"r2");});
+    this.authorityAdmission=new AuthorityAdmission(async()=>{if(this.store.ownerReady)await this.store.ownerReady;return openAuthority(env,coordinatorAuthorityMode(env));});
     if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.actor_started",role:"writer",actor_id:ctx.id.toString(),actor_instance_id:instanceId,version:env.WORKER_VERSION?.id,owner_identity:owner?"actor-version":"ephemeral",...kernelMetrics()}));
   }
-  async ensureAuthority(){if(!this.authority){const authority=await this.authorityAdmission.get();this.authority??=authority;}return this.authority;}
+  async ensureAuthority(){if(!this.authority){const authority=await this.authorityAdmission.get();this.store.configureAuthority(authority.descriptor);this.authority??=authority;}return this.authority;}
   requestMaintenance(kind,jobId){return this.maintenance.request(kind,jobId);}
   validMaintenance(kind,ticket,jobId){return this.maintenance.valid(kind,ticket,jobId);}
   advanceMaintenance(kind,ticket,jobId){return this.maintenance.advance(kind,ticket,jobId);}
@@ -77,13 +79,13 @@ export class R2CommitCoordinator extends DurableObject {
   openReadView(options={}) {
     const observedAt=Date.now();
     this.readAdmissions??=new FreshReadAdmissions({delayMs:Number(this.env.READ_VIEW_BATCH_MS??2)});
-    return this.readAdmissions.run(options.immutable===false?JSON.stringify(["metadata",options.version??"latest"]):options.version??"latest",async(traceIds,close)=>{
+    return this.readAdmissions.run(options.immutable===false?JSON.stringify(["metadata",options.version??"latest"]):JSON.stringify([options.version??"latest",options.durable_pin===true]),async(traceIds,close)=>{
       await this.ensureAuthority();
       const capture=async tx=>{
         const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);
         const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,...(options.immutable===false?[]:[keys.hints])]);
-        if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||this.authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
-        return captureReadView(tx,keys,{...options,lease_observed_at_ms:observedAt,read_lease_policy:this.env.FENCED_READ_LEASES!=="false"?this.authority.descriptor.read_lease_policy:undefined});
+        if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||!isObjectStoreAuthority(this.authority.descriptor.mode))throw Error("CoordinatorMigrationRequired");
+        return captureReadView(tx,keys,{...options,lease_observed_at_ms:observedAt,allow_ephemeral_pin:this.store.rootBackend==="conditional",read_lease_policy:this.env.FENCED_READ_LEASES!=="false"||this.store.rootBackend==="conditional"?this.authority.descriptor.read_lease_policy:undefined});
       };
       if(this.env.READ_ONLY_SNAPSHOTS==="false")close();
       return(this.env.READ_ONLY_SNAPSHOTS==="false"?Promise.reject(Error("ReadSnapshotNeedsAdmission")):this.store.readOnly(capture,{traceId:options.trace_id,traceIds,onAdmission:close,deadlineMs:options.deadlineMs,priority:options.immutable===false?"commit":"interactive"})).catch(error=>{
@@ -165,7 +167,7 @@ export class R2CommitCoordinator extends DurableObject {
     await this.ensureAuthority();
     return this.store.transaction(async tx => {
       const migration = await tx.get(MIGRATION);
-      if ((migration && migration.phase !== "active") || (this.env.COORDINATOR_MIGRATION_REQUIRED === "true" && !migration) || this.authority.descriptor.mode !== "r2") throw new Error("CoordinatorMigrationRequired");
+      if ((migration && migration.phase !== "active") || (this.env.COORDINATOR_MIGRATION_REQUIRED === "true" && !migration) || !isObjectStoreAuthority(this.authority.descriptor.mode)) throw new Error("CoordinatorMigrationRequired");
       return run(tx);
     },options);
   }
@@ -173,7 +175,7 @@ export class R2CommitCoordinator extends DurableObject {
     await this.ensureAuthority();
     const state = await this.store.transaction(async tx => await tx.get(MIGRATION) ?? {phase:"none"});
     if (state.phase === "none" && this.env.LEGACY_COMMITS && await this.env.LEGACY_COMMITS.getByName(this.env.ANTFLY_INCARNATION).frozenR2Status()) return {phase:"freeze"};
-    return state.phase === "active" && this.authority.descriptor.mode !== "r2" ? {...state,phase:"cutover"} : state;
+    return state.phase === "active" && !isObjectStoreAuthority(this.authority.descriptor.mode) ? {...state,phase:"cutover"} : state;
   }
   async migrateFromSqlite() {
     await this.ensureAuthority();
@@ -182,7 +184,7 @@ export class R2CommitCoordinator extends DurableObject {
     if (result.done) {
       const state = await this.store.transaction(tx => tx.get(MIGRATION));
       this.authority = await activateR2(this.env,this.authority,state.token);
-      if (this.authority.descriptor.mode !== "r2") return {has_more:true,phase:"cutover"};
+      if (!isObjectStoreAuthority(this.authority.descriptor.mode)) return {has_more:true,phase:"cutover"};
     }
     return result;
   }
@@ -280,7 +282,7 @@ export class R2CommitCoordinator extends DurableObject {
       let maximum=0n;for(const item of result.results)maximum=BigInt("0x"+item.visibility.slice(-16))>maximum?BigInt("0x"+item.visibility.slice(-16)):maximum;
       let committed;
       if(prepared.head&&this.env.NATIVE_WAL_COMMIT!=="false"){
-        if(this.authority.descriptor.mode!=="r2")throw new Error("CoordinatorMigrationRequired");
+        if(!isObjectStoreAuthority(this.authority.descriptor.mode))throw new Error("CoordinatorMigrationRequired");
         if(Date.now()>=deadline)throw new Error("DeadlineExceeded");
         const native=await trace.span("durable_commit",()=>this.store.commitWal({...(retained?{dependencies}:{}),wal_key:keys.wal,expected_etag:prepared.original?.etag??null,value:encode(prepared.head),publication_key:"__antfly_maintenance/publication",watermark:String(maximum),now_ms:Date.now(),id:crypto.randomUUID(),migration_required:this.env.COORDINATOR_MIGRATION_REQUIRED==="true"},{deadlineMs:deadline,traceId:trace.id}));
         committed=native.applied?native.publication:null;
@@ -305,7 +307,7 @@ export class R2CommitCoordinator extends DurableObject {
     const started=performance.now();
     try{
     await trace.span("writer_authority",()=>this.ensureAuthority());
-    if(this.authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
+    if(!isObjectStoreAuthority(this.authority.descriptor.mode))throw Error("CoordinatorMigrationRequired");
     const ioBudget={operations:0,bytes:0},physical={};
     const refresh=()=>trace.span("write_refresh",()=>this.transaction(async()=>{},{deadlineMs:deadline,traceId:trace.id,ioBudget}));
     if(!this.store.state||this.store.recovering)await refresh();
@@ -313,9 +315,20 @@ export class R2CommitCoordinator extends DurableObject {
     for(let attempt=0;attempt<3;attempt++){
       if(Date.now()>=deadline)throw Error("DeadlineExceeded");
       if(ioBudget.operations>=1024||ioBudget.bytes>=32*1024*1024)throw Error("CoordinatorIoBudgetExceeded");
-      let prepared;
-      try{prepared=await trace.span("native_wal_plan",()=>buildKernel.request({op:"mutate",...(this.env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(this.env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}),namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",working_set_bytes:walWorkingBytes,native_write_plan:{state:structuredClone(this.store.state),metadata_namespace:this.store.namespace,reservation_id:crypto.randomUUID()},mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-ioBudget.operations,maxTransferBytes:32*1024*1024-ioBudget.bytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{ioBudget.operations+=sample.operations;ioBudget.bytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,native_write_plan:true,...sample,physical}));}}));}
+      let prepared,wave,permit;
+      try{
+        const request={op:"mutate",...(this.env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(this.env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}),namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",working_set_bytes:walWorkingBytes,native_write_plan:{...(this.store.rootBackend==="conditional"?{metadata_backend:"conditional"}:{}),state:structuredClone(this.store.state),metadata_namespace:this.store.namespace,reservation_id:crypto.randomUUID()},mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))};
+        const options=()=>({transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-ioBudget.operations,maxTransferBytes:32*1024*1024-ioBudget.bytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{ioBudget.operations+=sample.operations;ioBudget.bytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,native_write_plan:true,...sample,physical}));}});
+        if(this.env.NATIVE_WRITE_READ_AHEAD==="true")permit=readAheadBudgetFor(buildKernel,Math.min(4,buildKernel.slots.length)).tryAcquire(this.env.ANTFLY_INCARNATION);
+        if(permit){
+          permit.start();
+          const plan=await trace.span("native_wal_read_plan",()=>buildKernel.request({...request,native_write_read_ahead:true,mutation_groups:[]},options()));
+          wave=await trace.span("native_wal_read_wave",()=>immutableReadWave(transport,plan.reads,{deadlineMs:deadline,reserve:(operations,bytes)=>{if(ioBudget.operations+operations>=1024||ioBudget.bytes+bytes>=32*1024*1024)throw Error("CoordinatorIoBudgetExceeded");ioBudget.operations+=operations;ioBudget.bytes+=bytes;}}));
+        }
+        prepared=await trace.span("native_wal_plan",()=>buildKernel.request(request,{...options(),transport:wave?.transport??transport}));
+      }
       catch(error){if(error?.message!=="FileNotFound")throw error;await refresh();continue;}
+      finally{wave?.close();permit?.();}
       if(!prepared.__write_plan||!Array.isArray(prepared.results)||prepared.results.length!==inputs.length)throw Error("NativeWritePlanRequired");
       let committed;
       try{committed=await trace.span("native_wal_finalize",()=>this.store.commitWal({...prepared.__write_plan,migration_required:this.env.COORDINATOR_MIGRATION_REQUIRED==="true"},{deadlineMs:deadline,traceId:trace.id,nativePlan:true,ioBudget}));}

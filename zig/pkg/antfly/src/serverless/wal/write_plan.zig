@@ -23,6 +23,7 @@ const A = std.mem.Allocator;
 const T = objects.types;
 
 pub const Input = struct {
+    metadata_backend: tx.RootBackend = .journal,
     state: objects.immutable_log.State,
     metadata_namespace: []const u8,
     reservation_id: []const u8,
@@ -56,6 +57,7 @@ pub const Plan = struct {
         };
         const encoded = try (tx.Context{ .alloc = a, .client = backing, .bucket = bucket, .prefix = prefix, .namespace = input.metadata_namespace, .io = io }).execute(.{
             .action = .read,
+            .root_backend = input.metadata_backend,
             .owner = input.state.owner,
             .state = input.state,
             .commands = &.{ .{ .kind = .get, .key = keys[0] }, .{ .kind = .get, .key = keys[1] }, .{ .kind = .get, .key = keys[2] } },
@@ -192,6 +194,18 @@ test "serverless native write plan preserves semantic dependencies and final nat
     indexed.inline_tail_enabled = true;
     const batch = try indexed.appendGroupsIdempotent("docs", &.{.{ .timestamp = 1, .payloads = &.{"one"}, .id = "first" }});
     defer a.free(batch);
+    const reads = try indexed.writeReadAhead(a, "docs");
+    defer {
+        for (reads) |item| a.free(item.key);
+        a.free(reads);
+    }
+    try std.testing.expect(reads.len >= 1 and reads.len <= 3);
+    for (reads) |item| {
+        try std.testing.expect(item.max_response_bytes <= 16384);
+        var fetched = try client_.getObject("database", item.key, .{ .max_response_bytes = item.max_response_bytes });
+        defer fetched.deinit(a);
+        try std.testing.expect(fetched.body.len <= item.max_response_bytes);
+    }
     const commit = try plan.finish(m, "1", 1000);
     try std.testing.expectError(error.FileNotFound, client_.getObject("database", commit.wal_key, .{}));
     const committed = try context.execute(.{ .action = .commit_wal, .owner = @splat(1), .state = state, .wal_commit = commit });

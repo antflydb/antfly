@@ -17,7 +17,7 @@ import{FencedReadLeases}from"../../zig/lib/objectstore/wasm/read-view-lease.mjs"
 import {edgeCacheForEnv} from "./edge-immutable-cache.mjs";
 import {AuthorityAdmission} from "./authority-admission.mjs";
 import {R2CoordinatorStore} from "./r2-coordinator-store.mjs";
-import {openAuthority} from "./coordinator-authority.mjs";
+import {openAuthority,coordinatorAuthorityMode} from "./coordinator-authority.mjs";
 import {metadataKeys,captureReadView} from "./read-view.mjs";
 import {MIGRATION} from "./r2-coordinator-migration.mjs";
 import {FreshReadAdmissions} from "./fresh-read-admissions.mjs";
@@ -27,7 +27,7 @@ import {readAheadBudgetFor} from "../../zig/lib/objectstore/wasm/read-ahead.mjs"
 // and can never create authority, acquire ownership or extend a durable pin.
 export class NativeReadViews {
  constructor(module,env,{kernel,cache,clock=Date.now,onMetrics,background,cohortDelayMs=2}={}){
-  this.env=env;this.clock=clock;this.cohorts=new FreshReadAdmissions({delayMs:cohortDelayMs});this.authorityAdmission=new AuthorityAdmission(()=>openAuthority(env,"r2",{allowCreate:false}));
+  this.env=env;this.clock=clock;this.cohorts=new FreshReadAdmissions({delayMs:cohortDelayMs});this.authorityAdmission=new AuthorityAdmission(()=>openAuthority(env,coordinatorAuthorityMode(env),{allowCreate:false}));
   const observation={request:(input,options)=>kernel.request(input,{...options,kernelVariant:"observe",memoryReservationBytes:8*1024*1024,reservationClass:"authority"})};
   this.background=background;this.leaseCapacity=env.FENCED_READ_LEASES==="false"?0:32768;
   this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,rowBudgetBytes:512*1024-this.leaseCapacity,readKernel:observation,cache,onMetrics,proofBudget:env.DETACHED_METADATA_PROOFS==="true"&&kernel.slots?.length?readAheadBudgetFor(kernel,Math.min(4,kernel.slots.length)):undefined,remoteCache:edgeCacheForEnv(env,{background})});
@@ -39,14 +39,15 @@ export class NativeReadViews {
  confirm(view,token){return this.leases?.confirm(view,token)??false;}
  metrics(){return{read_view_lease_bytes:this.leases?.bytes??0,read_view_lease_hits:this.leases?.hits??0,read_view_lease_joins:this.leases?.joins??0};}
  freshOpen(options={}){const observedAt=this.clock();
-  return this.cohorts.run(options.version??"latest",async(traceIds,close,publish)=>{
+  return this.cohorts.run(JSON.stringify([options.version??"latest",options.durable_pin===true]),async(traceIds,close,publish)=>{
    const authority=await this.authorityAdmission.get();
-   if(authority.descriptor.mode!=="r2"){this.authorityAdmission.value=null;throw Error("CoordinatorMigrationRequired");}
+   if(authority.descriptor.mode!==coordinatorAuthorityMode(this.env)){this.authorityAdmission.value=null;throw Error("CoordinatorMigrationRequired");}
+   this.store.configureAuthority(authority.descriptor);
    const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);
    return this.store.readOnly(async tx=>{
     const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,keys.hints]);
-    if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
-    const view=await captureReadView(tx,keys,{...options,lease_observed_at_ms:observedAt,read_lease_policy:this.leaseCapacity?authority.descriptor.read_lease_policy:undefined},this.clock);publish(view);return view;
+    if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||authority.descriptor.mode!==coordinatorAuthorityMode(this.env))throw Error("CoordinatorMigrationRequired");
+    const view=await captureReadView(tx,keys,{...options,lease_observed_at_ms:observedAt,allow_ephemeral_pin:this.store.rootBackend==="conditional",read_lease_policy:this.leaseCapacity||this.store.rootBackend==="conditional"?authority.descriptor.read_lease_policy:undefined},this.clock);publish(view);return view;
    },{traceId:options.trace_id,traceIds,onAdmission:close,background:options.background??this.background,deadlineMs:options.deadlineMs,...(this.env.FUSED_READ_ADMISSION==="true"?{readKeys:[MIGRATION,keys.head,keys.wal,keys.floor,keys.hints],readPrefix:keys.progress+"READ_PINS/"}:{})});
   },options.trace_id,{untilAdmission:true,onPrepared:options.onPrepared,onAdmitted:options.onAdmitted});
  }

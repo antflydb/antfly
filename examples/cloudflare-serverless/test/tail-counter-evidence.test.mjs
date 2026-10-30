@@ -30,3 +30,14 @@ test('closed native populations require two separated immutable observations and
  const late=structuredClone(second);late.objects.push(delivery());assert.equal((await reconcileTailCounterSnapshots(first,late,scope)).complete,false);
  const forged=structuredClone(second);forged.objects.push(forged.objects[0]);assert.equal((await reconcileTailCounterSnapshots(first,forged,scope)).complete,false);
 });
+
+
+test('minute counter reconciliation bounds terminal roots independently of verbose child spans',async()=>{
+ const snapshot=t=>({qualification:false,capture_id:captureId,collector_version:counterVersion,snapshot_started_at:t,snapshot_finished_at:t+100,objects:[delivery(),{key:'probe-v1/'+captureId+'/roots.json',value:{rows:[root()]}}]});
+ const first=snapshot(62000);
+ for(let i=0;i<25;i++)first.objects.push({key:'probe-v1/'+captureId+'/children-'+i+'.json',value:{rows:Array.from({length:1000},()=>({...root(),terminal:false}))}});
+ const second={...structuredClone(first),snapshot_started_at:92100,snapshot_finished_at:92200};
+ assert.equal((await reconcileTailCounterSnapshots(first,second,scope)).complete,true);
+ second.objects[0].value.records[0].event.logs=[{message:[JSON.stringify({event:'antfly.resource_failure',failure_code:'SQLITE_NOMEM'})]}];
+ assert.equal((await reconcileTailCounterSnapshots(first,second,scope)).complete,false,'unfiltered resource evidence still changes settlement');
+});

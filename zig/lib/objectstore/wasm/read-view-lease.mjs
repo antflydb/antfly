@@ -16,9 +16,10 @@
 // Provider-neutral host contract for native, visibility-fenced read snapshots.
 // No transport, request context or completed promise is retained in a lease.
 export const readLeasePolicy=Object.freeze({format:1,root_lifetime_ms:30000,gc_grace_ms:60000});
+export const conditionalReadLeasePolicy=Object.freeze({...readLeasePolicy,format:2,manifest_gc_grace_ms:60000});
 const text=new TextDecoder(),bindings=new WeakMap();
 const u64=value=>{try{const n=typeof value==='bigint'?value:typeof value==='string'&&/^(0|[1-9][0-9]{0,19})$/.test(value)?BigInt(value):Number.isSafeInteger(value)&&value>=0?BigInt(value):null;return n!==null&&n<=18446744073709551615n?n:null;}catch{return null;}};
-export const validReadLeasePolicy=p=>p?.format===1&&p.root_lifetime_ms===30000&&p.gc_grace_ms===60000;
+export const validReadLeasePolicy=p=>[1,2].includes(p?.format)&&p.root_lifetime_ms===30000&&p.gc_grace_ms===60000&&(p.format!==2||p.manifest_gc_grace_ms===60000);
 export function visibilityFence(value,scope){if(typeof value!=='string'||!/^01[a-f0-9]{80}$/i.test(value)||value.slice(2,66).toLowerCase()!==scope)return null;return BigInt('0x'+value.slice(66));}
 export function issueReadLease(view,{scope,walKey,pinPrefix,policy,observedAt,now}){
  if(!validReadLeasePolicy(policy)||!Number.isSafeInteger(observedAt)||observedAt<=0||!Number.isSafeInteger(now)||now<observedAt||!Array.isArray(view?.entries))return view;

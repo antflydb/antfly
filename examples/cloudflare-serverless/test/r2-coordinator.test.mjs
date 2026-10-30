@@ -272,3 +272,37 @@ test("metadata deletion intents fail closed on scope and cursor corruption",asyn
  await store.transaction(tx=>tx.put('__antfly_coord_gc/state',{id:'job',phase:'delete',barrier:'1',cursor:null,pending}));await assert.rejects(collectCoordinator(store,bucket),/InvalidCoordinatorCollectionIntent/);assert.equal(deletes,0);
  pending.keys=[];pending.deleted=0;pending.cursor='another-batch';await store.transaction(tx=>tx.put('__antfly_coord_gc/state',{id:'job',phase:'delete',barrier:'1',cursor:null,pending}));await assert.rejects(collectCoordinator(store,bucket),/InvalidCoordinatorCollectionIntent/);assert.equal(deletes,0);
 });
+
+
+test('conditional authority is explicit, permanent, and cannot fork a journal namespace',async()=>{
+ const bucket=new Bucket(),env={DATABASE:bucket,ANTFLY_INCARNATION:'conditional-authority',METADATA_ROOT_BACKEND:'conditional'};
+ const authority=await openAuthority(env,'r2-conditional');assert.equal(authority.descriptor.read_lease_policy.format,2);
+ assert.equal((await openAuthority(env,'r2-conditional')).descriptor.mode,'r2-conditional');
+ await assert.rejects(openAuthority(env,'r2'),/CoordinatorAuthorityMismatch/);
+ const journal={...env,ANTFLY_INCARNATION:'existing-journal'};await openAuthority(journal,'r2');
+ await assert.rejects(openAuthority(journal,'r2-conditional'),/CoordinatorAuthorityMismatch/);
+});
+
+test('conditional metadata commits reopen, cross kernel pools, and fence stale writers',async()=>{
+ const bucket=new Bucket(),env={DATABASE:bucket,ANTFLY_INCARNATION:'native-coordinator'};
+ const authority=await openAuthority(env,'r2-conditional');
+ const make=()=>{const store=storeFor(bucket);store.configureAuthority(authority.descriptor);return store;};
+ const first=make();await first.transaction(tx=>{tx.put('left',1);tx.put('right',2);});
+ assert.ok(first.rootCursor?.revision);assert.ok(first.rootCursor?.auth);
+ assert.equal((await first.readOnly(tx=>tx.get('left'))),1);
+ const second=make();assert.deepEqual(await second.transaction(tx=>tx.getMany(['left','right'])),[1,2]);
+ await second.transaction(tx=>tx.put('right',3));
+ await assert.rejects(first.transaction(tx=>tx.put('left',9)),/ImmutableLogFenced|PreconditionFailed/);
+ assert.deepEqual(await make().transaction(tx=>tx.getMany(['left','right'])),[1,3]);
+ assert.ok([...bucket.objects.keys()].some(key=>key.includes('/coord-v2/')&&key.endsWith('/ROOT')));
+ assert.ok(![...bucket.objects.keys()].some(key=>key.includes('/epochs/')||key.endsWith('/CHECKPOINT')));
+});
+
+test('conditional mutable ROOT is never admitted to immutable or edge caches',async()=>{
+ const {isImmutableObjectKey}=await import('../../../zig/lib/objectstore/wasm/cache.mjs');
+ const base='antfly/coord-v2/'+'a'.repeat(64);
+ for(const includeCommitLog of[false,true]){
+  assert.equal(isImmutableObjectKey(base+'/ROOT',{includeCommitLog}),false);
+  assert.equal(isImmutableObjectKey(base+'/artifacts/graph/'+'b'.repeat(64)+'/'+'c'.repeat(32)+'/'+'d'.repeat(64),{includeCommitLog}),true);
+ }
+});

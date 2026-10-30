@@ -722,6 +722,38 @@ pub const IndexedObjectStore = struct {
         if (!std.mem.eql(u8, &head.value.gc_attempt, &id) or head.value.gc_retired_before != retired_before) return error.CollectionSuperseded;
         return tree.readPage(alloc, ctx.store(), ref);
     }
+    pub const WriteRead = struct { key: []const u8, max_response_bytes: u32 };
+    /// Independent immutable roots only. The eventual mutation still decodes
+    /// and authenticates each page and the final commit validates dependencies.
+    pub fn writeReadAhead(self: *@This(), alloc: A, namespace: []const u8) ![]const WriteRead {
+        var ctx = try Context.init(self, namespace, null);
+        defer ctx.deinit();
+        var head = try ctx.readHead();
+        defer head.deinit(self.alloc);
+        var result = std.ArrayList(WriteRead).empty;
+        errdefer {
+            for (result.items) |item| alloc.free(item.key);
+            result.deinit(alloc);
+        }
+        for ([_]?tree.Ref{ head.value.records, head.value.operations, if (head.value.document_index) |index| index.root else null }) |optional| {
+            const ref = optional orelse continue;
+            if (ref.pack != null or ref.bytes > 16384) continue;
+            const key = try ctx.pageKey(alloc, ref);
+            var duplicate = false;
+            for (result.items) |item| if (std.mem.eql(u8, item.key, key)) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) {
+                alloc.free(key);
+                continue;
+            }
+            errdefer alloc.free(key);
+            try result.append(alloc, .{ .key = key, .max_response_bytes = ref.bytes });
+        }
+        return result.toOwnedSlice(alloc);
+    }
+
     pub fn pageKeyAlloc(self: *@This(), alloc: A, namespace: []const u8, ref: tree.Ref) ![]u8 {
         var ctx = try Context.init(self, namespace, null);
         defer ctx.deinit();

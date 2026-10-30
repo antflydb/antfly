@@ -23,7 +23,7 @@ import { R2CoordinatorStore } from "./r2-coordinator-store.mjs";
 import { RequestPool } from "./request-pool.mjs";
 import { instantiateHost } from "../../zig/lib/objectstore/wasm/asyncify.mjs";
 import { actorOwner } from "./actor-owner.mjs";
-import { openAuthority } from "./coordinator-authority.mjs";
+import { openAuthority, coordinatorAuthorityMode } from "./coordinator-authority.mjs";
 import { AuthorityAdmission } from "./authority-admission.mjs";
 import module from "./dist/antfly-serverless-observe.wasm";
 import { MailOutbox, digest, address, uuid } from "./mail-core.mjs";
@@ -54,12 +54,12 @@ export class MailAuth extends DurableObject {
             ANTFLY_INCARNATION: env.AUTH_STORAGE_ID,
             COORDINATOR_STORAGE_ID: env.AUTH_STORAGE_ID,
           },
-          "r2"
+          coordinatorAuthorityMode(env)
         )
       );
     this.store = {
       transaction: async (callback) => {
-        await authority.get();
+        nativeStore.configureAuthority((await authority.get()).descriptor);
         return nativeStore.transaction(callback);
       },
     };
