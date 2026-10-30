@@ -3775,7 +3775,7 @@ test "db graph metric runtime background open-configured split owners publish de
             });
             defer coordinator.close();
 
-            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
+            const tick = try coordinator.indexes.graph.metrics.runtime.?.runOnceDetailed();
             coordinator_total.add(tick);
             const stats = coordinator.graphMetricRuntimeStats();
             try std.testing.expect(stats.enabled);
@@ -5099,7 +5099,7 @@ test "db graph metric runtime background open-configured pagerank worker pool su
             });
             defer worker_pool.close();
 
-            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
+            const tick = try worker_pool.indexes.graph.metrics.runtime.?.runOnceDetailed();
             const stats = worker_pool.graphMetricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
@@ -5322,7 +5322,7 @@ test "db graph metric runtime background open-configured eigenvector worker pool
             });
             defer worker_pool.close();
 
-            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
+            const tick = try worker_pool.indexes.graph.metrics.runtime.?.runOnceDetailed();
             const stats = worker_pool.graphMetricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
@@ -5542,7 +5542,7 @@ test "db graph metric runtime background open-configured hits worker pool surviv
             });
             defer worker_pool.close();
 
-            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
+            const tick = try worker_pool.indexes.graph.metrics.runtime.?.runOnceDetailed();
             const stats = worker_pool.graphMetricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
@@ -6054,7 +6054,7 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
@@ -6402,7 +6402,7 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
@@ -6749,7 +6749,7 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
@@ -7954,7 +7954,7 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
@@ -8100,7 +8100,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
@@ -8311,7 +8311,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
@@ -8521,7 +8521,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
@@ -9435,7 +9435,7 @@ test "db graph metric runtime planned hits production budget matches local oracl
         break :blk graph_entry.index.edge_generation;
     };
 
-    var local_authority_refreshed = try local_db.refreshGraphMetric(alloc, "graph_idx", "hits_authority");
+    var local_authority_refreshed = try local_db.indexes.graph.refreshMetric(alloc, "graph_idx", "hits_authority");
     defer local_authority_refreshed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, local_authority_refreshed.state);
     try std.testing.expectEqual(target_generation, local_authority_refreshed.published_generation);
