@@ -24,6 +24,7 @@ const dense = @import("../quant_metal_dense.zig");
 const q4_k = @import("../quant_metal_q4_k.zig");
 const q8_0 = @import("../quant_metal_q8_0.zig");
 const mm_sg = @import("../quant_metal_mm_sg.zig");
+const io = @import("../quant_metal_io.zig");
 
 pub const regions = [_]Region{
     msl.metal("q4_0_shared", wrap.q4_0Shared()),
@@ -43,7 +44,7 @@ pub const regions = [_]Region{
     msl.metal("q8_0_linear_mm_sg_m64", &wrap.q8_0_linear_mm_sg_m64),
     msl.metal("q8_0_linear_mm_sg_m64_f16", &wrap.q8_0_linear_mm_sg_m64_f16),
     msl.metal("q8_0_kv_pair_mm_sg", &wrap.q8_0_kv_pair_mm_sg),
-    msl.metal("q8_0_pair_activation_mm_sg_v2", &wrap.q8_0_pair_activation_mm_sg_v2),
+    msl.metal("q8_0_pair_activation_mm_sg_v2", &(wrap.q8_0_pair_activation_mm_sg_v2 ++ io.q8_0_linear_mm_kernels ++ io.q8_0_pair_activation_multiply_mm_kernels)),
     msl.metal("q8_0_pair_linear_r_ext", wrap.q8_0_pair_linear_r_ext),
     msl.metal("q8_0_pair_activation_multiply_r_ext", wrap.q8_0_pair_activation_multiply_r_ext),
     msl.metal("q8_0_pair_activation", &[_]msl.Item{q8_0.pair_reduce4} ++ q8_0.pair_ext1r),
@@ -66,4 +67,6 @@ pub const regions = [_]Region{
     msl.metal("dense_bf16_multi_row", &.{ dense.multiRow(dense.bf16_), dense.multiRowReduce(dense.bf16_) }),
     msl.metal("q4_0_mm_sg", &mm_sg.q4_0_kernels),
     msl.metal("q8_0_mm_sg", &.{mm_sg.q8_0_kernel}),
+    msl.metal("florence_q4_k_mm_matrix", &.{io.florence_q4_k_mm_matrix_m64_n64}),
+    msl.metal("florence_q4_k_mm_matrix_in_f16", &.{io.florence_q4_k_mm_matrix_m64_n64_in_f16}),
 };
