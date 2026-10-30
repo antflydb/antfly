@@ -51637,7 +51637,7 @@ components:
           type: integer
           description: Maximum tokens to generate
           minimum: 1
-          maximum: 1024
+          maximum: 8192
           default: 256
           example: 256
     InferenceTextRegion:

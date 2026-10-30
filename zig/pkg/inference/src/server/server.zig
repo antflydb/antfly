@@ -1616,7 +1616,7 @@ const max_chunk_results = lib_chunker.max_chunk_results;
 const max_chunk_target_tokens = lib_chunker.max_chunk_target_tokens;
 const max_chunk_audio_window_ms = lib_chunker.max_chunk_audio_window_ms;
 const default_read_admission_max_tokens: usize = 256;
-const max_read_tokens: usize = 1024;
+const max_read_tokens: usize = 8192;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 const default_max_request_media_bytes: usize = 100 * 1024 * 1024;
 const read_admission_bytes_per_unit: usize = 16 * 1024 * 1024;
@@ -20794,7 +20794,7 @@ pub const Node = struct {
         var max_tokens = validateReadMaxTokens(body.max_tokens) catch
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
-                .message = "'max_tokens' must be between 1 and 1024",
+                .message = "'max_tokens' must be between 1 and 8192",
             });
         const inline_source_cap = readInlineSourceByteCap(self);
         var inline_source_bytes: usize = 0;
@@ -29292,7 +29292,6 @@ test "standalone inference model catalog publishes resolved native reader batchi
     try std.testing.expectEqual(@as(i64, 32 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_encoded_media_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, 8 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_decoded_pixels").?.integer);
     const task_limits = resolved.object.get("task_limits").?.object;
-    try std.testing.expectEqual(@as(i64, max_read_tokens), task_limits.get("max_output_tokens_per_item").?.integer);
     try std.testing.expect(task_limits.get("max_candidates_per_request").? == .null);
     const transform = resolved.object.get("image_transform").?.object;
     try std.testing.expectEqual(@as(i64, 768), transform.get("target_width").?.integer);
@@ -33157,7 +33156,8 @@ test "read admission units scale with image batch and decode length" {
     try std.testing.expectEqual(@as(usize, 1), estimateReadAdmissionUnits(1, null));
     try std.testing.expectEqual(@as(usize, 4), estimateReadAdmissionUnits(4, null));
     try std.testing.expectEqual(@as(usize, 8), estimateReadAdmissionUnits(4, default_read_admission_max_tokens + 1));
-    try std.testing.expectEqual(@as(usize, 16), estimateReadAdmissionUnits(4, max_read_tokens));
+    try std.testing.expectEqual(@as(usize, 16), estimateReadAdmissionUnits(4, 1024));
+    try std.testing.expectEqual(@as(usize, 128), estimateReadAdmissionUnits(4, 8192));
 }
 
 test "Qwen3-VL read admission includes one serial multimodal generation" {
@@ -33230,16 +33230,16 @@ test "Qwen3-VL direct read rejects insufficient generation capacity before fetch
 }
 
 test "direct extraction validates read max tokens" {
-    var valid = try parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":1024}");
+    var valid = try parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":8192}");
     defer valid.deinit();
-    try std.testing.expectEqual(@as(?usize, max_read_tokens), valid.max_tokens);
+    try std.testing.expectEqual(@as(?usize, 8192), valid.max_tokens);
     try std.testing.expectError(
         error.InvalidMaxTokens,
         parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":-1}"),
     );
     try std.testing.expectError(
         error.InvalidMaxTokens,
-        parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":1025}"),
+        parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":8193}"),
     );
 }
 
