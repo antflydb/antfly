@@ -18,6 +18,7 @@ pub const ordered_tree = @import("ordered_tree.zig");
 pub const ordered_pages = @import("ordered_pages.zig");
 pub const transactional_store = @import("transactional_store.zig");
 pub const immutable_log = @import("immutable_log.zig");
+pub const conditional_root = @import("conditional_root.zig");
 pub const wasm_host = @import("wasm_host.zig");
 pub const types = @import("types.zig");
 pub const client = @import("client.zig");
@@ -81,6 +82,7 @@ test "objectstore module compiles" {
     _ = ordered_tree;
     _ = ordered_pages;
     _ = immutable_log;
+    _ = conditional_root;
     _ = transactional_store;
     _ = types;
     _ = client;
