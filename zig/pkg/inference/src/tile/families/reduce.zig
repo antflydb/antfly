@@ -18,9 +18,18 @@
 const r = @import("../region.zig");
 const gather = @import("../reduce_gather.zig");
 const rope = @import("../reduce_rope.zig");
+const rows = @import("../reduce_rows.zig");
+
+fn metal(comptime family: []const u8, comptime msl: []const u8) r.Region {
+    return r.metal(family, r.metalLines(r.metal_indent, msl));
+}
 
 pub const regions = [_]r.Region{
-    r.metal("reduce.embedding_lookup", r.metalLines(r.metal_indent, gather.metalRegion())),
+    metal("reduce.embedding_lookup", gather.metalRegion()),
     r.cuda("reduce.embedding_lookup", gather.cudaRegion()),
     r.cuda("reduce.rope", rope.cudaRegion()),
+    metal("reduce.rows", rows.rowsRegion()),
+    metal("reduce.scan", rows.scanRegion()),
+    metal("reduce.qwen35_norm", rows.qwen35NormRegion()),
+    metal("reduce.lightonocr3_norm", rows.lightonocr3NormRegion()),
 };
