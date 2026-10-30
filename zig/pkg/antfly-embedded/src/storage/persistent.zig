@@ -248,7 +248,10 @@ const SegmentFileStore = struct {
                 // containing directory. Publish the directory entry itself
                 // first so those acknowledged files remain reachable after a
                 // crash that follows initial index creation.
-                try provided.syncParentAbsolute(owned_root);
+                // Lite infers directories from their child records. Reopening
+                // that virtual directory must not publish an empty mutation.
+                if (!provided.vtable.virtual_directories)
+                    try provided.syncParentAbsolute(owned_root);
             }
             return .{
                 .allocator = allocator,
@@ -6861,4 +6864,34 @@ test "lite persistent mapped initial streamed typed flush aborts and reopens ato
     const label = (try labels.getBytesAlloc(1)).?;
     defer a.free(label);
     try std.testing.expectEqualStrings("second", label);
+}
+
+test "lite segment directory open preserves checkpoint and durable files" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/segment-open.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    const before = docs.file.activeCheckpoint();
+    var files = try SegmentFileStore.open(a, "/lite-text/segments", storage.storage(), true, .threaded, null);
+    defer files.close();
+    try std.testing.expectEqualDeep(before, docs.file.activeCheckpoint());
+    var published = try files.publish(1, "immutable segment payload");
+    published.deinit(a);
+    const after = docs.file.activeCheckpoint();
+    try std.testing.expect(after.commit_sequence > before.commit_sequence);
+    var reopened = try SegmentFileStore.open(a, "/lite-text/segments", storage.storage(), true, .threaded, null);
+    defer reopened.close();
+    try std.testing.expectEqualDeep(after, docs.file.activeCheckpoint());
+    const name = try reopened.pathAlloc(1);
+    defer a.free(name);
+    const data = try reopened.storage.readFileAlloc(a, name, 1024);
+    defer a.free(data);
+    try std.testing.expectEqualStrings("immutable segment payload", data);
 }
