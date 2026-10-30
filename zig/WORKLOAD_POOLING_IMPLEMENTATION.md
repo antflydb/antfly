@@ -9397,23 +9397,69 @@ Preparing all encodings increases peak application memory, bounded by the shared
 
 ## Completion audit against the full delivery goal
 
-Current audit: 2026-10-13, codex/workload-scheduling, HEAD d2c629285b (origin/main merged through b77cb634d5) plus the uncommitted implementation. The goal remains sharing bounded execution across many connections by default, preserving sessions, query results, durability and control progress. Focused subsystem receipts do not establish that whole contract.
+Current audit: 2026-10-29, `codex/workload-scheduling`, runtime base
+`fb9540d4b36d9db8e7c70ddb0ea78b0b7814c2f7` plus the direct extraction
+observability fix. This checklist replaces the October 13 status table; later historical entries
+remain below. Historical entries describe
+their own source revision; they are not current deployment qualification.
 
-The user waived full qualification. The large Linux builder, complete performance sweep and full qualification run are not pending blockers or approval gates. Any Linux checks that are run must use pinned Nix glibc Zig. Remaining focused correctness checks must cover the production paths being enabled; historical throughput/latency claims are not inferred from them.
+The full goal remains bounded execution shared across many connections by
+default, with fair scheduling and bounded waiting, preserving sessions, query
+correctness, durability and protected control progress. Full GNU qualification
+and the full performance campaign are waived. Focused evidence for enabled
+production behavior remains required. Linux checks use pinned Nix glibc Zig.
 
-| Requirement from the design | Current evidence and remaining work | Completion predicate |
+| Requirement | Current implementation and inspected evidence | Remaining completion predicate |
 | --- | --- | --- |
-| Default bounded sharing and waiting | Canonical admission and managed serverless startup now default to automatic capacity and query waiting bounded by eight requests, 8 MiB and 250 ms. Explicit null disables the scheduler and implicit queue; explicit empty waiting selects fail-fast. Merged-main configuration tests pass 6/6 and the public transport envelope test passes 1/1. Serverless default integration passes 36 tests plus nine companions on the same merged source. Library Waiting defaults remain zero for explicit policy objects. | All enabled deployment paths publish one frozen automatic owner and finite query queue, honor explicit fixed/disabled/zero settings, and pass focused overload, cancellation, shutdown and session checks. |
-| Shared fair CPU execution across protocols/classes | Weighted dispatch, checked reentry and bounded backfill remain. Separate general/analytical/bounded read queues and CPU/count/metadata reserves are implemented; HTTP SQL and both pgwire execution paths classify compiler-owned plans. Focused isolation/classification/metrics/authority/ABI tests pass on interim source. Production bounded eligibility, application-memory/worker floors, measured debt and safe demotion/transition ownership, unused-capacity borrowing and current mixed-protocol overload proof remain incomplete. | Mixed HTTP/pgwire reads, writes, inference and background work share the owner; cheap work and protected controls progress under expensive/blocked work; queued expiration never starts execution and all charges retire. |
-| Connection/session efficiency | Aggregate pgwire and retained budgets and idle transaction limits are implemented. A pre-merge transport/session receipt passes 130 tests; native storage/shared-owner session checks are pending on merged main. Idle connection cost and supported scale still need focused evidence before large-client claims. | Supported idle and active connection envelopes remain bounded; session settings, prepared bindings, snapshots, transaction status and identity fences survive waits/cancel/close without session multiplexing or query replay. |
-| Query correctness and original authority | Focused SQL, checkpoint, cursor and read-resume receipts exist; several are historical relative to current cumulative edits. | Supported protocol fixtures preserve results, consistency and recall across yield, resource/output wait, cancellation, policy changes and restart, using original deadlines and permissions. |
-| Durable write/control progress | Retained completion, WAL prepublication allocation, prepared ingest acknowledgements, body transfer and pre-dispatch header reservations are implemented with pre-merge focused receipts. Response execution retirement and native H2 slow-output resume/reset/disconnect also have pre-merge receipts. Current native protocol/control verification remains pending. | Every supported accepted-write path retains original identity/receipt and joined or durable recovery; overload cannot strand completion, COMMIT/ROLLBACK/ACK or cleanup; uncertainty is reported conservatively and mutations are never automatically replayed. |
-| Memory/resource ownership | Stable request/control/retained serverless budgets, response owners and several native owners have focused receipts. The merged scan startup wait and existing ordered-scan contracts pass two tests with no skips/leaks. Complete backend/native/runtime allocation and physical wait coverage remain outside the proof. | Every enabled owner has a finite declared bound and stable lifetime through physical join/response retirement; verified waits loan CPU without holding incompatible locks; exhaustion and shutdown reconcile counters. |
-| Protected transport/control capacity | Existing H1/H2/h2c controls and recent serverless real-H2 health pressure tests provide focused evidence. They do not establish all protocol/control scenarios or defeat global FD exhaustion. | Exact verified controls and independent health/cleanup capacity progress with ordinary handlers, queues and heaps full; clients cannot claim protection through labels; pgwire control/disconnect paths are covered. |
-| Outbound pooling and remote attempts | Reusable client owners, separate read/forward control heaps, deadline propagation and local fanout result owners exist in parts. Local physical joining does not prove remote quiescence. The original design's bounded destination uncertainty ledger, coordinator generation fencing, delayed-dispatch rejection and restart reconciliation require implementation evidence and focused failure/restart tests. | All surviving pool owners enforce aggregate endpoint limits and bounded waits, preserve the original hop deadline and uncertain write identity, and join streams/tasks before pool retirement. |
-| Observability, restart and rollback | Primitive telemetry/config tests exist; complete current production endpoint proof remains pending. | Effective limits, queue reasons/waits, runnable/blocked owners and original memory charges are accurate in runtime metrics; drain/restart and explicit disabled/fixed policies retire owners and preserve live semantics. |
+| Default bounded sharing and waiting | `common/config.zig` defines automatic runnable capacity and query waiting of eight requests, 8 MiB and 250 ms. Standalone and data startup resolve the policy once and pass one node owner to storage and API consumers before startup, retaining it until consumer joins. Explicit disabled/fixed policy and finite waiting have historical configuration and serverless receipts. | Reconcile current configuration, generated public representation and deployment entry points in the final focused integration selection, including explicit null, zero and fixed rollback. Do not infer a universal optimal default or throughput improvement. |
+| Fair sharing across protocols and classes | The scheduler implements weighted teams, bounded backfill, read partitions, measured debt/demotion and elastic CPU reserves. `api/sql_read_lane.zig` classifies compiler-owned SQL as general or analytical. It explicitly never grants bounded eligibility; its authority test rejects `classifyRead(.bounded)`. Existing isolated-read-pool and mixed-protocol receipts are historical. | Complete a verified production bounded-read path through normal HTTP/pgwire callers, including a bounded work contract and safe demotion. Verify cheap reads and controls progressing beside expensive, blocked and slow-output work on current cumulative code. Core scheduler tests alone do not establish this. |
+| Connection and session efficiency | Pgwire retained/session budgets, idle transaction limits, prepared/portal ownership and cancel handling have focused transport/session coverage. Native protocol pooling has historical integration receipts, including `service-telemetry-protocol-pooling-v4.json`. | Current mixed-protocol storage/session checks must preserve settings, prepared bindings, cursor position, snapshots and identity through wait/cancel/close without replay or multiplexing. Measure the claimed idle-connection envelope before making large-client scale claims. |
+| Query correctness and original authority | SQL operator/checkpoint, graph preparation and inference discovery/configuration paths retain original scopes. `manifest-preparation-v3.json` verifies five public load/probe paths using the real node scheduler and refusal at every observed checkpoint. One optional sparse model fixture is absent, not passed. | Finish remaining materialization/framework preparation and supported backend wait coverage. Verify results and original cancellation/deadline/permission authority through the current normal protocol paths. Native deterministic fixtures do not prove deployed models or all engines. |
+| Durable write and control progress | Existing accepted-write identity, retained completion and conservative uncertainty remain required. `foreground-wal-production-v9-debug.json` verifies admitted native transaction/erased batch/DocStore publication and accepted-IO cleanup. Normal DB mutation still calls `mutation_admission.retainedLeaseControls`, which deliberately clears `execution_wait` while dependent service leases remain. | Safely integrate normal guarded DB mutation with the original execution owner before claiming WAL wait CPU lending through the server. Preserve apply/snapshot/replication ordering, accepted-write completion and COMMIT/ROLLBACK/ACK progress. Keep ineligible paths explicitly non-lending; never enable an unchecked lock cycle or replay mutations. |
+| Bounded memory and physical ownership | Stable request/output/cleanup owners, process memory parents and retained model-pull/file/registry/manifest scopes exist. Current manifest and embedded-pull fixtures check root/team/byte retention until finish; file artifact descriptor recovery has actual native-process evidence. | Finish enabled constructor, teardown, backend/native wait and remaining physical-resource coverage. Each owner must retain its finite charge through physical join, cleanup or response retirement; waits may lend CPU only with compatible lock ownership. Historical provider checks do not prove every deployed engine. |
+| Protected transport and controls | Protected control reservations, cleanup owners and real H2 slow-output/reset/disconnect fixtures exist, along with pgwire cancel/session tests. These establish the particular fixture scenarios at their recorded revisions. | Current mixed HTTP/pgwire/control integration must cover saturated ordinary queues/heaps, slow readers, cancellation and shutdown, including unforgeable protected classification. Do not claim protection from unrestricted process-wide FD exhaustion. |
+| Outbound pooling and distributed uncertainty | `api/remote_attempt_owner.zig` owns bounded destination/worker ledgers, separate read/control executors, startup fencing and reconciliation state. `common/remote_attempts.zig` and `remote_fence_store.zig` include generation, retained uncertainty and restart rejection. `remote-owner-recovery-native-v5.json` records historical focused recovery coverage. These are implemented, not an absent-ledger prerequisite. | Verify surviving normal fanout/forwarding callers use these owners and original hop authority, with bounded aggregate endpoint capacity and physical pool teardown. Reconcile current failure/restart evidence for delayed dispatch and authenticated generation fencing; local join alone cannot prove remote quiescence. |
+| Observability, restart and rollback | Existing runtime policy/queue/resource telemetry has historical protocol integration coverage. `design-audit-metrics-v1.json` passes the previously failing direct-cancel/HTTP-capacity case: early direct extraction refusals now count without parsing, allocation or admission; active gauges reconcile. | Verify effective limits, queue reasons, runnable/blocked owners and retained charges through current production metrics and drain/restart/disabled/fixed paths. This extraction fix closes its specific demonstrated gap, not all endpoint observability. |
 
-Next implementation sequence: finish the current native mixed-protocol/session/control check; repair any demonstrated lifetime or correctness failures; close the enabled production ownership/wait gaps; activate and verify automatic defaults and finite waiting with explicit rollback and matching canonical/generated configuration. Keep the original broader scheduling requirements visible: analytical/interactive isolation and bounded demotion, distributed attempt fencing/reconciliation and remaining entry-point ownership need their own implementation and verification; a passing native SQL fixture does not complete them. Performance sweeps remain optional follow-up under the user's qualification waiver.
+Evidence names above live under
+`qualification/workload-pooling/receipts/2026-10-10/child-outbox-capture-retirement-cumulative-integration/`.
+The current metrics run has unchanged inputs, seven selected tests with no skips
+and 27 successful build steps. Earlier failed receipts remain failed evidence:
+for example `sql-protocol-pooling-current-native.json` and
+`main-oct24-protocol-v1.json` have nonzero exit status; their names do not establish
+current protocol qualification. The installed CLI has not been rebuilt by this
+milestone. No deployed workload, all-engine performance or current Linux result
+is inferred from the native tests.
+
+### Remaining production milestones
+
+- [ ] Complete verified bounded-read eligibility, caller wiring and safe demotion
+  through normal SQL HTTP and pgwire execution. Keep the same root, memory charges
+  and original authority through classification and transitions. Verify cheap
+  read/control progress against expensive and blocked work with current native
+  storage/protocol fixtures.
+- [ ] Complete the guarded DB mutation handoff through the apply/snapshot/
+  replication ownership graph. Integrate original-admission WAL waits and all
+  required cleanup before claiming this production path lends CPU. Include
+  cancellation before/after acceptance, peer readers/writers and recovery.
+- [ ] Close remaining demonstrated preparation/materialization/backend owner
+  gaps, then verify the supported connection/session, mixed-class, distributed
+  uncertainty, protected-control and restart/rollback contracts on current code.
+  Use focused checks; the full qualification waiver remains in force.
+
+Work on one complete production milestone until its normal callers, ownership,
+cancellation, cleanup and focused verification are integrated. A prerequisite or
+isolated helper is not a completed capability. Report changed behavior, evidence
+and exact remaining milestone work each turn; retain this checklist instead of
+creating another parallel completion ledger.
+
+New physical-completion compilers, WAL formats, LSM pools and Raft acceptance
+contracts are separate from basic pooling, as stated in
+`WORKLOAD_SCHEDULING.md` under write ownership and delivery sequence. Preserve
+existing durability and accepted-write obligations without treating that separate
+project as a new pooling prerequisite. Adaptive policy follows trustworthy fixed
+telemetry; universal performance claims and a full campaign are not required by
+the waived qualification gate. The full goal remains open.
 
 ### Serverless response body ownership transfer
 

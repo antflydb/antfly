@@ -11034,7 +11034,11 @@ pub const Node = struct {
         request: extracting_api.Request,
         control: InferenceExecutionControl,
     ) !extracting_api.Response {
-        try control.check();
+        const started_ns = @import("antfly_platform").time.monotonicNs();
+        control.check() catch |err| {
+            self.metrics.recordDirectExtractionControlFailure(request.schema_version == 2, started_ns, err);
+            return err;
+        };
         const definition = try self.documentDefinition(allocator, model_name, .extract);
         defer if (definition) |bytes| allocator.free(bytes);
         if (definition != null) {
@@ -11077,7 +11081,15 @@ pub const Node = struct {
         request_json: []const u8,
         control: ?InferenceExecutionControl,
     ) !extracting_api.Response {
-        if (control) |active| try active.check();
+        if (control) |active| {
+            const started_ns = @import("antfly_platform").time.monotonicNs();
+            active.check() catch |err| {
+                // This public V2 entry point supplies the classification. An
+                // already refused request must not be parsed to recover it.
+                self.metrics.recordDirectExtractionControlFailure(true, started_ns, err);
+                return err;
+            };
+        }
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request_json, .{ .duplicate_field_behavior = .@"error" });
         defer parsed.deinit();
         if (try self.isDocumentOperation(allocator, parsed.value, .extract)) return .{
@@ -46434,4 +46446,35 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try std.testing.expectEqual(@as(i64, 1), shape.object.get("minimum_dimensions").?.integer);
     try std.testing.expectEqual(@as(usize, 64), model.object.get("model_revision").?.string.len);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+}
+
+test "direct extraction pre-admission refusal counts without request allocation or parsing" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+    const Refusal = struct {
+        cause: anyerror,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.cause;
+        }
+    };
+    var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    for ([_]anyerror{ error.Cancelled, error.DeadlineExceeded }) |cause| {
+        var refusal: Refusal = .{ .cause = cause };
+        const control: InferenceExecutionControl = .{ .ptr = &refusal, .check_fn = Refusal.check };
+        try std.testing.expectError(cause, node.extractDirectWithControl(denied.allocator(), "../unresolved", .{ .schema_version = 2, .inputs = &.{} }, control));
+        try std.testing.expectError(cause, node.extractV2DirectJsonWithControl(denied.allocator(), "not JSON", control));
+    }
+    try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
+    try std.testing.expect(!denied.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(u64, 4), node.metrics.extract_requests.impl.count);
+    try std.testing.expectEqual(@as(u64, 4), node.metrics.errors_total.impl.count);
+    try std.testing.expectEqual(@as(u64, 4), node.metrics.extraction_v2.requests.get(.direct));
+    try std.testing.expectEqual(@as(u64, 2), node.metrics.extraction_v2.outcomes.get(.cancelled));
+    try std.testing.expectEqual(@as(u64, 2), node.metrics.extraction_v2.outcomes.get(.timeout));
+    try std.testing.expectEqual(@as(u64, 0), node.metrics.extraction_v2.parsed_items.impl.count);
+    try std.testing.expectEqual(@as(i64, 0), node.metrics.requests_active.impl.value);
+    try std.testing.expectEqual(@as(i64, 0), node.metrics.extraction_v2.active.impl.value);
 }

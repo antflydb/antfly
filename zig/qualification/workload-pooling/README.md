@@ -1856,3 +1856,27 @@ The milestone covers these preparation paths, not deployed inference or throughp
 Other materialization/preparation, framework/vendor construction, mapped-page
 faults and wider cross-engine/deployment evidence remain in the full goal. The
 full GNU qualification waiver is unchanged; the installed CLI was not rebuilt.
+
+### Direct extraction refusal accounting and current completion audit
+
+The previously isolated direct-cancellation metric failure is resolved by
+`design-audit-metrics-v1.json` in the cumulative integration receipts. Public
+controlled extraction counts an early refusal before JSON parsing or model
+lookup. V2 classification comes from the public entry point or typed version;
+rejected raw JSON is not parsed to recover a label. Cancellation and deadline
+outcomes retain the original error and control-check start time. Fixed scalar
+metrics require no request allocation or admission lease, and active gauges
+return to zero. Normal successful dispatch retains its existing accounting.
+
+The exact original direct-cancel/HTTP-capacity case, denied-allocation typed/raw
+entry points, metric rendering and extraction trace contracts all pass: seven
+selected, no skips, 27/27 build steps, unchanged inputs. The old failure and its
+source audit remain preserved as historical evidence. This closes that specific
+observability issue; it does not rebuild the installed CLI or qualify deployed
+models, all backends or throughput.
+
+The existing [full-goal completion checklist](../../WORKLOAD_POOLING_IMPLEMENTATION.md#completion-audit-against-the-full-delivery-goal)
+now distinguishes implemented scheduler/remote-ledger primitives from missing
+production integration and stale evidence. Normal SQL bounded-read eligibility
+and guarded DB mutation CPU-lending integration remain concrete unfinished
+capabilities. Full GNU qualification remains waived; the full goal stays open.

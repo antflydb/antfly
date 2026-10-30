@@ -49,7 +49,7 @@ fn Counts(comptime Label: type) type {
 pub fn outcome(err: anyerror, stage: Stage) Outcome {
     switch (err) {
         error.Cancelled, error.Canceled => return .cancelled,
-        error.Timeout => return .timeout,
+        error.Timeout, error.DeadlineExceeded => return .timeout,
         error.QueueFull, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable => return .admission,
         error.MemoryBudgetExceeded => return .memory_budget,
         error.OutOfMemory => return .backing_oom,
@@ -92,7 +92,8 @@ pub const Metrics = struct {
     pub fn begin(self: *Metrics, transport: Transport) Trace {
         return self.beginAt(transport, time.monotonicNs());
     }
-    fn beginAt(self: *Metrics, transport: Transport, now: u64) Trace {
+    /// Use the original direct-call boundary sample when control rejects early.
+    pub fn beginAt(self: *Metrics, transport: Transport, now: u64) Trace {
         self.requests.add(transport, 1);
         self.active.incr();
         return .{ .metrics = self, .started_ns = now, .phase_started_ns = now };
