@@ -157,8 +157,10 @@ typedef struct antfly_open_options {
     uint32_t inference_combined_budget_mb;
     uint32_t inference_kv_budget_mb;
     uint32_t inference_scratch_budget_mb;
-    /* Milliseconds to retry a Lite operation while another process holds the
-     * writer lease (ANTFLY_BUSY), like sqlite3_busy_timeout. 0 fails immediately. */
+    /* Milliseconds to retry Lite admission while another process holds the
+     * writer lease or advances the allocator checkpoint (ANTFLY_BUSY), like
+     * sqlite3_busy_timeout. 0 fails immediately. Mutation bodies are never
+     * replayed by this admission retry. */
     uint64_t busy_timeout_ms;
     uint64_t reserved[6];
     /* Optional model directory for database enrichments; empty uses default. */

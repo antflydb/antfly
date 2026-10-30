@@ -922,7 +922,32 @@ pub fn enterHandle(ptr: ?*anyopaque, access: HandleAccess) ?HandleGuard {
 }
 
 pub fn enterHandleWithIntent(ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent) ?HandleGuard {
-    return enterHandleInternal(ptr, access, intent, false);
+    if (intent != .mutation) return enterHandleInternal(ptr, access, intent, false);
+    const io = handleLockIo();
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    var guard = enterHandleInternal(ptr, access, intent, false) orelse return null;
+    const connection = guard.connection orelse return guard;
+    const timeout_ms = connection.options.busy_timeout_ms;
+    if (timeout_ms == 0) return guard;
+    const deadline = started + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    var backoff: i96 = std.time.ns_per_ms;
+    // Only admission is retried: the exported operation has not executed yet.
+    // Drop both locks and registry pins while waiting so a competing publisher
+    // can finish, and reacquire the opaque handle in case it was closed.
+    while (guard.entry_error != null and guard.entry_error.? == .busy) {
+        const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+        if (remaining <= 0) return guard;
+        guard.leave();
+        const slept = io.sleep(.fromNanoseconds(@min(backoff, remaining)), .awake);
+        guard = enterHandleInternal(ptr, access, intent, false) orelse return null;
+        slept catch |err| {
+            if (guard.entry_error == null) guard.entry_error = capi.mapErrorContext(err, @src().fn_name);
+            return guard;
+        };
+        if (guard.entry_error == null) capi.clearLastError();
+        backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
+    }
+    return guard;
 }
 
 /// Cursor continuation uses a previously pinned immutable generation.
