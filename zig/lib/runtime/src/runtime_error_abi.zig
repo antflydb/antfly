@@ -953,6 +953,9 @@ pub const Detail = enum(c_int) {
     gcs_connection_not_found_or_out_of_scope,
     ambiguous_gcs_connection,
     invalid_connection_credentials,
+    pioneer_credential_missing,
+    unsupported_pioneer_schema,
+    unsupported_pioneer_input,
     // Append-only Cypher details preserve graph errors across owner callbacks.
     cypher_aggregate_scope,
     cypher_aggregate_wildcard,
@@ -1074,6 +1077,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidCloudflareConfig => status(.invalid_argument, .invalid_cloudflare_config),
         error.UnsupportedCloudflareModel => status(.invalid_argument, .unsupported_cloudflare_model),
         error.UnsupportedCloudflareSchema => status(.invalid_argument, .unsupported_cloudflare_schema),
+        error.PioneerCredentialMissing => status(.invalid_argument, .pioneer_credential_missing),
+        error.UnsupportedPioneerSchema => status(.invalid_argument, .unsupported_pioneer_schema),
+        error.UnsupportedPioneerInput => status(.invalid_argument, .unsupported_pioneer_input),
         error.CloudflareAuthenticationFailed => status(.unauthorized, .cloudflare_authentication_failed),
         error.InvalidExtractorResponse => status(.invalid_argument, .invalid_extractor_response),
         error.UnsupportedExtractionSchemaVersion => status(.invalid_argument, .unsupported_extraction_schema_version),
@@ -2049,6 +2055,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_cloudflare_config => "InvalidCloudflareConfig",
         .unsupported_cloudflare_model => "UnsupportedCloudflareModel",
         .unsupported_cloudflare_schema => "UnsupportedCloudflareSchema",
+        .pioneer_credential_missing => "PioneerCredentialMissing",
+        .unsupported_pioneer_schema => "UnsupportedPioneerSchema",
+        .unsupported_pioneer_input => "UnsupportedPioneerInput",
         .cloudflare_authentication_failed => "CloudflareAuthenticationFailed",
         .invalid_extractor_response => "InvalidExtractorResponse",
         .unsupported_extraction_schema_version => "UnsupportedExtractionSchemaVersion",
@@ -3427,7 +3436,9 @@ test "merged runtime error details preserve the common prefix under ABI two" {
     try std.testing.expectEqual(@as(c_int, 826), @backingInt(Detail.hierarchy_cursor_stale));
     try std.testing.expectEqual(@as(c_int, 827), @backingInt(Detail.read_transient_failure));
     try std.testing.expectEqual(@as(c_int, 832), @backingInt(Detail.invalid_connection_credentials));
-    try std.testing.expectEqual(@as(c_int, 833), @backingInt(Detail.cypher_aggregate_scope));
+    try std.testing.expectEqual(@as(c_int, 833), @backingInt(Detail.pioneer_credential_missing));
+    try std.testing.expectEqual(@as(c_int, 835), @backingInt(Detail.unsupported_pioneer_input));
+    try std.testing.expectEqual(@as(c_int, 836), @backingInt(Detail.cypher_aggregate_scope));
 }
 
 test "logical query work and scan policy failures retain their identities" {
@@ -3474,6 +3485,9 @@ test "durable document policy errors retain identity across native runtime bound
         error.InvalidCloudflareConfig,
         error.UnsupportedCloudflareModel,
         error.UnsupportedCloudflareSchema,
+        error.PioneerCredentialMissing,
+        error.UnsupportedPioneerSchema,
+        error.UnsupportedPioneerInput,
         error.CloudflareAuthenticationFailed,
         error.InvalidExtractorResponse,
         error.UnsupportedExtractionSchemaVersion,

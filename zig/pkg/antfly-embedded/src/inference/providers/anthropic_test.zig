@@ -21,7 +21,7 @@ const Decoder = @import("anthropic_stream.zig").Decoder;
 pub fn run() !void {
     const a = std.testing.allocator;
     var result = try wire.responseAlloc(a,
-        \\{"role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"signed-value"},{"type":"tool_use","id":"call-1","name":"lookup","input":{"id":7}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"cache_read_input_tokens":5,"output_tokens":3}}
+        \\{"id":"msg-test","model":"future-claude","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"signed-value"},{"type":"tool_use","id":"call-1","name":"lookup","input":{"id":7}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"cache_read_input_tokens":5,"output_tokens":3}}
     );
     defer result.deinit();
     try std.testing.expectEqual(lib.GenerationFinishReason.tool_calls, result.finish_reason.?);

@@ -623,10 +623,11 @@ pub const Runtime = struct {
     }
 
     fn routeExtractorConfig(self: *const Runtime, alloc: Allocator, cfg: *extracting.Config) !void {
-        if (cfg.provider == .cloudflare) {
-            var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.bearer_token orelse cfg.api_key, "CLOUDFLARE_API_TOKEN");
+        if (cfg.provider == .cloudflare or cfg.provider == .pioneer) {
+            const env_name = if (cfg.provider == .cloudflare) "CLOUDFLARE_API_TOKEN" else extracting.pioneer.credential_env;
+            var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.bearer_token orelse cfg.api_key, env_name);
             defer secret.deinit(alloc);
-            const token = (try secret.resolveOwned(alloc, self.secret_store)) orelse return error.CloudflareCredentialMissing;
+            const token = (try secret.resolveOwned(alloc, self.secret_store)) orelse return if (cfg.provider == .cloudflare) error.CloudflareCredentialMissing else error.PioneerCredentialMissing;
             if (cfg.api_key) |value| alloc.free(value);
             if (cfg.bearer_token) |value| alloc.free(value);
             cfg.api_key = token;

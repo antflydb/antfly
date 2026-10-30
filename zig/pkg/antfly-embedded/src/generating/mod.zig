@@ -2026,6 +2026,10 @@ test "generating remote-only default endpoint is shared with named gateway execu
     try std.testing.expectEqualStrings("http://runtime.internal:8080/ai/v1", state.quotaIdentity("configured").endpoint.endpoint);
 }
 
+test "generating backend Anthropic constrained extraction uses supported wire modes and schemas" {
+    try @import("../inference/providers/anthropic_constrained_test.zig").run();
+}
+
 test "generating backend Anthropic native wire preserves images signed replay and stream lifecycle" {
     try @import("../inference/providers/anthropic_test.zig").run();
 }
