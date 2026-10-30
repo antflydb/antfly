@@ -9378,11 +9378,37 @@
       "passed": 267
     },
     "default_gate": "pending",
-    "full_unit": "original attempt interrupted after missing antfly_video compile failure; repaired full gate running",
+    "full_unit": {
+      "aggregate_exit_code": null,
+      "compiler_reservation_overruns": [
+        {
+          "corrected_claim_gib": 21,
+          "owner": "api_http_runtime_tests consumer",
+          "peak_bytes": 20413906944,
+          "reservation_bytes": 20401094656
+        },
+        {
+          "corrected_claim_gib": 12,
+          "owner": "storage-engine-tests-local",
+          "peak_bytes": 10863706112,
+          "reservation_bytes": 10737418240
+        }
+      ],
+      "inference_abort": {
+        "cause": "allocation-failure sweep dereferences null batch.usage",
+        "location": "zig/pkg/inference/src/server/server.zig:33129",
+        "scope": "outside Lite runtime change",
+        "signal": "ABRT",
+        "test": "Qwen3-VL encoded read results own page identities and report serial execution"
+      },
+      "scope": "remaining owners still running; gate already has independent failures",
+      "status": "failed"
+    },
     "maintenance_fix_contracts": {
       "failed": 0,
       "known_unexpected_logs": 2,
       "leaks": 0,
+      "merged_revision": "2011275565877bae7deff19b786b82f371a45345",
       "optional_skips": 3,
       "passed": 268,
       "runtime_revision": "ced99336b8"
