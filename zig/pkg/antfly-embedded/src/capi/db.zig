@@ -923,12 +923,13 @@ pub fn enterHandle(ptr: ?*anyopaque, access: HandleAccess) ?HandleGuard {
 
 pub fn enterHandleWithIntent(ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent) ?HandleGuard {
     if (intent != .mutation) return enterHandleInternal(ptr, access, intent, false);
+    const entry = HandleEntry.capture(ptr) orelse return null;
+    const connection = entry.lock_handle.lite_connection orelse return enterCapturedHandle(entry, access, intent, false);
+    const timeout_ms = connection.options.busy_timeout_ms;
+    if (timeout_ms == 0) return enterCapturedHandle(entry, access, intent, false);
     const io = handleLockIo();
     const started = std.Io.Clock.awake.now(io).nanoseconds;
-    var guard = enterHandleInternal(ptr, access, intent, false) orelse return null;
-    const connection = guard.connection orelse return guard;
-    const timeout_ms = connection.options.busy_timeout_ms;
-    if (timeout_ms == 0) return guard;
+    var guard = enterCapturedHandle(entry, access, intent, false);
     const deadline = started + @as(i96, timeout_ms) * std.time.ns_per_ms;
     var backoff: i96 = std.time.ns_per_ms;
     // Only admission is retried: the exported operation has not executed yet.
