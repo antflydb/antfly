@@ -606,7 +606,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .root_module = capi_root_mod,
         // Keep this consumer's measured native floor separate from its
         // implementation partition; retain authored claims on other profiles.
-        .max_rss = @import("../../pkg/antfly/build/runtime_memory.zig").testCompileMaxRss(@import("../../pkg/antfly/build/test_owner_names.zig").capi_contract, b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024),
+        .max_rss = @import("../../pkg/antfly/build/runtime_memory.zig").testCompileMaxRssWithProfile(@import("../../pkg/antfly/build/test_owner_names.zig").capi_contract, b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024, @import("../antfly/test_partitions.zig").memoryProfile(b)),
         .filters = selectTestFilters(b, &capi_compile_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
