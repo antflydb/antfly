@@ -2492,12 +2492,47 @@ reader protocol **97** and stored formats remain unchanged.
 Index publication consumes leased sort records and bounded leased windows.
 Builders finish consuming borrowed record bytes before the next advance, and
 covering stripes encode physical/frozen columns directly through the shared
-batch encoder. Windows retain at most 256 rows and the existing 512-KiB raw
-quantum, including one indivisible oversized row, under statement admission.
-JSON size accounting can inspect frozen frames without constructing a DOM.
-The aggregate fallback retains its established 256-complete-row input contract;
-its output pins survive stream closure until synchronous consumption finishes.
-EOF, cancellation, allocation failures and publisher teardown retire all leases.
+batch encoder. Publication is single-pass: independent replay or layout comparisons build
+independent input streams. Each window owns one pressure-aware keyed sort page,
+with at most 64 rows and the existing caller's 512-KiB ceiling. The spill engine's
+physical target and current allocation headroom can return a shorter productive
+prefix. Unread indirect references remain in the sort's bounded backlog; an
+allocation refusal must never skip a key. Direct resident/spilled rows and
+indirect payloads use the same keyed-page interface. Resident rows borrow the
+finished sort's typed stores until their page releases. JSON size accounting
+inspects frozen frames without constructing a DOM.
+
+The aggregate fallback drains variable physical batches through EOF. Its output
+pins survive stream closure until synchronous consumption finishes. EOF,
+cancellation, allocation failures and publisher teardown retire every lease.
 No leased payload or sort owner escapes publication. Identity witnesses,
-ordinals, covering stripe version and content-addressed artifact bytes retain
-the owning publisher's semantics.
+ordinals and covering stripe version retain the owning publisher's semantics;
+identical logical batches produce identical artifact bytes even when admission
+changes batch boundaries.
+
+
+### Covering ranges across logical decode batches
+
+A covering pack's complete selected stripe set is planned before scheduling raw
+reads. Decoded residency is checked first; omitted columns and resident decoded
+stripes stay out of the raw plan. Adjacent misses share a physical range up to
+the existing 4-MiB artifact limit, independently of stripe/decode boundaries.
+The planner admits at most 1025 logical units (1024 columns plus identity), and
+runs at most 16 physical jobs in one wave. It charges all logical bytes and any
+explicitly permitted physical gaps before provider work. Query, scheduler,
+cache and final response limits are unchanged.
+
+Each stripe keeps its own checksum and immutable cache identity. Coalescing
+neither weakens authentication nor makes an omitted column a decode dependency.
+Encoded transport bytes retire after cache decoding or transfer to the uncached
+result's explicit byte owner. Completion notifications drain whichever read
+finishes first: a failed later request cancels parked siblings before joining
+and retiring their provider contexts. Genuine allocation, integrity and request
+cancellation failures still propagate.
+
+Runtime ABI remains **77** and reader protocol **97**: this refinement changes
+no callback layout, stored recipe or persisted format. Local qualification
+checks a cold 128-column, 32-row covering pack: **nine range GETs become one** for
+the same 72,622 bytes. A warm projection performs zero GETs; sparse projection
+reads only identity and required stripes. These are provider-call counts, not
+measured cloud latency or whole-query throughput.

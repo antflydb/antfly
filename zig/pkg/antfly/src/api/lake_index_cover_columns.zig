@@ -95,7 +95,7 @@ const Input = union(enum) {
             },
             .leased => |v| blk: {
                 if (v.key_width != 1) return error.InvalidNativeLakeRowIndex;
-                break :blk try v.leases.items[row].keyCell(0);
+                break :blk try v.rows[row].keyCell(0);
             },
         };
         if (value.sql_null or value.value != .string or value.value.string.len < 16) return error.InvalidNativeLakeRowIndex;
@@ -104,7 +104,7 @@ const Input = union(enum) {
     fn ordinal(self: Input, row: usize) u64 {
         return switch (self) {
             .rows => |v| v[row].ordinal,
-            .leased => |v| v.leases.items[row].row.ordinal,
+            .leased => |v| v.rows[row].row.ordinal,
         };
     }
     fn values(self: Input, a: A) !local.sql_execution_batch.Batch {
@@ -329,76 +329,76 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
             try stores.chargeReadBudget(@ptrCast(@alignCast(raw)), bytes);
         }
     };
-    var begin: usize = 0;
-    while (begin < selected.items.len) {
-        const end = @min(selected.items.len, begin + ranges.max_batch);
-        var units: [ranges.max_batch]ranges.Unit = undefined;
-        var cold: [ranges.max_batch]?usize = @splat(null);
-        var warm: [ranges.max_batch]?metadata.Owned(Block) = @splat(null);
-        defer for (&warm) |*slot| if (slot.*) |held| held.release();
-        var count: usize = 0;
-        var admitted: u64 = 0;
-        for (selected.items[begin..end], 0..) |index, position| {
-            const section = directory.sections[index];
-            try token.check();
-            try stores.chargeReadBudget(reads, section.bytes);
-            admitted += section.bytes;
-            if (cached) |cache| {
-                var buffer: [160]u8 = undefined;
-                if (try metadata.lookupRequiredInterpretedBounded(Block, cache, reference, token, try interpretation(&buffer, section), limit)) |held| {
-                    warm[position] = held;
-                    live = std.math.add(usize, live, held.lease.item.budget.live) catch return error.SqlMemoryLimitExceeded;
-                    if (live > limit) return error.SqlMemoryLimitExceeded;
-                    continue;
-                }
-            }
-            cold[position] = count;
-            units[count] = .{ .object = directory.pack, .offset = section.offset, .bytes = section.bytes, .digest = section.digest };
-            count += 1;
-        }
-        // Exact adjacency avoids reading omitted columns or charging gaps. Raw
-        // transport storage is reclaimed after this wave; cache units stay stripes.
-        var wire = try ranges.load(result.wire_allocator.?, store, units[0..count], token, cached, .{ .ptr = &admitted, .charge = Charge.charge }, .{ .max_range = artifacts.max_block_bytes });
-        defer wire.deinit();
-        for (selected.items[begin..end], 0..) |index, position| {
-            const section = directory.sections[index];
-            const bytes = if (cold[position]) |slot| wire.values[slot] else null;
-            const Loader = struct {
-                const Arguments = struct { stripe: Section, encoded: ?[]const u8 };
-                fn decode(out: A, source: stores.ArtifactStore, ref_: local.serverless_manifest_artifact_ref.ArtifactRef, cancel: Token, caching: artifacts.CachedRead, arguments: Arguments) !Block {
-                    const data = if (arguments.encoded) |encoded| try out.dupe(u8, encoded) else try artifacts.readColumnRange(out, source, .{ .artifact_id = ref_.artifact_id, .checksum = ref_.checksum, .byte_len = ref_.byte_len }, arguments.stripe.offset, arguments.stripe.bytes, arguments.stripe.digest, cancel, caching);
-                    return local.sql_spill.decodeColumnarBlockInArena(out, data, artifacts.max_block_bytes);
-                }
-            };
-            const block = if (cached) |cache| blk: {
-                var buffer: [160]u8 = undefined;
-                const retained = warm[position] != null;
-                const owned = warm[position] orelse try metadata.acquireRequiredInterpretedBounded(Block, cache, store, reference, token, try interpretation(&buffer, section), Loader.Arguments{ .stripe = section, .encoded = bytes }, Loader.decode, limit);
-                warm[position] = null;
-                var transfer = false;
-                defer if (!transfer) owned.release();
-                if (!retained) live = std.math.add(usize, live, owned.lease.item.budget.live) catch return error.SqlMemoryLimitExceeded;
+    // Prove decoded residency for the complete projection before planning raw
+    // reads. Physical ranges span adjacent cold stripes, independently of the
+    // bounded CPU decoder work; omitted and already-decoded stripes stay out.
+    const warm = try a.alloc(?metadata.Owned(Block), selected.items.len);
+    @memset(warm, null);
+    defer for (warm) |slot| if (slot) |held| held.release();
+    const cold = try a.alloc(?usize, selected.items.len);
+    @memset(cold, null);
+    var units: std.ArrayList(ranges.Unit) = .empty;
+    var admitted: u64 = 0;
+    for (selected.items, 0..) |index, position| {
+        const section = directory.sections[index];
+        try token.check();
+        try stores.chargeReadBudget(reads, section.bytes);
+        if (cached) |cache| {
+            var buffer: [160]u8 = undefined;
+            if (try metadata.lookupRequiredInterpretedBounded(Block, cache, reference, token, try interpretation(&buffer, section), limit)) |held| {
+                warm[position] = held;
+                live = std.math.add(usize, live, held.lease.item.budget.live) catch return error.SqlMemoryLimitExceeded;
                 if (live > limit) return error.SqlMemoryLimitExceeded;
-                try result.leases.append(a, owned);
-                transfer = true;
-                break :blk owned.value.*;
-            } else blk: {
-                const slot = cold[position].?;
-                try result.wires.append(a, wire.values[slot].?);
-                wire.values[slot] = null;
-                break :blk try local.sql_spill.decodeColumnarBlockInArena(a, bytes.?, artifacts.max_block_bytes);
-            };
-            if (block.count() != directory.rows) return error.InvalidNativeLakeRowIndex;
-            if (index == 0) {
-                if (block.values.len != 0 or block.keys.len != 2) return error.InvalidNativeLakeRowIndex;
-                ordinals = block.ordinals;
-                identity_keys = block.keys;
-            } else {
-                if (block.values.len != 1 or block.keys.len != 0 or !std.mem.eql(u64, block.ordinals, ordinals)) return error.InvalidNativeLakeRowIndex;
-                values[index - 1] = block.values[0];
+                continue;
             }
         }
-        begin = end;
+        cold[position] = units.items.len;
+        admitted += section.bytes;
+        try units.append(a, .{ .object = directory.pack, .offset = section.offset, .bytes = section.bytes, .digest = section.digest });
+    }
+    var wire = try ranges.loadMany(result.wire_allocator.?, store, units.items, token, cached, .{ .ptr = &admitted, .charge = Charge.charge }, .{ .max_range = artifacts.max_block_bytes });
+    defer wire.deinit();
+    for (selected.items, 0..) |index, position| {
+        const section = directory.sections[index];
+        const bytes = if (cold[position]) |slot| wire.values[slot] else null;
+        defer if (cold[position]) |slot| if (wire.values[slot]) |data| {
+            wire.a.free(data);
+            wire.values[slot] = null;
+        };
+        const Loader = struct {
+            const Arguments = struct { stripe: Section, encoded: ?[]const u8 };
+            fn decode(out: A, source: stores.ArtifactStore, ref_: local.serverless_manifest_artifact_ref.ArtifactRef, cancel: Token, caching: artifacts.CachedRead, arguments: Arguments) !Block {
+                const data = if (arguments.encoded) |encoded| try out.dupe(u8, encoded) else try artifacts.readColumnRange(out, source, .{ .artifact_id = ref_.artifact_id, .checksum = ref_.checksum, .byte_len = ref_.byte_len }, arguments.stripe.offset, arguments.stripe.bytes, arguments.stripe.digest, cancel, caching);
+                return local.sql_spill.decodeColumnarBlockInArena(out, data, artifacts.max_block_bytes);
+            }
+        };
+        const block = if (cached) |cache| blk: {
+            var buffer: [160]u8 = undefined;
+            const retained = warm[position] != null;
+            const owned = warm[position] orelse try metadata.acquireRequiredInterpretedBounded(Block, cache, store, reference, token, try interpretation(&buffer, section), Loader.Arguments{ .stripe = section, .encoded = bytes }, Loader.decode, limit);
+            warm[position] = null;
+            var transfer = false;
+            defer if (!transfer) owned.release();
+            if (!retained) live = std.math.add(usize, live, owned.lease.item.budget.live) catch return error.SqlMemoryLimitExceeded;
+            if (live > limit) return error.SqlMemoryLimitExceeded;
+            try result.leases.append(a, owned);
+            transfer = true;
+            break :blk owned.value.*;
+        } else blk: {
+            const slot = cold[position].?;
+            try result.wires.append(a, wire.values[slot].?);
+            wire.values[slot] = null;
+            break :blk try local.sql_spill.decodeColumnarBlockInArena(a, bytes.?, artifacts.max_block_bytes);
+        };
+        if (block.count() != directory.rows) return error.InvalidNativeLakeRowIndex;
+        if (index == 0) {
+            if (block.values.len != 0 or block.keys.len != 2) return error.InvalidNativeLakeRowIndex;
+            ordinals = block.ordinals;
+            identity_keys = block.keys;
+        } else {
+            if (block.values.len != 1 or block.keys.len != 0 or !std.mem.eql(u64, block.ordinals, ordinals)) return error.InvalidNativeLakeRowIndex;
+            values[index - 1] = block.values[0];
+        }
     }
     result.block = .{ .values = values, .keys = identity_keys, .ordinals = ordinals };
     return result;
@@ -563,8 +563,6 @@ test "external lake leased publication covering stripes match owning bytes for t
         row.* = .{ .keys = key, .values = cells, .ordinal = i };
     }
     var writes: u64 = 0;
-    const owned = try publish(a, store, scope, &rows, .none, &writes);
-    defer a.free(owned.artifact_id);
     const Hook = struct {
         fn check(_: *anyopaque) !void {}
     };
@@ -582,13 +580,20 @@ test "external lake leased publication covering stripes match owning bytes for t
         }
         var window: @import("lake_index_sort_stream.zig").Window = .{ .sort = &sort };
         defer window.deinit();
-        try std.testing.expectEqual(@as(usize, count), try window.read(256, 512 << 10));
-        const leased = try publishLeased(a, store, scope, &window, .none, &writes);
-        defer a.free(leased.artifact_id);
-        // Content addresses cover the pack, directory, identities, ordinals,
-        // exact values and null provenance: no persistent format migration.
-        try std.testing.expectEqualStrings(owned.artifact_id, leased.artifact_id);
-        try std.testing.expectEqual(owned.byte_len, leased.byte_len);
+        var seen: usize = 0;
+        while (try window.read(256, 512 << 10) != 0) {
+            const batch = window.count;
+            const owned = try publish(a, store, scope, rows[seen..][0..batch], .none, &writes);
+            defer a.free(owned.artifact_id);
+            const leased = try publishLeased(a, store, scope, &window, .none, &writes);
+            defer a.free(leased.artifact_id);
+            // Physical admission may shorten a batch. Identical logical rows
+            // still produce byte-identical packs, witnesses and ordinals.
+            try std.testing.expectEqualStrings(owned.artifact_id, leased.artifact_id);
+            try std.testing.expectEqual(owned.byte_len, leased.byte_len);
+            seen += batch;
+        }
+        try std.testing.expectEqual(@as(usize, count), seen);
         try std.testing.expectEqual(@as(usize, 0), try window.read(256, 512 << 10));
     }
 }

@@ -128,28 +128,54 @@ const Job = struct {
     }
 };
 
+/// Logical units and physical jobs have independent bounds. Wide covering
+/// packs may contain 1025 stripes, while at most 16 bounded reads run together.
+pub const ManyBatch = struct {
+    a: A,
+    values: []?[]u8,
+    pub fn deinit(self: *ManyBatch) void {
+        for (self.values) |value| if (value) |bytes| self.a.free(bytes);
+        self.a.free(self.values);
+    }
+};
+pub fn loadMany(a: A, store: stores.ArtifactStore, refs: []const Unit, token: Token, cached: ?artifacts.CachedRead, budget: Budget, options: Options) !ManyBatch {
+    if (refs.len > 1025) return error.InvalidGraphPage;
+    const values = try a.alloc(?[]u8, refs.len);
+    @memset(values, null);
+    var result: ManyBatch = .{ .a = a, .values = values };
+    errdefer result.deinit();
+    try loadInto(a, store, refs, values, token, cached, budget, options);
+    return result;
+}
 pub fn load(a: A, store: stores.ArtifactStore, refs: []const Unit, token: Token, cached: ?artifacts.CachedRead, budget: Budget, options: Options) !Batch {
-    if (refs.len > max_batch or options.max_range == 0) return error.InvalidGraphPage;
-    try token.check();
-    if (cached) |cache| try cache.context.ensureActive();
+    if (refs.len > max_batch) return error.InvalidGraphPage;
     var result: Batch = .{ .a = a };
     errdefer result.deinit();
-    var ids: [max_batch][]const u8 = undefined;
-    var key_storage: [max_batch][256]u8 = undefined;
-    var keys: [max_batch][]const u8 = undefined;
-    var missing: [max_batch]usize = undefined;
+    try loadInto(a, store, refs, result.values[0..refs.len], token, cached, budget, options);
+    return result;
+}
+fn loadInto(a: A, store: stores.ArtifactStore, refs: []const Unit, values: []?[]u8, token: Token, cached: ?artifacts.CachedRead, budget: Budget, options: Options) !void {
+    if (refs.len != values.len or options.max_range == 0) return error.InvalidGraphPage;
+    try token.check();
+    if (cached) |cache| try cache.context.ensureActive();
+    if (refs.len == 0) return;
+    var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const key_storage = try sa.alloc([256]u8, refs.len);
+    const keys = try sa.alloc([]const u8, refs.len);
+    const missing = try sa.alloc(usize, refs.len);
     var count: usize = 0;
     var logical: u64 = 0;
     for (refs, 0..) |ref, i| {
         try stores.validateSha256ArtifactIdentity(ref.object.artifact_id, ref.object.checksum);
         if (ref.bytes == 0 or ref.bytes > options.max_range or ref.offset > ref.object.byte_len or ref.bytes > ref.object.byte_len - ref.offset) return error.InvalidGraphPage;
-        ids[i] = ref.object.artifact_id;
-        keys[i] = if (ref.offset == 0 and ref.bytes == ref.object.byte_len) ids[i] else try std.fmt.bufPrint(&key_storage[i], "{s}:page:{x}:{x}", .{ ids[i], ref.offset, ref.bytes });
-        logical += ref.bytes;
+        keys[i] = if (ref.offset == 0 and ref.bytes == ref.object.byte_len) ref.object.artifact_id else try std.fmt.bufPrint(&key_storage[i], "{s}:page:{x}:{x}", .{ ref.object.artifact_id, ref.offset, ref.bytes });
+        logical = std.math.add(u64, logical, ref.bytes) catch return error.InvalidGraphPage;
         if (cached) |cache| if (try cache.cache.lookupImmutableBlockLease(a, cache.scope, keys[i], ref.bytes, ref.digest, cache.context)) |found| {
             var lease = found;
             defer lease.deinit();
-            result.values[i] = try a.dupe(u8, lease.bytes());
+            values[i] = try a.dupe(u8, lease.bytes());
             continue;
         };
         missing[count] = i;
@@ -157,86 +183,224 @@ pub fn load(a: A, store: stores.ArtifactStore, refs: []const Unit, token: Token,
     }
     const Order = struct {
         units: []const Unit,
-        ids: []const []const u8,
         fn less(self: @This(), l: usize, r: usize) bool {
-            const order = std.mem.order(u8, self.ids[l], self.ids[r]);
+            const order = std.mem.order(u8, self.units[l].object.artifact_id, self.units[r].object.artifact_id);
             return order == .lt or (order == .eq and self.units[l].offset < self.units[r].offset);
         }
     };
-    std.mem.sort(usize, missing[0..count], Order{ .units = refs, .ids = ids[0..refs.len] }, Order.less);
-    var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = a };
-    var jobs: [max_batch]Job = undefined;
-    var group_for: [max_batch]usize = undefined;
-    var groups: usize = 0;
-    var members: [max_batch]usize = @splat(0);
-    var gap_bytes: u64 = 0;
-    for (missing[0..count]) |i| {
-        const ref = refs[i];
+    std.mem.sort(usize, missing[0..count], Order{ .units = refs }, Order.less);
+    const Run = struct { first: usize, end: usize, offset: u64, length: usize };
+    const runs = try sa.alloc(Run, count);
+    const ordered = try sa.alloc(Unit, count);
+    var run_count: usize = 0;
+    var gaps: u64 = 0;
+    for (missing[0..count], ordered, 0..) |index, *unit, position| {
+        const ref = refs[index];
+        unit.* = ref;
         const end = ref.offset + ref.bytes;
-        if (groups != 0) {
-            const previous = &jobs[groups - 1];
-            if (std.mem.eql(u8, previous.id, ids[i]) and ref.offset <= previous.begin + previous.length + options.max_gap and
-                @max(end, previous.begin + previous.length) - previous.begin <= options.max_range)
-            {
-                const length: usize = @intCast(@max(end, previous.begin + previous.length) - previous.begin);
-                gap_bytes += ref.offset -| (previous.begin + previous.length);
-                previous.length = length;
-                group_for[i] = groups - 1;
-                members[groups - 1] += 1;
+        if (run_count != 0) {
+            const previous = &runs[run_count - 1];
+            const previous_end = previous.offset + previous.length;
+            if (std.mem.eql(u8, ordered[previous.first].object.artifact_id, ref.object.artifact_id) and ref.offset <= previous_end +| options.max_gap and @max(end, previous_end) - previous.offset <= options.max_range) {
+                gaps = std.math.add(u64, gaps, ref.offset -| previous_end) catch return error.InvalidGraphPage;
+                previous.length = @intCast(@max(end, previous_end) - previous.offset);
+                previous.end = position + 1;
                 continue;
             }
         }
-        jobs[groups] = .{ .store = store, .a = allocations.allocator(), .id = ids[i], .begin = ref.offset, .length = ref.bytes, .token = token, .units = refs, .cached = cached };
-        group_for[i] = groups;
-        members[groups] = 1;
-        groups += 1;
+        runs[run_count] = .{ .first = position, .end = position + 1, .offset = ref.offset, .length = ref.bytes };
+        run_count += 1;
     }
-    // Cache hits retain the ordinary logical read charge. Coalesced gaps are
-    // additional physical traffic and cannot bypass the request's allowance.
-    try budget.charge(budget.ptr, logical + gap_bytes);
-    defer for (jobs[0..groups]) |*job| job.deinit();
-    var tasks: [max_batch]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
+    // Charge every logical byte and physical gap before provider work starts.
+    // Decode batch boundaries never split an otherwise admissible range.
+    try budget.charge(budget.ptr, std.math.add(u64, logical, gaps) catch return error.InvalidGraphPage);
     const io = if (cached) |cache| cache.context.io else null;
-    defer if (io) |active| for (&tasks) |*task| if (task.*) |*held| {
-        held.cancel(active) catch {};
-    };
-    var failure: ?anyerror = null;
-    for (jobs[0..groups], 0..) |*job, i| {
-        if (failure != null) break;
-        if (io) |active| if (groups > 1) {
-            tasks[i] = local.sql_parallel_scheduler.global().submitIo(active, job.length * 2 + 64 * 1024, Job.run, .{job});
+    var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = a };
+    var first: usize = 0;
+    while (first < run_count) {
+        const end = @min(first + max_batch, run_count);
+        const wave = runs[first..end];
+        var jobs: [max_batch]Job = undefined;
+        for (wave, jobs[0..wave.len]) |run, *job| job.* = .{ .store = store, .a = allocations.allocator(), .id = ordered[run.first].object.artifact_id, .units = ordered[run.first..run.end], .begin = run.offset, .length = run.length, .token = token, .cached = cached };
+        defer for (jobs[0..wave.len]) |*job| job.deinit();
+        var ready: std.Io.Event = .unset;
+        var tasks: [max_batch]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
+        defer if (io) |active| for (&tasks) |*task| if (task.*) |*held| {
+            held.cancel(active) catch {};
         };
-        if (tasks[i] == null) job.run() catch |err| {
-            failure = err;
-        };
-    }
-    if (io) |active| for (&tasks) |*task| if (task.*) |*held| {
-        held.await(active) catch |err| {
-            if (failure == null) failure = err;
-        };
-        task.* = null;
-    };
-    if (failure) |err| return err;
-    const Loader = struct {
-        data: []const u8,
-        fn read(raw: *anyopaque, alloc: A) ![]u8 {
-            return alloc.dupe(u8, @as(*@This(), @ptrCast(@alignCast(raw))).data);
+        var failure: ?anyerror = null;
+        for (jobs[0..wave.len], 0..) |*job, i| {
+            if (failure != null) break;
+            if (io) |active| if (wave.len > 1) {
+                tasks[i] = local.sql_parallel_scheduler.global().submitIoNotified(active, job.length * 2 + 64 * 1024, &ready, Job.run, .{job});
+            };
+            if (tasks[i] == null) job.run() catch |err| {
+                failure = err;
+            };
         }
-        fn traffic(_: *anyopaque) local.serverless_query_lake_serving_cache.Cache.ProviderRead {
-            return .{ .requests = 0, .bytes = 0 };
+        // Drain whichever read completes first. A later failing request must
+        // cancel earlier parked reads before joining their provider contexts.
+        if (io) |active| while (failure == null) {
+            ready.reset();
+            var pending = false;
+            for (&tasks) |*task| if (task.*) |*held| {
+                if (!held.isComplete()) {
+                    pending = true;
+                    continue;
+                }
+                held.await(active) catch |err| {
+                    if (failure == null) failure = err;
+                };
+                task.* = null;
+            };
+            if (failure != null or !pending) break;
+            try ready.wait(active);
+        };
+        if (failure) |err| return err;
+        const Loader = struct {
+            data: []const u8,
+            fn read(raw: *anyopaque, alloc: A) ![]u8 {
+                return alloc.dupe(u8, @as(*@This(), @ptrCast(@alignCast(raw))).data);
+            }
+            fn traffic(_: *anyopaque) local.serverless_query_lake_serving_cache.Cache.ProviderRead {
+                return .{ .requests = 0, .bytes = 0 };
+            }
+        };
+        for (wave, jobs[0..wave.len]) |run, *job| for (missing[run.first..run.end]) |index| {
+            try token.check();
+            const ref = refs[index];
+            const offset: usize = @intCast(ref.offset - job.begin);
+            const bytes = job.result.?[offset..][0..ref.bytes];
+            try stores.validatePayloadSha256WithCancellation(bytes, &std.fmt.bytesToHex(&ref.digest, .lower), token);
+            var loader: Loader = .{ .data = bytes };
+            values[index] = if (cached) |cache| try cache.cache.readImmutableAlloc(a, cache.scope, keys[index], bytes.len, ref.digest, cache.context, .{ .ptr = &loader, .load = Loader.read, .provider_read = Loader.traffic }) else if (run.end - run.first == 1 and job.lease == null and ref.offset == job.begin and ref.bytes == job.length) transfer: {
+                job.result = null;
+                break :transfer @constCast(bytes);
+            } else try a.dupe(u8, bytes);
+        };
+        first = end;
+    }
+}
+
+test "external lake metadata navigation wide range plans bound physical jobs charge gaps and unwind partial waves" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("wide-range-plans");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const scope: stores.UploadScope = .{ .domain = @splat(7), .attempt = @splat(3) };
+    const payload: [1280]u8 = @splat(37);
+    var object = try store.putScoped(scope, &payload, .none);
+    defer object.deinit(a);
+    var units: [80]Unit = undefined;
+    for (&units, 0..) |*unit, i| {
+        const start = i * 16;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(payload[start..][0..8], &digest, .{});
+        unit.* = .{ .object = .{ .artifact_id = object.artifact_id, .checksum = object.checksum, .byte_len = object.byte_len }, .offset = start, .bytes = 8, .digest = digest };
+    }
+    const Probe = struct {
+        var active: *@This() = undefined;
+        original: *const stores.ArtifactStore.VTable,
+        calls: usize = 0,
+        fail_offset: ?u64 = null,
+        fn get(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Token) ![]u8 {
+            const self = active;
+            self.calls += 1;
+            if (self.fail_offset == offset) return error.InjectedRangeFailure;
+            return if (self.original.get_range_alloc_with_cancellation) |read| read(raw, alloc, id, offset, length, token) else self.original.get_range_alloc(raw, alloc, id, offset, length);
         }
     };
-    for (missing[0..count]) |i| {
-        try token.check();
-        const job = &jobs[group_for[i]];
-        const offset: usize = @intCast(refs[i].offset - job.begin);
-        const bytes = job.result.?[offset..][0..refs[i].bytes];
-        try stores.validatePayloadSha256WithCancellation(bytes, &std.fmt.bytesToHex(&refs[i].digest, .lower), token);
-        var loader: Loader = .{ .data = bytes };
-        result.values[i] = if (cached) |cache| try cache.cache.readImmutableAlloc(a, cache.scope, keys[i], bytes.len, refs[i].digest, cache.context, .{ .ptr = &loader, .load = Loader.read, .provider_read = Loader.traffic }) else if (members[group_for[i]] == 1 and job.lease == null and refs[i].offset == job.begin and refs[i].bytes == job.length) transfer: {
-            job.result = null;
-            break :transfer @constCast(bytes);
-        } else try a.dupe(u8, bytes);
+    var probe: Probe = .{ .original = store.vtable };
+    Probe.active = &probe;
+    var traced = store.vtable.*;
+    traced.get_range_alloc_with_cancellation = Probe.get;
+    store.vtable = &traced;
+    const Charge = struct {
+        fn charge(raw: *anyopaque, bytes: u64) !void {
+            try stores.chargeReadBudget(@ptrCast(@alignCast(raw)), bytes);
+        }
+    };
+    for ([_]usize{ 0, 8 }) |gap| {
+        var remaining: u64 = 16 * 1024;
+        const before = probe.calls;
+        var loaded = try loadMany(a, store, &units, .none, null, .{ .ptr = &remaining, .charge = Charge.charge }, .{ .max_range = 1024, .max_gap = gap });
+        defer loaded.deinit();
+        for (units, loaded.values) |unit, value| try std.testing.expectEqualSlices(u8, payload[@intCast(unit.offset)..][0..unit.bytes], value.?);
+        try std.testing.expectEqual(@as(usize, if (gap == 0) 80 else 2), probe.calls - before);
+        try std.testing.expectEqual(@as(u64, if (gap == 0) 640 else 1264), 16 * 1024 - remaining);
     }
-    return result;
+    var remaining: u64 = 0;
+    const before = probe.calls;
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, loadMany(a, store, &units, .none, null, .{ .ptr = &remaining, .charge = Charge.charge }, .{ .max_range = 1024 }));
+    try std.testing.expectEqual(before, probe.calls);
+    probe.fail_offset = units[17].offset;
+    remaining = 16 * 1024;
+    try std.testing.expectError(error.InjectedRangeFailure, loadMany(a, store, &units, .none, null, .{ .ptr = &remaining, .charge = Charge.charge }, .{ .max_range = 1024 }));
+    probe.fail_offset = null;
+    const Faults = struct {
+        fn run(alloc: A, backend: stores.ArtifactStore, refs: []const Unit) !void {
+            var allowance: u64 = 16 * 1024;
+            var batch = try loadMany(alloc, backend, refs, .none, null, .{ .ptr = &allowance, .charge = Charge.charge }, .{ .max_range = 1024 });
+            defer batch.deinit();
+            for (batch.values) |value| try std.testing.expectEqual(@as(usize, 8), value.?.len);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Faults.run, .{ store, @as([]const Unit, units[0..18]) });
+}
+
+test "external lake metadata navigation range failures cancel parked siblings before joining" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("range-failure-progress");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const scope: stores.UploadScope = .{ .domain = @splat(7), .attempt = @splat(3) };
+    const bytes: [24]u8 = @splat(37);
+    var object = try store.putScoped(scope, &bytes, .none);
+    defer object.deinit(a);
+    var units: [2]Unit = undefined;
+    for (&units, 0..) |*unit, i| {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes[i * 16 ..][0..8], &digest, .{});
+        unit.* = .{ .object = .{ .artifact_id = object.artifact_id, .checksum = object.checksum, .byte_len = object.byte_len }, .offset = i * 16, .bytes = 8, .digest = digest };
+    }
+    const Probe = struct {
+        var active: *@This() = undefined;
+        entered: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        live: std.atomic.Value(usize) = .init(0),
+        fn get(_: *anyopaque, _: A, _: []const u8, offset: u64, _: usize, _: Token) ![]u8 {
+            const self = active;
+            _ = self.live.fetchAdd(1, .acq_rel);
+            defer _ = self.live.fetchSub(1, .acq_rel);
+            if (offset == 0) {
+                self.entered.set(std.testing.io);
+                // A finite safeguard makes the old ordered-join path fail the
+                // oracle instead of hanging the test. Healthy work cancels it.
+                try self.gate.waitTimeout(std.testing.io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } });
+                return error.UnexpectedGateRelease;
+            }
+            try self.entered.wait(std.testing.io);
+            return error.InjectedRangeFailure;
+        }
+    };
+    var probe: Probe = .{};
+    Probe.active = &probe;
+    var traced = store.vtable.*;
+    traced.get_range_alloc_with_cancellation = Probe.get;
+    store.vtable = &traced;
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(8), .context = .{ .io = std.testing.io } };
+    const Charge = struct {
+        fn charge(raw: *anyopaque, length: u64) !void {
+            try stores.chargeReadBudget(@ptrCast(@alignCast(raw)), length);
+        }
+    };
+    var remaining: u64 = 1024;
+    try std.testing.expectError(error.InjectedRangeFailure, loadMany(a, store, &units, .none, cached, .{ .ptr = &remaining, .charge = Charge.charge }, .{ .max_range = 1024 }));
+    try std.testing.expectEqual(@as(usize, 0), probe.live.load(.acquire));
 }

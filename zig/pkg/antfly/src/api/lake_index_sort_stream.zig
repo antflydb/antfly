@@ -44,39 +44,35 @@ pub const Records = struct {
 
 pub const Window = struct {
     sort: *spill.Sort,
-    leases: std.ArrayListUnmanaged(RowLease) = .empty,
+    // The descriptor view borrows page.rows; the page retires every lease.
+    page: ?spill.Sort.Page = null,
+    rows: []const RowLease = &.{},
     count: usize = 0,
     width: usize = 0,
     key_width: usize = 0,
     pub fn clear(self: *Window) void {
-        for (self.leases.items) |lease| lease.release();
-        self.leases.clearRetainingCapacity();
+        if (self.page) |page| page.release();
+        self.page = null;
+        self.rows = &.{};
         self.count = 0;
     }
     pub fn deinit(self: *Window) void {
         self.clear();
-        self.leases.deinit(local.sql_memory_budget.reclaimingAllocator(self.sort.a));
     }
-    /// Keep the same row/raw-byte quantum as the owning publisher, including
-    /// one indivisible oversized record. The sort owns physical block admission.
+    /// Single-pass publication may return a shorter physical batch under
+    /// pressure. The sort retains unread references; callers drain through EOF.
     pub fn read(self: *Window, maximum: usize, bytes: usize) !usize {
         if (maximum == 0 or maximum > 256 or bytes == 0) return error.InvalidSqlLimit;
         self.clear();
         errdefer self.clear();
-        var retained: usize = 0;
-        while (self.count < maximum and retained < bytes) {
-            const lease = (try self.sort.nextLeased()) orelse break;
-            self.leases.append(local.sql_memory_budget.reclaimingAllocator(self.sort.a), lease) catch |err| {
-                lease.release();
-                return err;
-            };
-            self.count = self.leases.items.len;
-            if (self.count == 1) {
-                self.width = lease.width();
-                self.key_width = lease.keyWidth();
-            } else if (lease.width() != self.width or lease.keyWidth() != self.key_width) return error.InvalidSqlSpill;
-            for (0..self.width) |i| retained +|= try lease.cellBytes(i);
-            for (0..self.key_width) |i| retained +|= try local.sql_operators.datumBytes(try lease.keyCell(i));
+        self.page = try self.sort.nextPageLeased(maximum, bytes);
+        const rows = self.page.?.rows;
+        self.rows = rows;
+        self.count = rows.len;
+        if (rows.len != 0) {
+            self.width = rows[0].width();
+            self.key_width = rows[0].keyWidth();
+            for (rows) |row| if (row.width() != self.width or row.keyWidth() != self.key_width) return error.InvalidSqlSpill;
         }
         return self.count;
     }
@@ -84,12 +80,12 @@ pub const Window = struct {
     /// payloads remain pinned by this window, including dictionaries and JSON.
     pub fn values(self: *Window, a: A) !local.sql_execution_batch.Batch {
         const view = try a.create(spill.Sort.LeaseView);
-        view.* = try .init(a, self.leases.items, self.width);
+        view.* = try .init(a, self.rows, self.width);
         return view.batch();
     }
     pub fn ordinals(self: *const Window, a: A) ![]const u64 {
         const result = try a.alloc(u64, self.count);
-        for (result, self.leases.items) |*out, lease| out.* = lease.row.ordinal;
+        for (result, self.rows) |*out, lease| out.* = lease.row.ordinal;
         return result;
     }
 };
@@ -128,12 +124,13 @@ test "external lake leased publication records preserve resident and spilled byt
 test "external lake leased publication windows bound quanta preserve EOF and unwind allocation faults" {
     const Probe = struct {
         fn check(_: *anyopaque) !void {}
-        fn run(a: A) !void {
+        fn run(a: A, memory: usize) !void {
             var marker: u8 = 0;
             var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = check, .async_writes = false };
             defer manager.deinit();
-            var sort = spill.Sort.init(a, &manager, &.{.{}}, 1 << 20);
+            var sort = spill.Sort.init(a, &manager, &.{.{}}, memory);
             defer sort.deinit();
+            sort.parallel_runs = false;
             for (0..4) |i| try sort.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .integer = @intCast(i) })}, .values = &.{local.sql_scalar.Datum.json(.{ .string = "payload" })}, .ordinal = i });
             var window: Window = .{ .sort = &sort };
             defer window.deinit();
@@ -144,9 +141,14 @@ test "external lake leased publication windows bound quanta preserve EOF and unw
             while (try window.read(2, 1) != 0) {
                 // A single indivisible row can exceed the raw-byte quantum.
                 try std.testing.expectEqual(@as(usize, 1), window.count);
+                const page = window.page.?.values;
+                try std.testing.expectEqualStrings("payload", (try page.cell(scratch.allocator(), 0, 0)).value.string);
+                _ = try page.frozenJson(0, 0);
+                _ = try page.encodedJson(0, 0);
+                _ = try page.dictionaryColumn(scratch.allocator(), 0);
                 const batch = try window.values(scratch.allocator());
                 try std.testing.expectEqualStrings("payload", (try batch.cell(scratch.allocator(), 0, 0)).value.string);
-                try std.testing.expectEqual(@as(u64, seen), window.leases.items[0].row.ordinal);
+                try std.testing.expectEqual(@as(u64, seen), window.rows[0].row.ordinal);
                 seen += 1;
                 window.clear();
                 _ = scratch.reset(.free_all);
@@ -155,8 +157,10 @@ test "external lake leased publication windows bound quanta preserve EOF and unw
             try std.testing.expectEqual(@as(usize, 0), try window.read(2, 1));
         }
     };
-    try Probe.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    for ([_]usize{ 512, 1 << 20 }) |memory| {
+        try Probe.run(std.testing.allocator, memory);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{memory});
+    }
 }
 
 test "external lake leased publication benchmark sorted record drain" {
@@ -220,4 +224,189 @@ test "external lake leased publication benchmark sorted record drain" {
             std.debug.print("LEASED_PUBLICATION sample={d} memory={d} before_cpu_ns={d} after_cpu_ns={d} before_allocated={d} after_allocated={d} before_read={d} after_read={d} before_write={d} after_write={d}\n", .{ sample, memory, before.ns, after.ns, before.allocated, after.allocated, before.reads, after.reads, before.written, after.written });
         }
     }
+}
+
+test "external lake leased publication pressure preserves every pending key and value" {
+    const Probe = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(mode: u8) !void {
+            var budget: local.sql_memory_budget = .{ .backing = std.heap.smp_allocator, .limit = 32 << 20 };
+            const a = budget.allocator();
+            var marker: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = check, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            var sort = spill.Sort.init(a, &manager, &.{.{}}, 4096);
+            defer sort.deinit();
+            sort.encoded_bytes = true;
+            sort.shared_runs = true;
+            sort.parallel_runs = false;
+            const count = 8192;
+            var bodies: [64][8][128]u8 = @splat(@splat(@splat('v')));
+            var keys: [64][20]u8 = undefined;
+            var cells: [64][8]local.sql_scalar.Datum = undefined;
+            var key_cells: [64][1]local.sql_scalar.Datum = undefined;
+            var rows: [64][]const local.sql_scalar.Datum = undefined;
+            var key_rows: [64][]const local.sql_scalar.Datum = undefined;
+            var ordinals: [64]u64 = undefined;
+            for (0..count / 64) |batch| {
+                for (0..64) |i| {
+                    const ordinal = batch * 64 + i;
+                    const rank = i * (count / 64) + batch;
+                    for (0..8) |column| {
+                        std.mem.writeInt(u64, bodies[i][column][0..8], ordinal * 8 + column, .little);
+                        cells[i][column] = local.sql_scalar.Datum.json(.{ .string = &bodies[i][column] });
+                    }
+                    const key = try std.fmt.bufPrint(&keys[i], "key-{d:0>16}", .{rank});
+
+                    key_cells[i][0] = local.sql_scalar.Datum.json(.{ .string = key });
+                    rows[i] = &cells[i];
+                    key_rows[i] = &key_cells[i];
+                    ordinals[i] = ordinal;
+                }
+                try sort.addBatch(.{ .rows = &rows }, &key_rows, &ordinals);
+            }
+            try sort.finish();
+            budget.limit = budget.live + (1 << 20);
+            std.debug.print("PIN_ADMISSION mode={} live={} limit={}\n", .{ mode, budget.live, budget.limit });
+            var seen: usize = 0;
+            if (mode == 1) {
+                var window: Window = .{ .sort = &sort };
+                defer window.deinit();
+                while (true) {
+                    const n = window.read(256, 512 * 1024) catch |err| {
+                        std.debug.print("PIN_WINDOW leased={} seen={} partial={} error={} page_limit={}\n", .{ mode, seen, window.count, err, manager.page_residency_bytes });
+                        return err;
+                    };
+                    if (n == 0) break;
+                    for (window.rows) |lease| {
+                        var expected: [20]u8 = undefined;
+                        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "key-{d:0>16}", .{seen}), (try lease.keyCell(0)).value.string);
+                        const ordinal = (seen % (count / 64)) * 64 + seen / (count / 64);
+                        for (0..8) |column| {
+                            const bytes = (try lease.cell(column)).value.string;
+                            try std.testing.expectEqual(@as(u64, ordinal * 8 + column), std.mem.readInt(u64, bytes[0..8], .little));
+                        }
+                        seen += 1;
+                    }
+                }
+            } else if (mode == 2) {
+                while (true) {
+                    const page = try sort.nextPageLeased(256, 512 * 1024);
+                    defer page.release();
+                    if (page.rows.len == 0) break;
+                    for (page.rows) |lease| {
+                        var expected: [20]u8 = undefined;
+                        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "key-{d:0>16}", .{seen}), (try lease.keyCell(0)).value.string);
+                        const ordinal = (seen % (count / 64)) * 64 + seen / (count / 64);
+                        for (0..8) |column| {
+                            const bytes = (try lease.cell(column)).value.string;
+                            try std.testing.expectEqual(@as(u64, ordinal * 8 + column), std.mem.readInt(u64, bytes[0..8], .little));
+                        }
+                        seen += 1;
+                    }
+                }
+            } else {
+                var scratch = std.heap.ArenaAllocator.init(a);
+                defer scratch.deinit();
+                while (true) {
+                    _ = scratch.reset(.free_all);
+                    const row = (try sort.next(scratch.allocator())) orelse break;
+                    try std.testing.expectEqual(@as(usize, 128), row.values[0].value.string.len);
+                    seen += 1;
+                }
+            }
+            std.debug.print("PIN_WINDOW leased={} seen={} page_limit={} reads={}\n", .{ mode, seen, manager.page_residency_bytes, sort.payload_reads });
+            try std.testing.expectEqual(@as(usize, count), seen);
+        }
+    };
+    // Owning control, existing grouped delivery, and publication all complete
+    // under identical headroom. The publication path must not lose a hydrated
+    // prefix or an unread key when physical admission shortens a batch.
+    try Probe.run(0);
+    try Probe.run(2);
+    try Probe.run(1);
+}
+
+test "external lake leased publication wide covering ranges coalesce before decoding" {
+    const a = std.testing.allocator;
+    const columns = @import("lake_index_cover_columns.zig");
+    const stores = @import("../serverless/artifacts/store.zig");
+    var dir = try local.common_test_directory.TestDirectory.init("review-cover-fanout");
+    defer dir.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, dir.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const scope: stores.UploadScope = .{ .domain = @splat(7), .attempt = @splat(3) };
+    store.upload_scope = scope;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pa = arena.allocator();
+    var rows: [32]local.sql_operators.Row = undefined;
+    for (&rows, 0..) |*row, i| {
+        const key = try pa.alloc(local.sql_scalar.Datum, 1);
+        key[0] = local.sql_scalar.Datum.json(.{ .string = try std.fmt.allocPrint(pa, "key-{d:0>16}", .{i}) });
+        const cells = try pa.alloc(local.sql_scalar.Datum, 128);
+        for (cells, 0..) |*cell, col| cell.* = local.sql_scalar.Datum.json(.{ .integer = @intCast(i * 128 + col) });
+        row.* = .{ .values = cells, .keys = key, .ordinal = i };
+    }
+    var writes: u64 = 0;
+    const ref = try columns.publish(pa, store, scope, &rows, .none, &writes);
+    const directory = try columns.readDirectory(pa, store, ref, .none);
+    const Probe = struct {
+        var active: *@This() = undefined;
+        original: *const stores.ArtifactStore.VTable,
+        pack: []const u8,
+        calls: usize = 0,
+        bytes: u64 = 0,
+        fn get(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, cancel: @import("antfly_cancellation").CancellationToken) ![]u8 {
+            const self = active;
+            if (std.mem.eql(u8, id, self.pack)) {
+                self.calls += 1;
+                self.bytes += length;
+            }
+            return if (self.original.get_range_alloc_with_cancellation) |read| read(raw, alloc, id, offset, length, cancel) else self.original.get_range_alloc(raw, alloc, id, offset, length);
+        }
+    };
+    var probe: Probe = .{ .original = store.vtable, .pack = directory.pack.artifact_id };
+    Probe.active = &probe;
+    var traced = store.vtable.*;
+    traced.get_range_alloc_with_cancellation = Probe.get;
+    store.vtable = &traced;
+    var selected: [128]usize = undefined;
+    for (&selected, 0..) |*index, i| index.* = i;
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &cache, .scope = @splat(7), .context = .{ .io = std.testing.io } };
+    // Match the serving covering wave's byte-derived admission, rather than
+    // relying on the loader's maximum 16 MiB allowance.
+    const allowance = @min(16 << 20, (directory.pack.byte_len + ref.byte_len) * 4 + (256 << 10));
+    var reads: u64 = 16 << 20;
+    var loaded = try columns.load(a, store, ref, true, &selected, 128, .none, cached, allowance, &reads, null);
+    defer loaded.deinit();
+    for (0..32) |row| for (0..128) |col| try std.testing.expectEqual(@as(i64, @intCast(row * 128 + col)), (try loaded.block.cell(row, col)).value.integer);
+    std.debug.print("WIDE_COVER columns=128 rows=32 stripes={} pack_bytes={} range_gets={} fetched={}\n", .{ directory.sections.len, directory.pack.byte_len, probe.calls, probe.bytes });
+    const cold_calls = probe.calls;
+    var warm = try columns.load(a, store, ref, true, &selected, 128, .none, cached, allowance, &reads, null);
+    defer warm.deinit();
+    std.debug.print("WIDE_COVER_WARM range_gets={}\n", .{probe.calls - cold_calls});
+    try std.testing.expectEqual(@as(usize, 1), cold_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls - cold_calls);
+    // A fresh scope with a sparse projection reads the identity and two
+    // required stripes, without bringing omitted columns into a coalesced GET.
+    var narrow_cache = cached;
+    narrow_cache.scope = @splat(8);
+    const before_calls = probe.calls;
+    const before_bytes = probe.bytes;
+    var narrow = try columns.load(a, store, ref, true, &.{ 0, 127 }, 128, .none, narrow_cache, allowance, &reads, null);
+    defer narrow.deinit();
+    try std.testing.expectEqual(@as(usize, 2), probe.calls - before_calls);
+    const required = directory.sections[0].bytes + directory.sections[1].bytes + directory.sections[128].bytes;
+    try std.testing.expectEqual(@as(u64, required), probe.bytes - before_bytes);
+    try std.testing.expect((try narrow.block.cell(0, 64)).sql_null);
+    try std.testing.expectEqual(@as(i64, 127), (try narrow.block.cell(0, 127)).value.integer);
+    const uncached_calls = probe.calls;
+    var uncached = try columns.load(a, store, ref, true, &selected, 128, .none, null, allowance, &reads, null);
+    defer uncached.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls - uncached_calls);
+    for (0..32) |row| for (0..128) |col| try std.testing.expectEqual(@as(i64, @intCast(row * 128 + col)), (try uncached.block.cell(row, col)).value.integer);
 }

@@ -5370,9 +5370,56 @@ pub const Sort = struct {
             self.a.free(self.rows);
         }
     };
+    /// Keyed direct-sort batches share delivery's physical admission policy.
+    /// A productive prefix is returned before the next block needs more room;
+    /// no failed hydration can consume an unread indirect reference. Resident
+    /// rows borrow typed stores: retain the sort until the returned page releases.
+    fn nextDirectPageLeased(self: *Sort, maximum: usize, byte_limit: usize) anyerror!Page {
+        var rows: [64]RowLease = undefined;
+        var count: usize = 0;
+        errdefer for (rows[0..count]) |lease| lease.release();
+        var owners: [128]*Sequential.OwnedBlock = undefined;
+        var owner_count: usize = 0;
+        var retained: usize = 0;
+        var logical: usize = 0;
+        while (count < @min(maximum, rows.len)) {
+            var pressure: CachePressure = .{ .manager = self.manager, .context = self, .evict = keepCollectedPayloads, .bounded = true, .reserve = (count + 1) * @sizeOf(RowLease) + @sizeOf(PageView) };
+            if (!pressure.admit(0)) {
+                if (count == 0) return error.SqlProgramLimitExceeded;
+                break;
+            }
+            const lease = (self.nextLeasedWithPressure(&pressure) catch |err| {
+                if (err != error.OutOfMemory or !pressure.denied) return err;
+                if (count == 0) return error.SqlProgramLimitExceeded;
+                break;
+            }) orelse break;
+            rows[count] = lease;
+            count += 1;
+            for (0..lease.width()) |column| logical +|= try lease.cellBytes(column);
+            for (0..lease.keyWidth()) |column| logical +|= try operators.datumBytes(try lease.keyCell(column));
+            for ([_]?*Sequential.OwnedBlock{ lease.block, lease.key_block }) |optional| if (optional) |block| {
+                const known = for (owners[0..owner_count]) |prior| {
+                    if (prior == block) break true;
+                } else false;
+                if (!known) {
+                    owners[owner_count] = block;
+                    owner_count += 1;
+                    retained +|= block.retainedBytes() +| @sizeOf(Sequential.OwnedBlock);
+                }
+            };
+            if (logical >= byte_limit or retained +| count * @sizeOf(RowLease) +| @sizeOf(PageView) >= byte_limit) break;
+        }
+        const stable = self.manager.allocator();
+        const output = try stable.dupe(RowLease, rows[0..count]);
+        errdefer stable.free(output);
+        const view = try stable.create(PageView);
+        view.* = .{ .rows = output };
+        return .{ .rows = output, .a = stable, .values = view.batch(if (count == 0) 0 else rows[0].width()) };
+    }
     pub fn nextPageLeased(self: *Sort, maximum: usize, byte_limit: usize) anyerror!Page {
-        if (maximum == 0) return error.InvalidSqlLimit;
+        if (maximum == 0 or byte_limit == 0) return error.InvalidSqlLimit;
         try self.finishDelivery(@sizeOf(RowLease) + @sizeOf(PageView));
+        if (self.order_sort == null) return self.nextDirectPageLeased(maximum, byte_limit);
         const reader = try self.payloadReader();
         const limit = reader.target(byte_limit);
         var keys: [64]?RowLease = @splat(null);
@@ -5431,10 +5478,13 @@ pub const Sort = struct {
     }
     const PageView = struct {
         rows: []const RowLease,
+        fn batch(self: *@This(), width: usize) @import("execution_batch.zig").Batch {
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .read_identity = identity, .read_dictionary = dictionary, .count = self.rows.len, .width = width } };
+        }
         fn shared(self: *const @This()) bool {
             if (self.rows.len == 0) return false;
-            for (self.rows) |row| if (row.block != self.rows[0].block) return false;
-            return true;
+            for (self.rows) |row| if (row.block != self.rows[0].block or row.values != self.rows[0].values) return false;
+            return self.rows[0].block != null or self.rows[0].values != null;
         }
         fn cell(raw: *anyopaque, _: Allocator, row: usize, column: usize) anyerror!Datum {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -5443,25 +5493,29 @@ pub const Sort = struct {
         fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const lease = self.rows[row];
-            return lease.block.?.encoded.?.frozenJson(lease.index, column, false);
+            if (lease.block) |block| return if (block.encoded) |encoded| encoded.frozenJson(lease.index, column, false) else null;
+            return if (lease.values) |values| values.frozenJson(lease.index, column) else null;
         }
         fn json(raw: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const lease = self.rows[row];
-            return lease.block.?.encoded.?.encodedJson(lease.index, column, false);
+            if (lease.block) |block| return if (block.encoded) |encoded| encoded.encodedJson(lease.index, column, false) else null;
+            return if (lease.values) |values| values.encodedJson(lease.index, column) else null;
         }
         fn identity(raw: *anyopaque, row: usize, column: usize) anyerror!?u64 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (!self.shared()) return null;
             const lease = self.rows[row];
-            return lease.block.?.encoded.?.dictionaryIdentity(lease.index, column, false);
+            if (lease.block) |block| return if (block.encoded) |encoded| encoded.dictionaryIdentity(lease.index, column, false) else null;
+            return if (lease.values) |values| values.dictionaryId(lease.index, column) else null;
         }
         fn dictionary(raw: *anyopaque, a: Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (!self.shared()) return null;
             const Batch = @import("execution_batch.zig").Batch;
             const source = try a.create(Batch);
-            source.* = try self.rows[0].block.?.batch(a, false);
+            const first = self.rows[0];
+            source.* = if (first.block) |block| try block.batch(a, false) else .{ .retained = .{ .store = first.values.?, .count = first.values.?.len } };
             const indices = try a.alloc(usize, self.rows.len);
             for (indices, self.rows) |*index, row| index.* = row.index;
             return (try source.select(a, indices)).dictionaryColumn(a, column);

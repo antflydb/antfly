@@ -311,7 +311,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                     self.block = encoded;
                 }
             }
-            const row = window.leases.items[self.position];
+            const row = window.rows[self.position];
             const ordinal = self.position;
             self.position += 1;
             if (window.key_width != 1) return error.InvalidNativeLakeRowIndex;
@@ -1847,6 +1847,10 @@ test "external lake warm tie pagination reuses scoped file order with bounded pa
     const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = files };
     var sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 512 * 1024);
     defer sort.deinit();
+    // Publication consumes a sort once; independent layouts get independent
+    // streams over the same immutable input fixture.
+    var other_sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 512 * 1024);
+    defer other_sort.deinit();
     const expected = try ca.alloc([]const u8, 64);
     const prefix: [2048]u8 = @splat(1);
     for (files, 0..) |file, slot| for (0..2) |row| {
@@ -1856,6 +1860,7 @@ test "external lake warm tie pagination reuses scoped file order with bounded pa
         @memcpy(key[2048..], &coordinate(@intCast(slot), ref.external));
         const position = slot * 2 + row;
         try sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = &key })}, .values = &.{}, .ordinal = position });
+        try other_sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = &key })}, .values = &.{}, .ordinal = position });
         expected[position] = try local.storage_rowsource_identity.allocId(ca, ref);
     };
     std.mem.sort([]const u8, expected, {}, struct {
@@ -1914,8 +1919,7 @@ test "external lake warm tie pagination reuses scoped file order with bounded pa
     // Keep the inventory valid and supply the second index's independent layout.
     const other_names = try ca.alloc([]const u8, files.len);
     for (other_names, 0..) |*name, i| name.* = files[files.len - i - 1].file_id;
-    try sort.rewind();
-    const other_artifact = try publishIncremental(a, ca, &store, &sort, "other", @splat(3), inventory, &.{}, .none, .{ .files = other_names });
+    const other_artifact = try publishIncremental(a, ca, &store, &other_sort, "other", @splat(3), inventory, &.{}, .none, .{ .files = other_names });
     const other_root = try loadRoot(ca, store, other_artifact, .none, null);
     try std.testing.expectEqualDeep(root.ties, other_root.ties);
     var other_reader: Reader = undefined;

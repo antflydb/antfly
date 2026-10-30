@@ -531,14 +531,14 @@ const PartialStream = struct {
         if (self.encoded_sort) |sort| {
             if (self.encoded_window == null) self.encoded_window = .{ .sort = sort };
             const window = &self.encoded_window.?;
-            // The fallback's established quantum is 256 complete rows. Keep
-            // pins until next/deinit: small-radix consumers may close the input
-            // stream before synchronously consuming the returned row views.
-            const count = try window.read(256, std.math.maxInt(usize));
+            // Radix publication drains variable physical batches until EOF.
+            // Keep output pins through synchronous consumption, including a
+            // caller closing the stream before consuming its final row views.
+            const count = try window.read(256, 512 * 1024);
             if (count == 0) return &.{};
             if (window.width != 1 or window.key_width != 1) return error.InvalidNativeAggregateArtifact;
             const rows = try a.alloc(operators.Row, count);
-            for (window.leases.items, rows) |lease, *row| {
+            for (window.rows, rows) |lease, *row| {
                 const value = try lease.cell(0);
                 if (value.sql_null or value.value != .string) return error.InvalidNativeAggregateArtifact;
                 const block = try state_tree.block(a, value.value.string, self.recipe);
