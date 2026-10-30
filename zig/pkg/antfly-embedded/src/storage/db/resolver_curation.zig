@@ -286,7 +286,7 @@ pub fn planMetadataBatch(a: std.mem.Allocator, indexes_json: []const u8, request
     var root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{});
     const metadata = try metadataFromValue(a, root);
     var desired: std.ArrayListUnmanaged(catalog.ResolverConfig) = .empty;
-    try @import("../../metadata/index_reconcile.zig").collectDesiredResolvers(a, root, &desired);
+    try catalog.collectDesiredResolvers(a, root, &desired);
     var definitions: std.StringHashMapUnmanaged(catalog.ResolverConfig) = .empty;
     for (desired.items) |cfg| try definitions.put(a, cfg.name, cfg);
     var records: std.ArrayListUnmanaged(MetadataIdentity) = .empty;
@@ -691,7 +691,7 @@ pub fn planNamespaceMetadata(a: std.mem.Allocator, indexes_json: []const u8, nam
     var root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{});
     const metadata = try metadataFromValue(a, root);
     var desired: std.ArrayListUnmanaged(catalog.ResolverConfig) = .empty;
-    try @import("../../metadata/index_reconcile.zig").collectDesiredResolvers(a, root, &desired);
+    try catalog.collectDesiredResolvers(a, root, &desired);
     var selected: ?catalog.ResolverConfig = null;
     for (desired.items) |cfg| if (std.mem.eql(u8, cfg.name, name)) {
         selected = cfg;
@@ -957,7 +957,7 @@ pub const drop_marker_prefix = catalog.drop_marker_prefix;
 pub fn planDropMetadata(a: std.mem.Allocator, indexes_json: []const u8, name: []const u8) !MetadataPlan {
     var root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{});
     var desired: std.ArrayListUnmanaged(catalog.ResolverConfig) = .empty;
-    try @import("../../metadata/index_reconcile.zig").collectDesiredResolvers(a, root, &desired);
+    try catalog.collectDesiredResolvers(a, root, &desired);
     for (desired.items) |cfg| if (std.mem.eql(u8, cfg.name, name)) return error.ResolverIdentityActive;
     const metadata = try metadataFromValue(a, root);
     for (metadata.identities) |identity| {
@@ -1064,9 +1064,8 @@ pub fn retainRetiredMetadata(alloc: std.mem.Allocator, before: []const u8, after
     var next = try std.json.parseFromSliceLeaky(std.json.Value, a, after, .{});
     var old: std.ArrayListUnmanaged(catalog.ResolverConfig) = .empty;
     var desired: std.ArrayListUnmanaged(catalog.ResolverConfig) = .empty;
-    const reconcile = @import("../../metadata/index_reconcile.zig");
-    try reconcile.collectDesiredResolvers(a, prior, &old);
-    try reconcile.collectDesiredResolvers(a, next, &desired);
+    try catalog.collectDesiredResolvers(a, prior, &old);
+    try catalog.collectDesiredResolvers(a, next, &desired);
     inline for (.{ "_resolver_record_store", "_resolver_record_owners" }) |key| if (prior.object.get(key)) |value| try next.object.put(a, key, value);
     if (prior.object.get(namespaces_key)) |value| try next.object.put(a, namespaces_key, value);
     if (prior.object.get("_curation_proposals")) |value| try next.object.put(a, "_curation_proposals", value);
@@ -1230,7 +1229,7 @@ test "resolver curation proposal evidence cannot declare indexes or resolver ide
         \\{"_curation_proposals":{"proposals":[{"evidence":{"resolvers":[{"malformed":true}]}}]}}
     , .{});
     var out: std.ArrayListUnmanaged(catalog.ResolverConfig) = .empty;
-    try @import("../../metadata/index_reconcile.zig").collectDesiredResolvers(a, root, &out);
+    try catalog.collectDesiredResolvers(a, root, &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 

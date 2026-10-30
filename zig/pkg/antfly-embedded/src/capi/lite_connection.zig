@@ -658,6 +658,9 @@ pub const Owner = struct {
     // Connection-owner lifetime totals, protected by the path gate. They survive
     // foreground runtime refreshes and distinguish conflicts from a moving tip.
     publication_stats: struct {
+        /// Namespace rounds reaching replay/idle completion (errors below).
+        /// Lets observers distinguish quiescence from a worker that stopped.
+        maintenance_rounds: u64 = 0,
         attempts: u64 = 0,
         refused: u64 = 0,
         rebased: u64 = 0,
@@ -1399,6 +1402,7 @@ pub const Owner = struct {
         self.maintenance_round_pending = self.maintenance_round_pending or pending;
         const ttl_pending = self.maintenance_round_ttl_pending;
         if (self.maintenance_table_cursor == 0) {
+            self.publication_stats.maintenance_rounds +|= 1;
             self.maintenance_round_ttl_pending = false;
             // Mutations arriving during the detached turn still wake the owner;
             // replay debt is inspected again under the next capture fence.
