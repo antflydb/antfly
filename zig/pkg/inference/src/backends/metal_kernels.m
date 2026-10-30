@@ -6499,6 +6499,23 @@ TERMITE_METAL_ABI_DECLARE_TAGGED(conv2d_f32)
 #define TERMITE_MSL_ABI_DOT_SMALL_ROWS(Kernel) "kernel void " #Kernel "(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_dot_general_2d_f32_params &p [[buffer(3)]], threadgroup float *partials [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {"
 #define TERMITE_MSL_ABI_ATTENTION_F16_KV(Kernel) "kernel void " #Kernel "(device const float *q [[buffer(0)]], device const half *k [[buffer(1)]], device const half *v [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_attention_f32_params &p [[buffer(4)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {"
 
+// Native quantized matrix phases retain swizzle, explicit unroll and SIMD
+// barriers. They expand in caller scope so storage and register liveness stay.
+#define ANTFLY_MSL_QUANT_SWIZZLE16(Pre,Post,Groups,Tile) \
+    "const short " Pre "sx" Post " = 2 * il0 + i / 8; const short " Pre "sy" Post " = (short(tiitg) / NL0) / 8; const short " Pre "lx" Post " = (short(tiitg) / NL0) % 8; const short " Pre "ly" Post " = i % 8; const short " Pre "ib" Post " = " Groups " * " Pre "sx" Post " + " Pre "sy" Post "; *(sa + 64 * " Pre "ib" Post " + 8 * " Pre "ly" Post " + " Pre "lx" Post ") = " Tile "[i / 4][i % 4];"
+#define ANTFLY_MSL_MATRIX_4X2_MMA(Loop,Sync,Left,Right,Accumulator,RightStep) \
+    Loop "(short ik = 0; ik < NK / 8; ++ik) { " Sync \
+    Loop "(short i = 0; i < 4; ++i) simdgroup_load(ma[i], " Left " + 64 * i, 8, 0, false); " Sync \
+    Loop "(short i = 0; i < 2; ++i) simdgroup_load(mb[i], " Right " + 64 * i, 8, 0, false); " Sync \
+    Loop "(short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(" Accumulator "[i], mb[i / 4], ma[i % 4], " Accumulator "[i]); " Left " += 8 * 64; " Right " += " RightStep " * 64; }"
+
+#define ANTFLY_MSL_MATRIX_4X2_STORE(Loop,Accumulator,Destination,Pitch) \
+    Loop "(short i = 0; i < 8; ++i) simdgroup_store(" Accumulator "[i], " Destination " + 8u * uint(i % 4) + 8u * " Pitch " * uint(i / 4), " Pitch ", 0, false);"
+#define ANTFLY_MSL_MATRIX_4X1_MMA(Left,Right,Accumulator) \
+    "TERMITE_FOR_UNROLL(short ik = 0; ik < NK / 8; ++ik) { TERMITE_FOR_UNROLL(short i = 0; i < 4; ++i) simdgroup_load(ma[i], " Left " + 64 * i, 8, 0, false); simdgroup_load(mb, " Right ", 8, 0, false); TERMITE_FOR_UNROLL(short i = 0; i < 4; ++i) simdgroup_multiply_accumulate(" Accumulator "[i], mb, ma[i], " Accumulator "[i]); " Left " += 4 * 64; " Right " += 4 * 64; }"
+#define ANTFLY_MSL_QUANT_SCALAR_INPUT8() \
+    "(short i = 0; i < 8; ++i) { const short sx = short(tiitg) % NL1; const short sy = (short(tiitg) / NL1) / 8; const short lx = i; const short ly = (short(tiitg) / NL1) % 8; const short ib = 4 * sx + sy; uint k = loop_k + uint(iy + i); *(sb + 64 * ib + 8 * ly + lx) = k < p.in_dim ? half(input[uint(r1 + lr1) * p.in_dim + k]) : half(0.0f); }"
+
 // Shared 32x64 gated matrix algorithm. Codec, activation acquisition,
 // unroll directives and publication remain explicit native source policies.
 // Paired 32x64 projections share native decode, staging, barriers and MMA.
@@ -6506,7 +6523,7 @@ TERMITE_METAL_ABI_DECLARE_TAGGED(conv2d_f32)
 #define TERMITE_MSL_PAIR_MATRIX_32X64_INPUT(LoadInput) \
     "const short sx = short(tiitg) % NL1; const short sy = (short(tiitg) / NL1) / 8; const short ly = (short(tiitg) / NL1) % 8; const short ib = 4 * sx + sy; *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) = " LoadInput "; "
 #define TERMITE_MSL_PAIR_MATRIX_32X64_STAGE(Projection, Block, Pre, Post, Decode, AcquireInput) \
-    "half4x4 " "temp_" Projection "; " Decode "(" Block ", il0, " "temp_" Projection "); threadgroup_barrier(mem_flags::mem_threadgroup); TERMITE_FOR_UNROLL(short i = 0; i < 16; ++i) { const short " Pre "sx" Post " = 2 * il0 + i / 8; const short " Pre "sy" Post " = (short(tiitg) / NL0) / 8; const short " Pre "lx" Post " = (short(tiitg) / NL0) % 8; const short " Pre "ly" Post " = i % 8; const short " Pre "ib" Post " = 8 * " Pre "sx" Post " + " Pre "sy" Post "; *(sa + 64 * " Pre "ib" Post " + 8 * " Pre "ly" Post " + " Pre "lx" Post ") = " "temp_" Projection "[i / 4][i % 4]; } " AcquireInput "threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const half *" "lsma_" Projection " = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *" "lsmb_" Projection " = sb + 2 * 64 * (uint(sgitg) / 2u); TERMITE_FOR_UNROLL(short ik = 0; ik < NK / 8; ++ik) { TERMITE_FOR_UNROLL(short i = 0; i < 4; ++i) simdgroup_load(ma[i], " "lsma_" Projection " + 64 * i, 8, 0, false); TERMITE_FOR_UNROLL(short i = 0; i < 2; ++i) simdgroup_load(mb[i], " "lsmb_" Projection " + 64 * i, 8, 0, false); TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(" Projection "_acc" "[i], mb[i / 4], ma[i % 4], " Projection "_acc" "[i]); " "lsma_" Projection " += 8 * 64; " "lsmb_" Projection " += 4 * 64; } "
+    "half4x4 " "temp_" Projection "; " Decode "(" Block ", il0, " "temp_" Projection "); threadgroup_barrier(mem_flags::mem_threadgroup); TERMITE_FOR_UNROLL(short i = 0; i < 16; ++i) { " ANTFLY_MSL_QUANT_SWIZZLE16(Pre, Post, "8", "temp_" Projection) " } " AcquireInput "threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const half *" "lsma_" Projection " = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *" "lsmb_" Projection " = sb + 2 * 64 * (uint(sgitg) / 2u); " ANTFLY_MSL_MATRIX_4X2_MMA("TERMITE_FOR_UNROLL", "", "lsma_" Projection, "lsmb_" Projection, Projection "_acc", "4") " "
 #define TERMITE_MSL_PAIR_MATRIX_32X64_TRAVERSE(First, FirstBlock, Second, SecondBlock, Pre, Post, Decode, LoadInput) \
     "    for (uint loop_k = 0u; loop_k < p.in_dim; loop_k += uint(NK)) { " \
     TERMITE_MSL_PAIR_MATRIX_32X64_STAGE(First, FirstBlock, "", "", Decode, TERMITE_MSL_PAIR_MATRIX_32X64_INPUT(LoadInput)) \
@@ -7192,6 +7209,36 @@ static NSString *termite_metal_tensor_program_source(void) {
 
 // Shared range admission, key staging and publication for native segment tiles.
 // These source phases retain the exact qualified compiler inputs and schedules.
+// Grouped matrix geometry and fragment traversal retain native tail/barrier policies.
+#define ANTFLY_MSL_GROUPED_MATRIX_GEOMETRY() \
+    "    const uint t = uint(tid), L = uint(lane), s = uint(sg) % 4u, qb = uint(sg) / 4u;\n    const uint q0 = tg.x * BQ, h = tg.y, hidden = p.num_heads * D, kv_hidden = p.reserved0 * D, kh = h / (p.num_heads / p.reserved0);\n"
+
+#define ANTFLY_MSL_GROUPED_MATRIX_QK(Tiles,Stage,Guard,Acquire,Finish) \
+    "        for (uint bc = 0; bc < " \
+    Tiles \
+    "u; ++bc) {\n            const uint key = kb + bc * 8u;\n" \
+    Stage \
+    "            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);\n            " \
+    Guard \
+    "TERMITE_FOR_UNROLL(uint dt = 0; dt < 16u; ++dt) {\n                simdgroup_float8x8 km;\n" \
+    Acquire \
+    "                simdgroup_multiply_accumulate(acc, qm[dt], km, acc);\n            }\n            simdgroup_store(acc, partial + pb + bc * 8u, BK);\n" \
+    Finish \
+    "        }\n"
+
+#define ANTFLY_MSL_GROUPED_MATRIX_PV(Tiles,Stage,WeightPitch,Acquire,Finish) \
+    "        for (uint bc = 0; bc < " \
+    Tiles \
+    "u; ++bc) {\n            const uint key = kb + bc * 8u;\n" \
+    Stage \
+    "            simdgroup_float8x8 pm; simdgroup_load(pm, weights + qb * " \
+    WeightPitch \
+    "u + bc * 8u, BK);\n            TERMITE_FOR_UNROLL(uint dt = 0; dt < 16u; ++dt) {\n                simdgroup_float8x8 vm;\n" \
+    Acquire \
+    "                simdgroup_multiply_accumulate(o[dt], pm, vm, o[dt]);\n            }\n" \
+    Finish \
+    "        }\n"
+
 #define ANTFLY_MSL_SEGMENT_RANGE_ENVELOPE() \
     "    uint lo = 0xffffffffu, hi = 0u;\n" \
     "    int pmin = 2147483647, pmax = -2147483647 - 1;\n" \
@@ -9195,14 +9242,14 @@ static NSString *termite_metal_shader_source(void) {
            "    for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "    for (uint loop_k = 0u; loop_k < p.in_dim; loop_k += uint(NK)) {\n"
            "        half4x4 temp_a; termite_sg_dequantize_block(x, il, temp_a); threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (short i = 0; i < 16; ++i) { const short sx = 2 * il0 + i / 8; const short sy = (short(tiitg) / NL0) / 8; const short lx = (short(tiitg) / NL0) % 8; const short ly = i % 8; const short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = temp_a[i / 4][i % 4]; }\n"
-           "        for (short i = 0; i < 8; ++i) { const short sx = short(tiitg) % NL1; const short sy = (short(tiitg) / NL1) / 8; const short lx = i; const short ly = (short(tiitg) / NL1) % 8; const short ib = 4 * sx + sy; uint k = loop_k + uint(iy + i); *(sb + 64 * ib + 8 * ly + lx) = k < p.in_dim ? half(input[uint(r1 + lr1) * p.in_dim + k]) : half(0.0f); }\n"
+           "        for (short i = 0; i < 16; ++i) { " ANTFLY_MSL_QUANT_SWIZZLE16("", "", "8", "temp_a") " }\n"
+           "        for " ANTFLY_MSL_QUANT_SCALAR_INPUT8() "\n"
            "        if (BlockBytes == 34u) { il = (il + 2 < 2) ? il + 2 : il % 2; x = (il < 2) ? x + 1 : x; } else x = x + 1; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
-           "        for (short ik = 0; ik < NK / 8; ++ik) { simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); for (short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 4 * 64; }\n"
+           "        " ANTFLY_MSL_MATRIX_4X2_MMA("for ", "simdgroup_barrier(mem_flags::mem_none); ", "lsma", "lsmb", "mc", "4") "\n"
            "    }\n"
-           "    if (r0 + NR0 <= int(p.out_dim) && r1 + NR1 <= int(p.rows)) { device float *C = output + uint(r1) * p.out_dim + uint(r0) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; for (short i = 0; i < 8; ++i) simdgroup_store(mc[i], C + 8u * uint(i % 4) + 8u * p.out_dim * uint(i / 4), p.out_dim, 0, false); }\n"
-           "    else { threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); for (short i = 0; i < 8; ++i) simdgroup_store(mc[i], temp_str + 8u * uint(i % 4) + 8u * uint(NR0) * uint(i / 4), uint(NR0), 0, false); threadgroup_barrier(mem_flags::mem_threadgroup); if (sgitg == 0) { for (int j = int(tiitg); j < int(nr1); j += NR1) { device float *D = output + uint(r1 + j) * p.out_dim + uint(r0); threadgroup float *C = ((threadgroup float *)shmem) + uint(j) * uint(NR0); uint i = 0u; for (; i < uint(nr0); ++i) D[i] = C[i]; } } }\n"
+           "    if (r0 + NR0 <= int(p.out_dim) && r1 + NR1 <= int(p.rows)) { device float *C = output + uint(r1) * p.out_dim + uint(r0) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; " ANTFLY_MSL_MATRIX_4X2_STORE("for ", "mc", "C", "p.out_dim") " }\n"
+           "    else { threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); " ANTFLY_MSL_MATRIX_4X2_STORE("for ", "mc", "temp_str", "uint(NR0)") " threadgroup_barrier(mem_flags::mem_threadgroup); if (sgitg == 0) { for (int j = int(tiitg); j < int(nr1); j += NR1) { device float *D = output + uint(r1 + j) * p.out_dim + uint(r0); threadgroup float *C = ((threadgroup float *)shmem) + uint(j) * uint(NR0); uint i = 0u; for (; i < uint(nr0); ++i) D[i] = C[i]; } } }\n"
            "}\n"
            TERMITE_MSL_ABI_QUANT_MATRIX(termite_q4_0_linear_mm_sg) "\n"
            "    termite_quant_linear_mm_sg<termite_block_q4_0, 18u>(input, weight, output, p, shmem, tiitg, sgitg, tg);\n"
@@ -9221,19 +9268,19 @@ static NSString *termite_metal_shader_source(void) {
            "    for (short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "    for (uint loop_k = 0u; loop_k < p.in_dim; loop_k += uint(NK)) {\n"
            "        half4x4 temp_a; termite_dequantize_q4_0_4x4_half(x, il, temp_a); threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        TERMITE_FOR_UNROLL(short i = 0; i < 16; ++i) { const short sx = 2 * il0 + i / 8; const short sy = (short(tiitg) / NL0) / 8; const short lx = (short(tiitg) / NL0) % 8; const short ly = i % 8; const short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = temp_a[i / 4][i % 4]; }\n"
+           "        TERMITE_FOR_UNROLL(short i = 0; i < 16; ++i) { " ANTFLY_MSL_QUANT_SWIZZLE16("", "", "8", "temp_a") " }\n"
            "        if (Unrolled) {\n"
-           "        TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) { const short sx = short(tiitg) % NL1; const short sy = (short(tiitg) / NL1) / 8; const short lx = i; const short ly = (short(tiitg) / NL1) % 8; const short ib = 4 * sx + sy; uint k = loop_k + uint(iy + i); *(sb + 64 * ib + 8 * ly + lx) = k < p.in_dim ? half(input[uint(r1 + lr1) * p.in_dim + k]) : half(0.0f); }\n"
+           "        TERMITE_FOR_UNROLL" ANTFLY_MSL_QUANT_SCALAR_INPUT8() "\n"
            "        } else {\n"
            "        const short sx = short(tiitg) % NL1; const short sy = (short(tiitg) / NL1) / 8; const short ly = (short(tiitg) / NL1) % 8; const short ib = 4 * sx + sy;\n"
            "        *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) = (half2x4)(*((device const float2x4 *)y));\n"
            "        }\n"
            "        x = x + 1; if (!Unrolled) y += uint(NK); threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u);\n"
-           "        TERMITE_FOR_UNROLL(short ik = 0; ik < NK / 8; ++ik) { simdgroup_barrier(mem_flags::mem_none); TERMITE_FOR_UNROLL(short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); TERMITE_FOR_UNROLL(short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += 4 * 64; }\n"
+           "        " ANTFLY_MSL_MATRIX_4X2_MMA("TERMITE_FOR_UNROLL", "simdgroup_barrier(mem_flags::mem_none); ", "lsma", "lsmb", "mc", "4") "\n"
            "    }\n"
-           "    if ((!Unrolled || r0 + NR0 <= int(p.out_dim)) && (!Tail || r1 + NR1 <= int(p.rows))) { device float *C = output + uint(r1) * p.out_dim + uint(r0) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; for (short i = 0; i < 8; ++i) simdgroup_store(mc[i], C + 8u * uint(i % 4) + 8u * p.out_dim * uint(i / 4), p.out_dim, 0, false); }\n"
-           "    else { threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); for (short i = 0; i < 8; ++i) simdgroup_store(mc[i], temp_str + 8u * uint(i % 4) + 8u * uint(NR0) * uint(i / 4), uint(NR0), 0, false); threadgroup_barrier(mem_flags::mem_threadgroup); if (sgitg == 0) { for (int j = int(tiitg); j < int(nr1); j += NR1) { device float *D = output + uint(r1 + j) * p.out_dim + uint(r0); threadgroup float *C = ((threadgroup float *)shmem) + uint(j) * uint(NR0); for (uint i = 0u; i < uint(Unrolled ? nr0 : NR0); ++i) D[i] = C[i]; } } }\n"
+           "    if ((!Unrolled || r0 + NR0 <= int(p.out_dim)) && (!Tail || r1 + NR1 <= int(p.rows))) { device float *C = output + uint(r1) * p.out_dim + uint(r0) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; " ANTFLY_MSL_MATRIX_4X2_STORE("for ", "mc", "C", "p.out_dim") " }\n"
+           "    else { threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); " ANTFLY_MSL_MATRIX_4X2_STORE("for ", "mc", "temp_str", "uint(NR0)") " threadgroup_barrier(mem_flags::mem_threadgroup); if (sgitg == 0) { for (int j = int(tiitg); j < int(nr1); j += NR1) { device float *D = output + uint(r1 + j) * p.out_dim + uint(r0); threadgroup float *C = ((threadgroup float *)shmem) + uint(j) * uint(NR0); for (uint i = 0u; i < uint(Unrolled ? nr0 : NR0); ++i) D[i] = C[i]; } } }\n"
            "}\n"
            TERMITE_MSL_ABI_QUANT_MATRIX(termite_q4_0_linear_mm_sg_unrolled) "\n"
            "    termite_q4_0_matrix_aligned_impl<2u>(input, weight, output, p, shmem, tiitg, sgitg, tg);\n"
@@ -9258,7 +9305,7 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_ABI_QUANT_PAIR_MATRIX(termite_q4_0_pair_activation_mm_m32_n64_tail) " termite_q4_0_pair_activation_mm_m32_n64_impl(input, weight_gate, weight_up, output, p, ap, shmem, tiitg, sgitg, tg, true); }\n"
            "inline void termite_q4_0_pair_activation_mm_m32_n32_impl(device const float *input, device const uchar *weight_gate, device const uchar *weight_up, device float *output, constant termite_metal_linear_params &p, constant termite_metal_apply_activation_params &ap, threadgroup char *shmem, ushort tiitg, ushort sgitg, uint3 tg, bool tail) {\n"
            "    threadgroup half *sa = (threadgroup half *)shmem; threadgroup half *sb = (threadgroup half *)(shmem + 2048u); const short NR0 = 32; const short NR1 = 32; const short NK = 32; const short NL0 = 2; const short NL1 = 4; const uint r0 = tg.x * uint(NR0); const uint r1 = tg.y * uint(NR1); const uint nr1 = tail ? min(uint(NR1), p.rows - r1) : uint(NR1); const short lr0 = short(min(uint(tiitg) / uint(NL0), 31u)); const short lr1 = tail ? short(min(uint(tiitg) / uint(NL1), nr1 - 1u)) : short(tiitg) / NL1; const short il0 = short(tiitg) % NL0; const short iy = 8 * (short(tiitg) % NL1); device const termite_block_q4_0 *x_gate = (device const termite_block_q4_0 *)(weight_gate + (r0 + uint(lr0)) * p.row_blocks * 18u); device const termite_block_q4_0 *x_up = (device const termite_block_q4_0 *)(weight_up + (r0 + uint(lr0)) * p.row_blocks * 18u); device const float *y = input + (r1 + uint(lr1)) * p.in_dim + uint(iy); simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb; simdgroup_float8x8 gate_acc[4]; simdgroup_float8x8 up_acc[4]; for (short i = 0; i < 4; ++i) { gate_acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f); up_acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f); }\n"
-           "    for (uint loop_k = 0u; loop_k < p.in_dim; loop_k += uint(NK)) { half4x4 temp_gate; if (tiitg < 64u) termite_dequantize_q4_0_4x4_half(x_gate, il0, temp_gate); threadgroup_barrier(mem_flags::mem_threadgroup); if (tiitg < 64u) { TERMITE_FOR_UNROLL(short i = 0; i < 16; ++i) { const short sx = 2 * il0 + i / 8; const short sy = (short(tiitg) / NL0) / 8; const short lx = (short(tiitg) / NL0) % 8; const short ly = i % 8; const short ib = 4 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = temp_gate[i / 4][i % 4]; } } const short sx = short(tiitg) % NL1; const short sy = (short(tiitg) / NL1) / 8; const short ly = (short(tiitg) / NL1) % 8; const short ib = 4 * sx + sy; *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) = (half2x4)(*((device const float2x4 *)y)); threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const half *lsma_gate = sa; threadgroup const half *lsmb_gate = sb + 64u * uint(sgitg); TERMITE_FOR_UNROLL(short ik = 0; ik < NK / 8; ++ik) { TERMITE_FOR_UNROLL(short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma_gate + 64 * i, 8, 0, false); simdgroup_load(mb, lsmb_gate, 8, 0, false); TERMITE_FOR_UNROLL(short i = 0; i < 4; ++i) simdgroup_multiply_accumulate(gate_acc[i], mb, ma[i], gate_acc[i]); lsma_gate += 4 * 64; lsmb_gate += 4 * 64; } half4x4 temp_up; if (tiitg < 64u) termite_dequantize_q4_0_4x4_half(x_up, il0, temp_up); threadgroup_barrier(mem_flags::mem_threadgroup); if (tiitg < 64u) { TERMITE_FOR_UNROLL(short i = 0; i < 16; ++i) { const short wsx = 2 * il0 + i / 8; const short wsy = (short(tiitg) / NL0) / 8; const short wlx = (short(tiitg) / NL0) % 8; const short wly = i % 8; const short wib = 4 * wsx + wsy; *(sa + 64 * wib + 8 * wly + wlx) = temp_up[i / 4][i % 4]; } } threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const half *lsma_up = sa; threadgroup const half *lsmb_up = sb + 64u * uint(sgitg); TERMITE_FOR_UNROLL(short ik = 0; ik < NK / 8; ++ik) { TERMITE_FOR_UNROLL(short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma_up + 64 * i, 8, 0, false); simdgroup_load(mb, lsmb_up, 8, 0, false); TERMITE_FOR_UNROLL(short i = 0; i < 4; ++i) simdgroup_multiply_accumulate(up_acc[i], mb, ma[i], up_acc[i]); lsma_up += 4 * 64; lsmb_up += 4 * 64; } x_gate += 1; x_up += 1; y += uint(NK); }\n"
+           "    for (uint loop_k = 0u; loop_k < p.in_dim; loop_k += uint(NK)) { half4x4 temp_gate; if (tiitg < 64u) termite_dequantize_q4_0_4x4_half(x_gate, il0, temp_gate); threadgroup_barrier(mem_flags::mem_threadgroup); if (tiitg < 64u) { TERMITE_FOR_UNROLL(short i = 0; i < 16; ++i) { " ANTFLY_MSL_QUANT_SWIZZLE16("", "", "4", "temp_gate") " } } const short sx = short(tiitg) % NL1; const short sy = (short(tiitg) / NL1) / 8; const short ly = (short(tiitg) / NL1) % 8; const short ib = 4 * sx + sy; *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) = (half2x4)(*((device const float2x4 *)y)); threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const half *lsma_gate = sa; threadgroup const half *lsmb_gate = sb + 64u * uint(sgitg); " ANTFLY_MSL_MATRIX_4X1_MMA("lsma_gate", "lsmb_gate", "gate_acc") " half4x4 temp_up; if (tiitg < 64u) termite_dequantize_q4_0_4x4_half(x_up, il0, temp_up); threadgroup_barrier(mem_flags::mem_threadgroup); if (tiitg < 64u) { TERMITE_FOR_UNROLL(short i = 0; i < 16; ++i) { " ANTFLY_MSL_QUANT_SWIZZLE16("w", "", "4", "temp_up") " } } threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const half *lsma_up = sa; threadgroup const half *lsmb_up = sb + 64u * uint(sgitg); " ANTFLY_MSL_MATRIX_4X1_MMA("lsma_up", "lsmb_up", "up_acc") " x_gate += 1; x_up += 1; y += uint(NK); }\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *gate_tile = (threadgroup float *)shmem; threadgroup float *up_tile = gate_tile + 32u * 32u; const uint tile_base = 8u * uint(sgitg) * 32u; for (short i = 0; i < 4; ++i) { const uint matrix_offset = 8u * uint(i); simdgroup_store(gate_acc[i], gate_tile + tile_base + matrix_offset, 32u, 0, false); simdgroup_store(up_acc[i], up_tile + tile_base + matrix_offset, 32u, 0, false); } threadgroup_barrier(mem_flags::mem_threadgroup); for (uint index = uint(tiitg); index < nr1 * 32u; index += 128u) { uint row = index / 32u; uint col = index - row * 32u; uint output_index = (r1 + row) * p.out_dim + r0 + col; output[output_index] = termite_gated_activation_product(gate_tile[index], up_tile[index], ap.activation_kind); }\n"
            "}\n"
            TERMITE_MSL_ABI_QUANT_PAIR_MATRIX(termite_q4_0_pair_activation_mm_m32_n32_aligned) " termite_q4_0_pair_activation_mm_m32_n32_impl(input, weight_gate, weight_up, output, p, ap, shmem, tiitg, sgitg, tg, false); }\n"
@@ -9279,8 +9326,8 @@ static NSString *termite_metal_shader_source(void) {
            "    const uint nr1 = Tail ? min(uint(NR1), p.rows - r1) : uint(NR1); const short lr0 = Rows64 ? short(min(uint(tiitg) / uint(NL0), 63u)) : short(tiitg) / NL0; const short lr1 = Tail ? short(min(uint(short(tiitg) / NL1), nr1 - 1u)) : short(tiitg) / NL1; const short il0 = short(tiitg) % NL0; const short iy = 8 * (short(tiitg) % NL1);\n"
            "    device const termite_block_q8_0 *x = (device const termite_block_q8_0 *)(weight + (r0 + uint(lr0)) * p.row_blocks * 34u); device const Input *y = input + (r1 + uint(lr1)) * p.in_dim + uint(iy);\n"
            "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2]; simdgroup_float8x8 mc[8]; TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "    for (uint loop_k = 0u; loop_k < p.in_dim; loop_k += uint(NK)) { half4x4 temp_a; if (!Rows64 || tiitg < 128u) termite_dequantize_q8_0_4x4_half(x, il0, temp_a); threadgroup_barrier(mem_flags::mem_threadgroup); if (!Rows64 || tiitg < 128u) { TERMITE_FOR_UNROLL(short i = 0; i < 16; ++i) { const short sx = 2 * il0 + i / 8; const short sy = (short(tiitg) / NL0) / 8; const short lx = (short(tiitg) / NL0) % 8; const short ly = i % 8; const short ib = 8 * sx + sy; *(sa + 64 * ib + 8 * ly + lx) = temp_a[i / 4][i % 4]; } } const short sx = short(tiitg) % NL1; const short sy = (short(tiitg) / NL1) / 8; const short ly = (short(tiitg) / NL1) % 8; const short ib = (Rows64 ? 8 : 4) * sx + sy; *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) = termite_q8_0_sg_v2_load(y); x += 1; y += uint(NK); threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u); TERMITE_FOR_UNROLL(short ik = 0; ik < NK / 8; ++ik) { simdgroup_barrier(mem_flags::mem_none); TERMITE_FOR_UNROLL(short i = 0; i < 4; ++i) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); TERMITE_FOR_UNROLL(short i = 0; i < 2; ++i) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); simdgroup_barrier(mem_flags::mem_none); TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]); lsma += 8 * 64; lsmb += (Rows64 ? 8 : 4) * 64; } }\n"
-           "    if (!Tail) { device float *C = output + r1 * p.out_dim + r0 + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) simdgroup_store(mc[i], C + 8u * uint(i % 4) + 8u * p.out_dim * uint(i / 4), p.out_dim, 0, false); return; } threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) simdgroup_store(mc[i], temp_str + 8u * uint(i % 4) + 8u * uint(NR0) * uint(i / 4), uint(NR0), 0, false); threadgroup_barrier(mem_flags::mem_threadgroup); for (uint index = uint(tiitg); index < nr1 * uint(NR0); index += Rows64 ? 256u : 128u) { const uint row = index / uint(NR0); const uint col = index - row * uint(NR0); output[(r1 + row) * p.out_dim + r0 + col] = ((threadgroup float *)shmem)[index]; }\n"
+           "    for (uint loop_k = 0u; loop_k < p.in_dim; loop_k += uint(NK)) { half4x4 temp_a; if (!Rows64 || tiitg < 128u) termite_dequantize_q8_0_4x4_half(x, il0, temp_a); threadgroup_barrier(mem_flags::mem_threadgroup); if (!Rows64 || tiitg < 128u) { TERMITE_FOR_UNROLL(short i = 0; i < 16; ++i) { " ANTFLY_MSL_QUANT_SWIZZLE16("", "", "8", "temp_a") " } } const short sx = short(tiitg) % NL1; const short sy = (short(tiitg) / NL1) / 8; const short ly = (short(tiitg) / NL1) % 8; const short ib = (Rows64 ? 8 : 4) * sx + sy; *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) = termite_q8_0_sg_v2_load(y); x += 1; y += uint(NK); threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup const half *lsma = sa + 4 * 64 * (uint(sgitg) % 2u); threadgroup const half *lsmb = sb + 2 * 64 * (uint(sgitg) / 2u); " ANTFLY_MSL_MATRIX_4X2_MMA("TERMITE_FOR_UNROLL", "simdgroup_barrier(mem_flags::mem_none); ", "lsma", "lsmb", "mc", "(Rows64 ? 8 : 4)") " }\n"
+           "    if (!Tail) { device float *C = output + r1 * p.out_dim + r0 + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; " ANTFLY_MSL_MATRIX_4X2_STORE("TERMITE_FOR_UNROLL", "mc", "C", "p.out_dim") " return; } threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); " ANTFLY_MSL_MATRIX_4X2_STORE("TERMITE_FOR_UNROLL", "mc", "temp_str", "uint(NR0)") " threadgroup_barrier(mem_flags::mem_threadgroup); for (uint index = uint(tiitg); index < nr1 * uint(NR0); index += Rows64 ? 256u : 128u) { const uint row = index / uint(NR0); const uint col = index - row * uint(NR0); output[(r1 + row) * p.out_dim + r0 + col] = ((threadgroup float *)shmem)[index]; }\n"
            "}\n"
            TERMITE_MSL_ABI_QUANT_MATRIX(termite_q8_0_linear_mm_sg_v2) " termite_q8_0_linear_mm_sg_typed_impl<false, false>(input, weight, output, p, shmem, tiitg, sgitg, tg); }\n"
            TERMITE_MSL_ABI_QUANT_MATRIX(termite_q8_0_linear_mm_sg_v2_tail) " termite_q8_0_linear_mm_sg_typed_impl<false, true>(input, weight, output, p, shmem, tiitg, sgitg, tg); }\n"
@@ -9304,7 +9351,7 @@ static NSString *termite_metal_shader_source(void) {
            "    device const termite_block_q8_0 *xk = (device const termite_block_q8_0 *)(weight_k + (r0 + uint(lr0)) * p.row_blocks * 34u); device const termite_block_q8_0 *xv = (device const termite_block_q8_0 *)(weight_v + (r0 + uint(lr0)) * p.row_blocks * 34u); device const float *y = input + (r1 + uint(lr1)) * p.in_dim + uint(iy);\n"
            "    simdgroup_half8x8 ma[4]; simdgroup_half8x8 mb[2]; simdgroup_float8x8 k_acc[8]; simdgroup_float8x8 v_acc[8]; TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) { k_acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f); v_acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f); }\n"
            TERMITE_MSL_PAIR_MATRIX_32X64_TRAVERSE("k", "xk", "v", "xv", "", "v", "termite_dequantize_q8_0_4x4_half", "termite_q8_0_sg_v2_load(y)")
-           "    const uint tile_base = 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); if (!tail) { device float *K = output_k + r1 * p.out_dim + r0 + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; device float *V = output_v + r1 * p.out_dim + r0 + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) { const uint off = 8u * uint(i % 4) + 8u * p.out_dim * uint(i / 4); simdgroup_store(k_acc[i], K + off, p.out_dim, 0, false); simdgroup_store(v_acc[i], V + off, p.out_dim, 0, false); } return; } threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + tile_base; TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) simdgroup_store(k_acc[i], temp_str + 8u * uint(i % 4) + 8u * uint(NR0) * uint(i / 4), uint(NR0), 0, false); threadgroup_barrier(mem_flags::mem_threadgroup); for (uint index = uint(tiitg); index < nr1 * uint(NR0); index += 128u) { const uint row = index / uint(NR0); const uint col = index - row * uint(NR0); output_k[(r1 + row) * p.out_dim + r0 + col] = ((threadgroup float *)shmem)[index]; } threadgroup_barrier(mem_flags::mem_threadgroup); TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) simdgroup_store(v_acc[i], temp_str + 8u * uint(i % 4) + 8u * uint(NR0) * uint(i / 4), uint(NR0), 0, false); threadgroup_barrier(mem_flags::mem_threadgroup); for (uint index = uint(tiitg); index < nr1 * uint(NR0); index += 128u) { const uint row = index / uint(NR0); const uint col = index - row * uint(NR0); output_v[(r1 + row) * p.out_dim + r0 + col] = ((threadgroup float *)shmem)[index]; }\n"
+           "    const uint tile_base = 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); if (!tail) { device float *K = output_k + r1 * p.out_dim + r0 + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; device float *V = output_v + r1 * p.out_dim + r0 + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * p.out_dim; TERMITE_FOR_UNROLL(short i = 0; i < 8; ++i) { const uint off = 8u * uint(i % 4) + 8u * p.out_dim * uint(i / 4); simdgroup_store(k_acc[i], K + off, p.out_dim, 0, false); simdgroup_store(v_acc[i], V + off, p.out_dim, 0, false); } return; } threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + tile_base; " ANTFLY_MSL_MATRIX_4X2_STORE("TERMITE_FOR_UNROLL", "k_acc", "temp_str", "uint(NR0)") " threadgroup_barrier(mem_flags::mem_threadgroup); for (uint index = uint(tiitg); index < nr1 * uint(NR0); index += 128u) { const uint row = index / uint(NR0); const uint col = index - row * uint(NR0); output_k[(r1 + row) * p.out_dim + r0 + col] = ((threadgroup float *)shmem)[index]; } threadgroup_barrier(mem_flags::mem_threadgroup); " ANTFLY_MSL_MATRIX_4X2_STORE("TERMITE_FOR_UNROLL", "v_acc", "temp_str", "uint(NR0)") " threadgroup_barrier(mem_flags::mem_threadgroup); for (uint index = uint(tiitg); index < nr1 * uint(NR0); index += 128u) { const uint row = index / uint(NR0); const uint col = index - row * uint(NR0); output_v[(r1 + row) * p.out_dim + r0 + col] = ((threadgroup float *)shmem)[index]; }\n"
            "}\n"
            TERMITE_MSL_ABI_Q8_KV_PAIR_MATRIX(termite_q8_0_kv_pair_mm_sg) " termite_q8_0_kv_pair_mm_sg_impl(input, weight_k, weight_v, output_k, output_v, p, shmem, tiitg, sgitg, tg, false); }\n"
            TERMITE_MSL_ABI_Q8_KV_PAIR_MATRIX(termite_q8_0_kv_pair_mm_sg_tail) " termite_q8_0_kv_pair_mm_sg_impl(input, weight_k, weight_v, output_k, output_v, p, shmem, tiitg, sgitg, tg, true); }\n"
@@ -13029,8 +13076,7 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup float partial[4096], weights[1024], diagonal[128], mrow[BQ], lrow[BQ], alpha[BQ];\n"
            "    threadgroup uint rg[BQ * 6u];\n"
            "    threadgroup int qp[BQ];\n"
-           "    const uint t = uint(tid), L = uint(lane), s = uint(sg) % 4u, qb = uint(sg) / 4u;\n"
-           "    const uint q0 = tg.x * BQ, h = tg.y, hidden = p.num_heads * D, kv_hidden = p.reserved0 * D, kh = h / (p.num_heads / p.reserved0);\n"
+           ANTFLY_MSL_GROUPED_MATRIX_GEOMETRY()
            "    const uint nq = min(BQ, p.queries - q0), pb = qb * 2048u + s * 512u;\n"
            TERMITE_MSL_GROUPED_MATRIX_RANGES
            "    simdgroup_float8x8 qm[16], o[16];\n"
@@ -13040,16 +13086,12 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    lo = lo == 0xffffffffu ? lo : lo / 8u * 8u;\n"
            "    for (uint kb = lo; kb < hi; kb += BK) {\n"
-           "        for (uint bc = 0; bc < 8u; ++bc) {\n"
-           "            const uint key = kb + bc * 8u;\n"
-           "            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "            if (key < p.keys) TERMITE_FOR_UNROLL(uint dt = 0; dt < 16u; ++dt) {\n"
-           "                simdgroup_float8x8 km;\n"
-           "                simdgroup_load(km, k + key * kv_hidden + kh * D + s * 128u + dt * 8u, kv_hidden, ulong2(0,0), true);\n"
-           "                simdgroup_multiply_accumulate(acc, qm[dt], km, acc);\n"
-           "            }\n"
-           "            simdgroup_store(acc, partial + pb + bc * 8u, BK);\n"
-           "        }\n"
+           ANTFLY_MSL_GROUPED_MATRIX_QK(
+               "8",
+               "",
+               "if (key < p.keys) ",
+               "                simdgroup_load(km, k + key * kv_hidden + kh * D + s * 128u + dt * 8u, kv_hidden, ulong2(0,0), true);\n",
+               "")
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        if (s == 0u) for (uint row = 0; row < 8u; ++row) {\n"
            "            const uint r = qb * 8u + row;\n"
@@ -13072,16 +13114,12 @@ static NSString *termite_metal_shader_source(void) {
            "            if (L == 0u) { alpha[r] = rescale; lrow[r] = lrow[r] * rescale + sum; mrow[r] = maximum; }\n"
            "        }\n"
            TERMITE_MSL_GROUPED_MATRIX_RESCALE
-           "        for (uint bc = 0; bc < 8u; ++bc) {\n"
-           "            const uint key = kb + bc * 8u;\n"
-           "            if (key >= p.keys) break;\n"
-           "            simdgroup_float8x8 pm; simdgroup_load(pm, weights + qb * 512u + bc * 8u, BK);\n"
-           "            TERMITE_FOR_UNROLL(uint dt = 0; dt < 16u; ++dt) {\n"
-           "                simdgroup_float8x8 vm;\n"
-           "                simdgroup_load(vm, v + key * kv_hidden + kh * D + s * 128u + dt * 8u, kv_hidden);\n"
-           "                simdgroup_multiply_accumulate(o[dt], pm, vm, o[dt]);\n"
-           "            }\n"
-           "        }\n"
+           ANTFLY_MSL_GROUPED_MATRIX_PV(
+               "8",
+               "            if (key >= p.keys) break;\n",
+               "512",
+               "                simdgroup_load(vm, v + key * kv_hidden + kh * D + s * 128u + dt * 8u, kv_hidden);\n",
+               "")
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            TERMITE_MSL_GROUPED_MATRIX_PUBLISH
@@ -13091,8 +13129,7 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup float partial[2048], weights[512], diagonal[128], tail[4096], mrow[BQ], lrow[BQ], alpha[BQ];\n"
            "    threadgroup uint rg[BQ * 6u];\n"
            "    threadgroup int qp[BQ];\n"
-           "    const uint t = uint(tid), L = uint(lane), s = uint(sg) % 4u, qb = uint(sg) / 4u;\n"
-           "    const uint q0 = tg.x * BQ, h = tg.y, hidden = p.num_heads * D, kv_hidden = p.reserved0 * D, kh = h / (p.num_heads / p.reserved0);\n"
+           ANTFLY_MSL_GROUPED_MATRIX_GEOMETRY()
            "    const uint nq = min(BQ, p.queries - q0), pb = qb * 1024u + s * 256u;\n"
            TERMITE_MSL_GROUPED_MATRIX_RANGES
            "    simdgroup_float8x8 qm[16], o[16];\n"
@@ -13109,20 +13146,12 @@ static NSString *termite_metal_shader_source(void) {
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "    for (uint kb = lo; kb < hi; kb += BK) {\n"
-           "        for (uint bc = 0; bc < 4u; ++bc) {\n"
-           "            const uint key = kb + bc * 8u;\n"
-           "            if (key + 8u > p.keys) for (uint i = t; i < 8u * D; i += 256u) tail[i] = key + i / D < p.keys ? k[(key + i / D) * kv_hidden + kh * D + i % D] : 0;\n"
-           "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "            TERMITE_FOR_UNROLL(uint dt = 0; dt < 16u; ++dt) {\n"
-           "                simdgroup_float8x8 km;\n"
-           "                if (key + 8u <= p.keys) simdgroup_load(km, k + key * kv_hidden + kh * D + s * 128u + dt * 8u, kv_hidden, ulong2(0,0), true);\n"
-           "                else simdgroup_load(km, tail + s * 128u + dt * 8u, D, ulong2(0,0), true);\n"
-           "                simdgroup_multiply_accumulate(acc, qm[dt], km, acc);\n"
-           "            }\n"
-           "            simdgroup_store(acc, partial + pb + bc * 8u, BK);\n"
-           "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        }\n"
+           ANTFLY_MSL_GROUPED_MATRIX_QK(
+               "4",
+               "            if (key + 8u > p.keys) for (uint i = t; i < 8u * D; i += 256u) tail[i] = key + i / D < p.keys ? k[(key + i / D) * kv_hidden + kh * D + i % D] : 0;\n            threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+               "",
+               "                if (key + 8u <= p.keys) simdgroup_load(km, k + key * kv_hidden + kh * D + s * 128u + dt * 8u, kv_hidden, ulong2(0,0), true);\n                else simdgroup_load(km, tail + s * 128u + dt * 8u, D, ulong2(0,0), true);\n",
+               "            threadgroup_barrier(mem_flags::mem_threadgroup);\n")
            "        if (s == 0u) for (uint row = 0; row < 8u; ++row) {\n"
            "            const uint r = qb * 8u + row, key = kb + L, at = qb * 1024u + row * BK + L;\n"
            "            const bool in_key = key < p.keys;\n"
@@ -13139,19 +13168,12 @@ static NSString *termite_metal_shader_source(void) {
            "            if (L == 0u) { alpha[r] = rescale; lrow[r] = lrow[r] * rescale + sum; mrow[r] = maximum; }\n"
            "        }\n"
            TERMITE_MSL_GROUPED_MATRIX_RESCALE
-           "        for (uint bc = 0; bc < 4u; ++bc) {\n"
-           "            const uint key = kb + bc * 8u;\n"
-           "            if (key + 8u > p.keys) for (uint i = t; i < 8u * D; i += 256u) tail[i] = key + i / D < p.keys ? v[(key + i / D) * kv_hidden + kh * D + i % D] : 0;\n"
-           "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "            simdgroup_float8x8 pm; simdgroup_load(pm, weights + qb * 256u + bc * 8u, BK);\n"
-           "            TERMITE_FOR_UNROLL(uint dt = 0; dt < 16u; ++dt) {\n"
-           "                simdgroup_float8x8 vm;\n"
-           "                if (key + 8u <= p.keys) simdgroup_load(vm, v + key * kv_hidden + kh * D + s * 128u + dt * 8u, kv_hidden);\n"
-           "                else simdgroup_load(vm, tail + s * 128u + dt * 8u, D);\n"
-           "                simdgroup_multiply_accumulate(o[dt], pm, vm, o[dt]);\n"
-           "            }\n"
-           "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        }\n"
+           ANTFLY_MSL_GROUPED_MATRIX_PV(
+               "4",
+               "            if (key + 8u > p.keys) for (uint i = t; i < 8u * D; i += 256u) tail[i] = key + i / D < p.keys ? v[(key + i / D) * kv_hidden + kh * D + i % D] : 0;\n            threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+               "256",
+               "                if (key + 8u <= p.keys) simdgroup_load(vm, v + key * kv_hidden + kh * D + s * 128u + dt * 8u, kv_hidden);\n                else simdgroup_load(vm, tail + s * 128u + dt * 8u, D);\n",
+               "            threadgroup_barrier(mem_flags::mem_threadgroup);\n")
            "    }\n"
            TERMITE_MSL_GROUPED_MATRIX_PUBLISH
            "}\n"

@@ -50,15 +50,8 @@
         if (warp < 4u) {
             #pragma unroll
             for (unsigned int kc=0u;kc<4u;++kc) {
-                wmma::fragment<wmma::accumulator,16,16,16,float> dot;
-                wmma::fill_fragment(dot,0.0f);
-                #pragma unroll
-                for (unsigned int d=0u;d<4u;++d) {
-                    wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> keys;
-                    wmma::load_matrix_sync(keys,kv+kc*16u*P+d*16u,P);
-                    wmma::mma_sync(dot,rows[d],keys,dot);
-                }
-                wmma::store_matrix_sync(shared_scores+warp*16u*S+kc*16u,dot,S,wmma::mem_row_major);
+                ANTFLY_CUDA_WMMA_PRELOADED_DOT16_F32(dot, rows, kv+kc*16u*P, 4u, P,
+                    shared_scores+warp*16u*S+kc*16u, S, keys);
             }
         } else {
             #pragma unroll
@@ -96,15 +89,8 @@
                     kr[r*P+d]=__float2half_rn(valid?k_r[(unsigned int)bucket*hidden+head_off+d]:0.0f);
                 }
                 __syncthreads();
-                wmma::fragment<wmma::accumulator,16,16,16,float> relative;
-                wmma::fill_fragment(relative,0.0f);
-                #pragma unroll
-                for (unsigned int d=0u;d<4u;++d) {
-                    wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> rf;
-                    wmma::load_matrix_sync(rf,(warp<4u?kr:qr)+d*16u,P);
-                    wmma::mma_sync(relative,rows[d],rf,relative);
-                }
-                wmma::store_matrix_sync(relative_scores+warp*16u*C,relative,C,wmma::mem_row_major);
+                ANTFLY_CUDA_WMMA_PRELOADED_DOT16_F32(relative, rows, (warp<4u?kr:qr), 4u, P,
+                    relative_scores+warp*16u*C, C, rf);
                 __syncthreads();
                 if (uniform) {
                     for (unsigned int i=tid;i<M*N;i+=T) {
@@ -136,15 +122,8 @@
                     kr[r*P+d]=__float2half_rn(valid?k_r[(unsigned int)bucket*hidden+head_off+d]:0.0f);
                 }
                 __syncthreads();
-                wmma::fragment<wmma::accumulator,16,16,16,float> relative;
-                wmma::fill_fragment(relative,0.0f);
-                #pragma unroll
-                for (unsigned int d=0u;d<4u;++d) {
-                    wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> rf;
-                    wmma::load_matrix_sync(rf,(warp<4u?kr:qr)+d*16u,P);
-                    wmma::mma_sync(relative,rows[d],rf,relative);
-                }
-                wmma::store_matrix_sync(relative_scores+warp*16u*C,relative,C,wmma::mem_row_major);
+                ANTFLY_CUDA_WMMA_PRELOADED_DOT16_F32(relative, rows, (warp<4u?kr:qr), 4u, P,
+                    relative_scores+warp*16u*C, C, rf);
                 __syncthreads();
                 for (unsigned int i=tid;i<M*16u;i+=T) {
                     const unsigned int row=i/16u,r=rs+i%16u;

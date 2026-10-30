@@ -3458,3 +3458,7 @@ identity, CPU pipeline bitwise parity and paired hardware timing.
 records explicit prefix geometry, portable pooling/stencil policies, shared
 training/Q8 phases and physical CPU naming, with original-program qualification
 and the complete source cost of the new reusable APIs.
+
+[BH: shared native matrix phases](unified-execution-bh-outcomes.md) records net
+authored-byte reduction with identical Metal shader and CUDA shipping images,
+preloaded-fragment reuse and hardware matrix-family qualification.

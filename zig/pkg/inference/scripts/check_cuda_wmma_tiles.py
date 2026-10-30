@@ -153,7 +153,7 @@ def relative_case(device, modules, seq, mode, timing):
     q, k, v = (
         samples(n, salt, scale) for salt, scale in [(1, 0.12), (2, 0.09), (3, 0.2)]
     )
-    boundary = mode == "boundary"
+    boundary = mode in ("boundary", "m64", "compact", "compact_uniform")
     rows = 17 if boundary else 2 * seq - 1
     qr, kr = (samples(rows * heads * 64, salt, 0.07) for salt in (4, 5))
     mask = [
@@ -162,6 +162,8 @@ def relative_case(device, modules, seq, mode, timing):
         for key in range(seq)
     ]
     buckets = [(i * 7 + 3) % rows for i in range(2 * seq - 1)] if boundary else None
+    if mode == "compact_uniform":
+        buckets = [5] * (2 * seq - 1)
     reference = attention_reference(
         q, k, v, batch, seq, heads, half, mask, qr, kr, buckets, boundary
     )
@@ -183,6 +185,9 @@ def relative_case(device, modules, seq, mode, timing):
             C.c_uint(n),
         ]
         symbol, tile = "termite_gliner_boundary_attention_tc_f16", 16
+        if mode != "boundary":
+            symbol += "_m64" if mode == "m64" else "_compact"
+            tile = 64
     else:
         valid = device.alloc(array.array("q", mask).tobytes())
         args = [output, *inputs, valid, *map(C.c_uint, (batch, seq, heads, 64))]
@@ -246,9 +251,15 @@ def main():
     p.add_argument("baseline", type=Path)
     p.add_argument("candidate", type=Path)
     p.add_argument("--bench", action="store_true")
+    p.add_argument("--m64-only", action="store_true")
     a = p.parse_args()
     device = Device()
     modules = [device.module(path) for path in (a.baseline, a.candidate)]
+    if a.m64_only:
+        for seq in (1, 7, 63, 64, 65, 129, 513):
+            for mode in ("m64", "compact", "compact_uniform"):
+                relative_case(device, modules, seq, mode, a.bench)
+        return
     for seq in (1, 7, 15, 16, 17, 31, 32, 33, 65, 129, 255, 256):
         for mode in ("m16n32", "m32n16", "boundary"):
             relative_case(device, modules, seq, mode, a.bench)

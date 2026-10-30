@@ -19,3 +19,16 @@
         wmma::mma_sync(acc, a_frag, b_frag, acc); \
     } \
     wmma::store_matrix_sync(Result, acc, ResultPitch, wmma::mem_row_major);
+
+// Preloaded row fragments retain the native M64 register reuse. Unlike the
+// two-load phase above, this never reacquires the left operand from shared RAM.
+#define ANTFLY_CUDA_WMMA_PRELOADED_DOT16_F32(Accumulator,Rows,Right,Depth,Pitch,Destination,Stride,RightFragment) \
+    wmma::fragment<wmma::accumulator,16,16,16,float> Accumulator; \
+    wmma::fill_fragment(Accumulator,0.0f); \
+    _Pragma("unroll") \
+    for(unsigned int d=0u;d<Depth;++d){ \
+        wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> RightFragment; \
+        wmma::load_matrix_sync(RightFragment,Right+d*16u,Pitch); \
+        wmma::mma_sync(Accumulator,Rows[d],RightFragment,Accumulator); \
+    } \
+    wmma::store_matrix_sync(Destination,Accumulator,Stride,wmma::mem_row_major)

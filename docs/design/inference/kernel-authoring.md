@@ -13,7 +13,7 @@ The agent-facing rules are in `zig/pkg/inference/src/ops/AGENTS.md`.
 | Masked token-major pooling | `src/ops/gpu/masked_pool_program.h` | Mask optionality, independent coordinate/address widths, count ownership and per-term versus post-sum division; callers retain row normalization |
 | Prefix L2 normalization and accumulated VJP | `cuda/prefix_normalization.zig`, `kernels/prefix_normalization_program.cuh` | Explicit input stride, dense output, untouched gradient suffix, four-accumulator reduction, clamp and division boundaries; static 768-stride compatibility schedule |
 | Spatial depthwise residual | `src/ops/cuda/prototypes/vision_f16_programs.cu` | Native 3x3 traversal and explicit FMA/add boundaries |
-| Native CUDA WMMA score products | `src/ops/cuda/kernels/wmma_tile_program.cuh` | F16/BF16 storage, B layout, depth, pitches and caller-owned shared arrays/fragment scope |
+| Native CUDA WMMA score products | `src/ops/cuda/kernels/wmma_tile_program.cuh` | F16/BF16 storage, B layout, depth, pitches, caller-owned scope and preloaded left-fragment reuse |
 | Row statistics and normalization | `src/ops/cuda/kernels/row_program.cuh` | Warp/block, shared tree, four-accumulator training fold and fixed-256 warp-finish reductions; publication dtype |
 | Rotary products and axes | `src/ops/cuda/kernels/rotary_program.cuh` and Metal rotary helpers | Axis-local versus head-wide halves, product rounding, frequency evaluation and upper-product order |
 | MPP projection | `antfly_mpp_affine`, `antfly_mpp_split_projection`, `TERMITE_MSL_MPP_GATE_PROGRAM` in `metal_kernels.m` | Rows/columns, SIMD groups, split-K, projection planes, F32/BF16 storage and finite-gate epilogue |
@@ -25,6 +25,7 @@ The agent-facing rules are in `zig/pkg/inference/src/ops/AGENTS.md`.
 | Range/segment training attention | `range_attention_reference.zig`, `segment_training_attention.zig`, Metal segment fragments | Mask/control layout, replay/dropout, orientation, tile geometry and gradient ownership |
 | Relative training attention | `kernels/relative_attention_training.cuh`, `relative_attention_tensor_*` and the GPU training renderer | Relative terms, bucket layout, deterministic replay and distinct tensor-core schedules |
 | CPU online attention rows | `linalg.attention.updateOnlineRow` | Conditional/scalar/SIMD maxima, empty-tile handling, rescale guards, vector width and statistic read/store order |
+| Quantized Metal matrix phases | `ANTFLY_MSL_QUANT_SWIZZLE16`, `ANTFLY_MSL_MATRIX_4X1_*`, `ANTFLY_MSL_MATRIX_4X2_*` | Swizzle groups, scalar/vector acquisition, unroll and SIMD barriers, M32/M64 right-operand advance, output pitch and scratch publication |
 | Wide CPU segment GEMM | `native.WideSegmentAttentionGemm` | 512-query BLAS tile, explicit key reuse; model admission remains in adapters |
 | Dense projection admission | `dense_projection_policy.zig` | Workload, rows, output width, quant layout and packed-expert exclusion |
 
@@ -107,3 +108,8 @@ resources and complete production-image identity with the pinned toolchain.
 `check_cpu_attention_rows.zig` takes frozen/current linalg module imports for
 pipeline parity and paired timing. Static schedule sharing must preserve
 maximum-load order as well as arithmetic; compare the optimized row bodies.
+
+`check_metal_matrix_phases.m` qualifies the grouped matrix and quantized
+projection phases with complete shader identity, pipeline resources, independent
+references and optional paired timing. The CUDA WMMA fixture's `--m64-only`
+mode covers preloaded row products, compact runs and non-monotonic bucket maps.
