@@ -318,7 +318,9 @@ normal read admission and may itself require a proof on a capacity-limited tip.
 The same object reports `mutation_admission_count`, `mutation_admission_ns`,
 `mutation_admission_max_ns`, and `mutation_admission_log2_ns`. These measure
 successful mutation admission with a positive busy timeout, before the mutation
-body runs, including queueing, retries, and proof work. Zero-timeout calls keep
+body runs, including queueing, retries, and proof work. Resuming an operation
+after it suspends admission (for example, during inference) records another
+admission; these are not counts of unique exported calls. Zero-timeout calls keep
 their existing fast path and are not sampled. Reads and diagnostic calls are
 excluded. Histogram bucket `i` covers `[2^i, 2^(i+1)-1]` nanoseconds (bucket zero
 also includes zero; bucket 63 ends at `UINT64_MAX`), so percentile estimates are
