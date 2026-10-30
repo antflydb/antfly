@@ -47,12 +47,12 @@ out.mkdir(exist_ok=True)
 count = 12
 body = ("needle " + "x" * 65520 + '🙂\n"\\') * 4
 columns = {"id": list(range(count)), "body": [body + str(i) for i in range(count)]}
-for ordinal in range(64):
+for ordinal in range(4):
     columns[f"value_{ordinal:02}"] = [
-        None if ordinal == 63 and i % 3 == 0 else 9007199254740993 + ordinal + i
+        None if ordinal == 3 and i % 3 == 0 else 9007199254740993 + ordinal + i
         for i in range(count)
     ]
-archive = shared / "archive-bounded-pages.parquet"
+archive = shared / "archive-six-columns.parquet"
 if not archive.exists():
     pq.write_table(
         pa.table(columns),
@@ -64,12 +64,12 @@ if not archive.exists():
     )
 assert pq.read_table(archive).to_pydict() == columns
 fixture = bench.import_fixture(
-    shared / "fixture-bounded-pages", [archive], "typed-navigation-v1"
+    shared / "fixture-six-columns", [archive], "typed-navigation-v1"
 )
 properties = {
     name: {"type": "string", "x-antfly-field": {"type": "text"}}
     if name == "body"
-    else {"type": "integer", "nullable": name == "value_63"}
+    else {"type": "integer", "nullable": name == "value_03"}
     for name in columns
 }
 properties["id"]["x-antfly-field"] = {"type": "number", "sortable": True}
@@ -100,8 +100,8 @@ queries = {
         "limit": count,
     }
     for name, fields in (
-        ("native_wide", list(columns)),
-        ("mixed_identity_wide", ["_id"] + list(columns)),
+        ("native_scalar_and_string", list(columns)),
+        ("mixed_identity_scalar_and_string", ["_id"] + list(columns)),
         ("native_large_strings", ["body"]),
         ("mixed_identity_large_strings", ["_id", "body"]),
     )
