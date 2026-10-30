@@ -19,6 +19,11 @@ const objectstore = @import("objectstore");
 
 pub const data_uri = @import("antfly_data_uri");
 
+// Public connection-input contracts. Configuration consumers already depend on
+// scraping; they do not need a direct dependency on the concrete object store.
+pub const GcsCredentialSource = objectstore.Gcs.CredentialSource;
+pub const GcsCredentialConfig = objectstore.Gcs.Credentials;
+
 const Allocator = std.mem.Allocator;
 const default_max_download_size_bytes: u64 = 100 * 1024 * 1024;
 const default_download_timeout_ms: u64 = 30_000;
