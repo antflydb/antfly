@@ -16,5 +16,8 @@
 //! Generated kernel regions of the `quant_metal` families.
 
 const Region = @import("../region.zig").Region;
+const msl = @import("../quant_metal_msl.zig");
 
-pub const regions = [_]Region{};
+pub const regions = [_]Region{
+    msl.raw("rows", @import("../quant_metal_rows.zig").region()),
+};
