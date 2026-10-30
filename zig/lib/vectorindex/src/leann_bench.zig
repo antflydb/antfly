@@ -111,17 +111,20 @@ pub fn main(init: std.process.Init) !void {
         const bytes = try index.serialize(alloc);
         defer alloc.free(bytes);
         const gs = index.graphStats();
-        try out.print("\n== {s} graph: build {d:.1}s, avg degree {d:.2}, max {d}, hubs {d}, index {d:.2} MiB = {d:.1}% of raw f32 ({d:.2} MiB)\n", .{
+        try out.print("\n== {s} graph: build {d:.1}s, avg degree {d:.2}, max {d}, hubs {d}, levels {d}, upper nodes {d}, repaired {d}, index {d:.2} MiB = {d:.1}% of raw f32 ({d:.2} MiB)\n", .{
             if (prune) "pruned (LEANN)" else "unpruned",
             build_ms / 1000,
             gs.avg_degree,
             gs.max_degree,
             gs.hubs,
+            gs.max_level,
+            gs.upper_nodes,
+            index.repaired,
             mib(bytes.len),
             100 * @as(f64, @floatFromInt(bytes.len)) / @as(f64, @floatFromInt(raw_bytes)),
             mib(raw_bytes),
         });
-        try out.print("{s:<18} {s:>5} {s:>9} {s:>12} {s:>9} {s:>9}\n", .{ "mode", "ef", "recall@10", "recomputed/q", "batches/q", "ms/q" });
+        try out.print("{s:<20} {s:>5} {s:>9} {s:>12} {s:>9} {s:>9}\n", .{ "mode", "ef", "recall@10", "recomputed/q", "batches/q", "ms/q" });
         try out.flush();
 
         const Mode = struct { name: []const u8, opts: leann.SearchOptions };
@@ -130,6 +133,7 @@ pub fn main(init: std.process.Init) !void {
             .{ .name = "two-level a=0.1", .opts = .{ .rerank_ratio = 0.1 } },
             .{ .name = "two-level a=0.3", .opts = .{ .rerank_ratio = 0.3 } },
             .{ .name = "two-level+batch64", .opts = .{ .rerank_ratio = 0.3, .batch_size = 64 } },
+            .{ .name = "exact descent a=0.1", .opts = .{ .rerank_ratio = 0.1, .exact_descent = true } },
         };
         for (modes) |mode| {
             for ([_]u32{ 16, 32, 64, 128, 256 }) |ef| {
@@ -152,7 +156,7 @@ pub fn main(init: std.process.Init) !void {
                 }
                 const ns = s0.untilNow(io, .awake).nanoseconds;
                 const nq: f64 = @floatFromInt(test_set.rows);
-                try out.print("{s:<18} {d:>5} {d:>9.3} {d:>12.1} {d:>9.1} {d:>9.3}\n", .{
+                try out.print("{s:<20} {d:>5} {d:>9.3} {d:>12.1} {d:>9.1} {d:>9.3}\n", .{
                     mode.name,
                     ef,
                     @as(f64, @floatFromInt(hits)) / (nq * k),

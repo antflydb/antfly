@@ -22,7 +22,9 @@
 //! `EmbeddingSource` (normally the embedder that produced them).
 //!
 //! Pieces from the paper implemented here:
-//! - High-degree preserving pruning (Algorithm 3): the top `hub_fraction` of
+//! - An HNSW-style layered graph. Upper layers are kept as built and are
+//!   descended with PQ distances (or exact ones with `exact_descent`).
+//! - High-degree preserving pruning (Algorithm 3) of layer 0: the top `hub_fraction` of
 //!   nodes by in-degree keep up to `max_degree` neighbors; every other node
 //!   selects `low_degree` neighbors. Reverse links may grow any list to
 //!   `max_degree`, so low-degree nodes stay connected to hubs.
@@ -151,6 +153,10 @@ pub const SearchOptions = struct {
     /// False disables the approximate queue and recomputes every neighbor,
     /// which is the plain best-first search (Algorithm 1) the paper compares to.
     two_level: bool = true,
+    /// Descend the upper layers with recomputed exact distances instead of
+    /// PQ distances. Costs roughly levels x M recomputations per query but
+    /// avoids starting layer 0 in the wrong region when PQ is coarse.
+    exact_descent: bool = false,
 };
 
 pub const SearchStats = struct {
@@ -178,28 +184,73 @@ pub const SearchResponse = struct {
 
 pub const GraphStats = struct {
     nodes: u32,
+    /// Bottom-layer edges, which dominate storage.
     edges: u64,
     avg_degree: f64,
     max_degree: u32,
     hubs: u32,
     deleted: u32,
+    /// Highest layer (0 when only the bottom layer exists).
+    max_level: u8,
+    /// Nodes present above the bottom layer, and their edges.
+    upper_nodes: u32,
+    upper_edges: u64,
 };
 
 const flag_hub: u8 = 1;
 const flag_deleted: u8 = 2;
+/// With M = 30, a level above 6 already has odds of about 1 in 10^9.
+const max_level_cap: u8 = 15;
 
 const NeighborList = std.ArrayListUnmanaged(u32);
+
+/// Per-layer adjacency. Layer 0 holds every node; `upper[v]` holds one list
+/// for each layer 1..level(v).
+const Layers = struct {
+    base: []NeighborList,
+    upper: []const []NeighborList,
+
+    fn list(self: Layers, v: u32, layer: u8) *NeighborList {
+        return if (layer == 0) &self.base[v] else &self.upper[v][layer - 1];
+    }
+
+    fn neighbors(self: Layers, v: u32, layer: u8) []const u32 {
+        return self.list(v, layer).items;
+    }
+};
+
+/// HNSW level for a node: floor(-ln(U) / ln(M)), with U derived from a hash
+/// of (seed, id) so builds and inserts are reproducible across replicas.
+fn levelFor(seed: u64, id: u32, max_degree: u32) u8 {
+    var z = seed +% (@as(u64, id) +% 1) *% 0x9E3779B97F4A7C15;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    z ^= z >> 31;
+    // U in (0, 1].
+    const u = (@as(f64, @floatFromInt(z >> 11)) + 1) / 9007199254740992.0;
+    const ml = 1.0 / @log(@as(f64, @floatFromInt(max_degree)));
+    const level = @floor(-@log(u) * ml);
+    return @intFromFloat(@min(level, @as(f64, max_level_cap)));
+}
 
 pub const Index = struct {
     alloc: Allocator,
     config: Config,
     node_count: u32 = 0,
+    /// Entry point: a node on the highest layer.
     entry: u32 = 0,
+    max_level: u8 = 0,
     deleted_count: u32 = 0,
+    /// Layer-0 neighbor lists (pruned).
     adjacency: std.ArrayListUnmanaged(NeighborList) = .empty,
+    /// Upper-layer neighbor lists per node; `upper.items[v].len` is v's level.
+    upper: std.ArrayListUnmanaged([]NeighborList) = .empty,
     flags: std.ArrayListUnmanaged(u8) = .empty,
     codes: std.ArrayListUnmanaged(u8) = .empty,
     pq: ProductQuantizer,
+    /// Build statistic: unreachable layer-0 nodes the connectivity pass
+    /// linked. Not serialized.
+    repaired: u32 = 0,
 
     /// Builds an index from `vectors` (row-major, `dims` floats each). The
     /// vectors are only used during the build; the index keeps none of them.
@@ -217,66 +268,82 @@ pub const Index = struct {
             for (0..n) |i| normalize(work[i * dims ..][0..dims]);
         }
 
-        var pq = try ProductQuantizer.train(alloc, work, dims, cfg.pq_subspaces, cfg.pq_train_iterations, cfg.pq_train_sample, cfg.seed);
-        errdefer pq.deinit(alloc);
-
+        const pq = try ProductQuantizer.train(alloc, work, dims, cfg.pq_subspaces, cfg.pq_train_iterations, cfg.pq_train_sample, cfg.seed);
         var index = Index{ .alloc = alloc, .config = cfg, .pq = pq };
-        errdefer {
-            for (index.adjacency.items) |*list| list.deinit(alloc);
-            index.adjacency.deinit(alloc);
-            index.flags.deinit(alloc);
-            index.codes.deinit(alloc);
-        }
+        errdefer index.deinit();
 
         try index.codes.resize(alloc, n_usize * cfg.pq_subspaces);
         for (0..n) |i| pq.encode(work[i * dims ..][0..dims], index.codes.items[i * cfg.pq_subspaces ..][0..cfg.pq_subspaces]);
         try index.flags.appendNTimes(alloc, 0, n_usize);
 
+        try index.upper.ensureTotalCapacity(alloc, n_usize);
+        for (0..n) |i| {
+            const lists = try alloc.alloc(NeighborList, levelFor(cfg.seed, @intCast(i), cfg.max_degree));
+            @memset(lists, NeighborList.empty);
+            index.upper.appendAssumeCapacity(lists);
+        }
+
         const ctx = BuildContext{ .vectors = work, .dims = dims, .metric = cfg.metric };
-        const entry = try ctx.medoid(alloc, n);
         var visited = try VisitSet.init(alloc, n);
         defer visited.deinit(alloc);
         var cands = std.ArrayListUnmanaged(Cand).empty;
         defer cands.deinit(alloc);
+        var shrink_scratch = std.ArrayListUnmanaged(Cand).empty;
+        defer shrink_scratch.deinit(alloc);
         var scratch = BeamScratch{};
         defer scratch.deinit(alloc);
 
-        // Base graph: single-layer HNSW-style incremental construction,
-        // starting from the medoid so it is a good entry point.
+        // Standard HNSW construction with exact distances.
         const base = try allocLists(alloc, n);
         defer freeLists(alloc, base);
-        for (0..n) |step| {
-            const v: u32 = if (step == 0) entry else if (step <= entry) @intCast(step - 1) else @intCast(step);
-            if (step == 0) continue;
-            try beamSearchExact(alloc, &ctx, base, ctx.vec(v), entry, cfg.ef_construction, &visited, &scratch, &cands);
-            try selectHeuristic(alloc, &ctx, cands.items, v, cfg.max_degree, &base[v]);
-            for (base[v].items) |u| {
-                try base[u].append(alloc, v);
-                if (base[u].items.len > cfg.max_degree) try shrinkExact(alloc, &ctx, &base[u], u, cfg.max_degree, &cands);
+        const layers = Layers{ .base = base, .upper = index.upper.items };
+        var entry: u32 = 0;
+        var top: u8 = @intCast(index.upper.items[0].len);
+        for (1..n) |i| {
+            const v: u32 = @intCast(i);
+            const level: u8 = @intCast(index.upper.items[v].len);
+            var ep = greedyDescentExact(&ctx, layers, ctx.vec(v), entry, top, level);
+            var layer = @min(level, top);
+            while (true) : (layer -= 1) {
+                try beamSearchExact(alloc, &ctx, layers, layer, ctx.vec(v), ep, cfg.ef_construction, &visited, &scratch, &cands);
+                const own = layers.list(v, layer);
+                try selectHeuristic(alloc, &ctx, cands.items, v, cfg.max_degree, own);
+                for (own.items) |u| {
+                    const ul = layers.list(u, layer);
+                    try ul.append(alloc, v);
+                    if (ul.items.len > cfg.max_degree) try shrinkExact(alloc, &ctx, ul, u, cfg.max_degree, &shrink_scratch);
+                }
+                ep = cands.items[0].id;
+                if (layer == 0) break;
+            }
+            if (level > top) {
+                top = level;
+                entry = v;
             }
         }
+        index.entry = entry;
+        index.max_level = top;
 
+        try index.adjacency.ensureTotalCapacity(alloc, n_usize);
         if (!cfg.prune) {
-            try index.adjacency.ensureTotalCapacity(alloc, n_usize);
             for (base) |*list| {
                 index.adjacency.appendAssumeCapacity(list.*);
                 list.* = .empty;
             }
         } else {
-            const pruned = try pruneGraph(alloc, &ctx, cfg, base, entry, index.flags.items, &visited, &scratch, &cands);
+            const pruned = try pruneGraph(alloc, &ctx, cfg, layers, entry, top, index.flags.items, &visited, &scratch, &cands, &index.repaired);
             defer alloc.free(pruned);
-            try index.adjacency.ensureTotalCapacity(alloc, n_usize);
             for (pruned) |list| index.adjacency.appendAssumeCapacity(list);
         }
-
         index.node_count = n;
-        index.entry = entry;
         return index;
     }
 
     pub fn deinit(self: *Index) void {
         for (self.adjacency.items) |*list| list.deinit(self.alloc);
         self.adjacency.deinit(self.alloc);
+        for (self.upper.items) |lists| freeLists(self.alloc, lists);
+        self.upper.deinit(self.alloc);
         self.flags.deinit(self.alloc);
         self.codes.deinit(self.alloc);
         self.pq.deinit(self.alloc);
@@ -315,8 +382,24 @@ pub const Index = struct {
             max_deg = @max(max_deg, @as(u32, @intCast(list.items.len)));
             if (flag & flag_hub != 0) hubs += 1;
         }
+        var upper_nodes: u32 = 0;
+        var upper_edges: u64 = 0;
+        for (self.upper.items) |lists| {
+            if (lists.len > 0) upper_nodes += 1;
+            for (lists) |list| upper_edges += list.items.len;
+        }
         const avg = if (self.node_count == 0) 0 else @as(f64, @floatFromInt(edges)) / @as(f64, @floatFromInt(self.node_count));
-        return .{ .nodes = self.node_count, .edges = edges, .avg_degree = avg, .max_degree = max_deg, .hubs = hubs, .deleted = self.deleted_count };
+        return .{
+            .nodes = self.node_count,
+            .edges = edges,
+            .avg_degree = avg,
+            .max_degree = max_deg,
+            .hubs = hubs,
+            .deleted = self.deleted_count,
+            .max_level = self.max_level,
+            .upper_nodes = upper_nodes,
+            .upper_edges = upper_edges,
+        };
     }
 
     /// Searches for the `k` nearest live nodes to `query`.
@@ -328,10 +411,17 @@ pub const Index = struct {
         const q = try alloc.dupe(f32, query);
         defer alloc.free(q);
         if (self.config.metric == .cosine) normalize(q);
+        const table = try alloc.alloc(f32, self.pq.tableLen());
+        defer alloc.free(table);
+        self.pq.buildTable(self.config.metric, q, table);
 
+        const start = if (opts.exact_descent)
+            try self.greedyDescentRecompute(alloc, source, q, self.entry, self.max_level, &stats)
+        else
+            self.greedyDescentApprox(table, self.entry, self.max_level, 0, &stats);
         var found = std.ArrayListUnmanaged(Cand).empty;
         defer found.deinit(alloc);
-        try self.twoLevelSearch(alloc, source, q, opts, &found, &stats);
+        try self.twoLevelSearch(alloc, source, q, table, start, opts, &found, &stats);
 
         var out = std.ArrayListUnmanaged(Result).empty;
         errdefer out.deinit(alloc);
@@ -345,42 +435,69 @@ pub const Index = struct {
 
     /// Inserts one embedding and returns its node id. Ids are dense and
     /// assigned in insertion order, so the caller's EmbeddingSource must be
-    /// able to recompute the new id afterwards. Uses the paper's simplified
-    /// neighbor selection: the closest `low_degree` live candidates become
-    /// forward edges, and full reverse lists drop their farthest neighbor by
-    /// PQ distance, so no neighbor embeddings are recomputed for shrinking.
+    /// able to recompute the new id afterwards.
+    ///
+    /// Upper layers are linked with PQ distances, so they cost no
+    /// recomputation. Layer 0 uses the paper's simplified neighbor selection:
+    /// a two-level search, then the closest `low_degree` live candidates
+    /// become forward edges. Full reverse lists drop their farthest member by
+    /// PQ distance.
     pub fn insert(self: *Index, source: EmbeddingSource, vector: []const f32) !u32 {
         const alloc = self.alloc;
         const d = self.dimension();
         if (vector.len != d) return error.DimensionMismatch;
         if (self.node_count == std.math.maxInt(u32) - 1) return error.IndexFull;
         const sub = self.config.pq_subspaces;
+        const id = self.node_count;
+        const level = levelFor(self.config.seed, id, self.config.max_degree);
 
         const v = try alloc.dupe(f32, vector);
         defer alloc.free(v);
         if (self.config.metric == .cosine) normalize(v);
+        const table = try alloc.alloc(f32, self.pq.tableLen());
+        defer alloc.free(table);
+        self.pq.buildTable(self.config.metric, v, table);
 
+        const new_upper = try alloc.alloc(NeighborList, level);
+        @memset(new_upper, NeighborList.empty);
+        var forward = NeighborList.empty;
+        var committed = false;
+        errdefer if (!committed) {
+            freeLists(alloc, new_upper);
+            forward.deinit(alloc);
+        };
+
+        var stats = SearchStats{};
+        var ep = self.greedyDescentApprox(table, self.entry, self.max_level, level, &stats);
         var found = std.ArrayListUnmanaged(Cand).empty;
         defer found.deinit(alloc);
-        if (self.node_count > 0) {
-            var stats = SearchStats{};
-            const ef = self.config.ef_construction;
-            try self.twoLevelSearch(alloc, source, v, .{ .k = ef, .ef = ef }, &found, &stats);
+        var layer = @min(level, self.max_level);
+        while (layer > 0) : (layer -= 1) {
+            try self.beamSearchApprox(alloc, table, layer, ep, self.config.ef_construction, &found);
+            for (found.items) |c| {
+                if (new_upper[layer - 1].items.len >= self.config.max_degree) break;
+                try new_upper[layer - 1].append(alloc, c.id);
+            }
+            ep = found.items[0].id;
         }
 
-        const id = self.node_count;
-        try self.codes.ensureUnusedCapacity(alloc, sub);
-        try self.flags.ensureUnusedCapacity(alloc, 1);
-        try self.adjacency.ensureUnusedCapacity(alloc, 1);
-        var forward = NeighborList.empty;
-        errdefer forward.deinit(alloc);
+        const ef = self.config.ef_construction;
+        try self.twoLevelSearch(alloc, source, v, table, ep, .{ .k = ef, .ef = ef }, &found, &stats);
         for (found.items) |c| {
             if (forward.items.len >= self.config.low_degree) break;
             if (self.isDeleted(c.id)) continue;
             try forward.append(alloc, c.id);
         }
+
         // Reserve everything up front: nothing below the commit may fail.
+        try self.codes.ensureUnusedCapacity(alloc, sub);
+        try self.flags.ensureUnusedCapacity(alloc, 1);
+        try self.adjacency.ensureUnusedCapacity(alloc, 1);
+        try self.upper.ensureUnusedCapacity(alloc, 1);
         for (forward.items) |u| try self.adjacency.items[u].ensureUnusedCapacity(alloc, 1);
+        for (new_upper, 1..) |list, l| {
+            for (list.items) |u| try self.upper.items[u][l - 1].ensureUnusedCapacity(alloc, 1);
+        }
         const a = try alloc.alloc(f32, d);
         defer alloc.free(a);
         const b = try alloc.alloc(f32, d);
@@ -391,29 +508,42 @@ pub const Index = struct {
         self.pq.encode(v, self.codes.items[code_start..][0..sub]);
         self.flags.appendAssumeCapacity(0);
         self.adjacency.appendAssumeCapacity(forward);
+        self.upper.appendAssumeCapacity(new_upper);
         self.node_count += 1;
+        committed = true;
 
-        for (forward.items) |u| {
-            const list = &self.adjacency.items[u];
-            if (list.items.len < self.config.max_degree) {
-                list.appendAssumeCapacity(id);
-                continue;
-            }
-            self.pq.decode(self.code(u), a);
-            self.pq.decode(self.code(id), b);
-            var worst_i: usize = list.items.len;
-            var worst = distance(self.config.metric, a, b);
-            for (list.items, 0..) |w, i| {
-                self.pq.decode(self.code(w), b);
-                const dist = distance(self.config.metric, a, b);
-                if (dist > worst) {
-                    worst = dist;
-                    worst_i = i;
-                }
-            }
-            if (worst_i < list.items.len) list.items[worst_i] = id;
+        for (forward.items) |u| self.addReverseLink(&self.adjacency.items[u], u, id, a, b);
+        for (new_upper, 1..) |list, l| {
+            for (list.items) |u| self.addReverseLink(&self.upper.items[u][l - 1], u, id, a, b);
+        }
+        if (level > self.max_level) {
+            self.max_level = level;
+            self.entry = id;
         }
         return id;
+    }
+
+    /// Appends `id` to `list` (owned by `owner`), or replaces the member
+    /// farthest from `owner` by PQ distance when the list is full. Capacity
+    /// must already be reserved.
+    fn addReverseLink(self: *const Index, list: *NeighborList, owner: u32, id: u32, a: []f32, b: []f32) void {
+        if (list.items.len < self.config.max_degree) {
+            list.appendAssumeCapacity(id);
+            return;
+        }
+        self.pq.decode(self.code(owner), a);
+        self.pq.decode(self.code(id), b);
+        var worst_i: usize = list.items.len;
+        var worst = distance(self.config.metric, a, b);
+        for (list.items, 0..) |w, i| {
+            self.pq.decode(self.code(w), b);
+            const dist = distance(self.config.metric, a, b);
+            if (dist > worst) {
+                worst = dist;
+                worst_i = i;
+            }
+        }
+        if (worst_i < list.items.len) list.items[worst_i] = id;
     }
 
     fn code(self: *const Index, id: u32) []const u8 {
@@ -421,23 +551,130 @@ pub const Index = struct {
         return self.codes.items[@as(usize, id) * sub ..][0..sub];
     }
 
-    /// Algorithm 2. Fills `out` with up to `ef` exact candidates in ascending
-    /// distance order, including deleted nodes.
+    /// Greedy descent with PQ distances from layer `from` down to layer
+    /// `to + 1`. Costs no recomputation.
+    fn greedyDescentApprox(self: *const Index, table: []const f32, start: u32, from: u8, to: u8, stats: *SearchStats) u32 {
+        var cur = start;
+        var cur_d = self.pq.adc(table, self.code(cur));
+        var layer = from;
+        while (layer > to) : (layer -= 1) {
+            var improved = true;
+            while (improved) {
+                improved = false;
+                for (self.upper.items[cur][layer - 1].items) |nb| {
+                    stats.approx_evaluated += 1;
+                    const dist = self.pq.adc(table, self.code(nb));
+                    if (dist < cur_d) {
+                        cur_d = dist;
+                        cur = nb;
+                        improved = true;
+                    }
+                }
+            }
+        }
+        return cur;
+    }
+
+    /// Greedy descent to layer 1 with exact distances. Each step recomputes
+    /// the unseen neighbors of the current node in one batch.
+    fn greedyDescentRecompute(self: *const Index, alloc: Allocator, source: EmbeddingSource, q: []const f32, start: u32, from: u8, stats: *SearchStats) !u32 {
+        if (from == 0) return start;
+        var seen = std.AutoHashMapUnmanaged(u32, f32).empty;
+        defer seen.deinit(alloc);
+        var ids = std.ArrayListUnmanaged(u32).empty;
+        defer ids.deinit(alloc);
+        var buf = std.ArrayListUnmanaged(f32).empty;
+        defer buf.deinit(alloc);
+
+        const Batch = struct {
+            fn run(index: *const Index, a: Allocator, src: EmbeddingSource, query: []const f32, todo: []const u32, vectors: *std.ArrayListUnmanaged(f32), dists: *std.AutoHashMapUnmanaged(u32, f32), st: *SearchStats) !void {
+                if (todo.len == 0) return;
+                const dd = index.dimension();
+                try vectors.resize(a, todo.len * dd);
+                try src.recompute(todo, vectors.items);
+                st.batches += 1;
+                st.recomputed += @intCast(todo.len);
+                for (todo, 0..) |id, i| {
+                    const row = vectors.items[i * dd ..][0..dd];
+                    if (index.config.metric == .cosine) normalize(row);
+                    try dists.put(a, id, distance(index.config.metric, query, row));
+                }
+            }
+        };
+
+        try Batch.run(self, alloc, source, q, &.{start}, &buf, &seen, stats);
+        var cur = start;
+        var cur_d = seen.get(start).?;
+        var layer = from;
+        while (layer > 0) : (layer -= 1) {
+            var improved = true;
+            while (improved) {
+                improved = false;
+                const nbs = self.upper.items[cur][layer - 1].items;
+                ids.clearRetainingCapacity();
+                for (nbs) |nb| if (!seen.contains(nb)) try ids.append(alloc, nb);
+                try Batch.run(self, alloc, source, q, ids.items, &buf, &seen, stats);
+                for (nbs) |nb| {
+                    const dist = seen.get(nb).?;
+                    if (dist < cur_d) {
+                        cur_d = dist;
+                        cur = nb;
+                        improved = true;
+                    }
+                }
+            }
+        }
+        return cur;
+    }
+
+    /// Beam search on an upper layer with PQ distances (used by insert).
+    fn beamSearchApprox(self: *const Index, alloc: Allocator, table: []const f32, layer: u8, start: u32, ef: u32, out: *std.ArrayListUnmanaged(Cand)) !void {
+        var visited = std.AutoHashMapUnmanaged(u32, void).empty;
+        defer visited.deinit(alloc);
+        var candidates = Heap(false){};
+        defer candidates.deinit(alloc);
+        var results = Heap(true){};
+        defer results.deinit(alloc);
+        const first = Cand{ .dist = self.pq.adc(table, self.code(start)), .id = start };
+        try visited.put(alloc, start, {});
+        try candidates.push(alloc, first);
+        try results.push(alloc, first);
+        while (candidates.len() > 0) {
+            const c = candidates.pop();
+            if (results.len() >= ef and c.dist > results.top().dist) break;
+            for (self.upper.items[c.id][layer - 1].items) |nb| {
+                const gop = try visited.getOrPut(alloc, nb);
+                if (gop.found_existing) continue;
+                const nc = Cand{ .dist = self.pq.adc(table, self.code(nb)), .id = nb };
+                if (results.len() < ef) {
+                    try results.push(alloc, nc);
+                } else if (nc.dist < results.top().dist) {
+                    results.replaceTop(nc);
+                } else continue;
+                try candidates.push(alloc, nc);
+            }
+        }
+        out.clearRetainingCapacity();
+        try out.appendSlice(alloc, results.items.items);
+        std.mem.sortUnstable(Cand, out.items, {}, candLessThan);
+    }
+
+    /// Algorithm 2 on layer 0, starting at `start`. Fills `out` with up to
+    /// `ef` exact candidates in ascending distance order, including deleted
+    /// nodes.
     fn twoLevelSearch(
         self: *const Index,
         alloc: Allocator,
         source: EmbeddingSource,
         q: []const f32,
+        table: []const f32,
+        start: u32,
         opts: SearchOptions,
         out: *std.ArrayListUnmanaged(Cand),
         stats: *SearchStats,
     ) !void {
         const ef: usize = @max(opts.ef, opts.k);
         const ratio: f32 = std.math.clamp(opts.rerank_ratio, 0, 1);
-
-        const table = try alloc.alloc(f32, self.pq.tableLen());
-        defer alloc.free(table);
-        self.pq.buildTable(self.config.metric, q, table);
 
         var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.node_count);
         defer visited.deinit(alloc);
@@ -486,8 +723,8 @@ pub const Index = struct {
             }
         };
 
-        visited.set(self.entry);
-        try pending.append(alloc, self.entry);
+        visited.set(start);
+        try pending.append(alloc, start);
         try Flush.run(self, alloc, source, q, &pending, &buf, &exact_queue, &results, ef, stats);
 
         while (true) {
@@ -542,10 +779,12 @@ pub const Index = struct {
     // ---------------------------------------------------------------------
 
     const magic = "LEANNIDX";
-    pub const format_version: u32 = 1;
+    pub const format_version: u32 = 2;
 
-    /// Serializes the graph (CSR), PQ codebooks, codes, and flags. No
-    /// embeddings are written.
+    /// Serializes the graph layers, PQ codebooks, codes, and flags. No
+    /// embeddings are written. Layout after the header: centroids, codes,
+    /// flags, levels, layer-0 CSR offsets and neighbors, then for each node
+    /// with level > 0 and each of its layers a u32 count and the neighbors.
     pub fn serialize(self: *const Index, alloc: Allocator) ![]u8 {
         var w: std.Io.Writer.Allocating = .init(alloc);
         defer w.deinit();
@@ -560,12 +799,15 @@ pub const Index = struct {
         try wr.writeInt(u32, cfg.ef_construction, .little);
         try wr.writeInt(u32, @bitCast(cfg.hub_fraction), .little);
         try wr.writeInt(u32, cfg.pq_subspaces, .little);
+        try wr.writeInt(u64, cfg.seed, .little);
         try wr.writeInt(u32, self.pq.k, .little);
         try wr.writeInt(u32, self.node_count, .little);
         try wr.writeInt(u32, self.entry, .little);
+        try wr.writeByte(self.max_level);
         for (self.pq.centroids) |f| try wr.writeInt(u32, @bitCast(f), .little);
         try wr.writeAll(self.codes.items);
         try wr.writeAll(self.flags.items);
+        for (self.upper.items) |lists| try wr.writeByte(@intCast(lists.len));
         var offset: u32 = 0;
         try wr.writeInt(u32, 0, .little);
         for (self.adjacency.items) |list| {
@@ -575,8 +817,13 @@ pub const Index = struct {
         for (self.adjacency.items) |list| {
             for (list.items) |nb| try wr.writeInt(u32, nb, .little);
         }
-        const body = w.written();
-        const crc = std.hash.Crc32.hash(body);
+        for (self.upper.items) |lists| {
+            for (lists) |list| {
+                try wr.writeInt(u32, @intCast(list.items.len), .little);
+                for (list.items) |nb| try wr.writeInt(u32, nb, .little);
+            }
+        }
+        const crc = std.hash.Crc32.hash(w.written());
         try wr.writeInt(u32, crc, .little);
         return w.toOwnedSlice();
     }
@@ -599,30 +846,33 @@ pub const Index = struct {
         cfg.ef_construction = try readU32(&r);
         cfg.hub_fraction = @bitCast(try readU32(&r));
         cfg.pq_subspaces = try readU32(&r);
+        cfg.seed = r.takeInt(u64, .little) catch return error.InvalidFormat;
         cfg = cfg.resolved() catch return error.InvalidFormat;
         const k = try readU32(&r);
         const n = try readU32(&r);
         const entry = try readU32(&r);
+        const max_level = r.takeByte() catch return error.InvalidFormat;
         if (k == 0 or k > 256) return error.InvalidFormat;
-        if (n == 0 or entry >= n) return error.InvalidFormat;
+        if (n == 0 or entry >= n or max_level > max_level_cap) return error.InvalidFormat;
 
         const sub: usize = cfg.pq_subspaces;
         const centroid_len = @as(usize, k) * cfg.dims;
         // Cheap size check before allocating anything large.
-        const fixed_len = centroid_len * 4 + @as(usize, n) * (sub + 1) + (@as(usize, n) + 1) * 4;
+        const fixed_len = centroid_len * 4 + @as(usize, n) * (sub + 2) + (@as(usize, n) + 1) * 4;
         if (r.bufferedLen() < fixed_len) return error.InvalidFormat;
 
-        var pq = ProductQuantizer{ .dims = cfg.dims, .subspaces = cfg.pq_subspaces, .sub_dims = cfg.dims / cfg.pq_subspaces, .k = k, .centroids = try alloc.alloc(f32, centroid_len) };
-        errdefer pq.deinit(alloc);
-        for (pq.centroids) |*f| f.* = @bitCast(try readU32(&r));
+        const centroids = try alloc.alloc(f32, centroid_len);
+        for (centroids) |*f| f.* = @bitCast(readU32(&r) catch unreachable);
+        var index = Index{
+            .alloc = alloc,
+            .config = cfg,
+            .pq = .{ .dims = cfg.dims, .subspaces = cfg.pq_subspaces, .sub_dims = cfg.dims / cfg.pq_subspaces, .k = k, .centroids = centroids },
+            .node_count = n,
+            .entry = entry,
+            .max_level = max_level,
+        };
+        errdefer index.deinit();
 
-        var index = Index{ .alloc = alloc, .config = cfg, .pq = pq, .node_count = n, .entry = entry };
-        errdefer {
-            for (index.adjacency.items) |*list| list.deinit(alloc);
-            index.adjacency.deinit(alloc);
-            index.flags.deinit(alloc);
-            index.codes.deinit(alloc);
-        }
         try index.codes.appendSlice(alloc, r.take(@as(usize, n) * sub) catch return error.InvalidFormat);
         for (index.codes.items) |c| if (c >= k) return error.InvalidFormat;
         try index.flags.appendSlice(alloc, r.take(n) catch return error.InvalidFormat);
@@ -630,28 +880,47 @@ pub const Index = struct {
             if (f & ~(flag_hub | flag_deleted) != 0) return error.InvalidFormat;
             if (f & flag_deleted != 0) index.deleted_count += 1;
         }
+        const levels = r.take(n) catch return error.InvalidFormat;
+        for (levels) |l| if (l > max_level) return error.InvalidFormat;
+        if (levels[entry] != max_level) return error.InvalidFormat;
 
         const offsets = try alloc.alloc(u32, @as(usize, n) + 1);
         defer alloc.free(offsets);
         for (offsets) |*o| o.* = try readU32(&r);
         if (offsets[0] != 0) return error.InvalidFormat;
         for (offsets[1..], offsets[0..n]) |hi, lo| if (hi < lo) return error.InvalidFormat;
-        if (r.bufferedLen() != @as(usize, offsets[n]) * 4) return error.InvalidFormat;
+        if (r.bufferedLen() < @as(usize, offsets[n]) * 4) return error.InvalidFormat;
 
         try index.adjacency.ensureTotalCapacity(alloc, n);
         for (0..n) |i| {
             const len = offsets[i + 1] - offsets[i];
-            var list = try NeighborList.initCapacity(alloc, len);
+            index.adjacency.appendAssumeCapacity(.empty);
+            const list = &index.adjacency.items[i];
+            try list.ensureTotalCapacity(alloc, len);
             for (0..len) |_| {
                 const nb = try readU32(&r);
-                if (nb >= n) {
-                    list.deinit(alloc);
-                    return error.InvalidFormat;
-                }
+                if (nb >= n) return error.InvalidFormat;
                 list.appendAssumeCapacity(nb);
             }
-            index.adjacency.appendAssumeCapacity(list);
         }
+
+        try index.upper.ensureTotalCapacity(alloc, n);
+        for (levels) |level| {
+            const lists = try alloc.alloc(NeighborList, level);
+            @memset(lists, NeighborList.empty);
+            index.upper.appendAssumeCapacity(lists);
+            for (lists, 1..) |*list, layer| {
+                const len = try readU32(&r);
+                if (len > cfg.max_degree) return error.InvalidFormat;
+                try list.ensureTotalCapacity(alloc, len);
+                for (0..len) |_| {
+                    const nb = try readU32(&r);
+                    if (nb >= n or levels[nb] < layer) return error.InvalidFormat;
+                    list.appendAssumeCapacity(nb);
+                }
+            }
+        }
+        if (r.bufferedLen() != 0) return error.InvalidFormat;
         return index;
     }
 };
@@ -684,32 +953,6 @@ const BuildContext = struct {
     fn dist(self: *const BuildContext, a: u32, b: u32) f32 {
         return distance(self.metric, self.vec(a), self.vec(b));
     }
-
-    /// Node closest to the mean vector, used as the search entry point.
-    fn medoid(self: *const BuildContext, alloc: Allocator, n: u32) !u32 {
-        const sum = try alloc.alloc(f64, self.dims);
-        defer alloc.free(sum);
-        @memset(sum, 0);
-        for (0..n) |i| {
-            for (self.vec(@intCast(i)), 0..) |x, j| sum[j] += x;
-        }
-        const inv = 1.0 / @as(f64, @floatFromInt(n));
-        for (sum) |*x| x.* *= inv;
-        var best: u32 = 0;
-        var best_d: f64 = std.math.inf(f64);
-        for (0..n) |i| {
-            var d: f64 = 0;
-            for (self.vec(@intCast(i)), sum) |x, m| {
-                const diff = @as(f64, x) - m;
-                d += diff * diff;
-            }
-            if (d < best_d) {
-                best_d = d;
-                best = @intCast(i);
-            }
-        }
-        return best;
-    }
 };
 
 fn allocLists(alloc: Allocator, n: u32) ![]NeighborList {
@@ -733,11 +976,34 @@ const BeamScratch = struct {
     }
 };
 
-/// Best-first search with exact distances (Algorithm 1), used while building.
+/// Greedy descent with exact distances from layer `from` down to `to + 1`.
+fn greedyDescentExact(ctx: *const BuildContext, layers: Layers, query: []const f32, start: u32, from: u8, to: u8) u32 {
+    var cur = start;
+    var cur_d = distance(ctx.metric, query, ctx.vec(cur));
+    var layer = from;
+    while (layer > to) : (layer -= 1) {
+        var improved = true;
+        while (improved) {
+            improved = false;
+            for (layers.neighbors(cur, layer)) |nb| {
+                const d = distance(ctx.metric, query, ctx.vec(nb));
+                if (d < cur_d) {
+                    cur_d = d;
+                    cur = nb;
+                    improved = true;
+                }
+            }
+        }
+    }
+    return cur;
+}
+
+/// Best-first search on one layer with exact distances (Algorithm 1).
 fn beamSearchExact(
     alloc: Allocator,
     ctx: *const BuildContext,
-    adj: []const NeighborList,
+    layers: Layers,
+    layer: u8,
     query: []const f32,
     entry: u32,
     ef: u32,
@@ -755,7 +1021,7 @@ fn beamSearchExact(
     while (scratch.candidates.len() > 0) {
         const c = scratch.candidates.pop();
         if (scratch.results.len() >= ef and c.dist > scratch.results.top().dist) break;
-        for (adj[c.id].items) |nb| {
+        for (layers.neighbors(c.id, layer)) |nb| {
             if (!visited.testAndSet(nb)) continue;
             const nc = Cand{ .dist = distance(ctx.metric, query, ctx.vec(nb)), .id = nb };
             if (scratch.results.len() < ef) {
@@ -817,24 +1083,26 @@ fn addUnique(alloc: Allocator, list: *NeighborList, id: u32) !bool {
     return true;
 }
 
-/// High-degree preserving pruning (Algorithm 3). Returns the pruned lists and
-/// marks hubs in `flags`.
+/// High-degree preserving pruning (Algorithm 3) of layer 0. Upper layers are
+/// left alone. Returns the pruned layer-0 lists and marks hubs in `flags`.
 fn pruneGraph(
     alloc: Allocator,
     ctx: *const BuildContext,
     cfg: Config,
-    base: []const NeighborList,
+    layers: Layers,
     entry: u32,
+    top: u8,
     flags: []u8,
     visited: *VisitSet,
     scratch: *BeamScratch,
     cands: *std.ArrayListUnmanaged(Cand),
+    repaired: *u32,
 ) ![]NeighborList {
-    const n: u32 = @intCast(base.len);
+    const n: u32 = @intCast(layers.base.len);
     const indegree = try alloc.alloc(u32, n);
     defer alloc.free(indegree);
     @memset(indegree, 0);
-    for (base) |list| for (list.items) |nb| {
+    for (layers.base) |list| for (list.items) |nb| {
         indegree[nb] += 1;
     };
     const order = try alloc.alloc(u32, n);
@@ -858,26 +1126,12 @@ fn pruneGraph(
     var shrink_scratch = std.ArrayListUnmanaged(Cand).empty;
     defer shrink_scratch.deinit(alloc);
 
-    // Hubs keep their base edges. In a single-layer graph the long-range
-    // links that HNSW would keep in upper layers sit on early, high in-degree
-    // nodes, so preserving hub lists preserves the routing backbone.
-    for (0..n) |i| {
-        if (flags[i] & flag_hub == 0) continue;
-        try pruned[i].appendSlice(alloc, base[i].items);
-    }
     for (0..n) |i| {
         const v: u32 = @intCast(i);
-        if (flags[v] & flag_hub != 0) continue;
-        try beamSearchExact(alloc, ctx, base, ctx.vec(v), entry, cfg.ef_construction, visited, scratch, cands);
-        // The base graph's own edges include the long-range links made early
-        // in construction. Without them a single-layer graph splits into
-        // per-cluster islands once degrees drop to `low_degree`.
-        for (base[v].items) |nb| {
-            if (!visited.testAndSet(nb)) continue;
-            try cands.append(alloc, .{ .dist = ctx.dist(v, nb), .id = nb });
-        }
-        std.mem.sortUnstable(Cand, cands.items, {}, candLessThan);
-        try selectHeuristic(alloc, ctx, cands.items, v, cfg.low_degree, &selected);
+        const ep = greedyDescentExact(ctx, layers, ctx.vec(v), entry, top, 0);
+        try beamSearchExact(alloc, ctx, layers, 0, ctx.vec(v), ep, cfg.ef_construction, visited, scratch, cands);
+        const cap = if (flags[v] & flag_hub != 0) cfg.max_degree else cfg.low_degree;
+        try selectHeuristic(alloc, ctx, cands.items, v, cap, &selected);
         for (selected.items) |s| _ = try addUnique(alloc, &pruned[v], s);
         if (pruned[v].items.len > cfg.max_degree) try shrinkExact(alloc, ctx, &pruned[v], v, cfg.max_degree, &shrink_scratch);
         for (selected.items) |u| {
@@ -885,33 +1139,35 @@ fn pruneGraph(
             if (pruned[u].items.len > cfg.max_degree) try shrinkExact(alloc, ctx, &pruned[u], u, cfg.max_degree, &shrink_scratch);
         }
     }
-    try repairConnectivity(alloc, ctx, cfg, pruned, entry, visited, scratch, cands);
+    repaired.* = try repairConnectivity(alloc, ctx, cfg, .{ .base = pruned, .upper = layers.upper }, entry, visited, scratch, cands);
     return pruned;
 }
 
-/// Makes every node reachable from `entry` (as in NSG). For each node the
-/// traversal cannot reach, search the reachable part of the graph for its
-/// nearest reachable node and link that node to it.
+/// Safety net (as in NSG): links every layer-0 node the traversal cannot
+/// reach from `entry` to its nearest reachable node. Returns the number of
+/// nodes linked; normally zero or close to it.
 fn repairConnectivity(
     alloc: Allocator,
     ctx: *const BuildContext,
     cfg: Config,
-    adj: []NeighborList,
+    layers: Layers,
     entry: u32,
     visited: *VisitSet,
     scratch: *BeamScratch,
     cands: *std.ArrayListUnmanaged(Cand),
-) !void {
+) !u32 {
+    const adj = layers.base;
     const n: u32 = @intCast(adj.len);
     var reached = try std.DynamicBitSetUnmanaged.initEmpty(alloc, n);
     defer reached.deinit(alloc);
     var stack = std.ArrayListUnmanaged(u32).empty;
     defer stack.deinit(alloc);
     try markReachable(alloc, adj, entry, &reached, &stack);
+    var linked: u32 = 0;
     for (0..n) |i| {
         const u: u32 = @intCast(i);
         if (reached.isSet(u)) continue;
-        try beamSearchExact(alloc, ctx, adj, ctx.vec(u), entry, cfg.ef_construction, visited, scratch, cands);
+        try beamSearchExact(alloc, ctx, layers, 0, ctx.vec(u), entry, cfg.ef_construction, visited, scratch, cands);
         // Prefer a reachable node with spare capacity; otherwise exceed the
         // cap on the nearest one rather than leave `u` stranded.
         var parent = cands.items[0].id;
@@ -923,7 +1179,9 @@ fn repairConnectivity(
         }
         try adj[parent].append(alloc, u);
         try markReachable(alloc, adj, u, &reached, &stack);
+        linked += 1;
     }
+    return linked;
 }
 
 fn markReachable(alloc: Allocator, adj: []const NeighborList, start: u32, reached: *std.DynamicBitSetUnmanaged, stack: *std.ArrayListUnmanaged(u32)) !void {
@@ -1387,6 +1645,48 @@ test "leann: pruning keeps hubs and lowers average degree" {
         try stack.append(alloc, nb);
     };
     try testing.expectEqual(@as(usize, ps.nodes), seen.count());
+}
+
+test "leann: level assignment follows the HNSW distribution" {
+    var above: usize = 0;
+    var max_seen: u8 = 0;
+    const n = 100_000;
+    for (0..n) |i| {
+        const l = levelFor(42, @intCast(i), 30);
+        if (l > 0) above += 1;
+        max_seen = @max(max_seen, l);
+        try testing.expectEqual(l, levelFor(42, @intCast(i), 30));
+    }
+    // P(level >= 1) = 1 / M.
+    const frac = @as(f64, @floatFromInt(above)) / n;
+    try testing.expect(frac > 0.8 / 30.0 and frac < 1.2 / 30.0);
+    try testing.expect(max_seen >= 2 and max_seen <= max_level_cap);
+}
+
+test "leann: upper layers are unpruned and well formed" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 3000, 20, 32, 24, 31);
+    defer fx.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = 32, .max_degree = 16, .ef_construction = 96 }, fx.data);
+    defer index.deinit();
+    const gs = index.graphStats();
+    try testing.expect(gs.max_level >= 1);
+    try testing.expect(gs.upper_nodes > 0 and gs.upper_nodes < gs.nodes / 4);
+    try testing.expectEqual(@as(usize, gs.max_level), index.upper.items[index.entry].len);
+    for (index.upper.items, 0..) |lists, v| {
+        for (lists, 1..) |list, layer| {
+            try testing.expect(list.items.len <= 16);
+            for (list.items) |nb| {
+                try testing.expect(nb != v);
+                try testing.expect(index.upper.items[nb].len >= layer);
+            }
+        }
+    }
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 32 };
+    const approx = try recallAt(alloc, &index, &fx, src.source(), .{ .ef = 64 }, 20, std.math.maxInt(usize));
+    const exact = try recallAt(alloc, &index, &fx, src.source(), .{ .ef = 64, .exact_descent = true }, 20, std.math.maxInt(usize));
+    try testing.expect(approx.recall >= 0.85);
+    try testing.expect(exact.recall >= 0.85);
 }
 
 test "leann: two-level search recomputes less than plain search" {
