@@ -1,5 +1,11 @@
 # OCR performance evidence
 
+The [uncached-forward regression](uncached-forwards-1331.json) records the
+follow-up CUDA fix for null decode contexts: temporary device state owns its
+admission lease and is released after each full-prefix forward. The focused
+ReleaseSafe run passed all 41 selected tests (including import declarations),
+covering hidden/logits forwards, fresh-cache parity, repetition and denial.
+
 The [serving-default qualification](serving-defaults-1331.json) records the
 GPU-first recurrent dispatch and memory-admission checks added for Grepstein:
 381 post-main CUDA-suite tests passed with 21 skips. The earlier matched

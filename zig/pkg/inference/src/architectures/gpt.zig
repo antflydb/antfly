@@ -9081,28 +9081,35 @@ fn qwen35ProjectedCore(
         if (cb.kind() == .cuda and (config.qwen35_device_only_state or
             (maybe_state != null and (maybe_state.?.cuda_device.initialized or maybe_state.?.cuda_device.failed))))
         {
-            if (maybe_state) |state| {
-                if (state.initialized and !state.cuda_device.initialized) return error.CudaRecurrentStateMigrationUnavailable;
-                if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.qwen35LinearCore(cb, &state.cuda_device, .{
-                    .device_state_admitted = state.device_only,
-                    .destination = destination,
-                    .mixed = mixed,
-                    .z = z,
-                    .beta = beta_proj,
-                    .a = a_proj,
-                    .conv_weight = conv_w,
-                    .a_log = a_log_w,
-                    .dt_bias = dt_bias_w,
-                    .norm_weight = norm_w,
-                    .seq_len = seq_len,
-                    .key_heads = key_heads,
-                    .value_heads = value_heads,
-                    .dim = key_head_dim,
-                    .value_dim = value_head_dim,
-                    .conv_kernel = conv_kernel,
-                    .eps = config.norm_eps,
-                })) |core| return core;
-            }
+            // Session.run, comparison tools and other full-prefix forwards
+            // have no decode cache. Give that invocation a fresh device owner;
+            // unlike cached histories it has no caller-owned persistent lease.
+            var temporary_state: Qwen35LinearLayerState = undefined;
+            const state = maybe_state orelse state: {
+                temporary_state = .{ .device_only = true };
+                break :state &temporary_state;
+            };
+            defer if (maybe_state == null) temporary_state.deinit(allocator);
+            if (state.initialized and !state.cuda_device.initialized) return error.CudaRecurrentStateMigrationUnavailable;
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.qwen35LinearCore(cb, &state.cuda_device, .{
+                .device_state_admitted = maybe_state != null and state.device_only,
+                .destination = destination,
+                .mixed = mixed,
+                .z = z,
+                .beta = beta_proj,
+                .a = a_proj,
+                .conv_weight = conv_w,
+                .a_log = a_log_w,
+                .dt_bias = dt_bias_w,
+                .norm_weight = norm_w,
+                .seq_len = seq_len,
+                .key_heads = key_heads,
+                .value_heads = value_heads,
+                .dim = key_head_dim,
+                .value_dim = value_head_dim,
+                .conv_kernel = conv_kernel,
+                .eps = config.norm_eps,
+            })) |core| return core;
         }
     }
     if (comptime build_options.enable_metal) {
@@ -14822,4 +14829,89 @@ test "LightOnOCR3 default CUDA dispatch keeps admitted recurrent histories on de
         defer a.free(actual);
         for (actual) |value| try std.testing.expectEqual(@as(f32, 0), value);
     }
+}
+
+test "LightOnOCR3 CUDA uncached hidden and logits forwards own admitted temporary recurrence" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const cuda = @import("../ops/cuda/cuda_compute.zig");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const a = std.testing.allocator;
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const Fixture = struct {
+        fn weight(c: *cuda.CudaCompute, name: []const u8, shape: []const i64, norm: bool) !void {
+            var count: usize = 1;
+            for (shape) |dim| count *= @intCast(dim);
+            const values = try a.alloc(f32, count);
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = if (norm) 1 else @sin(@as(f32, @floatFromInt(i + 1)) * 0.17) * 0.1;
+            var tensor = try Tensor.initFloat32(a, name, shape, values);
+            defer tensor.deinit();
+            const key = try a.dupe(u8, name);
+            errdefer a.free(key);
+            try c.insertWeightFromTensor(key, &tensor);
+        }
+    };
+    var cfg = Config{ .family = .qwen3_5, .hidden_size = 4, .intermediate_size = 8, .vocab_size = 8, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .max_position_embeddings = 64, .position_encoding = .rope, .norm_type = .rms_norm, .activation = .silu, .qwen35_has_linear_attention = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 128, .qwen35_linear_value_head_dim = 128, .qwen35_linear_conv_kernel_dim = 4 };
+    try std.testing.expectEqual(.cuda, qwen35_execution.apply(&cfg, compute.ctx.info.compute_major, true).placement);
+    inline for (.{
+        .{ "model.embed_tokens.weight", 8, 4 },
+        .{ "lm_head.weight", 8, 4 },
+        .{ "model.layers.0.linear_attn.in_proj_qkv.weight", 384, 4 },
+        .{ "model.layers.0.linear_attn.in_proj_z.weight", 128, 4 },
+        .{ "model.layers.0.linear_attn.in_proj_b.weight", 1, 4 },
+        .{ "model.layers.0.linear_attn.in_proj_a.weight", 1, 4 },
+        .{ "model.layers.0.linear_attn.conv1d.weight", 384, 4 },
+        .{ "model.layers.0.linear_attn.out_proj.weight", 4, 128 },
+        .{ "model.layers.0.mlp.gate_proj.weight", 8, 4 },
+        .{ "model.layers.0.mlp.up_proj.weight", 8, 4 },
+        .{ "model.layers.0.mlp.down_proj.weight", 4, 8 },
+    }) |spec| try Fixture.weight(&compute, spec[0], &.{ spec[1], spec[2] }, false);
+    inline for (.{ "model.norm.weight", "model.layers.0.input_layernorm.weight", "model.layers.0.post_attention_layernorm.weight" }) |name|
+        try Fixture.weight(&compute, name, &.{4}, true);
+    try Fixture.weight(&compute, "model.layers.0.linear_attn.norm.weight", &.{128}, true);
+    try Fixture.weight(&compute, "model.layers.0.linear_attn.A_log", &.{1}, false);
+    try Fixture.weight(&compute, "model.layers.0.linear_attn.dt_bias", &.{1}, false);
+
+    var controller = runtime.tier.memory.AdmissionController{};
+    defer controller.deinit();
+    const limits = runtime.tier.memory.Limits{ .backend_limit_bytes = 16 * 1024 * 1024 };
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = limits, .check_live_memory = false };
+    defer compute.ctx.video_cache_budget.admission = null;
+    const ids = [_]i64{ 1, 3, 2 };
+    // The same null-context entry points used by Session.run and compare-generate.
+    const hidden = try hiddenForward(&cb, a, cfg, &ids, 1, ids.len, null);
+    defer a.free(hidden);
+    try std.testing.expectEqual(@as(usize, ids.len * cfg.hidden_size), hidden.len);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
+    const logits = try forward(&cb, a, cfg, &ids, 1, ids.len, null);
+    defer a.free(logits);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
+    const repeated = try forward(&cb, a, cfg, &ids, 1, ids.len, null);
+    defer a.free(repeated);
+    try std.testing.expectEqualSlices(f32, logits, repeated);
+    var nonzero = false;
+    for (logits) |value| {
+        try std.testing.expect(std.math.isFinite(value));
+        nonzero = nonzero or @abs(value) > 1e-6;
+    }
+    try std.testing.expect(nonzero);
+
+    {
+        var lease = try controller.tryAcquire(.gpu, limits, .{ .backend_scratch_bytes = try runtime.tier.memory.gptRecurrentBackendStateBytes(.cuda, cfg) }, false);
+        defer lease.release();
+        var cache = try Qwen35LinearCache.init(a, cfg);
+        defer cache.deinit();
+        const context = DecodeContext{ .total_sequence_len = ids.len, .query_sequence_len = ids.len, .kv_sequence_len = 0, .qwen35_linear_cache = &cache };
+        const cached = try forward(&cb, a, cfg, &ids, 1, ids.len, &context);
+        defer a.free(cached);
+        try std.testing.expectEqualSlices(f32, logits, cached);
+    }
+
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = 1;
+    const downloads = compute.stats.d2h_bytes;
+    try std.testing.expectError(error.ResourceLimitExceeded, forward(&cb, a, cfg, &ids, 1, ids.len, null));
+    try std.testing.expectEqual(downloads, compute.stats.d2h_bytes);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
 }

@@ -35,7 +35,10 @@ for the initial full-text, embedding, and GLiNER graph pipeline.
    recurrence must remain device-resident; explicitly disabling the core must
    resolve to `host/operator_disabled` at model load. A resident device history
    must fail closed if device execution fails, rather than migrate to an empty
-   host history. Check placement logs and recurrent model metrics.
+   host history. Full-prefix forwards without a decode cache must acquire
+   temporary device state, release its admission on completion or failure,
+   and match a fresh cached forward. Check placement logs and recurrent
+   model metrics.
 2. Compare the default serving profile with the explicit CPU recurrence
    baseline on identical inputs. Use `benchmark_concurrency.py --backend cuda
    --require-recurrent-placement`; omit `--cuda-recurrent-core` for the default
