@@ -24,7 +24,7 @@ const catalog = @import("catalog.zig");
 const A = std.mem.Allocator;
 // Named transport types keep the checked callback ABI stable across separately
 // compiled runtimes. Anonymous enum/struct type names contain local IDs.
-pub const Operation = enum { validate, scan, scan_ordered, estimate, population, get, get_many, expand, search, observe, observe_ranges, normalize, project, probe, count, expand_many };
+pub const Operation = enum { validate, scan, scan_ordered, estimate, population, get, get_many, expand, search, observe, observe_ranges, normalize, project, probe, count, expand_many, adjacency_routes };
 pub const Filter = struct { property: []const u8, value: std.json.Value, op: b.FilterOp = .eq, domain: ?b.ScalarDomain = null, plan: ?b.DomainPlan = null };
 // Borrow immutable scalar/string payloads through one owner call. Avoid the
 // stringify/parse round trip (and arena growth) for already typed filter data.
@@ -118,6 +118,7 @@ pub const Request = struct {
 };
 pub const Projection = struct { node: ?*const v.Node, relationships: []const *const v.Relationship = &.{} };
 pub const Reply = struct {
+    adjacency_routes: []const b.AdjacencyRoute = &.{},
     batch: ?BatchReply = null,
     count: ?b.CountResult = null,
     read_failure: ?BudgetFailure = null,
@@ -145,6 +146,20 @@ pub const Reply = struct {
     /// scratch (including per-document decoding) has been reclaimed.
     pub fn clone(self: Reply, a: A) !Reply {
         var out = self;
+        try b.validateAdjacencyRoutes(self.adjacency_routes);
+        const routes = try a.dupe(b.AdjacencyRoute, self.adjacency_routes);
+        for (routes) |*route| {
+            route.index = try a.dupe(u8, route.index);
+            if (route.outgoing) |*r| {
+                r.min = try a.dupe(u8, r.min);
+                r.max = try a.dupe(u8, r.max);
+            }
+            if (route.incoming) |*r| {
+                r.min = try a.dupe(u8, r.min);
+                r.max = try a.dupe(u8, r.max);
+            }
+        }
+        out.adjacency_routes = routes;
         if (self.batch) |batch| out.batch = try BatchReply.fromBatch(a, try batch.toBatch(a));
         const values = try a.dupe(wire.Value, self.values);
         for (values) |*item| item.value = try item.value.clone(a);
@@ -214,7 +229,7 @@ pub const Client = struct {
         if (reply.work > bounded.max_work) return error.CypherInvalidBackendPage;
         if (self.work) |work| try work.charge(work.ptr, reply.work);
         if (reply.read_failure) |failure| {
-            if ((request.operation != .scan_ordered and request.operation != .get_many and request.operation != .probe and request.operation != .count and request.operation != .expand_many) or reply.values.len != 0 or reply.next != null or reply.ordered or reply.cursors != null or reply.cursor_trace != null or reply.count != null or reply.batch != null) return error.CypherInvalidBackendPage;
+            if ((request.operation != .scan_ordered and request.operation != .get_many and request.operation != .probe and request.operation != .count and request.operation != .expand_many) or reply.values.len != 0 or reply.next != null or reply.ordered or reply.cursors != null or reply.cursor_trace != null or reply.count != null or reply.batch != null or reply.adjacency_routes.len != 0) return error.CypherInvalidBackendPage;
             return switch (failure) {
                 .work => error.CypherStateBudgetExceeded,
                 .anchors => error.CypherAnchorBudgetExceeded,
@@ -402,11 +417,13 @@ pub const Client = struct {
     }
     fn countNodes(ptr: *anyopaque, a: A, table: []const u8, input: b.CountInput) !?b.CountResult {
         const self = cast(ptr);
-        const request: Request = .{ .read_fields = self.read_fields, .operation = .count, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .max_examined = input.max_examined, .count = .{ .node = input.node, .predicate = input.predicate, .parameters = .{ .value = .{ .map = input.parameters } }, .source = input.source, .memory_bytes = input.memory_bytes } };
+        const request: Request = .{ .read_fields = self.read_fields, .operation = .count, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .max_examined = input.max_examined, .max_work = input.max_work, .count = .{ .node = input.node, .predicate = input.predicate, .parameters = .{ .value = .{ .map = input.parameters } }, .source = input.source, .memory_bytes = input.memory_bytes } };
         var size = std.Io.Writer.Discarding.init(&.{});
         try std.json.Stringify.value(request, .{}, &size.writer);
         if (size.fullCount() > (1 << 20) - 2048) return null;
-        const reply = try self.invoke(a, request);
+        var arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer arena.deinit();
+        const reply = try self.invoke(arena.allocator(), request);
         if (reply.values.len != 0 or reply.next != null or reply.batch != null) return error.CypherInvalidBackendPage;
         if (reply.count) |result| if (result.count > result.examined or result.examined > input.max_examined or reply.values.len != 0 or reply.next != null) return error.CypherInvalidBackendPage;
         return reply.count;
@@ -578,6 +595,13 @@ pub const Owner = struct {
                 node.* = .{ .identity = identity, .properties = document.map };
                 const normalized = try (self.backend.vtable.normalize_node orelse return error.CypherInvalidDocument)(self.backend.ptr, scratch, node, request.apply_defaults);
                 try values.append(scratch, .{ .value = .{ .node = normalized } });
+            },
+            .adjacency_routes => {
+                if (!self.permitsTable(request.table)) return error.Forbidden;
+                const routes = if (self.backend.vtable.adjacency_routes) |read| try read(self.backend.ptr, scratch, request.table) else &.{};
+                try self.backend.vtable.checkpoint(self.backend.ptr);
+                try b.validateAdjacencyRoutes(routes);
+                return .{ .adjacency_routes = routes, .work = meter.units };
             },
             .population => {
                 if (!self.permitsTable(request.table)) return error.Forbidden;
@@ -1138,4 +1162,23 @@ test "typed reply clones own composite seek window ordinals" {
     const reply = try (Reply{ .seek_window = .{ .filter = 7, .prefix_filters = &ordinals } }).clone(arena.allocator());
     ordinals[0] = 99;
     try std.testing.expectEqualSlices(usize, &.{ 2, 5 }, reply.seek_window.?.prefix_filters);
+}
+
+test "retained adjacency directory clones owned bounds and rejects invalid exclusion proofs" {
+    var output = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer output.deinit();
+    var owned: Reply = undefined;
+    {
+        var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const routes = try a.alloc(b.AdjacencyRoute, 1);
+        routes[0] = .{ .index = try a.dupe(u8, "links"), .outgoing = .{ .min = try a.dupe(u8, "a\x00"), .max = try a.dupe(u8, "z") }, .incoming = .{ .empty = true } };
+        owned = try (Reply{ .adjacency_routes = routes }).clone(output.allocator());
+    }
+    try std.testing.expectEqualStrings("links", owned.adjacency_routes[0].index);
+    try std.testing.expect(owned.adjacency_routes[0].outgoing.?.contains("a\x00"));
+    try std.testing.expect(!owned.adjacency_routes[0].incoming.?.contains("a"));
+    try std.testing.expectError(error.CypherInvalidBackendPage, b.validateAdjacencyRoutes(&.{.{ .index = "links", .outgoing = .{ .min = "z", .max = "a" } }}));
+    try std.testing.expectError(error.CypherInvalidBackendPage, b.validateAdjacencyRoutes(&.{ .{ .index = "links" }, .{ .index = "links" } }));
 }

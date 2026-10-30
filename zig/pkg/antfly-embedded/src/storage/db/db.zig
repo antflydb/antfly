@@ -28197,6 +28197,32 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("scanCypherPinnedSnapshot", .{ self, alloc, cut, from, to, opts });
         return @import("cypher_pinned_read.zig").scan(self, alloc, cut, from, to, opts);
     }
+    pub fn cypherAdjacencyRoutes(self: *DB, alloc: Allocator) ![]const @import("cypher").backend.AdjacencyRoute {
+        if (comptime storage_engine.enabled) return storage_engine.call("cypherAdjacencyRoutes", .{ self, alloc });
+        // A capture fence alone cannot pin independently published index roots.
+        // Durable query-cut DBs are immutable physical copies; mutable DBs do
+        // not export exclusion proofs. Pinned facades use their captured roots.
+        if (!self.hasRetainedQueryCut()) return &.{};
+        const indexes = try self.listIndexes(alloc);
+        defer {
+            for (indexes) |*index| index.deinit(alloc);
+            alloc.free(indexes);
+        }
+        var routes: std.ArrayList(@import("cypher").backend.AdjacencyRoute) = .empty;
+        for (indexes) |index| if (index.kind == .graph) {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            const entry = self.core.graphIndex(index.name) orelse return error.IndexNotFound;
+            var context = try entry.index.beginEdgeReadContextWithProof(.both);
+            defer context.deinit();
+            try routes.append(alloc, try @import("cypher_pinned_read.zig").adjacencyRoute(alloc, index.name, &context));
+        };
+        return routes.toOwnedSlice(alloc);
+    }
+    pub fn cypherPinnedAdjacencyRoutes(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot) ![]const @import("cypher").backend.AdjacencyRoute {
+        if (comptime storage_engine.enabled) return storage_engine.call("cypherPinnedAdjacencyRoutes", .{ self, alloc, cut });
+        return @import("cypher_pinned_read.zig").adjacencyRoutes(alloc, cut);
+    }
     pub fn graphEdgesForCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, index: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits) !graph_mod.CypherEdgePage {
         if (comptime storage_engine.enabled) return storage_engine.call("graphEdgesForCypherPinnedSnapshot", .{ self, alloc, cut, index, key, edge_types, direction, cursor, limits });
         return @import("cypher_pinned_read.zig").edges(self, alloc, cut, index, key, edge_types, direction, cursor, limits);

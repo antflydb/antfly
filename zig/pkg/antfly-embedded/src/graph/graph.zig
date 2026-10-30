@@ -8605,6 +8605,34 @@ pub const GraphIndex = struct {
         defer context.deinit();
         return self.getCypherEdgesByTypesPageInRead(a, key, edge_types, direction, scan_cursor, limits, now_ns, &context);
     }
+    pub const EndpointRange = struct { empty: bool = false, min: []const u8 = "", max: []const u8 = "" };
+    /// Four bounded seeks over the same physical roots as adjacency reads.
+    /// All user records widen these envelopes, including producer ownership
+    /// records. No policy-filtered row or primary document range is evidence
+    /// for excluding a physical endpoint. Legacy/malformed roots stay unknown.
+    pub fn endpointRangeInRead(a: Allocator, read: *backend_erased.ReadTxn) !?EndpointRange {
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const first = (try cursor.seekAtOrAfter(&.{internal_keys.user_namespace})) orelse return .{ .empty = true };
+        if (!internal_keys.isInternalUserKey(first.key)) return .{ .empty = true };
+        if (first.key.len > 8192) return null;
+        const min = (try internal_keys.decodeDocumentComponentAlloc(a, first.key)) orelse return null;
+        errdefer a.free(min);
+        const last = (try cursor.seekAtOrBefore(&.{internal_keys.user_namespace + 1})) orelse {
+            a.free(min);
+            return null;
+        };
+        if (last.key.len > 8192 or !internal_keys.isInternalUserKey(last.key)) {
+            a.free(min);
+            return null;
+        }
+        const max = (try internal_keys.decodeDocumentComponentAlloc(a, last.key)) orelse {
+            a.free(min);
+            return null;
+        };
+        return .{ .min = min, .max = max };
+    }
+
     /// Read every assertion page from the same captured ownership pair.
     pub fn getCypherEdgesByTypesPageInRead(self: *GraphIndex, a: Allocator, key: []const u8, edge_types: []const []const u8, direction: EdgeDirection, scan_cursor: ?CypherEdgeScanCursor, limits: EdgePageLimits, now_ns: u64, context: *EdgeReadContext) !CypherEdgePage {
         if (limits.max_edges == 0 or limits.max_scanned_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
@@ -40274,4 +40302,34 @@ test "graph pair prefixes seek hubs and preserve parallel IDs across assertion p
         try std.testing.expectEqual(@as(usize, 2), total);
         try std.testing.expect(examined <= 6);
     }
+}
+
+test "graph endpoint envelopes retain producer endpoints binary keys and immutable roots" {
+    const a = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer graph.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    {
+        var empty = try graph.beginEdgeReadContextWithProof(.both);
+        defer empty.deinit();
+        try std.testing.expect((try GraphIndex.endpointRangeInRead(scratch, &empty.reads.outgoing.?)).?.empty);
+        try std.testing.expect((try GraphIndex.endpointRangeInRead(scratch, &empty.reads.incoming.?)).?.empty);
+    }
+    try graph.batchApply(&.{.{ .source = "a\x00source", .target = "b\x00target", .edge_type = "R", .edge_id = "fact", .owner_document = "z" }}, &.{});
+    var retained = try graph.beginEdgeReadContextWithProof(.both);
+    defer retained.deinit();
+    // New live endpoints must not widen the captured directory or appear in
+    // its captured reads. Producer z is allowed to widen the outgoing bound.
+    try graph.batchApply(&.{.{ .source = "0", .target = "zz", .edge_type = "R" }}, &.{});
+    const outgoing = (try GraphIndex.endpointRangeInRead(scratch, &retained.reads.outgoing.?)).?;
+    const incoming = (try GraphIndex.endpointRangeInRead(scratch, &retained.reads.incoming.?)).?;
+    try std.testing.expect(!outgoing.empty and !incoming.empty);
+    try std.testing.expect(std.mem.order(u8, outgoing.min, "a\x00source") != .gt);
+    try std.testing.expect(std.mem.order(u8, outgoing.max, "a\x00source") != .lt);
+    try std.testing.expect(std.mem.order(u8, incoming.min, "b\x00target") != .gt);
+    try std.testing.expect(std.mem.order(u8, incoming.max, "b\x00target") != .lt);
+    try std.testing.expect(std.mem.order(u8, outgoing.min, "0") == .gt);
+    try std.testing.expect(std.mem.order(u8, incoming.max, "zz") == .lt);
 }

@@ -4735,3 +4735,34 @@ and the replicated-owner qualification in 161.72 seconds. The nonunique
 127-key public regression counts 254 matches while visiting exactly 254 anchors.
 The enrichment owner-loss campaign caveat recorded above
 remains open; these gates do not rerun or establish a fix for that campaign.
+
+The owner-wave follow-up merges `origin/main` through `7b9245d250` in
+`62bef6bf40`; the generated Go SDK spec is regenerated from the merged OpenAPI
+source. Exact count partials and adjacency frontier batches now share the
+bounded owner-read scheduler. Remote waves respect configured width, local
+capability thread affinity, statement cancellation and retained-cut checks.
+Every started call joins before scratch is released. Isolated work reservations
+are charged before skewed owners retry; discarded count/edge reservations and
+speculative adjacency pages remain accounted. Adjacency results are consumed in
+original owner order, preserving first nonempty pages and native continuation
+ownership. Payload admission remains one MiB for the returned batch.
+
+Retained physical graph roots now supply a conservative endpoint directory.
+Two boundary seeks in each outgoing/reverse root produce inclusive endpoint
+envelopes without scanning rows or changing persistent write metadata. Producer
+ownership records may widen an envelope; logical endpoints outside primary
+shard ranges remain included. The directory is captured during the existing
+owner-fork wave and lives exactly as long as that owner's retained capability.
+Routing consults these graph envelopes before document-placement certificates.
+Unknown/legacy capabilities keep broadcast routing. Empty proofs exclude empty
+owners; broad or overlapping envelopes retain false positives. Durable managed
+cuts derive the same proof from their immutable physical copies; mutable DBs
+return unknown rather than consulting live graph roots.
+
+In the same eight-owner fixture with a 20-ms delay per owner and fanout width
+four, count latency drops from 175 to 53 ms and empty adjacency from 176 to
+50 ms. These are synthetic transport-latency measurements, not production
+throughput claims. Regression coverage includes skewed reservations, work
+charging, revocation, controller-thread affinity, speculative edge accounting,
+original owner ordering, binary endpoint keys, producer placement and cloned
+routing-proof ownership.

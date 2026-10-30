@@ -160,10 +160,16 @@ pub const Statement = struct {
             const read = try self.fence.captureGraph(a, .{ .defer_validation = self.fence.graph_finalizes_validation, .indexes = self.plan.table.indexes, .catalog_json = statement.input.catalog_json, .catalogs_json = statement.input.catalogs_json, .table = self.plan.table.name, .table_id = self.plan.table.table_id, .schema_version = self.plan.table.schema_version, .cut_id = std.fmt.bytesToHex(digest, .lower), .expires_ms = statement.input.expires_ms, .ttl_now_ns = statement.input.ttl_now_ns, .principal_proof = self.plan.table.principal_proof, .database = self.plan.table.database, .filter_query_json = self.plan.table.filter_query_json });
             errdefer read.deinit();
             self.read = read;
+            errdefer self.read = null;
             const snapshot = try a.create(Owner);
-            snapshot.* = .{ .a = a, .statement = statement, .read = read, .client = undefined };
+            snapshot.* = .{ .a = a, .statement = statement, .read = read, .client = undefined, .routing_arena = .init(a) };
+            errdefer a.destroy(snapshot);
+            errdefer snapshot.routing_arena.deinit();
             snapshot.client = .{ .channel = .{ .ptr = snapshot, .call = Owner.call, .typed = Owner.callTyped }, .incarnation = statement.graph.incarnation, .revision = statement.graph.revision, .allowed_versions = statement.versions };
-            return .{ .backend = snapshot.client.backend(), .ptr = snapshot, .validate = Owner.validate, .close = Owner.close, .validation_covered_by_source = true };
+            const adjacency_needed = if (self.plan.table.indexes) |indexes| indexes.len != 0 else statement.graph.relationships.len != 0;
+            const routing = if (!adjacency_needed) cypher.rpc.Reply{} else try Owner.callTyped(snapshot, snapshot.routing_arena.allocator(), .{ .operation = .adjacency_routes, .table = self.plan.table.name, .graph_incarnation = statement.graph.incarnation, .graph_revision = statement.graph.revision });
+            try cypher.backend.validateAdjacencyRoutes(routing.adjacency_routes);
+            return .{ .adjacency_routes = routing.adjacency_routes, .backend = snapshot.client.backend(), .ptr = snapshot, .validate = Owner.validate, .close = Owner.close, .validation_covered_by_source = true };
         }
     };
     const Owner = struct {
@@ -171,6 +177,7 @@ pub const Statement = struct {
         statement: *Statement,
         read: port.GraphRead,
         client: cypher.rpc.Client,
+        routing_arena: std.heap.ArenaAllocator,
         fn validate(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try checkpoint(self.statement);
@@ -178,6 +185,7 @@ pub const Statement = struct {
         fn close(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.read.deinit();
+            self.routing_arena.deinit();
             self.a.destroy(self);
         }
         fn call(ptr: *anyopaque, a: std.mem.Allocator, body: []const u8) ![]u8 {

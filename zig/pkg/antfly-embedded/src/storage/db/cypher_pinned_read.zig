@@ -255,6 +255,17 @@ fn checkBatch(authority: anytype, opts: types.ScanOptions) !void {
     if (opts.execution_deadline_ns) |deadline| if (time.monotonicNs() >= deadline) return error.DeadlineExceeded;
 }
 
+pub fn adjacencyRoute(a: A, name: []const u8, context: *graph.GraphIndex.EdgeReadContext) !cypher.backend.AdjacencyRoute {
+    const outgoing = if (context.reads.outgoing) |*read| try graph.GraphIndex.endpointRangeInRead(a, read) else null;
+    const incoming = if (context.reads.incoming) |*read| try graph.GraphIndex.endpointRangeInRead(a, read) else null;
+    return .{ .index = try a.dupe(u8, name), .outgoing = if (outgoing) |r| .{ .empty = r.empty, .min = r.min, .max = r.max } else null, .incoming = if (incoming) |r| .{ .empty = r.empty, .min = r.min, .max = r.max } else null };
+}
+pub fn adjacencyRoutes(a: A, cut: *Snapshot) ![]const cypher.backend.AdjacencyRoute {
+    const routes = try a.alloc(cypher.backend.AdjacencyRoute, cut.graphs.len);
+    for (cut.graphs, routes) |*entry, *route| route.* = try adjacencyRoute(a, entry.name, &entry.context);
+    return routes;
+}
+
 pub fn edges(db: anytype, a: A, cut: *Snapshot, name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph.EdgeDirection, cursor: ?graph.CypherEdgeScanCursor, limits: graph.EdgePageLimits) !graph.CypherEdgePage {
     const pinned = for (cut.graphs) |*entry| {
         if (std.mem.eql(u8, entry.name, name)) break entry;
@@ -375,6 +386,9 @@ pub fn Database(comptime DB: type) type {
         /// Authenticate every adjacency read while retaining its captured roots.
         /// Producer/end-point projection remains the adapter's authoritative
         /// per-entity policy check; no live adjacency fallback is permitted.
+        pub fn cypherAdjacencyRoutes(self: *@This(), a: A) ![]const cypher.backend.AdjacencyRoute {
+            return self.source.cypherPinnedAdjacencyRoutes(a, &self.cut);
+        }
         pub fn graphEdgesForCypherPageAuthorizedAt(self: *@This(), a: A, index: []const u8, key: []const u8, edge_types: []const []const u8, direction: cypher.ast.Direction, cursor: ?DB.CypherEdgeScanCursor, limits: anytype, now: u64, proof: []const u8, database: []const u8) !DB.CypherEdgePage {
             var authority = try self.source.acquireCypherReadAuthority(a, proof, database);
             defer authority.release();

@@ -587,3 +587,153 @@ test "parallel probes join charge and preserve EOF encounter order under skew an
         for (owners) |owner| try std.testing.expectEqual(meter.work().ptr, owner.work.?.ptr);
     }
 }
+
+test "count waves join charge skewed retries and preserve local affinity" {
+    const Fixture = struct {
+        activity: Activity,
+        controller: std.Thread.Id,
+        mode: enum { normal, serial, local, anchors, work, forbidden, revoked },
+        revoked: std.atomic.Value(bool) = .init(false),
+        calls: atomic = .init(0),
+        owners: [8]Owner = undefined,
+        const Owner = struct {
+            f: *ThisFixture,
+            index: usize,
+            work: ?b.Work = null,
+            fn configure(ptr: *anyopaque, work: ?b.Work) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.work = work;
+            }
+            fn check(_: *anyopaque) !void {}
+            fn count(ptr: *anyopaque, _: A, _: []const u8, input: b.CountInput) !?b.CountResult {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.f.mode == .local and self.index == 0) try std.testing.expectEqual(self.f.controller, std.Thread.getCurrentId());
+                try self.f.activity.enter();
+                defer self.f.activity.leave();
+                _ = self.f.calls.fetchAdd(1, .monotonic);
+                const units: usize = if (self.f.mode == .work and self.index == 0) 9000 else 1;
+                for (0..units) |_| if (self.work) |work| try work.charge(work.ptr, 1);
+                if (self.index == 1 and self.f.mode == .forbidden) return error.Forbidden;
+                if (self.index == 1 and self.f.mode == .revoked) self.f.revoked.store(true, .release);
+                const count_value: usize = if (self.f.mode == .anchors and self.index == 0) 1500 else 1;
+                if (count_value > input.max_examined) return error.CypherAnchorBudgetExceeded;
+                return .{ .count = count_value, .examined = count_value };
+            }
+        };
+        const ThisFixture = @This();
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.revoked.load(.acquire)) return error.Forbidden;
+        }
+    };
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(4) });
+    defer threaded.deinit();
+    for (std.enums.values(@FieldType(Fixture, "mode"))) |mode| {
+        var f: Fixture = .{ .activity = .{ .io = threaded.io() }, .controller = std.Thread.getCurrentId(), .mode = mode };
+        var targets: [8]d.Target = undefined;
+        var snapshots: [8]d.Snapshot = undefined;
+        for (&f.owners, &targets, &snapshots, 0..) |*owner, *target, *snapshot, i| {
+            owner.* = .{ .f = &f, .index = i };
+            target.* = .{ .parallel = mode != .local or i != 0, .table = "docs", .table_id = 1, .group_id = i + 1 };
+            snapshot.* = .{ .ptr = owner, .validate = Fixture.Owner.check, .close = undefined, .backend = .{ .ptr = owner, .vtable = &.{ .bind = undefined, .checkpoint = Fixture.Owner.check, .scan = undefined, .get = undefined, .expand = undefined, .count_nodes = Fixture.Owner.count, .set_work = Fixture.Owner.configure } } };
+        }
+        var read: d.ReadSet = .{ .a = std.testing.allocator, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &f, .checkpoint = Fixture.check, .admit = undefined, .capture = undefined, .fanout_io = if (mode == .serial) null else threaded.io(), .fanout_width = 4 } };
+        var meter: b.Meter = .{ .a = std.testing.allocator, .backend = .{ .ptr = &f, .vtable = &.{ .bind = undefined, .checkpoint = Fixture.check, .scan = undefined, .get = undefined, .expand = undefined } }, .limit = 20000 };
+        const backend = read.backend();
+        backend.vtable.set_work.?(backend.ptr, meter.work());
+        const result = backend.vtable.count_nodes.?(backend.ptr, std.testing.allocator, "docs", .{ .node = .{ .span = .{}, .alias = "n", .labels = &.{"D"}, .properties = &.{} }, .max_examined = 4096, .max_work = 20000 });
+        if (mode == .forbidden or mode == .revoked) {
+            try std.testing.expectError(error.Forbidden, result);
+        } else {
+            const count_result = (try result).?;
+            try std.testing.expectEqual(@as(usize, if (mode == .anchors) 1507 else 8), count_result.count);
+            try std.testing.expect(count_result.examined <= 4096);
+            if (mode == .anchors) try std.testing.expect(count_result.examined > count_result.count);
+            if (mode == .work) try std.testing.expect(meter.units > 9007);
+        }
+        try std.testing.expectEqual(@as(usize, 0), f.activity.active.load(.acquire));
+        try std.testing.expect(if (mode == .serial) f.activity.peak.load(.acquire) == 1 else f.activity.peak.load(.acquire) > 1);
+        for (f.owners) |owner| try std.testing.expectEqual(meter.work().ptr, owner.work.?.ptr);
+    }
+}
+
+test "adjacency waves retain original first owner and charge speculative pages" {
+    const catalog = @import("catalog.zig");
+    const Fixture = struct {
+        activity: Activity,
+        calls: atomic = .init(0),
+        skew: bool = false,
+        owners: [8]Owner = undefined,
+        const Owner = struct {
+            f: *ThisFixture,
+            edge: v.Relationship,
+            index: usize,
+            work: ?b.Work = null,
+            fn configure(ptr: *anyopaque, work: ?b.Work) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.work = work;
+            }
+            fn check(_: *anyopaque) !void {}
+            fn batch(ptr: *anyopaque, a: A, _: catalog.Relationship, ids: []const v.Identity, _: @import("ast.zig").Direction, _: usize, maximum: usize) !?b.ExpansionBatch {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                try self.f.activity.enter();
+                defer self.f.activity.leave();
+                _ = self.f.calls.fetchAdd(1, .monotonic);
+                const units: usize = if (self.f.skew and self.index == 0) 9000 else 1;
+                for (0..units) |_| if (self.work) |work| try work.charge(work.ptr, 1);
+                try std.testing.expect(maximum >= 1);
+                const pages = try a.alloc(?b.Page(*const v.Relationship), ids.len);
+                for (pages) |*page| page.* = .{ .items = try a.dupe(*const v.Relationship, &.{&self.edge}), .examined = 1 };
+                return .{ .pages = pages, .examined = ids.len };
+            }
+        };
+        const ThisFixture = @This();
+    };
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(4) });
+    defer threaded.deinit();
+    for ([_]bool{ false, true }) |skew| {
+        var f: Fixture = .{ .activity = .{ .io = threaded.io() }, .skew = skew };
+        var targets: [8]d.Target = undefined;
+        var snapshots: [8]d.Snapshot = undefined;
+        for (&f.owners, &targets, &snapshots, 0..) |*owner, *target, *snapshot, i| {
+            owner.* = .{ .f = &f, .index = i, .edge = .{ .identity = .{ .table = "docs", .key = "edge" }, .index = "links", .type = "R", .source = .{ .table = "docs", .key = "a" }, .target = .{ .table = "docs", .key = "b" } } };
+            target.* = .{ .parallel = true, .table = "docs", .table_id = 1, .group_id = i + 1 };
+            snapshot.* = .{ .ptr = owner, .validate = Fixture.Owner.check, .close = undefined, .backend = .{ .ptr = owner, .vtable = &.{ .bind = undefined, .checkpoint = Fixture.Owner.check, .scan = undefined, .get = undefined, .expand = undefined, .expand_many = Fixture.Owner.batch, .set_work = Fixture.Owner.configure } } };
+        }
+        const mapping: catalog.Relationship = .{ .name = "R", .stored_type = "R", .index = "links", .source_label = "D", .target_label = "D" };
+        var read: d.ReadSet = .{ .a = std.testing.allocator, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &f, .checkpoint = Fixture.Owner.check, .admit = undefined, .capture = undefined, .fanout_io = threaded.io(), .fanout_width = 4 }, .graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{mapping} } };
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const backend = read.backend();
+        var meter: b.Meter = .{ .a = std.testing.allocator, .backend = .{ .ptr = &f, .vtable = &.{ .bind = undefined, .checkpoint = Fixture.Owner.check, .scan = undefined, .get = undefined, .expand = undefined } }, .limit = 20000 };
+        backend.vtable.set_work.?(backend.ptr, meter.work());
+        const result = (try backend.vtable.expand_many.?(backend.ptr, arena.allocator(), mapping, &.{.{ .table = "docs", .key = "a" }}, .out, 128, 4096)).?;
+        try std.testing.expectEqual(@as(usize, if (skew) 5 else 4), f.calls.load(.acquire));
+        try std.testing.expectEqual(@as(usize, if (skew) 516 else 4), result.examined);
+        try std.testing.expectEqual(@as(usize, 1), result.pages[0].?.items.len);
+        try std.testing.expect(result.pages[0].?.next != null);
+        try std.testing.expect(f.activity.peak.load(.acquire) > 1);
+        try std.testing.expectEqual(@as(usize, 0), f.activity.active.load(.acquire));
+        // Excluded owners consume neither batch quota nor capability probes.
+        // The last physical owner can contain a producer-owned source a.
+        var excluded: [7]b.Backend.VTable = undefined;
+        for (snapshots[0..7], &excluded) |*snapshot, *callbacks| {
+            callbacks.* = snapshot.backend.vtable.*;
+            callbacks.expand_many = null;
+            snapshot.backend.vtable = callbacks;
+            snapshot.adjacency_routes = &.{.{ .index = "links", .outgoing = .{ .empty = true }, .incoming = .{ .empty = true } }};
+        }
+        snapshots[7].adjacency_routes = &.{.{ .index = "links", .outgoing = .{ .min = "a", .max = "a" }, .incoming = .{ .empty = true } }};
+        f.calls.store(0, .release);
+        const routed = (try backend.vtable.expand_many.?(backend.ptr, arena.allocator(), mapping, &.{.{ .table = "docs", .key = "a" }}, .out, 128, 1)).?;
+        try std.testing.expectEqual(@as(usize, 1), f.calls.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), routed.examined);
+        try std.testing.expectEqual(@as(usize, 1), routed.pages[0].?.items.len);
+        try std.testing.expect(routed.pages[0].?.next == null);
+        f.calls.store(0, .release);
+        const empty = (try backend.vtable.expand_many.?(backend.ptr, arena.allocator(), mapping, &.{.{ .table = "docs", .key = "outside" }}, .out, 128, 1)).?;
+        try std.testing.expectEqual(@as(usize, 0), f.calls.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), empty.examined);
+        try std.testing.expectEqual(@as(usize, 0), empty.pages[0].?.items.len);
+    }
+}

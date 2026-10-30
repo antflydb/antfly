@@ -45,6 +45,8 @@ pub const Target = struct {
     }
 };
 pub const Snapshot = struct {
+    /// Borrowed from this exact retained capability, never live catalog state.
+    adjacency_routes: []const b.AdjacencyRoute = &.{},
     /// Set only when source.checkpoint already performs exactly this snapshot's
     /// validation. Independent authority checks remain mandatory by default.
     validation_covered_by_source: bool = false,
@@ -286,6 +288,8 @@ pub const ReadSet = struct {
         operation: union(enum) {
             ordered: struct { table: []const u8, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, after: ?[]const u8 = null, limit: usize = 0 },
             get_many: []const v.Identity,
+            count: struct { table: []const u8, input: b.CountInput },
+            expand: struct { mapping: catalog.Relationship, identities: []const v.Identity, direction: ast.Direction, limit: usize, allowance: usize },
             probe: struct { table: []const u8, filters: []const b.PropertyFilter, limit: usize },
         },
         arena: std.heap.ArenaAllocator = undefined,
@@ -294,11 +298,20 @@ pub const ReadSet = struct {
         page: ?b.Page(*const v.Node) = null,
         nodes: []const ?*const v.Node = &.{},
         probe: ?b.Probe = null,
+        count_result: ?b.CountResult = null,
+        expansion: ?b.ExpansionBatch = null,
         err: ?anyerror = null,
         fn invoke(self: *@This(), read: *ReadSet) !void {
             const owner = read.snapshots[self.owner].backend;
             const a = self.arena.allocator();
             switch (self.operation) {
+                .count => |input| {
+                    var demand = input.input;
+                    demand.max_examined = self.maximum;
+                    if (self.meter) |meter| demand.max_work = @min(demand.max_work, meter.limit);
+                    self.count_result = try owner.vtable.count_nodes.?(owner.ptr, a, input.table, demand);
+                },
+                .expand => |input| self.expansion = if (input.identities.len == 0) .{ .pages = &.{}, .examined = 0 } else try owner.vtable.expand_many.?(owner.ptr, a, input.mapping, input.identities, input.direction, input.limit, self.maximum),
                 .probe => |input| self.probe = if (owner.vtable.probe_where) |callback| try callback(owner.ptr, a, input.table, input.filters, input.limit) else null,
                 .ordered => |input| self.page = try (owner.vtable.scan_ordered orelse return error.CypherInvalidBackendPage)(owner.ptr, a, input.table, input.filters, input.order, input.after, input.limit, self.maximum),
                 .get_many => |ids| self.nodes = if (owner.vtable.get_many) |batch| try batch(owner.ptr, a, ids) else blk: {
@@ -332,6 +345,26 @@ pub const ReadSet = struct {
             };
         }
         fn usage(job: ReadJob) !usize {
+            if (job.operation == .count) {
+                if (job.count_result) |result| {
+                    if (result.count > result.examined or result.examined > job.maximum) return error.CypherInvalidBackendPage;
+                    return result.examined;
+                }
+                return if (job.err != null and (job.err.? == error.CypherAnchorBudgetExceeded or job.err.? == error.CypherStateBudgetExceeded)) job.maximum else 0;
+            }
+            if (job.operation == .expand) {
+                if (job.expansion) |result| {
+                    if (result.examined > job.maximum or result.pages.len != job.operation.expand.identities.len) return error.CypherInvalidBackendPage;
+                    var admitted: usize = 0;
+                    for (result.pages) |page| if (page) |value| {
+                        const used = value.examined orelse value.items.len;
+                        if (value.items.len > job.operation.expand.limit or used < value.items.len or used > result.examined - admitted) return error.CypherInvalidBackendPage;
+                        admitted += used;
+                    };
+                    return result.examined;
+                }
+                return if (job.err != null and job.err.? == error.CypherStateBudgetExceeded) job.maximum else 0;
+            }
             if (job.operation != .ordered) return 0;
             const input = job.operation.ordered;
             if (job.page) |page| {
@@ -348,7 +381,7 @@ pub const ReadSet = struct {
             for (self.jobs[0..self.count]) |*job| {
                 job.arena = .init(self.shared.allocator());
                 self.initialized += 1;
-                job.maximum = maximum / self.count;
+                job.maximum = if (job.operation == .expand) @min(job.operation.expand.allowance, maximum / self.count) else maximum / self.count;
                 if (remaining) |left| if (self.read.snapshots[job.owner].backend.vtable.set_work != null) {
                     job.meter = .{ .a = job.arena.allocator(), .backend = self.read.snapshots[job.owner].backend, .limit = if (self.count == 1) left else left / (self.count + 1) };
                 };
@@ -376,7 +409,8 @@ pub const ReadSet = struct {
                 _ = job.arena.reset(.free_all);
                 job.meter = null;
                 job.err = null;
-                job.maximum = maximum - self.examined;
+                job.maximum = if (job.operation == .expand) @min(job.operation.expand.allowance, maximum - self.examined) else maximum - self.examined;
+                if (job.operation == .expand and job.maximum < job.operation.expand.identities.len) return err;
                 job.invoke(self.read) catch |retry_error| {
                     job.err = retry_error;
                     self.examined += try usage(job.*);
@@ -757,25 +791,38 @@ pub const ReadSet = struct {
     fn countNodes(ptr: *anyopaque, a: A, table: []const u8, input: b.CountInput) !?b.CountResult {
         const self = cast(ptr);
         if (!@import("owner_count.zig").eligible(input)) return null;
+        var inventory = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer inventory.deinit();
+        var owners: std.ArrayList(usize) = .empty;
+        for (self.targets, self.snapshots, 0..) |target, snapshot, owner| if (std.mem.eql(u8, target.table, table)) {
+            if (snapshot.backend.vtable.count_nodes == null) return null;
+            try owners.append(inventory.allocator(), owner);
+        };
         var total: b.CountResult = .{ .count = 0, .examined = 0 };
-        var found = false;
-        for (self.targets, self.snapshots) |target, snapshot| {
-            if (!std.mem.eql(u8, target.table, table)) continue;
-            found = true;
+        var start: usize = 0;
+        while (start < owners.items.len) {
             try checkpoint(ptr);
-            var demand = input;
-            demand.max_examined = input.max_examined - total.examined;
-            if (self.work) |work| {
-                if (work.remaining) |left| demand.max_work = @min(demand.max_work, left(work.ptr));
+            const remaining = input.max_examined - total.examined;
+            const width = self.readWidth(owners.items[start..], remaining);
+            var single: ReadJob = .{ .owner = owners.items[start], .operation = .{ .count = .{ .table = table, .input = input } }, .maximum = remaining };
+            var wave: ReadWave = undefined;
+            if (width > 1) wave = .{ .read = self, .shared = .{ .backing = b.reclaimingAllocator(a), .io = self.source.fanout_io.? }, .count = width };
+            defer if (width > 1) wave.deinit() else single.arena.deinit();
+            const jobs = if (width > 1) wave.jobs[0..width] else @as(*[1]ReadJob, @ptrCast(&single))[0..];
+            if (width > 1) {
+                for (jobs, owners.items[start..][0..width]) |*job, owner| job.* = .{ .owner = owner, .operation = .{ .count = .{ .table = table, .input = input } } };
+                try wave.run(remaining);
+                total.examined += wave.examined;
+            } else {
+                single.arena = .init(b.reclaimingAllocator(a));
+                try single.invoke(self);
+                total.examined += try ReadWave.usage(single);
             }
-            const read = snapshot.backend.vtable.count_nodes orelse return null;
-            const value = (try read(snapshot.backend.ptr, a, table, demand)) orelse return null;
-            if (value.count > value.examined or value.examined > demand.max_examined) return error.CypherInvalidBackendPage;
-            total.count += value.count;
-            total.examined += value.examined;
+            for (jobs) |job| total.count += (job.count_result orelse return null).count;
+            start += width;
         }
         try checkpoint(ptr);
-        return if (found) total else null;
+        return if (owners.items.len != 0) total else null;
     }
     fn probeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?b.Probe {
         const self = cast(ptr);
@@ -942,16 +989,20 @@ pub const ReadSet = struct {
         const self = cast(ptr);
         if (identities.len == 0 or identities.len > 16 or limit == 0 or limit > 128) return null;
         const table = self.mappingSource(mapping) orelse return error.UndefinedGraphTable;
-        var owner_count: usize = 0;
-        for (self.targets, self.snapshots) |target, snapshot| if (std.mem.eql(u8, target.table, table)) {
-            if (snapshot.backend.vtable.expand_many == null) return null;
-            owner_count += 1;
-        };
-        if (owner_count == 0 or maximum / owner_count < identities.len) return null;
-        const allowance = @min(4096, maximum / owner_count);
         var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer scratch.deinit();
         const temporary = scratch.allocator();
+        var owners: std.ArrayList(usize) = .empty;
+        for (self.targets, self.snapshots, 0..) |target, snapshot, owner| if (std.mem.eql(u8, target.table, table)) {
+            const needed = for (identities) |identity| {
+                if (self.adjacencyOwner(owner, mapping, identity, null, direction)) break true;
+            } else false;
+            if (!needed) continue;
+            if (snapshot.backend.vtable.expand_many == null) return null;
+            try owners.append(temporary, owner);
+        };
+        if (owners.items.len != 0 and maximum / owners.items.len < identities.len) return null;
+        const allowance = if (owners.items.len == 0) 0 else @min(4096, maximum / owners.items.len);
         const items = try temporary.alloc(std.ArrayList(*const v.Relationship), identities.len);
         const pages = try a.alloc(?b.Page(*const v.Relationship), identities.len);
         const finished = try temporary.alloc(bool, identities.len);
@@ -963,49 +1014,73 @@ pub const ReadSet = struct {
         // Group by immutable owner, retaining its original encounter position.
         // First-page batches replace V separate RPCs with one per owner. Each
         // node stops at its first unfinished owner; cursors retain native tokens.
-        for (self.targets, self.snapshots, 0..) |target, snapshot, owner| {
-            if (!std.mem.eql(u8, target.table, table)) continue;
-            var selected: [16]v.Identity = undefined;
-            var positions: [16]usize = undefined;
-            var count: usize = 0;
-            for (identities, 0..) |identity, index| if (!finished[index] and self.adjacencyOwner(owner, mapping, identity, null, direction)) {
-                selected[count] = identity;
-                positions[count] = index;
-                count += 1;
-            };
-            if (count == 0) continue;
+        var start: usize = 0;
+        while (start < owners.items.len) {
+            const pending = for (finished) |done| {
+                if (!done) break true;
+            } else false;
+            if (!pending) break;
+            const width = self.readWidth(owners.items[start..], null);
+            var selected: [16][16]v.Identity = undefined;
+            var positions: [16][16]usize = undefined;
+            var counts: [16]usize = @splat(0);
+            var single: ReadJob = undefined;
+            var wave: ReadWave = undefined;
+            if (width > 1) wave = .{ .read = self, .shared = .{ .backing = b.reclaimingAllocator(a), .io = self.source.fanout_io.? }, .count = width };
+            defer if (width > 1) wave.deinit() else single.arena.deinit();
+            const jobs = if (width > 1) wave.jobs[0..width] else @as(*[1]ReadJob, @ptrCast(&single))[0..];
+            for (jobs, owners.items[start..][0..width], 0..) |*job, owner, slot| {
+                for (identities, 0..) |identity, index| if (!finished[index] and self.adjacencyOwner(owner, mapping, identity, null, direction)) {
+                    selected[slot][counts[slot]] = identity;
+                    positions[slot][counts[slot]] = index;
+                    counts[slot] += 1;
+                };
+                job.* = .{ .owner = owner, .maximum = allowance, .operation = .{ .expand = .{ .mapping = mapping, .identities = selected[slot][0..counts[slot]], .direction = direction, .limit = limit, .allowance = allowance } } };
+            }
             try checkpoint(ptr);
-            var owner_arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
-            defer owner_arena.deinit();
-            const batch = (try snapshot.backend.vtable.expand_many.?(snapshot.backend.ptr, owner_arena.allocator(), mapping, selected[0..count], direction, limit, allowance)) orelse {
-                for (positions[0..count]) |index| {
-                    pages[index] = null;
-                    finished[index] = true;
-                }
-                continue;
-            };
-            if (batch.pages.len != count or batch.examined > allowance) return error.CypherInvalidBackendPage;
-            examined += batch.examined;
-            for (batch.pages, positions[0..count]) |page, index| {
-                const value = page orelse {
-                    pages[index] = null;
-                    finished[index] = true;
+            if (width > 1) {
+                try wave.run(maximum - examined);
+                examined += wave.examined;
+            } else {
+                single.maximum = @min(allowance, maximum - examined);
+                single.arena = .init(b.reclaimingAllocator(a));
+                try single.invoke(self);
+                examined += try ReadWave.usage(single);
+            }
+            for (jobs, 0..) |job, slot| {
+                const owner = job.owner;
+                const count = counts[slot];
+                const batch = job.expansion orelse {
+                    for (positions[slot][0..count]) |index| if (!finished[index]) {
+                        pages[index] = null;
+                        finished[index] = true;
+                    };
                     continue;
                 };
-                if (value.items.len > limit or (value.examined orelse value.items.len) < value.items.len) return error.CypherInvalidBackendPage;
-                const needed = try @import("expansion_batch.zig").pageBytes(value);
-                if (needed > @import("expansion_batch.zig").max_bytes - bytes) {
-                    pages[index] = null;
-                    finished[index] = true;
-                    continue;
+                if (batch.pages.len != count or batch.examined > allowance) return error.CypherInvalidBackendPage;
+                for (batch.pages, positions[slot][0..count]) |page, index| {
+                    if (finished[index]) continue;
+                    const value = page orelse {
+                        pages[index] = null;
+                        finished[index] = true;
+                        continue;
+                    };
+                    if (value.items.len > limit or (value.examined orelse value.items.len) < value.items.len) return error.CypherInvalidBackendPage;
+                    const needed = try @import("expansion_batch.zig").pageBytes(value);
+                    if (needed > @import("expansion_batch.zig").max_bytes - bytes) {
+                        pages[index] = null;
+                        finished[index] = true;
+                        continue;
+                    }
+                    const copied = try @import("expansion_batch.zig").clone(a, value);
+                    bytes += needed;
+                    try items[index].appendSlice(a, copied.items);
+                    const continuation = try self.adjacencyNext(a, mapping, identities[index], null, direction, .{ .owner = owner }, copied.next);
+                    pages[index] = .{ .items = items[index].items, .next = continuation };
+                    finished[index] = copied.items.len != 0 or copied.next != null or continuation == null;
                 }
-                const copied = try @import("expansion_batch.zig").clone(a, value);
-                bytes += needed;
-                try items[index].appendSlice(a, copied.items);
-                const continuation = try self.adjacencyNext(a, mapping, identities[index], null, direction, .{ .owner = owner }, copied.next);
-                pages[index] = .{ .items = items[index].items, .next = continuation };
-                finished[index] = copied.items.len != 0 or copied.next != null or continuation == null;
             }
+            start += width;
         }
         try checkpoint(ptr);
         return .{ .pages = pages, .examined = examined };
@@ -1019,6 +1094,14 @@ pub const ReadSet = struct {
         const outgoing = direction != .in and std.mem.eql(u8, identity.table, source) and (peer == null or std.mem.eql(u8, peer.?.table, target));
         const incoming = direction != .out and std.mem.eql(u8, identity.table, target) and (peer == null or std.mem.eql(u8, peer.?.table, source));
         if (!outgoing and !incoming) return false;
+        for (self.snapshots[owner].adjacency_routes) |route| if (std.mem.eql(u8, route.index, mapping.index)) {
+            const out_possible = outgoing and (if (route.outgoing) |range| range.contains(identity.key) else true);
+            const in_possible = incoming and (if (route.incoming) |range| range.contains(identity.key) else true);
+            if (!out_possible and !in_possible) return false;
+            // Physical endpoint envelopes supersede document placement. A
+            // producer can emit a source outside its primary document range.
+            return true;
+        };
         // Every source owner must certify placement before any can be pruned.
         // An artifact producer may be on the very owner pruning would omit.
         for (self.targets, self.snapshots) |candidate, snapshot| if (std.mem.eql(u8, candidate.table, source) and !snapshot.backend.vtable.source_owned_adjacency) return true;
@@ -1984,6 +2067,25 @@ test "adjacency routing prunes only catalog certified source owners and preserve
         try std.testing.expectEqual(if (legacy or direction != .in or !pair) visits else 0, fixture.calls[0]);
         try std.testing.expectEqual(if (legacy or direction != .out) visits else 0, fixture.calls[1]);
     };
+    // Physical graph envelopes override primary placement. This assertion is
+    // produced on owner z while its logical source is a on the other shard.
+    targets[0].ranges = &.{.{ .end = "m" }};
+    targets[1].ranges = &.{.{ .start = "m" }};
+    snapshots[0].adjacency_routes = &.{.{ .index = "links", .outgoing = .{ .min = "k", .max = "l" }, .incoming = .{ .empty = true } }};
+    snapshots[1].adjacency_routes = &.{.{ .index = "links", .outgoing = .{ .min = "a", .max = "a" }, .incoming = .{ .min = "b", .max = "b" } }};
+    fixture.pages = false;
+    fixture.calls = .{ 0, 0 };
+    _ = try backend.vtable.expand(backend.ptr, a, mapping, .{ .table = "docs", .key = "a" }, .out, null, 1);
+    try std.testing.expectEqual([2]usize{ 0, 1 }, fixture.calls);
+    fixture.calls = .{ 0, 0 };
+    _ = try backend.vtable.expand(backend.ptr, a, mapping, .{ .table = "docs", .key = "b" }, .in, null, 1);
+    try std.testing.expectEqual([2]usize{ 0, 1 }, fixture.calls);
+    fixture.calls = .{ 0, 0 };
+    _ = try backend.vtable.expand(backend.ptr, a, mapping, .{ .table = "docs", .key = "outside" }, .both, null, 1);
+    try std.testing.expectEqual([2]usize{ 0, 0 }, fixture.calls);
+    // A missing directory is unknown, never proof of absence.
+    snapshots[0].adjacency_routes = &.{};
+    snapshots[1].adjacency_routes = &.{};
     // A known source in the other physical table cannot have outgoing rows in
     // this mapping. Incoming rows must still query every declared source owner.
     var cross = mapping;

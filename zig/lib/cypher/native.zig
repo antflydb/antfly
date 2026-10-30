@@ -126,7 +126,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         read_fields: ?[]const []const u8 = null,
 
         pub fn backend(self: *Self) b.Backend {
-            return .{ .ptr = self, .vtable = &.{ .prefer_count_nodes = false, .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .count_nodes = countNodes, .expand_many = expandMany, .planned_domains = if (@hasDecl(DB, "RelationalReadSession")) @hasDecl(DB.RelationalReadSession, "seekPrefix") else false, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+            return .{ .ptr = self, .vtable = &.{ .prefer_count_nodes = false, .adjacency_routes = adjacencyRoutes, .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .count_nodes = countNodes, .expand_many = expandMany, .planned_domains = if (@hasDecl(DB, "RelationalReadSession")) @hasDecl(DB.RelationalReadSession, "seekPrefix") else false, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
         }
         fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
             cast(ptr).read_fields = fields;
@@ -319,6 +319,15 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         }
         fn expandMany(ptr: *anyopaque, a: A, mapping: root.catalog.Relationship, identities: []const v.Identity, direction: root.ast.Direction, limit: usize, maximum: usize) !?b.ExpansionBatch {
             return @import("expansion_batch.zig").run(a, ptr, mapping, identities, direction, limit, maximum, cast(ptr).work, expandBatchOne);
+        }
+        fn adjacencyRoutes(ptr: *anyopaque, a: A, table: []const u8) ![]const b.AdjacencyRoute {
+            const self = cast(ptr);
+            try checkpoint(ptr);
+            if (comptime @hasDecl(DB, "cypherAdjacencyRoutes")) {
+                const db = try self.selected(table);
+                return db.cypherAdjacencyRoutes(a);
+            }
+            return &.{};
         }
         fn countNodes(ptr: *anyopaque, a: A, table: []const u8, input: b.CountInput) !?b.CountResult {
             const self = cast(ptr);

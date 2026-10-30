@@ -83,6 +83,8 @@ pub const VTable = struct {
     captureCypherSelectedSnapshot: *const fn (*DB, Allocator, *const DB.StatementReadFence, []const []const u8, u64, types.CancellationToken) Outcome(DB.CypherPinnedSnapshot),
     captureCypherPinnedSnapshot: *const fn (*DB, Allocator, *const DB.StatementReadFence, @import("cypher").catalog.Graph, []const u8) Outcome(DB.CypherPinnedSnapshot),
     scanCypherPinnedSnapshot: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, types.ScanOptions) Outcome(types.ScanResult),
+    cypherAdjacencyRoutes: *const fn (*DB, Allocator) Outcome([]const @import("cypher").backend.AdjacencyRoute),
+    cypherPinnedAdjacencyRoutes: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot) Outcome([]const @import("cypher").backend.AdjacencyRoute),
     graphEdgesForCypherPinnedSnapshot: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, []const []const u8, graph_mod.EdgeDirection, ?graph_mod.CypherEdgeScanCursor, graph_mod.EdgePageLimits) Outcome(graph_mod.CypherEdgePage),
     cypherPinnedSnapshotDeinit: *const fn (*DB.CypherPinnedSnapshot) Outcome(void),
     cypherGraphIndexIdentity: *const fn (self: *const DB, alloc: Allocator, index_name: []const u8) Outcome(?@import("cypher").catalog.IndexIdentity),

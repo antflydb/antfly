@@ -129,6 +129,12 @@ fn captureCypherPinnedSnapshot(self: *DB, alloc: Allocator, fence: *const DB.Sta
 fn scanCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) engine.Outcome(types.ScanResult) {
     return .{ .value = self.scanCypherPinnedSnapshot(alloc, cut, from, to, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn cypherAdjacencyRoutes(self: *DB, alloc: Allocator) engine.Outcome([]const @import("cypher").backend.AdjacencyRoute) {
+    return .{ .value = self.cypherAdjacencyRoutes(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn cypherPinnedAdjacencyRoutes(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot) engine.Outcome([]const @import("cypher").backend.AdjacencyRoute) {
+    return .{ .value = self.cypherPinnedAdjacencyRoutes(alloc, cut) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn graphEdgesForCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, index: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits) engine.Outcome(graph_mod.CypherEdgePage) {
     return .{ .value = self.graphEdgesForCypherPinnedSnapshot(alloc, cut, index, key, edge_types, direction, cursor, limits) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

@@ -415,6 +415,14 @@ test "external lake Cypher execution reads immutable native document and graph c
         defer statement_fence.release();
         var capture: DB.CypherBackend = .{ .tables = &.{.{ .name = "docs", .db = &db, .capture_fence = &statement_fence }}, .authority = authority, .ttl_now_ns = @import("antfly_platform").time.realtimeNs() };
         const materialized = try cypher.snapshot.Materialized.create(a, capture.backend(), graph, .{});
+        // Mutable capture fences never export live roots as exclusion proofs.
+        {
+            var route_arena = std.heap.ArenaAllocator.init(a);
+            defer route_arena.deinit();
+            const backend = capture.backend();
+            const routes = try backend.vtable.adjacency_routes.?(backend.ptr, route_arena.allocator(), "docs");
+            try std.testing.expectEqual(@as(usize, 0), routes.len);
+        }
         defer materialized.deinit();
         // An unrelated owner capability must never authorize mutable capture.
         var wrong_owner: DB.StatementReadFence = .{ .source = &snapshot, .primary = undefined, .replay = undefined };
@@ -481,6 +489,16 @@ test "external lake Cypher execution reads immutable native document and graph c
         const many = try typed_client.backend().vtable.get_many.?(&typed_client, wire_arena.allocator(), &.{ .{ .table = "docs", .key = "a" }, .{ .table = "docs", .key = "b" } });
         try std.testing.expectEqual(@as(usize, 2), many.len);
         try std.testing.expectEqualStrings("Changed", many[1].?.properties[1].value.string);
+        const routing = try read.invokeTyped(wire_arena.allocator(), .{ .operation = .adjacency_routes, .graph_incarnation = 1, .graph_revision = 1, .table = "docs" });
+        {
+            try std.testing.expectEqual(@as(usize, 1), routing.adjacency_routes.len);
+            const route = routing.adjacency_routes[0];
+            try std.testing.expectEqualStrings("links", route.index);
+            try std.testing.expect(route.outgoing.?.contains("a"));
+            try std.testing.expect(!route.outgoing.?.contains("outside"));
+            try std.testing.expect(route.incoming.?.contains("b"));
+        }
+        try std.testing.expectError(error.Forbidden, read.invokeTyped(wire_arena.allocator(), .{ .operation = .adjacency_routes, .graph_incarnation = 1, .graph_revision = 1, .table = "other" }));
         const edges = try typed_client.backend().vtable.expand(&typed_client, wire_arena.allocator(), graph.relationships[0], .{ .table = "docs", .key = "a" }, .out, null, 128);
         try std.testing.expectEqual(@as(usize, 2), edges.items.len);
         const bounded = try read.invokeTyped(wire_arena.allocator(), .{ .operation = .get_many, .graph_incarnation = 1, .graph_revision = 1, .identities = &.{.{ .table = "docs", .key = "b" }}, .max_work = 0 });

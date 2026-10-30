@@ -76,6 +76,29 @@ pub const CountResult = struct { count: usize, examined: usize };
 /// First adjacency pages for a bounded frontier. NULL slots decline cache
 /// admission without inventing EOF. Examined includes discarded page reads.
 pub const ExpansionBatch = struct { pages: []const ?Page(*const v.Relationship), examined: usize };
+/// Conservative physical endpoint envelope from immutable graph roots. Bounds
+/// are inclusive. NULL means unknown, empty certifies no physical endpoints.
+/// Stale records and producer keys may widen the envelope, never narrow it.
+pub const EndpointRange = struct {
+    empty: bool = false,
+    min: []const u8 = "",
+    max: []const u8 = "",
+    pub fn contains(self: @This(), key: []const u8) bool {
+        return !self.empty and std.mem.order(u8, key, self.min) != .lt and std.mem.order(u8, key, self.max) != .gt;
+    }
+};
+pub const AdjacencyRoute = struct { index: []const u8, outgoing: ?EndpointRange = null, incoming: ?EndpointRange = null };
+pub fn validateAdjacencyRoutes(routes: []const AdjacencyRoute) !void {
+    if (routes.len > 1024) return error.CypherInvalidBackendPage;
+    for (routes, 0..) |route, i| {
+        if (route.index.len == 0 or route.index.len > 1024) return error.CypherInvalidBackendPage;
+        for (routes[0..i]) |prior| if (std.mem.eql(u8, prior.index, route.index)) return error.CypherInvalidBackendPage;
+        for ([_]?EndpointRange{ route.outgoing, route.incoming }) |maybe| if (maybe) |range| {
+            if (range.min.len > 8192 or range.max.len > 8192 or (!range.empty and std.mem.order(u8, range.min, range.max) == .gt)) return error.CypherInvalidBackendPage;
+        };
+    }
+}
+
 pub const FilterOp = enum { eq, lt, lte, gt, gte, in, is_null };
 /// Private compiler proof: a distinct, homogeneous, non-null primitive set.
 /// Inexact integers cannot be lowered into rounded DOUBLE equality domains.
@@ -183,6 +206,7 @@ pub const Backend = struct {
         /// under their logical source key. Document ranges alone are no proof:
         /// producer-owned edges may reside in another owner's immutable root.
         source_owned_adjacency: bool = false,
+        adjacency_routes: ?*const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]const AdjacencyRoute = null,
         /// Row transports benefit from partial counts. A direct local adapter
         /// can expose the owner operation while retaining its existing evaluator.
         prefer_count_nodes: bool = true,
