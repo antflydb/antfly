@@ -52,11 +52,18 @@ for ordinal in range(64):
         None if ordinal == 63 and i % 3 == 0 else 9007199254740993 + ordinal + i
         for i in range(count)
     ]
-archive = shared / "archive.parquet"
+archive = shared / "archive-bounded-pages.parquet"
 if not archive.exists():
-    pq.write_table(pa.table(columns), archive, row_group_size=4, use_dictionary=False)
+    pq.write_table(
+        pa.table(columns),
+        archive,
+        row_group_size=4,
+        use_dictionary=False,
+        data_page_size=256 * 1024,
+        write_batch_size=1,
+    )
 assert pq.read_table(archive).to_pydict() == columns
-fixture = bench.import_fixture(shared / "fixture", [archive], "typed-navigation-v1")
+fixture = bench.import_fixture(shared / "fixture-bounded-pages", [archive], "typed-navigation-v1")
 properties = {
     name: {"type": "string", "x-antfly-field": {"type": "text"}}
     if name == "body"
