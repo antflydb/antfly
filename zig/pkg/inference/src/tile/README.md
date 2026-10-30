@@ -67,6 +67,17 @@ modules preserve the qualified native schedules already shared by inference.
 comptime; names and static literals are parameters. They introduce no extra
 device call, runtime branch, scratch allocation or launch.
 
+The registry declares families with `region.metalFamily`, `cudaFamily`, or
+`nativeFamily` for a custom header. `region.regions` flattens their typed source
+namespaces once. Each owner exports contiguous `source_0`, `source_1`, etc.;
+region names keep their existing numbered suffixes. Empty or gapped namespaces
+are rejected at compile time.
+
+Use `native_program.metal` to encode readable MSL at the Objective-C boundary;
+`metalAt` retains a different native indentation where required. Keep host ABI
+macro splices as raw parts of `native_program.join`, preserving their canonical
+native owners instead of duplicating declarations.
+
 The registry owns 175 disjoint regions. Existing `quant-kernel-codegen` regions
 retain their owners; do not register a Tile region inside them. Shared arithmetic,
 layout and synchronization helpers stay in their existing native program headers.

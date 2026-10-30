@@ -42,28 +42,135 @@ pub fn cuda(comptime family: []const u8, comptime data: []const u8) Region {
     return region(cuda_bundle, "", family, data);
 }
 
-/// Renders MSL source as the C-string lines metal_kernels.m embeds
-/// (`<indent>"...\\n"`), escaping quotes and backslashes.
+/// Encode shader lines once at the source boundary. Native owners keep readable
+/// MSL; the checked-in Objective-C translation unit retains its string ABI.
 pub fn metalLines(comptime indent: []const u8, comptime src: []const u8) []const u8 {
     comptime {
         @setEvalBranchQuota(100_000_000);
-        var out: []const u8 = "";
-        var start: usize = 0;
-        for (src, 0..) |ch, i| {
-            if (ch != '\n') continue;
-            out = out ++ indent ++ "\"" ++ escape(src[start..i]) ++ "\\n\"\n";
-            start = i + 1;
+        // Preserve the historical contract: only newline-terminated lines emit.
+        const end = if (std.mem.lastIndexOfScalar(u8, src, '\n')) |last| last + 1 else 0;
+        var size: usize = 0;
+        for (src[0..end]) |ch| size += switch (ch) {
+            '\n' => indent.len + 5,
+            '\\', '"' => 2,
+            else => 1,
+        };
+        var buffer: [size]u8 = undefined;
+        var cursor: usize = 0;
+        var line_start = true;
+        for (src[0..end]) |ch| {
+            if (line_start) {
+                @memcpy(buffer[cursor..][0..indent.len], indent);
+                cursor += indent.len;
+                buffer[cursor] = '"';
+                cursor += 1;
+                line_start = false;
+            }
+            if (ch == '\n') {
+                @memcpy(buffer[cursor..][0..4], "\\n\"\n");
+                cursor += 4;
+                line_start = true;
+            } else {
+                if (ch == '\\' or ch == '"') {
+                    buffer[cursor] = '\\';
+                    cursor += 1;
+                }
+                buffer[cursor] = ch;
+                cursor += 1;
+            }
         }
-        return out;
+        const result = buffer;
+        return &result;
     }
 }
 
-fn escape(comptime s: []const u8) []const u8 {
-    var out: []const u8 = "";
-    for (s) |ch| out = out ++ switch (ch) {
-        '\\' => "\\\\",
-        '"' => "\\\"",
-        else => &[_]u8{ch},
+const std = @import("std");
+
+/// A native owner exports source_0, source_1, ... in lexical program order.
+/// One region has the family name; multiple regions retain numbered suffixes.
+fn sourceCount(comptime source: type) usize {
+    comptime {
+        var count: usize = 0;
+        for (std.meta.declarations(source)) |decl| {
+            if (std.mem.startsWith(u8, decl, "source_")) count += 1;
+        }
+        if (count == 0) @compileError("native family has no source regions");
+        for (0..count) |i| {
+            if (!@hasDecl(source, std.fmt.comptimePrint("source_{d}", .{i})))
+                @compileError("native family source indices must be contiguous from zero");
+        }
+        return count;
+    }
+}
+
+/// Compile-time ownership metadata, separate from emitted device programs.
+pub const Family = struct {
+    path: []const u8,
+    indent: []const u8,
+    name: []const u8,
+    source: type,
+};
+
+pub fn nativeFamily(comptime path: []const u8, comptime indent: []const u8, comptime name: []const u8, comptime source: type) Family {
+    return .{ .path = path, .indent = indent, .name = name, .source = source };
+}
+
+pub fn metalFamily(comptime name: []const u8, comptime source: type) Family {
+    return nativeFamily(metal_kernels_m, metal_indent, name, source);
+}
+
+pub fn cudaFamily(comptime name: []const u8, comptime source: type) Family {
+    return nativeFamily(cuda_bundle, "", name, source);
+}
+
+fn regionCount(comptime families: []const Family) usize {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var count: usize = 0;
+        for (families) |item| count += sourceCount(item.source);
+        return count;
+    }
+}
+
+/// Flatten family descriptions once; do not repeatedly concatenate arrays.
+pub fn regions(comptime families: []const Family) [regionCount(families)]Region {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var result: [regionCount(families)]Region = undefined;
+        var cursor: usize = 0;
+        for (families) |item| {
+            const count = sourceCount(item.source);
+            for (0..count) |i| {
+                const key = if (count == 1) item.name else std.fmt.comptimePrint("{s}.{d}", .{ item.name, i });
+                result[cursor] = region(item.path, item.indent, key, @field(item.source, std.fmt.comptimePrint("source_{d}", .{i})));
+                cursor += 1;
+            }
+        }
+        return result;
+    }
+}
+
+test "Metal source encoding preserves quotes backslashes blanks and line boundaries" {
+    const text = "kernel void k() {\n  // \"quoted\" \\n\n}\n";
+    try std.testing.expectEqualStrings("  \"kernel void k() {\\n\"\n  \"  // \\\"quoted\\\" \\\\n\\n\"\n  \"}\\n\"\n", comptime metalLines("  ", text));
+    try std.testing.expectEqualStrings("", comptime metalLines("", "unterminated"));
+    try std.testing.expectEqualStrings("\"a\\n\"\n", comptime metalLines("", "a\nunterminated"));
+}
+
+test "native family descriptors retain numbered keys and custom source paths" {
+    const sources = struct {
+        pub const source_0 = "first";
+        pub const source_1 = "second";
     };
-    return out;
+    const entries = comptime regions(&.{nativeFamily("custom.cuh", "", "row_program", sources)});
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("custom.cuh", entries[0].path);
+    try std.testing.expectEqualStrings("first", entries[0].data);
+    try std.testing.expectEqualStrings("second", entries[1].data);
+    try std.testing.expect(std.mem.indexOf(u8, entries[1].begin, "row_program.1 family") != null);
+    const single = comptime regions(&.{metalFamily("single", struct {
+        pub const source_0 = "kernel";
+    })});
+    try std.testing.expectEqualStrings(metal_indent, single[0].begin[0..metal_indent.len]);
+    try std.testing.expect(std.mem.indexOf(u8, single[0].begin, "single family") != null);
 }

@@ -30,25 +30,32 @@ pub const source_0 = program.join(&.{
     program.render(program_0, .{ .name = "termite_q4_0_pair_activation_multiply_r4_ext", .literal_0 = "4u" }),
     program.render(program_0, .{ .name = "termite_q4_0_pair_activation_multiply_r5_ext", .literal_0 = "5u" }),
 
-    \\           "kernel void termite_q8_0_activation_multiply_1r_ext(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device const float *rhs [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
-    \\           "    weight += p.weight_offset;\n"
-    \\           "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint CHPT = 4u; uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint o = tg.x * (NY * NSG) + uint(sgitg) * NY + ty; uint r = tg.y; if (r >= p.rows || o >= p.out_dim) return; uint row_offset = o * p.row_blocks * 34u; uint total_chunks = p.row_blocks * 8u; uint input_row = r * p.in_dim; float acc = 0.0f;\n"
-    \\           "    for (uint chunk = tx; chunk < total_chunks; chunk += CHPT * NX) { for (uint ch = 0u; ch < CHPT; ++ch) { uint c = chunk + ch * NX; if (c >= total_chunks) continue; uint b = c >> 3; uint ci = c & 7u; uint off = row_offset + b * 34u; ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); float4 w = float4(float(as_type<char>(weight[off + 2u + ci * 4u])), float(as_type<char>(weight[off + 3u + ci * 4u])), float(as_type<char>(weight[off + 4u + ci * 4u])), float(as_type<char>(weight[off + 5u + ci * 4u]))) * d; uint in_col = input_row + c * 4u; float4 x = float4(input[in_col], input[in_col + 1u], input[in_col + 2u], input[in_col + 3u]); acc += dot(x, w); } }\n"
-    \\           "    acc += simd_shuffle_down(acc, 4u); acc += simd_shuffle_down(acc, 2u); acc += simd_shuffle_down(acc, 1u); if (tx == 0u) { uint idx = r * p.out_dim + o; output[idx] = termite_gated_activation_product(acc, rhs[idx], ap.activation_kind); }\n"
-    \\           "}\n"
-    \\
-    ,
+    program.metal(
+        \\kernel void termite_q8_0_activation_multiply_1r_ext(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device const float *rhs [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {
+        \\    weight += p.weight_offset;
+        \\    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint CHPT = 4u; uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint o = tg.x * (NY * NSG) + uint(sgitg) * NY + ty; uint r = tg.y; if (r >= p.rows || o >= p.out_dim) return; uint row_offset = o * p.row_blocks * 34u; uint total_chunks = p.row_blocks * 8u; uint input_row = r * p.in_dim; float acc = 0.0f;
+        \\    for (uint chunk = tx; chunk < total_chunks; chunk += CHPT * NX) { for (uint ch = 0u; ch < CHPT; ++ch) { uint c = chunk + ch * NX; if (c >= total_chunks) continue; uint b = c >> 3; uint ci = c & 7u; uint off = row_offset + b * 34u; ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); float4 w = float4(float(as_type<char>(weight[off + 2u + ci * 4u])), float(as_type<char>(weight[off + 3u + ci * 4u])), float(as_type<char>(weight[off + 4u + ci * 4u])), float(as_type<char>(weight[off + 5u + ci * 4u]))) * d; uint in_col = input_row + c * 4u; float4 x = float4(input[in_col], input[in_col + 1u], input[in_col + 2u], input[in_col + 3u]); acc += dot(x, w); } }
+        \\    acc += simd_shuffle_down(acc, 4u); acc += simd_shuffle_down(acc, 2u); acc += simd_shuffle_down(acc, 1u); if (tx == 0u) { uint idx = r * p.out_dim + o; output[idx] = termite_gated_activation_product(acc, rhs[idx], ap.activation_kind); }
+        \\}
+        \\
+    ),
 
-    \\           TERMITE_MSL_ABI_QUANT_RHS_REDUCE(termite_q8_0_activation_multiply_1x_reduce4) "\n"
-    \\           "    weight += p.weight_offset;\n"
-    \\           "    const uint NR0 = 4u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
-    \\           "    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint ib0 = sgitg * NQ + ix; uint in_row = r * p.in_dim; float acc0 = 0.0f; float acc1 = 0.0f; float acc2 = 0.0f; float acc3 = 0.0f;\n"
-    \\           "    for (uint b = ib0; b < p.row_blocks; b += NSG * NQ) { float x[8]; uint in_off = in_row + b * 32u + il * NQ; for (uint i = 0; i < NQ; ++i) { x[i] = input[in_off + i]; } for (uint row = 0; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 34u + b * 34u; ushort bits = (ushort(weight[off + 1]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); float block = 0.0f; for (uint i = 0; i < NQ; ++i) block += x[i] * float(as_type<char>(weight[off + 2u + il * NQ + i])); if (row == 0u) acc0 += d * block; else if (row == 1u) acc1 += d * block; else if (row == 2u) acc2 += d * block; else acc3 += d * block; } }\n"
-    \\           "    if (sgitg == 0u) { shmem[lane] = 0.0f; shmem[32u + lane] = 0.0f; shmem[64u + lane] = 0.0f; shmem[96u + lane] = 0.0f; } acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3); threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-    \\           "    if (lane == 0u) { shmem[sgitg] = acc0; shmem[32u + sgitg] = acc1; shmem[64u + sgitg] = acc2; shmem[96u + sgitg] = acc3; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-    \\           "    float total0 = simd_sum(shmem[lane]); float total1 = simd_sum(shmem[32u + lane]); float total2 = simd_sum(shmem[64u + lane]); float total3 = simd_sum(shmem[96u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; if (first_o < p.out_dim) output[idx] = termite_gated_activation_product(total0, rhs[idx], ap.activation_kind); if (first_o + 1u < p.out_dim) output[idx + 1u] = termite_gated_activation_product(total1, rhs[idx + 1u], ap.activation_kind); if (first_o + 2u < p.out_dim) output[idx + 2u] = termite_gated_activation_product(total2, rhs[idx + 2u], ap.activation_kind); if (first_o + 3u < p.out_dim) output[idx + 3u] = termite_gated_activation_product(total3, rhs[idx + 3u], ap.activation_kind); }\n"
-    \\           "}\n"
-    \\
+    program.join(&.{
+        \\           TERMITE_MSL_ABI_QUANT_RHS_REDUCE(termite_q8_0_activation_multiply_1x_reduce4) "\n"
+        \\
+        ,
+        program.metal(
+            \\    weight += p.weight_offset;
+            \\    const uint NR0 = 4u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;
+            \\    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint ib0 = sgitg * NQ + ix; uint in_row = r * p.in_dim; float acc0 = 0.0f; float acc1 = 0.0f; float acc2 = 0.0f; float acc3 = 0.0f;
+            \\    for (uint b = ib0; b < p.row_blocks; b += NSG * NQ) { float x[8]; uint in_off = in_row + b * 32u + il * NQ; for (uint i = 0; i < NQ; ++i) { x[i] = input[in_off + i]; } for (uint row = 0; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 34u + b * 34u; ushort bits = (ushort(weight[off + 1]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); float block = 0.0f; for (uint i = 0; i < NQ; ++i) block += x[i] * float(as_type<char>(weight[off + 2u + il * NQ + i])); if (row == 0u) acc0 += d * block; else if (row == 1u) acc1 += d * block; else if (row == 2u) acc2 += d * block; else acc3 += d * block; } }
+            \\    if (sgitg == 0u) { shmem[lane] = 0.0f; shmem[32u + lane] = 0.0f; shmem[64u + lane] = 0.0f; shmem[96u + lane] = 0.0f; } acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); acc2 = simd_sum(acc2); acc3 = simd_sum(acc3); threadgroup_barrier(mem_flags::mem_threadgroup);
+            \\    if (lane == 0u) { shmem[sgitg] = acc0; shmem[32u + sgitg] = acc1; shmem[64u + sgitg] = acc2; shmem[96u + sgitg] = acc3; } threadgroup_barrier(mem_flags::mem_threadgroup);
+            \\    float total0 = simd_sum(shmem[lane]); float total1 = simd_sum(shmem[32u + lane]); float total2 = simd_sum(shmem[64u + lane]); float total3 = simd_sum(shmem[96u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; if (first_o < p.out_dim) output[idx] = termite_gated_activation_product(total0, rhs[idx], ap.activation_kind); if (first_o + 1u < p.out_dim) output[idx + 1u] = termite_gated_activation_product(total1, rhs[idx + 1u], ap.activation_kind); if (first_o + 2u < p.out_dim) output[idx + 2u] = termite_gated_activation_product(total2, rhs[idx + 2u], ap.activation_kind); if (first_o + 3u < p.out_dim) output[idx + 3u] = termite_gated_activation_product(total3, rhs[idx + 3u], ap.activation_kind); }
+            \\}
+            \\
+        ),
+    }),
 });
 
 pub const source_1 = program.render(program_1, .{ .name = "termite_q4_0_get_rows", .literal_0 = "0u" });

@@ -336,3 +336,7 @@ test "tile im2col and embed lay data out as conv and lookup expect" {
     layout.embed(.{ .name = "e" }, .{ .ids = &.{ 2, 1 }, .table = &table, .pos = &pos, .out = &e, .dim = 2, .pos_offset = 1 });
     try std.testing.expectEqualSlices(f32, &.{ 2.25, 2.25, 1.125, 1.125 }, &e);
 }
+
+test {
+    _ = @import("region.zig");
+}

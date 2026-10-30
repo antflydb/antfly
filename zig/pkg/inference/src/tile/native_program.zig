@@ -19,3 +19,11 @@ pub fn join(comptime parts: []const []const u8) []const u8 {
         return &result;
     }
 }
+
+/// Render readable MSL at the Objective-C source boundary, keeping raw host
+/// macro splices with their native ABI owners.
+pub fn metal(comptime text: []const u8) []const u8 {
+    return metalAt(@import("region.zig").metal_indent, text);
+}
+
+pub const metalAt = @import("region.zig").metalLines;
