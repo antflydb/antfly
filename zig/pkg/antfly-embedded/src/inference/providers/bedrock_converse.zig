@@ -184,12 +184,15 @@ pub fn requestJsonAlloc(alloc: Allocator, messages: []const inference.ChatMessag
         }
         try root.object.put(a, "toolConfig", tool_config);
     } else if (options.tool_choice_json != null) return error.InvalidGeneratorConfig;
-    // Validate the native wire body before signing; keep the original tree so
-    // signed reasoning blocks and document-valued tool schemas are preserved.
+    // The translator constructs supported envelope/options fields, while
+    // validateNativeProjection admits replay blocks against the visible turn.
+    // Match response validation's tolerance for fields inside native blocks:
+    // stripping opaque provider fields could invalidate signed reasoning.
+    // Validate known fields, then serialize the original tree unchanged.
     if (options.streaming) {
-        _ = std.json.parseFromValueLeaky(api.ConverseStreamRequestBody, a, root, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceRequest;
+        _ = std.json.parseFromValueLeaky(api.ConverseStreamRequestBody, a, root, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceRequest;
     } else {
-        _ = std.json.parseFromValueLeaky(api.ConverseRequestBody, a, root, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceRequest;
+        _ = std.json.parseFromValueLeaky(api.ConverseRequestBody, a, root, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceRequest;
     }
     return std.json.Stringify.valueAlloc(alloc, root, .{});
 }
@@ -359,6 +362,30 @@ pub fn testConverseWire() !void {
     try std.testing.expectError(error.InvalidBedrockResponse, responseAlloc(a,
         \\{"metrics":{"latencyMs":1},"output":{"message":{"role":"assistant","content":[{"reasoningContent":{"reasoningText":{"text":"private","signature":7}}}]}},"stopReason":"end_turn","usage":{"inputTokens":1,"outputTokens":1,"totalTokens":2}}
     ));
+    // A response accepted with opaque native fields must remain replayable.
+    // Check both wire endpoints and compare the full retained blocks, including
+    // signatures, unknown reasoning fields, and tool metadata.
+    var extended = try responseAlloc(a,
+        \\{"output":{"message":{"role":"assistant","content":[{"reasoningContent":{"reasoningText":{"text":"private","signature":"signed","providerExtension":{"opaque":[1,true]}}}},{"text":"ok"},{"toolUse":{"toolUseId":"call-3","name":"lookup","input":{"id":9},"providerExtension":"tool-metadata"}}]}},"stopReason":"tool_use","usage":{"inputTokens":1,"outputTokens":1,"totalTokens":2},"metrics":{"latencyMs":1}}
+    );
+    defer extended.deinit();
+    var extended_message = inference.ChatMessage{ .role = .assistant, .content = .{ .text = extended.content }, .tool_calls = extended.tool_calls, .bedrock_content_json = extended.bedrock_content_json };
+    inline for (.{ false, true }) |streaming| {
+        const extended_replay = try requestJsonAlloc(a, &.{extended_message}, .{ .streaming = streaming });
+        defer a.free(extended_replay);
+        var wire = try std.json.parseFromSlice(Value, a, extended_replay, .{});
+        defer wire.deinit();
+        const replayed_blocks = try std.json.Stringify.valueAlloc(a, wire.value.object.get("messages").?.array.items[0].object.get("content").?, .{});
+        defer a.free(replayed_blocks);
+        try std.testing.expectEqualStrings(extended.bedrock_content_json.?, replayed_blocks);
+        // Compatibility must not relax visible-turn admission or known types.
+        extended_message.content = .{ .text = "tampered" };
+        try std.testing.expectError(error.InvalidInferenceRequest, requestJsonAlloc(a, &.{extended_message}, .{ .streaming = streaming }));
+        extended_message.content = .{ .text = extended.content };
+        extended_message.bedrock_content_json = "[{\"reasoningContent\":{\"reasoningText\":{\"text\":\"private\",\"signature\":7,\"providerExtension\":true}}},{\"text\":\"ok\"}]";
+        try std.testing.expectError(error.InvalidInferenceRequest, requestJsonAlloc(a, &.{extended_message}, .{ .streaming = streaming }));
+        extended_message.bedrock_content_json = extended.bedrock_content_json;
+    }
     // Completed and streaming adapters share the same stop-reason mapping.
     const cases = .{
         .{ "max_tokens", inference.GenerationFinishReason.length },

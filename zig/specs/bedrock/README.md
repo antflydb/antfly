@@ -26,10 +26,11 @@ general-purpose Smithy converter. It follows the
 
 `bedrock_api` validates outgoing Converse and ConverseStream bodies, completed
 response envelopes, and each decoded streaming event before publication. Request
-validation rejects unknown fields; response validation permits additional fields
-for upstream compatibility, while the adapter enforces admitted content variants
-and stream lifecycle rules. Serialization retains the original request tree,
-preserving reasoning signatures and document-valued schemas. Generated types
+bodies are assembled from supported fields; both request and response validation
+permit opaque fields inside native blocks for upstream compatibility. The adapter
+still enforces admitted content variants, visible-turn replay matching, known
+field types, and stream lifecycle rules. Serialization retains the original
+request tree, preserving reasoning signatures and document-valued schemas. Generated types
 check field types, required fields, and enums; numeric/string bounds and model
 capabilities still require application-level checks.
 
