@@ -2391,3 +2391,44 @@ identities. This changes neither identity nor ordering semantics. Runtime ABI
 publications whose compact pages exceed the older expansion policy. Stored
 source recipe **v10**, `AFOV0005`, `AFSC0005` and the page wire layout remain
 unchanged; older compact pages remain readable by the new reader.
+
+
+### Physical page admission and owned compact routing fences
+
+Scheduling uses physical work estimates independently of request policy. Header
+workers reserve at most 64 KiB for bounded header discovery. OffsetIndex ranges
+enter the payload phase directly after directory pruning, so skipping unequal
+pages cannot leave a reservation sized for an earlier page. A payload gets a
+separate I/O task charged for its exact encoded length, and its header is checked
+against the authenticated directory before decoding. CPU admission starts after that complete input lease exists and
+uses uncompressed bytes plus a conservative per-row codec allowance. The cursor
+still limits the cohort to four phases; raw, resident and input quotas remain
+unchanged. Input credits follow the encoded lease through queued decoding and a
+bounded retry. Completed header probes that already contain the full page are
+transferred directly, and saturated admission consumes the prepared payload in
+one caller lane without repeating header discovery. Cancellation joins header,
+payload and decode tasks before releasing request state.
+
+This avoids estimating each task as a fraction of a 256-MiB request limit: under
+the previous calculation, ordinary two-column scans requested 128 MiB per fetch
+against a 32-MiB shared I/O allowance and therefore advanced serially. Native
+qualification blocks both payload reads simultaneously under default limits,
+checks exact physical reservations and zero CPU occupancy, admits unrelated CPU
+work, and tests cancellation and a fully saturated I/O scheduler.
+
+Single-page scalar, nullable and dictionary scanners transfer the decoder's final
+owned vector directly. They retain chunk aggregation only when additional pages
+require it. This preserves the existing timestamp scaling, exact numeric,
+physical validation and vector destruction contracts without retaining a second
+aggregation allocation. A bounded native check admits exactly one uncompressed
+payload plus one final i64 vector; the previous extra copy cannot fit that budget.
+
+Mutation child fences also have independent compact ownership. A reference-counted
+immutable seed is shared by adjacent long routing keys; children own only their
+suffix and aggregate. Ownership transfers through rebalancing, retention and
+boundary joins without pinning a decoded input page or expanding every untouched
+fence. Small independent keys retain their single-allocation representation.
+Encoded page occupancy, identity, ordering, reader protocol and all wire formats
+are unchanged. A dense internal-page fixture built by the production builder
+exercises a single-key mutation with a 4-MiB allocator, and allocation-failure
+checks cover shared seed creation, reuse and teardown.

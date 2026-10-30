@@ -285,7 +285,33 @@ pub const Cursor = struct {
             if (try self.decodeFetched(column, fetched)) return;
         }
     }
+    const PreparedFetch = struct {
+        parsed: ?page.ParsedHeader = null,
+        indexed_rows: ?u64 = null,
+        len: usize,
+        end: u64,
+        cache_key: ?[32]u8,
+        probe: ?ranges.RangeLease = null,
+    };
+    fn completeFetch(self: *Cursor, column: *Column, prepared: PreparedFetch) !Fetched {
+        const lease = prepared.probe orelse try self.read(column.offset, prepared.len);
+        errdefer lease.release();
+        const parsed = prepared.parsed orelse try page.parsePageHeader(lease.bytes);
+        if (prepared.indexed_rows) |rows| {
+            try parsed.header.validateResourceLimits();
+            if ((parsed.header.page_type != .data_page and parsed.header.page_type != .data_page_v2) or
+                parsed.header_len + parsed.header.compressed_page_size != prepared.len or parsed.header.value_count != rows) return error.InvalidParquetMetadata;
+            if (parsed.header.uncompressed_page_size > self.limits.max_decoded_bytes) return error.ParquetPageTooLarge;
+        }
+        return .{ .parsed = parsed, .len = prepared.len, .end = prepared.end, .cache_key = prepared.cache_key, .lease = lease };
+    }
     fn fetch(self: *Cursor, column: *Column) !?Fetched {
+        const prepared = (try self.prepareFetch(column)) orelse return null;
+        return try self.completeFetch(column, prepared);
+    }
+    /// Discover bounded headers first. A large payload is fetched in a separate
+    /// I/O phase admitted using its validated physical length, not query quotas.
+    fn prepareFetch(self: *Cursor, column: *Column) !?PreparedFetch {
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         while (column.offset < end) {
             if (column.directory) |directory| {
@@ -332,6 +358,14 @@ pub const Cursor = struct {
                 column.consumed = @intCast(self.position - column.first);
                 return null;
             }
+            // Directory pruning may have advanced past several unequal pages.
+            // Admit the surviving exact range in the payload phase, then verify
+            // its encoded header against the directory in completeFetch.
+            if (self.indexedPage(column)) |entry| {
+                if (entry.len > end - column.offset) return error.InvalidParquetMetadata;
+                if (entry.len > self.limits.max_input_bytes) return error.ParquetPageTooLarge;
+                return .{ .indexed_rows = entry.rows, .len = entry.len, .end = end, .cache_key = try self.pageCacheKey(column, entry.len) };
+            }
             const probe = try self.headerRead(column);
             var probe_held = true;
             defer if (probe_held) probe.lease.release();
@@ -354,9 +388,7 @@ pub const Cursor = struct {
             if (self.shared_reader) |reader| if (parsed.header.page_type == .data_page or parsed.header.page_type == .data_page_v2) {
                 // Resource policy is checked for each consumer, independently
                 // of the immutable physical interpretation of a page.
-                const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v5", .chunk = column.chunk, .decimal_representation = "native_decimal", .preserve_dictionary = true }, .{});
-                defer self.a.free(interpretation);
-                cache_key = try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = len }, .purpose = .parquet_column_chunk }, interpretation);
+                cache_key = try self.pageCacheKey(column, len);
                 if (reader.cache.decoded.lookup(cache_key.?)) |lease| {
                     errdefer lease.release();
                     var admission = self.limits;
@@ -379,9 +411,8 @@ pub const Cursor = struct {
                 probe.lease.release();
                 probe_held = false;
             }
-            const encoded_lease = if (reuse_probe) null else try self.read(column.offset, len);
             if (reuse_probe) probe_held = false;
-            return .{ .parsed = parsed, .len = len, .end = end, .lease = encoded_lease orelse probe.lease, .cache_key = cache_key };
+            return .{ .parsed = parsed, .len = len, .end = end, .probe = if (reuse_probe) probe.lease else null, .cache_key = cache_key };
         }
         return error.ParquetRowGroupRowCountMismatch;
     }
@@ -542,6 +573,12 @@ pub const Cursor = struct {
     }
     /// Only a validated exact-range cache entry may bypass encoded I/O.
     /// Reapply all request-specific admission and directory checks on each hit.
+    fn pageCacheKey(self: *Cursor, column: *const Column, len: usize) !?[32]u8 {
+        const reader = self.shared_reader orelse return null;
+        const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v5", .chunk = column.chunk, .decimal_representation = "native_decimal", .preserve_dictionary = true }, .{});
+        defer self.a.free(interpretation);
+        return try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = len }, .purpose = .parquet_column_chunk }, interpretation);
+    }
     fn cachedIndexedPage(self: *Cursor, column: *const Column) !?@import("lake_decoded_cache.zig").Lease {
         const reader = self.shared_reader orelse return null;
         try reader.context.ensureActive();
@@ -680,10 +717,53 @@ pub const Cursor = struct {
     }
     const DecodeStats = struct { pages: usize, dictionaries: usize, encoded_predicates: usize };
     const DecodedStep = struct { stats: DecodeStats, ready: bool };
-    fn fetchWorker(template: Cursor, column: *Column) anyerror!?Fetched {
+    const Scheduler = @import("../../sql/parallel_scheduler.zig");
+    const Pending = union(enum) {
+        header: Scheduler.Task(anyerror!?PreparedFetch),
+        body: PreparedFetch,
+        fetch: Scheduler.Task(anyerror!Fetched),
+        decode: struct { task: Scheduler.Task(anyerror!DecodedStep), input: Fetched },
+        retry: Fetched,
+    };
+    fn headerWorker(template: Cursor, column: *Column) anyerror!?PreparedFetch {
         var worker = template;
         worker.a = worker.admission.backing.allocator();
-        return worker.fetch(column);
+        return worker.prepareFetch(column);
+    }
+    fn fetchWorker(template: Cursor, column: *Column, prepared: PreparedFetch) anyerror!Fetched {
+        var worker = template;
+        worker.a = worker.admission.backing.allocator();
+        return worker.completeFetch(column, prepared);
+    }
+    fn headerWorkspace(self: *Cursor, column: *const Column) usize {
+        // Discovery performs no payload I/O for OffsetIndex ranges. Other
+        // headers probe at most 64 KiB; every larger payload is admitted later.
+        const end = column.chunk.file_offset +| column.chunk.compressed_len;
+        return @intCast(@min(end -| column.offset, @min(self.limits.max_input_bytes, 64 * 1024)));
+    }
+    fn decodeWorkspace(fetched: Fetched) usize {
+        // Retained vectors remain charged to the request/cache owner. Reserve
+        // conservative transient codec work from physical bytes and row count;
+        // oversized phases keep the bounded caller lane rather than overbooking.
+        return @as(usize, fetched.parsed.header.uncompressed_page_size) *| 2 +|
+            @as(usize, fetched.parsed.header.value_count) *| 32 +| 64 * 1024;
+    }
+    fn queueDecode(self: *Cursor, io: std.Io, changed: *std.Io.Event, slot: *?Pending, column: *Column, fetched: Fetched) !bool {
+        if ((self.scheduler orelse Scheduler.global()).submitNotified(io, decodeWorkspace(fetched), changed, decodeWorker, .{ self.*, column, fetched })) |task| {
+            slot.* = .{ .decode = .{ .task = task, .input = fetched } };
+            return false;
+        }
+        const step = decodeWorker(self.*, column, fetched) catch |err| {
+            if (err == error.ParquetPageTooLarge) {
+                slot.* = .{ .retry = fetched };
+                return false;
+            }
+            fetched.lease.release();
+            return err;
+        };
+        fetched.lease.release();
+        self.addStats(step.stats);
+        return step.ready;
     }
     fn decodeWorker(template: Cursor, column: *Column, fetched: Fetched) anyerror!DecodedStep {
         var worker = template;
@@ -732,12 +812,6 @@ pub const Cursor = struct {
             }
             return;
         }
-        const scheduler = @import("../../sql/parallel_scheduler.zig");
-        const Pending = union(enum) {
-            fetch: scheduler.Task(anyerror!?Fetched),
-            decode: struct { task: scheduler.Task(anyerror!DecodedStep), input: Fetched },
-            retry: Fetched,
-        };
         var pending: [4]?Pending = @splat(null);
         var columns: [4]?*Column = @splat(null);
         var changed: std.Io.Event = .unset;
@@ -745,8 +819,12 @@ pub const Cursor = struct {
         // but unjoined fetch still owns its input credit and must be drained.
         defer for (&pending) |*slot| if (slot.*) |*task| {
             switch (task.*) {
-                .fetch => |*active| if (active.cancel(io.?)) |result| {
-                    if (result) |fetched| fetched.lease.release();
+                .header => |*active| if (active.cancel(io.?)) |result| {
+                    if (result) |prepared| if (prepared.probe) |probe| probe.release();
+                } else |_| {},
+                .body => |prepared| if (prepared.probe) |probe| probe.release(),
+                .fetch => |*active| if (active.cancel(io.?)) |fetched| {
+                    fetched.lease.release();
                 } else |_| {},
                 .decode => |*active| {
                     _ = active.task.cancel(io.?) catch {};
@@ -763,34 +841,24 @@ pub const Cursor = struct {
             var progressed = false;
             for (&pending, &columns) |*slot, *column_slot| {
                 if (slot.*) |*task| switch (task.*) {
+                    .header => |*active| if (active.isComplete()) {
+                        const outcome = active.await(io.?);
+                        slot.* = null;
+                        progressed = true;
+                        if (try outcome) |prepared| {
+                            if (prepared.probe != null) {
+                                const fetched = try self.completeFetch(column_slot.*.?, prepared);
+                                if (try self.queueDecode(io.?, &changed, slot, column_slot.*.?, fetched)) column_slot.* = null;
+                            } else slot.* = .{ .body = prepared };
+                        } else column_slot.* = null;
+                    },
                     .fetch => |*active| if (active.isComplete()) {
                         const outcome = active.await(io.?);
                         slot.* = null;
                         progressed = true;
-                        if (try outcome) |fetched| {
-                            // CPU admission begins only after the complete
-                            // encoded lease is ready; input residency remains
-                            // bounded by the independent live request owner.
-                            const workspace = (self.limits.max_input_bytes +| self.limits.max_decoded_bytes) / @max(@as(usize, 1), self.columns.len);
-                            if ((self.scheduler orelse scheduler.global()).submitNotified(io.?, workspace, &changed, decodeWorker, .{ self.*, column_slot.*.?, fetched })) |decode_task| {
-                                slot.* = .{ .decode = .{ .task = decode_task, .input = fetched } };
-                            } else {
-                                const inline_outcome = decodeWorker(self.*, column_slot.*.?, fetched);
-                                if (inline_outcome) |step| {
-                                    fetched.lease.release();
-                                    self.addStats(step.stats);
-                                    if (step.ready) column_slot.* = null;
-                                } else |err| {
-                                    if (err == error.ParquetPageTooLarge) {
-                                        slot.* = .{ .retry = fetched };
-                                    } else {
-                                        fetched.lease.release();
-                                        return err;
-                                    }
-                                }
-                            }
-                        } else column_slot.* = null;
+                        if (try self.queueDecode(io.?, &changed, slot, column_slot.*.?, try outcome)) column_slot.* = null;
                     },
+                    .body => {},
                     .decode => |*active| if (active.task.isComplete()) {
                         const outcome = active.task.await(io.?);
                         const fetched = active.input;
@@ -811,8 +879,14 @@ pub const Cursor = struct {
                     },
                     .retry => {},
                 };
-                if (slot.* != null) {
-                    active_count += 1;
+                if (slot.*) |task| {
+                    if (task == .body) {
+                        if ((self.scheduler orelse Scheduler.global()).submitIoNotified(io.?, task.body.len, &changed, fetchWorker, .{ self.*, column_slot.*.?, task.body })) |future| {
+                            slot.* = .{ .fetch = future };
+                            active_count += 1;
+                            progressed = true;
+                        }
+                    } else if (task != .retry) active_count += 1;
                     continue;
                 }
                 while (column_slot.* == null and next_column < self.columns.len) {
@@ -822,9 +896,8 @@ pub const Cursor = struct {
                     column_slot.* = column;
                 }
                 if (column_slot.*) |column| {
-                    const workspace = self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len);
-                    if ((self.scheduler orelse scheduler.global()).submitIoNotified(io.?, workspace, &changed, fetchWorker, .{ self.*, column })) |fetch_task| {
-                        slot.* = .{ .fetch = fetch_task };
+                    if ((self.scheduler orelse Scheduler.global()).submitIoNotified(io.?, self.headerWorkspace(column), &changed, headerWorker, .{ self.*, column })) |fetch_task| {
+                        slot.* = .{ .header = fetch_task };
                         active_count += 1;
                         progressed = true;
                     }
@@ -850,6 +923,7 @@ pub const Cursor = struct {
                 progressed = true;
                 break;
             };
+            if (active_count == 0 and progressed) continue;
             if (active_count == 0) {
                 var waiting: ?*?*Column = null;
                 for (&columns) |*column| if (column.* != null) {
@@ -857,6 +931,15 @@ pub const Cursor = struct {
                     break;
                 };
                 if (waiting) |column_slot| {
+                    for (&pending, &columns) |*slot, *held| if (held == column_slot and slot.* != null and slot.*.? == .body) {
+                        const prepared = slot.*.?.body;
+                        slot.* = null;
+                        const fetched = try self.completeFetch(column_slot.*.?, prepared);
+                        if (try self.queueDecode(io.?, &changed, slot, column_slot.*.?, fetched)) column_slot.* = null;
+                        progressed = true;
+                        break;
+                    };
+                    if (progressed) continue;
                     // No live phase can own input here. A saturated global I/O
                     // lane uses one caller lane without parking behind our own
                     // completed encoded pages.

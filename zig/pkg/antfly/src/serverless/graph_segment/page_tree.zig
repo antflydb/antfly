@@ -559,13 +559,28 @@ pub const Page = struct {
     }
 };
 
+/// Mutation output owns compact fences independently of decoded input pages.
+/// Adjacent children share one immutable seed; replacing or moving a child
+/// transfers its reference, including across occupancy repair and spine joins.
+const FenceSeed = struct {
+    bytes: []u8,
+    refs: usize = 1,
+    fn release(self: *FenceSeed, alloc: Allocator) void {
+        self.refs -= 1;
+        if (self.refs != 0) return;
+        alloc.free(self.bytes);
+        alloc.destroy(self);
+    }
+};
 const Child = struct {
-    first: []u8,
+    first: KeyView,
+    seed: ?*FenceSeed = null,
     ref: Ref,
     aggregate: []u8,
 
     pub fn deinit(self: Child, alloc: Allocator) void {
-        alloc.free(self.first);
+        alloc.free(self.first.suffix);
+        if (self.seed) |seed| seed.release(alloc);
         alloc.free(self.aggregate);
     }
 };
@@ -578,19 +593,40 @@ fn freeChildren(alloc: Allocator, children: *Children) void {
 }
 
 fn appendChild(alloc: Allocator, children: *Children, first: []const u8, ref: Ref, aggregate: []const u8) !void {
-    const owned = try alloc.dupe(u8, first);
-    errdefer alloc.free(owned);
-    const reduced = try alloc.dupe(u8, aggregate);
-    errdefer alloc.free(reduced);
-    try children.append(alloc, .{ .first = owned, .ref = ref, .aggregate = reduced });
+    return appendChildView(alloc, children, .from(first), ref, aggregate);
 }
 
 fn appendChildView(alloc: Allocator, children: *Children, first: KeyView, ref: Ref, aggregate: []const u8) !void {
-    const owned = try first.dupe(alloc);
-    errdefer alloc.free(owned);
-    const reduced = try alloc.dupe(u8, aggregate);
-    errdefer alloc.free(reduced);
-    try children.append(alloc, .{ .first = owned, .ref = ref, .aggregate = reduced });
+    var child: Child = .{ .first = .from(""), .ref = ref, .aggregate = &.{} };
+    errdefer child.deinit(alloc);
+    // Small independent keys keep the single-allocation representation. Long
+    // fences amortize seed ownership across siblings, even when retainKnown
+    // receives complete caller-owned keys rather than prefix/suffix views.
+    const minimum_shared = 128;
+    if (children.items.len != 0) {
+        if (children.items[children.items.len - 1].seed) |seed| {
+            const shared = first.common(.from(seed.bytes));
+            if (shared >= minimum_shared) {
+                child.seed = seed;
+                seed.refs += 1;
+                child.first.prefix = seed.bytes[0..shared];
+                child.first.suffix = try alloc.alloc(u8, first.len() - shared);
+                first.copyRange(shared, @constCast(child.first.suffix));
+            }
+        }
+    }
+    if (child.seed == null) {
+        if (first.len() >= minimum_shared) {
+            const bytes = try first.dupe(alloc);
+            errdefer alloc.free(bytes);
+            const seed = try alloc.create(FenceSeed);
+            seed.* = .{ .bytes = bytes };
+            child.seed = seed;
+            child.first.prefix = bytes;
+        } else child.first.suffix = try first.dupe(alloc);
+    }
+    child.aggregate = try alloc.dupe(u8, aggregate);
+    try children.append(alloc, child);
 }
 
 fn readU32(bytes: []const u8, offset: usize) u32 {
@@ -1060,7 +1096,7 @@ fn packAt(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ou
 
 fn childEntries(alloc: Allocator, children: []const Child) ![]Entry {
     const entries = try alloc.alloc(Entry, children.len);
-    for (entries, children) |*entry, child| entry.* = .{ .key = child.first, .child = child.ref, .aggregate = child.aggregate };
+    for (entries, children) |*entry, child| entry.* = .{ .key = child.first.suffix, .prefix = child.first.prefix, .child = child.ref, .aggregate = child.aggregate };
     return entries;
 }
 
@@ -1081,8 +1117,8 @@ fn rebalance(alloc: Allocator, store: Store, children: *Children) !void {
         defer left.deinit(alloc);
         var right = try load(alloc, store, b.ref);
         defer right.deinit(alloc);
-        if (a.ref.height != b.ref.height or left.key(0).order(KeyView.from(a.first)) != .eq or
-            right.key(0).order(KeyView.from(b.first)) != .eq or !keyLess(left.key(left.entries.len - 1), right.key(0)))
+        if (a.ref.height != b.ref.height or left.key(0).order(a.first) != .eq or
+            right.key(0).order(b.first) != .eq or !keyLess(left.key(left.entries.len - 1), right.key(0)))
             return error.InvalidGraphPage;
         const entries = try alloc.alloc(Entry, left.entries.len + right.entries.len);
         defer alloc.free(entries);
@@ -1244,11 +1280,11 @@ fn joinBoundary(alloc: Allocator, store: Store, left: Ref, right: Ref, out: *Chi
         try joinBoundary(alloc, store, lp.entries[lp.entries.len - 1].child.?.*, right, &boundary);
         entries = try alloc.alloc(Entry, lp.entries.len - 1 + boundary.items.len);
         for (entries[0 .. lp.entries.len - 1], 0..) |*out_entry, i_| out_entry.* = lp.writeEntry(i_);
-        for (boundary.items, entries[lp.entries.len - 1 ..]) |child, *entry| entry.* = .{ .key = child.first, .child = child.ref, .aggregate = child.aggregate };
+        for (boundary.items, entries[lp.entries.len - 1 ..]) |child, *entry| entry.* = .{ .key = child.first.suffix, .prefix = child.first.prefix, .child = child.ref, .aggregate = child.aggregate };
     } else {
         try joinBoundary(alloc, store, left, rp.entries[0].child.?.*, &boundary);
         entries = try alloc.alloc(Entry, boundary.items.len + rp.entries.len - 1);
-        for (boundary.items, entries[0..boundary.items.len]) |child, *entry| entry.* = .{ .key = child.first, .child = child.ref, .aggregate = child.aggregate };
+        for (boundary.items, entries[0..boundary.items.len]) |child, *entry| entry.* = .{ .key = child.first.suffix, .prefix = child.first.prefix, .child = child.ref, .aggregate = child.aggregate };
         for (entries[boundary.items.len..], 1..) |*out_entry, i_| out_entry.* = rp.writeEntry(i_);
     }
     defer alloc.free(entries);
@@ -4630,4 +4666,62 @@ test "external lake metadata navigation vector prefix comparisons match scalar b
         try std.testing.expectEqual(length, commonBytes(&left, right[0..length]));
         try std.testing.expectEqual(std.math.order(left.len, length), KeyView.from(&left).order(.from(right[0..length])));
     }
+}
+
+test "external lake metadata navigation dense branch mutation keeps compact owned fences" {
+    const a = std.testing.allocator;
+    const count = 512;
+    const width = 16384;
+    const keys = try a.alloc([width]u8, count);
+    defer a.free(keys);
+    const value = try a.alloc(u8, 32768);
+    defer a.free(value);
+    @memset(value, 'v');
+    var memory: TestStore = .{ .alloc = a };
+    defer memory.deinit();
+    var store = memory.store();
+    store.prefix_keys = true;
+    var builder: SortedBuilder = .{ .alloc = a, .store = store };
+    defer builder.deinit();
+    for (keys, 0..) |*key, i| {
+        @memset(key, 'p');
+        std.mem.writeInt(u64, key[width - 8 ..], i, .big);
+        try builder.add(key, value);
+    }
+    const root = (try builder.finish()).?;
+    try std.testing.expect(root.height > 0);
+    value[0] = 'x';
+    var tracking = std.testing.FailingAllocator.init(a, .{});
+    const updated = (try apply(tracking.allocator(), store, root, &.{.{ .key = &keys[300], .value = value }})).?;
+    try std.testing.expectEqual(@as(u64, count), updated.records);
+    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+    const space = try a.alloc(u8, 4 * 1024 * 1024);
+    defer a.free(space);
+    var fixed = std.heap.FixedBufferAllocator.init(space);
+    const bounded = (try apply(fixed.allocator(), store, root, &.{.{ .key = &keys[300], .value = value }})).?;
+    try std.testing.expectEqual(@as(u64, count), bounded.records);
+    try std.testing.expect(tracking.allocated_bytes < space.len);
+    std.debug.print("REVIEW_PRODUCTION_BRANCH root_height={} root_bytes={} edit_total_allocated={} limit={}\n", .{ root.height, root.bytes, tracking.allocated_bytes, space.len });
+}
+
+test "external lake metadata navigation owned compact fences unwind allocation faults" {
+    const Check = struct {
+        fn run(a: Allocator) !void {
+            var children: Children = .empty;
+            defer freeChildren(a, &children);
+            var keys: [6][512]u8 = @splat(@splat('p'));
+            for (&keys, 0..) |*key, i| {
+                if (i >= 3) key[100] = 'q';
+                std.mem.writeInt(u64, key[504..], i, .big);
+                try appendChildView(a, &children, .{ .prefix = key[0..400], .suffix = key[400..] }, .{ .digest = @splat(1), .bytes = 100, .height = 0, .records = 1 }, "aggregate");
+            }
+            const entries = try childEntries(a, children.items);
+            defer a.free(entries);
+            for (entries, &keys) |entry, *key| try std.testing.expectEqual(.eq, entry.keyView().order(.from(key)));
+            try std.testing.expect(children.items[0].seed == children.items[1].seed);
+            try std.testing.expect(children.items[3].seed == children.items[4].seed);
+            try std.testing.expect(children.items[0].seed != children.items[3].seed);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

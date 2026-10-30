@@ -10980,45 +10980,200 @@ test "external lake Parquet page phases leave CPU admission free during delayed 
     defer memory.deinit();
     var shared: serving.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(memory.client()), .scope = @splat(0), .context = .{ .io = io } };
     defer shared.drain(true);
-    for ([_]bool{ false, true }) |cancel| {
-        delayed.entered.reset();
-        delayed.gate.reset();
-        delayed.calls.store(0, .release);
-        var cursor = try Cursor.init(a, .{ .ctx = &delayed, .read_range_alloc = Reader.read }, inventory, "data", 0, &.{ "a", "b" }, .{ .max_input_bytes = 1024 * 1024, .max_decoded_bytes = 1024 * 1024 });
-        defer cursor.deinit();
-        cursor.shared_reader = &shared;
-        cursor.scheduler = &scheduler;
-        // A separate scope makes both passes physically cold.
-        shared.scope = @splat(@intFromBool(cancel));
-        var future = try io.concurrent(Reader.run, .{&cursor});
-        var joined = false;
-        defer if (!joined) {
-            _ = future.cancel(io) catch {};
-        };
-        try delayed.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } });
-        while (!scheduler.mutex.tryLock()) std.atomic.spinLoopHint();
-        const io_workers = scheduler.io_workers;
-        const cpu_workers = scheduler.workers - scheduler.io_workers;
-        scheduler.mutex.unlock();
-        try std.testing.expectEqual(@as(usize, 2), io_workers);
-        try std.testing.expectEqual(@as(usize, 0), cpu_workers);
-        var unrelated = scheduler.submit(io, 1, Reader.cpu, .{}) orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqual(@as(usize, 7), unrelated.await(io));
-        if (cancel) {
-            const result = future.cancel(io);
-            joined = true;
-            try std.testing.expectError(error.Canceled, result);
-        } else {
-            delayed.gate.set(io);
-            const outcome = future.await(io);
-            joined = true;
-            const batch = (try outcome).?;
-            try std.testing.expectEqual(@as(i64, 11), try batch.columns[0].integerAt(0));
-            try std.testing.expectEqual(@as(i64, 22), try batch.columns[1].integerAt(0));
+    for ([_]MaterializationLimits{ .{}, .{ .max_input_bytes = 1024 * 1024, .max_decoded_bytes = 1024 * 1024 } }) |limits| {
+        for ([_]bool{ false, true }) |cancel| {
+            delayed.entered.reset();
+            delayed.gate.reset();
+            delayed.calls.store(0, .release);
+            var cursor = try Cursor.init(a, .{ .ctx = &delayed, .read_range_alloc = Reader.read }, inventory, "data", 0, &.{ "a", "b" }, limits);
+            defer cursor.deinit();
+            cursor.shared_reader = &shared;
+            cursor.scheduler = &scheduler;
+            // A separate scope makes both passes physically cold.
+            shared.scope = @splat(@intFromBool(cancel));
+            var future = try io.concurrent(Reader.run, .{&cursor});
+            var joined = false;
+            defer if (!joined) {
+                _ = future.cancel(io) catch {};
+            };
+            try delayed.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } });
+            while (!scheduler.mutex.tryLock()) std.atomic.spinLoopHint();
+            const io_workers = scheduler.io_workers;
+            const cpu_workers = scheduler.workers - scheduler.io_workers;
+            scheduler.mutex.unlock();
+            try std.testing.expectEqual(@as(usize, 2), io_workers);
+            try std.testing.expectEqual(@as(usize, 0), cpu_workers);
+            var unrelated = scheduler.submit(io, 1, Reader.cpu, .{}) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 7), unrelated.await(io));
+            if (cancel) {
+                const result = future.cancel(io);
+                joined = true;
+                try std.testing.expectError(error.Canceled, result);
+            } else {
+                delayed.gate.set(io);
+                const outcome = future.await(io);
+                joined = true;
+                const batch = (try outcome).?;
+                try std.testing.expectEqual(@as(i64, 11), try batch.columns[0].integerAt(0));
+                try std.testing.expectEqual(@as(i64, 22), try batch.columns[1].integerAt(0));
+            }
+            try std.testing.expectEqual(@as(usize, 0), cursor.admission.input);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
         }
-        try std.testing.expectEqual(@as(usize, 0), cursor.admission.input);
-        try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
-        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    }
+}
+
+test "external lake Parquet physical payload phases overlap at default quotas cancel and preserve saturated inline work" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Scheduler = @import("../../sql/parallel_scheduler.zig");
+    const serving = @import("lake_serving_cache.zig");
+    const Cursor = @import("lake_parquet_cursor.zig").Cursor;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    try appendPlainI64DataPage(&bytes, a, &.{-1});
+    const first_small = bytes.items.len;
+    try appendPlainI64DataPage(&bytes, a, &@as([128]i64, @splat(11)));
+    const split = bytes.items.len;
+    try appendPlainI64DataPage(&bytes, a, &.{-1});
+    const second_small = bytes.items.len - split;
+    try appendPlainI64DataPage(&bytes, a, &@as([128]i64, @splat(22)));
+    var chunks = [_]external_source.ColumnChunk{
+        .{ .column_id = @constCast("a"), .file_offset = 0, .compressed_len = split, .uncompressed_len = split, .physical_type = @constCast("int64"), .encoding = @constCast("plain") },
+        .{ .column_id = @constCast("b"), .file_offset = split, .compressed_len = bytes.items.len - split, .uncompressed_len = bytes.items.len - split, .physical_type = @constCast("int64"), .encoding = @constCast("plain") },
+    };
+    const data_end = bytes.items.len;
+    var index_starts: [2]usize = undefined;
+    var index_lengths: [2]usize = undefined;
+    for (&chunks, &index_starts, &index_lengths, [_]usize{ first_small, second_small }) |*chunk, *start, *len, small| {
+        start.* = bytes.items.len;
+        var field: i16 = 0;
+        try appendField(&bytes, a, &field, 1, .list);
+        try appendListHeader(&bytes, a, .struct_, 2);
+        for (0..2) |page_index| {
+            var id: i16 = 0;
+            try appendField(&bytes, a, &id, 1, .i64);
+            try appendI64(&bytes, a, @intCast(chunk.file_offset + if (page_index == 0) @as(usize, 0) else small));
+            try appendField(&bytes, a, &id, 2, .i32);
+            try appendI32(&bytes, a, @intCast(if (page_index == 0) small else chunk.compressed_len - small));
+            try appendField(&bytes, a, &id, 3, .i64);
+            try appendI64(&bytes, a, @intCast(page_index));
+            try appendStop(&bytes, a);
+        }
+        try appendStop(&bytes, a);
+        len.* = bytes.items.len - start.*;
+    }
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 129, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = @constCast("version"), .byte_len = bytes.items.len, .row_count = 129, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const Reader = struct {
+        bytes: []const u8,
+        data_end: usize,
+        entered: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        bodies: std.atomic.Value(usize) = .init(0),
+        body_entered: std.Io.Event = .unset,
+        body_gate: std.Io.Event = .unset,
+        fn read(raw: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, offset: u64, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (offset >= self.data_end) return allocator.dupe(u8, self.bytes[@intCast(offset)..][0..len]);
+            if (len > 512) {
+                if (self.bodies.fetchAdd(1, .acq_rel) + 1 == 2) self.body_entered.set(std.testing.io);
+                try self.body_gate.wait(std.testing.io);
+            } else {
+                if (self.calls.fetchAdd(1, .acq_rel) + 1 == 2) self.entered.set(std.testing.io);
+                try self.gate.wait(std.testing.io);
+            }
+            return allocator.dupe(u8, self.bytes[@intCast(offset)..][0..len]);
+        }
+        fn run(cursor: *Cursor) !?@import("../../storage/rowsource/types.zig").ColumnBatch {
+            return cursor.next();
+        }
+        fn cpu() usize {
+            return 7;
+        }
+    };
+    var delayed: Reader = .{ .bytes = bytes.items, .data_end = data_end };
+    var scheduler: Scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = 2 };
+    var cache = serving.Cache.init(a);
+    defer cache.deinit();
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var shared: serving.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(memory.client()), .scope = @splat(0), .context = .{ .io = io } };
+    defer shared.drain(true);
+    var case_scope: u8 = 0;
+    for ([_]bool{ false, true }) |indexed| {
+        for (&chunks, index_starts, index_lengths) |*chunk, start, len| {
+            chunk.offset_index_offset = if (indexed) start else null;
+            chunk.offset_index_length = if (indexed) @intCast(len) else null;
+        }
+        for ([_]MaterializationLimits{ .{}, .{ .max_input_bytes = 1024 * 1024, .max_decoded_bytes = 1024 * 1024 } }) |limits| {
+            for ([_]bool{ false, true }) |cancel| {
+                for ([_]usize{ 0, 2 }) |lanes| {
+                    scheduler.max_io_workers = lanes;
+                    delayed.entered.reset();
+                    delayed.gate.reset();
+                    delayed.calls.store(0, .release);
+                    delayed.bodies.store(0, .release);
+                    delayed.body_entered.reset();
+                    delayed.body_gate.reset();
+                    if (lanes == 0) {
+                        delayed.gate.set(io);
+                        delayed.body_gate.set(io);
+                    }
+                    var cursor = try Cursor.init(a, .{ .ctx = &delayed, .read_range_alloc = Reader.read }, inventory, "data", 0, &.{ "a", "b" }, limits);
+                    defer cursor.deinit();
+                    cursor.shared_reader = &shared;
+                    cursor.scheduler = &scheduler;
+                    // Model a predicate survivor beyond a tiny earlier page.
+                    // Admission must use the larger surviving indexed range.
+                    cursor.position = 1;
+                    // A separate scope makes both passes physically cold.
+                    shared.scope = @splat(case_scope);
+                    case_scope += 1;
+                    var future = try io.concurrent(Reader.run, .{&cursor});
+                    var joined = false;
+                    defer if (!joined) {
+                        _ = future.cancel(io) catch {};
+                    };
+                    if (lanes != 0) {
+                        if (!indexed) try delayed.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } });
+                        delayed.gate.set(io);
+                        try delayed.body_entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } });
+                        while (!scheduler.mutex.tryLock()) std.atomic.spinLoopHint();
+                        const io_workers = scheduler.io_workers;
+                        const cpu_workers = scheduler.workers - scheduler.io_workers;
+                        const io_bytes = scheduler.io_bytes;
+                        scheduler.mutex.unlock();
+                        try std.testing.expectEqual(@as(usize, 2), io_workers);
+                        try std.testing.expectEqual(@as(usize, 0), cpu_workers);
+                        try std.testing.expectEqual(data_end - first_small - second_small, io_bytes);
+                        var unrelated = scheduler.submit(io, 1, Reader.cpu, .{}) orelse return error.TestUnexpectedResult;
+                        try std.testing.expectEqual(@as(usize, 7), unrelated.await(io));
+                    }
+                    if (cancel and lanes != 0) {
+                        const result = future.cancel(io);
+                        joined = true;
+                        try std.testing.expectError(error.Canceled, result);
+                    } else {
+                        delayed.body_gate.set(io);
+                        const outcome = future.await(io);
+                        joined = true;
+                        const batch = (try outcome).?;
+                        try std.testing.expectEqual(@as(i64, 11), try batch.columns[0].integerAt(0));
+                        try std.testing.expectEqual(@as(i64, 22), try batch.columns[1].integerAt(0));
+                        try std.testing.expectEqual(@as(usize, if (indexed) 0 else 4), delayed.calls.load(.acquire));
+                        try std.testing.expectEqual(@as(usize, 2), delayed.bodies.load(.acquire));
+                    }
+                    try std.testing.expectEqual(@as(usize, 0), cursor.admission.input);
+                    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+                    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+                }
+            }
+        }
     }
 }
 
