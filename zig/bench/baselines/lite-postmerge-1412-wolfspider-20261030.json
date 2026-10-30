@@ -9377,9 +9377,9 @@
       "optional_skips": 3,
       "passed": 267
     },
-    "default_gate": "pending",
+    "default_gate": "not run after confirmed unit failure",
     "full_unit": {
-      "aggregate_exit_code": null,
+      "aggregate_exit_code": 143,
       "compiler_reservation_overruns": [
         {
           "corrected_claim_gib": 21,
@@ -9395,14 +9395,27 @@
         }
       ],
       "inference_abort": {
-        "cause": "allocation-failure sweep dereferences null batch.usage",
+        "cause": "encoded-read adapter omitted aggregate batch usage; test dereferences null on its first normal call",
+        "fix_pr": 1424,
+        "fix_revision": "53dae92765",
+        "isolated_repro_exit_code": 134,
         "location": "zig/pkg/inference/src/server/server.zig:33129",
         "scope": "outside Lite runtime change",
         "signal": "ABRT",
         "test": "Qwen3-VL encoded read results own page identities and report serial execution"
       },
-      "scope": "remaining owners still running; gate already has independent failures",
+      "scope": "remaining owners stopped after confirmed failures; retained logs, no complete full-gate pass",
       "status": "failed"
+    },
+    "inference_usage_fix": {
+      "allocation_failure_sweep": "passed",
+      "focused_build_exit_code": 0,
+      "full_unit_rerun": false,
+      "passed_tests": 1,
+      "pr": 1424,
+      "prior_binary_exit_code": 134,
+      "revision": "53dae92765",
+      "selected_tests": 1
     },
     "maintenance_fix_contracts": {
       "failed": 0,
