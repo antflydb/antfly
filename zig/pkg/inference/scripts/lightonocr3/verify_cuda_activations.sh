@@ -28,7 +28,7 @@ case "$("$nvcc" --version)" in
   *) echo "Use CUDA 13.0 to reproduce the driver-13.0-compatible PTX image" >&2; exit 2 ;;
 esac
 mkdir -p "$output_dir"
-"$nvcc" -ptx -arch=compute_80 -O3 "$pkg_root/src/ops/cuda/prototypes/lighton_activation.cu" -o "$output_dir/lighton_activation.ptx"
+"$nvcc" -ptx -arch=compute_80 -O3 "$pkg_root/src/ops/cuda/prototypes/bf16_activation_programs.cu" -o "$output_dir/lighton_activation.ptx"
 "${PYTHON:-python3}" - "$output_dir/lighton_activation.ptx" <<'PY'
 from pathlib import Path
 import sys
@@ -37,7 +37,7 @@ p.write_bytes(p.read_bytes().rstrip(b"\n") + b"\n")
 PY
 cmp "$pkg_root/src/ops/cuda/lighton_activation.ptx" "$output_dir/lighton_activation.ptx"
 "${PYTHON:-python3}" "$pkg_root/scripts/lightonocr3/make_cuda_activation_oracle.py" \
-  --prototype "$pkg_root/src/ops/cuda/prototypes/lighton_activation.cu" \
+  --prototype "$pkg_root/src/ops/cuda/prototypes/bf16_activation_programs.cu" \
   --reference "$pkg_root/src/ops/cuda/artifacts/inference_cuda_kernels.cu" \
   --output "$output_dir/activation_oracle.cu"
 "$nvcc" -ptx -arch=compute_80 -O3 "$output_dir/activation_oracle.cu" -o "$output_dir/activation_oracle.ptx"

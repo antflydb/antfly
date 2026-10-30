@@ -18,11 +18,11 @@ const driver = @import("driver.zig");
 
 // Native export names remain the compatibility ABI of the qualified PTX.
 const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("florence_fused.ptx") ++ "\x00", .{
-    .token_depthwise_residual = "florence_token_depthwise_residual",
-    .layer_norm_f16 = "florence_layer_norm_f16",
+    .token_depthwise_residual = "antfly_depthwise_3x3_residual_f32",
+    .layer_norm_f16 = "antfly_layer_norm_warp_finish_f16",
     .exact_gelu_f16 = "florence_exact_gelu_f16",
     .cross_q1_h12_d64_f32 = "florence_cross_q1_f32",
-    .window_norm_f16 = "florence_window_norm_f16",
+    .window_norm_f16 = "antfly_window_layer_norm_warp_finish_f16",
     .split_qkv_f16 = "florence_split_qkv_f16",
     .append_self_kv_f32 = "florence_append_self_kv_f32",
 });

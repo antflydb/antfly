@@ -1,13 +1,14 @@
+#include "../../gpu/depthwise_program.h"
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "embedding_gemma2_training_rope.cuh"
+#include "rotary_frequency_training.cuh"
 #include "row_program.cuh"
 
-// EmbeddingGemma 2's encoder deliberately has its own kernels.  Decoder
-// attention is causal and applies a sqrt(head_dim) scale; neither property is
-// valid here.  Values are BF16 in memory and all reductions remain FP32.
+// Bidirectional BF16 encoder programs retain unscaled FP32 attention.
+// Decoder causal attention uses a different score scale and schedule.
+// Historical exports are compatibility names; extend these shared owners.
 
 // Pillow's RGB8 bicubic resize materializes quantized horizontal pixels.
 // The CPU supplies its exact integer coefficient plan; both passes retain
@@ -1299,7 +1300,7 @@ extern "C" __global__ void termite_gemma4_audio_glu_rows_f32(
     out[i] = input[base + column] / (1.0f + expf(-gate));
 }
 
-extern "C" __global__ void termite_gemma4_audio_depthwise_causal_conv1d_f32(
+extern "C" __global__ void termite_causal_depthwise_f32(
     float* out, const float* input, const float* weight,
     unsigned int rows, unsigned int dim, unsigned int kernel_size) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1307,20 +1308,7 @@ extern "C" __global__ void termite_gemma4_audio_depthwise_causal_conv1d_f32(
     if ((size_t)i >= count) return;
     const unsigned int time = i / dim;
     const unsigned int channel = i - time * dim;
-    const size_t left_pad = (size_t)kernel_size - 1;
-    float sum = 0.0f;
-    for (unsigned int kernel = 0; kernel < kernel_size; ++kernel) {
-        const size_t padded_time = (size_t)time + kernel;
-        if (padded_time < left_pad) continue;
-        const size_t source_time = padded_time - left_pad;
-        // Preserve the separate FP32 multiply/add rounding of the host
-        // convolution. FMA contraction changes near-cancelling activations
-        // enough to cross later BF16 rounding boundaries in the audio tower.
-        const float product = __fmul_rn(input[(size_t)source_time * dim + channel],
-            weight[(size_t)kernel * dim + channel]);
-        sum = __fadd_rn(sum, product);
-    }
-    out[i] = sum;
+    out[i]=antfly_causal_depthwise<false,false,false,true>(input,weight,input,size_t(time),channel,dim,kernel_size,0u);
 }
 
 extern "C" __global__ void antfly_audio_frontend_f32(const float *input, const float *aux, float *out, unsigned mode, unsigned rows, unsigned width, unsigned hop, float floor, unsigned batch) {

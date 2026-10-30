@@ -592,7 +592,7 @@ pub const SegmentTrainingAttentionAttrs = struct {
 /// logical positions. A row with no visible key outputs zero. The scale is
 /// `1/sqrt(head_dim)`. The backward replays the softmax statistics instead of
 /// saving them, and returns the packed [dQ;dK;dV] gradient.
-pub const ModernBertTrainingAttentionAttrs = struct {
+pub const RangeTrainingAttentionAttrs = struct {
     batch: u32,
     seq_len: u32,
     num_heads: u32,
@@ -617,7 +617,7 @@ pub const ModernBertTrainingAttentionAttrs = struct {
     };
 
     /// Shape validation only; backends validate the control contents.
-    pub fn layout(self: ModernBertTrainingAttentionAttrs) !Layout {
+    pub fn layout(self: RangeTrainingAttentionAttrs) !Layout {
         for ([_]u32{ self.batch, self.seq_len, self.num_heads, self.head_dim }) |dim|
             if (dim == 0 or dim > std.math.maxInt(i32)) return error.InvalidModernBertTrainingAttentionShape;
         const tokens = try std.math.mul(i64, self.batch, self.seq_len);
@@ -629,6 +629,9 @@ pub const ModernBertTrainingAttentionAttrs = struct {
         return .{ .tokens = tokens, .hidden = hidden, .qkv_rows = qkv_rows, .control_elements = control_elements };
     }
 };
+
+/// Compatibility type for the historical graph operation.
+pub const ModernBertTrainingAttentionAttrs = RangeTrainingAttentionAttrs;
 
 pub const RopeAttrs = struct {
     seq_len: u32,

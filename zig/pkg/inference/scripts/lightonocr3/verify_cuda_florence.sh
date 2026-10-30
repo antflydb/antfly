@@ -29,7 +29,7 @@ case "$("$nvcc" --version)" in
 esac
 mkdir -p "$output_dir"
 "$nvcc" -ptx -arch=compute_80 -O3 \
-  "$pkg_root/src/ops/cuda/prototypes/florence_fused.cu" \
+  "$pkg_root/src/ops/cuda/prototypes/vision_f16_programs.cu" \
   -o "$output_dir/florence_fused.ptx"
 "${PYTHON:-python3}" - "$output_dir/florence_fused.ptx" <<'PY'
 from pathlib import Path

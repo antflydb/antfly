@@ -21,7 +21,7 @@ const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("lighto
     .layer_norm_bf16 = "lighton_vision_norm_bf16",
     .bias_gelu_bf16 = "lighton_vision_bias_gelu_bf16",
     .bias_residual_f32 = "lighton_vision_bias_residual_f32",
-    .split_qkv_rope_2d_bf16 = "lighton_vision_qkv_rope_bf16",
+    .split_qkv_rope_2d_bf16 = "antfly_qkv_rope_two_axis_bf16",
     .learned_positions = "lighton_vision_learned_positions_f32",
 });
 

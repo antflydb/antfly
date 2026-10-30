@@ -21,6 +21,7 @@
 #import <dispatch/dispatch.h>
 #include "metal_compile_options.h"
 #include "metal_gdn_source.h"
+#include "../ops/gpu/depthwise_program.h"
 // Use libdispatch's exported implementation: the SDK inline fast path's
 // completion-state assumption trips Zig 0.17's C sanitizer on macOS.
 #undef dispatch_once
@@ -6169,12 +6170,12 @@ typedef struct termite_metal_sdpa_segments_f32_params {
 _Static_assert(sizeof(termite_metal_sdpa_segments_f32_params) == 32, "Metal parameter size drift");
 TERMITE_METAL_SDPA_SEGMENTS_F32_FIELDS(TERMITE_METAL_PARAM_ASSERT, termite_metal_sdpa_segments_f32_params)
 
-/// ModernBERT training attention V1 (ops/modernbert_training_attention.zig).
+/// ModernBERT training attention V1 (ops/range_attention_reference.zig).
 /// Mirrored in the MSL source and metal_runtime.zig. `dropout_probability`
 /// and `dropout_seed` are segment training attention's head-layer dropout
 /// (the ModernBERT trunk always passes probability 0); only the flash
 /// kernels below implement the mask.
-typedef struct termite_metal_modernbert_training_attention_params {
+typedef struct antfly_segment_training_attention_params {
     uint32_t tokens;
     uint32_t seq_len;
     uint32_t num_heads;
@@ -6184,7 +6185,7 @@ typedef struct termite_metal_modernbert_training_attention_params {
     float scale;
     float dropout_probability;
     uint64_t dropout_seed;
-} termite_metal_modernbert_training_attention_params;
+} antfly_segment_training_attention_params;
 
 TERMITE_METAL_ABI_DECLARE_TAGGED(sdpa_f32)
 
@@ -6221,6 +6222,33 @@ TERMITE_METAL_ABI_DECLARE_TAGGED(conv2d_f32)
 
 // Stage K/V and form the 32-query, 16-key score tile. Both callers keep
 // their own range types, Q initialization, masking and online statistics.
+#define TERMITE_MSL_MPP_GATE_PROGRAM(Header,Name,Input,Output,Declare,Slice,Sink,Tail) \
+    Header Name "(device " Input "*x,device bfloat*gw,device bfloat*uw,device float*gb,device float*ub,device " Output "*y,constant Params&p,uint2 group){\n" \
+    " tensor<device " Input ",dextents<int,2>,tensor_inline>a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n" \
+    " tensor<device bfloat,dextents<int,2>,tensor_inline>gmat(gw,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)}),umat(uw,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n" \
+    Declare " auto left=a.slice(0,int(group.y)*M);auto rightG=gmat.slice(0,int(group.x)*N);auto rightU=umat.slice(0,int(group.x)*N);" Slice "\n" \
+    " constexpr auto desc=matmul2d_descriptor(M,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<SG>>op;\n" \
+    " auto g=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightG),float>();auto u=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightU),float>();\n" \
+    " op.run(left,rightG,g);op.run(left,rightU,u);\n" \
+    " #pragma unroll\n" \
+    " for(ushort i=0;i<g.get_capacity();i++){auto coord=g.get_multidimensional_index(i);int col=int(group.x)*N+coord[0],row=int(group.y)*M+coord[1];if(coord[0]>=0&&coord[0]<N&&coord[1]>=0&&coord[1]<M&&col<int(p.out_dim)&&row<int(p.rows)){float gs=g[i]+gb[col],us=u[i]+ub[col];" Sink "}}\n" \
+    Tail "}\n"
+
+#define TERMITE_MSL_SEGMENT_BACKWARD_SCORE(LeftScore,LeftGradient,RightScore,RightGradient,Columns) \
+    "TERMITE_FOR_UNROLL(uint ct = 0u; ct < 2u; ++ct) {\n" \
+    "    simdgroup_float8x8 accS = make_filled_simdgroup_matrix<float, 8>(0.0f);\n" \
+    "    simdgroup_float8x8 accP = make_filled_simdgroup_matrix<float, 8>(0.0f);\n" \
+    "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n" \
+    "        simdgroup_float8x8 right_score, right_gradient;\n" \
+    "        simdgroup_load(right_score, " RightScore " + ct * 8u * DM + dt * 8u, DM, ulong2(0, 0), true);\n" \
+    "        simdgroup_multiply_accumulate(accS, " LeftScore "[dt], right_score, accS);\n" \
+    "        simdgroup_load(right_gradient, " RightGradient " + ct * 8u * DM + dt * 8u, DM, ulong2(0, 0), true);\n" \
+    "        simdgroup_multiply_accumulate(accP, " LeftGradient "[dt], right_gradient, accP);\n" \
+    "    }\n" \
+    "    simdgroup_store(accS, ss + s8 * " Columns " + ct * 8u, " Columns ");\n" \
+    "    simdgroup_store(accP, dps + s8 * " Columns " + ct * 8u, " Columns ");\n" \
+    "}\n"
+
 #define TERMITE_MSL_SEGMENT_MMA_QK \
     "        for (uint i = t; i < BK * D; i += 128u) { uint c = i / D, d = i % D; bool in = c < nk; ks[c * DM + d] = in ? k[(kb + c) * hidden + h * D + d] : 0.0f; vs[c * DM + d] = in ? v[(kb + c) * hidden + h * D + d] : 0.0f; }\n" \
     "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" \
@@ -6569,7 +6597,7 @@ TERMITE_METAL_ABI_DECLARE_TAGGED(conv2d_f32)
 // leave the existing recurrent implementation available. F32 state, products,
 // reductions and outputs; each SIMD group owns eight value columns and splits
 // the 128 keys across its lanes. One dispatch covers independent pages.
-static NSString *termite_metal_lightonocr3_recurrent_source(void) {
+static NSString *termite_metal_gated_delta_source(void) {
     return @""
         "#include <metal_stdlib>\n"
         "using namespace metal;\n"
@@ -6677,34 +6705,24 @@ static NSString *termite_metal_lightonocr3_recurrent_source(void) {
 }
 
 // Same RNE packing and clamped SiLU as the ordinary prefill path.
-static NSString *termite_metal_lighton_prefill_ffn_source(void) {
+static NSString *termite_metal_mpp_bf16_gate_source(void) {
     return @""
         "#include <metal_stdlib>\n"
         "#include <metal_tensor>\n"
         "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
         "using namespace metal;using namespace mpp::tensor_ops;\n"
         "struct Params {uint rows,in_dim,out_dim,pad;};\n"
-        "inline float termite_lighton_prefill_silu(float x) {\n"
+        "inline float antfly_silu_finite_clamped(float x) {\n"
         "    if (!isfinite(x)) return 0.0f;\n"
         "    if (x > 20.0f) return x;\n"
         "    if (x < -20.0f) return 0.0f;\n"
         "    float y = x / (1.0f + exp(-x));\n"
         "    return isfinite(y) ? y : 0.0f;\n"
         "}\n"
-        "inline ushort termite_lighton_prefill_pack(float x){uint bits=as_type<uint>(x);return (bits&0x7fffffffu)>0x7f800000u?ushort((bits>>16)|0x40u):ushort((bits+0x7fffu+((bits>>16)&1u))>>16);}\n"
-        "template<uint M, uint N, uint SG> inline void termite_lighton_prefill_gate(device bfloat*x,device bfloat*gw,device bfloat*uw,device float*gb,device float*ub,device ushort*y,constant Params&p,uint2 group){\n"
-        " tensor<device bfloat,dextents<int,2>,tensor_inline>a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
-        " tensor<device bfloat,dextents<int,2>,tensor_inline>gmat(gw,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)}),umat(uw,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
-        " auto left=a.slice(0,int(group.y)*M);auto rightG=gmat.slice(0,int(group.x)*N);auto rightU=umat.slice(0,int(group.x)*N);\n"
-        " constexpr auto desc=matmul2d_descriptor(M,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<SG>>op;\n"
-        " auto g=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightG),float>();auto u=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightU),float>();\n"
-        " op.run(left,rightG,g);op.run(left,rightU,u);\n"
-        " #pragma unroll\n"
-        " for(ushort i=0;i<g.get_capacity();i++){auto coord=g.get_multidimensional_index(i);int col=int(group.x)*N+coord[0],row=int(group.y)*M+coord[1];if(coord[0]>=0&&coord[0]<N&&coord[1]>=0&&coord[1]<M&&col<int(p.out_dim)&&row<int(p.rows)){float gs=g[i]+gb[col],us=u[i]+ub[col];float activated=termite_lighton_prefill_silu(gs);float value=activated==0.0f?0.0f:activated*us;y[uint(row)*p.out_dim+uint(col)]=termite_lighton_prefill_pack(value);}}\n"
-        "\n"
-        "}\n"
-        "kernel void termite_lighton_prefill_gate0(device bfloat*x[[buffer(0)]],device bfloat*g[[buffer(1)]],device bfloat*u[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device ushort*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lighton_prefill_gate<32,64,4>(x,g,u,gb,ub,y,p,group);}\n"
-        "kernel void termite_lighton_prefill_gate1(device bfloat*x[[buffer(0)]],device bfloat*g[[buffer(1)]],device bfloat*u[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device ushort*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lighton_prefill_gate<64,32,4>(x,g,u,gb,ub,y,p,group);}\n"
+        "inline ushort antfly_bf16_rne_nan(float x){uint bits=as_type<uint>(x);return (bits&0x7fffffffu)>0x7f800000u?ushort((bits>>16)|0x40u):ushort((bits+0x7fffu+((bits>>16)&1u))>>16);}\n"
+        TERMITE_MSL_MPP_GATE_PROGRAM("template<uint M, uint N, uint SG> inline void ","antfly_mpp_bf16_gate_up","bfloat","ushort","","","float activated=antfly_silu_finite_clamped(gs);float value=activated==0.0f?0.0f:activated*us;y[uint(row)*p.out_dim+uint(col)]=antfly_bf16_rne_nan(value);","\n")
+        "kernel void antfly_mpp_bf16_gate_up0(device bfloat*x[[buffer(0)]],device bfloat*g[[buffer(1)]],device bfloat*u[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device ushort*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){antfly_mpp_bf16_gate_up<32,64,4>(x,g,u,gb,ub,y,p,group);}\n"
+        "kernel void antfly_mpp_bf16_gate_up1(device bfloat*x[[buffer(0)]],device bfloat*g[[buffer(1)]],device bfloat*u[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device ushort*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){antfly_mpp_bf16_gate_up<64,32,4>(x,g,u,gb,ub,y,p,group);}\n"
         ;
 }
 
@@ -6723,7 +6741,7 @@ static NSString *termite_metal_lighton_prefill_ffn_source(void) {
     X(termite_lightonocr3_wide_mpp_1,float,bfloat,16,16,1,false) \
     X(termite_lightonocr3_wide_mpp_2,float,bfloat,16,64,4,false)
 
-static NSString *termite_metal_lightonocr3_tensor_source(void) {
+static NSString *termite_metal_tensor_program_source(void) {
     return @""
         "#include <metal_stdlib>\n"
         "#include <metal_tensor>\n"
@@ -7030,61 +7048,39 @@ static NSString *termite_metal_lightonocr3_tensor_source(void) {
         "    }\n"
         "}\n"
         "struct Params { uint rows; uint in_dim; uint out_dim; uint pad; };\n"
-        "template<uint S,uint N> inline void termite_lightonocr3_prefill_gate_body(device float*x,device bfloat*w,device float*bias,device float*y,constant Params&p,threadgroup float*tmp,uint2 group,uint sg,uint tid){\n"
-        " const uint chunk=p.in_dim/S,row=group.y*8,col=group.x*N;\n"
-        " tensor<device float,dextents<int,2>,tensor_inline>a(x+sg*chunk,dextents<int,2>(chunk,p.rows),array<int,2>{1,int(p.in_dim)});\n"
-        " tensor<device bfloat,dextents<int,2>,tensor_inline>b(w+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
-        " tensor<threadgroup float,dextents<int,2>,tensor_inline>dest(tmp+sg*8*N,dextents<int,2>(N,8),array<int,2>{1,int(N)});\n"
-        " auto left=a.slice(0,int(row));auto right=b.slice(0,int(col));\n"
-        " constexpr auto desc=matmul2d_descriptor(8,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<1>>op;\n"
-        " auto result=op.template get_destination_cooperative_tensor<decltype(left),decltype(right),float>();op.run(left,right,result);result.store(dest);\n"
-        " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-        " for(uint i=tid;i<min(8u,p.rows-row)*N;i+=S*32){float sum=0;\n"
-        "  #pragma unroll\n"
-        "  for(uint j=0;j<S;j++)sum+=tmp[j*8*N+i];\n"
-        "  uint c=col+i%N;if(c<p.out_dim)y[(row+i/N)*p.out_dim+c]=sum+bias[c];\n"
-        " }\n"
+        "template<uint Planes,bool TiledRows,uint S,uint N> inline void antfly_mpp_split_projection(\n"
+        "    device float*x,device bfloat*gw,device bfloat*uw,device float*gb,device float*ub,device float*y,\n"
+        "    constant Params&p,threadgroup float*tmp,uint2 group,uint sg,uint tid){\n"
+        "    const uint chunk=p.in_dim/S,row=TiledRows?group.y*8:0,col=group.x*N;\n"
+        "    const uint tile_rows=TiledRows?8:p.rows,valid_rows=TiledRows?min(8u,p.rows-row):p.rows;\n"
+        "    tensor<device float,dextents<int,2>,tensor_inline>a(x+sg*chunk,dextents<int,2>(chunk,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+        "    tensor<device bfloat,dextents<int,2>,tensor_inline>gmat(gw+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        "    tensor<threadgroup float,dextents<int,2>,tensor_inline>dest(tmp+sg*8*N,dextents<int,2>(N,tile_rows),array<int,2>{1,int(N)});\n"
+        "    auto left=a.slice(0,int(row));auto rightG=gmat.slice(0,int(col));\n"
+        "    constexpr auto desc=matmul2d_descriptor(8,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<1>>op;\n"
+        "    auto g=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightG),float>();\n"
+        "    if constexpr(Planes==2){\n"
+        "        tensor<device bfloat,dextents<int,2>,tensor_inline>umat(uw+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+        "        tensor<threadgroup float,dextents<int,2>,tensor_inline>destU(tmp+(S+sg)*8*N,dextents<int,2>(N,tile_rows),array<int,2>{1,int(N)});\n"
+        "        auto rightU=umat.slice(0,int(col));auto u=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightU),float>();\n"
+        "        op.run(left,rightG,g);op.run(left,rightU,u);g.store(dest);u.store(destU);\n"
+        "    }else{op.run(left,rightG,g);g.store(dest);}\n"
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "    for(uint i=tid;i<valid_rows*N;i+=S*32){float gs=0,us=0;\n"
+        "        #pragma unroll\n"
+        "        for(uint j=0;j<S;j++){gs+=tmp[j*8*N+i];if constexpr(Planes==2)us+=tmp[(S+j)*8*N+i];}\n"
+        "        uint c=col+i%N;\n"
+        "        if constexpr(Planes==2){gs+=gb[c];us+=ub[c];y[(row+i/N)*p.out_dim+c]=(gs/(1.0f+exp(-gs)))*us;}\n"
+        "        else {if(!TiledRows || c<p.out_dim)y[(row+i/N)*p.out_dim+c]=gs+gb[c];}\n"
+        "    }\n"
         "}\n"
-        "#define PN(S,N) kernel void termite_lightonocr3_prefill_gate##S##_##N(device float*x[[buffer(0)]],device bfloat*w[[buffer(1)]],device float*b[[buffer(2)]],device float*y[[buffer(3)]],constant Params&p[[buffer(4)]],threadgroup float*tmp[[threadgroup(0)]],uint2 group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint tid[[thread_index_in_threadgroup]]){termite_lightonocr3_prefill_gate_body<S,N>(x,w,b,y,p,tmp,group,sg,tid);}\n"
+        "#define PN(S,N) kernel void antfly_mpp_split_affine_rows##S##_##N(device float*x[[buffer(0)]],device bfloat*w[[buffer(1)]],device float*b[[buffer(2)]],device float*y[[buffer(3)]],constant Params&p[[buffer(4)]],threadgroup float*tmp[[threadgroup(0)]],uint2 group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint tid[[thread_index_in_threadgroup]]){antfly_mpp_split_projection<1,true,S,N>(x,w,w,b,b,y,p,tmp,group,sg,tid);}\n"
         "PN(8,16) PN(16,32)\n"
         "#undef PN\n"
-        "\n"
-        "template<uint S,uint N> inline void termite_lightonocr3_local_gate_body(device float*x,device bfloat*gw,device bfloat*uw,device float*gb,device float*ub,device float*y,constant Params&p,threadgroup float*tmp,uint group,uint sg,uint tid){\n"
-        " uint chunk=p.in_dim/S;\n"
-        " tensor<device float,dextents<int,2>,tensor_inline>a(x+sg*chunk,dextents<int,2>(chunk,p.rows),array<int,2>{1,int(p.in_dim)});\n"
-        " tensor<device bfloat,dextents<int,2>,tensor_inline>gmat(gw+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)}),umat(uw+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
-        " tensor<threadgroup float,dextents<int,2>,tensor_inline>dest(tmp+sg*8*N,dextents<int,2>(N,p.rows),array<int,2>{1,int(N)}),destU(tmp+(S+sg)*8*N,dextents<int,2>(N,p.rows),array<int,2>{1,int(N)});\n"
-        " auto left=a.slice(0,0);auto rightG=gmat.slice(0,int(group)*N);auto rightU=umat.slice(0,int(group)*N);\n"
-        " constexpr auto desc=matmul2d_descriptor(8,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<1>>op;\n"
-        " auto g=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightG),float>();auto u=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightU),float>();\n"
-        " op.run(left,rightG,g);op.run(left,rightU,u);g.store(dest);u.store(destU);\n"
-        " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-        " for(uint i=tid;i<p.rows*N;i+=S*32){float gs=0,us=0;\n"
-        "  #pragma unroll\n"
-        "  for(uint j=0;j<S;j++){gs+=tmp[j*8*N+i];us+=tmp[(S+j)*8*N+i];}\n"
-        "  uint col=group*N+i%N;gs+=gb[col];us+=ub[col];y[(i/N)*p.out_dim+col]=(gs/(1.0f+exp(-gs)))*us;\n"
-        " }\n"
-        "}\n"
-        "#define TG(S,N) kernel void termite_lightonocr3_local_gate##S##_##N(device float*x[[buffer(0)]],device bfloat*g[[buffer(1)]],device bfloat*u[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],threadgroup float*tmp[[threadgroup(0)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint tid[[thread_index_in_threadgroup]]){termite_lightonocr3_local_gate_body<S,N>(x,g,u,gb,ub,y,p,tmp,group,sg,tid);}\n"
+        "#define TG(S,N) kernel void antfly_mpp_split_gate##S##_##N(device float*x[[buffer(0)]],device bfloat*g[[buffer(1)]],device bfloat*u[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],threadgroup float*tmp[[threadgroup(0)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint tid[[thread_index_in_threadgroup]]){antfly_mpp_split_projection<2,false,S,N>(x,g,u,gb,ub,y,p,tmp,uint2(group,0),sg,tid);}\n"
         "TG(4,16) TG(4,32)\n"
         "#undef TG\n"
-        "\n"
-        "template<uint S,uint N> inline void termite_lightonocr3_local_down_body(device float*x,device bfloat*w,device float*bias,device float*y,constant Params&p,threadgroup float*tmp,uint group,uint sg,uint tid){\n"
-        " uint chunk=p.in_dim/S;\n"
-        " tensor<device float,dextents<int,2>,tensor_inline>a(x+sg*chunk,dextents<int,2>(chunk,p.rows),array<int,2>{1,int(p.in_dim)});\n"
-        " tensor<device bfloat,dextents<int,2>,tensor_inline>wm(w+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
-        " tensor<threadgroup float,dextents<int,2>,tensor_inline>dest(tmp+sg*8*N,dextents<int,2>(N,p.rows),array<int,2>{1,int(N)});\n"
-        " auto left=a.slice(0,0);auto right=wm.slice(0,int(group)*N);\n"
-        " constexpr auto desc=matmul2d_descriptor(8,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<1>>op;\n"
-        " auto result=op.template get_destination_cooperative_tensor<decltype(left),decltype(right),float>();op.run(left,right,result);result.store(dest);\n"
-        " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-        " for(uint i=tid;i<p.rows*N;i+=S*32){float sum=0;\n"
-        "  #pragma unroll\n"
-        "  for(uint j=0;j<S;j++)sum+=tmp[j*8*N+i];\n"
-        "  uint col=group*N+i%N;y[(i/N)*p.out_dim+col]=sum+bias[col];\n"
-        " }\n"
-        "}\n"
-        "#define TP(S,N) kernel void termite_lightonocr3_local_down##S##_##N(device float*x[[buffer(0)]],device bfloat*w[[buffer(1)]],device float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant Params&p[[buffer(4)]],threadgroup float*tmp[[threadgroup(0)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint tid[[thread_index_in_threadgroup]]){termite_lightonocr3_local_down_body<S,N>(x,w,bias,y,p,tmp,group,sg,tid);}\n"
+        "#define TP(S,N) kernel void antfly_mpp_split_affine##S##_##N(device float*x[[buffer(0)]],device bfloat*w[[buffer(1)]],device float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant Params&p[[buffer(4)]],threadgroup float*tmp[[threadgroup(0)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint tid[[thread_index_in_threadgroup]]){antfly_mpp_split_projection<1,false,S,N>(x,w,w,bias,bias,y,p,tmp,uint2(group,0),sg,tid);}\n"
         "TP(8,16) TP(16,16)\n"
         "#undef TP\n"
         "struct GateSplitParams{uint rows,in_dim,out_dim,pad;};\n"
@@ -7104,23 +7100,12 @@ static NSString *termite_metal_lightonocr3_tensor_source(void) {
         "K(16)\n"
         "#undef K\n"
         "kernel void termite_gate_split_reduce(device const float*s[[buffer(0)]],device const float*gb[[buffer(1)]],device const float*ub[[buffer(2)]],device float*y[[buffer(3)]],constant GateSplitParams&p[[buffer(4)]],uint i[[thread_position_in_grid]]){uint count=p.rows*p.out_dim;if(i>=count)return;float g=0,u=0;for(uint j=0;j<p.pad;j++){g+=s[j*count+i];u+=s[(p.pad+j)*count+i];}g+=gb[i%p.out_dim];u+=ub[i%p.out_dim];y[i]=(g/(1.0f+exp(-g)))*u;}\n"
-        "template<uint N, uint M=8, uint SG=1> inline void termite_lightonocr3_gate_up_small_body(device float*x,device bfloat*gw,device bfloat*uw,device float*gb,device float*ub,device float*y,constant Params&p,uint2 group){\n"
-        " tensor<device float,dextents<int,2>,tensor_inline>a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
-        " tensor<device bfloat,dextents<int,2>,tensor_inline>gmat(gw,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)}),umat(uw,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
-        " tensor<device float,dextents<int,2>,tensor_inline>dest(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
-        " auto left=a.slice(0,int(group.y)*M);auto rightG=gmat.slice(0,int(group.x)*N);auto rightU=umat.slice(0,int(group.x)*N);auto out=dest.slice(int(group.x)*N,int(group.y)*M);\n"
-        " constexpr auto desc=matmul2d_descriptor(M,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<SG>>op;\n"
-        " auto g=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightG),float>();auto u=op.template get_destination_cooperative_tensor<decltype(left),decltype(rightU),float>();\n"
-        " op.run(left,rightG,g);op.run(left,rightU,u);\n"
-        " #pragma unroll\n"
-        " for(ushort i=0;i<g.get_capacity();i++){auto coord=g.get_multidimensional_index(i);int col=int(group.x)*N+coord[0],row=int(group.y)*M+coord[1];if(coord[0]>=0&&coord[0]<N&&coord[1]>=0&&coord[1]<M&&col<int(p.out_dim)&&row<int(p.rows)){float gs=g[i]+gb[col],us=u[i]+ub[col];g[i]=(gs/(1.0f+exp(-gs)))*us;}}\n"
-        " g.store(out);\n"
-        "}\n"
-        "kernel void termite_lightonocr3_gate_up_small16(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lightonocr3_gate_up_small_body<16>(x,gw,uw,gb,ub,y,p,group);}\n"
-        "kernel void termite_lightonocr3_gate_up_small32(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lightonocr3_gate_up_small_body<32>(x,gw,uw,gb,ub,y,p,group);}\n"
-        "kernel void termite_lightonocr3_gate_up_wide16(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lightonocr3_gate_up_small_body<16,16>(x,gw,uw,gb,ub,y,p,group);}\n"
-        "kernel void termite_lightonocr3_gate_up_wide32(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lightonocr3_gate_up_small_body<16,32,2>(x,gw,uw,gb,ub,y,p,group);}\n"
-        "kernel void termite_lightonocr3_gate_up_wide64(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){termite_lightonocr3_gate_up_small_body<32,64,4>(x,gw,uw,gb,ub,y,p,group);}\n"
+        TERMITE_MSL_MPP_GATE_PROGRAM("template<uint N, uint M=8, uint SG=1> inline void ","antfly_mpp_gate_up_f32","float","float"," tensor<device float,dextents<int,2>,tensor_inline>dest(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n","auto out=dest.slice(int(group.x)*N,int(group.y)*M);","g[i]=(gs/(1.0f+exp(-gs)))*us;"," g.store(out);\n")
+        "kernel void termite_lightonocr3_gate_up_small16(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){antfly_mpp_gate_up_f32<16>(x,gw,uw,gb,ub,y,p,group);}\n"
+        "kernel void termite_lightonocr3_gate_up_small32(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){antfly_mpp_gate_up_f32<32>(x,gw,uw,gb,ub,y,p,group);}\n"
+        "kernel void termite_lightonocr3_gate_up_wide16(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){antfly_mpp_gate_up_f32<16,16>(x,gw,uw,gb,ub,y,p,group);}\n"
+        "kernel void termite_lightonocr3_gate_up_wide32(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){antfly_mpp_gate_up_f32<16,32,2>(x,gw,uw,gb,ub,y,p,group);}\n"
+        "kernel void termite_lightonocr3_gate_up_wide64(device float*x[[buffer(0)]],device bfloat*gw[[buffer(1)]],device bfloat*uw[[buffer(2)]],device float*gb[[buffer(3)]],device float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 group[[threadgroup_position_in_grid]]){antfly_mpp_gate_up_f32<32,64,4>(x,gw,uw,gb,ub,y,p,group);}\n"
         "kernel void termite_lightonocr3_down_split_reduce(device const float*s[[buffer(0)]], device const float*bias[[buffer(1)]], device float*y[[buffer(2)]], constant Params&p[[buffer(3)]],uint i[[thread_position_in_grid]]) {\n"
         " if(i>=p.rows*p.out_dim)return;float sum=0;for(uint j=0;j<p.pad;j++)sum+=s[j*p.rows*p.out_dim+i];y[i]=sum+bias[i%p.out_dim];\n"
         "}\n"
@@ -7205,7 +7190,7 @@ static NSString *termite_metal_lightonocr3_tensor_source(void) {
     "}\n"
 
 static NSString *termite_metal_shader_source(void) {
-    return @"#include <metal_stdlib>\n"
+    return [[NSString stringWithUTF8String:antfly_msl_depthwise_source] stringByAppendingString:@"#include <metal_stdlib>\n"
            "using namespace metal;\n"
            "#define TERMITE_FOR_UNROLL(x) _Pragma(\"clang loop unroll(full)\") for (x)\n"
            "struct termite_metal_linear_params { " TERMITE_METAL_LINEAR_FIELDS(TERMITE_METAL_PARAM_MSL, termite_metal_linear_params) "};\n"
@@ -7291,7 +7276,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_sdpa_segments_f32_params { " TERMITE_METAL_SDPA_SEGMENTS_F32_FIELDS(TERMITE_METAL_PARAM_MSL, termite_metal_sdpa_segments_f32_params) "};\n"
            "static_assert(sizeof(termite_metal_sdpa_segments_f32_params) == 32, \"Metal parameter size drift\");\n"
            TERMITE_METAL_SDPA_SEGMENTS_F32_FIELDS(TERMITE_METAL_PARAM_MSL_ASSERT, termite_metal_sdpa_segments_f32_params)
-           "struct termite_metal_modernbert_training_attention_params { uint tokens; uint seq_len; uint num_heads; uint head_dim; uint window; uint backward; float scale; float dropout_probability; ulong dropout_seed; };\n"
+           "struct antfly_segment_training_attention_params { uint tokens; uint seq_len; uint num_heads; uint head_dim; uint window; uint backward; float scale; float dropout_probability; ulong dropout_seed; };\n"
            TERMITE_METAL_ABI_MSL(disentangled_relative_attention_f32)
            TERMITE_METAL_ABI_MSL(deberta_relative_score_gemm_f32)
            "struct termite_metal_transpose_f32_params { uint rank; uint total; uint reserved0; uint reserved1; uint dims[8]; uint in_strides[8]; uint out_strides[8]; uint perm[8]; };\n"
@@ -9838,6 +9823,16 @@ static NSString *termite_metal_shader_source(void) {
            "        output[i] = y.x; output[i + 1u] = y.y; output[i + 2u] = y.z; output[i + 3u] = y.w;\n"
            "    }\n"
            "}\n"
+           "template<bool AxisLocalHalves,bool TwoAxes> inline uint4 antfly_rotary_pair_indices(uint pair,uint pairs_per_axis){\n"
+           "    uint axis=TwoAxes?(pair<pairs_per_axis?0u:1u):pair/pairs_per_axis,local=pair%pairs_per_axis;\n"
+           "    uint lo=AxisLocalHalves?axis*2u*pairs_per_axis+local:pair;\n"
+           "    return uint4(axis,local,lo,lo+(AxisLocalHalves?pairs_per_axis:2u*pairs_per_axis));\n"
+           "}\n"
+           "template<bool Upper,bool ReverseUpper=false> __attribute__((always_inline)) inline float antfly_rotary_component(float lo,float hi,float c,float sine){\n"
+           "    if constexpr(!Upper)return lo*c-hi*sine;\n"
+           "    else if constexpr(ReverseUpper)return hi*c+lo*sine;\n"
+           "    else return lo*sine+hi*c;\n"
+           "}\n"
            "__attribute__((always_inline)) inline bool termite_rope_pair_indices(uint d, uint head_dim, uint rope_dim, uint consecutive, thread uint &idx0, thread uint &idx1, thread uint &j) {\n"
            "    if (consecutive != 0u) {\n"
            "        if (d >= rope_dim) return false;\n"
@@ -10130,7 +10125,7 @@ static NSString *termite_metal_shader_source(void) {
            "  }\n"
            " }\n"
            "}\n"
-           "#define T(B,SN,TM) kernel void termite_lightonocr3_local_gate_vec##B##_##SN##_##TM(device const float*x[[buffer(0)]],device const ushort*g[[buffer(1)]],device const ushort*u[[buffer(2)]],device const float*gb[[buffer(3)]],device const float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant termite_lightonocr3_local_params&p[[buffer(6)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]]){termite_lightonocr3_local_tile_body<B,SN,TM,true>(x,g,u,gb,ub,y,p,group,sg,lane);}\n"
+           "#define T(B,SN,TM) kernel void antfly_mpp_split_gate_vec##B##_##SN##_##TM(device const float*x[[buffer(0)]],device const ushort*g[[buffer(1)]],device const ushort*u[[buffer(2)]],device const float*gb[[buffer(3)]],device const float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant termite_lightonocr3_local_params&p[[buffer(6)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]]){termite_lightonocr3_local_tile_body<B,SN,TM,true>(x,g,u,gb,ub,y,p,group,sg,lane);}\n"
            "#define V(B,SN,TM) kernel void termite_lightonocr3_local_proj_vec##B##_##SN##_##TM(device const float*x[[buffer(0)]],device const ushort*g[[buffer(1)]],device const float*gb[[buffer(2)]],device float*y[[buffer(3)]],constant termite_lightonocr3_local_params&p[[buffer(4)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]]){termite_lightonocr3_local_tile_body<B,SN,TM,false>(x,g,g,gb,gb,y,p,group,sg,lane);}\n"
            "T(2,16,2) T(3,16,2)\n"
            "V(2,16,2) V(3,16,2) V(4,16,4) V(4,16,2) V(2,32,4) V(3,32,4)\n"
@@ -11658,17 +11653,10 @@ static NSString *termite_metal_shader_source(void) {
            "    float s = g >= 0.0f ? 1.0f / (1.0f + exp(-g)) : exp(g) / (1.0f + exp(g));\n"
            "    output[gid] = a * s;\n"
            "}\n"
-           "kernel void termite_gemma4_audio_dwconv_causal(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], device const float *starts [[buffer(3)]], constant termite_metal_gemma4_audio_rows_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
-           "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
-           "    uint t = gid / p.dim; uint h = gid - t * p.dim;\n"
-           "    uint left_pad = p.extra - 1u; uint start = p.reserved ? uint(starts[t]) : 0u;\n"
-           "    float sum = 0.0f;\n"
-           "    for (uint k = 0u; k < p.extra; ++k) {\n"
-           "        if (t + k < left_pad + start) continue;\n"
-           "        uint src_t = t + k - left_pad;\n"
-           "        sum += input[src_t * p.dim + h] * weight[k * p.dim + h];\n"
-           "    }\n"
-           "    output[gid] = sum;\n"
+           "kernel void antfly_causal_depthwise_segmented_f32(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], device const float *starts [[buffer(3)]], constant termite_metal_gemma4_audio_rows_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    uint total=p.rows*p.dim;if(gid>=total)return;\n"
+           "    uint t=gid/p.dim,h=gid-t*p.dim,start=p.reserved?uint(starts[t]):0u;\n"
+           "    output[gid]=antfly_causal_depthwise<false,false,false,false>(input,weight,input,t,h,p.dim,p.extra,0u,start);\n"
            "}\n"
            TERMITE_MSL_ABI_AUDIO_ROWS(termite_gemma4_audio_flatten_ctf) "\n"
            "    uint time_steps = p.rows; uint freq_bins = p.dim; uint channels = p.extra;\n"
@@ -13299,24 +13287,24 @@ static NSString *termite_metal_shader_source(void) {
            "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "}\n"
-           // ModernBERT training attention (ops/modernbert_training_attention.zig).
+           // ModernBERT training attention (ops/range_attention_reference.zig).
            // Control: tokens*6 disjoint in-row key ranges, then tokens logical
            // positions. One threadgroup per (row, head); 256-key chunks and
            // fixed-shape reductions keep results deterministic. A row with no
            // visible key stores the -FLT_MAX sentinel as its log-sum-exp.
-           "inline bool mbta_visible(device const int *ctrl, constant termite_metal_modernbert_training_attention_params &p, uint q, uint k) {\n"
+           "inline bool segment_visible(device const int *ctrl, constant antfly_segment_training_attention_params &p, uint q, uint k) {\n"
            "    device const int *r = ctrl + q * 6u; int key = int(k);\n"
            "    if (!((key >= r[0] && key < r[1]) || (key >= r[2] && key < r[3]) || (key >= r[4] && key < r[5]))) return false;\n"
            "    if (p.window == 0xffffffffu) return true;\n"
            "    device const int *pos = ctrl + p.tokens * 6u; return uint(abs(pos[q] - pos[k])) <= p.window;\n"
            "}\n"
-           "inline float mbta_reduce(threadgroup float *partials, uint lid, uint width, float value, bool take_max) {\n"
+           "inline float segment_reduce(threadgroup float *partials, uint lid, uint width, float value, bool take_max) {\n"
            "    partials[lid] = value; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] = take_max ? max(partials[lid], partials[lid + stride]) : partials[lid] + partials[lid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    float result = partials[0]; threadgroup_barrier(mem_flags::mem_threadgroup); return result;\n"
            "}\n"
            // Forward: output rows and per-(row, head) log-sum-exp.
-           "kernel void termite_modernbert_training_attention_forward(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device float *output [[buffer(2)]], device float *lse [[buffer(3)]], constant termite_metal_modernbert_training_attention_params &p [[buffer(4)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "kernel void antfly_segment_training_attention_forward(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device float *output [[buffer(2)]], device float *lse [[buffer(3)]], constant antfly_segment_training_attention_params &p [[buffer(4)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    const uint chunk = 256u; uint row = tg.x; uint qi = row / p.num_heads; uint h = row - qi * p.num_heads; if (qi >= p.tokens) return;\n"
            "    uint lid = uint(tid); uint width = uint(tpg.x); uint hidden = p.num_heads * p.head_dim; uint q_base = qi * hidden + h * p.head_dim;\n"
            "    device const float *k = qkv + p.tokens * hidden; device const float *v = qkv + 2u * p.tokens * hidden;\n"
@@ -13328,13 +13316,13 @@ static NSString *termite_metal_shader_source(void) {
            "            uint n = min(chunk, hi - base); float local_best = neg;\n"
            "            for (uint j = lid; j < n; j += width) {\n"
            "                uint key = base + j; float score = neg;\n"
-           "                if (mbta_visible(ctrl, p, qi, key)) { uint k_base = key * hidden + h * p.head_dim; float dot = 0.0f; for (uint d = 0u; d < p.head_dim; ++d) dot += qkv[q_base + d] * k[k_base + d]; score = dot * p.scale; local_best = max(local_best, score); }\n"
+           "                if (segment_visible(ctrl, p, qi, key)) { uint k_base = key * hidden + h * p.head_dim; float dot = 0.0f; for (uint d = 0u; d < p.head_dim; ++d) dot += qkv[q_base + d] * k[k_base + d]; score = dot * p.scale; local_best = max(local_best, score); }\n"
            "                scores[j] = score;\n"
            "            }\n"
-           "            float chunk_best = mbta_reduce(partials, lid, width, local_best, true);\n"
+           "            float chunk_best = segment_reduce(partials, lid, width, local_best, true);\n"
            "            if (chunk_best <= neg) continue;\n"
            TERMITE_MSL_SEGMENT_SCALAR_WEIGHTS
-           "            run_sum = run_sum * rescale + mbta_reduce(partials, lid, width, local_sum, false);\n"
+           "            run_sum = run_sum * rescale + segment_reduce(partials, lid, width, local_sum, false);\n"
            TERMITE_MSL_SEGMENT_SCALAR_PV
            "        }\n"
            "    }\n"
@@ -13342,12 +13330,12 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lid == 0u) lse[qi * p.num_heads + h] = run_sum > 0.0f ? run_max + log(run_sum) : neg;\n"
            "}\n"
            // dQ and D = dO . O per (query, head), replaying probabilities from lse.
-           "kernel void termite_modernbert_training_attention_dq(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device const float *dout [[buffer(2)]], device const float *replayed [[buffer(3)]], device const float *lse [[buffer(4)]], device float *delta [[buffer(5)]], device float *dq [[buffer(6)]], constant termite_metal_modernbert_training_attention_params &p [[buffer(7)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "kernel void antfly_segment_training_attention_dq(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device const float *dout [[buffer(2)]], device const float *replayed [[buffer(3)]], device const float *lse [[buffer(4)]], device float *delta [[buffer(5)]], device float *dq [[buffer(6)]], constant antfly_segment_training_attention_params &p [[buffer(7)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    const uint chunk = 256u; uint row = tg.x; uint qi = row / p.num_heads; uint h = row - qi * p.num_heads; if (qi >= p.tokens) return;\n"
            "    uint lid = uint(tid); uint width = uint(tpg.x); uint hidden = p.num_heads * p.head_dim; uint q_base = qi * hidden + h * p.head_dim;\n"
            "    device const float *k = qkv + p.tokens * hidden; device const float *v = qkv + 2u * p.tokens * hidden;\n"
            "    threadgroup float *weights = scratch; threadgroup float *partials = scratch + chunk; const float neg = -3.402823466e+38f;\n"
-           "    float d_row = mbta_reduce(partials, lid, width, lid < p.head_dim ? dout[q_base + lid] * replayed[q_base + lid] : 0.0f, false);\n"
+           "    float d_row = segment_reduce(partials, lid, width, lid < p.head_dim ? dout[q_base + lid] * replayed[q_base + lid] : 0.0f, false);\n"
            "    float row_lse = lse[qi * p.num_heads + h]; float acc = 0.0f;\n"
            "    if (lid == 0u) delta[qi * p.num_heads + h] = d_row;\n"
            "    if (row_lse > neg) for (uint r = 0u; r < 3u; ++r) {\n"
@@ -13356,7 +13344,7 @@ static NSString *termite_metal_shader_source(void) {
            "            uint n = min(chunk, hi - base);\n"
            "            for (uint j = lid; j < n; j += width) {\n"
            "                uint key = base + j; float ds = 0.0f;\n"
-           "                if (mbta_visible(ctrl, p, qi, key)) { uint kv = key * hidden + h * p.head_dim; float s = 0.0f; float dp = 0.0f; for (uint d = 0u; d < p.head_dim; ++d) { s += qkv[q_base + d] * k[kv + d]; dp += dout[q_base + d] * v[kv + d]; } float prob = exp(s * p.scale - row_lse); ds = prob * (dp - d_row) * p.scale; }\n"
+           "                if (segment_visible(ctrl, p, qi, key)) { uint kv = key * hidden + h * p.head_dim; float s = 0.0f; float dp = 0.0f; for (uint d = 0u; d < p.head_dim; ++d) { s += qkv[q_base + d] * k[kv + d]; dp += dout[q_base + d] * v[kv + d]; } float prob = exp(s * p.scale - row_lse); ds = prob * (dp - d_row) * p.scale; }\n"
            "                weights[j] = ds;\n"
            "            }\n"
            "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
@@ -13367,7 +13355,7 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lid < p.head_dim) dq[q_base + lid] = acc;\n"
            "}\n"
            // dK and dV per (key, head) over the queries of the key's own row.
-           "kernel void termite_modernbert_training_attention_dkdv(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device const float *dout [[buffer(2)]], device const float *lse [[buffer(3)]], device const float *delta [[buffer(4)]], device float *dk [[buffer(5)]], device float *dv [[buffer(6)]], constant termite_metal_modernbert_training_attention_params &p [[buffer(7)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "kernel void antfly_segment_training_attention_dkdv(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device const float *dout [[buffer(2)]], device const float *lse [[buffer(3)]], device const float *delta [[buffer(4)]], device float *dk [[buffer(5)]], device float *dv [[buffer(6)]], constant antfly_segment_training_attention_params &p [[buffer(7)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    const uint chunk = 256u; uint row = tg.x; uint ki = row / p.num_heads; uint h = row - ki * p.num_heads; if (ki >= p.tokens) return;\n"
            "    uint lid = uint(tid); uint width = uint(tpg.x); uint hidden = p.num_heads * p.head_dim; uint kv = ki * hidden + h * p.head_dim;\n"
            "    device const float *k = qkv + p.tokens * hidden; device const float *v = qkv + 2u * p.tokens * hidden;\n"
@@ -13377,7 +13365,7 @@ static NSString *termite_metal_shader_source(void) {
            "        uint n = min(chunk, first + p.seq_len - base);\n"
            "        for (uint j = lid; j < n; j += width) {\n"
            "            uint qi = base + j; float prob = 0.0f; float ds = 0.0f; float row_lse = lse[qi * p.num_heads + h];\n"
-           "            if (row_lse > neg && mbta_visible(ctrl, p, qi, ki)) { uint q_base = qi * hidden + h * p.head_dim; float s = 0.0f; float dp = 0.0f; for (uint d = 0u; d < p.head_dim; ++d) { s += qkv[q_base + d] * k[kv + d]; dp += dout[q_base + d] * v[kv + d]; } prob = exp(s * p.scale - row_lse); ds = prob * (dp - delta[qi * p.num_heads + h]) * p.scale; }\n"
+           "            if (row_lse > neg && segment_visible(ctrl, p, qi, ki)) { uint q_base = qi * hidden + h * p.head_dim; float s = 0.0f; float dp = 0.0f; for (uint d = 0u; d < p.head_dim; ++d) { s += qkv[q_base + d] * k[kv + d]; dp += dout[q_base + d] * v[kv + d]; } prob = exp(s * p.scale - row_lse); ds = prob * (dp - delta[qi * p.num_heads + h]) * p.scale; }\n"
            "            probs[j] = prob; grads[j] = ds;\n"
            "        }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
@@ -13387,14 +13375,14 @@ static NSString *termite_metal_shader_source(void) {
            "    if (lid < p.head_dim) { dk[kv + lid] = acc_k; dv[kv + lid] = acc_v; }\n"
            "}\n"
            // Tiled FlashAttention-2-style kernels for ModernBERT training
-           // attention (ops/modernbert_training_attention.zig). One threadgroup
+           // attention (ops/range_attention_reference.zig). One threadgroup
            // reuses K/V (forward, dQ) or Q/dO (dK/dV) across a 32-row block via
            // simdgroup_float8x8 matmuls and an online softmax (forward only;
            // backward recomputes P from the saved lse, no rescale needed).
            // head_dim must be a multiple of 8 and <= 64; threadgroup memory stays
            // under 22 KB. Falls back to the serial kernels above otherwise, or
            // when TERMITE_METAL_DISABLE_FLASH_TRAINING_ATTENTION is set.
-           "inline bool mbta_flash_visible(threadgroup const int *rg, int row_pos, int key_pos, uint r, uint key, uint window) {\n"
+           "inline bool segment_flash_visible(threadgroup const int *rg, int row_pos, int key_pos, uint r, uint key, uint window) {\n"
            "    threadgroup const int *x = rg + r * 6u;\n"
            "    int k = int(key);\n"
            "    if (!((k >= x[0] && k < x[1]) || (k >= x[2] && k < x[3]) || (k >= x[4] && k < x[5]))) return false;\n"
@@ -13409,20 +13397,20 @@ static NSString *termite_metal_shader_source(void) {
            // token indices. Multiplying by 2^32 is exact in f32 (a power-of-two
            // scale), so this threshold matches the host's f64 computation
            // exactly without needing double precision on the GPU.
-           "inline ulong mbta_dropout_mix(ulong value) {\n"
+           "inline ulong segment_dropout_mix(ulong value) {\n"
            "    ulong x = value + 0x9e3779b97f4a7c15UL;\n"
            "    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9UL;\n"
            "    x = (x ^ (x >> 27)) * 0x94d049bb133111ebUL;\n"
            "    return x ^ (x >> 31);\n"
            "}\n"
-           "inline float mbta_dropout_keep(ulong seed, uint batch, uint head, uint num_heads, uint seq_len, uint query, uint key, float probability) {\n"
+           "inline float segment_dropout_keep(ulong seed, uint batch, uint head, uint num_heads, uint seq_len, uint query, uint key, float probability) {\n"
            "    if (probability <= 0.0f) return 1.0f;\n"
            "    ulong index = (((ulong(batch) * ulong(num_heads) + ulong(head)) * ulong(seq_len) + ulong(query)) * ulong(seq_len) + ulong(key));\n"
-           "    ulong bits = mbta_dropout_mix(seed ^ mbta_dropout_mix(index));\n"
+           "    ulong bits = segment_dropout_mix(seed ^ segment_dropout_mix(index));\n"
            "    ulong threshold = ulong(probability * 4294967296.0f);\n"
            "    return (bits >> 32) < threshold ? 0.0f : 1.0f / (1.0f - probability);\n"
            "}\n"
-           "kernel void termite_modernbert_training_attention_flash_forward(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device float *output [[buffer(2)]], device float *lse [[buffer(3)]], constant termite_metal_modernbert_training_attention_params &p [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           "kernel void antfly_segment_training_attention_flash_forward(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device float *output [[buffer(2)]], device float *lse [[buffer(3)]], constant antfly_segment_training_attention_params &p [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    constexpr uint BQ = 32u, BK = 16u, DM = 64u;\n"
            "    threadgroup float ks[BK * DM], vs[BK * DM], ss[BQ * BK], diag[4u * 64u], finrecip[4u * 64u];\n"
            "    threadgroup int rg[BQ * 6u];\n"
@@ -13452,8 +13440,8 @@ static NSString *termite_metal_shader_source(void) {
                "qkv",
                "    TERMITE_FOR_UNROLL(uint i = 0u; i < 8u; ++i) if (i < nd) o[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n",
                "pos",
-               "mbta_flash_visible(rg, qp[r], kp[c], r, kb + c, p.window)",
-               "            for (uint j = 0u; j < 4u; ++j) { uint c = c0 + j; float w = vals[j] == neg ? 0.0f : exp(vals[j] - mnew); sum += w; float keep = mbta_dropout_keep(p.dropout_seed, row, h, p.num_heads, p.seq_len, q0 + r - row_start, kb + c - row_start, p.dropout_probability); ss[r * BK + c0 + j] = w * keep; }\n",
+               "segment_flash_visible(rg, qp[r], kp[c], r, kb + c, p.window)",
+               "            for (uint j = 0u; j < 4u; ++j) { uint c = c0 + j; float w = vals[j] == neg ? 0.0f : exp(vals[j] - mnew); sum += w; float keep = segment_dropout_keep(p.dropout_seed, row, h, p.num_heads, p.seq_len, q0 + r - row_start, kb + c - row_start, p.dropout_probability); ss[r * BK + c0 + j] = w * keep; }\n",
                "")
            "    for (uint i = L; i < 64u; i += 32u) { uint r = s8 + i / 8u; finrecip[uint(sg) * 64u + i] = (i / 8u == i % 8u) ? (lrow[r] > 0.0f ? 1.0f / lrow[r] : 0.0f) : 0.0f; }\n"
            "    if (t < nq) lse[(q0 + t) * p.num_heads + h] = lrow[t] > 0.0f ? mrow[t] + log(lrow[t]) : neg;\n"
@@ -13467,7 +13455,27 @@ static NSString *termite_metal_shader_source(void) {
            "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "}\n"
-           "kernel void termite_modernbert_training_attention_flash_dq(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device const float *dout [[buffer(2)]], device const float *replayed [[buffer(3)]], device const float *lse [[buffer(4)]], device float *delta [[buffer(5)]], device float *dq [[buffer(6)]], constant termite_metal_modernbert_training_attention_params &p [[buffer(7)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           "// Replay uses the caller's native orientation; dQ does not publish probability\n"
+           "// tiles, while dK/dV publishes them for the value-gradient MMA.\n"
+           "template<bool Transposed,uint Columns> __attribute__((always_inline)) inline void antfly_segment_score_vjp(\n"
+           "    threadgroup float*ss,threadgroup float*dps,threadgroup const float*lrow,threadgroup const float*drow,\n"
+           "    threadgroup const int*rg,threadgroup const int*qp,threadgroup const int*kp,\n"
+           "    constant antfly_segment_training_attention_params&p,uint nleft,uint nright,\n"
+           "    uint s8,uint L,uint row,uint h,uint qfirst,uint kfirst,uint row_start){\n"
+           "    const float scale=p.scale,neg=-3.402823466e+38f;\n"
+           "    const uint r=s8+L/4u,c0=(L%4u)*4u;\n"
+           "    for(uint j=0u;j<4u;++j){\n"
+           "        uint c=c0+j,q=Transposed?c:r,k=Transposed?r:c;\n"
+           "        bool vis=r<nleft && c<nright && lrow[q]>neg && segment_flash_visible(rg,qp[q],kp[k],q,kfirst+k,p.window);\n"
+           "        float sval=ss[r*Columns+c];\n"
+           "        float pval=vis?exp(sval*scale-lrow[q]):0.0f;\n"
+           "        float dpval=dps[r*Columns+c];\n"
+           "        float keep=segment_dropout_keep(p.dropout_seed,row,h,p.num_heads,p.seq_len,qfirst+q-row_start,kfirst+k-row_start,p.dropout_probability);\n"
+           "        if constexpr(Transposed)dps[r*Columns+c]=pval*keep;\n"
+           "        ss[r*Columns+c]=pval*(keep*dpval-drow[q])*scale;\n"
+           "    }\n"
+           "}\n"
+           "kernel void antfly_segment_training_attention_flash_dq(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device const float *dout [[buffer(2)]], device const float *replayed [[buffer(3)]], device const float *lse [[buffer(4)]], device float *delta [[buffer(5)]], device float *dq [[buffer(6)]], constant antfly_segment_training_attention_params &p [[buffer(7)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    constexpr uint BQ = 32u, BK = 16u, DM = 64u;\n"
            "    threadgroup float qs[BQ * DM], dos[BQ * DM], kst[BK * DM], vst[BK * DM];\n"
            "    threadgroup float ss[BQ * BK], dps[BQ * BK];\n"
@@ -13516,32 +13524,9 @@ static NSString *termite_metal_shader_source(void) {
            "        if (t < BK) kp[t] = t < nk ? pos[kb + t] : 0;\n"
            "        for (uint i = t; i < BK * D; i += 128u) { uint c = i / D, d = i % D; bool in = c < nk; kst[c * DM + d] = in ? k[(kb + c) * hidden + h * D + d] : 0.0f; vst[c * DM + d] = in ? v[(kb + c) * hidden + h * D + d] : 0.0f; }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        TERMITE_FOR_UNROLL(uint ct = 0u; ct < 2u; ++ct) {\n"
-           "            simdgroup_float8x8 accS = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "            simdgroup_float8x8 accP = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "            TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
-           "                simdgroup_float8x8 bk8, bv8;\n"
-           "                simdgroup_load(bk8, kst + ct * 8u * DM + dt * 8u, DM, ulong2(0, 0), true);\n"
-           "                simdgroup_multiply_accumulate(accS, qm[dt], bk8, accS);\n"
-           "                simdgroup_load(bv8, vst + ct * 8u * DM + dt * 8u, DM, ulong2(0, 0), true);\n"
-           "                simdgroup_multiply_accumulate(accP, dm[dt], bv8, accP);\n"
-           "            }\n"
-           "            simdgroup_store(accS, ss + s8 * BK + ct * 8u, BK);\n"
-           "            simdgroup_store(accP, dps + s8 * BK + ct * 8u, BK);\n"
-           "        }\n"
+           TERMITE_MSL_SEGMENT_BACKWARD_SCORE("qm","dm","kst","vst","BK")
            "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        {\n"
-           "            const uint r = s8 + L / 4u, c0 = (L % 4u) * 4u;\n"
-           "            for (uint j = 0u; j < 4u; ++j) {\n"
-           "                uint c = c0 + j;\n"
-           "                bool vis = r < nq && c < nk && lrow[r] > neg && mbta_flash_visible(rg, qp[r], kp[c], r, kb + c, p.window);\n"
-           "                float sval = ss[r * BK + c];\n"
-           "                float pval = vis ? exp(sval * scale - lrow[r]) : 0.0f;\n"
-           "                float dpval = dps[r * BK + c];\n"
-           "                float keep = mbta_dropout_keep(p.dropout_seed, row, h, p.num_heads, p.seq_len, q0 + r - row_start, kb + c - row_start, p.dropout_probability);\n"
-           "                ss[r * BK + c] = pval * (keep * dpval - drow[r]) * scale;\n"
-           "            }\n"
-           "        }\n"
+           "        antfly_segment_score_vjp<false,BK>(ss,dps,lrow,drow,rg,qp,kp,p,nq,nk,s8,L,row,h,q0,kb,row_start);\n"
            "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        simdgroup_float8x8 dsm0, dsm1;\n"
            "        simdgroup_load(dsm0, ss + s8 * BK, BK);\n"
@@ -13562,7 +13547,7 @@ static NSString *termite_metal_shader_source(void) {
            "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "}\n"
-           "kernel void termite_modernbert_training_attention_flash_dkdv(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device const float *dout [[buffer(2)]], device const float *lse [[buffer(3)]], device const float *delta [[buffer(4)]], device float *dk [[buffer(5)]], device float *dv [[buffer(6)]], constant termite_metal_modernbert_training_attention_params &p [[buffer(7)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           "kernel void antfly_segment_training_attention_flash_dkdv(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device const float *dout [[buffer(2)]], device const float *lse [[buffer(3)]], device const float *delta [[buffer(4)]], device float *dk [[buffer(5)]], device float *dv [[buffer(6)]], constant antfly_segment_training_attention_params &p [[buffer(7)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    constexpr uint BK = 32u, BQT = 16u, DM = 64u;\n"
            "    threadgroup float kst[BK * DM], vst[BK * DM], qst[BQT * DM], dost[BQT * DM];\n"
            "    threadgroup float ss[BK * BQT], dps[BK * BQT];\n"
@@ -13608,33 +13593,9 @@ static NSString *termite_metal_shader_source(void) {
            "        if (!range_hit || !window_hit) continue;\n"
            "        for (uint i = t; i < BQT * D; i += 128u) { uint r = i / D, d = i % D; bool in = r < nqt; qst[r * DM + d] = in ? qkv[(q0t + r) * hidden + h * D + d] : 0.0f; dost[r * DM + d] = in ? dout[(q0t + r) * hidden + h * D + d] : 0.0f; }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        TERMITE_FOR_UNROLL(uint ct = 0u; ct < 2u; ++ct) {\n"
-           "            simdgroup_float8x8 accS = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "            simdgroup_float8x8 accP = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "            TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
-           "                simdgroup_float8x8 bq8, bd8;\n"
-           "                simdgroup_load(bq8, qst + ct * 8u * DM + dt * 8u, DM, ulong2(0, 0), true);\n"
-           "                simdgroup_multiply_accumulate(accS, km[dt], bq8, accS);\n"
-           "                simdgroup_load(bd8, dost + ct * 8u * DM + dt * 8u, DM, ulong2(0, 0), true);\n"
-           "                simdgroup_multiply_accumulate(accP, vm[dt], bd8, accP);\n"
-           "            }\n"
-           "            simdgroup_store(accS, ss + s8 * BQT + ct * 8u, BQT);\n"
-           "            simdgroup_store(accP, dps + s8 * BQT + ct * 8u, BQT);\n"
-           "        }\n"
+           TERMITE_MSL_SEGMENT_BACKWARD_SCORE("km","vm","qst","dost","BQT")
            "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        {\n"
-           "            const uint r = s8 + L / 4u, c0 = (L % 4u) * 4u;\n"
-           "            for (uint j = 0u; j < 4u; ++j) {\n"
-           "                uint c = c0 + j;\n"
-           "                bool vis = r < nk && c < nqt && lrow[c] > neg && mbta_flash_visible(rg, qp[c], kp[r], c, k0 + r, p.window);\n"
-           "                float sval = ss[r * BQT + c];\n"
-           "                float pval = vis ? exp(sval * scale - lrow[c]) : 0.0f;\n"
-           "                float dpval = dps[r * BQT + c];\n"
-           "                float keep = mbta_dropout_keep(p.dropout_seed, row, h, p.num_heads, p.seq_len, q0t + c - row_start, k0 + r - row_start, p.dropout_probability);\n"
-           "                dps[r * BQT + c] = pval * keep;\n"
-           "                ss[r * BQT + c] = pval * (keep * dpval - drow[c]) * scale;\n"
-           "            }\n"
-           "        }\n"
+           "        antfly_segment_score_vjp<true,BQT>(ss,dps,lrow,drow,rg,qp,kp,p,nk,nqt,s8,L,row,h,q0t,k0,row_start);\n"
            "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        simdgroup_float8x8 pm0, pm1, dsm0, dsm1;\n"
            "        simdgroup_load(pm0, dps + s8 * BQT, BQT);\n"
@@ -14407,7 +14368,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float gate=z[h*128+d];\n"
            "    output[h*128+d]=value*scales[0]*norm[d]*(gate/(1.0f+exp(-gate)));\n"
            "}\n"
-           "kernel void termite_qwen35_prefill_conv_vec4(device const float*mixed[[buffer(0)]],device const float*weight[[buffer(1)]],device const float*history[[buffer(6)]],device float*conv[[buffer(9)]],constant termite_qwen35_params&p[[buffer(15)]],uint gid[[thread_position_in_grid]]){\n"
+           "kernel void antfly_gdn_causal_conv_vec4_f32(device const float*mixed[[buffer(0)]],device const float*weight[[buffer(1)]],device const float*history[[buffer(6)]],device float*conv[[buffer(9)]],constant termite_qwen35_params&p[[buffer(15)]],uint gid[[thread_position_in_grid]]){\n"
            " uint channels=(2*p.key_heads+p.value_heads)*p.dim;\n"
            " if(gid>=p.seq*(channels/4))return;uint t=gid/(channels/4),c=gid%(channels/4)*4;\n"
            " float4 w0=*((device const float4*)(weight+c*4)),w1=*((device const float4*)(weight+(c+1)*4)),w2=*((device const float4*)(weight+(c+2)*4)),w3=*((device const float4*)(weight+(c+3)*4));\n"
@@ -14416,19 +14377,11 @@ static NSString *termite_metal_shader_source(void) {
            " for(uint k=0;k<4;k++){int src=int(t)+int(k)-3;float4 x=0;if(src>=0)x=*((device const float4*)(mixed+uint(src)*channels+c));else if(p.initialized)x=float4(history[c*4+uint(4+src)],history[(c+1)*4+uint(4+src)],history[(c+2)*4+uint(4+src)],history[(c+3)*4+uint(4+src)]);sum+=x*float4(w0[k],w1[k],w2[k],w3[k]);}\n"
            " *((device float4*)(conv+t*channels+c))=sum/(1.0f+exp(-sum));\n"
            "}\n"
-           "kernel void termite_qwen35_conv(device const float *mixed [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *history [[buffer(6)]], device float *conv [[buffer(9)]], constant termite_qwen35_params &p [[buffer(15)]], uint gid [[thread_position_in_grid]]) {\n"
-           "    uint channels=(2*p.key_heads+p.value_heads)*p.dim;\n"
-           "    if(gid>=p.seq*channels)return;\n"
-           "    uint t=gid/channels,c=gid%channels;\n"
-           "    float sum=0;\n"
-           "    for(uint k=0;k<p.kernel_size;k++) {\n"
-           "        int src=int(t)+int(k)+1-int(p.kernel_size);\n"
-           "        float x=src>=0?mixed[uint(src)*channels+c]:(p.initialized?history[c*p.kernel_size+uint(int(p.kernel_size)+src)]:0.0f);\n"
-           "        sum+=x*weight[c*p.kernel_size+k];\n"
-           "    }\n"
-           "    conv[gid]=sum/(1.0f+exp(-sum));\n"
+           "kernel void antfly_gdn_causal_conv_f32(device const float *mixed [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *history [[buffer(6)]], device float *conv [[buffer(9)]], constant termite_qwen35_params &p [[buffer(15)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    uint channels=(2*p.key_heads+p.value_heads)*p.dim;if(gid>=p.seq*channels)return;\n"
+           "    conv[gid]=antfly_causal_depthwise<true,true,true,false>(mixed,weight,history,gid/channels,gid%channels,channels,p.kernel_size,p.initialized);\n"
            "}\n"
-           "kernel void termite_qwen35_history(device const float *mixed [[buffer(0)]], device const float *history [[buffer(6)]], device float *next [[buffer(7)]], constant termite_qwen35_params &p [[buffer(15)]], uint gid [[thread_position_in_grid]]) {\n"
+           "kernel void antfly_causal_history_f32(device const float *mixed [[buffer(0)]], device const float *history [[buffer(6)]], device float *next [[buffer(7)]], constant termite_qwen35_params &p [[buffer(15)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint channels=(2*p.key_heads+p.value_heads)*p.dim;\n"
            "    if(gid>=channels*p.kernel_size)return;\n"
            "    uint c=gid/p.kernel_size,slot=gid%p.kernel_size;\n"
@@ -14535,7 +14488,7 @@ static NSString *termite_metal_shader_source(void) {
            "            else { float frequency = 1.0f / pow(p.theta, float(2u * left) / float(p.dim)); float angle = float(position) * frequency; c = cos(angle); s = sin(angle); }\n"
            "            float a = x[base + left] * inv * (p.weighted ? w[left] : 1.0f);\n"
            "            float b = x[base + right] * inv * (p.weighted ? w[right] : 1.0f);\n"
-           "            value = d < half_dim ? a * c - b * s : a * s + b * c;\n"
+           "            value = d < half_dim ? antfly_rotary_component<false>(a,b,c,s) : antfly_rotary_component<true>(a,b,c,s);\n"
            "        }\n"
            "        y[head * p.dim + d] = value * p.scale;\n"
            "    }\n"
@@ -14547,14 +14500,14 @@ static NSString *termite_metal_shader_source(void) {
            "    if (!p.rotate) { for (uint d=lane; d<p.head_dim; d+=32u) output[out_base+d]=input[base+d]*inv*(p.weighted ? weight[d] : 1.0f)*p.scale; return; }\n"
            "    uint quarter = p.head_dim / 4u;\n"
            "    for (uint pair = lane; pair < p.head_dim / 2u; pair += 32u) {\n"
-           "        uint axis = pair / quarter; uint j = pair % quarter; uint a = axis * 2u * quarter + j; uint b = a + quarter;\n"
+           "        uint4 rotary_pair=antfly_rotary_pair_indices<true,false>(pair,quarter); uint axis=rotary_pair.x,j=rotary_pair.y,a=rotary_pair.z,b=rotary_pair.w;\n"
            "        float position = axis == 0u ? float(row % p.grid_x) : float((row / p.grid_x) % p.grid_y);\n"
            "        float c, s;\n"
            "        if (p.cached_rotary) { uint index = (axis == 0u ? uint(position) : p.grid_x + uint(position)) * quarter + j; float2 value = rotary[index]; c = value.x; s = value.y; }\n"
            "        else { float angle = position / pow(p.theta, float(2u*j)/float(p.head_dim/2u)); c = cos(angle); s = sin(angle); }\n"
            "        float x = input[base+a] * inv * (p.weighted ? weight[a] : 1.0f); float y = input[base+b] * inv * (p.weighted ? weight[b] : 1.0f);\n"
-           "        output[out_base+a] = (x*c-y*s)*p.scale;\n"
-           "        output[out_base+b] = (y*c+x*s)*p.scale;\n"
+           "        output[out_base+a] = antfly_rotary_component<false>(x,y,c,s)*p.scale;\n"
+           "        output[out_base+b] = antfly_rotary_component<true,true>(x,y,c,s)*p.scale;\n"
            "    }\n"
            "}\n"
            "kernel void termite_apply_mrope(device const float *input [[buffer(0)]], device const uint *positions [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_mrope_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
@@ -14569,8 +14522,8 @@ static NSString *termite_metal_shader_source(void) {
            "    uint exponent_dim = p.head_dim;\n"
            "    if (p.mode == 1u) {\n"
            "        uint pairs_per_axis = half_dim / 2u;\n"
-           "        axis = pair < pairs_per_axis ? 0u : 1u;\n"
-           "        local_pair = pair % pairs_per_axis;\n"
+           "        uint4 rotary_pair=antfly_rotary_pair_indices<false,true>(pair,pairs_per_axis);\n"
+           "        axis=rotary_pair.x;local_pair=rotary_pair.y;\n"
            "        exponent_dim = half_dim;\n"
            "    } else {\n"
            "        if ((pair % 3u) == 1u && pair < p.section_h * 3u) axis = 1u;\n"
@@ -14585,7 +14538,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint base = chunk * p.head_dim;\n"
            "    float x0 = input[base + pair];\n"
            "    float x1 = input[base + half_dim + pair];\n"
-           "    output[gid] = d < half_dim ? x0 * cos_val - x1 * sin_val : x0 * sin_val + x1 * cos_val;\n"
+           "    output[gid] = d < half_dim ? antfly_rotary_component<false>(x0,x1,cos_val,sin_val) : antfly_rotary_component<true>(x0,x1,cos_val,sin_val);\n"
            "}\n"
            "kernel void termite_apply_rope_pair(device const float *first_input [[buffer(0)]], device const float *second_input [[buffer(1)]], device const uint *positions [[buffer(2)]], device float *first_output [[buffer(3)]], device float *second_output [[buffer(4)]], constant termite_metal_rope_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.total_chunks * p.head_dim; if (gid >= total) return; uint chunk = gid / p.head_dim; uint d = gid - chunk * p.head_dim; uint base = chunk * p.head_dim;\n"
@@ -15306,7 +15259,7 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            TERMITE_MSL_ABI_COMPRESSED_ATTENTION_SPAN(termite_turbo3_attention_span) "\n"
            "    termite_compressed_attention_span<termite_turbo3_span_codec>(q, encoded_key, v, output, p, h);\n"
-           "}\n";
+           "}\n"];
 }
 
 // Reuse an already populated Metal staging allocation rather than copying its
@@ -28959,7 +28912,7 @@ static void termite_metal_initialize_lightonocr3_local(termite_metal_decode_runt
     // Build these only for the model owner. Missing/unsupported PSOs remain nil
     // and the per-dispatch SIMD/threadgroup checks retain the fallback routes.
     for(size_t b=0;b<2;b++) {
-        runtime->lightonocr3_local_gate_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_gate_vec%zu_16_2",b+2]);
+        runtime->lightonocr3_local_gate_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"antfly_mpp_split_gate_vec%zu_16_2",b+2]);
         runtime->lightonocr3_local_down_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_proj_vec%zu_32_4",b+2]);
     }
     for(size_t b=0;b<3;b++)runtime->lightonocr3_local_projection_vectors[b]=termite_metal_make_pipeline(device,library,[NSString stringWithFormat:@"termite_lightonocr3_local_proj_vec%zu_16_%zu",b+2,b==2?(size_t)4:(size_t)2]);
@@ -28994,7 +28947,7 @@ static void termite_metal_initialize_lightonocr3_mpp(termite_metal_decode_runtim
         tensor_options.languageVersion = MTLLanguageVersion4_0;
         termite_metal_set_precise_math(tensor_options);
         NSError *tensor_error = nil;
-        id<MTLLibrary> tensor_library = [device newLibraryWithSource:termite_metal_lightonocr3_tensor_source()
+        id<MTLLibrary> tensor_library = [device newLibraryWithSource:termite_metal_tensor_program_source()
                                                              options:tensor_options
                                                                error:&tensor_error];
         if (tensor_library != nil) {
@@ -29018,12 +28971,12 @@ static void termite_metal_initialize_lightonocr3_mpp(termite_metal_decode_runtim
                 device, tensor_library, @"termite_lightonocr3_prefill_attention_mpp32");
             runtime->lightonocr3_prefill_attention_direct_pipeline = termite_metal_make_pipeline(
                 device, tensor_library, @"termite_lightonocr3_prefill_attention_direct16_64");
-            runtime->lightonocr3_prefill_gate8_16=termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_prefill_gate8_16");
-            runtime->lightonocr3_prefill_gate16_32=termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_prefill_gate16_32");
-            runtime->lightonocr3_local_gate_tg16 = termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_local_gate4_16");
-            runtime->lightonocr3_local_gate_tg32 = termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_local_gate4_32");
-            runtime->lightonocr3_local_down_tg8 = termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_local_down8_16");
-            runtime->lightonocr3_local_down_tg16 = termite_metal_make_pipeline(device,tensor_library,@"termite_lightonocr3_local_down16_16");
+            runtime->lightonocr3_prefill_gate8_16=termite_metal_make_pipeline(device,tensor_library,@"antfly_mpp_split_affine_rows8_16");
+            runtime->lightonocr3_prefill_gate16_32=termite_metal_make_pipeline(device,tensor_library,@"antfly_mpp_split_affine_rows16_32");
+            runtime->lightonocr3_local_gate_tg16 = termite_metal_make_pipeline(device,tensor_library,@"antfly_mpp_split_gate4_16");
+            runtime->lightonocr3_local_gate_tg32 = termite_metal_make_pipeline(device,tensor_library,@"antfly_mpp_split_gate4_32");
+            runtime->lightonocr3_local_down_tg8 = termite_metal_make_pipeline(device,tensor_library,@"antfly_mpp_split_affine8_16");
+            runtime->lightonocr3_local_down_tg16 = termite_metal_make_pipeline(device,tensor_library,@"antfly_mpp_split_affine16_16");
             runtime->lightonocr3_gate_up_split16_pipeline = termite_metal_make_pipeline(device, tensor_library, @"termite_gate_split16");
             runtime->lightonocr3_gate_up_split_reduce_pipeline = termite_metal_make_pipeline(device, tensor_library, @"termite_gate_split_reduce");
             runtime->lightonocr3_gate_up_small16_pipeline = termite_metal_make_pipeline(device, tensor_library, @"termite_lightonocr3_gate_up_small16");
@@ -29053,7 +29006,7 @@ static void termite_metal_initialize_lightonocr3_recurrent(termite_metal_decode_
     if (![options respondsToSelector:@selector(setMathMode:)]) return;
     termite_metal_set_precise_math(options);
     NSError *error = nil;
-    id<MTLLibrary> library = [runtime->device newLibraryWithSource:termite_metal_lightonocr3_recurrent_source()
+    id<MTLLibrary> library = [runtime->device newLibraryWithSource:termite_metal_gated_delta_source()
                                                         options:options error:&error];
     if (library != nil) {
         runtime->lightonocr3_copy_pipeline = termite_metal_make_pipeline(
@@ -39066,11 +39019,11 @@ static void termite_metal_initialize_lighton_prefill_ffn(termite_metal_decode_ru
         options.languageVersion = MTLLanguageVersion4_0;
         termite_metal_set_precise_math(options);
         NSError *error = nil;
-        id<MTLLibrary> library = [r->device newLibraryWithSource:termite_metal_lighton_prefill_ffn_source()
+        id<MTLLibrary> library = [r->device newLibraryWithSource:termite_metal_mpp_bf16_gate_source()
                                                        options:options error:&error];
         if (library != nil) for (size_t i = 0; i < 2; ++i)
             r->lighton_prefill_ffn_pipelines[i] = termite_metal_make_pipeline(
-                r->device, library, [NSString stringWithFormat:@"termite_lighton_prefill_gate%zu", i]);
+                r->device, library, [NSString stringWithFormat:@"antfly_mpp_bf16_gate_up%zu", i]);
     }
 }
 int antfly_metal_lighton_prefill_ffn_can_apply(termite_metal_decode_runtime *r,
@@ -51302,7 +51255,7 @@ int termite_metal_decode_runtime_masked_mean_rows_normalized(termite_metal_decod
 /// replayed output [tokens*hidden], lse and D [tokens*heads each]. The control
 /// was validated on the host (disjoint in-row ranges). Outside a frame it owns
 /// and waits for its command buffer.
-int termite_metal_decode_runtime_modernbert_training_attention_v1(
+int termite_metal_decode_runtime_segment_training_attention_v1(
     termite_metal_decode_runtime *runtime,
     void *qkv_handle,
     size_t qkv_offset,
@@ -51314,21 +51267,21 @@ int termite_metal_decode_runtime_modernbert_training_attention_v1(
     size_t output_offset,
     void *scratch_handle,
     size_t scratch_offset,
-    const termite_metal_modernbert_training_attention_params *params
+    const antfly_segment_training_attention_params *params
 ) {
     if (runtime == NULL || params == NULL || qkv_handle == NULL || control_handle == NULL || output_handle == NULL || scratch_handle == NULL) return -1;
     if (params->backward != 0 && dout_handle == NULL) return -1;
-    if (runtime->modernbert_training_attention_forward_pipeline == nil || runtime->modernbert_training_attention_dq_pipeline == nil ||
-        runtime->modernbert_training_attention_dkdv_pipeline == nil) return -2;
+    if (runtime->segment_training_attention_forward_pipeline == nil || runtime->segment_training_attention_dq_pipeline == nil ||
+        runtime->segment_training_attention_dkdv_pipeline == nil) return -2;
     const NSUInteger width = 128u;
     const size_t tokens = params->tokens;
     const size_t heads = params->num_heads;
     const size_t head_dim = params->head_dim;
     if (tokens == 0 || heads == 0 || head_dim == 0 || head_dim > width || params->seq_len == 0 || tokens % params->seq_len != 0 ||
         tokens * heads > UINT32_MAX) return -1;
-    if (runtime->modernbert_training_attention_forward_pipeline.maxTotalThreadsPerThreadgroup < width ||
-        runtime->modernbert_training_attention_dq_pipeline.maxTotalThreadsPerThreadgroup < width ||
-        runtime->modernbert_training_attention_dkdv_pipeline.maxTotalThreadsPerThreadgroup < width) return -2;
+    if (runtime->segment_training_attention_forward_pipeline.maxTotalThreadsPerThreadgroup < width ||
+        runtime->segment_training_attention_dq_pipeline.maxTotalThreadsPerThreadgroup < width ||
+        runtime->segment_training_attention_dkdv_pipeline.maxTotalThreadsPerThreadgroup < width) return -2;
     @autoreleasepool {
         // Inside an active frame the work joins that command buffer; the
         // caller keeps scratch alive through the returned output view.
@@ -51370,7 +51323,7 @@ int termite_metal_decode_runtime_modernbert_training_attention_v1(
         // Forward writes the output (forward) or the replayed output
         // (backward), and the log-sum-exp after it in scratch.
         const size_t lse_at = params->backward != 0 ? scratch_offset + rows_bytes : scratch_offset;
-        [encoder setComputePipelineState:runtime->modernbert_training_attention_forward_pipeline];
+        [encoder setComputePipelineState:runtime->segment_training_attention_forward_pipeline];
         termite_metal_bind_two_buffers_only(encoder, qkv_buffer, qkv_offset, control_buffer, control_offset);
         if (params->backward != 0) [encoder setBuffer:scratch_buffer offset:scratch_offset atIndex:2];
         else [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
@@ -51381,13 +51334,13 @@ int termite_metal_decode_runtime_modernbert_training_attention_v1(
         if (params->backward != 0) {
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             const size_t delta_at = lse_at + stats_bytes;
-            [encoder setComputePipelineState:runtime->modernbert_training_attention_dq_pipeline];
+            [encoder setComputePipelineState:runtime->segment_training_attention_dq_pipeline];
             termite_metal_bind_seven_buffers_only(encoder, qkv_buffer, qkv_offset, control_buffer, control_offset, dout_buffer, dout_offset, scratch_buffer, scratch_offset, scratch_buffer, lse_at, scratch_buffer, delta_at, output_buffer, output_offset);
             [encoder setBytes:params length:sizeof(*params) atIndex:7];
             [encoder setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
             [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            [encoder setComputePipelineState:runtime->modernbert_training_attention_dkdv_pipeline];
+            [encoder setComputePipelineState:runtime->segment_training_attention_dkdv_pipeline];
             termite_metal_bind_seven_buffers_only(encoder, qkv_buffer, qkv_offset, control_buffer, control_offset, dout_buffer, dout_offset, scratch_buffer, lse_at, scratch_buffer, delta_at, output_buffer, output_offset + rows_bytes, output_buffer, output_offset + 2u * rows_bytes);
             [encoder setBytes:params length:sizeof(*params) atIndex:7];
             [encoder setThreadgroupMemoryLength:pair_bytes atIndex:0];
@@ -51405,7 +51358,7 @@ int termite_metal_decode_runtime_modernbert_training_attention_v1(
 /// them per query. Only eligible for head_dim a multiple of 8, <= 64; the
 /// caller is expected to have already checked this, but this function fails
 /// closed (-3) if it has not.
-int termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
+int termite_metal_decode_runtime_segment_training_attention_flash_v1(
     termite_metal_decode_runtime *runtime,
     void *qkv_handle,
     size_t qkv_offset,
@@ -51417,12 +51370,12 @@ int termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
     size_t output_offset,
     void *scratch_handle,
     size_t scratch_offset,
-    const termite_metal_modernbert_training_attention_params *params
+    const antfly_segment_training_attention_params *params
 ) {
     if (runtime == NULL || params == NULL || qkv_handle == NULL || control_handle == NULL || output_handle == NULL || scratch_handle == NULL) return -1;
     if (params->backward != 0 && dout_handle == NULL) return -1;
-    if (runtime->modernbert_training_attention_flash_forward_pipeline == nil || runtime->modernbert_training_attention_flash_dq_pipeline == nil ||
-        runtime->modernbert_training_attention_flash_dkdv_pipeline == nil) return -2;
+    if (runtime->segment_training_attention_flash_forward_pipeline == nil || runtime->segment_training_attention_flash_dq_pipeline == nil ||
+        runtime->segment_training_attention_flash_dkdv_pipeline == nil) return -2;
     const NSUInteger width = 128u;
     const size_t tokens = params->tokens;
     const size_t heads = params->num_heads;
@@ -51430,9 +51383,9 @@ int termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
     if (tokens == 0 || heads == 0 || head_dim == 0 || params->seq_len == 0 || tokens % params->seq_len != 0 ||
         tokens * heads > UINT32_MAX) return -1;
     if (head_dim % 8u != 0u || head_dim > 64u) return -3;
-    if (runtime->modernbert_training_attention_flash_forward_pipeline.maxTotalThreadsPerThreadgroup < width ||
-        runtime->modernbert_training_attention_flash_dq_pipeline.maxTotalThreadsPerThreadgroup < width ||
-        runtime->modernbert_training_attention_flash_dkdv_pipeline.maxTotalThreadsPerThreadgroup < width) return -2;
+    if (runtime->segment_training_attention_flash_forward_pipeline.maxTotalThreadsPerThreadgroup < width ||
+        runtime->segment_training_attention_flash_dq_pipeline.maxTotalThreadsPerThreadgroup < width ||
+        runtime->segment_training_attention_flash_dkdv_pipeline.maxTotalThreadsPerThreadgroup < width) return -2;
     @autoreleasepool {
         bool frame_owned = (runtime->active_frame_cb == nil);
         id<MTLBuffer> qkv_buffer = (__bridge id<MTLBuffer>)qkv_handle;
@@ -51482,7 +51435,7 @@ int termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
         BOOL encoder_owned = YES;
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned);
         if (encoder == nil) return -5;
-        [encoder setComputePipelineState:runtime->modernbert_training_attention_flash_forward_pipeline];
+        [encoder setComputePipelineState:runtime->segment_training_attention_flash_forward_pipeline];
         termite_metal_bind_two_buffers_only(encoder, qkv_buffer, qkv_offset, control_buffer, control_offset);
         if (params->backward != 0) [encoder setBuffer:scratch_buffer offset:scratch_offset atIndex:2];
         else [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
@@ -51498,7 +51451,7 @@ int termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
             } else {
                 [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
-            [encoder setComputePipelineState:runtime->modernbert_training_attention_flash_dq_pipeline];
+            [encoder setComputePipelineState:runtime->segment_training_attention_flash_dq_pipeline];
             termite_metal_bind_seven_buffers_only(encoder, qkv_buffer, qkv_offset, control_buffer, control_offset, dout_buffer, dout_offset, scratch_buffer, scratch_offset, scratch_buffer, lse_at, scratch_buffer, delta_at, output_buffer, output_offset);
             [encoder setBytes:params length:sizeof(*params) atIndex:7];
             [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
@@ -51509,7 +51462,7 @@ int termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
             } else {
                 [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
-            [encoder setComputePipelineState:runtime->modernbert_training_attention_flash_dkdv_pipeline];
+            [encoder setComputePipelineState:runtime->segment_training_attention_flash_dkdv_pipeline];
             termite_metal_bind_seven_buffers_only(encoder, qkv_buffer, qkv_offset, control_buffer, control_offset, dout_buffer, dout_offset, scratch_buffer, lse_at, scratch_buffer, delta_at, output_buffer, output_offset + rows_bytes, output_buffer, output_offset + 2u * rows_bytes);
             [encoder setBytes:params length:sizeof(*params) atIndex:7];
             [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
@@ -51971,7 +51924,7 @@ _Static_assert(sizeof(termite_metal_deberta_training_attention_v1_params) == 88,
 _Static_assert(offsetof(termite_metal_deberta_training_attention_v1_params, dropout_stream) == 80, "DeBERTa training attention V1 stream ABI");
 _Static_assert(sizeof(termite_metal_deberta_training_attention_v1_buffer) == 24, "DeBERTa training attention V1 buffer ABI");
 
-static NSString *termite_metal_deberta_training_attention_v1_source(void) {
+static NSString *termite_metal_relative_attention_training_source(void) {
     return @"#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "#pragma clang fp contract(off)\n"
@@ -52336,7 +52289,7 @@ int termite_metal_decode_runtime_deberta_training_attention_v1_ready(termite_met
                 options.mathMode = MTLMathModeSafe;
                 if (options.mathMode != MTLMathModeSafe) return 0;
                 NSError *error = nil;
-                id<MTLLibrary> library = [runtime->device newLibraryWithSource:termite_metal_deberta_training_attention_v1_source() options:options error:&error];
+                id<MTLLibrary> library = [runtime->device newLibraryWithSource:termite_metal_relative_attention_training_source() options:options error:&error];
                 if (library == nil) {
                     if (error != nil) fprintf(stderr, "metal-deberta-training-v1 safe-library error=%s\n", error.localizedDescription.UTF8String);
                     return 0;

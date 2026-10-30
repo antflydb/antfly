@@ -119,7 +119,7 @@ comptime {
 
 // Native export names remain the compatibility ABI of the qualified PTX.
 const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("lighton_recurrent.ptx") ++ "\x00", .{
-    .causal_conv = "lighton_conv",
+    .causal_conv = "antfly_gdn_causal_conv",
     .normalize_qk = "lighton_normalize",
     .recurrent = "lighton_recurrent",
     .gated_norm = "lighton_gated_norm",

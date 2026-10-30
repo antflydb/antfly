@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #include <math.h>
+#include "../kernels/row_program.cuh"
 __device__ __forceinline__ unsigned short lighton_activation_bf16(float x) {
     unsigned bits=__float_as_uint(x);
     return (unsigned short)((bits+0x7fffu+((bits>>16)&1u))>>16);
@@ -34,19 +35,13 @@ extern "C" __global__ void lighton_packed_silu_up_bf16(
     out[i]=lighton_activation_bf16(value);
 }
 
-extern "C" __global__ void lighton_rms_input_bf16(
+extern "C" __global__ void antfly_rms_tree_bf16(
     unsigned short* out, const float* input, const float* raw_weight,
     unsigned rows, unsigned dim, float eps, float weight_offset) {
     unsigned row=blockIdx.x;if(row>=rows)return;
     unsigned tid=threadIdx.x,base=row*dim;
     __shared__ float partial[256];
-    float sumsq=0.f;
-    for(unsigned i=tid;i<dim;i+=blockDim.x){float x=input[base+i];sumsq+=x*x;}
-    partial[tid]=sumsq;__syncthreads();
-    for(unsigned stride=blockDim.x>>1;stride>0;stride>>=1){
-        if(tid<stride)partial[tid]+=partial[tid+stride];__syncthreads();
-    }
-    const float scale=rsqrtf(partial[0]/(float)dim+eps);
+    const float scale=antfly_row_rms_tree_inverse(dim,eps,partial,[&](unsigned i){return input[base+i];});
     for(unsigned i=tid;i<dim;i+=blockDim.x){
         const float w=weight_offset==0.f?raw_weight[i]:__fadd_rn(raw_weight[i],weight_offset);
         out[base+i]=lighton_activation_bf16(input[base+i]*scale*w);

@@ -10,7 +10,7 @@ pub const owners = .{ Boundary(.metal), Boundary(.cuda) };
 
 fn Boundary(comptime backend: Backend) type {
     return struct {
-        pub const path = if (backend == .metal) "src/backends/metal_kernels.m" else "src/ops/cuda/kernels/gliner25_boundary.cuh";
+        pub const path = if (backend == .metal) "src/backends/metal_kernels.m" else "src/ops/cuda/kernels/ragged_boundary_programs.cuh";
         pub const begin = "// quant-kernel-codegen:begin shared GPU boundary operators";
         pub const end = "// quant-kernel-codegen:end shared GPU boundary operators";
         pub fn render(allocator: std.mem.Allocator) ![]u8 {

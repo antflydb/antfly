@@ -1,3 +1,4 @@
+#include "../../gpu/depthwise_program.h"
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -20,14 +21,7 @@ __device__ __forceinline__ void conv_channel(
     float *next_history, float *out, int seq, int channels, int initialized, int c) {
     if (c >= channels) return;
     for (int t = 0; t < seq; ++t) {
-        float sum = 0;
-        for (int k = 0; k < 4; ++k) {
-            int source = t + k - 3;
-            float v = source >= 0 ? x[source * channels + c]
-                : (initialized ? history[c * 4 + source + 4] : 0.0f);
-            sum += v * weight[c * 4 + k];
-        }
-        out[t * channels + c] = sum / (1.0f + expf(-sum));
+        out[t*channels+c]=antfly_causal_depthwise<true,true,true,false,4>(x,weight,history,t,c,channels,4u,initialized);
     }
     // History is always the last four samples, left-padded with zero for a
     // fresh short prefix, so continuation consumes the same causal window.
@@ -39,7 +33,7 @@ __device__ __forceinline__ void conv_channel(
     }
 }
 
-extern "C" __global__ void lighton_conv(
+extern "C" __global__ void antfly_gdn_causal_conv(
     const float *x, const float *weight, const float *history,
     float *next_history, float *out, int seq, int channels, int initialized) {
     conv_channel(x, weight, history, next_history, out, seq, channels, initialized,
@@ -314,14 +308,7 @@ __device__ __forceinline__ void prefix_conv_normalize_cached_gates(
     const int d = threadIdx.x;
     const int c = head * 128 + d;
     const int key_heads = (channels / 128 - value_heads) / 2;
-    float sum = 0;
-    for (int k = 0; k < 4; ++k) {
-        const int source = t + k - 3;
-        const float v = source >= 0 ? x[source * channels + c]
-            : (initialized ? history[c * 4 + source + 4] : 0.f);
-        sum += v * weight[c * 4 + k];
-    }
-    float v = sum / (1.f + expf(-sum));
+    float v=antfly_causal_depthwise<true,true,true,false,4>(x,weight,history,t,c,channels,4u,initialized);
     if (head < 2 * key_heads) {
         const float square = warp_sum(v * v);
         if ((d & 31) == 0) partial[d >> 5] = square;

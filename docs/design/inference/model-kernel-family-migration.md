@@ -99,3 +99,7 @@ or qualification of this future migration. AV's Metal GPU p95 miss remains open.
 
 The remaining recurrent/audio/projection/training-row implementation and its
 performance limits are recorded in [BA outcomes](unified-execution-ba-outcomes.md).
+
+[BB outcomes](unified-execution-bb-outcomes.md) records the next six families,
+operation-based owner names, and typed CPU admission. Follow the
+[kernel authoring guide](kernel-authoring.md) for new reusable programs.

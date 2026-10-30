@@ -85,6 +85,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/kernel_geometry.zig",
         "src/ops/kernel_math.zig",
         "src/ops/kernel_reduction.zig",
+        "src/ops/gpu/depthwise_program.h",
     };
     // Native includes and host ABI consumers affect qualification even when
     // the translation-unit text is unchanged. Declare the complete local
@@ -108,11 +109,11 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/cuda/lighton_activation.ptx",
         "src/ops/cuda/lighton_vision.ptx",
         "src/ops/cuda/florence_fused.ptx",
-        "src/ops/cuda/prototypes/lighton_qwen35_recurrent.cu",
+        "src/ops/cuda/prototypes/gated_delta_recurrent.cu",
         "src/ops/cuda/prototypes/lighton_batched_attention.cu",
-        "src/ops/cuda/prototypes/lighton_activation.cu",
-        "src/ops/cuda/prototypes/lighton_vision.cu",
-        "src/ops/cuda/prototypes/florence_fused.cu",
+        "src/ops/cuda/prototypes/bf16_activation_programs.cu",
+        "src/ops/cuda/prototypes/vision_projection_programs.cu",
+        "src/ops/cuda/prototypes/vision_f16_programs.cu",
         "src/graph/templates/cuda_gqa_flash_prefill_f16_sm89.cuh",
         "src/graph/templates/cuda_gqa_decode_splitk_online_sm89.cuh",
         "src/graph/templates/cuda_gqa_split_decode_f32.cuh",
@@ -123,12 +124,14 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/graph/templates/cuda_gqa_repeat_prefill_f16.cuh",
         "src/graph/templates/cuda_gqa_repeat_split_f16.cuh",
         "src/ops/cuda/kernels/kernel_abi.cuh",
-        "src/ops/cuda/kernels/embedding_gemma2.cuh",
-        "src/ops/cuda/kernels/embedding_gemma2_training_rope.cuh",
-        "src/ops/cuda/kernels/embedding_gemma2_optimized.cuh",
-        "src/ops/cuda/kernels/gliner25_boundary.cuh",
-        "src/ops/cuda/kernels/gliner_boundary_m64.cuh",
-        "src/ops/cuda/kernels/deberta_tc_tiles.cuh",
+        "src/ops/cuda/kernels/row_program.cuh",
+        "src/ops/cuda/kernels/rotary_program.cuh",
+        "src/ops/cuda/kernels/encoder_multimodal_programs.cuh",
+        "src/ops/cuda/kernels/rotary_frequency_training.cuh",
+        "src/ops/cuda/kernels/encoder_fused_programs.cuh",
+        "src/ops/cuda/kernels/ragged_boundary_programs.cuh",
+        "src/ops/cuda/kernels/relative_attention_tensor_rows64.cuh",
+        "src/ops/cuda/kernels/relative_attention_tensor_tiles.cuh",
         "src/ops/cuda/kernels/q8_projection_tile4.cuh",
         "src/ops/cuda/kernels/projection_rows_cols_init.cuh",
         "src/ops/cuda/kernels/projection_rows_cols_tree.cuh",
@@ -154,7 +157,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/cuda/kernels/training_validation.cuh",
         "src/ops/cuda/kernels/training_welford_layer_norm.cuh",
         "src/ops/cuda/kernels/training_row_softmax.cuh",
-        "src/ops/cuda/kernels/gliner25_attention.cuh",
+        "src/ops/cuda/kernels/relative_attention_training.cuh",
     };
     run.addArg(b.fmt("{d}", .{qualification.len + contracts.len + if (backend == .cuda) cuda_dependencies.len else metal_dependencies.len}));
     for (qualification) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });

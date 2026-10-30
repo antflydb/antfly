@@ -35,9 +35,10 @@ pub const blasThreads = native.openblas.threadLimit;
 const activations_mod = @import("../backends/activations.zig");
 const deberta_tiled = @import("deberta_tiled_attention.zig");
 const deberta_training = @import("deberta_training_attention.zig");
-const modernbert_training = @import("modernbert_training_attention.zig");
+const modernbert_training = @import("range_attention_reference.zig");
 const segment_training = @import("segment_training_attention.zig");
 const LoadedWeight = @import("../models/weight_source.zig").LoadedWeight;
+const dense_projection_policy = @import("dense_projection_policy.zig");
 const QuantizedStorage = @import("../models/weight_source.zig").QuantizedStorage;
 const runtime = @import("../runtime/root.zig");
 const tensor_store_mod = @import("../models/tensor_store.zig");
@@ -591,99 +592,6 @@ fn clipClapDequantSgemmEnabled() bool {
     return false;
 }
 
-fn isClipClapProjectionWeightName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "text_projection.weight") or
-        std.mem.eql(u8, name, "visual_projection.weight") or
-        std.mem.startsWith(u8, name, "text_projection.") or
-        std.mem.startsWith(u8, name, "visual_projection.") or
-        std.mem.startsWith(u8, name, "audio_projection.") or
-        std.mem.eql(u8, name, "clip.text_projection.weight") or
-        std.mem.eql(u8, name, "clip.visual_projection.weight") or
-        std.mem.startsWith(u8, name, "clap.text_projection.") or
-        std.mem.startsWith(u8, name, "clap.audio_projection.");
-}
-
-fn isGlinerRecognizerWeightName(name: []const u8) bool {
-    return std.mem.startsWith(u8, name, "span_rep.") or
-        std.mem.startsWith(u8, name, "count_embed.");
-}
-
-fn shouldUseGlinerRecognizerDequantSgemm(
-    name: []const u8,
-    tensor_type: gguf_tensor_types.TensorType,
-) bool {
-    if (!isGlinerRecognizerWeightName(name)) return false;
-    const known = switch (tensor_type) {
-        .known => |value| value,
-        else => return false,
-    };
-    return known == .Q4_K or known == .Q5_K;
-}
-
-fn isGlinerEncoderLinearWeightName(name: []const u8) bool {
-    if (!std.mem.startsWith(u8, name, "encoder.layer.")) return false;
-    return std.mem.endsWith(u8, name, ".attention.self.query_proj.weight") or
-        std.mem.endsWith(u8, name, ".attention.self.key_proj.weight") or
-        std.mem.endsWith(u8, name, ".attention.self.value_proj.weight") or
-        std.mem.endsWith(u8, name, ".attention.output.dense.weight") or
-        std.mem.endsWith(u8, name, ".intermediate.dense.weight") or
-        std.mem.endsWith(u8, name, ".output.dense.weight");
-}
-
-fn shouldUseGlinerEncoderDequantSgemm(
-    name: []const u8,
-    rows: usize,
-    out_dim: usize,
-    tensor_type: gguf_tensor_types.TensorType,
-) bool {
-    if (rows < 16 or out_dim < 512) return false;
-    if (!isGlinerEncoderLinearWeightName(name)) return false;
-    const known = switch (tensor_type) {
-        .known => |value| value,
-        else => return false,
-    };
-    return known == .Q4_K or known == .Q5_K;
-}
-
-fn shouldUseClipClapDequantSgemm(
-    name: []const u8,
-    rows: usize,
-    out_dim: usize,
-    tensor_type: gguf_tensor_types.TensorType,
-) bool {
-    if (!clipClapDequantSgemmEnabled()) return false;
-    if (out_dim < 512) return false;
-    const known = switch (tensor_type) {
-        .known => |value| value,
-        else => return false,
-    };
-    if (!dequantSgemmSupportedQuant(known)) return false;
-
-    const known_prefix =
-        std.mem.startsWith(u8, name, "text_model.") or
-        std.mem.startsWith(u8, name, "vision_model.") or
-        std.mem.startsWith(u8, name, "audio_model.");
-
-    if (isClipClapProjectionWeightName(name)) {
-        return rows <= 4;
-    }
-
-    if (rows < 16 or !known_prefix) return false;
-
-    return std.mem.endsWith(u8, name, ".self_attn.q_proj.weight") or
-        std.mem.endsWith(u8, name, ".self_attn.k_proj.weight") or
-        std.mem.endsWith(u8, name, ".self_attn.v_proj.weight") or
-        std.mem.endsWith(u8, name, ".self_attn.out_proj.weight") or
-        std.mem.endsWith(u8, name, ".attention.self.query.weight") or
-        std.mem.endsWith(u8, name, ".attention.self.key.weight") or
-        std.mem.endsWith(u8, name, ".attention.self.value.weight") or
-        std.mem.endsWith(u8, name, ".attention.output.dense.weight") or
-        std.mem.endsWith(u8, name, ".mlp.fc1.weight") or
-        std.mem.endsWith(u8, name, ".mlp.fc2.weight") or
-        std.mem.endsWith(u8, name, ".intermediate.dense.weight") or
-        std.mem.endsWith(u8, name, ".output.dense.weight");
-}
-
 /// Laya (LAYA.md "Weight quantization (step 1d)") serves ModernBERT encoder
 /// and decision-head linears as Q8_0. Their shapes (rows in the hundreds to
 /// low thousands, out_dim >= 512) make Accelerate's SGEMM much faster than
@@ -773,30 +681,21 @@ fn tryLayaDequantSgemmBias(
     return layaDequantScratchSgemm(self, storage, input, output, rows, in_dim, out_dim, 1.0);
 }
 
-fn shouldUseQuantizedDequantSgemm(
-    name: []const u8,
-    rows: usize,
-    out_dim: usize,
-    storage: *const QuantizedStorage,
-) bool {
-    if (storage.packed_expert != null) return false;
+fn shouldUseQuantizedDequantSgemm(name: []const u8, rows: usize, out_dim: usize, storage: *const QuantizedStorage) bool {
     const known = switch (storage.tensor_type) {
         .known => |value| value,
         else => return false,
     };
-    if (!dequantSgemmSupportedQuant(known)) return false;
-    if (quantizedDequantSgemmEnabled()) return true;
-    // Florence's CPU encoder and incremental decoder benefit from BLAS over
-    // cached dense weights. Promotion remains bounded by the dense-cache budget.
-    if (std.mem.startsWith(u8, name, "language_model.model.encoder.") or
-        std.mem.startsWith(u8, name, "language_model.model.decoder.") or
-        std.mem.eql(u8, name, "language_model.model.shared.weight") or
-        std.mem.eql(u8, name, "language_model.lm_head.weight") or
-        std.mem.startsWith(u8, name, "vision_tower.blocks.") or
-        std.mem.eql(u8, name, "image_projection")) return true;
-    if (shouldUseGlinerRecognizerDequantSgemm(name, storage.tensor_type)) return true;
-    if (shouldUseGlinerEncoderDequantSgemm(name, rows, out_dim, storage.tensor_type)) return true;
-    return shouldUseClipClapDequantSgemm(name, rows, out_dim, storage.tensor_type);
+    return dense_projection_policy.admit(.{
+        .workload = storage.dense_workload orelse @import("../models/projection_workload.zig").classify(name),
+        .rows = rows,
+        .out_dim = out_dim,
+        .supported_quant = dequantSgemmSupportedQuant(known),
+        .low_bit_k = known == .Q4_K or known == .Q5_K,
+        .packed_expert = storage.packed_expert != null,
+        .force_dense = quantizedDequantSgemmEnabled(),
+        .allow_optional = clipClapDequantSgemmEnabled(),
+    });
 }
 
 fn canFallbackDenseBudgetPressure(name: []const u8, entry: *const LazyWeightEntry) bool {
@@ -6235,14 +6134,14 @@ fn linearInto(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
         } else {
             const weight_view = try denseWeightView(self, weight);
             defer weight_view.deinit(self.allocator);
-            if (try preparedEmbeddingGemma2Linear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim)) {
+            if (try preparedDenseLinear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim)) {
                 addLinearBiasRows(output, getData(bias), rows, out_dim);
             } else try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 1.0, output);
         }
     } else {
         const weight_view = try denseWeightView(self, weight);
         defer weight_view.deinit(self.allocator);
-        if (try preparedEmbeddingGemma2Linear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim)) {
+        if (try preparedDenseLinear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim)) {
             addLinearBiasRows(output, getData(bias), rows, out_dim);
         } else try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 1.0, output);
     }
@@ -7998,7 +7897,7 @@ fn embeddingGemma2DenseFloor(data: *WeightStore) [3]usize {
 
 /// Only model-owned immutable snapshots may publish panels. Pointer keys are
 /// valid while the existing model reader guard pins both caches together.
-fn preparedEmbeddingGemma2Panels(self: *NativeCompute, source: []const f32, n: usize, k: usize) !?linalg.prepared_gemm.Panels {
+fn cachedImmutableDensePanels(self: *NativeCompute, source: []const f32, n: usize, k: usize) !?linalg.prepared_gemm.Panels {
     if (!self.cache_embeddinggemma2_bf16_weights or !self.embeddinggemma2_cache_reader or n < 64 or k < 64) return null;
     const cache = if (self.data.tier_cache) |*cache| cache else return null;
     const key = PreparedPanelKey{ .address = @intFromPtr(source.ptr), .n = n, .k = k };
@@ -8044,10 +7943,10 @@ fn preparedEmbeddingGemma2Panels(self: *NativeCompute, source: []const f32, n: u
     std.debug.assert(self.embeddinggemma2_cache_reader);
     return panels;
 }
-fn preparedEmbeddingGemma2Linear(self: *NativeCompute, input: []const f32, source: []const f32, output: []f32, m: usize, n: usize, k: usize) !bool {
+fn preparedDenseLinear(self: *NativeCompute, input: []const f32, source: []const f32, output: []f32, m: usize, n: usize, k: usize) !bool {
     // Direct dot products remain preferable for tiny row counts.
-    if (m < 32 or native.useBlas()) return false;
-    const panels = (preparedEmbeddingGemma2Panels(self, source, n, k) catch |err| switch (err) {
+    if (!dense_projection_policy.preparedRows(m, k, n, native.useBlas())) return false;
+    const panels = (cachedImmutableDensePanels(self, source, n, k) catch |err| switch (err) {
         error.OutOfMemory => return false,
         else => return err,
     }) orelse return false;
@@ -8101,7 +8000,7 @@ fn linearNoBiasInto(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim:
     }
     const weight_view = try denseWeightView(self, weight);
     defer weight_view.deinit(self.allocator);
-    if (!try preparedEmbeddingGemma2Linear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim))
+    if (!try preparedDenseLinear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim))
         try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 0.0, output);
     return;
 }
@@ -48708,16 +48607,16 @@ test "embeddinggemma2 prepared panels share admission pin readers and reclaim at
             }
             var source = tensor_mod.Tensor{ .data = &raw, .shape = &.{ 128, 64 }, .dtype = .bf16, .name = "language_model.layers.0.self_attn.o_proj.weight", .allocator = a, .owns_data = false, .owns_shape = false };
             const dense = (try cachedEmbeddingGemma2F32Weight(&compute, source.name, &source)).?;
-            const panels = (try preparedEmbeddingGemma2Panels(&compute, dense[0..4096], 64, 64)).?;
-            const again = (try preparedEmbeddingGemma2Panels(&compute, dense[0..4096], 64, 64)).?;
+            const panels = (try cachedImmutableDensePanels(&compute, dense[0..4096], 64, 64)).?;
+            const again = (try cachedImmutableDensePanels(&compute, dense[0..4096], 64, 64)).?;
             try std.testing.expectEqual(panels.data.ptr, again.data.ptr);
             try std.testing.expectEqual(@as(usize, 49152), store.tier_cache.?.host_bytes);
             try std.testing.expectEqual(@as(usize, 0), reclaimEmbeddingGemma2Weights(&store, .language));
             // Unowned request memory cannot become a persistent weight plan.
             var other: [4096]f32 = @splat(2);
-            try std.testing.expect(try preparedEmbeddingGemma2Panels(&compute, &other, 64, 64) == null);
+            try std.testing.expect(try cachedImmutableDensePanels(&compute, &other, 64, 64) == null);
             // A second geometry cannot bypass the shared cap.
-            try std.testing.expect(try preparedEmbeddingGemma2Panels(&compute, dense[4096..8192], 64, 64) == null);
+            try std.testing.expect(try cachedImmutableDensePanels(&compute, dense[4096..8192], 64, 64) == null);
             compute.deinit();
             live = false;
             try std.testing.expectEqual(@as(usize, 49152), reclaimEmbeddingGemma2Weights(&store, .language));
@@ -51075,4 +50974,16 @@ test "wide grouped projection families independent oracle and benchmark" {
             };
         };
     }
+}
+
+test "explicit dense workload overrides checkpoint names without a kernel fork" {
+    setQuantizedDequantSgemmOverrideForBench(false);
+    defer setQuantizedDequantSgemmOverrideForBench(null);
+    var storage = QuantizedStorage{ .tensor_type = .{ .known = .Q4_K }, .raw_bytes = &.{}, .shape = &.{}, .raw_owned = false, .allocator = std.testing.allocator, .dense_workload = .encoder };
+    try std.testing.expect(shouldUseQuantizedDequantSgemm("new_checkpoint.weight", 16, 512, &storage));
+    try std.testing.expect(!shouldUseQuantizedDequantSgemm("new_checkpoint.weight", 15, 512, &storage));
+    storage.dense_workload = .direct;
+    try std.testing.expect(!shouldUseQuantizedDequantSgemm("span_rep.weight", 16, 512, &storage));
+    storage.dense_workload = null;
+    try std.testing.expect(shouldUseQuantizedDequantSgemm("span_rep.weight", 16, 512, &storage));
 }

@@ -140,7 +140,7 @@ test {
     _ = @import("finetune/laya/training_test.zig");
     _ = @import("finetune/laya/training_packed_test.zig");
     _ = @import("finetune/laya/fused_attention_test.zig");
-    _ = @import("ops/segment_training_attention.zig");
+    _ = @import("ops/range_attention_reference.zig");
     _ = @import("finetune/laya/data.zig");
     _ = @import("finetune/laya/job.zig");
     _ = @import("finetune/laya/evaluate.zig");
@@ -211,7 +211,7 @@ test {
     _ = @import("ops/deberta_training_attention_test.zig");
     _ = @import("ops/deberta_training_attention_source_test.zig");
     _ = @import("ops/deberta_training_attention_device_test.zig");
-    _ = @import("ops/modernbert_training_attention.zig");
+    _ = @import("ops/range_attention_reference.zig");
     _ = @import("ops/modernbert_training_attention_device_test.zig");
     _ = @import("ops/segment_training_attention_device_test.zig");
     _ = @import("graph/recomputed_training_test.zig");

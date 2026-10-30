@@ -559,6 +559,7 @@ fn ggufGetTensor(self: *GgufStore, name: []const u8) !weight_source_mod.LoadedWe
             .raw_bytes = @constCast(raw_bytes),
             .shape = quant_shape,
             .source_name = storage_source_name,
+            .dense_workload = @import("projection_workload.zig").registered(storage_source_name),
             .raw_owned = false,
             .raw_mmap_backed = self.mmap_region != null,
             .raw_mmap_source_bytes = if (self.mmap_region != null) self.rawData() else null,

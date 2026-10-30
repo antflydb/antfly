@@ -29,7 +29,7 @@ case "$("$nvcc" --version)" in
 esac
 mkdir -p "$output_dir"
 "$nvcc" -ptx -arch=compute_75 -O3 --fmad=false -std=c++17 \
-  "$pkg_root/src/ops/cuda/prototypes/lighton_qwen35_recurrent.cu" \
+  "$pkg_root/src/ops/cuda/prototypes/gated_delta_recurrent.cu" \
   -o "$output_dir/lighton_recurrent.ptx"
 "${PYTHON:-python3}" - "$output_dir/lighton_recurrent.ptx" <<'PY'
 from pathlib import Path

@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! CPU reference for the ModernBERT training attention
-//! (`ml.graph.ModernBertTrainingAttentionAttrs`). Storage is linear in the
+//! Deterministic range-segment training attention reference.
+//! The existing ModernBERT graph operation is an adapter to this shared program. Storage is linear in the
 //! sequence: the forward keeps only per-row softmax statistics, and the
 //! backward replays them. Every loop runs in a fixed order, so results are
 //! bit-reproducible. The Metal kernels implement the same arithmetic.
@@ -22,7 +22,7 @@ const std = @import("std");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Allocator = std.mem.Allocator;
 
-pub const Attrs = @import("ml").graph.ModernBertTrainingAttentionAttrs;
+pub const Attrs = @import("ml").graph.RangeTrainingAttentionAttrs;
 
 /// The i32 control leaf: `tokens*6` range bounds, then `tokens` positions.
 pub const ControlView = struct {

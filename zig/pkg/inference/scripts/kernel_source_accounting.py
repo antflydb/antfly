@@ -186,7 +186,7 @@ def account(root, baseline):
             continue
         a = before.decode()
         b = after.decode()
-        if name.startswith('docs/'):
+        if name.startswith('docs/') or path.name == 'AGENTS.md':
             row['groups'].append(add('documentation', a, b))
         elif '/scripts/' in name or '/bench/' in name or '/tools/' in name or '/testing/' in name or (name == 'zig/pkg/inference/build.zig') or name.endswith('/quant_kernel_metal_runtime_check.zig'):
             row['groups'].append(add('tests_and_benchmark_tooling', a, b))
@@ -217,6 +217,8 @@ def account(root, baseline):
                 group = 'authored_metal_shader'
             elif '/graph/templates/' in name and path.suffix == '.metal':
                 group = 'authored_metal_shader'
+            elif '/ops/gpu/' in name and path.suffix == '.h':
+                group = 'authored_shared_gpu_device'
             elif path.suffix in {'.cu', '.cuh'}:
                 group = 'authored_cuda_device'
             elif name.endswith(('/cuda/kernels.zig', '/cuda/launch_abi.zig')):

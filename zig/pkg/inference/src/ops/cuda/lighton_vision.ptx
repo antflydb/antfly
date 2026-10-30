@@ -372,17 +372,17 @@ $L__BB2_2:
 	ret;
 
 }
-	// .globl	lighton_vision_qkv_rope_bf16
-.visible .entry lighton_vision_qkv_rope_bf16(
-	.param .u64 lighton_vision_qkv_rope_bf16_param_0,
-	.param .u64 lighton_vision_qkv_rope_bf16_param_1,
-	.param .u64 lighton_vision_qkv_rope_bf16_param_2,
-	.param .u64 lighton_vision_qkv_rope_bf16_param_3,
-	.param .u64 lighton_vision_qkv_rope_bf16_param_4,
-	.param .u32 lighton_vision_qkv_rope_bf16_param_5,
-	.param .u32 lighton_vision_qkv_rope_bf16_param_6,
-	.param .u32 lighton_vision_qkv_rope_bf16_param_7,
-	.param .f32 lighton_vision_qkv_rope_bf16_param_8
+	// .globl	antfly_qkv_rope_two_axis_bf16
+.visible .entry antfly_qkv_rope_two_axis_bf16(
+	.param .u64 antfly_qkv_rope_two_axis_bf16_param_0,
+	.param .u64 antfly_qkv_rope_two_axis_bf16_param_1,
+	.param .u64 antfly_qkv_rope_two_axis_bf16_param_2,
+	.param .u64 antfly_qkv_rope_two_axis_bf16_param_3,
+	.param .u64 antfly_qkv_rope_two_axis_bf16_param_4,
+	.param .u32 antfly_qkv_rope_two_axis_bf16_param_5,
+	.param .u32 antfly_qkv_rope_two_axis_bf16_param_6,
+	.param .u32 antfly_qkv_rope_two_axis_bf16_param_7,
+	.param .f32 antfly_qkv_rope_two_axis_bf16_param_8
 )
 {
 	.local .align 4 .b8 	__local_depot3[28];
@@ -396,15 +396,15 @@ $L__BB2_2:
 
 
 	mov.u64 	%SPL, __local_depot3;
-	ld.param.u64 	%rd15, [lighton_vision_qkv_rope_bf16_param_0];
-	ld.param.u64 	%rd16, [lighton_vision_qkv_rope_bf16_param_1];
-	ld.param.u64 	%rd17, [lighton_vision_qkv_rope_bf16_param_2];
-	ld.param.u64 	%rd18, [lighton_vision_qkv_rope_bf16_param_3];
-	ld.param.u64 	%rd19, [lighton_vision_qkv_rope_bf16_param_4];
-	ld.param.u32 	%r43, [lighton_vision_qkv_rope_bf16_param_5];
-	ld.param.u32 	%r44, [lighton_vision_qkv_rope_bf16_param_6];
-	ld.param.u32 	%r45, [lighton_vision_qkv_rope_bf16_param_7];
-	ld.param.f32 	%f31, [lighton_vision_qkv_rope_bf16_param_8];
+	ld.param.u64 	%rd15, [antfly_qkv_rope_two_axis_bf16_param_0];
+	ld.param.u64 	%rd16, [antfly_qkv_rope_two_axis_bf16_param_1];
+	ld.param.u64 	%rd17, [antfly_qkv_rope_two_axis_bf16_param_2];
+	ld.param.u64 	%rd18, [antfly_qkv_rope_two_axis_bf16_param_3];
+	ld.param.u64 	%rd19, [antfly_qkv_rope_two_axis_bf16_param_4];
+	ld.param.u32 	%r43, [antfly_qkv_rope_two_axis_bf16_param_5];
+	ld.param.u32 	%r44, [antfly_qkv_rope_two_axis_bf16_param_6];
+	ld.param.u32 	%r45, [antfly_qkv_rope_two_axis_bf16_param_7];
+	ld.param.f32 	%f31, [antfly_qkv_rope_two_axis_bf16_param_8];
 	add.u64 	%rd1, %SPL, 0;
 	mov.u32 	%r46, %ntid.x;
 	mov.u32 	%r47, %ctaid.x;

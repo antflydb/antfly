@@ -48,6 +48,22 @@ class SourceAccountingTest(unittest.TestCase):
         self.assertEqual(receipt["groups"]["authored_metal_shader"]["bytes_removed"], -2 * len(payload))
         self.assertEqual(receipt["groups"]["tests_and_benchmark_tooling"]["bytes_removed"], -len(payload))
 
+    def test_portable_gpu_owner_and_authoring_guidance_have_distinct_budgets(self):
+        owner = "zig/pkg/inference/src/ops/gpu/depthwise_program.h"
+        guide = "zig/pkg/inference/src/ops/AGENTS.md"
+        payload = "maintained text\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in (owner, guide):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(payload)
+            with mock.patch.object(accounting.subprocess, "check_output", side_effect=["0" * 40, owner + "\n" + guide + "\n", "", "1" * 40]), mock.patch.object(accounting.subprocess, "run", return_value=SimpleNamespace(stdout=b"")):
+                receipt = accounting.account(root, "baseline")
+        self.assertEqual(receipt["authored_production"]["bytes_removed"], -len(payload))
+        self.assertEqual(receipt["groups"]["authored_shared_gpu_device"]["bytes_removed"], -len(payload))
+        self.assertEqual(receipt["groups"]["documentation"]["bytes_removed"], -len(payload))
+
     def test_private_shader_goldens_are_not_production_savings(self):
         source = r'''const golden = SourceFragment{
     .name = "test-only",
@@ -120,7 +136,7 @@ const multiline =
 
     def test_secondary_metal_program_is_device_source(self):
         primary = 'static NSString *termite_metal_shader_source(void) {\n    return @"primary";\n}'
-        secondary = 'static NSString *termite_metal_deberta_training_attention_v1_source(void) {\n    return @"training";\n}'
+        secondary = 'static NSString *termite_metal_relative_attention_training_source(void) {\n    return @"training";\n}'
         source = 'before\n' + primary + '\nbetween\n' + secondary + '\nafter\n'
         device, host = accounting.shader(source)
         self.assertEqual(device, primary + secondary)

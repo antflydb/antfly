@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-extern "C" __global__ void florence_token_depthwise_residual(
+extern "C" __global__ void antfly_depthwise_3x3_residual_f32(
     float* out, const float* input, const float* weight, const float* bias,
     unsigned count, unsigned height, unsigned width, unsigned channels) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -41,43 +41,20 @@ extern "C" __global__ void florence_token_depthwise_residual(
 
 #include <cuda_fp16.h>
 #include <math.h>
-// FP32 statistics and affine arithmetic shared by ordinary and window rows.
-// Preserve the 128/64/32 merge tree, then the 16/8/4/2/1 lane tree.
-// Destination selects publication layout without changing the source row.
+#include "../kernels/row_program.cuh"
+// Row addressing is owned by the ordinary/window entrypoint. Statistics and
+// conversion use the shared fixed-256, warp-finish LayerNorm schedule.
 #define ANTFLY_F16_ROW_NORM(Destination) \
-const unsigned tid = threadIdx.x; \
 __shared__ float sums[256], sumsq[256]; \
-float sum = 0.f, square = 0.f; \
-for (unsigned i = tid; i < dim; i += 256) { \
-    const float x = input[base+i]; \
-    sum += x; \
-    square += x*x; \
-} \
-sums[tid] = sum; sumsq[tid] = square; \
-__syncthreads(); \
-if (tid < 32) { \
-    float sum = ((sums[tid]+sums[tid+128])+(sums[tid+64]+sums[tid+192])) + \
-                 ((sums[tid+32]+sums[tid+160])+(sums[tid+96]+sums[tid+224])); \
-    float square = ((sumsq[tid]+sumsq[tid+128])+(sumsq[tid+64]+sumsq[tid+192])) + \
-                 ((sumsq[tid+32]+sumsq[tid+160])+(sumsq[tid+96]+sumsq[tid+224])); \
-    for (unsigned distance=16;distance;distance>>=1) { \
-        sum += __shfl_down_sync(0xffffffffu,sum,distance); \
-        square += __shfl_down_sync(0xffffffffu,square,distance); \
-    } \
-    if (tid == 0) { sums[0]=sum; sumsq[0]=square; } \
-} \
-__syncthreads(); \
-const float mean = sums[0] / (float)dim; \
-const float var = fmaxf(sumsq[0] / (float)dim - mean*mean, 0.f); \
-const float inv = rsqrtf(var+eps); \
-for (unsigned i = tid; i < dim; i += 256) { \
-    const float value = (input[base+i]-mean)*inv*gamma[i]+beta[i]; \
-    out[Destination+i] = __float2half_rn(value); \
-}
+antfly_row_layer_norm<256,true>(dim,eps,sums,sumsq, \
+    [&](unsigned i){return input[base+i];}, \
+    [&](unsigned i,float x,float mean,float inverse){ \
+        out[Destination+i]=__float2half_rn((x-mean)*inverse*gamma[i]+beta[i]); \
+    });
 
 // Same reduction tree and FP32 expression as termite_layer_norm_f32;
 // only the final storage cast changes (the next GEMM already consumes FP16).
-extern "C" __global__ void florence_layer_norm_f16(
+extern "C" __global__ void antfly_layer_norm_warp_finish_f16(
     __half* out, const float* input, const float* gamma, const float* beta,
     unsigned rows, unsigned dim, float eps) {
     const unsigned row = blockIdx.x;
@@ -163,7 +140,7 @@ extern "C" __global__ void florence_cross_q1_f32(
     }
 }
 
-extern "C" __global__ void florence_window_norm_f16(
+extern "C" __global__ void antfly_window_layer_norm_warp_finish_f16(
     __half* out, const float* input, const float* gamma, const float* beta,
     unsigned rows, unsigned dim, float eps, unsigned height, unsigned width, unsigned window) {
     const unsigned row = blockIdx.x;

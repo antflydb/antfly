@@ -20,7 +20,7 @@ const driver = @import("driver.zig");
 const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("lighton_activation.ptx") ++ "\x00", .{
     .silu_product_f32 = "lighton_silu_up_bf16",
     .packed_silu_product_f32 = "lighton_packed_silu_up_bf16",
-    .rms_f32 = "lighton_rms_input_bf16",
+    .rms_f32 = "antfly_rms_tree_bf16",
     .silu_product_bf16 = "lighton_silu_up_bf16_inputs",
     .residual_f32 = "lighton_bf16_residual_f32",
 });

@@ -18,6 +18,8 @@
 import argparse
 from pathlib import Path
 
+from native_source_closure import expand_native_source
+
 
 def extract(source, header):
     start = source.index(header)
@@ -55,10 +57,7 @@ def main():
     # the unfused native reference wrapper keeps its real template dependency.
     kernel_dir = args.reference.parent.parent / "kernels"
     abi = (kernel_dir / "kernel_abi.cuh").read_text()
-    row_program = (kernel_dir / "row_program.cuh").read_text()
-    prototype = args.prototype.read_text().replace(
-        '#include "../kernels/row_program.cuh"', row_program
-    )
+    prototype = expand_native_source(args.prototype)
     args.output.write_text(abi + "\n" + prototype + "\n\n" + functions + "\n")
 
 

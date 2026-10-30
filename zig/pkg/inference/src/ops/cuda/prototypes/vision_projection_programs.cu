@@ -1,3 +1,4 @@
+#include "../kernels/rotary_program.cuh"
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -52,7 +53,7 @@ extern "C" __global__ void lighton_vision_bias_residual_f32(
     out[i] = __fadd_rn(residual[i], biased);
 }
 
-extern "C" __global__ void lighton_vision_qkv_rope_bf16(
+extern "C" __global__ void antfly_qkv_rope_two_axis_bf16(
     unsigned short* q, unsigned short* k, unsigned short* v,
     const float* packed, const unsigned* positions,
     unsigned rows, unsigned heads, unsigned dim, float theta) {
@@ -64,8 +65,8 @@ extern "C" __global__ void lighton_vision_qkv_rope_bf16(
     const unsigned token = chunk / heads, head = chunk % heads;
     const unsigned width = heads * dim;
     const unsigned axis_pairs = half / 2;
-    const unsigned axis = pair < axis_pairs ? 0u : 1u;
-    const unsigned local_pair = pair % axis_pairs;
+    const auto rotary=antfly_rotary_pair_indices<false,true>(pair,axis_pairs);
+    const unsigned axis=rotary.axis,local_pair=rotary.local;
     const unsigned position = positions[axis * rows + token];
     const float exponent = (2.f * (float)local_pair) / (float)(dim / 2u);
     const float frequency = 1.f / powf(theta, exponent);
@@ -75,10 +76,10 @@ extern "C" __global__ void lighton_vision_qkv_rope_bf16(
     const unsigned dst = chunk * dim + pair;
     const float ql = packed[src], qr = packed[src + half];
     const float kl = packed[src + width], kr = packed[src + width + half];
-    q[dst] = lighton_bf16_rne(ql * c - qr * s);
-    q[dst + half] = lighton_bf16_rne(ql * s + qr * c);
-    k[dst] = lighton_bf16_rne(kl * c - kr * s);
-    k[dst + half] = lighton_bf16_rne(kl * s + kr * c);
+    q[dst] = lighton_bf16_rne(antfly_rotary_component(ql,qr,c,s,false));
+    q[dst + half] = lighton_bf16_rne(antfly_rotary_component(ql,qr,c,s,true));
+    k[dst] = lighton_bf16_rne(antfly_rotary_component(kl,kr,c,s,false));
+    k[dst + half] = lighton_bf16_rne(antfly_rotary_component(kl,kr,c,s,true));
     v[dst] = lighton_bf16_rne(packed[src + 2 * width]);
     v[dst + half] = lighton_bf16_rne(packed[src + 2 * width + half]);
 }

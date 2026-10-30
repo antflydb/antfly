@@ -140,6 +140,8 @@ pub const QuantizedStorage = struct {
     raw_bytes: []const u8,
     shape: []const i64,
     source_name: ?[]u8 = null,
+    /// Operation workload supplied by the model adapter; independent of kernel names.
+    dense_workload: ?@import("../ops/dense_projection_policy.zig").Workload = null,
     packed_expert: ?PackedExpertView = null,
     raw_owned: bool = true,
     /// The raw bytes are borrowed from a stable mmap-backed region. This is

@@ -8665,7 +8665,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// require disjoint ranges; the segment kernels do not).
     fn segmentAttentionOnDevice(self: *MetalCompute, qkv_ct: CT, control_ct: CT, d_out_ct: ?CT, attrs: @import("ml").graph.SegmentTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) !?CT {
         const segment = @import("segment_training_attention.zig");
-        const modernbert = @import("modernbert_training_attention.zig");
+        const modernbert = @import("range_attention_reference.zig");
         // The device kernels hold one head row per 128-lane threadgroup.
         if (!self.provider_impl.hasDecoderRuntime() or attrs.head_dim > 128) return null;
         const storage = toBuf(control_ct).resident_index_storage orelse return null;
@@ -8738,7 +8738,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (control) |active| try active.check();
         const control_buf = toBuf(control_ct);
         const storage = control_buf.resident_index_storage orelse return error.UnsupportedResidentTrainingIndexProof;
-        _ = try @import("modernbert_training_attention.zig").validateControl(attrs, storage.values);
+        _ = try @import("range_attention_reference.zig").validateControl(attrs, storage.values);
         const control_tensor = control_buf.metal_tensor orelse return error.ResidentTrainingRequiresDeviceTensor;
         const output = try metal_runtime.decoderRuntimeModernBertTrainingAttentionV1Device(self.provider_impl, qkv, control_tensor, d_out, attrs, control, dropout_probability, dropout_seed);
         return self.boundaryOwnedTensor(output);

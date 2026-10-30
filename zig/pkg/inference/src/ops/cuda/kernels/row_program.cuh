@@ -80,9 +80,36 @@ __device__ __forceinline__ float antfly_row_rms_tree_inverse(
     return rsqrtf(partial[0] / (float)width + eps);
 }
 
+// The fixed 256-thread tree may finish its final five stages in warp 0.
+// This is the same association as the original expanded vision row program.
+template<unsigned Planes> __device__ __forceinline__ void antfly_row_warp_finish_256(
+    float (&values)[Planes],float*const (&partials)[Planes]) {
+    const unsigned tid=threadIdx.x;
+    #pragma unroll
+    for(unsigned p=0;p<Planes;++p)partials[p][tid]=values[p];
+    __syncthreads();
+    if(tid<32){
+        #pragma unroll
+        for(unsigned p=0;p<Planes;++p){
+            float* v=partials[p];
+            values[p]=((v[tid]+v[tid+128])+(v[tid+64]+v[tid+192]))+
+                      ((v[tid+32]+v[tid+160])+(v[tid+96]+v[tid+224]));
+        }
+        for(unsigned step=16;step;step>>=1){
+            #pragma unroll
+            for(unsigned p=0;p<Planes;++p)values[p]+=__shfl_down_sync(0xffffffffu,values[p],step);
+        }
+        if(tid==0){
+            #pragma unroll
+            for(unsigned p=0;p<Planes;++p)partials[p][0]=values[p];
+        }
+    }
+    __syncthreads();
+}
+
 // Shared-tree LayerNorm policy, preserving fixed-256 and dynamic-block trees.
 // Load owns any residual add; Store owns affine arithmetic and final conversion.
-template<unsigned FixedThreads = 0, typename Load, typename Store>
+template<unsigned FixedThreads = 0, bool WarpFinish256 = false, typename Load, typename Store>
 __device__ __forceinline__ void antfly_row_layer_norm(
     unsigned width, float eps, float* sums, float* squares, Load load, Store store) {
     const unsigned tid = threadIdx.x;
@@ -92,7 +119,9 @@ __device__ __forceinline__ void antfly_row_layer_norm(
         float x = load(i); sum += x; square += x * x;
     }
     float values[] = {sum, square}; float* const planes[] = {sums, squares};
-    antfly_row_tree_statistics(values, planes, threads);
+    static_assert(!WarpFinish256 || FixedThreads==256,"warp finish requires 256 threads");
+    if constexpr(WarpFinish256)antfly_row_warp_finish_256(values,planes);
+    else antfly_row_tree_statistics(values, planes, threads);
     const float mean = sums[0] / (float)width;
     const float variance = fmaxf(squares[0] / (float)width - mean * mean, 0.0f);
     const float inverse = rsqrtf(variance + eps);

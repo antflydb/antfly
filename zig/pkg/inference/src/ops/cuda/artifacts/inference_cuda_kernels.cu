@@ -18,7 +18,7 @@
 #include <mma.h>
 #include <stdint.h>
 #include "../../../graph/templates/cuda_q4_0_bf16_staged.cuh"
-#include "../kernels/embedding_gemma2.cuh"
+#include "../kernels/encoder_multimodal_programs.cuh"
 #include "../kernels/kernel_abi.cuh"
 
 using namespace nvcuda;
@@ -13585,7 +13585,7 @@ extern "C" __global__ void termite_deberta_attention_stream_f16(ANTFLY_CUDA_DEBE
 
 extern "C" __global__ __launch_bounds__(256) void termite_deberta_attention_tc_f16_m16n32(ANTFLY_CUDA_DEBERTA_ATTENTION_PARAMS) {
     constexpr unsigned int QueryTile = 16u, KeyTile = 32u;
-#include "../kernels/deberta_tc_tiles.cuh"
+#include "../kernels/relative_attention_tensor_tiles.cuh"
 }
 
 // Larger-query generated tensor-core DeBERTa prefill schedule.  The M16xN32
@@ -13596,7 +13596,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_deberta_attention_tc_f
 // occupancy or shared-memory carveout API special case on SM80+.
 extern "C" __global__ __launch_bounds__(256) void termite_deberta_attention_tc_f16_m32n16(ANTFLY_CUDA_DEBERTA_ATTENTION_PARAMS) {
     constexpr unsigned int QueryTile = 32u, KeyTile = 16u;
-#include "../kernels/deberta_tc_tiles.cuh"
+#include "../kernels/relative_attention_tensor_tiles.cuh"
 }
 
 // Pack graph-layout [B, S, H, D] tensors into the head-major layout consumed
@@ -14828,11 +14828,11 @@ extern "C" __global__ void antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1(
 }
 // quant-kernel-codegen:end generated CUDA runtime-wired dev matmul candidates
 
-#include "../kernels/gliner25_boundary.cuh"
+#include "../kernels/ragged_boundary_programs.cuh"
 #include "../kernels/training_validation.cuh"
 #include "../kernels/training_welford_layer_norm.cuh"
 #include "../kernels/training_row_softmax.cuh"
-#include "../kernels/gliner25_attention.cuh"
+#include "../kernels/relative_attention_training.cuh"
 
 // Laya inference kernels. Keep outside compiler-owned generated regions.
 extern "C" __global__ void termite_laya_local_attention_f32(
@@ -15571,7 +15571,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
 
 extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16_m64(ANTFLY_CUDA_GLINER_BOUNDARY_PARAMS) {
     constexpr bool Compact = false;
-#include "../kernels/gliner_boundary_m64.cuh"
+#include "../kernels/relative_attention_tensor_rows64.cuh"
 }
 
 // Long-sequence direct attention. Adjacent equal relative buckets share one
@@ -15580,10 +15580,10 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attent
 // the wider tile's arithmetic. No global cache or additional workspace.
 extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16_compact(ANTFLY_CUDA_GLINER_BOUNDARY_PARAMS) {
     constexpr bool Compact = true;
-#include "../kernels/gliner_boundary_m64.cuh"
+#include "../kernels/relative_attention_tensor_rows64.cuh"
 }
 
 // Native Attention Matching repeat-only kernels; host dispatch is opt-in.
 #include "../../../graph/templates/cuda_gqa_repeat_split_f16.cuh"
 // Append inference-only kernels so existing kernel numbering stays stable.
-#include "../kernels/embedding_gemma2_optimized.cuh"
+#include "../kernels/encoder_fused_programs.cuh"

@@ -206,8 +206,8 @@ const native_source_files = [_]struct { path: []const u8, owners: []const Native
     .{ .path = "src/ops/cuda/artifacts/inference_cuda_kernels.cu", .owners = &cuda_runtime_source_owners },
     .{ .path = "src/ops/native_compute.zig", .owners = &cpu_source_owners },
     .{ .path = "src/backends/metal_kernels.m", .owners = &metal_source_owners },
-    .{ .path = "src/ops/cuda/kernels/gliner25_boundary.cuh", .owners = &cuda_boundary_source_owners },
-    .{ .path = "src/ops/cuda/kernels/gliner25_attention.cuh", .owners = &cuda_training_source_owners },
+    .{ .path = "src/ops/cuda/kernels/ragged_boundary_programs.cuh", .owners = &cuda_boundary_source_owners },
+    .{ .path = "src/ops/cuda/kernels/relative_attention_training.cuh", .owners = &cuda_training_source_owners },
 };
 fn nativeOwnedRegionCount() usize {
     var count: usize = 0;

@@ -1,3 +1,4 @@
+#include "rotary_program.cuh"
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -150,11 +151,12 @@ extern "C" __global__ void termite_embedding_gemma2_packed_heads_bf16(
     for (unsigned d = tid; d < dim; d += blockDim.x) {
         if (!rotate) { dst[d] = normalized[d]; continue; }
         if (vision) {
-            unsigned local = d % 32u, pair = local % 16u, first = d - local;
-            float angle = (float)positions[((size_t)row * q_heads + head) * 2u + d / 32u] * (1.0f / powf(theta, (2.0f * pair) / 32.0f));
+            const auto rotary=antfly_rotary_pair_indices<true,false>((d/32u)*16u+d%16u,16u);
+            unsigned local=d%32u,pair=rotary.local,first=rotary.lo-pair;
+            float angle = (float)positions[((size_t)row * q_heads + head) * 2u + rotary.axis] * (1.0f / powf(theta, (2.0f * pair) / 32.0f));
             float sn = sinf(angle), cs = cosf(angle);
             float lo = __bfloat162float(normalized[first+pair]), hi = __bfloat162float(normalized[first+16u+pair]);
-            float x = local < 16u ? lo * cs - hi * sn : lo * sn + hi * cs;
+            float x = antfly_rotary_component(lo,hi,cs,sn,local>=16u);
             dst[d] = __float2bfloat16_rn(kind == 0u ? x * q_scale : x);
         } else {
             unsigned half = dim / 2u, pair = d % half;
@@ -162,9 +164,7 @@ extern "C" __global__ void termite_embedding_gemma2_packed_heads_bf16(
             float sn, cs; sincosf(angle, &sn, &cs);
             float s = __bfloat162float(__float2bfloat16_rn(sn)), c = __bfloat162float(__float2bfloat16_rn(cs));
             float lo = __bfloat162float(normalized[pair]), hi = __bfloat162float(normalized[pair+half]);
-            __nv_bfloat16 a = __float2bfloat16_rn((d < half ? lo : hi) * c);
-            __nv_bfloat16 b = __float2bfloat16_rn((d < half ? -hi : lo) * s);
-            dst[d] = __float2bfloat16_rn(__bfloat162float(a) + __bfloat162float(b));
+            dst[d] = __float2bfloat16_rn(antfly_rotary_component<antfly_rotary_products::bf16>(lo,hi,c,s,d>=half));
         }
     }
 }

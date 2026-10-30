@@ -7778,7 +7778,7 @@ pub fn decoderRuntimeFlorenceChannelAttentionF32Device(
     return finishDeviceOutput(&output_device, rc);
 }
 
-const modernbert_training_attention = @import("../ops/modernbert_training_attention.zig");
+const modernbert_training_attention = @import("../ops/range_attention_reference.zig");
 
 /// POD ABI mirrored in metal_kernels.m and its MSL source.
 const ModernBertTrainingAttentionParams = extern struct {
@@ -7861,7 +7861,7 @@ pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
         .dropout_seed = dropout_seed,
     };
     const flash_eligible = modernBertFlashTrainingAttentionEligible(attrs.head_dim);
-    const rc = if (flash_eligible) termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
+    const rc = if (flash_eligible) termite_metal_decode_runtime_segment_training_attention_flash_v1(
         runtime,
         qkv.deviceHandle(),
         qkv.deviceByteOffset(),
@@ -7874,7 +7874,7 @@ pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
         storage.deviceHandle(),
         storage.deviceByteOffset() + output_bytes,
         &params,
-    ) else termite_metal_decode_runtime_modernbert_training_attention_v1(
+    ) else termite_metal_decode_runtime_segment_training_attention_v1(
         runtime,
         qkv.deviceHandle(),
         qkv.deviceByteOffset(),
@@ -20410,7 +20410,7 @@ pub extern fn termite_metal_decode_runtime_apply_rope_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
-pub extern fn termite_metal_decode_runtime_modernbert_training_attention_v1(
+pub extern fn termite_metal_decode_runtime_segment_training_attention_v1(
     runtime: ?*RawMetalDecodeRuntime,
     qkv_handle: ?*anyopaque,
     qkv_offset: usize,
@@ -20424,7 +20424,7 @@ pub extern fn termite_metal_decode_runtime_modernbert_training_attention_v1(
     scratch_offset: usize,
     params: *const ModernBertTrainingAttentionParams,
 ) c_int;
-pub extern fn termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
+pub extern fn termite_metal_decode_runtime_segment_training_attention_flash_v1(
     runtime: ?*RawMetalDecodeRuntime,
     qkv_handle: ?*anyopaque,
     qkv_offset: usize,

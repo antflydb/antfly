@@ -53,9 +53,9 @@
     X(q8_1_cpy_f32_to_q_pipeline, @"termite_q8_1_cpy_f32_to_q", library, 39, 39, Q8_1) \
     X(rope_pipeline, @"termite_apply_rope", precise_library, 40, 40, ALWAYS) \
     X(mrope_pipeline, @"termite_apply_mrope", precise_library, 41, 41, ALWAYS) \
-    X(qwen35_conv_pipeline, @"termite_qwen35_conv", precise_library, 42, 42, ALWAYS) \
-    X(qwen35_prefill_conv_vec4_pipeline, @"termite_qwen35_prefill_conv_vec4", precise_library, 43, 43, ALWAYS) \
-    X(qwen35_history_pipeline, @"termite_qwen35_history", precise_library, 44, 44, ALWAYS) \
+    X(qwen35_conv_pipeline, @"antfly_gdn_causal_conv_f32", precise_library, 42, 42, ALWAYS) \
+    X(qwen35_prefill_conv_vec4_pipeline, @"antfly_gdn_causal_conv_vec4_f32", precise_library, 43, 43, ALWAYS) \
+    X(qwen35_history_pipeline, @"antfly_causal_history_f32", precise_library, 44, 44, ALWAYS) \
     X(qwen35_prepare_pipeline, @"termite_qwen35_prepare", precise_library, 45, 45, ALWAYS) \
     X(qwen35_recurrent_pipeline, @"termite_qwen35_recurrent", precise_library, 46, 46, ALWAYS) \
     X(qwen35_recurrent_columns4_pipeline, @"termite_qwen35_recurrent_columns4", precise_library, 47, 47, ALWAYS) \
@@ -150,12 +150,12 @@
     X(masked_mean_batch_pipeline, @"antfly_masked_mean_batch", precise_library, 117, 121, ALWAYS) \
     X(compose_rows_pipeline, @"antfly_compose_rows", precise_library, 118, 122, ALWAYS) \
     X(normalize_embedding_pipeline, @"termite_normalize_embedding", precise_library, 119, 123, ALWAYS) \
-    X(modernbert_training_attention_forward_pipeline, @"termite_modernbert_training_attention_forward", precise_library, 126, 130, ALWAYS) \
-    X(modernbert_training_attention_dq_pipeline, @"termite_modernbert_training_attention_dq", precise_library, 127, 131, ALWAYS) \
-    X(modernbert_training_attention_dkdv_pipeline, @"termite_modernbert_training_attention_dkdv", precise_library, 128, 132, ALWAYS) \
-    X(modernbert_training_attention_flash_forward_pipeline, @"termite_modernbert_training_attention_flash_forward", precise_library, 129, 133, ALWAYS) \
-    X(modernbert_training_attention_flash_dq_pipeline, @"termite_modernbert_training_attention_flash_dq", precise_library, 130, 134, ALWAYS) \
-    X(modernbert_training_attention_flash_dkdv_pipeline, @"termite_modernbert_training_attention_flash_dkdv", precise_library, 131, 135, ALWAYS) \
+    X(segment_training_attention_forward_pipeline, @"antfly_segment_training_attention_forward", precise_library, 126, 130, ALWAYS) \
+    X(segment_training_attention_dq_pipeline, @"antfly_segment_training_attention_dq", precise_library, 127, 131, ALWAYS) \
+    X(segment_training_attention_dkdv_pipeline, @"antfly_segment_training_attention_dkdv", precise_library, 128, 132, ALWAYS) \
+    X(segment_training_attention_flash_forward_pipeline, @"antfly_segment_training_attention_flash_forward", precise_library, 129, 133, ALWAYS) \
+    X(segment_training_attention_flash_dq_pipeline, @"antfly_segment_training_attention_flash_dq", precise_library, 130, 134, ALWAYS) \
+    X(segment_training_attention_flash_dkdv_pipeline, @"antfly_segment_training_attention_flash_dkdv", precise_library, 131, 135, ALWAYS) \
     X(sdpa_f32_florence_window_hd32_pipeline, @"termite_sdpa_f32_florence_window_hd32", precise_library, 132, 136, ALWAYS) \
     X(sdpa_f32_florence_window_parallel_pipeline, @"termite_sdpa_f32_florence_window_parallel", precise_library, 133, 137, ALWAYS) \
     X(florence_window_pack_f32_pipeline, @"termite_florence_window_pack_f32", precise_library, 134, 138, ALWAYS) \
@@ -346,7 +346,7 @@
     X(audio_fft512_pipeline, @"antfly_audio_fft512", precise_library, 289, 283, ALWAYS) \
     X(gemma4_audio_clamp_pipeline, @"termite_gemma4_audio_clamp", library, 293, 284, ALWAYS) \
     X(gemma4_audio_glu_pipeline, @"termite_gemma4_audio_glu_rows", precise_library, 294, 285, ALWAYS) \
-    X(gemma4_audio_dwconv_pipeline, @"termite_gemma4_audio_dwconv_causal", library, 295, 286, ALWAYS) \
+    X(gemma4_audio_dwconv_pipeline, @"antfly_causal_depthwise_segmented_f32", library, 295, 286, ALWAYS) \
     X(gemma4_audio_flatten_pipeline, @"termite_gemma4_audio_flatten_ctf", library, 296, 287, ALWAYS) \
     X(gemma4_audio_channel_norm_pipeline, @"termite_gemma4_audio_channel_norm_relu", precise_library, 297, 288, ALWAYS) \
     X(gemma4_audio_attention_pipeline, @"termite_gemma4_audio_local_attention", precise_library, 298, 289, ALWAYS) \

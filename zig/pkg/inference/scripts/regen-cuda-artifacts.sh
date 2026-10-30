@@ -219,7 +219,7 @@ required_symbols=(
   termite_gemma4_audio_local_attention_f32
   termite_gemma4_audio_clamp_f32
   termite_gemma4_audio_glu_rows_f32
-  termite_gemma4_audio_depthwise_causal_conv1d_f32
+  termite_causal_depthwise_f32
   termite_embedding_gemma2_rms_norm_bf16
   termite_embedding_gemma2_training_rms_norm_bf16
   termite_embedding_gemma2_rms_norm_input_vjp_f32

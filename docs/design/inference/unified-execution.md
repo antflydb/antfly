@@ -3433,3 +3433,7 @@ instruction comparisons, device/model qualification and retained timing misses.
 
 [BA: shared recurrent, audio, BF16 projection and training row programs](unified-execution-ba-outcomes.md)
 records the next model-family consolidation and native device qualification.
+
+[BB: operation-based native program owners](unified-execution-bb-outcomes.md)
+records MPP/backward score sharing, portable causal stencils, rotary and row
+policies, typed CPU admission, and the [kernel authoring guide](kernel-authoring.md).

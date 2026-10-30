@@ -2752,7 +2752,7 @@ pub const ComputeBackend = struct {
 
         /// ModernBERT training attention over packed [Q;K;V] with an i32
         /// range/position control; linear storage, replayed backward
-        /// returning packed [dQ;dK;dV]. See ops/modernbert_training_attention.zig.
+        /// returning packed [dQ;dK;dV]. See ops/range_attention_reference.zig.
         modernBertTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
         modernBertTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
 
