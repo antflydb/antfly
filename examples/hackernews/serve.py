@@ -257,9 +257,9 @@ class Gateway(BaseHTTPRequestHandler):
                 (Path(__file__).parent / "web" / filename).read_bytes(),
                 content_type,
             )
-        if path == "/healthz":
+        if path in ("/health", "/healthz"):
             return self.respond(200, {"ok": True})
-        if path == "/readyz":
+        if path in ("/ready", "/readyz"):
             lock = getattr(self.server, "ready_lock", None)
             if lock is None:
                 ready = self.check_readiness()

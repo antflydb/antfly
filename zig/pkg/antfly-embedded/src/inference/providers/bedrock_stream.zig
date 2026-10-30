@@ -18,6 +18,7 @@
 //! buffering. EOF is successful only after an explicit native message stop.
 const std = @import("std");
 const inference = @import("antfly_inference_types");
+const api = @import("bedrock_api");
 const Json = std.json.Value;
 
 pub const Decoder = struct {
@@ -129,6 +130,9 @@ pub const Decoder = struct {
         defer arena.deinit();
         const parsed = std.json.parseFromSliceLeaky(Json, arena.allocator(), frame[12 + header_length .. frame.len - 4], .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceResponse;
         const value = if (parsed == .object) parsed.object.get(tag) orelse parsed else return error.InvalidInferenceResponse;
+        var envelope: Json = .{ .object = .empty };
+        try envelope.object.put(arena.allocator(), tag, value);
+        _ = std.json.parseFromValueLeaky(api.ConverseStreamOutput, arena.allocator(), envelope, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceResponse;
         if (std.mem.eql(u8, tag, "messageStart")) {
             if (self.role_seen or self.stopped or !std.mem.eql(u8, try string(try get(value, "role")), "assistant")) return error.InvalidInferenceResponse;
             self.role_seen = true;
@@ -149,7 +153,7 @@ pub const Decoder = struct {
             if (!self.role_seen or self.stopped) return error.InvalidInferenceResponse;
             const index = try blockIndex(value);
             const content = try get(value, "delta");
-            if (content != .object) return error.InvalidInferenceResponse;
+            if (content != .object or content.object.count() != 1) return error.InvalidInferenceResponse;
             if (self.blocks.get(index)) |block| if (block.closed) return error.InvalidInferenceResponse;
             if (content.object.get("text")) |part| {
                 if (self.blocks.get(index)) |block| if (block.tool_index != null) return error.InvalidInferenceResponse;
