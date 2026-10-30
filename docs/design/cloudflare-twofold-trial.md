@@ -1,6 +1,12 @@
 # Next disposable latency rehearsal
 
-The proposed pair uses the previously approved corrected control `c44896ac8c`
+Status: the original candidate closure below is preserved, pending replacement
+by the conservative warm-read policy in `e8591354d3`. Local traces exposed a
+short-tail prefetch regression in the original candidate. Do not deploy that
+closure; qualify the revised modules locally, re-seal the candidate, and update
+these hashes first. The resource names and disposable-token scope stay the same.
+
+The originally prepared pair uses the previously approved corrected control `c44896ac8c`
 and candidate production source `edd57e464c`. This is a short diagnostic
 rehearsal with the original offered workload, exact-body/receipt checks,
 independent whole-window evidence, and unchanged qualification thresholds.
