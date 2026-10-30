@@ -1289,7 +1289,7 @@ pub const GraphIndexes = struct {
         return try db.core.index_manager.runGraphMetricPlannedWorkerPageStepAt(index_name, metric_name, worker_id, now_ms);
     }
 
-    fn runMetricPlannedCoordinatorStep(self: *GraphIndexes, index_name: []const u8, metric_name: []const u8) !db_mod.graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+    pub fn runMetricPlannedCoordinatorStep(self: *GraphIndexes, index_name: []const u8, metric_name: []const u8) !db_mod.graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
         const db = self.dbPtr();
         if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
         db_mod.lockApply(db);
