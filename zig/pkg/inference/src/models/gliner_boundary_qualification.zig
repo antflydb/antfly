@@ -1307,9 +1307,20 @@ test "boundary qualification Transformers wrapper has exactly the original fp32 
     for (publishedProfiles()) |entry| {
         if (!equalIdentity(entry.identity, fastino_gliner25_base_v1)) continue;
         try require(identity, entry.backend, entry.features, entry.lengths);
+        var expected = entry;
+        expected.identity = identity;
+        const mirrored = for (publishedProfiles()) |candidate| {
+            if (std.meta.eql(expected, candidate)) break true;
+        } else false;
+        try std.testing.expect(mirrored);
         count += 1;
     }
-    try std.testing.expectEqual(@as(usize, 8), count);
+    var wrapper_count: usize = 0;
+    for (publishedProfiles()) |entry| {
+        if (equalIdentity(entry.identity, identity)) wrapper_count += 1;
+    }
+    try std.testing.expect(count > 0);
+    try std.testing.expectEqual(count, wrapper_count);
     for (0..4) |index| {
         var changed = identity;
         changed.sidecars[index].sha256[0] = 'f';
