@@ -710,7 +710,12 @@ pub const Cursor = struct {
                 while (next_column < self.columns.len and ((required_only and !self.columns[next_column].required) or self.columns[next_column].first + self.columns[next_column].count > self.position)) next_column += 1;
                 if (next_column == self.columns.len) break;
                 const column = &self.columns[next_column];
-                future.* = @import("../../sql/parallel_scheduler.zig").global().submit(io.?, self.limits.max_input_bytes +| self.limits.max_decoded_bytes, decode, .{ self.*, column, self.admission.backing.allocator() }) orelse {
+                // This remains a fan-out estimate, not a column allocation
+                // limit. Shared live admission above bounds the actual cohort;
+                // charging its entire quota per task would serialize ordinary
+                // wide scans even when every physical page is small.
+                const workspace = (self.limits.max_input_bytes +| self.limits.max_decoded_bytes) / @max(@as(usize, 1), self.columns.len);
+                future.* = @import("../../sql/parallel_scheduler.zig").global().submit(io.?, workspace, decode, .{ self.*, column, self.admission.backing.allocator() }) orelse {
                     const stats = try decode(self.*, column, self.admission.backing.allocator());
                     self.pages_decoded += stats.pages;
                     self.dictionary_decodes += stats.dictionaries;

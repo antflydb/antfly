@@ -147,6 +147,10 @@ if mode == "statistics":
             "profile": True,
         },
     }
+if mode == "wide":
+    queries["physical_sql_scan"] = {
+        "statement": f"SELECT {','.join(columns)} FROM {bench.TABLE} ORDER BY id"
+    }
 config = harness._write_remote_content_e2e_config(out)
 cfg = json.loads(config.read_text())
 cfg.setdefault("lake_indexes", {}).setdefault("text_cache", {}).update(
@@ -177,15 +181,53 @@ with bench.managed_server(
         client.ready(bench.readiness_indexes({"definition": definition}))
         publication_ns = time.perf_counter_ns() - started
         for request in queries.values():
-            client.query({"request": request})
+            client.query(request if "statement" in request else {"request": request})
         for sample in range(7):
             names = list(queries)
             if sample % 2:
                 names.reverse()
             for name in names:
                 started = time.perf_counter_ns()
-                response = client.query({"request": queries[name]})
+                request = queries[name]
+                response = client.query(
+                    request if "statement" in request else {"request": request}
+                )
                 elapsed = time.perf_counter_ns() - started
+                if "statement" in request:
+                    expected = [
+                        [
+                            str(values[i]) if isinstance(values[i], int) else values[i]
+                            for values in columns.values()
+                        ]
+                        for i in range(count)
+                    ]
+                    assert response["rows"] == expected
+                    assert [column["name"] for column in response["columns"]] == list(
+                        columns
+                    )
+                    complete = {
+                        key: response[key]
+                        for key in ("columns", "rows", "command_tag", "rows_affected")
+                    }
+                    if "sql_nulls" in response:
+                        complete["sql_nulls"] = response["sql_nulls"]
+                    digest = hashlib.sha256(
+                        json.dumps(
+                            complete, sort_keys=True, separators=(",", ":")
+                        ).encode()
+                    ).hexdigest()
+                    assert oracles.setdefault(name, digest) == digest
+                    samples.append(
+                        {
+                            "sample": sample,
+                            "case": name,
+                            "elapsed_ns": elapsed,
+                            "complete_sha256": digest,
+                            "rows": len(response["rows"]),
+                        }
+                    )
+                    (out / "samples.json").write_text(json.dumps(samples, indent=2))
+                    continue
                 hits = response["hits"]["hits"]
                 assert len(hits) == count
                 ids = []

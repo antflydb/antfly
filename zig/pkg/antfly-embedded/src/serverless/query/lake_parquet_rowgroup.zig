@@ -10757,6 +10757,17 @@ test "external lake Parquet live admission fits unequal pages and fences cached 
         // Failed page advancement is terminal for this cursor; a healthy new
         // request must still reuse the global cache under its own policy.
     }
+    // Raw scalar payload fits, but aggregate vector/arena capacity does not.
+    // Exercise local, cold cached-loader and warm cached-result admission.
+    var cold: serving.Reader = .{ .cache = &cache, .base = reader.base, .scope = @splat(9), .context = .{ .io = std.testing.io } };
+    defer cold.drain(true);
+    for (0..3) |pass| {
+        var bounded = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, names[1..], .{ .max_input_bytes = 512 * 1024, .max_decoded_bytes = 2048, .max_struct_allocation_bytes = 4096 });
+        defer bounded.deinit();
+        if (pass != 0) bounded.shared_reader = if (pass == 1) &cold else &reader;
+        try std.testing.expectError(error.ParquetPageTooLarge, bounded.next());
+        try std.testing.expect(bounded.admission.peak <= 6144);
+    }
     // Result leases remain valid after cursor teardown and own final refunds.
     var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &names, .{});
     cursor.shared_reader = &reader;

@@ -2537,9 +2537,18 @@ def test_unequal_wide_parquet_pages_preserve_typed_sql_across_restart(
                         {"statement": f"SELECT * FROM {bench.TABLE} ORDER BY id"},
                     )
                     assert len(value["rows"]) == 1, value
-                    assert value["rows"][0] == [
-                        str(values[0]) if isinstance(values[0], int) else values[0]
-                        for values in data.values()
-                    ]
+                    actual = dict(
+                        zip(
+                            (column["name"] for column in value["columns"]),
+                            value["rows"][0],
+                            strict=True,
+                        )
+                    )
+                    assert actual == {
+                        name: str(values[0])
+                        if isinstance(values[0], int)
+                        else values[0]
+                        for name, values in data.items()
+                    }
         finally:
             client.session.close()
