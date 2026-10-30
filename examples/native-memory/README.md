@@ -7,6 +7,9 @@ history behind it. The same actions run in-process on an embedded `.aflite`
 file or over HTTP against a server, and MCP clients reach them at
 `/memory/v1/mcp`.
 
+For a step-by-step walkthrough over HTTP and embedded, see
+[Give an Agent Long-Term Memory](../../docs/guides/agent-memory.mdx).
+
 The memory contract is documented in [zig/MEMORY.md](../../zig/MEMORY.md):
 evidence and temporal policy, identity and supersession judging, provenance,
 and recorded explanations.
