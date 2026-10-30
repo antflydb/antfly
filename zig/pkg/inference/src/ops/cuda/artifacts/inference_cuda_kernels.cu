@@ -1931,6 +1931,7 @@ extern "C" __global__ void termite_activation_multiply_fused_gate_up_f32(
     dst[i] = termite_decoder_activation_f32(fused_row[col], activation) * fused_row[f + col];
 }
 
+// tile-codegen:begin reduce.embedding_lookup family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_embedding_lookup_f32(
     float* dst,
     const float* weight,
@@ -2034,6 +2035,7 @@ extern "C" __global__ void termite_embedding_lookup_i32_f16_weight_f32(
     __half value = reinterpret_cast<const __half*>(weight)[(unsigned long long)((unsigned int)id) * dim + col];
     dst[idx] = __half2float(value) * scale;
 }
+// tile-codegen:end reduce.embedding_lookup family
 
 extern "C" __global__ void termite_take_rows_f32(
     float* dst,
@@ -3593,6 +3595,7 @@ __device__ float termite_rope_value(
     return second ? (x0 * s + x1 * c) : (x0 * c - x1 * s);
 }
 
+// tile-codegen:begin reduce.rope family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_rope_f32(
     float* dst,
     const float* input,
@@ -3720,22 +3723,6 @@ extern "C" __global__ void termite_rope_decode_scalars_f32(
     unsigned int position = position_offset + token_pos;
     unsigned int base = chunk * head_dim;
     dst[idx] = termite_rope_value(input, base, d, head_dim, rope_dim, position, theta, freq_scale, consecutive_pairs);
-}
-
-extern "C" __global__ void termite_decode_scalars_advance(
-    unsigned int* decode_scalars,
-    unsigned int position_delta,
-    unsigned int query_position_delta,
-    unsigned int kv_seq_delta,
-    unsigned int total_sequence_delta,
-    unsigned int kv_position_delta
-) {
-    if (blockIdx.x != 0 || threadIdx.x != 0 || decode_scalars == 0) return;
-    decode_scalars[0] += position_delta;
-    decode_scalars[1] += query_position_delta;
-    decode_scalars[2] += kv_seq_delta;
-    decode_scalars[3] += total_sequence_delta;
-    decode_scalars[4] += kv_position_delta;
 }
 
 extern "C" __global__ void termite_rope_scaled_f32(
@@ -3933,6 +3920,23 @@ extern "C" __global__ void termite_rms_norm_heads_rope_decode_scalars_f32(
         }
         dst[base + d] = value * output_scale;
     }
+}
+// tile-codegen:end reduce.rope family
+
+extern "C" __global__ void termite_decode_scalars_advance(
+    unsigned int* decode_scalars,
+    unsigned int position_delta,
+    unsigned int query_position_delta,
+    unsigned int kv_seq_delta,
+    unsigned int total_sequence_delta,
+    unsigned int kv_position_delta
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0 || decode_scalars == 0) return;
+    decode_scalars[0] += position_delta;
+    decode_scalars[1] += query_position_delta;
+    decode_scalars[2] += kv_seq_delta;
+    decode_scalars[3] += total_sequence_delta;
+    decode_scalars[4] += kv_position_delta;
 }
 
 extern "C" __global__ void termite_gqa_attention_f32(

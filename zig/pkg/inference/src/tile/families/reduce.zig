@@ -15,6 +15,12 @@
 
 //! Generated kernel regions of the `reduce` families.
 
-const Region = @import("../region.zig").Region;
+const r = @import("../region.zig");
+const gather = @import("../reduce_gather.zig");
+const rope = @import("../reduce_rope.zig");
 
-pub const regions = [_]Region{};
+pub const regions = [_]r.Region{
+    r.metal("reduce.embedding_lookup", r.metalLines(r.metal_indent, gather.metalRegion())),
+    r.cuda("reduce.embedding_lookup", gather.cudaRegion()),
+    r.cuda("reduce.rope", rope.cudaRegion()),
+};

@@ -14421,6 +14421,8 @@ static NSString *termite_metal_shader_source(void) {
            "    uint position_base = p.position_id * p.hidden_size;\n"
            "    output[gid] = token_embedding[token_base + gid] + position_embedding[position_base + gid];\n"
            "}\n"
+           "static inline float termite_embedding_bf16_to_f32(ushort bits) { return as_type<float>((uint(bits) << 16u)); }\n"
+           // tile-codegen:begin reduce.embedding_lookup family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_embedding_lookup(device const float *weight [[buffer(0)]], device const uint *ids [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_embedding_lookup_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.total * p.dim;\n"
            "    if (gid >= total) return;\n"
@@ -14429,7 +14431,6 @@ static NSString *termite_metal_shader_source(void) {
            "    uint idx = ids[row];\n"
            "    output[gid] = weight[idx * p.dim + col];\n"
            "}\n"
-           "static inline float termite_embedding_bf16_to_f32(ushort bits) { return as_type<float>((uint(bits) << 16u)); }\n"
            "kernel void termite_embedding_lookup_bf16(device const ushort *weight [[buffer(0)]], device const uint *ids [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_embedding_lookup_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.total * p.dim;\n"
            "    if (gid >= total) return;\n"
@@ -14446,6 +14447,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint idx = ids[row];\n"
            "    output[gid] = float(as_type<half>(weight[idx * p.dim + col]));\n"
            "}\n"
+           // tile-codegen:end reduce.embedding_lookup family
            "kernel void termite_apply_rope(device const float *input [[buffer(0)]], device const uint *positions [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_rope_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.total_chunks * p.head_dim;\n"
            "    if (gid >= total) return;\n"
