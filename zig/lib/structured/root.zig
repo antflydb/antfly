@@ -646,8 +646,8 @@ pub fn hostedCapabilities(cfg: anytype) Capabilities {
             for ([_][]const u8{ "llama-3.3-70b-instruct-fp8-fast", "qwen3-30b-a3b-fp8", "mistral-small-3.1-24b-instruct" }) |model| if (std.mem.eql(u8, name, model)) return .{ .tool_call = true, .images = std.mem.startsWith(u8, model, "mistral-small") };
         },
         .gemini, .vertex => if (geminiModel(name)) return .{ .tool_call = true, .images = true },
-        .anthropic => if (claudeModel(name)) return .{ .tool_call = true, .images = true },
-        .bedrock => if (bedrockClaudeModel(name)) return .{ .tool_call = true, .images = true },
+        .anthropic => return claudeCapabilities(name),
+        .bedrock => if (bedrockClaudeName(name)) |claude| return claudeCapabilities(claude),
         else => {},
     }
     return .{};
@@ -747,19 +747,32 @@ fn claudeModel(name: []const u8) bool {
     return tier_seen and major >= 3;
 }
 
+/// A qualified Claude family can support tools while rejecting forced tool
+/// selection. In constrained output, tool_call means the forced-call contract.
+fn claudeCapabilities(name: []const u8) Capabilities {
+    if (!claudeModel(name)) return .{};
+    var forced = true;
+    for ([_][]const u8{ "claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-5-5-opus", "claude-5-5-sonnet", "claude-5-1-fable" }) |family| {
+        if (!std.mem.startsWith(u8, name, family)) continue;
+        const suffix = name[family.len..];
+        if (suffix.len == 0 or (suffix.len == 9 and suffix[0] == '-' and allDigits(suffix[1..]))) forced = false;
+    }
+    return .{ .tool_call = forced, .json_schema = true, .images = true };
+}
+
 fn isClaudeTier(part: []const u8) bool {
     for ([_][]const u8{ "opus", "sonnet", "haiku", "fable" }) |tier| if (std.mem.eql(u8, part, tier)) return true;
     return false;
 }
 
 /// `[region.]anthropic.<claude>[-vN[:N]]`
-fn bedrockClaudeModel(name: []const u8) bool {
+fn bedrockClaudeName(name: []const u8) ?[]const u8 {
     var rest = name;
     for ([_][]const u8{ "us.", "eu.", "apac.", "jp.", "au.", "global." }) |region| if (std.mem.startsWith(u8, rest, region)) {
         rest = rest[region.len..];
         break;
     };
-    if (!std.mem.startsWith(u8, rest, "anthropic.")) return false;
+    if (!std.mem.startsWith(u8, rest, "anthropic.")) return null;
     rest = rest["anthropic.".len..];
     if (std.mem.lastIndexOf(u8, rest, "-v")) |version| {
         const suffix = rest[version + 2 ..];
@@ -767,7 +780,7 @@ fn bedrockClaudeModel(name: []const u8) bool {
         const major = suffix[0 .. colon orelse suffix.len];
         if (allDigits(major) and (colon == null or allDigits(suffix[colon.? + 1 ..]))) rest = rest[0..version];
     }
-    return claudeModel(rest);
+    return if (claudeModel(rest)) rest else null;
 }
 
 test "constrained hosted metadata rejects unqualified task variants and unknown aliases" {
@@ -810,12 +823,12 @@ test "constrained hosted metadata admits qualified families by name grammar" {
     for (admitted) |cfg| {
         const caps = hostedCapabilities(cfg);
         errdefer std.debug.print("expected {s} {s} to be admitted\n", .{ @tagName(cfg.provider), cfg.model });
-        try std.testing.expectEqual(Output.tool_call, try caps.select(.auto, null));
+        try std.testing.expectEqual(if (caps.tool_call) Output.tool_call else Output.json_schema, try caps.select(.auto, null));
         try std.testing.expect(caps.images or std.mem.eql(u8, cfg.model, "o3-mini"));
     }
     try std.testing.expect(hostedCapabilities(Config{ .provider = .openai, .model = "gpt-4o-mini" }).token_logprobs);
     try std.testing.expect(!hostedCapabilities(Config{ .provider = .openai, .model = "gpt-5" }).token_logprobs);
-    try std.testing.expect(!hostedCapabilities(Config{ .provider = .anthropic, .model = "claude-opus-5-5" }).json_schema);
+    try std.testing.expect(hostedCapabilities(Config{ .provider = .anthropic, .model = "claude-opus-5-5" }).json_schema);
     const rejected = [_]Config{
         .{ .provider = .openai, .model = "gpt-5-codex" },
         .{ .provider = .openai, .model = "gpt-5-chat-latest" },
@@ -847,6 +860,9 @@ pub fn validateProviderSchema(cfg: anytype, mode: Output, schema: Json) !void {
     if (cfg.provider == .openai and (mode == .tool_call or mode == .json_schema)) {
         var enums: usize = 0;
         try validateOpenAiSchema(schema, 3, &enums);
+    } else if (isClaudeProvider(cfg)) {
+        if (mode != .tool_call and mode != .json_schema) return error.UnsupportedConstrainedOutput;
+        try validateClaudeSchema(schema);
     }
 }
 fn validateOpenAiSchema(schema: Json, depth: usize, enums: *usize) anyerror!void {
@@ -876,17 +892,84 @@ fn validateOpenAiSchema(schema: Json, depth: usize, enums: *usize) anyerror!void
     if (schema.object.get("items")) |items| try validateOpenAiSchema(items, depth + 1, enums);
     if (schema.object.get("anyOf")) |choices| for (choices.array.items) |child| try validateOpenAiSchema(child, depth + 1, enums);
 }
-/// Array uniqueness stays a mandatory common validation rule. It is omitted
-/// only from OpenAI's narrower wire dialect, which does not expose that keyword.
-/// Typed arrays/enums remain provider constrained and duplicates get one repair.
+/// Project the canonical schema into the provider's grammar subset. Removed
+/// wire constraints remain mandatory in the common validator and repair engine;
+/// provider translation never mutates the original acceptance contract.
 pub fn providerSchema(a: Allocator, cfg: anytype, mode: Output, schema: Json) !Json {
     try validateSchema(schema);
+    if (isClaudeProvider(cfg)) {
+        if (mode != .tool_call and mode != .json_schema) return error.UnsupportedConstrainedOutput;
+        try validateClaudeSchema(schema);
+        return claudeSchema(a, schema);
+    }
     if (cfg.provider != .openai) return schema;
     if (mode != .tool_call and mode != .json_schema) return error.UnsupportedConstrainedOutput;
     var enums: usize = 0;
     try validateOpenAiSchema(schema, 0, &enums);
     return openAiSchema(a, schema);
 }
+fn isClaudeProvider(cfg: anytype) bool {
+    const provider = @tagName(cfg.provider);
+    return std.mem.eql(u8, provider, "anthropic") or std.mem.eql(u8, provider, "bedrock");
+}
+
+/// Strict Claude tools and JSON output share a grammar subset. Open objects
+/// cannot be closed without narrowing the user's contract; reject them before
+/// I/O. Scalar bounds and uniqueness can be relaxed on the wire because the
+/// common validator and repair engine retain the original schema.
+fn validateClaudeSchema(schema: Json) anyerror!void {
+    if (schema.object.contains("oneOf")) return error.UnsupportedConstrainedSchema;
+    if (schema.object.get("enum")) |values| for (values.array.items) |value| switch (value) {
+        .object, .array => return error.UnsupportedConstrainedSchema,
+        else => {},
+    };
+    if (schema.object.get("const")) |value| switch (value) {
+        .object, .array => return error.UnsupportedConstrainedSchema,
+        else => {},
+    };
+    if (schema.object.get("type")) |kind| if (std.mem.eql(u8, kind.string, "object")) {
+        const additional = schema.object.get("additionalProperties") orelse return error.UnsupportedConstrainedSchema;
+        if (additional != .bool or additional.bool) return error.UnsupportedConstrainedSchema;
+    };
+    if (schema.object.get("properties")) |fields| for (fields.object.values()) |child| try validateClaudeSchema(child);
+    if (schema.object.get("items")) |items| try validateClaudeSchema(items);
+    inline for (.{ "anyOf", "allOf" }) |key| if (schema.object.get(key)) |choices| {
+        for (choices.array.items) |child| try validateClaudeSchema(child);
+    };
+}
+
+fn claudeLocalConstraint(key: []const u8, value: Json) bool {
+    for ([_][]const u8{ "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength", "maxItems", "uniqueItems" }) |name| {
+        if (std.mem.eql(u8, key, name)) return true;
+    }
+    return std.mem.eql(u8, key, "minItems") and value.integer > 1;
+}
+
+fn claudeSchema(a: Allocator, schema: Json) anyerror!Json {
+    var copy = object();
+    var local = object();
+    for (schema.object.keys(), schema.object.values()) |key, value| {
+        if (claudeLocalConstraint(key, value)) {
+            try put(a, &local, key, value);
+            continue;
+        }
+        var entry = value;
+        if (std.mem.eql(u8, key, "properties")) {
+            entry = object();
+            for (value.object.keys(), value.object.values()) |name, child| try put(a, &entry, name, try claudeSchema(a, child));
+        } else if (std.mem.eql(u8, key, "items")) entry = try claudeSchema(a, value) else if (std.mem.eql(u8, key, "anyOf") or std.mem.eql(u8, key, "allOf")) {
+            entry = try array(a, &.{});
+            for (value.array.items) |child| try entry.array.append(try claudeSchema(a, child));
+        }
+        try put(a, &copy, key, entry);
+    }
+    if (local.object.count() > 0) {
+        const description = if (schema.object.get("description")) |value| value.string else "";
+        try put(a, &copy, "description", .{ .string = try std.fmt.allocPrint(a, "{s}\nLocally validated constraints: {s}", .{ description, try std.json.Stringify.valueAlloc(a, local, .{}) }) });
+    }
+    return copy;
+}
+
 fn openAiSchema(a: Allocator, schema: Json) anyerror!Json {
     var copy = object();
     for (schema.object.keys(), schema.object.values()) |key, value| {
@@ -902,6 +985,88 @@ fn openAiSchema(a: Allocator, schema: Json) anyerror!Json {
         try put(a, &copy, key, entry);
     }
     return copy;
+}
+
+test "Claude constrained modes distinguish native JSON from forced tool support" {
+    const Provider = enum { openai, anthropic, bedrock, antfly, cloudflare, gemini, vertex };
+    const Config = struct { provider: Provider, model: []const u8 };
+    const native_only = [_]Config{
+        .{ .provider = .anthropic, .model = "claude-opus-5-5" },
+        .{ .provider = .anthropic, .model = "claude-sonnet-5-5-20261001" },
+        .{ .provider = .anthropic, .model = "claude-fable-5-1" },
+        .{ .provider = .anthropic, .model = "claude-5-5-opus" },
+        .{ .provider = .bedrock, .model = "us.anthropic.claude-sonnet-5-5-v1:0" },
+        .{ .provider = .bedrock, .model = "global.anthropic.claude-fable-5-1-20261001-v2:0" },
+    };
+    for (native_only) |cfg| {
+        const caps = hostedCapabilities(cfg);
+        try std.testing.expectEqual(Output.json_schema, try caps.select(.auto, .verdict_only));
+        try std.testing.expectError(error.UnsupportedConstrainedOutput, caps.select(.tool_call, .verdict_only));
+        try std.testing.expectError(error.UnsupportedConstrainedProbabilities, caps.select(.json_schema, .token_logprobs));
+    }
+    for ([_]Config{
+        .{ .provider = .anthropic, .model = "claude-opus-5" },
+        .{ .provider = .anthropic, .model = "claude-fable-5" },
+        .{ .provider = .anthropic, .model = "claude-haiku-5-5" },
+        .{ .provider = .bedrock, .model = "us.anthropic.claude-sonnet-4-5-20250929-v1:0" },
+    }) |cfg| {
+        const caps = hostedCapabilities(cfg);
+        try std.testing.expectEqual(Output.tool_call, try caps.select(.tool_call, .verdict_only));
+        try std.testing.expectEqual(Output.json_schema, try caps.select(.json_schema, .verdict_only));
+    }
+}
+
+fn expectClaudeWireSchema(schema: Json) anyerror!void {
+    for ([_][]const u8{ "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength", "maxItems", "uniqueItems" }) |key| try std.testing.expect(!schema.object.contains(key));
+    if (schema.object.get("minItems")) |value| try std.testing.expect(value.integer <= 1);
+    if (schema.object.get("properties")) |properties| for (properties.object.values()) |child| try expectClaudeWireSchema(child);
+    if (schema.object.get("items")) |child| try expectClaudeWireSchema(child);
+    inline for (.{ "anyOf", "allOf" }) |key| if (schema.object.get(key)) |children| {
+        for (children.array.items) |child| try expectClaudeWireSchema(child);
+    };
+}
+
+test "Claude wire schema relaxes grammar bounds while original constraints trigger repair" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"type":"object","properties":{"text":{"type":"string","minLength":2,"maxLength":8,"description":"source text"},"ids":{"type":"array","items":{"type":"integer","minimum":1,"maximum":3},"minItems":2,"maxItems":3,"uniqueItems":true}},"required":["text","ids"],"additionalProperties":false}
+    , .{});
+    const Provider = enum { openai, anthropic, bedrock, antfly, cloudflare, gemini, vertex };
+    inline for (.{ Provider.anthropic, Provider.bedrock }) |provider| {
+        const wire_schema = try providerSchema(a, .{ .provider = provider }, .json_schema, schema);
+        try expectClaudeWireSchema(wire_schema);
+        const text_schema = wire_schema.object.get("properties").?.object.get("text").?;
+        const description = text_schema.object.get("description").?.string;
+        try std.testing.expect(std.mem.indexOf(u8, description, "source text") != null);
+        try std.testing.expect(std.mem.indexOf(u8, description, "minLength") != null);
+        try std.testing.expect(schema.object.get("properties").?.object.get("ids").?.object.get("uniqueItems").?.bool);
+    }
+    const Fake = struct {
+        calls: usize = 0,
+        fn invoke(ptr: *anyopaque, alloc: Allocator, request: Invocation) !Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const wire_schema = try providerSchema(alloc, .{ .provider = Provider.anthropic }, request.mode, request.schema);
+            try expectClaudeWireSchema(wire_schema);
+            if (self.calls > 1) try std.testing.expect(request.validation_error != null);
+            return .{ .value = try std.json.parseFromSliceLeaky(Json, alloc, if (self.calls == 1)
+                "{\"items\":[{\"item\":0,\"value\":{\"text\":\"x\",\"ids\":[0,0]}}]}"
+            else
+                "{\"items\":[{\"item\":0,\"value\":{\"text\":\"good\",\"ids\":[1,2]}}]}", .{}) };
+        }
+    };
+    var fake = Fake{};
+    const result = try execute(a, .{ .ptr = &fake, .invoke = Fake.invoke }, .json_schema, schema, "extract", .{}, &.{"input"});
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqualStrings("good", result.values[0].?.object.get("text").?.string);
+    try std.testing.expect(result.failures[0] == null);
+    for ([_][]const u8{
+        "{\"type\":\"object\",\"properties\":{}}",
+        "{\"type\":\"object\",\"additionalProperties\":true}",
+        "{\"oneOf\":[{\"type\":\"string\"},{\"type\":\"integer\"}]}",
+    }) |raw| try std.testing.expectError(error.UnsupportedConstrainedSchema, validateProviderSchema(.{ .provider = Provider.anthropic }, .json_schema, try std.json.parseFromSliceLeaky(Json, a, raw, .{})));
 }
 
 test "constrained OpenAI dialect admission rejects optional properties and retains uniqueness validation" {

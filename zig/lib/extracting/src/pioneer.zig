@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const text = @import("text.zig");
+const fastino_api = @import("fastino_api");
 
 const A = std.mem.Allocator;
 const V = std.json.Value;
@@ -101,6 +102,21 @@ fn nonEmptyString(value: ?V) ![]const u8 {
 pub fn compile(a: A, schema: V, options: ?V) !Plan {
     try onlyKeys(schema, &.{ "entities", "relations", "classifications", "structures", "entity_definitions" });
     var plan = Plan{ .schema = object() };
+
+    if (options) |raw| if (raw != .null) {
+        try onlyKeys(raw, &.{ "threshold", "include_confidence", "include_spans" });
+        if (raw.object.get("threshold")) |threshold| switch (threshold) {
+            .integer, .float, .number_string => {
+                _ = probability(threshold) catch return error.UnsupportedPioneerSchema;
+                plan.threshold = threshold;
+            },
+            else => return error.UnsupportedPioneerSchema,
+        };
+        inline for (.{ "include_confidence", "include_spans" }) |name| if (raw.object.get(name)) |flag| switch (flag) {
+            .bool => |value| @field(plan.output, name) = value,
+            else => return error.UnsupportedPioneerSchema,
+        };
+    };
 
     const definitions = schema.object.get("entity_definitions");
     if (schema.object.get("entities")) |raw| {
@@ -190,6 +206,9 @@ pub fn compile(a: A, schema: V, options: ?V) !Plan {
             var task_schema = object();
             try put(a, &task_schema, "labels", .{ .array = label_list });
             try put(a, &task_schema, "multi_label", .{ .bool = multi });
+            // GLiNER selects classification labels using a task-level cutoff;
+            // the request-level threshold only controls span extraction.
+            if (multi) if (plan.threshold) |threshold| try put(a, &task_schema, "cls_threshold", threshold);
             try put(a, &classifications, name, task_schema);
             task.* = .{ .name = name, .multi_label = multi };
         }
@@ -224,24 +243,16 @@ pub fn compile(a: A, schema: V, options: ?V) !Plan {
     }
 
     if (plan.schema.object.count() == 0) return error.UnsupportedPioneerSchema;
-    // Result keys are task names; a name shared between tasks would make the
-    // answer ambiguous.
+    // GLiNER indexes tasks by name before grouping relations in the response.
+    // Separate output sections do not make colliding task names safe.
+    for (plan.relation_types) |name| {
+        if (isReservedKey(name) or plan.classification(name) != null or plan.structure(name) != null) return error.UnsupportedPioneerSchema;
+    }
     for (plan.classifications) |task| {
         if (plan.structure(task.name) != null or plan.isEntityLabel(task.name) or isReservedKey(task.name)) return error.UnsupportedPioneerSchema;
     }
     for (plan.structures) |item| if (plan.isEntityLabel(item.name) or isReservedKey(item.name)) return error.UnsupportedPioneerSchema;
 
-    if (options) |raw| if (raw != .null) {
-        try onlyKeys(raw, &.{ "threshold", "include_confidence", "include_spans" });
-        if (raw.object.get("threshold")) |threshold| switch (threshold) {
-            .integer, .float, .number_string => plan.threshold = threshold,
-            else => return error.UnsupportedPioneerSchema,
-        };
-        inline for (.{ "include_confidence", "include_spans" }) |name| if (raw.object.get(name)) |flag| switch (flag) {
-            .bool => |value| @field(plan.output, name) = value,
-            else => return error.UnsupportedPioneerSchema,
-        };
-    };
     return plan;
 }
 
@@ -309,24 +320,20 @@ pub fn contentText(a: A, content: V) ![]const u8 {
 }
 
 pub fn requestBody(a: A, model: []const u8, plan: Plan, source: []const u8) ![]u8 {
-    var body = object();
-    try put(a, &body, "model", .{ .string = model });
-    var message = object();
-    try put(a, &message, "role", .{ .string = "user" });
-    try put(a, &message, "content", .{ .string = source });
-    var messages = std.json.Array.init(a);
-    try messages.append(message);
-    try put(a, &body, "messages", .{ .array = messages });
-    try put(a, &body, "schema", plan.schema);
-    if (plan.threshold) |threshold| try put(a, &body, "threshold", threshold);
-    // Spans and confidence are always requested so offsets can be verified;
-    // the caller's output options decide what is retained.
-    try put(a, &body, "include_confidence", .{ .bool = true });
-    try put(a, &body, "include_spans", .{ .bool = true });
-    try put(a, &body, "stream", .{ .bool = false });
-    // Enrichment inputs are database content; do not opt them into hosted
-    // inference retention.
-    try put(a, &body, "store", .{ .bool = false });
+    const body: fastino_api.ChatCompletionRequest = .{
+        .model = model,
+        .messages = &.{.{ .role = "user", .content = .{ .string = source } }},
+        .schema = plan.schema,
+        .threshold = if (plan.threshold) |value| try probability(value) else null,
+        // Spans and confidence are always requested so offsets can be verified;
+        // the caller's output options decide what is retained.
+        .include_confidence = true,
+        .include_spans = true,
+        .stream = false,
+        // Enrichment inputs are database content; do not opt them into hosted
+        // inference retention.
+        .store = false,
+    };
     return try std.json.Stringify.valueAlloc(a, body, .{});
 }
 
@@ -353,7 +360,7 @@ fn integer(value: V) !i64 {
     };
 }
 
-fn score(value: V) !V {
+fn probability(value: V) !f64 {
     const parsed: f64 = switch (value) {
         .integer => |n| @floatFromInt(n),
         .float => |f| f,
@@ -361,28 +368,34 @@ fn score(value: V) !V {
         else => return error.InvalidExtractionResponse,
     };
     if (!(parsed >= 0 and parsed <= 1)) return error.InvalidExtractionResponse;
+    return parsed;
+}
+
+fn score(value: V) !V {
+    _ = try probability(value);
     return value;
 }
 
 /// Decode one chat completion envelope into a canonical extraction row.
 pub fn decode(a: A, body: []const u8, plan: Plan, source: []const u8, id: ?[]const u8) !Decoded {
-    const envelope = try parseLeaky(a, body);
-    if (envelope != .object) return error.InvalidExtractionResponse;
-    const choices = envelope.object.get("choices") orelse return error.InvalidExtractionResponse;
-    if (choices != .array or choices.array.items.len != 1) return error.InvalidExtractionResponse;
-    const choice = choices.array.items[0];
-    if (choice != .object) return error.InvalidExtractionResponse;
-    const message = choice.object.get("message") orelse return error.InvalidExtractionResponse;
-    if (message != .object) return error.InvalidExtractionResponse;
-    const content = message.object.get("content") orelse return error.InvalidExtractionResponse;
+    // Parse the published envelope with generated types. The schema leaves
+    // message content untyped, so GLiNER result validation remains below.
+    const envelope = std.json.parseFromValueLeaky(fastino_api.ChatCompletionResponse, a, try parseLeaky(a, body), .{
+        .ignore_unknown_fields = true,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidExtractionResponse,
+    };
+    if (envelope.choices.len != 1) return error.InvalidExtractionResponse;
+    const message = envelope.choices[0].message orelse return error.InvalidExtractionResponse;
+    const content = message.map.get("content") orelse return error.InvalidExtractionResponse;
     if (content != .string) return error.InvalidExtractionResponse;
     const result = try parseLeaky(a, content.string);
-
-    var usage = Usage{};
-    if (envelope.object.get("usage")) |raw| if (raw == .object) {
-        if (raw.object.get("prompt_tokens")) |n| usage.input_tokens = try integer(n);
-        if (raw.object.get("completion_tokens")) |n| usage.output_tokens = try integer(n);
+    const usage: Usage = .{
+        .input_tokens = envelope.usage.prompt_tokens orelse 0,
+        .output_tokens = envelope.usage.completion_tokens orelse 0,
     };
+    if (usage.input_tokens < 0 or usage.output_tokens < 0) return error.InvalidExtractionResponse;
     return .{ .row = try decodeResult(a, result, plan, source, id), .usage = usage };
 }
 
@@ -558,7 +571,11 @@ const Decoder = struct {
         var records = std.json.Array.init(self.a);
         switch (value) {
             .array => |items| for (items.items) |record| try records.append(try self.structureRecord(item, record)),
-            .object => try records.append(try self.structureRecord(item, value)),
+            // GLiNER emits {} when a structure task predicts zero instances.
+            // A nonempty object is the supported single-record shorthand.
+            .object => if (value.object.count() > 0) {
+                try records.append(try self.structureRecord(item, value));
+            },
             .null => {},
             else => return error.InvalidExtractionResponse,
         }
@@ -566,7 +583,7 @@ const Decoder = struct {
     }
 
     fn structureRecord(self: Decoder, item: Plan.Structure, raw: V) !V {
-        if (raw != .object) return error.InvalidExtractionResponse;
+        if (raw != .object or raw.object.count() == 0) return error.InvalidExtractionResponse;
         var out = object();
         var it = raw.object.iterator();
         while (it.next()) |entry| {
@@ -621,6 +638,28 @@ const Decoder = struct {
     }
 };
 
+fn expectJsonEqual(expected: V, actual: V) !void {
+    try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+    switch (expected) {
+        .object => |fields| {
+            try std.testing.expectEqual(fields.count(), actual.object.count());
+            var it = fields.iterator();
+            while (it.next()) |entry| {
+                const value = actual.object.get(entry.key_ptr.*) orelse return error.TestExpectedEqual;
+                try expectJsonEqual(entry.value_ptr.*, value);
+            }
+        },
+        .array => |items| {
+            try std.testing.expectEqual(items.items.len, actual.array.items.len);
+            for (items.items, actual.array.items) |left, right| try expectJsonEqual(left, right);
+        },
+        .string, .number_string => |value| try std.testing.expectEqualStrings(value, if (actual == .string) actual.string else actual.number_string),
+        .bool => |value| try std.testing.expectEqual(value, actual.bool),
+        .null => {},
+        else => unreachable, // parseLeaky retains every number as number_string.
+    }
+}
+
 test "pioneer compiles antfly schema to fastino unified schema" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -634,12 +673,38 @@ test "pioneer compiles antfly schema to fastino unified schema" {
     const plan = try compile(a, schema, try parseLeaky(a, "{\"threshold\":0.4}"));
     const wire = try std.json.Stringify.valueAlloc(a, plan.schema, .{});
     try std.testing.expectEqualStrings(
-        \\{"entities":{"person":"","company":"an organization"},"relations":["works_for"],"classifications":{"sentiment":{"labels":["positive","negative"],"multi_label":false},"aspects":{"labels":["camera","battery"],"multi_label":true}},"structures":{"product":["name::str","colors::list",{"name":"tier","dtype":"str","description":"plan tier","choices":["basic","pro"]}]}}
+        \\{"entities":{"person":"","company":"an organization"},"relations":["works_for"],"classifications":{"sentiment":{"labels":["positive","negative"],"multi_label":false},"aspects":{"labels":["camera","battery"],"multi_label":true,"cls_threshold":0.4}},"structures":{"product":["name::str","colors::list",{"name":"tier","dtype":"str","description":"plan tier","choices":["basic","pro"]}]}}
     , wire);
     const body = try requestBody(a, "fastino/gliner2.5-multi-v1", plan, "Ada works for Antfly.");
-    try std.testing.expectEqualStrings(
-        \\{"model":"fastino/gliner2.5-multi-v1","messages":[{"role":"user","content":"Ada works for Antfly."}],"schema":{"entities":{"person":"","company":"an organization"},"relations":["works_for"],"classifications":{"sentiment":{"labels":["positive","negative"],"multi_label":false},"aspects":{"labels":["camera","battery"],"multi_label":true}},"structures":{"product":["name::str","colors::list",{"name":"tier","dtype":"str","description":"plan tier","choices":["basic","pro"]}]}},"threshold":0.4,"include_confidence":true,"include_spans":true,"stream":false,"store":false}
-    , body);
+    const expected = try parseLeaky(a,
+        \\{"model":"fastino/gliner2.5-multi-v1","messages":[{"role":"user","content":"Ada works for Antfly."}],"schema":{"entities":{"person":"","company":"an organization"},"relations":["works_for"],"classifications":{"sentiment":{"labels":["positive","negative"],"multi_label":false},"aspects":{"labels":["camera","battery"],"multi_label":true,"cls_threshold":0.4}},"structures":{"product":["name::str","colors::list",{"name":"tier","dtype":"str","description":"plan tier","choices":["basic","pro"]}]}},"threshold":0.4,"include_confidence":true,"include_spans":true,"stream":false,"store":false}
+    );
+    try expectJsonEqual(expected, try parseLeaky(a, body));
+}
+
+test "pioneer forwards multi-label classification thresholds in the request schema" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try parseLeaky(a,
+        \\{"classifications":[{"name":"topics","labels":["tech","finance"],"multi_label":true},{"name":"sentiment","labels":["positive","negative"]}]}
+    );
+    for ([_]?[]const u8{ null, "{}", "{\"threshold\":0.8}", "{\"threshold\":0.2}", "{\"threshold\":0}", "{\"threshold\":1}" }) |raw_options| {
+        const options = if (raw_options) |raw| try parseLeaky(a, raw) else null;
+        const plan = try compile(a, schema, options);
+        const body = try parseLeaky(a, try requestBody(a, "fastino/gliner2.5-multi-v1", plan, "Tech news"));
+        const tasks = body.object.get("schema").?.object.get("classifications").?.object;
+        const cutoff = tasks.get("topics").?.object.get("cls_threshold");
+        const threshold = if (options) |value| value.object.get("threshold") else null;
+        if (threshold) |expected| {
+            try std.testing.expect(cutoff != null);
+            try std.testing.expectEqualStrings(
+                try std.json.Stringify.valueAlloc(a, expected, .{}),
+                try std.json.Stringify.valueAlloc(a, cutoff.?, .{}),
+            );
+        } else try std.testing.expect(cutoff == null);
+        try std.testing.expect(!tasks.get("sentiment").?.object.contains("cls_threshold"));
+    }
 }
 
 test "pioneer rejects schema features without a hosted equivalent" {
@@ -660,6 +725,53 @@ test "pioneer rejects schema features without a hosted equivalent" {
         "{\"entities\":[\"sentiment\"],\"classifications\":[{\"name\":\"sentiment\",\"labels\":[\"a\",\"b\"]}]}",
     }) |raw| try std.testing.expectError(error.UnsupportedPioneerSchema, compile(a, try parseLeaky(a, raw), null));
     try std.testing.expectError(error.UnsupportedPioneerSchema, compile(a, try parseLeaky(a, "{\"entities\":[\"person\"]}"), try parseLeaky(a, "{\"flat_ner\":true}")));
+    for ([_][]const u8{ "{\"threshold\":-0.1}", "{\"threshold\":1.1}", "{\"threshold\":true}" }) |options| {
+        try std.testing.expectError(error.UnsupportedPioneerSchema, compile(a, try parseLeaky(a, "{\"entities\":[\"person\"]}"), try parseLeaky(a, options)));
+    }
+}
+
+test "pioneer rejects relation task names that collide before results are grouped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "{\"relations\":[{\"type\":\"contact\"}],\"classifications\":[{\"name\":\"contact\",\"labels\":[\"personal\",\"work\"]}]}",
+        "{\"relations\":[{\"type\":\"contact\"}],\"structures\":{\"contact\":{\"fields\":{\"name\":\"str\"}}}}",
+        "{\"relations\":[{\"type\":\"entities\"}]}",
+        "{\"relations\":[{\"type\":\"relation_extraction\"}]}",
+    }) |schema| try std.testing.expectError(error.UnsupportedPioneerSchema, compile(a, try parseLeaky(a, schema), null));
+
+    // Entity labels live inside the entities task, so they may match a
+    // relation task name without colliding in GLiNER's internal result map.
+    _ = try compile(a, try parseLeaky(a, "{\"entities\":[\"contact\"],\"relations\":[{\"type\":\"contact\"}]}"), null);
+}
+
+test "pioneer normalizes empty structure predictions without inventing records" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plan = try compile(a, try parseLeaky(a, "{\"structures\":{\"contact\":{\"fields\":{\"name\":\"str\"}}}}"), null);
+    for ([_][]const u8{ "{\"contact\":{}}", "{\"contact\":[]}", "{\"contact\":null}" }) |content| {
+        const body = try std.json.Stringify.valueAlloc(a, .{
+            .model = "fastino/gliner2.5-multi-v1",
+            .choices = .{.{ .message = .{ .content = content } }},
+            .usage = .{ .prompt_tokens = 0, .completion_tokens = 0 },
+        }, .{});
+        const decoded = try decode(a, body, plan, "No contacts here.", null);
+        const records = decoded.row.object.get("structures").?.object.get("contact").?.array.items;
+        try std.testing.expectEqual(@as(usize, 0), records.len);
+    }
+    for ([_][]const u8{ "{\"contact\":{\"name\":\"Ada\"}}", "{\"contact\":[{\"name\":\"Ada\"}]}" }) |content| {
+        const row = try decodeResult(a, try parseLeaky(a, content), plan, "Ada", null);
+        const records = row.object.get("structures").?.object.get("contact").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), records.len);
+        try std.testing.expectEqualStrings("Ada", records[0].object.get("name").?.object.get("value").?.string);
+    }
+    // An empty task result is special; empty or unrecognized records inside
+    // an explicit array remain malformed rather than becoming phantom rows.
+    for ([_][]const u8{ "{\"contact\":[{}]}", "{\"contact\":[null]}", "{\"contact\":[{\"unknown\":\"Ada\"}]}" }) |content| {
+        try std.testing.expectError(error.InvalidExtractionResponse, decodeResult(a, try parseLeaky(a, content), plan, "Ada", null));
+    }
 }
 
 test "pioneer decodes formatted GLiNER2 results with verified spans" {
@@ -688,6 +800,7 @@ test "pioneer decodes formatted GLiNER2 results with verified spans" {
     var choices = std.json.Array.init(a);
     try choices.append(choice);
     try put(a, &envelope, "choices", .{ .array = choices });
+    try put(a, &envelope, "model", .{ .string = "fastino/gliner2.5-multi-v1" });
     try put(a, &envelope, "usage", try parseLeaky(a, "{\"prompt_tokens\":21,\"completion_tokens\":0}"));
     const decoded = try decode(a, try std.json.Stringify.valueAlloc(a, envelope, .{}), plan, source, "doc-1");
     try std.testing.expectEqual(@as(i64, 21), decoded.usage.input_tokens);
@@ -728,6 +841,29 @@ test "pioneer fails closed on unrecognized answers" {
         "{\"choices\":[{\"message\":{\"content\":null}}]}",
         "{\"choices\":[{\"message\":{\"content\":\"not json\"}}]}",
     }) |raw| try std.testing.expectError(error.InvalidExtractionResponse, decode(a, raw, plan, "Ada", null));
+}
+
+test "pioneer validates the generated response envelope and tolerates additive fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plan = try compile(a, try parseLeaky(a, "{\"entities\":[\"person\"]}"), null);
+    const decoded = try decode(a,
+        \\{"model":"fastino/gliner2.5-multi-v1","choices":[{"message":{"role":"assistant","content":"{\"entities\":{\"person\":[\"Ada\"]}}","future_field":true}}],"usage":{"prompt_tokens":3,"completion_tokens":1,"future_field":true},"future_field":true}
+    , plan, "Ada", null);
+    try std.testing.expectEqual(@as(i64, 3), decoded.usage.input_tokens);
+    try std.testing.expectEqual(@as(i64, 1), decoded.usage.output_tokens);
+    try std.testing.expectEqualStrings("Ada", decoded.row.object.get("entities").?.array.items[0].object.get("text").?.string);
+    for ([_][]const u8{
+        "{\"choices\":[{\"message\":{\"content\":\"{}\"}}],\"usage\":{}}",
+        "{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":\"{}\"}}]}",
+        "{\"model\":\"m\",\"choices\":[],\"usage\":{}}",
+        "{\"model\":\"m\",\"choices\":[{}],\"usage\":{}}",
+        "{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":[]}}],\"usage\":{}}",
+        "{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":\"{}\"}}],\"usage\":{\"prompt_tokens\":\"three\"}}",
+        "{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":\"{}\"}}],\"usage\":{\"completion_tokens\":-1}}",
+        "{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":\"{}\",\"content\":\"{}\"}}],\"usage\":{}}",
+    }) |body| try std.testing.expectError(error.InvalidExtractionResponse, decode(a, body, plan, "Ada", null));
 }
 
 test "pioneer content accepts text parts only" {

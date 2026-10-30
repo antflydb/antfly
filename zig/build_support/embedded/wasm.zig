@@ -504,6 +504,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_generating_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     wasm_generating_mod.addImport("antfly-json", json_mod);
     wasm_generating_mod.addImport("antfly_generating_openapi", api.generating);
+    wasm_generating_mod.addAnonymousImport("anthropic_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/anthropic_api/root.zig") });
     const wasm_apple_mod = b.createModule(.{ .root_source_file = b.path("lib/apple_native/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     wasm_apple_mod.addImport("apple_native_options", apple_options_mod);
     wasm_apple_mod.addImport("antfly_platform", wasm_platform_mod);
@@ -517,6 +518,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_extracting_mod.addImport("antfly_image", wasm_image_mod);
     wasm_extracting_mod.addImport("httpx", httpx_mod);
     wasm_extracting_mod.addImport("antfly_extraction_openapi", api.extraction);
+    wasm_extracting_mod.addAnonymousImport("fastino_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/fastino_api/root.zig") });
     const wasm_structured_mod = b.createModule(.{ .root_source_file = b.path("lib/structured/root.zig"), .target = wasm_target, .optimize = optimize });
     wasm_structured_mod.addImport("antfly_jsonschema", wasm_schema_mod);
     wasm_structured_mod.addImport("antfly_image", wasm_image_mod);

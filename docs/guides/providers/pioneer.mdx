@@ -64,6 +64,8 @@ UTF-8 bytes and are kept only when they match the returned text exactly.
   entity attributes, constrained classification, joint IE, and numeric, date,
   or estimate structure fields are rejected before any request is sent.
 - Text inputs only; images and other attachments are rejected.
+- Relation, classification, and structure tasks must have distinct names.
+  `entities` and `relation_extraction` are reserved task names.
 - Requests set `store: false`, so Pioneer does not retain enrichment inputs.
 
 ## Related
