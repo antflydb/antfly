@@ -2448,3 +2448,75 @@ Finish task-owned compilation, native tests, E2E and cleanup before timing the
 probe. Other host activity is uncontrolled. All twelve raw samples, source/helper
 hashes, probe hash, executable identity and memory oracles are in the observation.
 Real-provider retention qualification remains deferred.
+
+## Pressure-safe lookahead and leased publication
+
+The [retained observation](phase-safe-prefetch-and-leased-publication-v1-observation.json)
+qualifies implementation `f8f08c5da0` with main
+`9986c8a10750eea05d20d5c966f38cd76f7f0ee8` merged. Later source commits register
+and refine its tests. Runtime ABI is **77**; reader protocol remains **97**.
+
+Controlled CPU/input pressure previously stranded an optional Parquet read even
+after unrelated CPU work released admission. Speculative input reservations now
+try once, and CPU admission retries wait only for a live sibling decoder. The
+one/two-column gates check pressure decline while foreign CPU work is still
+gated, required-read progress under the same limits, cancellation and complete
+reservation cleanup. Separately, a three-page warm text read now emits **zero**
+redundant raw prefetch hints (previously two), with zero new demand reads or
+decodes. Declining one resident proof retains exactly that page's hint; authority
+revocation after acquiring a lookup lease releases it before returning an error.
+
+Index publication now consumes leased sort records and bounded physical/frozen
+column windows. A same-binary Debug comparison retains the previous owning
+`Sort.next` drain as the control. It checks every key and payload byte for 1,024
+unique 2-KiB records, excludes setup/add, and includes first advancement/finish
+and the complete drain. Six alternating pairs follow one warmup per variant at
+each sort budget. Cumulative requested drain allocation falls:
+
+| Sort budget | Owning control | Leased records | Reduction |
+|---|---:|---:|---:|
+| 8 MiB | 8,882,218 bytes | 3,307,562 bytes | 62.8% |
+| 64 KiB | 9,328,010 bytes | 4,283,196 bytes | 54.1% |
+
+Both budgets perform spill I/O, and encoded read/write counts match exactly
+between variants. Thread CPU medians are **13.266 → 12.193 ms (1.09×)** and
+**17.425 → 17.185 ms (1.01×)** respectively. Each budget includes one slower
+candidate sample; all twelve pairs remain recorded. These results support
+removing transient allocations, with only modest measured CPU improvement.
+They establish neither live/peak RSS savings nor HTTP, archive, cloud or complete
+publication throughput. Task-owned builds, tests and cleanup did not overlap
+timing; unrelated compilation and other host activity were uncontrolled.
+
+The owning and leased covering publishers also produce identical pack/directory
+content addresses for resident and spilled input, including nested JSON, SQL
+NULL and integers above 2^53. Focused checks cover allocation failures, repeated
+EOF, bounded row/byte windows, aggregate spills and oversized-record fallback.
+The merged runtime passes **25 shared and 31 API checks** with no failures,
+skips or leaks. Three publisher checks and the enabled benchmark run separately;
+these overlap and must not be added as distinct checks.
+
+Reproduce from the worktree's `zig/` directory:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR=.zig-cache/global ~/bin/zig build lake-api-test \
+  -Dtest-filter='external lake leased publication' --summary all \
+  > /tmp/lake-publication-build.log 2>&1
+```
+
+Freeze the emitted `lake-api-tests` executable reported in that build's run
+command, recording its SHA-256 and source identity. After all task-owned builds,
+tests and cleanup finish, run that executable directly with
+`ANTFLY_LAKE_LEASED_PUBLICATION_BENCH=1` and
+`--suite-filter 'external lake leased publication benchmark sorted record drain'`.
+The observation contains the exact probe identity, source hashes and all samples.
+
+The frozen CLI built from source
+`5506d75a0d43e30a1bf43e7068bdfc58a7a9bff4` passes **50 real Parquet/Iceberg
+E2E cases in 375.70 seconds**, including cold/warm reads, restarts, unequal wide
+projections, hidden/projected highlights, exact decimals, deletes, ordering and
+refresh. Its SHA-256 is
+`6c03d86f83c245df81f268173e65bfe7b48626871a4e2390b5fd8626e7e68a2a`.
+Apache boundary (2,338 source files), license, formatting, final source/binary
+identity and whitespace checks pass. `make gc` completed its safety check; the
+collector skipped deletion under its native-build/process-inspection safety guard.
+Real-provider retention qualification remains deferred.
