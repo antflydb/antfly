@@ -18,6 +18,7 @@ template<class T> __device__ __forceinline__ T gliner25_warp_max(T v) {
 struct Gliner25BoundaryParams { uint kind; uint dims[8]; float scalars[4]; };
 static_assert(sizeof(Gliner25BoundaryParams) == 52, "boundary descriptor ABI");
 }
+// tile-codegen:begin model.gliner_boundary family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gliner25_boundary_f32(
     const float *a0, const float *a1, const float *a2, const float *a3,
     const float *a4, const float *a5, const float *a6, const float *a7,
@@ -272,3 +273,4 @@ extern "C" __global__ void termite_gliner25_boundary_f32(
     }
     }
 }
+// tile-codegen:end model.gliner_boundary family
