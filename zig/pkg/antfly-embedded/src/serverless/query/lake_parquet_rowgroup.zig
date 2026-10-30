@@ -10366,6 +10366,12 @@ test "external lake compact Parquet wide pages retain columns without duplicate 
         }
         try std.testing.expectEqual(@as(usize, row_count), position);
         try std.testing.expectEqual(@as(usize, chunks.len), cursor.pages_decoded);
+        try std.testing.expect(cursor.admission.peak <= 64 * 1024 * 1024);
+        if (cached) for (cursor.columns) |column| {
+            const held = column.cached.?;
+            try std.testing.expect(held.item.owned_columns != null);
+            try std.testing.expect(held.item.budget.live < row_count * 16);
+        };
     }
 }
 

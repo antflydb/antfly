@@ -2362,8 +2362,13 @@ keeps at most four column phases active and drains whichever phase completes
 first. Fetching uses I/O admission; only a complete encoded lease can enter CPU
 decoding. Dictionary pages return to fetching before the next data page. Encoded
 input credits remain owned across that transition, including while a decoder is
-queued. Cancellation joins every phase and releases even a decoder's input whose
-worker never started. Saturated execution admission retains a single caller
+queued. A resource rejection can retry once after competing decoders drain,
+under identical limits and without another provider read. A quota that still
+cannot accommodate the page fails normally. Cancellation joins every phase and releases even a decoder's input whose
+worker never started. Typed cached columns and dictionaries own reclaimable
+allocations: temporary codec arrays, vector growth and discarded staging buffers
+are freed rather than retained in an arena. Cached residency charges the final
+owned vectors. Saturated execution admission retains a single caller
 fallback; scheduler workspace estimates do not replace actual cursor admission.
 
 Compact keys now remain as prefix/suffix views through sorted publication,

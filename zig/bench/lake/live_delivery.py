@@ -45,12 +45,15 @@ spec.loader.exec_module(bench)
 label, executable, source, mode = sys.argv[1:]
 assert mode in ("wide", "ascii", "escaped", "statistics")
 binary = Path(executable).resolve()
-base = Path(
-    os.environ.get(
-        "ANTFLY_LAKE_DELIVERY_RESULTS",
-        root / ".benchmark-results/lake/live-admission-v1-qualified",
+base = (
+    Path(
+        os.environ.get(
+            "ANTFLY_LAKE_DELIVERY_RESULTS",
+            root / ".benchmark-results/lake/live-admission-v1-qualified",
+        )
     )
-) / mode
+    / mode
+)
 shared = base / "input"
 shared.mkdir(parents=True, exist_ok=True)
 out = base / label

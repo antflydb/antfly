@@ -392,7 +392,9 @@ pub const Cursor = struct {
         const end = fetched.end;
         const encoded = fetched.lease.bytes[0..len];
         const cache_key = fetched.cache_key;
+        const prior_offset = column.offset;
         column.offset += len;
+        errdefer column.offset = prior_offset;
         const credit = try self.admission.claim(parsed.header.uncompressed_page_size, if (parsed.header.page_type == .dictionary_page) null else column.dictionary_credit);
         defer credit.release();
         switch (parsed.header.page_type) {
@@ -412,11 +414,12 @@ pub const Cursor = struct {
                             var loading: Admission.Loading = undefined;
                             try loading.begin(value.admission, item);
                             defer loading.end();
-                            const decoded = decodeDictionaryAlloc(item.arena.allocator(), value.chunk, value.header, value.bytes) catch |err| {
+                            const decoded = decodeDictionaryAlloc(item.budget.allocator(), value.chunk, value.header, value.bytes) catch |err| {
                                 if (loading.failed) return error.ParquetPageTooLarge;
                                 return err;
                             };
                             item.payload = .{ .dictionary = decoded };
+                            item.owned_dictionary = true;
                         }
                     }{ .admission = self.admission, .chunk = column.chunk, .header = parsed.header, .bytes = encoded[parsed.header_len..] };
                     const lease = try reader.cache.decoded.acquire(key, @min(reader.cache.decoded.max_loading_bytes, self.limits.max_decoded_bytes *| 4), reader.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
@@ -487,11 +490,12 @@ pub const Cursor = struct {
                     var loading: Admission.Loading = undefined;
                     try loading.begin(cursor.admission, item);
                     defer loading.end();
-                    const decoded = parquet.buildSupportedColumnsAllocWithLimits(item.arena.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits) catch |err| {
+                    const decoded = parquet.buildSupportedColumnsAllocWithLimits(item.budget.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits) catch |err| {
                         if (loading.failed) return error.ParquetPageTooLarge;
                         return err;
                     };
                     item.payload = .{ .columns = decoded.columns };
+                    item.owned_columns = decoded;
                     item.parquet_page_header = value.parsed;
                     if (value.dictionary) |dictionary| dictionary.cache.depend(.{ .cache = dictionary.cache, .item = item }, dictionary);
                 }
@@ -731,7 +735,8 @@ pub const Cursor = struct {
         const scheduler = @import("../../sql/parallel_scheduler.zig");
         const Pending = union(enum) {
             fetch: scheduler.Task(anyerror!?Fetched),
-            decode: struct { task: scheduler.Task(anyerror!DecodedStep), input: ranges.RangeLease },
+            decode: struct { task: scheduler.Task(anyerror!DecodedStep), input: Fetched },
+            retry: Fetched,
         };
         var pending: [4]?Pending = @splat(null);
         var columns: [4]?*Column = @splat(null);
@@ -745,8 +750,9 @@ pub const Cursor = struct {
                 } else |_| {},
                 .decode => |*active| {
                     _ = active.task.cancel(io.?) catch {};
-                    active.input.release();
+                    active.input.lease.release();
                 },
+                .retry => |fetched| fetched.lease.release(),
             }
             slot.* = null;
         };
@@ -767,24 +773,43 @@ pub const Cursor = struct {
                             // bounded by the independent live request owner.
                             const workspace = (self.limits.max_input_bytes +| self.limits.max_decoded_bytes) / @max(@as(usize, 1), self.columns.len);
                             if ((self.scheduler orelse scheduler.global()).submitNotified(io.?, workspace, &changed, decodeWorker, .{ self.*, column_slot.*.?, fetched })) |decode_task| {
-                                slot.* = .{ .decode = .{ .task = decode_task, .input = fetched.lease } };
+                                slot.* = .{ .decode = .{ .task = decode_task, .input = fetched } };
                             } else {
-                                defer fetched.lease.release();
-                                const step = try decodeWorker(self.*, column_slot.*.?, fetched);
-                                self.addStats(step.stats);
-                                if (step.ready) column_slot.* = null;
+                                const inline_outcome = decodeWorker(self.*, column_slot.*.?, fetched);
+                                if (inline_outcome) |step| {
+                                    fetched.lease.release();
+                                    self.addStats(step.stats);
+                                    if (step.ready) column_slot.* = null;
+                                } else |err| {
+                                    if (err == error.ParquetPageTooLarge) {
+                                        slot.* = .{ .retry = fetched };
+                                    } else {
+                                        fetched.lease.release();
+                                        return err;
+                                    }
+                                }
                             }
                         } else column_slot.* = null;
                     },
                     .decode => |*active| if (active.task.isComplete()) {
                         const outcome = active.task.await(io.?);
-                        active.input.release();
+                        const fetched = active.input;
                         slot.* = null;
                         progressed = true;
-                        const step = try outcome;
-                        self.addStats(step.stats);
-                        if (step.ready) column_slot.* = null;
+                        if (outcome) |step| {
+                            fetched.lease.release();
+                            self.addStats(step.stats);
+                            if (step.ready) column_slot.* = null;
+                        } else |err| {
+                            if (err == error.ParquetPageTooLarge) {
+                                slot.* = .{ .retry = fetched };
+                            } else {
+                                fetched.lease.release();
+                                return err;
+                            }
+                        }
                     },
+                    .retry => {},
                 };
                 if (slot.* != null) {
                     active_count += 1;
@@ -805,6 +830,26 @@ pub const Cursor = struct {
                     }
                 }
             }
+            // Temporary decode work can exceed headroom even when the final
+            // retained cohort fits. Drain other decoders before one bounded
+            // retry with identical raw/resident policy. Never increase a quota
+            // or discard the encoded input needed to retry without another GET.
+            var decoding = false;
+            for (pending) |task| if (task != null and task.? == .decode) {
+                decoding = true;
+                break;
+            };
+            if (!decoding) for (&pending, &columns) |*slot, *column_slot| {
+                if (slot.* == null or slot.*.? != .retry) continue;
+                const fetched = slot.*.?.retry;
+                slot.* = null;
+                defer fetched.lease.release();
+                const step = try decodeWorker(self.*, column_slot.*.?, fetched);
+                self.addStats(step.stats);
+                if (step.ready) column_slot.* = null;
+                progressed = true;
+                break;
+            };
             if (active_count == 0) {
                 var waiting: ?*?*Column = null;
                 for (&columns) |*column| if (column.* != null) {
