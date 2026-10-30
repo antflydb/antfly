@@ -125,6 +125,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/graph/templates/cuda_gqa_repeat_split_f16.cuh",
         "src/ops/cuda/kernels/kernel_abi.cuh",
         "src/ops/cuda/kernels/row_program.cuh",
+        "src/ops/cuda/kernels/wmma_tile_program.cuh",
         "src/ops/cuda/kernels/rotary_program.cuh",
         "src/ops/cuda/kernels/encoder_multimodal_programs.cuh",
         "src/ops/cuda/kernels/rotary_frequency_training.cuh",

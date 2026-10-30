@@ -3445,3 +3445,7 @@ discarded template prototype with its retained timing miss.
 [BD: dense decoder and vision attention phases](unified-execution-bd-outcomes.md)
 records thirteen shared phases, unchanged emitted shader source, and independent
 qualification of seven native entrypoints.
+
+[BE: native CUDA WMMA score-product owner](unified-execution-be-outcomes.md)
+records ten shared score phases, identical shipping/native images and resource
+reports, and real-device reference qualification of five entrypoints.

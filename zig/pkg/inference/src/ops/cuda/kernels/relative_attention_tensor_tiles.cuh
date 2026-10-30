@@ -1,5 +1,6 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+#include "wmma_tile_program.cuh"
 // Intentionally included inside both native entrypoints; no include guard.
 // QueryTile/KeyTile are compile-time schedule constants supplied by the caller.
 // Direct kernel shared declarations avoid NVCC device-function address lowering
@@ -93,17 +94,11 @@
         if constexpr (QueryTile == 16u) {
             // Q*K^T: two 16x16 fragments, one per warp.
             if (warp < 2u) {
-                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-                wmma::fill_fragment(acc, 0.0f);
-                #pragma unroll
-                for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                    wmma::load_matrix_sync(a_frag, q_tile + d0, kHeadDim);
-                    wmma::load_matrix_sync(b_frag, k_tile + d0 * kKeyTile + warp * 16u, kKeyTile);
-                    wmma::mma_sync(acc, a_frag, b_frag, acc);
-                }
-                wmma::store_matrix_sync(scores + warp * 16u, acc, kKeyTile, wmma::mem_row_major);
+                ANTFLY_CUDA_WMMA_DOT16_F32(
+                    half, wmma::row_major, kHeadDim,
+                    q_tile + d0, kHeadDim,
+                    k_tile + d0 * kKeyTile + warp * 16u, kKeyTile,
+                    scores + warp * 16u, kKeyTile)
             }
 
             // Q*Kr^T: three compact relative columns. Warp 2 handles chunks 0/2
@@ -111,17 +106,11 @@
             if (warp == 2u || warp == 3u) {
                 const unsigned int first_chunk = warp == 2u ? 0u : 1u;
                 for (unsigned int chunk = first_chunk; chunk < 3u; chunk += 2u) {
-                    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-                    wmma::fill_fragment(acc, 0.0f);
-                    #pragma unroll
-                    for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                        wmma::load_matrix_sync(a_frag, q_tile + d0, kHeadDim);
-                        wmma::load_matrix_sync(b_frag, kr_tile + d0 * kRelPitch + chunk * 16u, kRelPitch);
-                        wmma::mma_sync(acc, a_frag, b_frag, acc);
-                    }
-                    wmma::store_matrix_sync(c2p_scores + chunk * 16u, acc, kRelPitch, wmma::mem_row_major);
+                    ANTFLY_CUDA_WMMA_DOT16_F32(
+                        half, wmma::row_major, kHeadDim,
+                        q_tile + d0, kHeadDim,
+                        kr_tile + d0 * kRelPitch + chunk * 16u, kRelPitch,
+                        c2p_scores + chunk * 16u, kRelPitch)
                 }
             }
 
@@ -131,17 +120,11 @@
                 for (unsigned int work = warp - 4u; work < 6u; work += 4u) {
                     const unsigned int key_chunk = work / 3u;
                     const unsigned int rel_chunk = work - key_chunk * 3u;
-                    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-                    wmma::fill_fragment(acc, 0.0f);
-                    #pragma unroll
-                    for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                        wmma::load_matrix_sync(a_frag, k_rows + (key_chunk * 16u) * kHeadDim + d0, kHeadDim);
-                        wmma::load_matrix_sync(b_frag, qr_tile + d0 * kRelPitch + rel_chunk * 16u, kRelPitch);
-                        wmma::mma_sync(acc, a_frag, b_frag, acc);
-                    }
-                    wmma::store_matrix_sync(p2c_scores + (key_chunk * 16u) * kRelPitch + rel_chunk * 16u, acc, kRelPitch, wmma::mem_row_major);
+                    ANTFLY_CUDA_WMMA_DOT16_F32(
+                        half, wmma::row_major, kHeadDim,
+                        k_rows + (key_chunk * 16u) * kHeadDim + d0, kHeadDim,
+                        qr_tile + d0 * kRelPitch + rel_chunk * 16u, kRelPitch,
+                        p2c_scores + (key_chunk * 16u) * kRelPitch + rel_chunk * 16u, kRelPitch)
                 }
             }
             __syncthreads();
@@ -206,49 +189,31 @@
             // Q*K^T has two M fragments.  The remaining warps produce the six
             // M32xR48 content-to-position fragments in parallel.
             if (warp < 2u) {
-                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-                wmma::fill_fragment(acc, 0.0f);
-                #pragma unroll
-                for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                    wmma::load_matrix_sync(a_frag, q_tile + warp * 16u * kHeadDim + d0, kHeadDim);
-                    wmma::load_matrix_sync(b_frag, k_tile + d0 * kKeyTile, kKeyTile);
-                    wmma::mma_sync(acc, a_frag, b_frag, acc);
-                }
-                wmma::store_matrix_sync(scores + warp * 16u * kKeyTile, acc, kKeyTile, wmma::mem_row_major);
+                ANTFLY_CUDA_WMMA_DOT16_F32(
+                    half, wmma::row_major, kHeadDim,
+                    q_tile + warp * 16u * kHeadDim + d0, kHeadDim,
+                    k_tile + d0 * kKeyTile, kKeyTile,
+                    scores + warp * 16u * kKeyTile, kKeyTile)
             }
             if (warp >= 2u) {
                 const unsigned int work = warp - 2u;
                 const unsigned int query_chunk = work / 3u;
                 const unsigned int rel_chunk = work - query_chunk * 3u;
-                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-                wmma::fill_fragment(acc, 0.0f);
-                #pragma unroll
-                for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                    wmma::load_matrix_sync(a_frag, q_tile + query_chunk * 16u * kHeadDim + d0, kHeadDim);
-                    wmma::load_matrix_sync(b_frag, kr_tile + d0 * kRelPitch + rel_chunk * 16u, kRelPitch);
-                    wmma::mma_sync(acc, a_frag, b_frag, acc);
-                }
-                wmma::store_matrix_sync(c2p_scores + query_chunk * 16u * kRelPitch + rel_chunk * 16u, acc, kRelPitch, wmma::mem_row_major);
+                ANTFLY_CUDA_WMMA_DOT16_F32(
+                    half, wmma::row_major, kHeadDim,
+                    q_tile + query_chunk * 16u * kHeadDim + d0, kHeadDim,
+                    kr_tile + d0 * kRelPitch + rel_chunk * 16u, kRelPitch,
+                    c2p_scores + query_chunk * 16u * kRelPitch + rel_chunk * 16u, kRelPitch)
             }
             __syncthreads();
 
             // K*Qr^T is M16xR48. It reuses warps after the first score phase.
             if (warp < 3u) {
-                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-                wmma::fill_fragment(acc, 0.0f);
-                #pragma unroll
-                for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                    wmma::load_matrix_sync(a_frag, k_rows + d0, kHeadDim);
-                    wmma::load_matrix_sync(b_frag, qr_tile + d0 * kRelPitch + warp * 16u, kRelPitch);
-                    wmma::mma_sync(acc, a_frag, b_frag, acc);
-                }
-                wmma::store_matrix_sync(p2c_scores + warp * 16u, acc, kRelPitch, wmma::mem_row_major);
+                ANTFLY_CUDA_WMMA_DOT16_F32(
+                    half, wmma::row_major, kHeadDim,
+                    k_rows + d0, kHeadDim,
+                    qr_tile + d0 * kRelPitch + warp * 16u, kRelPitch,
+                    p2c_scores + warp * 16u, kRelPitch)
             }
             __syncthreads();
 

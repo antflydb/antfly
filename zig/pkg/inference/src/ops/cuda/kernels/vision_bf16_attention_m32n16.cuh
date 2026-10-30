@@ -1,5 +1,6 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+#include "wmma_tile_program.cuh"
 // Shared head-64 WMMA online attention. Native kernel scope; no include guard.
 // Callers retain entry ABI and launch bounds. Storage policies preserve each
 // qualified F32/BF16 acquisition and publication boundary.
@@ -76,17 +77,11 @@
 
         // Two warps form the two 16-query halves of the 32x16 score tile.
         if (warp < 2u) {
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-            wmma::fill_fragment(acc, 0.0f);
-            #pragma unroll
-            for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;
-                wmma::load_matrix_sync(a_frag, q_tile + warp * 16u * kHeadDim + d0, kHeadDim);
-                wmma::load_matrix_sync(b_frag, k_tile + d0 * kKeyTile, kKeyTile);
-                wmma::mma_sync(acc, a_frag, b_frag, acc);
-            }
-            wmma::store_matrix_sync(scores + warp * 16u * kKeyTile, acc, kKeyTile, wmma::mem_row_major);
+            ANTFLY_CUDA_WMMA_DOT16_F32(
+                __nv_bfloat16, wmma::row_major, kHeadDim,
+                q_tile + warp * 16u * kHeadDim + d0, kHeadDim,
+                k_tile + d0 * kKeyTile, kKeyTile,
+                scores + warp * 16u * kKeyTile, kKeyTile)
         }
         __syncthreads();
 

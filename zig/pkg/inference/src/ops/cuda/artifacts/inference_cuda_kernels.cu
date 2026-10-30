@@ -20,6 +20,7 @@
 #include "../../../graph/templates/cuda_q4_0_bf16_staged.cuh"
 #include "../kernels/encoder_multimodal_programs.cuh"
 #include "../kernels/kernel_abi.cuh"
+#include "../kernels/wmma_tile_program.cuh"
 
 using namespace nvcuda;
 
@@ -15304,17 +15305,11 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attent
 
         // Q*K^T: two 16x16 fragments, one per warp.
         if (warp < 2u) {
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-            wmma::fill_fragment(acc, 0.0f);
-            #pragma unroll
-            for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-                wmma::load_matrix_sync(a_frag, q_tile + d0, kPitch);
-                wmma::load_matrix_sync(b_frag, k_rows + warp * 16u * kPitch + d0, kPitch);
-                wmma::mma_sync(acc, a_frag, b_frag, acc);
-            }
-            wmma::store_matrix_sync(scores + warp * 16u, acc, kKeyTile, wmma::mem_row_major);
+            ANTFLY_CUDA_WMMA_DOT16_F32(
+                half, wmma::col_major, kHeadDim,
+                q_tile + d0, kPitch,
+                k_rows + warp * 16u * kPitch + d0, kPitch,
+                scores + warp * 16u, kKeyTile)
         }
 
         // Q*Kr^T: three compact relative columns. Warp 2 handles chunks 0/2
@@ -15322,17 +15317,11 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attent
         if (warp == 2u || warp == 3u) {
             const unsigned int first_chunk = warp == 2u ? 0u : 1u;
             for (unsigned int chunk = first_chunk; chunk < 3u; chunk += 2u) {
-                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-                wmma::fill_fragment(acc, 0.0f);
-                #pragma unroll
-                for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-                    wmma::load_matrix_sync(a_frag, q_tile + d0, kPitch);
-                    wmma::load_matrix_sync(b_frag, kr_tile + chunk * 16u * kPitch + d0, kPitch);
-                    wmma::mma_sync(acc, a_frag, b_frag, acc);
-                }
-                wmma::store_matrix_sync(c2p_scores + chunk * 16u, acc, kRelPitch, wmma::mem_row_major);
+                ANTFLY_CUDA_WMMA_DOT16_F32(
+                    half, wmma::col_major, kHeadDim,
+                    q_tile + d0, kPitch,
+                    kr_tile + chunk * 16u * kPitch + d0, kPitch,
+                    c2p_scores + chunk * 16u, kRelPitch)
             }
         }
 
@@ -15342,17 +15331,11 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attent
             for (unsigned int work = warp - 4u; work < 6u; work += 4u) {
                 const unsigned int key_chunk = work / 3u;
                 const unsigned int rel_chunk = work - key_chunk * 3u;
-                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-                wmma::fill_fragment(acc, 0.0f);
-                #pragma unroll
-                for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-                    wmma::load_matrix_sync(a_frag, k_rows + (key_chunk * 16u) * kPitch + d0, kPitch);
-                    wmma::load_matrix_sync(b_frag, qr_tile + rel_chunk * 16u * kPitch + d0, kPitch);
-                    wmma::mma_sync(acc, a_frag, b_frag, acc);
-                }
-                wmma::store_matrix_sync(p2c_scores + (key_chunk * 16u) * kRelPitch + rel_chunk * 16u, acc, kRelPitch, wmma::mem_row_major);
+                ANTFLY_CUDA_WMMA_DOT16_F32(
+                    half, wmma::col_major, kHeadDim,
+                    k_rows + (key_chunk * 16u) * kPitch + d0, kPitch,
+                    qr_tile + rel_chunk * 16u * kPitch + d0, kPitch,
+                    p2c_scores + (key_chunk * 16u) * kRelPitch + rel_chunk * 16u, kRelPitch)
             }
         }
         __syncthreads();

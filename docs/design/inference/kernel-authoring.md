@@ -11,6 +11,7 @@ The agent-facing rules are in `zig/pkg/inference/src/ops/AGENTS.md`.
 |---|---|---|
 | Causal depthwise stencil | `src/ops/gpu/depthwise_program.h` | Weight order, history, fixed/dynamic kernel size, activation, separate product rounding and index width |
 | Spatial depthwise residual | `src/ops/cuda/prototypes/vision_f16_programs.cu` | Native 3x3 traversal and explicit FMA/add boundaries |
+| Native CUDA WMMA score products | `src/ops/cuda/kernels/wmma_tile_program.cuh` | F16/BF16 storage, B layout, depth, pitches and caller-owned shared arrays/fragment scope |
 | Row statistics and normalization | `src/ops/cuda/kernels/row_program.cuh` | Warp/block, shared tree and fixed-256 warp-finish reductions; publication dtype |
 | Rotary products and axes | `src/ops/cuda/kernels/rotary_program.cuh` and Metal rotary helpers | Axis-local versus head-wide halves, product rounding, frequency evaluation and upper-product order |
 | MPP projection | `antfly_mpp_affine`, `antfly_mpp_split_projection`, `TERMITE_MSL_MPP_GATE_PROGRAM` in `metal_kernels.m` | Rows/columns, SIMD groups, split-K, projection planes, F32/BF16 storage and finite-gate epilogue |
@@ -93,3 +94,7 @@ authored owners before estimating savings from expanded-shader similarity.
 
 `check_metal_dense_tiles.m` applies the same freeze/identity workflow to decoder
 and vision tiles, with separate half-stage and full-F32 reference contracts.
+
+`check_cuda_wmma_tiles.py` compares frozen CUDA images and independent references
+for the score-product family. For source-only phase sharing, verify both native
+resources and complete production-image identity with the pinned toolchain.
