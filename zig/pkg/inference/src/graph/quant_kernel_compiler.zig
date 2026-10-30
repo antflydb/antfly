@@ -30,6 +30,7 @@ const tensor_types = @import("../gguf/tensor_types.zig");
 const quant_kernel_op = @import("quant_kernel_op.zig");
 const kernel_jit = @import("kernel_jit.zig");
 const cuda_renderer = @import("quant_kernel_cuda_renderer.zig");
+const cuda_kernel_fold = @import("cuda_kernel_fold.zig");
 const metal_renderer = @import("quant_kernel_metal_renderer.zig");
 
 pub const metal_promotion_min_speedup: f64 = 1.02;
@@ -5179,14 +5180,14 @@ pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
         if (cudaFlashPrefillRenderPlanForArtifact(artifact)) |plan| {
             const plan_id = try cuda_renderer.flashPrefillPlanId(plan, allocator);
             defer allocator.free(plan_id);
-            const body = try cuda_renderer.renderFlashPrefillBodyAlloc(allocator, plan);
+            const body = try cuda_renderer.renderFlashPrefillBundleBodyAlloc(allocator, plan);
             defer allocator.free(body);
             try appendFmt(allocator, &out, "// kernel_id={s} plan_id={s}\n", .{ plan.kernel_id, plan_id });
             try out.appendSlice(allocator, body);
         } else if (cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact)) |plan| {
             const plan_id = try cuda_renderer.splitkOnlineDecodePlanId(plan, allocator);
             defer allocator.free(plan_id);
-            const body = try cuda_renderer.renderSplitkOnlineDecodeBodyAlloc(allocator, plan);
+            const body = try cuda_renderer.renderSplitkOnlineDecodeBundleBodyAlloc(allocator, plan);
             defer allocator.free(body);
             try appendFmt(allocator, &out, "// kernel_id={s} plan_id={s}\n", .{ plan.kernel_id, plan_id });
             try out.appendSlice(allocator, body);
@@ -5202,7 +5203,10 @@ pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
         emitted += 1;
     }
     if (emitted == 0) return error.MissingCudaAttentionRenderPlan;
-    return out.toOwnedSlice(allocator);
+    // Plans bake their shape constants in; share each repeated body.
+    const raw = try out.toOwnedSlice(allocator);
+    defer allocator.free(raw);
+    return cuda_kernel_fold.fold(allocator, raw);
 }
 
 /// The attention runtime region emits bodies only. Keep the block-reduction
@@ -5254,7 +5258,10 @@ pub fn renderCudaRuntimeDevMatmulRegion(allocator: std.mem.Allocator) ![]u8 {
         emitted += 1;
     }
     if (emitted == 0) return error.MissingCudaRenderPlan;
-    return out.toOwnedSlice(allocator);
+    // Plans bake their shape constants in; share each repeated body.
+    const raw = try out.toOwnedSlice(allocator);
+    defer allocator.free(raw);
+    return cuda_kernel_fold.fold(allocator, raw);
 }
 
 /// Verifies that renderer helpers intentionally kept outside the owned dev
@@ -8018,6 +8025,10 @@ test "quant kernel compiler paged CUDA address helpers stay in sync with the pro
     }
 }
 
+test {
+    _ = cuda_kernel_fold;
+}
+
 test "quant kernel compiler renders the runtime-wired CUDA attention region deterministically" {
     const first = try renderCudaRuntimeAttentionRegion(std.testing.allocator);
     defer std.testing.allocator.free(first);
@@ -8025,6 +8036,8 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expectEqual(@as(usize, 17), first_generated_attention_artifacts.len);
+    const unfolded = try cuda_kernel_fold.unfold(std.testing.allocator, first);
+    defer std.testing.allocator.free(unfolded);
 
     var runtime_wired_count: usize = 0;
     for (first_generated_attention_artifacts) |artifact| {
@@ -8047,7 +8060,7 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             };
             try std.testing.expectEqual(promoted, artifact.production_enabled);
             try std.testing.expectEqual(promoted, artifact.runtime_default_enabled);
-            const body = try cuda_renderer.renderFlashPrefillBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderFlashPrefillBundleBodyAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
         } else if (cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact)) |plan| {
@@ -8061,7 +8074,7 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, exported_symbol));
             try std.testing.expect(!artifact.production_enabled);
             try std.testing.expect(!artifact.runtime_default_enabled);
-            const body = try cuda_renderer.renderSplitkOnlineDecodeBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderSplitkOnlineDecodeBundleBodyAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
         } else {
@@ -8073,7 +8086,7 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, metadata));
             const body = try cuda_renderer.renderAttentionBodyAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
-            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, unfolded, body));
         }
     }
     try std.testing.expectEqual(@as(usize, 14), runtime_wired_count);
@@ -8089,6 +8102,8 @@ test "quant kernel compiler renders runtime-wired dev CUDA matmul candidates det
     const second = try renderCudaRuntimeDevMatmulRegion(std.testing.allocator);
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
+    const unfolded = try cuda_kernel_fold.unfold(std.testing.allocator, first);
+    defer std.testing.allocator.free(unfolded);
 
     var runtime_dev_count: usize = 0;
     for (first_generated_matmul_artifacts) |artifact| {
@@ -8103,7 +8118,7 @@ test "quant kernel compiler renders runtime-wired dev CUDA matmul candidates det
 
         const body = try cuda_renderer.renderBodyAlloc(std.testing.allocator, plan);
         defer std.testing.allocator.free(body);
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, unfolded, body));
         const declaration = try std.fmt.allocPrint(std.testing.allocator, "extern \"C\" __global__ void {s}(", .{plan.kernel_id});
         defer std.testing.allocator.free(declaration);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, declaration));
@@ -8118,6 +8133,8 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
     const attention_marker = "// quant-kernel-codegen:begin generated CUDA attention kernels";
     const attention_region_begin = std.mem.indexOf(u8, bundle, attention_marker) orelse return error.MissingCudaAttentionRuntimeMarker;
     try validateCudaRuntimeAttentionExternalHelpers(bundle[0..attention_region_begin]);
+    const unfolded_bundle = try cuda_kernel_fold.unfold(std.testing.allocator, bundle);
+    defer std.testing.allocator.free(unfolded_bundle);
     var runtime_cuda_attention_count: usize = 0;
     var standalone_cuda_attention_count: usize = 0;
     for (first_generated_attention_artifacts) |artifact| {
@@ -8142,7 +8159,7 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
             const bundle_metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, route_id });
             defer std.testing.allocator.free(bundle_metadata);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, bundle_metadata));
-            const body = try cuda_renderer.renderFlashPrefillBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderFlashPrefillBundleBodyAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, body));
         } else if (cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact)) |plan| {
@@ -8151,7 +8168,7 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
             const bundle_metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, route_id });
             defer std.testing.allocator.free(bundle_metadata);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, bundle_metadata));
-            const body = try cuda_renderer.renderSplitkOnlineDecodeBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderSplitkOnlineDecodeBundleBodyAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, body));
         } else {
@@ -8163,7 +8180,7 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, bundle_metadata));
             const body = try cuda_renderer.renderAttentionBodyAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
-            try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, body));
+            try std.testing.expect(std.mem.containsAtLeast(u8, unfolded_bundle, 1, body));
         }
     }
     try std.testing.expectEqual(@as(usize, 14), runtime_cuda_attention_count);

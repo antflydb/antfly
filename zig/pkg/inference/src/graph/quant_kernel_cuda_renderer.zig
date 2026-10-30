@@ -2087,8 +2087,8 @@ pub fn renderAttentionKernel(allocator: std.mem.Allocator, plan: AttentionRender
     return out.toOwnedSlice(allocator);
 }
 
-const flash_prefill_f16_sm89_template =
-    @embedFile("templates/cuda_gqa_flash_prefill_f16_sm89.cuh");
+const flash_prefill_f16_sm89_template_name = "cuda_gqa_flash_prefill_f16_sm89.cuh";
+const flash_prefill_f16_sm89_template = @embedFile("templates/" ++ flash_prefill_f16_sm89_template_name);
 
 pub fn flashPrefillPlanId(plan: FlashPrefillRenderPlan, allocator: std.mem.Allocator) ![]u8 {
     try plan.validate();
@@ -2104,9 +2104,32 @@ pub fn flashPrefillPlanId(plan: FlashPrefillRenderPlan, allocator: std.mem.Alloc
     );
 }
 
+/// Directory of the CUDA templates relative to the artifact bundle
+/// (`src/ops/cuda/artifacts/inference_cuda_kernels.cu`), which `#include`s
+/// them once per plan instead of carrying a copy each.
+pub const bundle_template_include_dir = "../../../graph/templates/";
+
 pub fn renderFlashPrefillBodyAlloc(
     allocator: std.mem.Allocator,
     plan: FlashPrefillRenderPlan,
+) ![]u8 {
+    return renderFlashPrefillBody(allocator, plan, .inline_template);
+}
+
+/// The bundle form: the plan's macros around an `#include` of the template.
+pub fn renderFlashPrefillBundleBodyAlloc(
+    allocator: std.mem.Allocator,
+    plan: FlashPrefillRenderPlan,
+) ![]u8 {
+    return renderFlashPrefillBody(allocator, plan, .include_template);
+}
+
+pub const TemplateEmission = enum { inline_template, include_template };
+
+fn renderFlashPrefillBody(
+    allocator: std.mem.Allocator,
+    plan: FlashPrefillRenderPlan,
+    emission: TemplateEmission,
 ) ![]u8 {
     try plan.validate();
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -2125,8 +2148,13 @@ pub fn renderFlashPrefillBodyAlloc(
         plan.lowering.head_dim,
         plan.lowering.sliding_window,
     });
-    try out.appendSlice(allocator, flash_prefill_f16_sm89_template);
-    if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
+    switch (emission) {
+        .inline_template => {
+            try out.appendSlice(allocator, flash_prefill_f16_sm89_template);
+            if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
+        },
+        .include_template => try out.appendSlice(allocator, "#include \"" ++ bundle_template_include_dir ++ flash_prefill_f16_sm89_template_name ++ "\"\n"),
+    }
     try out.appendSlice(allocator,
         \\#undef ANTFLY_FLASH_SLIDING_WINDOW
         \\#undef ANTFLY_FLASH_KV_HEADS
@@ -2178,8 +2206,8 @@ pub fn renderFlashPrefillKernel(
     return out.toOwnedSlice(allocator);
 }
 
-const splitk_online_decode_sm89_template =
-    @embedFile("templates/cuda_gqa_decode_splitk_online_sm89.cuh");
+const splitk_online_decode_sm89_template_name = "cuda_gqa_decode_splitk_online_sm89.cuh";
+const splitk_online_decode_sm89_template = @embedFile("templates/" ++ splitk_online_decode_sm89_template_name);
 
 pub fn splitkOnlineDecodePlanId(
     plan: SplitkOnlineDecodeRenderPlan,
@@ -2196,6 +2224,22 @@ pub fn splitkOnlineDecodePlanId(
 pub fn renderSplitkOnlineDecodeBodyAlloc(
     allocator: std.mem.Allocator,
     plan: SplitkOnlineDecodeRenderPlan,
+) ![]u8 {
+    return renderSplitkOnlineDecodeBody(allocator, plan, .inline_template);
+}
+
+/// The bundle form: the plan's macros around an `#include` of the template.
+pub fn renderSplitkOnlineDecodeBundleBodyAlloc(
+    allocator: std.mem.Allocator,
+    plan: SplitkOnlineDecodeRenderPlan,
+) ![]u8 {
+    return renderSplitkOnlineDecodeBody(allocator, plan, .include_template);
+}
+
+fn renderSplitkOnlineDecodeBody(
+    allocator: std.mem.Allocator,
+    plan: SplitkOnlineDecodeRenderPlan,
+    emission: TemplateEmission,
 ) ![]u8 {
     try plan.validate();
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -2214,8 +2258,13 @@ pub fn renderSplitkOnlineDecodeBodyAlloc(
         plan.lowering.sliding_window,
         plan.lowering.max_visible_tokens,
     });
-    try out.appendSlice(allocator, splitk_online_decode_sm89_template);
-    if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
+    switch (emission) {
+        .inline_template => {
+            try out.appendSlice(allocator, splitk_online_decode_sm89_template);
+            if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
+        },
+        .include_template => try out.appendSlice(allocator, "#include \"" ++ bundle_template_include_dir ++ splitk_online_decode_sm89_template_name ++ "\"\n"),
+    }
     try out.appendSlice(allocator,
         \\#undef ANTFLY_SPLITK_ONLINE_MAX_VISIBLE_TOKENS
         \\#undef ANTFLY_SPLITK_ONLINE_SLIDING_WINDOW
