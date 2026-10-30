@@ -18,6 +18,7 @@
 const Region = @import("../region.zig").Region;
 const msl = @import("../quant_metal_msl.zig");
 const wrap = @import("../quant_metal_wrap.zig");
+const gemv = @import("../quant_metal_gemv.zig");
 
 pub const regions = [_]Region{
     msl.raw("rows", @import("../quant_metal_rows.zig").region()),
@@ -38,4 +39,15 @@ pub const regions = [_]Region{
     msl.metal("q8_0_pair_activation_multiply_r_ext", wrap.q8_0_pair_activation_multiply_r_ext),
     msl.metal("q4_0_pair_activation_multiply_r_ext", wrap.q4_0_pair_activation_multiply_r_ext),
     msl.metal("q6_k_nbodd", wrap.q6_kNbOdd()),
+    msl.metal("gemv_q1_0", &.{ gemv.scalar("q1_0"), gemv.scalar("i8_s"), gemv.scalar("q4_0") }),
+    msl.metal("gemv_q4_1", &.{ gemv.scalar("q4_1"), gemv.reduce("q4_1"), gemv.scalar("q5_0"), gemv.reduce("q5_0"), gemv.scalar("q5_1"), gemv.reduce("q5_1") }),
+    msl.metal("gemv_q8_0", &.{gemv.scalar("q8_0")}),
+    msl.metal("gemv_q8_1", &.{ gemv.scalar("q8_1"), gemv.reduce("q8_1") }),
+    msl.metal("gemv_q8_k", &.{ gemv.scalar("q8_k"), gemv.reduce("q8_k") }),
+    msl.metal("gemv_q2_k", &.{ gemv.scalar("q2_k"), gemv.scalar("q3_k"), gemv.scalar("q4_k") }),
+    msl.metal("gemv_q5_k", &.{gemv.scalar("q5_k")}),
+    msl.metal("gemv_q6_k", &.{gemv.scalar("q6_k")}),
+    msl.metal("gemv_iq4_nl", &.{ gemv.scalar("iq4_nl"), gemv.reduce("iq4_nl"), gemv.scalar("iq4_xs"), gemv.reduce("iq4_xs"), gemv.scalar("mxfp4"), gemv.reduce("mxfp4") }),
+    msl.metal("gemv_nvfp4", &.{gemv.scalar("nvfp4")}),
+    msl.metal("gemv_iq2_xs", &.{gemv.scalar("iq2_xs")}),
 };

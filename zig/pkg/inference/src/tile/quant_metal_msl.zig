@@ -25,7 +25,7 @@ const std = @import("std");
 const r = @import("region.zig");
 
 /// `${name}` in `t` becomes `@field(args, name)`: a string, or an integer
-/// printed in decimal.
+/// printed in decimal. `$$` is a literal `$`.
 pub fn fill(comptime t: []const u8, comptime args: anytype) []const u8 {
     comptime {
         @setEvalBranchQuota(100_000_000);
@@ -33,6 +33,13 @@ pub fn fill(comptime t: []const u8, comptime args: anytype) []const u8 {
         var start: usize = 0;
         var i: usize = 0;
         while (i + 1 < t.len) {
+            if (t[i] == '$' and t[i + 1] == '$') {
+                // `$$` is a literal `$`, so `$${x}` leaves a hole for a later fill.
+                parts = parts ++ .{t[start .. i + 1]};
+                i += 2;
+                start = i;
+                continue;
+            }
             if (t[i] != '$' or t[i + 1] != '{') {
                 i += 1;
                 continue;
