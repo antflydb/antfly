@@ -98,6 +98,13 @@ the current table, even though the current table does not exist yet. For an
 existing archive, keep its definition intact and generate unique current index
 names before creating the missing table.
 
+The `body_text` index retains the complete source projection so `created_at` and
+`hn_id` have typed sort values. Search requests still match and highlight only
+`body`. Setting the index's `field` to `body` removes those metadata sort values
+and makes date ordering fail with `field_not_sort_ready`. Existing body-only
+indexes must be rebuilt with the complete projection; changing the plan alone
+does not repair deployed indexes. Keep source tables and CDC ownership intact.
+
 Supply `ANTFLY_API_BASE` including the complete tenant `/cloud/v1/UUID/db/v1` path.
 Use either `ANTFLY_AUTHORIZATION` (the complete header value) or `ANTFLY_API_KEY`
 (a bare key); never both. Authenticated destinations require HTTPS. The gateway
