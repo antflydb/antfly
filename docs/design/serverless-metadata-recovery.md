@@ -235,3 +235,17 @@ whole-window diagnostics before proceeding to the three hour-long trials and
 [the hosted proposal](cloudflare-twofold-trial.md); credential/cleanup approval
 is pending. No new cloud resources were deployed for these local experiments.
 The historical live `SQLITE_NOMEM` and the hosted gate remain unresolved.
+
+The local work is sealed at
+`examples/cloudflare-serverless/dist/qualification/twofold-serving-1793396451217/evidence.json`:
+568 verified artifacts / 1,172,967,209 bytes, source `616de21b41`, manifest SHA-256
+`70709e3f200a133d98180e588a4da25ad0ed28940ba4f44000548a2022a2141e`.
+It includes original and final modules, frozen sources, all local reports,
+unpromoted prototypes, interrupted attempts, test logs and the original
+undeployed proposal without credential files. All 1,069 artifacts in the prior
+hosted-investigation closure re-verify with no missing files or changed hashes.
+The earlier path-base error in the audit is explicitly superseded by its
+corrected audit; it did not indicate missing experimental evidence. The older
+163-artifact availability gap remains historical. Guarded `make gc` was attempted
+after the build/test sessions and skipped because a native build was active or
+process inspection was unavailable; no guard was bypassed.
