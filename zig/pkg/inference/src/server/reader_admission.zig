@@ -59,11 +59,18 @@ pub fn CohortMemory(comptime Hooks: type) type {
             // escaping outputs retain their original admission below. The
             // scratch estimate is independent of KV dtype; its KV result is
             // deliberately discarded, rather than replacing the page estimate.
+            // The generic estimate includes persistent CUDA histories. Remove
+            // them from shareable workspace; the per-page persistent lease below
+            // charges that same history once, independently of the GPU gate.
+            const recurrent_bytes = try runtime.tier.memory.gptRecurrentBackendStateBytes(self.backend, cfg);
+            if (decoder.backend_scratch_bytes < recurrent_bytes) return error.ResourceLimitExceeded;
+            var transient_decoder = decoder;
+            transient_decoder.backend_scratch_bytes -= recurrent_bytes;
             const working_scratch = if (self.prefill_query_chunk_rows != 0)
-                (try runtime.tier.memory.estimateGptGeneration(self.backend, .f16, cfg, prompt_tokens, output_tokens, working_rows)).scratch_bytes
+                (try runtime.tier.memory.estimateGptGeneration(self.backend, .f16, cfg, prompt_tokens, output_tokens, working_rows)).scratch_bytes - recurrent_bytes
             else
-                decoder.backend_scratch_bytes;
-            var retained_decoder = decoder;
+                transient_decoder.backend_scratch_bytes;
+            var retained_decoder = transient_decoder;
             if (self.share_decoder_scratch) {
                 // A single GPU gate owns prefill and decode. Their frame
                 // resources retire after their last queued consumer. CUDA may
@@ -78,7 +85,7 @@ pub fn CohortMemory(comptime Hooks: type) type {
                 // GPU gate returns. Full projected inputs remain charged below,
                 // together with KV, recurrent history and both working sets.
                 const retained = if (self.packed_mixed) logits else std.math.add(usize, logits, hidden) catch return error.ResourceLimitExceeded;
-                retained_decoder.backend_scratch_bytes = @min(decoder.backend_scratch_bytes, retained);
+                retained_decoder.backend_scratch_bytes = @min(transient_decoder.backend_scratch_bytes, retained);
                 if (!cfg.qwen35_device_only_state)
                     retained_decoder.host_scratch_bytes = std.math.add(usize, retained_decoder.host_scratch_bytes, logits) catch return error.ResourceLimitExceeded;
                 // Bound both an active and submitted set, plus the complete
