@@ -108,7 +108,10 @@ The byte bound means eight records is a maximum, not a guaranteed amortization
 factor. Larger workloads and sustained concurrent writers can force foreground
 folds. Report their latency and deferred work rather than claiming a one-upload
 write for every payload or provider. Native GCS hot-key constraints also remain
-unchanged by this format.
+unchanged by this format: [GCS documents a one-write-per-second limit for the
+same object name](https://docs.cloud.google.com/storage/quotas#objects). A direct
+provider HEAD is not the high-throughput immutable-slot adapter, and these local
+results do not establish GCS or S3 performance parity.
 
 ## Direct point routing and canonical bodies
 
@@ -188,3 +191,73 @@ from `15d9857127`, including full WASM
 The regenerated matching modules live in a new recovery directory with a rebuild
 log and attestation; no old evidence paths were repopulated or relabeled.
 New comparisons must include these modules in their own complete evidence closure.
+
+## Committed local results, October 30
+
+Implementation `9e70fb940c` and harness `215fb1e9c3` were checked with the pinned
+release toolchain. Full WASM SHA-256 is
+`9711adb54900fe7c494fb16a8fa0675b1e83ca2eba9a598bb9a6b0d79759f02c`.
+The control rebuild matches its recorded `2f2ac2ba…` binary; every case uses
+identical app/writer/reader/builder JavaScript bundle hashes. The final matrix
+contains 34 verified cases, including independent format toggles, reversed
+orders, zero/20/50 ms injected binding delay and traced outcome checks.
+
+The strongest paired comparison additionally uses identical per-tenant namespace
+and storage keys in fresh isolated stores (`--fixed-namespace`), removing the
+variant-specific names used in exploratory runs. Each case has four tenants,
+512 1 KiB documents per tenant, 128 fenced reads and 64 writes. Capacities,
+visibility guarantees and timeouts are unchanged. Completed fenced views may be
+reused within their original lifetime; these are sequential dependency-depth
+experiments, not an offered-load throughput test or physical-cold qualification.
+Initial namespace probes occur before delay injection.
+
+Ranges below are the two trial orders, not confidence intervals:
+
+| Injected delay | Measure | Control | Packed blocks + deferred indexes |
+| --- | --- | ---: | ---: |
+| 20 ms | Read p95 | 28.72–30.13 ms | 28.91–29.70 ms |
+| 20 ms | Write median | 63.19–64.06 ms | 33.51–34.06 ms |
+| 20 ms | Write p95 | 84.38–88.98 ms | 60.00–60.19 ms |
+| 50 ms | Read p95 | 58.87–59.22 ms | 58.72–59.30 ms |
+| 50 ms | Write median | 123.07 ms | 63.54–63.72 ms |
+| 50 ms | Write p95 | 175.80–177.19 ms | 118.23–120.80 ms |
+
+Write p95 improves about 29–33%; write median improves about 47–48%. Read p95 is
+essentially unchanged. Observed 20 ms burst writer PUT counts fall from 281 to
+77 in both orders. These counters include background activity and can be
+captured while such work is still active; they are not a per-write accounting
+proof. The native protocol test separately proves that an eligible append uses
+one HEAD GET and one CAS without private page uploads.
+
+Separate packing/point-routing toggles do not consistently lower latency, and
+some exploratory/zero-delay runs regress. Keep the flags opt-in. The earlier
+packed-read failures and the failed validations remain in the evidence set.
+Directory payload ownership, allocation-headroom checks, format-aware lease
+recognition, coalesced overflow folding and pre-ack projection validation are
+part of the committed implementation; larger limits and hidden retries are not
+its performance mechanism. No overall twofold or fourfold p95 result is claimed.
+
+Both traced control/candidate cases record zero failed native outcomes and zero
+resource failure codes. Regressions pass: 449 Node tests, 42 actual-workerd tests,
+one mail integration, 55 focused native checks (one additional live case skips),
+the native bootstrap check, and 183 shared object-store tests (two live-provider
+cases skip). Mail retains its pre-existing RPC-result-disposal warning. These
+checks do not establish exhaustive production allocator/provider coverage.
+
+Evidence is sealed at
+`dist/qualification/compact-serving-1793348334397/evidence.json`: 245 artifacts,
+243,508,748 bytes, manifest SHA-256
+`7975c3b6ea2faf9a9c30d70e8dcd24de1d72734da360ca7f006773b7f8d1784b`.
+Every new artifact was independently hashed after sealing. The seal includes
+source, committed modules, the matching reconstructed control, experimental
+module catalogs, reports, failed attempts and the prior-closure audit. It
+preserves the 163 missing prior artifacts as an explicit availability gap, with
+zero hash changes among surviving prior artifacts. It does not rewrite old
+closures or include credentials. The disposable control worktree was removed;
+`make gc` honored the active-native-build guard and deferred shared cleanup.
+
+No paid Cloudflare resources were created. Actual placement remains unverified.
+The hosted gate still requires complete compact/window-indexed diagnostics,
+verbose-archive separation, a short paired provider run using fresh probe/cold
+identities as appropriate, then the original three paired hour trials and 100
+physical-cold epochs. Recovered live `SQLITE_NOMEM` is not declared vendor-fixed.
