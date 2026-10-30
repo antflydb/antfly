@@ -2520,3 +2520,43 @@ Apache boundary (2,338 source files), license, formatting, final source/binary
 identity and whitespace checks pass. `make gc` completed its safety check; the
 collector skipped deletion under its native-build/process-inspection safety guard.
 Real-provider retention qualification remains deferred.
+
+## Adaptive publication and wide covering reads
+
+The [retained observation](adaptive-publication-and-covering-v1-observation.json)
+qualifies runtime `5549fbc7e1138a8f4bfb94fd891afcad48c928ae` with main
+`2011275565877bae7deff19b786b82f371a45345` merged. Runtime ABI **77**, reader
+protocol **97** and persisted layouts remain unchanged.
+
+A cold **128-column, 32-row** covering pack previously required **nine range
+GETs** for **72,622 bytes**. Planning the complete selected stripe set before
+splitting bounded physical job waves reduces that to **one GET for the same
+bytes**. Warm reads make zero GETs. A fresh-scope sparse projection fetches only
+identity and its two required stripes, in two GETs; uncached full projection
+also uses one GET. Every selected value is checked independently. These are
+instrumented FS provider-call counts, not cloud-latency or query-throughput
+measurements.
+
+Publication now shares keyed sort admission and unread-reference retention with
+result delivery, while keeping its own **256-row / 512-KiB caller target**.
+Ordinary indirect result delivery retains its **64-row / 128-KiB target**. Under
+**1 MiB additional headroom**, an 8,192-row, eight-column fixture previously
+failed before its first publication batch. The adaptive stream drains every row,
+with every sorted key and ordinal-tagged value independently checked. Existing
+owning and grouped-delivery controls also complete. Both resident and spilled
+32-row mixed-type covering fixtures retain a full pack without pressure and
+match owning artifact bytes. Independent publications use independent input
+sorts; leased publication is single-pass.
+
+Range tests cover all-wave byte/gap charging, zero-budget refusal, partial-wave
+and allocation failures, and cancellation of an earlier parked provider after a
+later read fails. The final source passes **114 shared and 81 API checks** with
+no failures, skips or leaks. The frozen server passes **50 real Parquet/Iceberg
+E2E cases in 371.08 seconds**, including cold/warm reads, restarts,
+highlights, wide projections, exact values, deletes, ordering and refresh.
+Its SHA-256 is
+`501cd6347f8289535ad58a09e3bf83966ae35c3eb96a5f9810e9901f5f24f3b7`.
+The observation records exact commands, source hashes and retained log hashes. Apache boundary (2,338 source files),
+license, formatting and whitespace checks pass. Earlier kernel measurements
+retain their original source identities; no new CPU or RSS claim is made.
+Real-provider retention qualification remains deferred.
