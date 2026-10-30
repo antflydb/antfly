@@ -34,5 +34,6 @@ pub const regions = [_]r.Region{
     metal("reduce.scan", rows.scanRegion()),
     metal("reduce.qwen35_norm", rows.qwen35NormRegion()),
     metal("reduce.lightonocr3_norm", rows.lightonocr3NormRegion()),
+    metal("reduce.lightonocr3_norm_cached", rows.lightonocr3CachedRegion()),
     metal("reduce.sample", sample.metalRegion()),
 };
