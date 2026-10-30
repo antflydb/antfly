@@ -6895,3 +6895,29 @@ test "lite segment directory open preserves checkpoint and durable files" {
     defer a.free(data);
     try std.testing.expectEqualStrings("immutable segment payload", data);
 }
+
+test "empty lite persistent reopen preserves checkpoint" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/persistent-open.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    // Isolate index recovery from independent background page reclamation.
+    docs.maintenance_start_suppressed = true;
+    var storage = lite_indexes.Store.init(a, &docs);
+    const opts = PersistentIndexOptions{ .path = "/lite-text", .io = std.testing.io, .main_lsm_storage = storage.storage(), .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true };
+    {
+        var index = try PersistentIndex.open(a, opts);
+        defer index.close();
+    }
+    const before = docs.file.activeCheckpoint();
+    var reopened = try PersistentIndex.open(a, opts);
+    defer reopened.close();
+    try std.testing.expectEqualDeep(before, docs.file.activeCheckpoint());
+    try std.testing.expectEqual(@as(u32, 0), reopened.snapshot().liveDocCount());
+}
