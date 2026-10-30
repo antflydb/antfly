@@ -7248,6 +7248,54 @@ static NSString *termite_metal_tensor_program_source(void) {
     "            sum += simd_shuffle_xor(sum, 1); sum += simd_shuffle_xor(sum, 2);\n" \
     "            if (L % 4u == 0u) { lrow[r] = lrow[r] * a + sum; mrow[r] = mnew; alpha[r] = a; }\n"
 
+// Dense Q16 phases keep single-head and paired-head storage and native schedules.
+// Direct-half and staged tails retain their original casts, strides and barriers.
+#define ANTFLY_MSL_DENSE_Q16_QK(Key,Query,StagedKey,Score) \
+    "        for (uint rb = 0u; rb < 2u; ++rb) {\n" \
+    "            simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f);\n" \
+    "            if (fast) { const device half *kbase = " Key "; for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, " Query ", hd); simdgroup_load(mk, kbase + d, kv_stride, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }\n" \
+    "            else { for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, " Query ", hd); simdgroup_load(mk, " StagedKey ", hd, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }\n" \
+    "            simdgroup_store(ms, " Score ", 32u, 0, false);\n" \
+    "        }\n"
+
+#define ANTFLY_MSL_DENSE_CAUSAL_SCORE(Score) \
+    "            bool allowed = ki < p.kv_len && qi < p.q_len;\n" \
+    "            if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }\n" \
+    "            float sc = allowed ? " Score " : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f;\n"
+
+#define ANTFLY_MSL_DENSE_Q16_PV(Branch,Probability,LoadValue) \
+    "        " Branch " { for (uint rb = 0u; rb < 2u; ++rb) { for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[rb * d_tiles + dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, " Probability ", 32u); " LoadValue " simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[rb * d_tiles + dt] = acc; } } }\n"
+
+#define ANTFLY_MSL_DENSE_Q16_RESCALE(Diagonal) \
+    "        for (uint rb = 0u; rb < 2u; ++rb) { simdgroup_float8x8 mcorr; simdgroup_load(mcorr, " Diagonal ", 8u); for (uint i = 0u; i < d_tiles; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[rb * d_tiles + i]); mo[rb * d_tiles + i] = scaled; } }\n"
+
+#define ANTFLY_MSL_DENSE_Q16_NORMALIZE(Diagonal) \
+    "    for (uint rb = 0u; rb < 2u; ++rb) { simdgroup_float8x8 minv; simdgroup_load(minv, " Diagonal ", 8u); for (uint dt = 0u; dt < d_tiles; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[rb * d_tiles + dt]); simdgroup_store(scaled, so + uint(sgitg) * (16u * (hd / 4u)) + rb * 8u * (hd / 4u) + dt * 8u, hd / 4u, 0, false); } }\n"
+
+#define ANTFLY_MSL_DENSE_Q16_STAGE(Width,Sample) \
+    "for (uint i = uint(tid); i < 32u * hd; i += " Width ") { uint kk = i / hd; uint d = i - kk * hd; uint ki = kc + kk; skv[i] = ki < p.kv_len ? " Sample " : half(0.0f); }"
+
+#define ANTFLY_MSL_VISION64_STAGE(Tile,Sample) \
+    "for (uint i = uint(tid); i < 2048u; i += 256u) { const uint kr = i >> 6u; const uint d = i & 63u; const uint ki = key_start + kr; skv[i] = ki < p.seq_len ? " Tile "(" Sample ") : " Tile "(0.0f); }"
+
+#define ANTFLY_MSL_VISION64_QK(Matrix) \
+    "simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f); for (uint d = 0u; d < 64u; d += 8u) { " Matrix " mq; " Matrix " mk; simdgroup_load(mq, sq + qgroup * 512u + d, 64u); simdgroup_load(mk, skv + subgroup * 512u + d, 64u, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } simdgroup_store(ms, ss + qgroup * 256u + subgroup * 8u, 32u);"
+
+#define ANTFLY_MSL_VISION64_ONLINE(Passes,Tile) \
+    "for (uint pass = 0u; pass < " Passes "; ++pass) { const uint j = uint(sgitg) + pass * 8u; const uint qi = q0 + j; const uint kk = uint(lane); const uint ki = key_start + kk; float sc = qi < p.seq_len && ki < p.seq_len ? ss[j * 32u + kk] : neg_inf; if (!isfinite(sc)) sc = neg_inf; const float row_max = simd_max(sc); const float m_old = sM[j]; const float m_new = max(m_old, row_max); float corr = 0.0f; float e = 0.0f; if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; } sp[j * 32u + kk] = " Tile "(e); const float row_sum = simd_sum(e); if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; const uint local_j = j & 7u; sdiag[(j >> 3u) * 64u + local_j * 8u + local_j] = corr; } }"
+
+#define ANTFLY_MSL_VISION64_PV(Matrix,Accumulator) \
+    "for (uint kk8 = 0u; kk8 < 4u; ++kk8) { " Matrix " mp; simdgroup_load(mp, sp + qgroup * 256u + kk8 * 8u, 32u); for (uint dt = 0u; dt < 2u; ++dt) { " Matrix " mv; simdgroup_load(mv, skv + kk8 * 512u + dslice + dt * 8u, 64u); simdgroup_multiply_accumulate(" Accumulator ", mp, mv, " Accumulator "); } }"
+
+#define ANTFLY_MSL_VISION64_DIAGONAL(Rows) \
+    "    if (tid < " Rows ") { const uint local_j = uint(tid) & 7u; const float denom = sS[tid]; sdiag[(uint(tid) >> 3u) * 64u + local_j * 8u + local_j] = denom > 0.0f ? 1.0f / denom : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+
+#define ANTFLY_MSL_VISION64_TAIL() \
+    "threadgroup_barrier(mem_flags::mem_threadgroup); const uint valid_rows = p.seq_len - q0; for (uint i = uint(tid); i < valid_rows * 64u; i += 256u) { const uint qr = i >> 6u; const uint d = i & 63u; const uint owner = (qr >> 3u) * 4u + (d >> 4u); const uint local_r = qr & 7u; const uint local_d = d & 15u; output[(b * p.seq_len + q0 + qr) * hidden + h * 64u + d] = so[owner * 128u + local_r * 16u + local_d]; }"
+
+#define ANTFLY_MSL_VISION64_SCALE(Scale,Accumulator) \
+    "for (uint dt = 0u; dt < 2u; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, " Scale ", " Accumulator "); " Accumulator " = scaled; }"
+
 static NSString *termite_metal_shader_source(void) {
     return [[NSString stringWithUTF8String:antfly_msl_depthwise_source] stringByAppendingString:@"#include <metal_stdlib>\n"
            "using namespace metal;\n"
@@ -13669,22 +13717,22 @@ static NSString *termite_metal_shader_source(void) {
            "    if (tid < 16u) { sM[tid] = neg_inf; sS[tid] = 0.0f; } if (tid < 128u) sdiag[tid] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    simdgroup_float8x8 mo[2]; mo[0] = make_filled_simdgroup_matrix<float, 8>(0.0f); mo[1] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "    for (uint key_start = 0u; key_start < p.seq_len; key_start += 32u) {\n"
-           "        for (uint i = uint(tid); i < 2048u; i += 256u) { const uint kr = i >> 6u; const uint d = i & 63u; const uint ki = key_start + kr; skv[i] = ki < p.seq_len ? half(k[(b * p.seq_len + ki) * hidden + h * 64u + d]) : half(0.0f); }\n"
+           "        " ANTFLY_MSL_VISION64_STAGE("half", "k[(b * p.seq_len + ki) * hidden + h * 64u + d]") "\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f); for (uint d = 0u; d < 64u; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + qgroup * 512u + d, 64u); simdgroup_load(mk, skv + subgroup * 512u + d, 64u, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } simdgroup_store(ms, ss + qgroup * 256u + subgroup * 8u, 32u);\n"
+           "        " ANTFLY_MSL_VISION64_QK("simdgroup_half8x8") "\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint pass = 0u; pass < 2u; ++pass) { const uint j = uint(sgitg) + pass * 8u; const uint qi = q0 + j; const uint kk = uint(lane); const uint ki = key_start + kk; float sc = qi < p.seq_len && ki < p.seq_len ? ss[j * 32u + kk] : neg_inf; if (!isfinite(sc)) sc = neg_inf; const float row_max = simd_max(sc); const float m_old = sM[j]; const float m_new = max(m_old, row_max); float corr = 0.0f; float e = 0.0f; if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; } sp[j * 32u + kk] = half(e); const float row_sum = simd_sum(e); if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; const uint local_j = j & 7u; sdiag[(j >> 3u) * 64u + local_j * 8u + local_j] = corr; } }\n"
+           "        " ANTFLY_MSL_VISION64_ONLINE("2u", "half") "\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag + qgroup * 64u, 8u); for (uint dt = 0u; dt < 2u; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[dt]); mo[dt] = scaled; }\n"
-           "        for (uint i = uint(tid); i < 2048u; i += 256u) { const uint kr = i >> 6u; const uint d = i & 63u; const uint ki = key_start + kr; skv[i] = ki < p.seq_len ? half(v[(b * p.seq_len + ki) * hidden + h * 64u + d]) : half(0.0f); }\n"
+           "        simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag + qgroup * 64u, 8u); " ANTFLY_MSL_VISION64_SCALE("mcorr", "mo[dt]") "\n"
+           "        " ANTFLY_MSL_VISION64_STAGE("half", "v[(b * p.seq_len + ki) * hidden + h * 64u + d]") "\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_load(mp, sp + qgroup * 256u + kk8 * 8u, 32u); for (uint dt = 0u; dt < 2u; ++dt) { simdgroup_half8x8 mv; simdgroup_load(mv, skv + kk8 * 512u + dslice + dt * 8u, 64u); simdgroup_multiply_accumulate(mo[dt], mp, mv, mo[dt]); } }\n"
+           "        " ANTFLY_MSL_VISION64_PV("simdgroup_half8x8", "mo[dt]") "\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
-           "    if (tid < 16u) { const uint local_j = uint(tid) & 7u; const float denom = sS[tid]; sdiag[(uint(tid) >> 3u) * 64u + local_j * 8u + local_j] = denom > 0.0f ? 1.0f / denom : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    simdgroup_float8x8 minv; simdgroup_load(minv, sdiag + qgroup * 64u, 8u); for (uint dt = 0u; dt < 2u; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[dt]); mo[dt] = scaled; }\n"
+           ANTFLY_MSL_VISION64_DIAGONAL("16u")
+           "    simdgroup_float8x8 minv; simdgroup_load(minv, sdiag + qgroup * 64u, 8u); " ANTFLY_MSL_VISION64_SCALE("minv", "mo[dt]") "\n"
            "    const uint output_base = (b * p.seq_len + q0 + qgroup * 8u) * hidden + h * 64u + dslice; if (q0 + 16u <= p.seq_len) { for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[dt], output + output_base + dt * 8u, hidden); return; }\n"
-           "    for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[dt], so + uint(sgitg) * 128u + dt * 8u, 16u); threadgroup_barrier(mem_flags::mem_threadgroup); const uint valid_rows = p.seq_len - q0; for (uint i = uint(tid); i < valid_rows * 64u; i += 256u) { const uint qr = i >> 6u; const uint d = i & 63u; const uint owner = (qr >> 3u) * 4u + (d >> 4u); const uint local_r = qr & 7u; const uint local_d = d & 15u; output[(b * p.seq_len + q0 + qr) * hidden + h * 64u + d] = so[owner * 128u + local_r * 16u + local_d]; }\n"
+           "    for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[dt], so + uint(sgitg) * 128u + dt * 8u, 16u); " ANTFLY_MSL_VISION64_TAIL() "\n"
            "}\n"
            // Q32 version of the dense vision FlashAttention tile. Each SIMD
            // group owns the same 16-column output slice for two eight-query
@@ -13706,22 +13754,22 @@ static NSString *termite_metal_shader_source(void) {
            "    if (tid < 32u) { sM[tid] = neg_inf; sS[tid] = 0.0f; } if (tid < 256u) sdiag[tid] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    simdgroup_float8x8 mo[2][2]; for (uint qp = 0u; qp < 2u; ++qp) for (uint dt = 0u; dt < 2u; ++dt) mo[qp][dt] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
            "    for (uint key_start = 0u; key_start < p.seq_len; key_start += 32u) {\n"
-           "        for (uint i = uint(tid); i < 2048u; i += 256u) { const uint kr = i >> 6u; const uint d = i & 63u; const uint ki = key_start + kr; skv[i] = ki < p.seq_len ? Tile(k[(b * p.seq_len + ki) * hidden + h * 64u + d]) : Tile(0.0f); }\n"
+           "        " ANTFLY_MSL_VISION64_STAGE("Tile", "k[(b * p.seq_len + ki) * hidden + h * 64u + d]") "\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f); for (uint d = 0u; d < 64u; d += 8u) { simdgroup_matrix<Tile, 8, 8> mq; simdgroup_matrix<Tile, 8, 8> mk; simdgroup_load(mq, sq + qgroup * 512u + d, 64u); simdgroup_load(mk, skv + subgroup * 512u + d, 64u, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } simdgroup_store(ms, ss + qgroup * 256u + subgroup * 8u, 32u); }\n"
+           "        for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; " ANTFLY_MSL_VISION64_QK("simdgroup_matrix<Tile, 8, 8>") " }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint pass = 0u; pass < 4u; ++pass) { const uint j = uint(sgitg) + pass * 8u; const uint qi = q0 + j; const uint kk = uint(lane); const uint ki = key_start + kk; float sc = qi < p.seq_len && ki < p.seq_len ? ss[j * 32u + kk] : neg_inf; if (!isfinite(sc)) sc = neg_inf; const float row_max = simd_max(sc); const float m_old = sM[j]; const float m_new = max(m_old, row_max); float corr = 0.0f; float e = 0.0f; if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; } sp[j * 32u + kk] = Tile(e); const float row_sum = simd_sum(e); if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; const uint local_j = j & 7u; sdiag[(j >> 3u) * 64u + local_j * 8u + local_j] = corr; } }\n"
+           "        " ANTFLY_MSL_VISION64_ONLINE("4u", "Tile") "\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag + qgroup * 64u, 8u); for (uint dt = 0u; dt < 2u; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[qp][dt]); mo[qp][dt] = scaled; } }\n"
-           "        for (uint i = uint(tid); i < 2048u; i += 256u) { const uint kr = i >> 6u; const uint d = i & 63u; const uint ki = key_start + kr; skv[i] = ki < p.seq_len ? Tile(v[(b * p.seq_len + ki) * hidden + h * 64u + d]) : Tile(0.0f); }\n"
+           "        for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag + qgroup * 64u, 8u); " ANTFLY_MSL_VISION64_SCALE("mcorr", "mo[qp][dt]") " }\n"
+           "        " ANTFLY_MSL_VISION64_STAGE("Tile", "v[(b * p.seq_len + ki) * hidden + h * 64u + d]") "\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_matrix<Tile, 8, 8> mp; simdgroup_load(mp, sp + qgroup * 256u + kk8 * 8u, 32u); for (uint dt = 0u; dt < 2u; ++dt) { simdgroup_matrix<Tile, 8, 8> mv; simdgroup_load(mv, skv + kk8 * 512u + dslice + dt * 8u, 64u); simdgroup_multiply_accumulate(mo[qp][dt], mp, mv, mo[qp][dt]); } } }\n"
+           "        for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; " ANTFLY_MSL_VISION64_PV("simdgroup_matrix<Tile, 8, 8>", "mo[qp][dt]") " }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
-           "    if (tid < 32u) { const uint local_j = uint(tid) & 7u; const float denom = sS[tid]; sdiag[(uint(tid) >> 3u) * 64u + local_j * 8u + local_j] = denom > 0.0f ? 1.0f / denom : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; simdgroup_float8x8 minv; simdgroup_load(minv, sdiag + qgroup * 64u, 8u); for (uint dt = 0u; dt < 2u; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[qp][dt]); mo[qp][dt] = scaled; } }\n"
+           ANTFLY_MSL_VISION64_DIAGONAL("32u")
+           "    for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; simdgroup_float8x8 minv; simdgroup_load(minv, sdiag + qgroup * 64u, 8u); " ANTFLY_MSL_VISION64_SCALE("minv", "mo[qp][dt]") " }\n"
            "    if (q0 + 32u <= p.seq_len) { for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; const uint output_base = (b * p.seq_len + q0 + qgroup * 8u) * hidden + h * 64u + dslice; for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[qp][dt], output + output_base + dt * 8u, hidden); } return; }\n"
-           "    for (uint qp = 0u; qp < 2u; ++qp) for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[qp][dt], so + (uint(sgitg) + qp * 8u) * 128u + dt * 8u, 16u); threadgroup_barrier(mem_flags::mem_threadgroup); const uint valid_rows = p.seq_len - q0; for (uint i = uint(tid); i < valid_rows * 64u; i += 256u) { const uint qr = i >> 6u; const uint d = i & 63u; const uint owner = (qr >> 3u) * 4u + (d >> 4u); const uint local_r = qr & 7u; const uint local_d = d & 15u; output[(b * p.seq_len + q0 + qr) * hidden + h * 64u + d] = so[owner * 128u + local_r * 16u + local_d]; }\n"
+           "    for (uint qp = 0u; qp < 2u; ++qp) for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[qp][dt], so + (uint(sgitg) + qp * 8u) * 128u + dt * 8u, 16u); " ANTFLY_MSL_VISION64_TAIL() "\n"
            "}\n"
            TERMITE_MSL_ABI_VISION_SDPA(termite_sdpa_f32_vision_hd64_flash_q32) "\n"
            "    threadgroup half sq[2048]; threadgroup half skv[2048]; threadgroup float ss[1024]; threadgroup half sp[1024]; threadgroup float sM[32]; threadgroup float sS[32]; threadgroup float sdiag[256]; threadgroup float so[2048];\n"
@@ -14835,35 +14883,28 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_DENSE_Q16_ACCUMULATORS
            "        const bool fast = DirectHalf && (kc + 32u <= p.kv_len);\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        if (!fast) { for (uint i = uint(tid); i < 32u * hd; i += 128u) { uint kk = i / hd; uint d = i - kk * hd; uint ki = kc + kk; skv[i] = ki < p.kv_len ? half(k[ki * kv_stride + kv_head_base + d]) : half(0.0f); } threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
-           "        for (uint rb = 0u; rb < 2u; ++rb) {\n"
-           "            simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "            if (fast) { const device half *kbase = (const device half *)k + (kc + uint(sgitg) * 8u) * kv_stride + kv_head_base; for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + rb * 8u * hd + d, hd); simdgroup_load(mk, kbase + d, kv_stride, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }\n"
-           "            else { for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + rb * 8u * hd + d, hd); simdgroup_load(mk, skv + uint(sgitg) * 8u * hd + d, hd, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }\n"
-           "            simdgroup_store(ms, ss + rb * 256u + uint(sgitg) * 8u, 32u, 0, false);\n"
-           "        }\n"
+           "        if (!fast) { " ANTFLY_MSL_DENSE_Q16_STAGE("128u", "half(k[ki * kv_stride + kv_head_base + d])") " threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+           ANTFLY_MSL_DENSE_Q16_QK("(const device half *)k + (kc + uint(sgitg) * 8u) * kv_stride + kv_head_base", "sq + rb * 8u * hd + d", "skv + uint(sgitg) * 8u * hd + d", "ss + rb * 256u + uint(sgitg) * 8u")
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        for (uint jj = 0u; jj < 4u; ++jj) {\n"
            "            uint j = uint(sgitg) + jj * 4u; uint qi = q0 + j; uint query_pos = p.query_position_offset + qi; uint kk = uint(lane); uint ki = kc + kk;\n"
-           "            bool allowed = ki < p.kv_len && qi < p.q_len;\n"
-           "            if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }\n"
-           "            float sc = allowed ? ss[j * 32u + kk] : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f;\n"
+           ANTFLY_MSL_DENSE_CAUSAL_SCORE("ss[j * 32u + kk]")
            "            float m_old; float m_new; float corr; float row_sum;\n"
            "            antfly_attention_online_row32(sc, sM, j, sp, j * 32u + kk, m_old, m_new, corr, row_sum);\n"
            "            if (lane == 0u) { uint rb = j >> 3u; uint jr = j & 7u; sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[rb * 64u + jr * 8u + jr] = corr; }\n"
            "        }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint rb = 0u; rb < 2u; ++rb) { simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag + rb * 64u, 8u); for (uint i = 0u; i < d_tiles; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[rb * d_tiles + i]); mo[rb * d_tiles + i] = scaled; } }\n"
-           "        if (!fast) { threadgroup_barrier(mem_flags::mem_threadgroup); for (uint i = uint(tid); i < 32u * hd; i += 128u) { uint kk = i / hd; uint d = i - kk * hd; uint ki = kc + kk; skv[i] = ki < p.kv_len ? half(v[ki * kv_stride + kv_head_base + d]) : half(0.0f); } }\n"
+           ANTFLY_MSL_DENSE_Q16_RESCALE("sdiag + rb * 64u")
+           "        if (!fast) { threadgroup_barrier(mem_flags::mem_threadgroup); " ANTFLY_MSL_DENSE_Q16_STAGE("128u", "half(v[ki * kv_stride + kv_head_base + d])") " }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        if (fast) { for (uint rb = 0u; rb < 2u; ++rb) { for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[rb * d_tiles + dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + rb * 256u + kk8 * 8u, 32u); simdgroup_load(mv, (const device half *)v + (kc + kk8 * 8u) * kv_stride + kv_head_base + d8, kv_stride); simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[rb * d_tiles + dt] = acc; } } }\n"
-           "        else { for (uint rb = 0u; rb < 2u; ++rb) { for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[rb * d_tiles + dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + rb * 256u + kk8 * 8u, 32u); simdgroup_load(mv, skv + kk8 * 8u * hd + d8, hd); simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[rb * d_tiles + dt] = acc; } } }\n"
+           ANTFLY_MSL_DENSE_Q16_PV("if (fast)", "sp + rb * 256u + kk8 * 8u", "simdgroup_load(mv, (const device half *)v + (kc + kk8 * 8u) * kv_stride + kv_head_base + d8, kv_stride);")
+           ANTFLY_MSL_DENSE_Q16_PV("else", "sp + rb * 256u + kk8 * 8u", "simdgroup_load(mv, skv + kk8 * 8u * hd + d8, hd);")
            "    }\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    if (tid < 16u) { uint rb = uint(tid) >> 3u; uint jr = uint(tid) & 7u; float denom = sS[tid]; sdiag[rb * 64u + jr * 8u + jr] = denom > 0.0f ? 1.0f / denom : 0.0f; }\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    threadgroup float *so = (threadgroup float *)shmem;\n"
-           "    for (uint rb = 0u; rb < 2u; ++rb) { simdgroup_float8x8 minv; simdgroup_load(minv, sdiag + rb * 64u, 8u); for (uint dt = 0u; dt < d_tiles; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[rb * d_tiles + dt]); simdgroup_store(scaled, so + uint(sgitg) * (16u * (hd / 4u)) + rb * 8u * (hd / 4u) + dt * 8u, hd / 4u, 0, false); } }\n"
+           ANTFLY_MSL_DENSE_Q16_NORMALIZE("sdiag + rb * 64u")
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint i = uint(tid); i < 16u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; if (qi >= p.q_len) continue; uint sg_of_d = d / (hd / 4u); uint d_in = d - sg_of_d * (hd / 4u); output[qi * q_stride + h * hd + d] = so[sg_of_d * (16u * (hd / 4u)) + j * (hd / 4u) + d_in]; }\n"
            "}\n"
@@ -14906,35 +14947,28 @@ static NSString *termite_metal_shader_source(void) {
            TERMITE_MSL_DENSE_Q16_ACCUMULATORS
            "        const bool fast = (kc + 32u <= p.kv_len);\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        if (!fast) { for (uint i = uint(tid); i < 32u * hd; i += 256u) { uint kk = i / hd; uint d = i - kk * hd; uint ki = kc + kk; skv[i] = ki < p.kv_len ? k[ki * kv_stride + kv_head_base + d] : half(0.0f); } threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
-           "        for (uint rb = 0u; rb < 2u; ++rb) {\n"
-           "            simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "            if (fast) { const device half *kbase = k + (kc + quarter * 8u) * kv_stride + kv_head_base; for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + head_sel * 16u * hd + rb * 8u * hd + d, hd); simdgroup_load(mk, kbase + d, kv_stride, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }\n"
-           "            else { for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + head_sel * 16u * hd + rb * 8u * hd + d, hd); simdgroup_load(mk, skv + quarter * 8u * hd + d, hd, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }\n"
-           "            simdgroup_store(ms, ss + head_sel * 512u + rb * 256u + quarter * 8u, 32u, 0, false);\n"
-           "        }\n"
+           "        if (!fast) { " ANTFLY_MSL_DENSE_Q16_STAGE("256u", "k[ki * kv_stride + kv_head_base + d]") " threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+           ANTFLY_MSL_DENSE_Q16_QK("k + (kc + quarter * 8u) * kv_stride + kv_head_base", "sq + head_sel * 16u * hd + rb * 8u * hd + d", "skv + quarter * 8u * hd + d", "ss + head_sel * 512u + rb * 256u + quarter * 8u")
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        for (uint jj = 0u; jj < 4u; ++jj) {\n"
            "            uint r = uint(sgitg) + jj * 8u; uint j = r & 15u; uint qi = q0 + j; uint query_pos = p.query_position_offset + qi; uint kk = uint(lane); uint ki = kc + kk;\n"
-           "            bool allowed = ki < p.kv_len && qi < p.q_len;\n"
-           "            if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }\n"
-           "            float sc = allowed ? ss[(r >> 4u) * 512u + j * 32u + kk] : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f;\n"
+           ANTFLY_MSL_DENSE_CAUSAL_SCORE("ss[(r >> 4u) * 512u + j * 32u + kk]")
            "            float m_old; float m_new; float corr; float row_sum;\n"
            "            antfly_attention_online_row32(sc, sM, r, sp, (r >> 4u) * 512u + j * 32u + kk, m_old, m_new, corr, row_sum);\n"
            "            if (lane == 0u) { uint rbg = r >> 3u; uint jr = r & 7u; sS[r] = sS[r] * corr + row_sum; sM[r] = m_new; sdiag[rbg * 64u + jr * 8u + jr] = corr; }\n"
            "        }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint rb = 0u; rb < 2u; ++rb) { simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag + (head_sel * 2u + rb) * 64u, 8u); for (uint i = 0u; i < d_tiles; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[rb * d_tiles + i]); mo[rb * d_tiles + i] = scaled; } }\n"
-           "        if (!fast) { threadgroup_barrier(mem_flags::mem_threadgroup); for (uint i = uint(tid); i < 32u * hd; i += 256u) { uint kk = i / hd; uint d = i - kk * hd; uint ki = kc + kk; skv[i] = ki < p.kv_len ? v[ki * kv_stride + kv_head_base + d] : half(0.0f); } }\n"
+           ANTFLY_MSL_DENSE_Q16_RESCALE("sdiag + (head_sel * 2u + rb) * 64u")
+           "        if (!fast) { threadgroup_barrier(mem_flags::mem_threadgroup); " ANTFLY_MSL_DENSE_Q16_STAGE("256u", "v[ki * kv_stride + kv_head_base + d]") " }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        if (fast) { for (uint rb = 0u; rb < 2u; ++rb) { for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[rb * d_tiles + dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + head_sel * 512u + rb * 256u + kk8 * 8u, 32u); simdgroup_load(mv, v + (kc + kk8 * 8u) * kv_stride + kv_head_base + d8, kv_stride); simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[rb * d_tiles + dt] = acc; } } }\n"
-           "        else { for (uint rb = 0u; rb < 2u; ++rb) { for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[rb * d_tiles + dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + head_sel * 512u + rb * 256u + kk8 * 8u, 32u); simdgroup_load(mv, skv + kk8 * 8u * hd + d8, hd); simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[rb * d_tiles + dt] = acc; } } }\n"
+           ANTFLY_MSL_DENSE_Q16_PV("if (fast)", "sp + head_sel * 512u + rb * 256u + kk8 * 8u", "simdgroup_load(mv, v + (kc + kk8 * 8u) * kv_stride + kv_head_base + d8, kv_stride);")
+           ANTFLY_MSL_DENSE_Q16_PV("else", "sp + head_sel * 512u + rb * 256u + kk8 * 8u", "simdgroup_load(mv, skv + kk8 * 8u * hd + d8, hd);")
            "    }\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    if (tid < 32u) { uint rbg = uint(tid) >> 3u; uint jr = uint(tid) & 7u; float denom = sS[tid]; sdiag[rbg * 64u + jr * 8u + jr] = denom > 0.0f ? 1.0f / denom : 0.0f; }\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    threadgroup float *so = (threadgroup float *)shmem;\n"
-           "    for (uint rb = 0u; rb < 2u; ++rb) { simdgroup_float8x8 minv; simdgroup_load(minv, sdiag + (head_sel * 2u + rb) * 64u, 8u); for (uint dt = 0u; dt < d_tiles; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[rb * d_tiles + dt]); simdgroup_store(scaled, so + uint(sgitg) * (16u * (hd / 4u)) + rb * 8u * (hd / 4u) + dt * 8u, hd / 4u, 0, false); } }\n"
+           ANTFLY_MSL_DENSE_Q16_NORMALIZE("sdiag + (head_sel * 2u + rb) * 64u")
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint i = uint(tid); i < 32u * hd; i += 256u) { uint r = i / hd; uint d = i - r * hd; uint head = r >> 4u; uint j = r & 15u; uint qi = q0 + j; if (qi >= p.q_len) continue; uint sg_of_d = d / (hd / 4u); uint d_in = d - sg_of_d * (hd / 4u); uint src_sg = head * 4u + sg_of_d; output[qi * q_stride + (h0 + head) * hd + d] = so[src_sg * (16u * (hd / 4u)) + j * (hd / 4u) + d_in]; }\n"
            "}\n"

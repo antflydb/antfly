@@ -3441,3 +3441,7 @@ policies, typed CPU admission, and the [kernel authoring guide](kernel-authoring
 [BC: source-preserving segmented-attention phases](unified-execution-bc-outcomes.md)
 records seven shared tile phases, exact emitted-program identity, and the
 discarded template prototype with its retained timing miss.
+
+[BD: dense decoder and vision attention phases](unified-execution-bd-outcomes.md)
+records thirteen shared phases, unchanged emitted shader source, and independent
+qualification of seven native entrypoints.
