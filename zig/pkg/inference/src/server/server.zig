@@ -3293,6 +3293,31 @@ const DiscoveredModelListing = struct {
     }
 };
 
+const RejectedModelListing = struct {
+    entry_index: usize,
+    err: anyerror,
+};
+
+/// Listing category for a candidate whose manifest could not be read. Path
+/// inference defaults to embedders, so a GLiNER directory is routed by name.
+fn rejectedListingTask(entry: registry_mod.ModelEntry) []const u8 {
+    if (std.ascii.findIgnoreCase(entry.path, "gliner") != null) return "extractors";
+    return registryKindListingTask(entry.kind);
+}
+
+fn registryKindListingTask(kind: registry_mod.ModelKind) []const u8 {
+    return switch (kind) {
+        .embedder => "embedders",
+        .chunker => "chunkers",
+        .reranker => "rerankers",
+        .generator => "generators",
+        .classifier, .extractor => "extractors",
+        .rewriter => "rewriters",
+        .reader => "readers",
+        .transcriber => "transcribers",
+    };
+}
+
 const ModelCounts = struct {
     embedders: usize = 0,
     rerankers: usize = 0,
@@ -3369,6 +3394,7 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
     }
 
     for (discovered) |entry| {
+        if (entry.load_error != null) continue;
         if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(allocator, entry.path)) continue;
 
         var maybe_manifest: ?manifest_mod.ModelManifest = manifest_mod.loadFromDir(allocator, entry.path) catch null;
@@ -24338,8 +24364,18 @@ pub const Node = struct {
             discovered_listings.deinit(a);
         }
         try discovered_listings.ensureTotalCapacity(a, discovered.len);
+        // Candidates whose manifest cannot be read stay visible with their
+        // error, so one malformed directory never hides a model silently.
+        var rejected_listings = std.ArrayListUnmanaged(RejectedModelListing).empty;
+        defer rejected_listings.deinit(a);
         for (discovered, 0..) |entry, entry_index| {
-            var manifest = (try manifest_mod.loadListingCandidateFromDir(a, entry.path)) orelse continue;
+            var manifest = switch (try manifest_mod.loadListingCandidateResult(a, entry.path)) {
+                .manifest => |loaded| loaded,
+                .rejected => |err| {
+                    try rejected_listings.append(a, .{ .entry_index = entry_index, .err = err });
+                    continue;
+                },
+            };
             errdefer manifest.deinit();
             if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) {
                 manifest.deinit();
@@ -24565,6 +24601,21 @@ pub const Node = struct {
                         );
                     }
                 }
+                model_count += 1;
+            }
+
+            // Unreadable candidates appear under the task their path implies,
+            // marked incompatible with the reason the manifest was rejected.
+            for (rejected_listings.items) |rejected| {
+                const entry = discovered[rejected.entry_index];
+                if (!std.mem.eql(u8, rejectedListingTask(entry), task)) continue;
+                const listed = try listed_model_names.getOrPut(a, entry.name);
+                if (listed.found_existing) continue;
+                if (model_count > 0) try body.append(a, ',');
+                try jsonEncodeString(&body, a, entry.name);
+                try body.appendSlice(a, ":{\"compatibility\":\"incompatible\",\"error\":{\"code\":");
+                try jsonEncodeString(&body, a, @errorName(rejected.err));
+                try body.appendSlice(a, ",\"message\":\"the model directory could not be read; repair or re-pull it\"}}");
                 model_count += 1;
             }
 
@@ -34520,6 +34571,40 @@ test "model listing does not parse GGUF payloads during discovery" {
     const body = try node.listModelsJsonAlloc(allocator, std.testing.io);
     defer allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"acme/demo\":") != null);
+}
+
+test "model listing reports an unreadable model per entry and keeps the others" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "generators/acme/demo");
+    try tmp.dir.writeFile(io, .{ .sub_path = "generators/acme/demo/model.gguf", .data = "listing-only fixture" });
+    // A span GLiNER safetensors checkpoint with no encoder geometry is the
+    // malformed shape that used to abort `antfly inference list`.
+    try tmp.dir.createDirPath(io, "extractors/acme/broken-gliner");
+    try tmp.dir.writeFile(io, .{ .sub_path = "extractors/acme/broken-gliner/config.json", .data = "{\"model_type\":\"extractor\",\"max_width\":8}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "extractors/acme/broken-gliner/model.onnx", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "extractors/acme/broken-gliner/model.safetensors", .data = "" });
+    const models_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_path);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_path });
+    defer node.deinit();
+
+    const body = try node.listModelsJsonAlloc(allocator, io);
+    defer allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("generators").?.object.get("acme/demo") != null);
+    const broken = root.get("extractors").?.object.get("acme/broken-gliner").?.object;
+    try std.testing.expectEqualStrings("incompatible", broken.get("compatibility").?.string);
+    try std.testing.expectEqualStrings("MissingGlinerSpanEncoderConfig", broken.get("error").?.object.get("code").?.string);
+
+    // Readiness counts the usable model instead of collapsing to zero.
+    try node.refreshReadinessInventory(io);
+    try std.testing.expectEqual(@as(usize, 1), node.readiness_inventory.load().counts.generators);
 }
 
 test "readiness refresh observes an externally published model" {
