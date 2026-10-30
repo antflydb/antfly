@@ -1932,3 +1932,48 @@ is available. Ordinary backend scans, vendor work, sessions and other operators
 retain their existing paths and remain in the full-design inventory. It adds no
 all-engine throughput, deployed workload or installed CLI rebuild claim. Full
 GNU qualification remains waived and the full design remains open.
+
+### Prepared numeric column chunks
+
+Normal API coordinator scopes now offer a prepared numeric stage to the existing
+columnar evaluator. Qualification uses the bound primitive program: at most 64
+instructions and 64 copied rows, with at most 65 steps and 128 primitive cell
+visits per step. These are finite work bounds, not hardware preemption or a
+wall-clock latency guarantee. Providers, coercion and backend reads run outside
+the private worker.
+
+The same query root moves to the node's shared bounded worker for a fixed numeric
+clone. Its heap and transition reservation equal the clone's fixed size plus its
+allocation header. The original snapshot, page and encoded output retain their
+general owners. Worker join precedes checked restoration of the original general
+or analytical lane and read-policy validation. No backend or mutable program
+pointer is published to private arithmetic. Cancellation, deadline and resource
+refusal fence foreground use while original charges remain until owning finish.
+Row-evaluation errors instead restore ordinary authority for the existing pure
+page fallback, preserving valid rows and their terminal error without recapturing
+storage or replaying a query.
+
+Preparation uses the existing original-CPU scratch admission. Physical column
+selection and primitive coercion can allocate, so their temporary arena retires
+before each private publication, including decline/error paths. Current node
+accounting supplies the nonblocking reservation callback; older accounting
+prefixes deliberately retain ordinary evaluation. Columnar output stays encoded.
+Sessions, strings, exact NUMERIC, row-oriented digest reads and unsupported hosts
+keep their established paths.
+
+`antfly-sql-bounded-production-test` compiles scalar, numeric, normal HTTP and
+legacy-scratch ownership checks together using one API root. The separate
+compiled API suite checks actual TCP execution. `bounded-numeric-production-v6.json` records a successful unchanged-input run:
+13 normal API cases, one local companion, 13 compiled TCP cases and 125 numeric
+regressions, with all 100 build steps successful. The selected API suites report
+zero skips/leaks; the default numeric runner reports 125/125 tests passing.
+Cancellation and deadline are refused at all five observed numeric worker
+checkpoints. Normal HTTP checks exact wide-integer output, actual bounded grants
+and zero ordinary/read memory at teardown. TCP checks five chunks over 302 native
+rows, exact portal continuation and bounded arithmetic followed by the first
+valid row and SQLSTATE 22012 without another storage capture. Legacy accounting
+without nonblocking reservation retains ordinary evaluation; the current-node
+fixture now supplies that capability. Per-chunk preparation arenas fix the
+ordinary-memory leak exposed by enabling it. Earlier failed and diagnostic
+receipts remain failed evidence. Full GNU qualification remains waived;
+this work adds no installed CLI, deployed workload or all-engine throughput claim.

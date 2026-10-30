@@ -924,6 +924,18 @@ pub fn evaluateColumnsEncodedManyWithScopes(a: std.mem.Allocator, programs: []co
         visited[index] = true;
         published = true;
     }
+    // Prepared primitive chunks preserve normal columnar output. Input access
+    // and result allocation remain on the original coordinator; only copied
+    // arithmetic can cross the optional private-stage boundary.
+    if (coordinator_scope) |authority| if (authority.prepared_numeric != null) {
+        for (programs, 0..) |program, index| {
+            if (visited[index]) continue;
+            if (try evaluateColumnsPreparedEncoded(a, program, page, columns, parameters, authority)) |encoded| {
+                outputs[index] = encoded.batch();
+                visited[index] = true;
+            }
+        }
+    };
     try fusedDecimals(a, programs, page, columns, parameters, outputs, visited);
     var decimal_workspace: DecimalWorkspace = undefined;
     decimal_workspace.init(a);
@@ -1149,23 +1161,77 @@ fn evaluateColumnsPrepared(a: std.mem.Allocator, program: *const scalar.Program,
         const end = @min(page.selection.len, offset + Prepared.max_rows);
         var part = page;
         part.selection = page.selection[offset..end];
-        stage.prepareWithAllocator(scope.allocator, ColumnInput{ .page = part, .columns = columns, .count = end - offset }, parameters) catch |err| switch (err) {
-            error.UnsupportedTypedKernel => {
-                try scope.checkpointCurrent();
-                return null;
-            },
-            else => return err,
-        };
-        const chunk = while (true) {
-            try scope.checkpointCurrent();
-            if (try stage.step()) |output| break output;
-        };
+        {
+            // Physical-column readers and primitive coercions may allocate.
+            // The prepared payload owns copied numeric values, so retire all
+            // preparation scratch before publishing private arithmetic.
+            var preparation = std.heap.ArenaAllocator.init(scope.allocator);
+            defer preparation.deinit();
+            stage.prepareWithAllocator(preparation.allocator(), ColumnInput{ .page = part, .columns = columns, .count = end - offset }, parameters) catch |err| switch (err) {
+                error.UnsupportedTypedKernel => {
+                    try scope.checkpointCurrent();
+                    return null;
+                },
+                else => return err,
+            };
+        }
+        try completePreparedNumeric(scope, stage);
         try scope.checkpointCurrent();
-        @memcpy(result[offset..end], chunk);
+        @memcpy(result[offset..end], stage.output[0..stage.count]);
         offset = end;
     }
     owned = false;
     return result;
+}
+
+fn completePreparedNumeric(scope: @import("parallel_scheduler.zig").CoordinatorScope, stage: *@import("typed_kernel.zig").PreparedNumeric) !void {
+    if (scope.prepared_numeric) |runner| if (try runner.run(runner.context, stage)) return;
+    while (true) {
+        try scope.checkpointCurrent();
+        if (try stage.step()) |_| return;
+    }
+}
+
+fn evaluateColumnsPreparedEncoded(a: std.mem.Allocator, program: *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value, scope: @import("parallel_scheduler.zig").CoordinatorScope) anyerror!?*@import("typed_kernel.zig").Encoded {
+    const Prepared = @import("typed_kernel.zig").PreparedNumeric;
+    if (!try Prepared.eligible(program)) return null;
+    const scratch = if (scope.scratch) |source| (try source.acquire(source.context, Prepared.scratch_bytes)) orelse return null else null;
+    defer if (scratch) |lease| lease.deinit();
+    const stage = (Prepared.init(if (scratch) |lease| lease.allocator else scope.allocator, program) catch |err| switch (err) {
+        error.OutOfMemory => return null,
+        else => return err,
+    }) orelse return null;
+    defer stage.deinit();
+    const output = try stage.allocateOutput(a, page.selection.len);
+    var owned = true;
+    defer if (owned) @import("typed_kernel.zig").Encoded.destroy(output, a);
+    var offset: usize = 0;
+    while (offset < page.selection.len) {
+        try scope.checkpointCurrent();
+        const end = @min(page.selection.len, offset + Prepared.max_rows);
+        var part = page;
+        part.selection = page.selection[offset..end];
+        {
+            // Physical-column readers and primitive coercions may allocate.
+            // The prepared payload owns copied numeric values, so retire all
+            // preparation scratch before publishing private arithmetic.
+            var preparation = std.heap.ArenaAllocator.init(scope.allocator);
+            defer preparation.deinit();
+            stage.prepareWithAllocator(preparation.allocator(), ColumnInput{ .page = part, .columns = columns, .count = end - offset }, parameters) catch |err| switch (err) {
+                error.UnsupportedTypedKernel => {
+                    try scope.checkpointCurrent();
+                    return null;
+                },
+                else => return err,
+            };
+        }
+        try completePreparedNumeric(scope, stage);
+        try scope.checkpointCurrent();
+        try stage.copyOutput(output, offset);
+        offset = end;
+    }
+    owned = false;
+    return output;
 }
 
 /// Parallel work must have multiple useful lanes and enough expression work

@@ -5908,3 +5908,21 @@ is available. Ordinary backend scans, vendor work, sessions and other operators
 retain their existing paths and remain in the full-design inventory. It adds no
 all-engine throughput, deployed workload or installed CLI rebuild claim. Full
 GNU qualification remains waived and the full design remains open.
+
+### Prepared numeric column ownership
+
+The [prepared numeric column stage](README.md#prepared-numeric-column-chunks)
+keeps snapshots, input pages, immutable plans and encoded output on their
+original general owners. One fixed primitive clone reserves its complete private
+heap and transition footprint before publication; its worker physically joins
+before original-lane CPU reentry. Per-chunk ordinary preparation arenas retire
+selection/coercion temporaries before private work. No private heap or worker
+pointer escapes into the returned columnar result. Semantic row errors retain
+ordinary authority for the existing same-page fallback; cancellation, deadline
+and resource refusals retain stopped-root charges through owning finish. Current
+node accounting and legacy-prefix fallback have separate focused checks. The successful
+unchanged-input `bounded-numeric-production-v6.json` verifies normal HTTP memory
+retirement, exact five-chunk TCP delivery, private row-error fallback without
+storage recapture, original worker refusal and legacy accounting. Its 152
+selected tests and 100 build steps pass; this closes this operator-family
+integration, not the full delivery goal.

@@ -355,6 +355,116 @@ fn runPreparedScalar(self: *ScalarStage, io: std.Io) !runtime.Result {
     return result;
 }
 
+const PreparedNumeric = sources.sql_typed_kernel.PreparedNumeric;
+const NumericStage = struct {
+    execution: *scheduling.Execution,
+    original_context: sources.api_operation.RequestContext,
+    prepared: *PreparedNumeric,
+    failure: ?anyerror = null,
+
+    fn active(self: *@This()) !void {
+        try self.original_context.ensureActive();
+        try self.execution.checkLifetime();
+    }
+    fn original(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.original_context.ensureActive();
+    }
+    fn run(self: *@This()) void {
+        self.compute() catch |err| {
+            self.failure = err;
+        };
+    }
+    fn compute(self: *@This()) !void {
+        // At most 65 steps, each at most 128 primitive cell visits. No input
+        // provider, coercion, allocation, backend or mutable policy is invoked.
+        while (true) {
+            try self.active();
+            if (try self.prepared.step()) |_| break;
+        }
+        try self.active();
+    }
+};
+
+/// The normal columnar executor has already copied/coerced one fixed chunk.
+/// Keep its snapshot and page in their original charged general owners; the
+/// private worker receives only numeric scratch and original lifetime controls.
+pub fn executePreparedNumeric(server: *@import("http_server.zig").ApiHttpServer, execution: *scheduling.Execution, prepared: *PreparedNumeric, original_context: sources.api_operation.RequestContext) !bool {
+    if (prepared.phase != .prepared or prepared.count == 0 or prepared.count > PreparedNumeric.max_rows or !try PreparedNumeric.eligible(prepared.program)) return false;
+    if (!supportsPreparedNumeric(server, execution)) return false;
+    const entry = if (execution.entry) |*e| e else return false;
+    const scheduler = entry.scheduler orelse return false;
+    const pool = server.readMemoryPool().?;
+    // Exactly one fixed clone is allocated; preparation and delivery never
+    // spend this group. Reserve its actual worst-case physical footprint.
+    const heap_bound = PreparedNumeric.scratch_bytes + read_memory.Group.overhead(.of(PreparedNumeric));
+    const io = try server.sqlBoundedReadIo();
+    const memory = try server.alloc.create(ScalarMemory);
+    memory.* = .{ .parent = server.alloc, .memory = read_memory.Group.init(pool, .bounded, heap_bound) catch |err| {
+        server.alloc.destroy(memory);
+        return err;
+    } };
+    defer ScalarMemory.release(memory);
+    try memory.memory.reserveTransition();
+    const private = try memory.memory.allocator().create(PreparedNumeric);
+    defer memory.memory.allocator().destroy(private);
+    private.* = prepared.*;
+    // step() uses only the copied instructions/payload. Remove pointers that
+    // belong exclusively to ordinary preparation and eventual scratch release.
+    private.program = undefined;
+    private.allocator = undefined;
+    var stage: NumericStage = .{ .execution = execution, .original_context = original_context, .prepared = private };
+    const target = entry.read_lane;
+    const stage_cleanup = entry.cleanup_options == null;
+    if (stage_cleanup) try execution.reserveCleanupFor(.{ .io = try server.sqlCleanupIo() }, 250 * std.time.ns_per_ms);
+    try execution.park(.resource_blocked);
+    try scheduler.prepareBoundedRead(entry, .{ .max_retained_bytes = entry.bytes, .max_wait_ms = scheduler.config.max_wait_ms, .estimated_work_ns = @as(u64, scheduler.config.quantum_ms) * std.time.ns_per_ms }, .{ .context = memory, .begin = ScalarMemory.begin, .try_general = ScalarMemory.general });
+    defer scheduler.detachReadResources(entry, stage_cleanup) catch unreachable;
+    runPreparedNumeric(&stage, prepared, target, io) catch |err| {
+        // Existing columnar delivery may defer row errors or evaluate the same
+        // retained page scalarly to preserve row/error order. Only that pure
+        // semantic fallback retains ordinary foreground authority.
+        if (!sources.sql_errors.isRowEvaluationError(err) or entry.state != .running or entry.read_lane != target)
+            scheduler.stopPreparedRead(entry, err);
+        return err;
+    };
+    return true;
+}
+
+fn runPreparedNumeric(stage: *NumericStage, original: *PreparedNumeric, target: scheduling.ReadLane, io: std.Io) !void {
+    try stage.execution.enter(.query);
+    var future = io.concurrent(NumericStage.run, .{stage}) catch |err| {
+        try stage.active();
+        return if (err == error.ConcurrencyUnavailable) error.SqlWriteCapacityUnavailable else err;
+    };
+    @import("protected_future.zig").wait(io, &future);
+    if (stage.failure) |err| if (!sources.sql_errors.isRowEvaluationError(err)) return err;
+    // The node's private worker is reusable even if the original general lane
+    // or heap is full. Original lifetime restrictions stay live during transfer.
+    try stage.execution.demoteReadWithCheck(target, .{ .context = stage, .check = NumericStage.original });
+    if (stage.failure) |err| return err;
+    try original.acceptCompleted(stage.prepared);
+}
+
+pub fn supportsPreparedNumeric(server: *@import("http_server.zig").ApiHttpServer, execution: *scheduling.Execution) bool {
+    const entry = execution.entry orelse return false;
+    const scheduler = entry.scheduler orelse return false;
+    if (!scheduler.config.readIsolation() or entry.class != .query or entry.slots != 1 or entry.parent != null or entry.children != 0 or
+        entry.read_lane == .bounded or entry.read_resource_transfer != null or entry.cpu_borrow_budget != null or
+        entry.completion_options != null or entry.pending_resources != null or entry.publication_active) return false;
+    if (entry.bytes > scheduler.config.boundedReadMetadataBytes() / 2) return false;
+    if (server.cfg.query_max_concurrent_requests == 0 or server.cfg.write_max_concurrent_requests == 0) return false;
+    if (server.cfg.imported_runtime_io) |views| {
+        if (views.sql_workers == null) return false;
+    } else {
+        const host = server.cfg.backend_runtime orelse return false;
+        if (host.borrowed_io != null) return false;
+    }
+    const pool = server.readMemoryPool() orelse return false;
+    const bound = PreparedNumeric.scratch_bytes + read_memory.Group.overhead(.of(PreparedNumeric));
+    return pool.limits.bytes[1] >= bound and pool.limits.bytes[2] >= bound;
+}
+
 test "SQL prepared scalar execution uses the private worker and returns the original root to general service" {
     const a = std.testing.allocator;
     const http = @import("http_server.zig");
@@ -759,4 +869,93 @@ test "SQL prepared scalar maximum instruction column and input envelopes match o
     for (server.readMemoryStats().used_bytes) |used| try std.testing.expectEqual(@as(u64, 0), used);
     for (server.readMemoryStats().groups) |groups| try std.testing.expectEqual(@as(u64, 0), groups);
     try std.testing.expectEqual(@as(u64, 0), server.runnableSchedulingStats().operations);
+}
+
+test "SQL prepared numeric bounded stage preserves analytical root exact cells and original refusal through worker join" {
+    const a = std.testing.allocator;
+    var backend = try sources.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+    defer backend.deinit();
+    const http = @import("http_server.zig");
+    var server = try http.ApiHttpServer.initWithConfig(a, .{
+        .backend_runtime = backend.ptr(),
+        .request_memory_bytes = 64 << 20,
+        .runnable_policy = .{ .slots = 4, .cleanup_slots = 1, .read_isolation = true, .max_operations = 64 },
+    }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    _ = try server.sqlExecutionIo();
+    const Signal = struct {
+        var tick: std.atomic.Value(u64) = .init(100);
+        coordinator: std.Thread.Id,
+        refuse: bool,
+        expire: bool,
+        reject_at: usize,
+        calls: std.atomic.Value(usize) = .init(0),
+        worker: std.atomic.Value(bool) = .init(false),
+        canceled: std.atomic.Value(bool) = .init(false),
+        fn now() u64 {
+            return tick.load(.acquire);
+        }
+        fn requested(raw: *const anyopaque) bool {
+            const self: *@This() = @constCast(@as(*const @This(), @ptrCast(@alignCast(raw))));
+            if (std.Thread.getCurrentId() != self.coordinator) {
+                self.worker.store(true, .release);
+                const call = self.calls.fetchAdd(1, .monotonic) + 1;
+                if (self.refuse and call >= self.reject_at) {
+                    if (self.expire) tick.store(201, .release) else self.canceled.store(true, .release);
+                }
+            }
+            return self.canceled.load(.acquire);
+        }
+    };
+    const Input = struct {
+        count: usize = PreparedNumeric.max_rows,
+        coordinator: std.Thread.Id,
+        pub fn cell(self: @This(), _: std.mem.Allocator, row: usize, _: u32) !sources.sql_scalar.Datum {
+            try std.testing.expectEqual(self.coordinator, std.Thread.getCurrentId());
+            return .{ .value = .{ .integer = 9007199254740992 + @as(i64, @intCast(row)) }, .sql_null = false };
+        }
+    };
+    var checkpoints: usize = 1;
+    var mode: usize = 0;
+    while (mode < checkpoints * 2 + 2) : (mode += 1) {
+        const division = mode == checkpoints * 2 + 1;
+        const expire = mode > checkpoints and !division;
+        Signal.tick.store(100, .release);
+        var signal: Signal = .{ .coordinator = std.Thread.getCurrentId(), .refuse = mode != 0 and !division, .expire = expire, .reject_at = if (expire) mode - checkpoints else mode };
+        var root: scheduling.Execution = .{};
+        defer root.finish();
+        try server.startSqlRunnable(&root, .{ .io = std.testing.io, .retained_bytes = 17, .native_now_ns = Signal.now, .deadline_ns = 200, .cancellation = .{ .ptr = &signal, .requested = Signal.requested } }, .query);
+        try root.classifyRead(.analytical);
+        const entry = &root.entry.?;
+        var compiled = try compiler.compileScalar(a, if (division) "n / 0" else "n + 1", .{});
+        defer compiled.deinit();
+        const columns = [_]sources.sql_scalar.Column{.{ .name = "n", .type = .integer, .element_type = .int64 }};
+        var program = try sources.sql_scalar.bind(a, compiled.expression, &columns, &.{}, .{});
+        defer program.deinit();
+        const prepared = (try PreparedNumeric.init(a, &program)).?;
+        defer prepared.deinit();
+        try prepared.prepare(Input{ .coordinator = std.Thread.getCurrentId() }, &.{});
+        if (mode == 0) {
+            try std.testing.expect(try executePreparedNumeric(&server, &root, prepared, .{}));
+            checkpoints = signal.calls.load(.acquire);
+            try std.testing.expect(checkpoints > 0);
+            try std.testing.expectEqual(scheduling.ReadLane.analytical, entry.read_lane);
+            for (prepared.output[0..prepared.count], 0..) |cell, row| try std.testing.expectEqual(@as(i64, 9007199254740993) + @as(i64, @intCast(row)), cell.value.integer);
+        } else {
+            try std.testing.expectError(if (division) error.SqlDivisionByZero else if (expire) error.DeadlineExceeded else error.Canceled, executePreparedNumeric(&server, &root, prepared, .{}));
+            try std.testing.expectEqual(if (division) scheduling.State.running else scheduling.State.stopped, entry.state);
+        }
+        try std.testing.expect(signal.worker.load(.acquire));
+        try std.testing.expect(entry == &root.entry.?);
+        try std.testing.expectEqual(@as(usize, 1), entry.scheduler.?.stats().operations);
+        try std.testing.expectEqual(@as(u64, 17), entry.scheduler.?.stats().retained_bytes);
+        try std.testing.expect(entry.read_resource_transfer == null);
+        try std.testing.expect(entry.cleanup_options == null);
+        root.finish();
+        const memory = server.readMemoryStats();
+        for (memory.used_bytes) |used| try std.testing.expectEqual(@as(u64, 0), used);
+        for (memory.groups) |groups| try std.testing.expectEqual(@as(u64, 0), groups);
+        try std.testing.expectEqual(@as(u64, 0), memory.transition_reserved_bytes);
+    }
+    std.debug.print("prepared numeric private checkpoints: {d}; cancellation and deadline rejected at each\n", .{checkpoints});
 }

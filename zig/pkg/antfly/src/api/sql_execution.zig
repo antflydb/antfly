@@ -828,7 +828,24 @@ pub const Adapter = struct {
             .allocator = memory.allocator(false),
             .check = .{ .context = self, .check = checkpoint },
             .scratch = .{ .context = self, .acquire = acquireNumericScratch },
+            .prepared_numeric = if (self.session_id == null and self.connection_id == null and @import("sql_read_lane.zig").supportsPreparedNumeric(self.server, execution))
+                .{ .context = self, .run = runPreparedNumeric }
+            else
+                null,
         };
+    }
+
+    fn runPreparedNumeric(raw: *anyopaque, stage: *@import("antfly_local_sources").sql_typed_kernel.PreparedNumeric) !bool {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        if (self.session_id != null or self.connection_id != null) return false;
+        const execution = self.runnable orelse return false;
+        try checkpoint(self);
+        const ran = try @import("sql_read_lane.zig").executePreparedNumeric(self.server, execution, stage, self.context);
+        // This may consult current policy only after private worker join and
+        // original-authority general CPU reentry, before exposing any output.
+        try checkpoint(self);
+        try self.validateReadFence(true);
+        return ran;
     }
 
     const NumericScratch = struct {

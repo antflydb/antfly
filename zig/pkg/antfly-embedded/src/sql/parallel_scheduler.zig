@@ -45,6 +45,12 @@ pub const CoordinatorScope = struct {
     allocator: A,
     check: ?Runnable.AdmissionCheck = null,
     scratch: ?ScratchSource = null,
+    /// Runs only a fully copied numeric chunk. False leaves its prepared state
+    /// untouched so unsupported hosts retain ordinary coordinator execution.
+    prepared_numeric: ?struct {
+        context: *anyopaque,
+        run: *const fn (*anyopaque, *@import("typed_kernel.zig").PreparedNumeric) anyerror!bool,
+    } = null,
 
     pub fn checkpointCurrent(self: CoordinatorScope) !void {
         if (self.check) |hook| try hook.checkpoint() else try self.execution.checkpoint();

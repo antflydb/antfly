@@ -366,6 +366,43 @@ pub const Client = struct {
         return error.PgwireFixtureFrameLimit;
     }
 
+    /// Verify partial streaming rows and the original terminal SQL error, with
+    /// no success completion or extra row after that error.
+    pub fn expectIntegerRowsThenError(self: *Client, expected: []const i64, code: []const u8) !void {
+        var rows: usize = 0;
+        var described = false;
+        var failed = false;
+        for (0..128) |_| {
+            const frame = try self.next();
+            switch (frame.tag) {
+                'T' => {
+                    if (described or failed or frame.body.len < 2 or std.mem.readInt(u16, frame.body[0..2], .big) != 1)
+                        return error.PgwireFixtureUnexpectedDescription;
+                    described = true;
+                },
+                'D' => {
+                    if (!described or failed or rows >= expected.len or frame.body.len < 7 or
+                        std.mem.readInt(u16, frame.body[0..2], .big) != 1 or
+                        std.mem.readInt(i32, frame.body[2..6], .big) != frame.body.len - 6)
+                        return error.PgwireFixtureUnexpectedPortalValue;
+                    try std.testing.expectEqual(expected[rows], try std.fmt.parseInt(i64, frame.body[6..], 10));
+                    rows += 1;
+                },
+                'E' => {
+                    if (failed or rows != expected.len or !std.mem.eql(u8, try errorCode(frame.body), code))
+                        return error.PgwireFixtureUnexpectedSqlstate;
+                    failed = true;
+                },
+                'Z' => {
+                    if (!failed or rows != expected.len or !std.mem.eql(u8, frame.body, "I")) return error.PgwireFixtureNotReady;
+                    return;
+                },
+                else => return error.PgwireFixtureUnexpectedPortalFrame,
+            }
+        }
+        return error.PgwireFixtureFrameLimit;
+    }
+
     pub fn command(self: *Client, query: [:0]const u8, tag: []const u8) !void {
         try self.send('Q', query[0 .. query.len + 1]);
         const complete = try self.next();

@@ -1552,14 +1552,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&b.addRunArtifact(remote_attempt_tests).step);
 
     const prepared_scalar_tests = b.addTest(.{
-        .name = "sql-prepared-scalar-tests",
+        .name = "sql-bounded-production-tests",
         .root_module = options.api_http_runtime_test_mod,
-        .filters = &.{"SQL prepared scalar"},
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        .filters = &.{ "SQL prepared scalar", "SQL prepared numeric bounded", "SQL prepared numeric serial owner", "SQL grouped coordinator scratch", "httpx SQL executes one relational page with exact integer parameters", "SQL pgwire dispatch preserves imported executor authority including unavailable views" },
+        .max_rss = 12 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-sql-prepared-scalar-test", "Verify prepared scalar ownership through the production SQL adapter")
-        .dependOn(&addFilteredTestRunArtifact(b, prepared_scalar_tests).step);
+    // These checks share the same API module. Compile their ownership and
+    // normal-caller coverage together instead of three large duplicate roots.
+    const bounded_production_run = addFilteredTestRunArtifact(b, prepared_scalar_tests);
+    b.step("antfly-sql-bounded-production-test", "Verify bounded SQL stages through normal callers, ownership and legacy fallback")
+        .dependOn(&bounded_production_run.step);
+    b.step("antfly-sql-prepared-scalar-test", "Verify prepared scalar and numeric SQL production ownership")
+        .dependOn(&bounded_production_run.step);
 
     const sql_protocol_pooling_tests = b.addTest(.{
         .name = "sql-protocol-pooling-tests",
@@ -4516,7 +4521,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "sql-prepared-numeric-owner-tests",
         .root_module = options.api_http_runtime_test_mod,
         .filters = &.{ "SQL prepared numeric serial owner", "SQL grouped coordinator scratch" },
-        .max_rss = 4 * 1024 * 1024 * 1024,
+        .max_rss = 12 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-sql-prepared-numeric-owner-test", "Verify serial SQL coordinator scope and node-charged scratch")

@@ -317,6 +317,27 @@ pub const PreparedNumeric = struct {
     pub fn run(self: *PreparedNumeric) ![]const Datum {
         while (true) if (try self.step()) |output| return output;
     }
+    /// Copy the finite result of a joined private clone back to its original
+    /// coordinator. No program, allocator or input pointer changes owner.
+    pub fn acceptCompleted(self: *PreparedNumeric, other: *const PreparedNumeric) !void {
+        if (self.phase != .prepared or other.phase != .complete or self.count != other.count or
+            self.root != other.root or self.instruction_count != other.instruction_count)
+            return error.InvalidRunnableTransition;
+        @memcpy(self.payload[self.root][0..self.count], other.payload[other.root][0..other.count]);
+        @memcpy(self.states[self.root][0..self.count], other.states[other.root][0..other.count]);
+        @memcpy(self.output[0..self.count], other.output[0..other.count]);
+        self.phase = .complete;
+    }
+    /// Keep normal columnar delivery instead of expanding a prepared kernel
+    /// into a page of Datum objects merely to schedule its arithmetic.
+    pub fn allocateOutput(self: *const PreparedNumeric, a: A, rows: usize) !*Encoded {
+        return Encoded.allocate(a, kind(self.instructions[self.root].type).?, rows, self.instructions[self.root].type);
+    }
+    pub fn copyOutput(self: *PreparedNumeric, output: *Encoded, begin: usize) !void {
+        if (self.phase != .complete or begin > output.vector.states.len or self.count > output.vector.states.len - begin or
+            !std.meta.eql(self.instructions[self.root].type, output.type)) return error.InvalidRunnableTransition;
+        output.copy(self.vector(self.root), begin);
+    }
     /// One fixed instruction (at most 64 evaluations plus 64 width checks), or
     /// 64 final root visits. No allocation, provider, coercion, callback or IO.
     /// Null retains a private continuation; only completion exposes output.

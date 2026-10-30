@@ -16352,6 +16352,15 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         fn reserve(ptr: *anyopaque, bytes: usize) callconv(.c) bool {
             return @as(*resources.ResourceManager, @ptrCast(@alignCast(ptr))).reserveExternal(bytes);
         }
+        fn attempt(ptr: *anyopaque, bytes: usize) callconv(.c) @import("../common/allocation_budget.zig").Accounting.TryReserve {
+            const manager: *resources.ResourceManager = @ptrCast(@alignCast(ptr));
+            return switch (manager.tryReserveExternal(bytes)) {
+                .reserved => .reserved,
+                .busy => .busy,
+                .denied => .denied,
+                .unsupported => .unsupported,
+            };
+        }
         fn release(ptr: *anyopaque, bytes: usize) callconv(.c) void {
             @as(*resources.ResourceManager, @ptrCast(@alignCast(ptr))).releaseExternal(bytes);
         }
@@ -16360,7 +16369,9 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         // Preserve the 1 MiB preparation stimulus inside the derived general
         // read heap as well as the original ordinary request envelope.
         .request_memory_bytes = 16 << 20,
-        .memory_accounting = .{ .ptr = &storage_manager, .reserve_fn = Accounting.reserve, .release_fn = Accounting.release },
+        // Prepared scratch uses the current node's bounded try-reservation.
+        // The numeric owner suite separately verifies legacy-prefix fallback.
+        .memory_accounting = .{ .ptr = &storage_manager, .reserve_fn = Accounting.reserve, .try_reserve_fn = Accounting.attempt, .release_fn = Accounting.release },
         .backend_runtime = backend_runtime.ptr(),
         .session_store = &prepared_durable,
         .query_max_concurrent_requests = 4,
@@ -16890,6 +16901,21 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     // Both adapters have executed actual query work, beyond issuing grants.
     try std.testing.expect(protocol_service.estimated_slot_ns[0] > 0);
     try std.testing.expect(protocol_service.observed_slot_ns[0] > 0);
+    {
+        const before = server.runnableSchedulingStats().read_lane_grants[@backingInt(@import("http_server.zig").RunnableScheduler.ReadLane.bounded)];
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = "{\"statement\":\"SELECT id + 1 AS n FROM usage_records LIMIT 1\"}";
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body.?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("9007199254740994", parsed.value.object.get("rows").?.array.items[0].array.items[0].string);
+        try std.testing.expect(server.runnableSchedulingStats().read_lane_grants[@backingInt(@import("http_server.zig").RunnableScheduler.ReadLane.bounded)] > before);
+    }
     const retired_read_memory = server.readMemoryStats();
     for (retired_read_memory.used_bytes) |used| try std.testing.expectEqual(@as(u64, 0), used);
     for (retired_read_memory.groups) |count| try std.testing.expectEqual(@as(u64, 0), count);

@@ -126,6 +126,8 @@ fn runFixture(mode: Mode) !void {
     if (streaming) {
         native_table.maximum_page_rows = 256;
         try native_table.addContinuationRows(allocator);
+    } else if (mode == .native_portals) {
+        try native_table.addContinuationRows(allocator);
     }
     var token: u8 = 0;
     const Status = struct {
@@ -159,7 +161,7 @@ fn runFixture(mode: Mode) !void {
         // Wide live-snapshot pages need projection scratch as well as retained
         // output. The 16 MiB scalar fixture leaves only 1.75 MiB for general
         // reads and rejects this working set before portal suspension.
-        .request_memory_bytes = if (streaming) 64 << 20 else 16 << 20,
+        .request_memory_bytes = if (streaming or mode == .native_portals) 64 << 20 else 16 << 20,
         .retained_memory_bytes = 16 << 20,
         .query_max_concurrent_requests = 2,
         .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 65536, .max_wait_ms = 5000 },
@@ -173,7 +175,7 @@ fn runFixture(mode: Mode) !void {
     {
         var telemetry = try bridge.createHandler(&api);
         defer bridge.deinitHandler(&telemetry);
-        errdefer if (streaming) {
+        errdefer if (streaming or mode == .native_portals) {
             const stats = bridge.handlerStats(&telemetry);
             std.debug.print("live snapshot fixture failure: read memory={any}; memory={any}\n", .{ stats.read_memory, stats.memory });
         };
@@ -182,6 +184,37 @@ fn runFixture(mode: Mode) !void {
         for (&clients) |*client| client.* = try Client.connect(allocator, client_io, port, "local-test-password");
         try waitNoQueries(&api);
         if (!cancel_mode) try std.testing.expectError(error.PgwireAuthenticationRejected, Client.connect(allocator, client_io, port, "incorrect-password"));
+        if (mode == .native_portals) {
+            const before = api.runnableSchedulingStats().read_lane_grants[@backingInt(native.RunnableScheduler.ReadLane.bounded)];
+            // No scalar/control query runs between these observations. The
+            // actual native columnar projection must enter private capacity for
+            // all five 64-row chunks and preserve exact portal continuation.
+            try clients[3].?.suspendPortalQueryExpected('0', "SELECT id + $1 AS x FROM usage_records", '4');
+            try std.testing.expect(api.runnableSchedulingStats().read_lane_grants[@backingInt(native.RunnableScheduler.ReadLane.bounded)] >= before + 5);
+            var remaining: [301]i64 = undefined;
+            remaining[0] = 7;
+            for (remaining[1..], 0..) |*value, index| value.* = @intCast(index + 100);
+            try clients[3].?.finishIntegerPortal(&remaining);
+            try waitNoQueries(&api);
+            try std.testing.expectEqual(@as(usize, 0), native_table.live_captures.load(.acquire));
+            const read = bridge.handlerStats(&telemetry).read_memory;
+            try std.testing.expectEqualDeep(@as([3]usize, @splat(0)), read.used_bytes);
+            try std.testing.expectEqualDeep(@as([3]usize, @splat(0)), read.groups);
+            const captures = native_table.captures.load(.acquire);
+            const before_error = api.runnableSchedulingStats().read_lane_grants[@backingInt(native.RunnableScheduler.ReadLane.bounded)];
+            try clients[4].?.suspendPortalQueryExpected('1', "SELECT $1 / (id - ($1 + $1 + $1 + $1 + $1 + $1 + $1)) AS x FROM usage_records", '0');
+            try std.testing.expect(api.runnableSchedulingStats().read_lane_grants[@backingInt(native.RunnableScheduler.ReadLane.bounded)] > before_error);
+            try clients[4].?.send('E', "session-held\x00\x00\x00\x00\x00");
+            try clients[4].?.send('S', "");
+            try clients[4].?.expectIntegerRowsThenError(&.{}, "22012");
+            try waitNoQueries(&api);
+            // Pure evaluation fallback uses the same retained page/snapshot;
+            // it must not replay a backend scan or acquire another statement.
+            try std.testing.expectEqual(captures + 1, native_table.captures.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), native_table.live_captures.load(.acquire));
+            try clients[4].?.scalar();
+            try waitNoQueries(&api);
+        }
         if (mode == .portals or mode == .native_portals) try portalProgress(&api, clients, native_tables);
         if (cancel_mode) {
             if (deadline_mode) try clients[2].?.command("SET statement_timeout = '100ms'", "SET\x00");
