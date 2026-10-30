@@ -1,0 +1,198 @@
+---
+title: "Give an Agent Long-Term Memory"
+description: "An agent memory that keeps the current answer, the history it replaced, and the evidence behind each claim, in a local file or on a server"
+order: 4
+---
+
+<Questions>
+- How do I give an agent memory that survives across sessions?
+- How do I keep newer guidance from being overwritten by an older document imported later?
+- How do I ask what an agent believed at an earlier date?
+- How do I trace a memory back to the source that supports it?
+- Can the same memory run embedded and on a server?
+</Questions>
+
+## The Result
+
+An agent records what it learns as claims with evidence. Recall returns the current answer, and a dated recall returns what was true then, even when the older runbook was imported last:
+
+```bash
+curl -X POST http://127.0.0.1:8080/memory/v1/spaces/agent/recall \
+  -H 'Content-Type: application/json' \
+  -d '{"subject": "production", "valid_at": 1769904000000, "token_budget": 4096}'
+```
+
+```json
+{
+  "items": [
+    {
+      "memory": {
+        "assertion": {"id": "deploy-helm", "value": "Helm",
+                      "valid_from": 1767571200000, "valid_to": 1772409600000},
+        "lifecycle": "superseded",
+        "superseded_by": "deploy-terraform"
+      },
+      "historical": true,
+      "citations": [{"id": "runbook-2026-01", "span": null}]
+    }
+  ],
+  "complete": true,
+  "revision": 4
+}
+```
+
+## Before You Start
+
+Antfly running in standalone mode. No model is needed: the agent supplies its claims, and Antfly orders and reconciles them.
+
+```bash
+curl -s http://127.0.0.1:8080/memory/v1/spaces/agent
+```
+
+A `404` with `"code": "TableNotFound"` means the server is up and the space doesn't exist yet.
+
+## Build It
+
+### 1. Create a Memory Space
+
+A space holds one agent's memory. `predicates` declares the relationships the agent records; `cardinality: "one"` means a subject has one current value, so a newer claim replaces an older one. Every write takes an `Idempotency-Key`, so a retried request is applied once.
+
+```bash
+curl -X POST http://127.0.0.1:8080/memory/v1/spaces \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: create-agent' \
+  -d '{
+    "space": "agent",
+    "config": {
+      "features": {"reconciliation": "deterministic"},
+      "predicates": [{"name": "deploys_with", "cardinality": "one"}]
+    }
+  }'
+```
+
+```json
+{"action": "create", "phase": "succeeded", "revision": 2}
+```
+
+### 2. Record Claims With Their Evidence
+
+Each observation pairs evidence (an immutable source version) with assertions that cite it. `valid_from` is when the claim became true in the world, in milliseconds since the Unix epoch. Record the March runbook first:
+
+```bash
+curl -X POST http://127.0.0.1:8080/memory/v1/spaces/agent/observations \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: runbook-2026-03' \
+  -d '{
+    "evidence": [{"id": "runbook-2026-03", "source_id": "deployment-runbook",
+                  "source_version": "2026-03", "text": "Production deploys with Terraform."}],
+    "assertions": [{"id": "deploy-terraform", "subject": "production",
+                    "predicate": "deploys_with", "value": "Terraform",
+                    "statement": "Production deploys with Terraform.",
+                    "valid_from": 1772409600000,
+                    "evidence": [{"id": "runbook-2026-03"}]}]
+  }'
+```
+
+```json
+{"action": "observe", "phase": "succeeded", "revision": 3, "evidence_accepted": true, "assertions_ready": true}
+```
+
+Then import the older January runbook, the way a backfill would. Repeat the call with `id`s `runbook-2026-01` and `deploy-helm`, the value `Helm`, and `"valid_from": 1767571200000`.
+
+### 3. Recall the Current Answer
+
+```bash
+curl -X POST http://127.0.0.1:8080/memory/v1/spaces/agent/recall \
+  -H 'Content-Type: application/json' \
+  -d '{"subject": "production", "token_budget": 4096}'
+```
+
+```json
+{
+  "items": [
+    {
+      "memory": {
+        "assertion": {"id": "deploy-terraform", "value": "Terraform",
+                      "valid_from": 1772409600000, "valid_to": null},
+        "lifecycle": "active",
+        "superseded_by": null
+      },
+      "historical": false,
+      "citations": [{"id": "runbook-2026-03", "span": null}]
+    }
+  ],
+  "complete": true,
+  "revision": 4
+}
+```
+
+Terraform stays current although Helm arrived later, because validity time decides, not import order. The Helm claim is kept as `superseded`, ending where Terraform begins. Recall with `valid_at` returns it, as in The Result. Add `"include_history": true` to get both in one response.
+
+### 4. Explain a Memory
+
+```bash
+curl -X POST http://127.0.0.1:8080/memory/v1/spaces/agent/memories/deploy-helm/explain \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+The response is a graph of `nodes`: the assertion, its `evidence`, the recorded `decision`s that reconciled it, and the `deploy-terraform` assertion that replaced it. `complete` and `missing_evidence` say whether the chain is whole. `GET .../memories/deploy-helm/history` returns every recorded revision.
+
+### 5. Record What Happened
+
+Close the loop by telling Antfly which memories a task used and whether it worked, so later reviews can see which memories led to good results.
+
+```bash
+curl -X POST http://127.0.0.1:8080/memory/v1/spaces/agent/outcomes \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: release-42' \
+  -d '{"id": "release-42", "task_id": "deploy-release-42", "success": true,
+       "used_memory_ids": ["deploy-terraform"], "detail": "terraform apply succeeded"}'
+```
+
+```json
+{"action": "outcome", "phase": "succeeded", "revision": 7}
+```
+
+### Run It Embedded
+
+The same actions run in-process on a `.aflite` file through the [embedded bindings](/docs/guides/lite), with the action name in the request:
+
+```python
+import antfly_embedded
+
+with antfly_embedded.create("agent.aflite") as db:
+    def memory(action, body=None, key=""):
+        return db.memory("agent", {"action": action, "body": body or {}, "idempotency_key": key})
+
+    memory("create", {"features": {"reconciliation": "deterministic"},
+                      "predicates": [{"name": "deploys_with", "cardinality": "one"}]}, "create-agent")
+    # observe, recall, explain and outcome take the same bodies as above.
+    print(memory("recall", {"subject": "production", "token_budget": 4096}))
+```
+
+Against a server, the Python SDK uses the same action names: `AntflyClient(url).memory.execute("agent", "recall", body={...})`. MCP clients reach these actions as tools at `/memory/v1/mcp`. The full contract, covering evidence and temporal policy, identity and supersession judging, provenance, and recorded explanations, is in [MEMORY.md](https://github.com/antflydb/antfly/blob/main/zig/MEMORY.md).
+
+## Tradeoffs
+
+The decision you own is which claims are facts with one current value. Declare a predicate with `cardinality: "one"` only when a newer claim should replace the old one; without it, both values stay `active` and recall returns both. Give every claim a real `valid_from`. A claim with no validity time can't be ordered against the others, so ingestion order never decides which is current.
+
+Evidence IDs name immutable source versions. When a runbook changes, record the new version under a new evidence ID rather than editing the old one, so explanations keep pointing at what the agent actually read.
+
+This guide has the agent write its own claims. Spaces can also extract and judge claims with a model; [Codex on Antfly](https://github.com/antflydb/codex/blob/antfly/integration/ANTFLY_INTEGRATION.md) does that, building a knowledge graph of decisions and lessons from each session. It also records each tool-approval verdict with its outcome so later approvals can follow precedent, indexes session history for search, and runs embedded or against a server from one setting.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "give my agent an Antfly memory space that records deployment guidance with sources and answers what was true at any date", and use this page to judge the result.
+
+## Next Steps
+
+- [Antfly Lite](/docs/guides/lite) to ship the memory inside your agent as a single file.
+- [Laya typed decisions](/docs/guides/models/laya) when the agent also needs to make and record yes or no calls.
+- [Use Antfly from n8n](/docs/guides/n8n) for connecting an agent over MCP.
