@@ -1,7 +1,7 @@
 # LightOnOCR-3 runtime
 
 Execution details, tuning switches, and measurements for the LightOnOCR-3
-readers. Usage is in the [LightOnOCR-3 guide](../../guides/lightonocr3.mdx).
+readers. Usage is in the [LightOnOCR-3 guide](../../guides/models/lightonocr3.mdx).
 
 ## Model geometry
 

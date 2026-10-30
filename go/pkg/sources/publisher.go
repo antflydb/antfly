@@ -50,6 +50,9 @@ func ValidateEndpoint(raw string) error {
 	return fmt.Errorf("Antfly endpoint requires HTTPS or loopback HTTP")
 }
 func (p *Publisher) call(ctx context.Context, method, path string, body any) ([]byte, error) {
+	if method == http.MethodGet {
+		return p.callRead(ctx, method, path, body)
+	}
 	return p.callContentType(ctx, method, path, body, "application/json")
 }
 func (p *Publisher) callContentType(ctx context.Context, method, path string, body any, contentType string) ([]byte, error) {
@@ -93,12 +96,15 @@ func (p *Publisher) callContentType(ctx context.Context, method, path string, bo
 		return nil, fmt.Errorf("Antfly response exceeds budget")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, &PublishHTTPError{Status: response.StatusCode}
+		return nil, &PublishHTTPError{Status: response.StatusCode, RetryAt: providerRetryAt(response.Header.Get("Retry-After"), time.Now())}
 	}
 	return data, nil
 }
 
-type PublishHTTPError struct{ Status int }
+type PublishHTTPError struct {
+	Status  int
+	RetryAt time.Time
+}
 
 func (e *PublishHTTPError) Error() string {
 	return fmt.Sprintf("Antfly publication returned HTTP %d", e.Status)
@@ -145,10 +151,17 @@ func (p *Publisher) ReadyAbsent(ctx context.Context, table string, ids []string)
 
 // WaitForAbsent verifies retirement through fresh ordinary table-query snapshots.
 func WaitForAbsent(ctx context.Context, query func(context.Context, string, []byte) ([]byte, error), table string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if len(ids) > 1000 {
+		return fmt.Errorf("canonical absence batch exceeds 1000 records")
+	}
+
 	wait, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
-		body, _ := json.Marshal(map[string]any{"query": map[string]any{"ids": ids}, "fields": []string{"_id"}, "limit": 1, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+		body, _ := json.Marshal(map[string]any{"query": documentIDsQuery(ids), "fields": []string{"_id"}, "limit": 1, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
 		data, err := query(wait, table, body)
 		if err != nil {
 			return err

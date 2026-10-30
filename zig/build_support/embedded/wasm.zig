@@ -56,6 +56,19 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .json = json_mod,
         .httpx = httpx_mod,
     });
+    // Browser readers consume wire contracts, never the inference server or
+    // its native provider graph. Reuse the canonical shared schema owners.
+    const inference_api_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/api/generated/inference_api/types.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const decision_api_mod = @import("../../lib/decisions/build.zig").createOpenApi(b, b.path("pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig"), api.generating);
+    inference_api_mod.addImport("antfly_decision_openapi", decision_api_mod);
+    inference_api_mod.addImport("antfly_chunking_api_openapi", api.chunking_api);
+    inference_api_mod.addImport("antfly_extraction_openapi", api.extraction);
+    inference_api_mod.addImport("antfly_generating_openapi", api.generating);
+    inference_api_mod.addImport("antfly_inference_config_openapi", api.inference_config);
     const wasm_protobuf_mod = b.dependency("protobuf", .{ .target = wasm_target, .optimize = optimize }).module("protobuf");
     const wasm_handlebars_mod = b.dependency("handlebars", .{ .target = wasm_target, .optimize = optimize }).module("handlebars");
     const wasm_platform_mod = platform_build.createModule(b, .{
@@ -181,6 +194,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const wasm_storage_boundary = @import("storage_boundary.zig").create(b, wasm_target, optimize);
     @call(.auto, configureBrowserModule, .{ b, wasm_storage_boundary, embedded_support_wasm_mod } ++ embedded_wasm_deps ++ .{addSnowballModule});
     embedded_support_wasm_mod.addImport("sql_parser", wasm_sql_parser_mod);
+    embedded_support_wasm_mod.addImport("inference_api", inference_api_mod);
     const wasm_cancellation_mod = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/cancellation.zig"),
         .target = wasm_target,
@@ -311,6 +325,28 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_readers_mod.addImport("antfly_document_runs", wasm_document_runs_mod);
     wasm_readers_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
     wasm_readers_mod.addImport("antfly_reader_config", wasm_reader_config);
+    const wasm_scraping_mod = b.createModule(.{
+        .root_source_file = b.path("lib/scraping/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_scraping_mod.addImport("antfly_source_reference", embedded_support_wasm_mod.import_table.get("antfly_source_reference").?);
+    wasm_scraping_mod.addImport("objectstore", wasm_objectstore_mod);
+    wasm_scraping_mod.addImport("httpx", httpx_mod);
+    wasm_scraping_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_scraping_mod.addImport("antfly_data_uri", wasm_data_uri_mod);
+    embedded_support_wasm_mod.addImport("antfly_scraping", wasm_scraping_mod);
+    const apple_options = b.addOptions();
+    apple_options.addOption(bool, "enabled", false);
+    const apple_options_mod = apple_options.createModule();
+    wasm_readers_mod.addImport("httpx", httpx_mod);
+    wasm_readers_mod.addImport("inference_api", inference_api_mod);
+    wasm_readers_mod.addImport("antfly_google", wasm_google_mod);
+    wasm_readers_mod.addImport("antfly_scraping", wasm_scraping_mod);
+    wasm_readers_mod.addImport("antfly_image", wasm_image_mod);
+    wasm_readers_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_readers_mod.addImport("antfly_inference_work", inference_work_mod);
+    wasm_readers_mod.addImport("apple_reader_options", apple_options_mod);
     embedded_support_wasm_mod.addImport("antfly_readers", wasm_readers_mod);
     const wasm_embeddings_mod = b.createModule(.{
         .root_source_file = b.path("lib/embeddings/src/mod.zig"),
@@ -469,9 +505,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_generating_mod.addImport("antfly-json", json_mod);
     wasm_generating_mod.addImport("antfly_generating_openapi", api.generating);
     const wasm_apple_mod = b.createModule(.{ .root_source_file = b.path("lib/apple_native/src/mod.zig"), .target = wasm_target, .optimize = optimize });
-    const apple_options = b.addOptions();
-    apple_options.addOption(bool, "enabled", false);
-    wasm_apple_mod.addOptions("apple_native_options", apple_options);
+    wasm_apple_mod.addImport("apple_native_options", apple_options_mod);
     wasm_apple_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_apple_mod.addImport("httpx", httpx_mod);
     wasm_generating_mod.addImport("antfly_apple_native", wasm_apple_mod);
@@ -510,6 +544,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     });
     inference_wasm_inference_mod.addImport("antfly_platform", wasm_platform_mod);
     inference_wasm_inference_mod.addImport("antfly_document_runs", wasm_document_runs_mod);
+    inference_wasm_inference_mod.addImport("antfly_readers", wasm_readers_mod);
     inference_wasm_inference_mod.addImport("jinja", wasm_inference_jinja_mod);
     inference_wasm_inference_mod.addImport("ml", wasm_inference_ml_mod);
     inference_wasm_inference_mod.addImport("onnx_graph", wasm_onnx.graph);

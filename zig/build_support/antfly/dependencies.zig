@@ -665,8 +665,14 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    scraping_mod.addAnonymousImport("antfly_data_uri", .{
+        .root_source_file = b.path("lib/scraping/src/data_uri.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     scraping_mod.addImport("antfly_source_reference", source_reference_mod);
     scraping_mod.addImport("objectstore", objectstore_mod);
+    scraping_mod.addImport("antfly_platform", platform_mod);
     scraping_mod.addImport("httpx", httpx_mod);
     const reranking_mod = b.createModule(.{
         .root_source_file = b.path("lib/reranking/src/mod.zig"),

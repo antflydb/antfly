@@ -25,6 +25,24 @@ const google_auth = @import("antfly_google").auth;
 
 const Allocator = std.mem.Allocator;
 
+pub const CredentialSource = enum { default, bearer_token, service_account };
+
+pub const Credentials = struct {
+    source: CredentialSource = .default,
+    bearer_token: ?[]u8 = null,
+    service_account_json: ?[]u8 = null,
+    credentials_path: ?[]u8 = null,
+    scope: ?[]u8 = null,
+
+    pub fn deinit(self: *Credentials, alloc: std.mem.Allocator) void {
+        if (self.bearer_token) |value| alloc.free(value);
+        if (self.service_account_json) |value| alloc.free(value);
+        if (self.credentials_path) |value| alloc.free(value);
+        if (self.scope) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
 test "standalone objectstore wires Google credential identity dependencies" {
     var manager = google_auth.CredentialManager.init(std.testing.allocator, std.testing.io);
     defer manager.deinit();
@@ -62,11 +80,11 @@ pub const Auth = union(enum) {
         self.* = undefined;
     }
 
-    fn authorizationValueAlloc(self: *Auth, alloc: Allocator) !?[]u8 {
+    fn authorizationValueAlloc(self: *Auth, alloc: Allocator, control: google_auth.RequestControl) !?[]u8 {
         return switch (self.*) {
             .none => null,
             .bearer_token => |token| try std.fmt.allocPrint(alloc, "Bearer {s}", .{token}),
-            .google_token_source => |source| try source.authorizationValueAlloc(alloc),
+            .google_token_source => |source| try source.authorizationValueAllocWithControl(alloc, control),
         };
     }
 };
@@ -79,6 +97,10 @@ pub const JsonApiConfig = struct {
     /// Optional end-to-end HTTP deadline. Object transfers leave this unset;
     /// control-plane probes set a bounded deadline explicitly.
     request_timeout_ms: ?u64 = null,
+    /// Absolute operation budget, including authentication and metadata probes.
+    request_deadline_ns: ?u64 = null,
+    /// Borrowed transport policy for scoped content downloads.
+    http_client_config: ?httpx.ClientConfig = null,
     /// Optional borrowed application runtime. When absent, the client owns a
     /// threaded fallback for standalone library use.
     io: ?std.Io = null,
@@ -152,7 +174,13 @@ const HttpxTransport = struct {
     io_impl: ?*std.Io.Threaded,
     client: httpx.Client,
 
+    deadline_ns: ?u64 = null,
+
     fn init(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io) !HttpxTransport {
+        return initConfigured(alloc, request_timeout_ms, shared_io, null);
+    }
+
+    fn initConfigured(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io, configured: ?httpx.ClientConfig) !HttpxTransport {
         const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
             const owned = try alloc.create(std.Io.Threaded);
             owned.* = std.Io.Threaded.init(alloc, .{});
@@ -162,14 +190,13 @@ const HttpxTransport = struct {
             owned.deinit();
             alloc.destroy(owned);
         };
-        var client_config: httpx.ClientConfig = if (request_timeout_ms) |timeout_ms| .{
-            .timeouts = .{
-                .connect_ms = timeout_ms,
-                .read_ms = timeout_ms,
-                .write_ms = timeout_ms,
-                .request_ms = timeout_ms,
-            },
-        } else .{};
+        var client_config: httpx.ClientConfig = configured orelse .{};
+        if (request_timeout_ms) |timeout_ms| client_config.timeouts = .{
+            .connect_ms = timeout_ms,
+            .read_ms = timeout_ms,
+            .write_ms = timeout_ms,
+            .request_ms = timeout_ms,
+        };
         // Small immutable objects still need room for provider error envelopes
         // so HTTP status mapping preserves missing, denied and transient errors.
         client_config.max_error_response_size = 4096;
@@ -211,9 +238,12 @@ const HttpxTransport = struct {
             try request_headers.append(alloc, .{ "Content-Type", value });
         }
 
+        const control = google_auth.RequestControl{ .deadline_ns = self.deadline_ns };
+        try control.check();
         var response = self.client.request(method.toHttpx(), url, .{
             .headers = request_headers.items,
             .body = body,
+            .timeout_ms = try control.remainingTimeoutMs(),
             .max_response_size = max_response_size,
             .cancellation = if (cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
@@ -289,7 +319,8 @@ pub const JsonApiClient = struct {
     pub fn init(alloc: Allocator, cfg: JsonApiConfig) !JsonApiClient {
         const transport = try alloc.create(HttpxTransport);
         errdefer alloc.destroy(transport);
-        transport.* = try HttpxTransport.init(alloc, cfg.request_timeout_ms, cfg.io);
+        transport.* = try HttpxTransport.initConfigured(alloc, cfg.request_timeout_ms, cfg.io, cfg.http_client_config);
+        transport.deadline_ns = cfg.request_deadline_ns;
         return .{
             .alloc = alloc,
             .cfg = cfg,
@@ -1020,8 +1051,18 @@ pub const JsonApiClient = struct {
         defer merged.deinit(alloc);
         try merged.appendSlice(alloc, headers);
 
-        const auth_value = try self.cfg.auth.authorizationValueAlloc(alloc);
+        const control = google_auth.RequestControl{
+            .deadline_ns = self.cfg.request_deadline_ns orelse if (self.cfg.request_timeout_ms) |ms|
+                (if (ms == 0) null else platform.time.monotonicNs() +| (ms *| std.time.ns_per_ms))
+            else
+                null,
+            .cancellation = if (cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null,
+        };
+        try control.check();
+        const auth_value = self.cfg.auth.authorizationValueAlloc(alloc, control) catch |err|
+            return if (err == error.Cancelled) error.Canceled else err;
         defer if (auth_value) |value| alloc.free(value);
+        try control.check();
         if (auth_value) |value| try merged.append(alloc, .{ "Authorization", value });
 
         return try self.request_fn(
@@ -1231,8 +1272,10 @@ pub fn jsonApiConfigAlloc(alloc: Allocator, bucket: []const u8) !Config {
 }
 
 pub fn jsonApiClientConfigAlloc(alloc: Allocator) !JsonApiConfig {
+    const endpoint = try alloc.dupe(u8, "https://storage.googleapis.com/storage/v1");
+    errdefer alloc.free(endpoint);
     return .{
-        .endpoint = try alloc.dupe(u8, "https://storage.googleapis.com/storage/v1"),
+        .endpoint = endpoint,
         .upload_endpoint = try alloc.dupe(u8, "https://storage.googleapis.com/upload/storage/v1"),
         .auth = .none,
     };
@@ -1247,6 +1290,86 @@ pub fn jsonApiClientConfigWithBearerTokenAlloc(
     errdefer cfg.deinit(alloc);
     cfg.auth = .{ .bearer_token = try alloc.dupe(u8, bearer_token) };
     if (project_id) |value| cfg.project_id = try alloc.dupe(u8, value);
+    return cfg;
+}
+
+/// Shared authentication/transport construction for every GCS connection user.
+pub fn clientConfigForCredentialsAlloc(
+    alloc: Allocator,
+    credentials: Credentials,
+    project_id: ?[]const u8,
+    endpoint_override: ?[]const u8,
+    upload_endpoint: ?[]const u8,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
+) !JsonApiConfig {
+    var cfg = switch (credentials.source) {
+        .default => try jsonApiClientConfigFromEnvWithAuthoritiesAlloc(
+            alloc,
+            credentials.scope,
+            network_io,
+            filesystem_io,
+        ),
+        .bearer_token => try jsonApiClientConfigWithBearerTokenAlloc(
+            alloc,
+            credentials.bearer_token orelse return error.InvalidConnectionCredentials,
+            project_id,
+        ),
+        .service_account => blk: {
+            var account = if (credentials.service_account_json) |raw|
+                try google_auth.parseServiceAccountJsonAlloc(alloc, raw)
+            else
+                try google_auth.serviceAccountFromFileAllocWithIo(alloc, credentials.credentials_path orelse return error.InvalidConnectionCredentials, filesystem_io);
+            var account_owned = true;
+            errdefer if (account_owned) account.deinit(alloc);
+            const account_project_id = if (account.project_id) |value| try alloc.dupe(u8, value) else null;
+            defer if (account_project_id) |value| alloc.free(value);
+            var auth_cfg = try google_auth.configFromServiceAccountAlloc(
+                alloc,
+                account,
+                credentials.scope orelse google_auth.default_scope,
+            );
+            account_owned = false;
+            var auth_owned = true;
+            errdefer if (auth_owned) auth_cfg.deinit(alloc);
+            const source = try alloc.create(google_auth.CachedTokenSource);
+            var source_allocation_owned = true;
+            errdefer if (source_allocation_owned) alloc.destroy(source);
+            source.* = try google_auth.CachedTokenSource.initWithAuthorities(
+                alloc,
+                auth_cfg,
+                network_io,
+                filesystem_io,
+            );
+            auth_owned = false;
+            var source_owned = true;
+            errdefer if (source_owned) source.deinit();
+            var value = try jsonApiClientConfigAlloc(alloc);
+            value.auth = .{ .google_token_source = source };
+            source_owned = false;
+            source_allocation_owned = false;
+            errdefer value.deinit(alloc);
+            if (project_id orelse account_project_id) |selected_project_id| value.project_id = try alloc.dupe(u8, selected_project_id);
+            break :blk value;
+        },
+    };
+    errdefer cfg.deinit(alloc);
+    cfg.io = network_io;
+    if (endpoint_override) |endpoint| {
+        const owned = try alloc.dupe(u8, endpoint);
+        alloc.free(cfg.endpoint);
+        cfg.endpoint = owned;
+    }
+    if (upload_endpoint) |endpoint| {
+        const owned = try alloc.dupe(u8, endpoint);
+        alloc.free(cfg.upload_endpoint);
+        cfg.upload_endpoint = owned;
+    }
+    if (project_id) |configured_project_id| {
+        const owned = try alloc.dupe(u8, configured_project_id);
+        if (cfg.project_id) |previous| alloc.free(previous);
+        cfg.project_id = owned;
+    }
     return cfg;
 }
 
@@ -2717,4 +2840,24 @@ test "gcs legacy media ETag is verified against a bounded captured generation be
     defer written.deinit(a);
     try std.testing.expectEqualStrings("6", written.version_id.?);
     try std.testing.expectEqual(@as(usize, 3), state.calls);
+}
+
+test "GCS shared credential factory rolls back every allocation failure" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            var cfg = try clientConfigForCredentialsAlloc(a, .{ .source = .bearer_token, .bearer_token = @constCast("fixture-token") }, "project", "https://storage.example/storage/v1", "https://storage.example/upload/storage/v1", null, null);
+            defer cfg.deinit(a);
+            try std.testing.expectEqualStrings("project", cfg.project_id.?);
+        }
+    };
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "GCS expired operation deadline fails before transport dispatch" {
+    var cfg = try jsonApiClientConfigWithBearerTokenAlloc(std.testing.allocator, "fixture-token", null);
+    cfg.request_deadline_ns = 1;
+    var client = try JsonApiClient.init(std.testing.allocator, cfg);
+    defer client.deinit();
+    var store = client.client();
+    try std.testing.expectError(error.Timeout, store.getObject("bucket", "doc", .{ .version_id = "123", .skip_metadata_probe = true }));
 }

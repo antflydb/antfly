@@ -208,15 +208,35 @@ exclusive key range, so reconciling one source cannot remove another source's
 records or unrelated application keys. Hosted deployments still reserve source
 tables to protect their ACL markers.
 
-The writer first queries normalized metadata, preserving `indexed_at` only when
-all canonical fields and the content digest are unchanged. Volatile enumeration
-positions are excluded. Non-destructive LinearMerge pages compare canonical
-content hashes and skip unchanged rows. Every page must pass the shared snapshot
-readiness barrier. Only a fully verified authoritative inventory can issue the
-final bounded cleanup, retaining its verified IDs without uploading their text a
-second time. Partial selections, failed reads, and repair retries never reconcile
-missing rows. Provider access/absence checks precede cleanup, and a fresh query
-proves the range contains no extra records before catalog publication.
+The writer first queries a bounded list of document identities using
+`{"query":{"doc_id":{"ids":["DOCUMENT_KEY"]}}}` and requires a successful fresh
+snapshot. It compares the complete normalized projection and content digest,
+including the outer ownership/filtering fields. Identical rows are verified
+without issuing a content merge, and keep their original `indexed_at`. Input
+text must match its normalized SHA-256 digest. Volatile enumeration positions
+are excluded. Mixed pages merge only the changed rows, with deletion disabled;
+those rows must pass the shared snapshot readiness barrier.
+
+Only a fully verified authoritative inventory can reconcile missing rows.
+After provider access/absence checks, a bounded fresh range query proves whether
+there are extra records. A clean range rechecks retained IDs in bounded fresh queries and finishes without a cleanup merge;
+otherwise the final scoped merge retains all verified IDs and a fresh query
+proves that cleanup is visible. Thus an unchanged sync sends no content or
+cleanup merges. Partial selections, failed reads and failed writes never
+reconcile missing rows. No-op results include verified rows in `Skipped`, with
+no mutation cursor or range acknowledgement.
+
+Read-only data-plane GETs and POST queries retry transient transport failures
+and HTTP 408/425/429/500/502/503/504 up to three total attempts, within a shared
+30-second budget or the caller's earlier deadline. Backoff is cancellable and
+honors a supported `Retry-After`; a cooldown longer than the remaining budget
+returns the error immediately. Batch, table creation and scoped merges are never
+blindly retried. An ambiguous or invalid merge acknowledgement closes that
+writer to further mutation or cleanup. Resume the durable source run: its
+ownership journal and pinned inventory survive, and a new writer uses fresh
+visibility proofs before deciding which rows or range still need work. A
+committed write or cleanup whose acknowledgement was lost is therefore not
+replayed just to obtain another acknowledgement.
 
 The existing `/tables/{table}/merge` endpoint accepts the versioned
 `application/vnd.antfly.scoped-merge.v1+json` envelope (`scoped_merge` with explicit
@@ -315,3 +335,52 @@ through GoogleCredentialsForServices. This preserves verified service-account
 JWT scope provenance when token response scopes are omitted. Custom OAuth clients
 must expose an oauth2.Transport with actual token scope extras; opaque transports
 or authorized-user tokens without scope proof cannot authorize cached Drive data.
+
+## Local native end-to-end qualification
+
+The regular Go suite uses HTTP protocol fixtures. To exercise the real database,
+first build `antfly` and `antfly-grep` from the same checkout, start a dedicated
+loopback-only standalone, and pass its API to the opt-in test:
+
+```sh
+# From zig/, using the repository's supported compiler and worktree caches:
+make build
+zig build grep -Dgrep-only=true
+# Start in a separate terminal; keep all server state inside this worktree.
+source_e2e_dir="$PWD/../.cache/source-e2e"
+mkdir -p "$source_e2e_dir"
+cat > "$source_e2e_dir/config.json" <<EOF
+{"public_inference":{"enabled":false},"inference":{"models_dir":"$source_e2e_dir/models"},"secrets":{"native":{"name":"native","path":"$source_e2e_dir/secrets.json"},"environment":true}}
+EOF
+./zig-out/bin/antfly standalone --config "$source_e2e_dir/config.json" \
+  --host 127.0.0.1 --port 18080 --control-tick-ms 5 \
+  --data-dir "$source_e2e_dir/data" \
+  --replica-root-dir "$source_e2e_dir/replicas" \
+  --replica-catalog-path "$source_e2e_dir/catalog.txt" \
+  --snapshot-root-dir "$source_e2e_dir/snapshots" --auth false --health false
+
+# From go/pkg/sources/:
+ANTFLY_SOURCES_E2E_URL=http://127.0.0.1:18080/db/v1 \
+ANTFLY_GREP_TEST_BINARY="$PWD/../../../zig/zig-out/bin/antfly-grep" \
+GOWORK=off GOEXPERIMENT=simd go test -v -run '^TestLocalAntflySourcePipeline$' -timeout 20m
+```
+
+Use a fresh standalone data directory. The test refuses non-loopback endpoints
+and creates uniquely named synthetic tables in the supplied database. It runs the
+actual source CLI against a local S3 fixture, publishes 475 records plus another
+source sharing the table, and invokes native grep through file and table catalogs.
+It checks no-op synchronization, changed records, post-commit connection loss,
+cleanup recovery, upstream access failure, and preservation of foreign records.
+`ANTFLY_SOURCES_E2E_RECORDS=4` selects a short smoke run; the default is 475.
+`ANTFLY_SOURCE_TEST_BINARY` may select an already-built source CLI.
+
+Native GCS PDF artifact fetching has a separate opt-in test in
+`examples/grepstein/local_e2e_test.go`. From that example directory, set
+`ANTFLY_GREPSTEIN_E2E_BINARY` to the same Antfly binary and run
+`go test -v -run '^TestLocalNativeGCSExtraction$' -timeout 10m` with `GOWORK=off`
+and `GOEXPERIMENT=simd`. It starts its own isolated standalone with a scoped GCS
+connection and a local storage fixture, then verifies generation-bound PDF text
+extraction, the qualification gate, and owner-side bucket/prefix/version rejection.
+These tests do not qualify real Google identity exchange or model-based OCR,
+embeddings, relationship extraction, or production GPU capacity. They are
+explicitly opt-in and do not make normal source-module tests build Antfly.

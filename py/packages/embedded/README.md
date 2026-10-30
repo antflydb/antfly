@@ -332,6 +332,22 @@ Tests that need `libantfly` skip cleanly when it cannot be found, unless
 `zig/pkg/antfly-embedded/capi-conformance/cases/*.json` through this public API, the
 same declarative cases the Go and Rust bindings run.
 
+Use `uv run pytest --durations=25` to separate fixture setup from test calls.
+The SQL FK/subquery regression keeps synchronous commits and checks reopen
+persistence; `ANTFLY_EMBEDDED_SQL_STRESS=1` runs the original 400-transaction
+stress workload. The ordinary case crosses the deletion boundary with nine
+children and checks the surviving keys. A native C ABI regression separately
+forces a runtime-generation refresh between the subquery and commit.
+
+Resolver restore tests share only immutable backup bytes and a backup file.
+Each restore API/storage combination gets its own database and verifies source
+isolation after migration. Background-progress tests must observe the real
+worker without calling `run_until_idle()`: the native Lite diagnostic
+`pending_work_stats()["background_publications"]["maintenance_rounds"]` counts
+namespace rounds reaching replay/idle completion, while `maintenance_errors`
+reports failures. Stability checks require further rounds with unchanged
+derived targets instead of assuming a fixed sleep was sufficient.
+
 ## SQL and multiple tables
 
 The PEP 249 interface provides independent connections, native streaming

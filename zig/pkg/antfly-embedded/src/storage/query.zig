@@ -16,7 +16,7 @@
 //! Physical local-query execution. Routing and owner acquisition belong to callers.
 
 const std = @import("std");
-const storage_engine = @import("engine.zig");
+const storage_engine = @import("engine_dispatch.zig").implementation;
 const graph_mod = @import("../graph/graph.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const graph_exec_mod = @import("db/query/graph_exec.zig");
