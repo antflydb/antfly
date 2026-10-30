@@ -8613,14 +8613,25 @@ const Engine = struct {
         const item = projection.items[0];
         if (item.expression.value != .call) return null;
         const aggregate_call = item.expression.value.call;
-        if (!std.ascii.eqlIgnoreCase(aggregate_call.name, "count") or !aggregate_call.star or aggregate_call.distinct or aggregate_call.args.len != 0) return null;
         const node = path.nodes[0];
+        if (!std.ascii.eqlIgnoreCase(aggregate_call.name, "count") or aggregate_call.distinct) return null;
+        if (aggregate_call.star) {
+            if (aggregate_call.args.len != 0) return null;
+        } else {
+            // A mandatory single-node MATCH binds this alias to a non-NULL
+            // node. COUNT(alias) is exactly COUNT(*) over the same predicates.
+            // Expressions, nullable aliases and DISTINCT keep their evaluator.
+            if (aggregate_call.args.len != 1 or node.alias == null) return null;
+            const argument = aggregate_call.args[0];
+            if (argument.value != .variable or !std.mem.eql(u8, argument.value.variable, node.alias.?)) return null;
+        }
         const request: backend_mod.CountInput = .{ .node = node, .predicate = operation.predicate, .source = self.source, .parameters = self.parameters, .max_examined = self.limits.scanned_anchors -| self.stats.scanned_anchors, .max_work = remainingWork(self), .memory_bytes = self.limits.memory_bytes };
         if (!@import("owner_count.zig").eligible(request)) return null;
         const label = self.graph.label(node.labels[0]) orelse return null;
         const result = (try read(self.backend.ptr, self.a, label.table, request)) orelse return null;
-        if (result.examined > request.max_examined or result.count > result.examined) return error.CypherInvalidBackendPage;
+        try result.validate(request.max_examined);
         self.stats.scanned_anchors += result.examined;
+        if (!result.complete) return null;
         const total_count = std.math.cast(i64, result.count) orelse return error.CypherNumericOverflow;
         const name = item.alias orelse try self.expressionName(item.expression);
         self.columns = try self.a.dupe([]const u8, &.{name});

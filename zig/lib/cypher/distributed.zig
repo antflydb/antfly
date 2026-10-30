@@ -364,7 +364,7 @@ pub const ReadSet = struct {
         fn usage(job: ReadJob) !usize {
             if (job.operation == .count) {
                 if (job.count_result) |result| {
-                    if (result.count > result.examined or result.examined > job.maximum) return error.CypherInvalidBackendPage;
+                    try result.validate(job.maximum);
                     return result.examined;
                 }
                 return if (job.err != null and (job.err.? == error.CypherAnchorBudgetExceeded or job.err.? == error.CypherStateBudgetExceeded)) job.maximum else 0;
@@ -416,6 +416,13 @@ pub const ReadSet = struct {
                     return err;
                 }
                 if (err != error.CypherStateBudgetExceeded and err != error.CypherAnchorBudgetExceeded) return err;
+            };
+            // A declined reduction cannot produce a complete cardinality.
+            // Preserve all joined reservations, but do not spend another read
+            // retrying a skewed owner merely to discard that count as well.
+            // Authority and other fatal failures above still take precedence.
+            for (self.jobs[0..self.count]) |job| if (job.operation == .count and job.err == null) {
+                if (job.count_result == null or !job.count_result.?.complete) return;
             };
             for (self.jobs[0..self.count]) |*job| if (job.err) |err| {
                 if (self.count == 1) return err;
@@ -835,7 +842,13 @@ pub const ReadSet = struct {
                 try single.invoke(self);
                 total.examined += try ReadWave.usage(single);
             }
-            for (jobs) |job| total.count += (job.count_result orelse return null).count;
+            for (jobs) |job| {
+                // Every started owner has joined and its physical progress is
+                // included, even when another owner declined this reduction.
+                const result = job.count_result orelse return .{ .count = 0, .examined = total.examined, .complete = false };
+                if (!result.complete) return .{ .count = 0, .examined = total.examined, .complete = false };
+                total.count += result.count;
+            }
             start += width;
         }
         try checkpoint(ptr);
@@ -1129,6 +1142,9 @@ pub const ReadSet = struct {
         try checkpoint(ptr);
         return .{ .pages = pages, .examined = examined };
     }
+    fn endpointPossible(range: ?b.EndpointRange, key: []const u8) bool {
+        return if (range) |known| known.contains(key) else true;
+    }
     fn adjacencyOwner(self: *ReadSet, owner: usize, mapping: catalog.Relationship, identity: v.Identity, peer: ?v.Identity, direction: ast.Direction) bool {
         const graph = self.graph orelse return false;
         const source = graph.label(mapping.source_label).?.table;
@@ -1139,8 +1155,12 @@ pub const ReadSet = struct {
         const incoming = direction != .out and std.mem.eql(u8, identity.table, target) and (peer == null or std.mem.eql(u8, peer.?.table, source));
         if (!outgoing and !incoming) return false;
         for (self.snapshots[owner].adjacency_routes) |route| if (std.mem.eql(u8, route.index, mapping.index)) {
-            const out_possible = outgoing and (if (route.outgoing) |range| range.contains(identity.key) else true);
-            const in_possible = incoming and (if (route.incoming) |range| range.contains(identity.key) else true);
+            // A bound pair must fit both physical endpoint envelopes in at
+            // least one permitted orientation. Unknown proofs stay possible.
+            const out_possible = outgoing and endpointPossible(route.outgoing, identity.key) and
+                (peer == null or endpointPossible(route.incoming, peer.?.key));
+            const in_possible = incoming and endpointPossible(route.incoming, identity.key) and
+                (peer == null or endpointPossible(route.outgoing, peer.?.key));
             if (!out_possible and !in_possible) return false;
             // Physical endpoint envelopes supersede document placement. A
             // producer can emit a source outside its primary document range.

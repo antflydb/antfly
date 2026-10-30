@@ -1085,6 +1085,7 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         for query in (
             "MATCH (n:P) RETURN count(*)",
+            "MATCH (n:P) RETURN count(n)",
             "MATCH (n:P) WHERE antfly.documentKey(n) IN [i IN range(0,199) | 'n'+toString(i)] RETURN count(n.body)",
             f"CALL antfly.search('{payload_table}',{{query:'body:needle',mode:'text',limit:200}}) YIELD score RETURN count(*)",
         ):
@@ -1093,6 +1094,11 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                 {"query": query, "limits": {"memory_bytes": 8 << 20}},
             )
             assert pruned["rows"] == [[{"type": "integer", "value": "200"}]], pruned
+        empty_count = call(
+            f"/graphs/{payload_table}/query",
+            {"query": "MATCH (n:P {body:'absent'}) RETURN count(n)"},
+        )
+        assert empty_count["rows"] == [[{"type": "integer", "value": "0"}]], empty_count
         for expression, expected in (
             ("min(n.body)", {"type": "string", "value": "needle"}),
             ("min(n.`literal.field`)", {"type": "integer", "value": "7"}),

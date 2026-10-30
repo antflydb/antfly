@@ -72,7 +72,16 @@ pub const Probe = struct { page: Page(*const v.Node), complete: bool };
 /// Exact scalar COUNT over a licensed single-node match. Owners evaluate the
 /// original Cypher predicate after policy projection, never admission hints.
 pub const CountInput = struct { node: ast.Node, predicate: ?*const ast.Expr = null, parameters: []const v.Entry = &.{}, source: []const u8 = "", max_examined: usize = 1_000_000, max_work: usize = 1_000_000, memory_bytes: usize = 64 << 20 };
-pub const CountResult = struct { count: usize, examined: usize };
+/// Incomplete attempts carry physical progress without asserting a count.
+/// Null is reserved for unsupported operations which performed no reads.
+pub const CountResult = struct {
+    count: usize,
+    examined: usize,
+    complete: bool = true,
+    pub fn validate(self: @This(), maximum: usize) !void {
+        if (self.examined > maximum or self.count > self.examined or (!self.complete and self.count != 0)) return error.CypherInvalidBackendPage;
+    }
+};
 /// First adjacency pages for a bounded frontier. NULL slots decline cache
 /// admission without inventing EOF. Examined includes discarded page reads.
 pub const ExpansionBatch = struct { pages: []const ?Page(*const v.Relationship), examined: usize };

@@ -619,7 +619,7 @@ test "count waves join charge skewed retries and preserve local affinity" {
     const Fixture = struct {
         activity: Activity,
         controller: std.Thread.Id,
-        mode: enum { normal, serial, local, anchors, work, forbidden, revoked },
+        mode: enum { normal, serial, local, anchors, work, forbidden, revoked, decline, partial, decline_anchors, partial_work, decline_forbidden, partial_revoked },
         revoked: std.atomic.Value(bool) = .init(false),
         calls: atomic = .init(0),
         owners: [8]Owner = undefined,
@@ -638,11 +638,15 @@ test "count waves join charge skewed retries and preserve local affinity" {
                 try self.f.activity.enter();
                 defer self.f.activity.leave();
                 _ = self.f.calls.fetchAdd(1, .monotonic);
-                const units: usize = if (self.f.mode == .work and self.index == 0) 9000 else 1;
+                const units: usize = if ((self.f.mode == .work or self.f.mode == .partial_work) and self.index == 0) 9000 else 1;
                 for (0..units) |_| if (self.work) |work| try work.charge(work.ptr, 1);
                 if (self.index == 1 and self.f.mode == .forbidden) return error.Forbidden;
                 if (self.index == 1 and self.f.mode == .revoked) self.f.revoked.store(true, .release);
-                const count_value: usize = if (self.f.mode == .anchors and self.index == 0) 1500 else 1;
+                if (self.index == 2 and self.f.mode == .decline_forbidden) return error.Forbidden;
+                if (self.index == 2 and self.f.mode == .partial_revoked) self.f.revoked.store(true, .release);
+                if (self.index == 1 and (self.f.mode == .decline or self.f.mode == .decline_anchors or self.f.mode == .decline_forbidden)) return null;
+                if (self.index == 1 and (self.f.mode == .partial or self.f.mode == .partial_work or self.f.mode == .partial_revoked)) return .{ .count = 0, .examined = 1, .complete = false };
+                const count_value: usize = if ((self.f.mode == .anchors or self.f.mode == .decline_anchors) and self.index == 0) 1500 else 1;
                 if (count_value > input.max_examined) return error.CypherAnchorBudgetExceeded;
                 return .{ .count = count_value, .examined = count_value };
             }
@@ -669,8 +673,16 @@ test "count waves join charge skewed retries and preserve local affinity" {
         const backend = read.backend();
         backend.vtable.set_work.?(backend.ptr, meter.work());
         const result = backend.vtable.count_nodes.?(backend.ptr, std.testing.allocator, "docs", .{ .node = .{ .span = .{}, .alias = "n", .labels = &.{"D"}, .properties = &.{} }, .max_examined = 4096, .max_work = 20000 });
-        if (mode == .forbidden or mode == .revoked) {
+        const declined = mode == .decline or mode == .partial or mode == .decline_anchors or mode == .partial_work or mode == .decline_forbidden or mode == .partial_revoked;
+        if (mode == .forbidden or mode == .revoked or mode == .decline_forbidden or mode == .partial_revoked) {
             try std.testing.expectError(error.Forbidden, result);
+        } else if (declined) {
+            const attempt = (try result).?;
+            try std.testing.expect(!attempt.complete);
+            try std.testing.expectEqual(@as(usize, 0), attempt.count);
+            try std.testing.expectEqual(@as(usize, if (mode == .decline) 3 else if (mode == .decline_anchors) 1026 else if (mode == .partial_work) 1027 else 4), attempt.examined);
+            try std.testing.expectEqual(@as(usize, 4), f.calls.load(.acquire));
+            try std.testing.expectEqual(@as(usize, if (mode == .partial_work) 4003 else 4), meter.units);
         } else {
             const count_result = (try result).?;
             try std.testing.expectEqual(@as(usize, if (mode == .anchors) 1507 else 8), count_result.count);
@@ -680,7 +692,7 @@ test "count waves join charge skewed retries and preserve local affinity" {
         }
         try std.testing.expectEqual(@as(usize, 0), f.activity.active.load(.acquire));
         try std.testing.expect(if (mode == .serial) f.activity.peak.load(.acquire) == 1 else f.activity.peak.load(.acquire) > 1);
-        for (f.owners) |owner| try std.testing.expectEqual(meter.work().ptr, owner.work.?.ptr);
+        for (f.owners[0..if (declined) 4 else 8]) |owner| try std.testing.expectEqual(meter.work().ptr, owner.work.?.ptr);
     }
 }
 

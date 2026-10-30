@@ -4811,3 +4811,32 @@ supports to disable deferred reclamation. This build-command workaround is not
 part of the product configuration. The previously recorded enrichment
 owner-loss campaign remains outside this qualification and has not been
 established as fixed.
+
+Count attempts now distinguish a complete cardinality from an incomplete
+reduction which has already examined physical rows. Unsupported callbacks may
+return NULL only before doing reads. A coordinator that encounters a declined
+owner returns `complete=false`, a zero count and all examined progress from
+joined owners and prior waves. The evaluator validates and charges that progress
+before scalar fallback. Completed counts remain the default for legacy private
+replies. Invalid incomplete cardinalities are rejected at both RPC boundaries.
+Once a joined owner has declined, skewed count reservations are not retried:
+their worst-case physical/work charges survive, but an unusable reduction does
+not consume another owner read. Authorization and revocation errors still win.
+The regression traverses an owner and coordinator JSON channel: a 32-anchor
+budget rejects the fallback, while a 49-anchor budget returns the 33 nodes and
+reports all 49 physical rows, including the discarded 16-row count attempt.
+
+Mandatory single-node `COUNT(alias)` uses the same owner reduction as
+`COUNT(*)`: the matched alias is necessarily a non-NULL node. DISTINCT,
+optional matches and arbitrary expressions retain their existing evaluators.
+No row payload is transported for an eligible alias count; predicate, label,
+policy and TTL evaluation still run at the retained owner cut.
+
+Bound-pair adjacency reads now require both endpoint certificates to admit
+the pair in at least one permitted orientation. Outgoing reads test the
+source envelope against the current node and the incoming envelope against
+the peer; incoming reads reverse those roles. Undirected reads admit either
+orientation. Missing bounds remain conservative, while an empty or excluding
+bound can prove that orientation impossible. RPC regressions reduce eight
+owner calls to one for disjoint peer envelopes and retain native owner cursors,
+both stored orientations and producer endpoints outside primary shard ranges.

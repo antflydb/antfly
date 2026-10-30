@@ -426,7 +426,7 @@ pub const Client = struct {
         defer arena.deinit();
         const reply = try self.invoke(arena.allocator(), request);
         if (reply.values.len != 0 or reply.next != null or reply.batch != null) return error.CypherInvalidBackendPage;
-        if (reply.count) |result| if (result.count > result.examined or result.examined > input.max_examined or reply.values.len != 0 or reply.next != null) return error.CypherInvalidBackendPage;
+        if (reply.count) |result| try result.validate(input.max_examined);
         return reply.count;
     }
     fn probeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?b.Probe {
@@ -625,6 +625,7 @@ pub const Owner = struct {
                 if (input.parameters.value != .map) return error.InvalidCypherParameters;
                 const read = self.backend.vtable.count_nodes orelse return .{ .work = meter.units };
                 const result = read(self.backend.ptr, scratch, request.table, .{ .node = input.node, .predicate = input.predicate, .parameters = input.parameters.value.map, .source = input.source, .max_examined = request.max_examined, .max_work = request.max_work, .memory_bytes = @min(input.memory_bytes, 64 << 20) }) catch |err| return self.readFailure(meter.units, err);
+                if (result) |attempt| try attempt.validate(request.max_examined);
                 try self.backend.vtable.checkpoint(self.backend.ptr);
                 return .{ .count = result, .work = meter.units };
             },
@@ -1204,4 +1205,37 @@ test "owner count retains its narrower work ceiling through client metering" {
     backend.vtable.set_work.?(backend.ptr, meter.work());
     _ = try backend.vtable.count_nodes.?(backend.ptr, std.testing.allocator, "docs", .{ .node = .{ .span = .{}, .alias = "n", .labels = &.{"D"}, .properties = &.{} }, .max_work = 32 });
     try std.testing.expectEqual(@as(usize, 32), fixture.seen);
+}
+
+test "count attempts preserve incomplete progress and reject false cardinalities" {
+    const Fixture = struct {
+        result: ?b.CountResult = .{ .count = 0, .examined = 7, .complete = false },
+        fn wireCall(_: *anyopaque, _: A, _: []const u8) ![]u8 {
+            return error.TestUnexpectedWireCall;
+        }
+        fn call(ptr: *anyopaque, _: A, _: Request) !Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .count = self.result };
+        }
+    };
+    var fixture: Fixture = .{};
+    var client: Client = .{ .channel = .{ .ptr = &fixture, .call = Fixture.wireCall, .typed = Fixture.call }, .incarnation = 1, .revision = 1 };
+    const backend = client.backend();
+    const input: b.CountInput = .{ .node = .{ .span = .{}, .alias = "n", .labels = &.{"D"}, .properties = &.{} }, .max_examined = 8 };
+    const attempt = (try backend.vtable.count_nodes.?(backend.ptr, std.testing.allocator, "docs", input)).?;
+    try std.testing.expect(!attempt.complete);
+    try std.testing.expectEqual(@as(usize, 7), attempt.examined);
+    fixture.result.?.count = 1;
+    try std.testing.expectError(error.CypherInvalidBackendPage, backend.vtable.count_nodes.?(backend.ptr, std.testing.allocator, "docs", input));
+    fixture.result.?.count = 0;
+    fixture.result.?.examined = 9;
+    try std.testing.expectError(error.CypherInvalidBackendPage, backend.vtable.count_nodes.?(backend.ptr, std.testing.allocator, "docs", input));
+    fixture.result = null;
+    try std.testing.expect((try backend.vtable.count_nodes.?(backend.ptr, std.testing.allocator, "docs", input)) == null);
+    // Replies produced before the progress flag existed remain complete.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const legacy = try std.json.parseFromSliceLeaky(Reply, arena.allocator(), "{\"count\":{\"count\":3,\"examined\":4}}", .{});
+    try std.testing.expect(legacy.count.?.complete);
+    try legacy.count.?.validate(8);
 }
