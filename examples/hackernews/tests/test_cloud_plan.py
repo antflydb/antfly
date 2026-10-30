@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
 import sys
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -37,6 +37,17 @@ def test_separate_object_tables_and_scoped_cloud_keys():
     base = tables["archive-table.json"]["schema"]["base_source"]
     assert base["format"] == "parquet" and "write_policy" not in base
     assert base["credentials"]["ref"] == "cloud-gcs-cred_" + archive.replace("-", "")
+    relation_names = set()
+    for table, filename in (
+        ("hn_archive", "archive-table.json"),
+        ("hn_current", "current-table.json"),
+    ):
+        indexes = tables[filename]["schema"]["relational_indexes"]
+        names = {index["name"] for index in indexes}
+        assert len(names) == len(indexes)
+        assert all(name.startswith(table + "_") for name in names)
+        assert not relation_names.intersection(names)
+        relation_names.update(names)
     plan = management_plan("antfly-showcases", RUNTIME["image"])
     assert plan["create-instance.json"]["version_policy"] == "pinned"
     assert "native_artifacts" not in plan["create-instance.json"]
