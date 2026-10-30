@@ -1,5 +1,16 @@
 # OCR performance evidence
 
+The [serving-default qualification](serving-defaults-1331.json) records the
+GPU-first recurrent dispatch and memory-admission checks added for Grepstein:
+352 CUDA tests passed with 21 skips, the matched host-recurrence rollback checks
+passed, and both pinned reader checkpoints passed five private page-tail checks
+at a 2048-token allowance. Raw DOJ content remains private. This sample does
+not qualify full-corpus accuracy, A100 capacity, or the hosted activation path.
+The [release qualification guide](../../../../../../docs/design/inference/grepstein-release-qualification.md)
+describes the separate deployment and enrichment gates. Hardware performance
+qualification does not control whether supported portable CUDA recurrence runs
+on the GPU.
+
 The historical experiment corpus is archived outside the source tree. The
 [archive manifest](archive.json) records its source commit, GCS object generation,
 SHA-256 and file count. All 9,197 files were compared byte-for-byte with the

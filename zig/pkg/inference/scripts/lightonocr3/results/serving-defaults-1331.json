@@ -1,0 +1,231 @@
+{
+  "schema_version": 1,
+  "scope": "CUDA runtime correctness and bounded private OCR sample on DGX Spark GB10; not A100, hosted-proxy, full-corpus, retrieval-quality, or production readiness qualification.",
+  "runtime_commit": "bb58e086978efc77610b9988c0e2c1765f2c9703",
+  "follow_up_source_commit": "680172f66f4e2511e8637907cdc6e41e5d58fdec",
+  "follow_up_changes": "Only tests, qualification tools, example configuration and documentation changed after the compiled runtime revision. The GLiNER wrapper grant comparison passes independently.",
+  "source_patch_sha256": "72ab4a91f731cf0b90ff234a0273fb2dab2895fedb099a2e9ca9c8c720301164",
+  "source_manifest_sha256": "0ce581b6b2664cddbed8abad73cd4f5aaaa8c0bcc42b3845223d1f1305f74b1a",
+  "binary_sha256": "05ebe2733a5251dfb9950dd62a97ad4d698a601323d79765582fdde2b7dba22f",
+  "hardware": {
+    "gpu": "NVIDIA GB10",
+    "compute_capability": "12.1",
+    "architecture": "aarch64"
+  },
+  "tests": {
+    "cuda_release_contracts": {
+      "selected": 373,
+      "passed": 352,
+      "skipped": 21,
+      "failed": 0,
+      "log_sha256": "c40c4bc2998814caae5c9e7c3d2abdfe99993b631b2c8ace294d83dc2364b5bf"
+    },
+    "memory_policy": {
+      "passed": 75,
+      "log_sha256": "747e93f632769ac9502dcab9242531358849427683bb86beabc6fc4c8e2e9b96"
+    },
+    "gliner_qualification_contracts": {
+      "passed": 14,
+      "log_sha256": "2f242da7830d68360ace3b88988ac872655076f305bb07e9a8edfd3e47bffcd6"
+    },
+    "benchmark_placement_assertions": {
+      "passed": 3
+    },
+    "native_pool_probe_assertions": {
+      "passed": 5
+    },
+    "grepstein_go": {
+      "result": "pass",
+      "log_sha256": "2f27b5cd1448008e75d801a3f1233a70c55b87a9fe0e12b01f9c723a494eb2f1"
+    }
+  },
+  "default_placement": [
+    {
+      "model": "08",
+      "status": "ok",
+      "pages_per_second": 1.8979,
+      "p50_ms": 532,
+      "p95_ms": 532,
+      "recurrent_placement": {
+        "sessions": [
+          {
+            "placement": "cuda",
+            "reason": "supported_geometry",
+            "compute": "12.1"
+          }
+        ],
+        "expected_placement": "cuda",
+        "matched": true
+      }
+    },
+    {
+      "model": "4b",
+      "status": "ok",
+      "pages_per_second": 0.6951,
+      "p50_ms": 1440,
+      "p95_ms": 1440,
+      "recurrent_placement": {
+        "sessions": [
+          {
+            "placement": "cuda",
+            "reason": "supported_geometry",
+            "compute": "12.1"
+          }
+        ],
+        "expected_placement": "cuda",
+        "matched": true
+      }
+    }
+  ],
+  "matched_host_recurrence_smoke": {
+    "scope": "Two timed invoice requests per model at concurrency one. Other model operations still use CUDA. Content comparison removes markup/whitespace; this is not a stable throughput estimate.",
+    "models": [
+      {
+        "model": "0.8B",
+        "gpu_recurrence_pages_per_second": 1.8979,
+        "host_recurrence_pages_per_second": 0.8266,
+        "content_parity": true
+      },
+      {
+        "model": "4B",
+        "gpu_recurrence_pages_per_second": 0.6951,
+        "host_recurrence_pages_per_second": 0.3315,
+        "content_parity": true
+      }
+    ]
+  },
+  "private_pages": {
+    "scope": "Five cached DOJ pages: handwritten label, handwritten cover form, deposition, email, dense report. Native encoded-image requests; PDF rendering and Cloud/GCS transport excluded from the inference test.",
+    "complete": true,
+    "max_output_tokens": 2048,
+    "source_fixture_manifest_sha256": "8dabef2b59629eff24714f11fd208850432b05f139f0c985d8befd1bcfb3ff23",
+    "checks": [
+      {
+        "model": "08",
+        "page": "doj-05-0-p1",
+        "visible_tail_pass": true
+      },
+      {
+        "model": "08",
+        "page": "doj-05-1-p1",
+        "visible_tail_pass": true
+      },
+      {
+        "model": "08",
+        "page": "doj-07-0-p1",
+        "visible_tail_pass": true
+      },
+      {
+        "model": "08",
+        "page": "doj-12-0-p1",
+        "visible_tail_pass": true
+      },
+      {
+        "model": "08",
+        "page": "doj-12-1-p1",
+        "visible_tail_pass": true
+      },
+      {
+        "model": "4b",
+        "page": "doj-05-0-p1",
+        "visible_tail_pass": true
+      },
+      {
+        "model": "4b",
+        "page": "doj-05-1-p1",
+        "visible_tail_pass": true
+      },
+      {
+        "model": "4b",
+        "page": "doj-07-0-p1",
+        "visible_tail_pass": true
+      },
+      {
+        "model": "4b",
+        "page": "doj-12-0-p1",
+        "visible_tail_pass": true
+      },
+      {
+        "model": "4b",
+        "page": "doj-12-1-p1",
+        "visible_tail_pass": true
+      }
+    ],
+    "timing_qualified": false,
+    "timing_exclusion": "Another GPU job started during the 4B sample. Functional results are retained; no real-page throughput claim.",
+    "setup_correction": "Initial glob included macOS AppleDouble sidecars; corrected to hash-verified manifest entries. No runtime change.",
+    "report_log_sha256": "42ba06e5f05d370ee1c487e41577d4c3bae0eb9423e7d9dd9cc5402edca0f0a5"
+  },
+  "dense_page_limit_diagnostic": {
+    "earlier_runtime_snapshot": true,
+    "output_512": "0.8B rejected with ReadOutputTruncated",
+    "output_2048": "Both checkpoints completed and retained checked tail markers"
+  },
+  "proposed_reader_policy": {
+    "applied": false,
+    "max_output_tokens_per_item": 2048,
+    "max_work_units": 16,
+    "max_concurrent_requests": 1,
+    "memory_limits": "Preserve existing limits; qualify on A100 before applying"
+  },
+  "pending_deployment_checks": [
+    "A100 execution, memory pressure, cancellation and sustained readiness under proposed policy",
+    "Actual authenticated hosted activation from scale to zero using the released candidate"
+  ],
+  "pending_enrichment_checks": [
+    "Pin deployed EmbeddingGemma 2 execution identity and check retrieval before creating semantic index",
+    "Hosted exact-artifact GLiNER entity/relation and graph-retry qualification",
+    "Full sealed-publication artifact coverage before enrichment/publication"
+  ],
+  "wide_cohort_timing": "Excluded: 105 isolation samples contained another GPU process during the 4B run; 0.8B timing was not attempted afterward. Historical performance remains scoped to followup-1331.json.",
+  "raw_evidence": "Retained privately; no DOJ document text or image payloads published in this report",
+  "model_revisions": {
+    "0.8B": "lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671bd8e479c517a004f7566bd9",
+    "4B": "lightonai/LightOnOCR-3-4B:safetensors@b71010f095dc3735de7ee6b9969bff8f8f50b39a"
+  },
+  "wide_cohort_functional": {
+    "model": "4B",
+    "execution_status": "ok",
+    "rounds": [
+      {
+        "round": 0,
+        "requests": 256,
+        "completed": 256,
+        "native_items": 256,
+        "physical_max_items": 128
+      },
+      {
+        "round": 1,
+        "requests": 256,
+        "completed": 256,
+        "native_items": 256,
+        "physical_max_items": 128
+      },
+      {
+        "round": 2,
+        "requests": 256,
+        "completed": 256,
+        "native_items": 256,
+        "physical_max_items": 128
+      }
+    ],
+    "serial_reference_byte_parity": true,
+    "historical_vllm_content_parity": true,
+    "recurrent_placement": {
+      "sessions": [
+        {
+          "placement": "cuda",
+          "reason": "supported_geometry",
+          "compute": "12.1"
+        }
+      ],
+      "expected_placement": "cuda",
+      "matched": true
+    },
+    "timing_qualified": false,
+    "isolation_foreign_samples": 105,
+    "isolation_error_samples": 0,
+    "log_sha256": "a982d728d12f40f11c2197a6eb38e9b77d5cc75738611a3f19af4bc819ba4e5b",
+    "isolation_sha256": "afe8ff03ffd90ed71963f46f24f4c42e6515d486ce517ec3ab8472ac4c8b0881"
+  }
+}

@@ -52,8 +52,8 @@ for the initial full-text, embedding, and GLiNER graph pipeline.
    either to a complete searchable transcript. Exercise the configured accurate
    reader/refinement policy and verify exhausted budgets remain unresolved.
 
-The previously deployed 512-token limit rejected a cached dense DOJ page. The
-Grepstein reader example now requests 2048 tokens; both checkpoint diagnostics
+A 512-token diagnostic, matching the deployed allowance, rejected a cached dense
+DOJ page on Glowworm. The Grepstein reader example now requests 2048 tokens; both checkpoint diagnostics
 completed that page and retained the checked tail text. This is a bounded
 sample, not proof that every corpus page fits. Do not retry an unchanged capped request forever.
 Measure the failing pages, then qualify a larger admitted output allowance or
