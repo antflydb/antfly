@@ -50504,7 +50504,7 @@ test "logical query projection upgrade is discovered by the admitted owner turn"
     const owner = @import("antfly_source_root").antfly_sources.local_write;
     const observed = try owner.repairStorageKernelOwnerDb(a, &db, null, false, .{});
     try std.testing.expectEqual(@as(usize, 1), observed.repair_remaining);
-    try std.testing.expectEqual(@as(usize, 0), (try db.indexRepairIntentSummary(a)).runnable);
+    try std.testing.expectEqual(@as(usize, 0), (try db.indexes.repair.intentSummary(a)).runnable);
     var completed = false;
     for (0..64) |_| {
         const result = try owner.repairStorageKernelOwnerDb(a, &db, null, true, .{});

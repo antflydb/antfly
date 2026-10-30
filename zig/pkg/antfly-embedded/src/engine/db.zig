@@ -240,7 +240,7 @@ pub const DB = struct {
     }
 
     pub fn drainScheduledTextMerges(self: *DB) !void {
-        try self.inner.drainScheduledTextMerges();
+        try self.inner.indexes.text.drainScheduledMerges();
     }
 
     pub fn forceCompactTextIndexes(self: *DB) !void {

@@ -957,7 +957,7 @@ fn vacuumAflitePath(allocator: Allocator, path: []const u8) !antfly.lite.backend
 fn prepareCompactLite(lite: *LiteDb) !void {
     try lite.db.maintenanceDriver().runUntilIdle();
     try lite.db.forceCompactTextIndexes();
-    try lite.db.drainScheduledTextMerges();
+    try lite.db.indexes.text.drainScheduledMerges();
     try lite.db.sync(true);
     try lite.db.syncIndexes(true);
 }

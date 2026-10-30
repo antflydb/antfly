@@ -765,8 +765,6 @@ pub fn ImplementationFor(comptime D: type) type {
             wait_fn: *const fn (*anyopaque, types.SyncLevel, u64, ManagedSyncTargets, types.CancellationToken, bool) anyerror!void,
             resolved_wait_fn: *const fn (*anyopaque, types.SyncLevel, u64, types.CancellationToken) anyerror!void,
             local_execution: *@FieldType(Execution, "local_execution"),
-            rewrite_program_cache: *@FieldType(Execution, "rewrite_program_cache"),
-            rewrite_tail_cache: *@FieldType(Execution, "rewrite_tail_cache"),
             restore_decoder_cache: *@FieldType(Execution, "restore_decoder_cache"),
             alloc: *@FieldType(Execution, "alloc"),
             runtime_alloc: *@FieldType(Execution, "runtime_alloc"),
@@ -780,7 +778,6 @@ pub fn ImplementationFor(comptime D: type) type {
             async_context: *@FieldType(Execution, "async_context"),
             backend_runtime: *@FieldType(Execution, "backend_runtime"),
             backend_owner_id: *@FieldType(Execution, "backend_owner_id"),
-            repair_cleanup_owner_id: *@FieldType(Execution, "repair_cleanup_owner_id"),
             executor: *@FieldType(Execution, "executor"),
             secret_store: *@FieldType(Execution, "secret_store"),
             remote_content: *@FieldType(Execution, "remote_content"),
@@ -790,13 +787,10 @@ pub fn ImplementationFor(comptime D: type) type {
             ttl_cleanup_context: *@FieldType(Execution, "ttl_cleanup_context"),
             transaction_recovery_identity_context: *@FieldType(Execution, "transaction_recovery_identity_context"),
             transaction_recovery_local_context: *@FieldType(Execution, "transaction_recovery_local_context"),
-            text_merge_runtime: *@FieldType(Execution, "text_merge_runtime"),
             indexes: *@FieldType(Execution, "indexes"),
             last_run_until_idle_no_progress: *@FieldType(Execution, "last_run_until_idle_no_progress"),
-            shadow: *@FieldType(Execution, "shadow"),
             bulk_identity: *@FieldType(Execution, "bulk_identity"),
             embedding_activity: *@FieldType(Execution, "embedding_activity"),
-            active_index_repairs: *@FieldType(Execution, "active_index_repairs"),
             graph_restore_parse_cache: *@FieldType(Execution, "graph_restore_parse_cache"),
             pub const derivedCoverageAppliesToIndex = Implementation.derivedCoverageAppliesToIndex;
             pub const acquireReplicationMutationShared = Implementation.acquireReplicationMutationShared;
@@ -917,8 +911,6 @@ pub fn ImplementationFor(comptime D: type) type {
         }
         pub const Execution = struct {
             local_execution: *LocalExecutionState,
-            rewrite_program_cache: @import("../rewrite_program_cache.zig").Cache = .{},
-            rewrite_tail_cache: @import("../rewrite_tail_spool.zig").Cache = .{},
             restore_decoder_cache: @import("../restore_decoder_cache.zig").Cache = .{},
             alloc: Allocator,
             runtime_alloc: Allocator,
@@ -932,7 +924,6 @@ pub fn ImplementationFor(comptime D: type) type {
             async_context: *AsyncContext,
             backend_runtime: *background_runtime_mod.BackendRuntime,
             backend_owner_id: u64,
-            repair_cleanup_owner_id: u64,
             executor: *derived_executor_mod.Executor,
             secret_store: ?*common_secrets.FileStore,
             remote_content: ?*const scraping.RemoteContentConfig,
@@ -942,13 +933,10 @@ pub fn ImplementationFor(comptime D: type) type {
             ttl_cleanup_context: ?*TtlCleanupContext,
             transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
             transaction_recovery_local_context: ?*TransactionRecoveryLocalContext,
-            text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
-            indexes: @import("indexes/mod.zig").Indexes,
+            indexes: @import("indexes/mod.zig").Indexes = .{},
             last_run_until_idle_no_progress: ?execution_resources.NoProgressDiagnostic = null,
-            shadow: ?*ShadowState,
             bulk_identity: @import("bulk_ingest_session.zig").IdentityScratch = .{},
             embedding_activity: @import("embedding_activity_cache.zig").Owner = .{},
-            active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
             graph_restore_parse_cache: ?GraphRestoreParseCache = null,
 
             pub const derivedCoverageAppliesToIndex = Implementation.derivedCoverageAppliesToIndex;
@@ -1035,13 +1023,13 @@ pub fn ImplementationFor(comptime D: type) type {
             pub fn deinitScratch(self: *@This()) void {
                 const filesystem_io = S.ownerField(self, "backend_runtime").*.filesystemIo() orelse std.Options.debug_io;
                 S.ownerField(self, "restore_decoder_cache").*.deinit(filesystem_io);
-                S.ownerField(self, "rewrite_program_cache").*.deinit(filesystem_io);
-                S.ownerField(self, "rewrite_tail_cache").*.deinit(filesystem_io);
+                S.ownerField(self, "indexes").relational.rewrite_program_cache.deinit(filesystem_io);
+                S.ownerField(self, "indexes").relational.rewrite_tail_cache.deinit(filesystem_io);
                 if (S.ownerField(self, "graph_restore_parse_cache").*) |*cache| cache.deinit(S.ownerField(self, "alloc").*);
                 if (S.ownerField(self, "last_run_until_idle_no_progress").*) |*diagnostic| diagnostic.deinit(S.ownerField(self, "alloc").*);
                 S.ownerField(self, "embedding_activity").*.deinit(S.ownerField(self, "alloc").*);
                 self.clearActiveIndexRepairsLocked();
-                S.ownerField(self, "active_index_repairs").*.deinit(S.ownerField(self, "alloc").*);
+                S.ownerField(self, "indexes").repair.active.deinit(S.ownerField(self, "alloc").*);
                 S.ownerField(self, "bulk_identity").*.deinit(S.ownerField(self, "alloc").*);
             }
 
@@ -1092,7 +1080,7 @@ pub fn ImplementationFor(comptime D: type) type {
                     .async_context = S.ownerField(db, "async_context").*,
                     .backend_runtime = S.ownerField(db, "backend_runtime").*,
                     .backend_owner_id = S.ownerField(db, "backend_owner_id").*,
-                    .repair_cleanup_owner_id = S.ownerField(db, "repair_cleanup_owner_id").*,
+                    .repair_cleanup_owner_id = S.ownerField(db, "indexes").repair.cleanup_owner_id,
                     .executor = S.ownerField(db, "executor").*,
                     .ttl_cleanup_context = S.ownerField(db, "ttl_cleanup_context").*,
                     .transaction_recovery_identity_context = S.ownerField(db, "transaction_recovery_identity_context").*,
@@ -1119,7 +1107,6 @@ pub fn ImplementationFor(comptime D: type) type {
                     .async_context = S.ownerField(self, "async_context").*,
                     .backend_runtime = S.ownerField(self, "backend_runtime").*,
                     .backend_owner_id = S.ownerField(self, "backend_owner_id").*,
-                    .repair_cleanup_owner_id = S.ownerField(self, "repair_cleanup_owner_id").*,
                     .executor = S.ownerField(self, "executor").*,
                     .secret_store = S.ownerField(self, "secret_store").*,
                     .remote_content = S.ownerField(self, "remote_content").*,
@@ -1129,9 +1116,11 @@ pub fn ImplementationFor(comptime D: type) type {
                     .ttl_cleanup_context = S.ownerField(self, "ttl_cleanup_context").*,
                     .transaction_recovery_identity_context = S.ownerField(self, "transaction_recovery_identity_context").*,
                     .transaction_recovery_local_context = null,
-                    .text_merge_runtime = S.ownerField(self, "async_context").*.text_merge_runtime,
-                    .indexes = .{ .sparse = .{ .compaction_runtime = S.ownerField(self, "async_context").*.sparse_compaction_runtime } },
-                    .shadow = null,
+                    .indexes = .{
+                        .text = .{ .merge_runtime = S.ownerField(self, "async_context").*.text_merge_runtime },
+                        .sparse = .{ .compaction_runtime = S.ownerField(self, "async_context").*.sparse_compaction_runtime },
+                        .repair = .{ .cleanup_owner_id = S.ownerField(self, "repair_cleanup_owner_id").* },
+                    },
                 };
             }
         };

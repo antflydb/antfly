@@ -502,7 +502,7 @@ test "storage.hot_standby graph retirement seal replays exact Raft receipt and r
     try std.testing.expectError(error.IntegrityTopologyBusy, db.batch(.{
         .graph_writes = &.{.{ .index_name = "links", .source = "a", .target = "b", .edge_type = "related", .weight = 1.0 }},
     }));
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.runGraphMetricMaintenanceForIdle());
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.indexes.graph.runMetricMaintenanceForIdle());
     // The begin intent alone must rehydrate the closed gate before optional
     // graph runtimes start. No seal receipt exists yet, so restart cannot
     // accidentally treat the owner as either unguarded or completed.
@@ -3049,7 +3049,7 @@ test "storage.hot_standby db standby role suppresses mutating background runtime
     try std.testing.expect(db.promotion_runtime == null);
     try std.testing.expect(db.ttl_runtime == null);
     try std.testing.expect(db.transaction_runtime == null);
-    try std.testing.expect(db.text_merge_runtime == null);
+    try std.testing.expect(db.indexes.text.merge_runtime == null);
     try std.testing.expect(db.indexes.sparse.compaction_runtime == null);
 }
 
@@ -3394,12 +3394,12 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
             };
             if (follower.hasIndex("expected") and follower.core.index_manager.hasRepairUnavailableIndexes()) {
                 saw_pending_repair = true;
-                var repairs = try follower.loadIndexRepairState(alloc);
+                var repairs = try follower.indexes.repair.loadState(alloc);
                 defer repairs.deinit(alloc);
                 follower.local_execution.replication_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
                 defer follower.local_execution.replication_write_gate = null;
                 for (repairs.entries.items) |repair| if (repair.intent.phase != .terminal) {
-                    _ = try follower.advanceIndexRepairIntent(alloc, repair.intent.repair_id, .{});
+                    _ = try follower.indexes.repair.advanceIntent(alloc, repair.intent.repair_id, .{});
                 };
             }
             continue;

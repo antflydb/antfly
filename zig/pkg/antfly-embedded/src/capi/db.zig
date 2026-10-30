@@ -3472,7 +3472,7 @@ pub const LiteCompactReport = struct {
 pub fn prepareLiteCompact(handle: *Handle) !void {
     try handle.database().*.runUntilIdle();
     try handle.database().*.forceCompactTextIndexes();
-    try handle.database().*.drainScheduledTextMerges();
+    try handle.database().*.indexes.text.drainScheduledMerges();
     try handle.database().*.sync(true);
     try handle.database().*.syncIndexes(true);
 }
@@ -9497,7 +9497,7 @@ pub fn antfly_db_create_shadow_index_manager(
     }
     defer guard.leave();
     const handle = guard.handle;
-    handle.database().*.createShadowIndexManager(split_key.bytes(), original_range_end.bytes()) catch |err| return capi.mapError(err);
+    handle.database().*.indexes.createSplitShadow(split_key.bytes(), original_range_end.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -9512,7 +9512,7 @@ pub fn antfly_db_close_shadow_index_manager(handle_ptr: ?*anyopaque) callconv(.c
     }
     defer guard.leave();
     const handle = guard.handle;
-    handle.database().*.closeShadowIndexManager() catch |err| return capi.mapError(err);
+    handle.database().*.indexes.closeSplitShadow() catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -9530,7 +9530,7 @@ pub fn antfly_db_get_shadow_index_dir(
     }
     defer guard.leave();
     const handle = guard.handle;
-    const dir = handle.database().*.getShadowIndexDir();
+    const dir = handle.database().*.indexes.splitShadowDir();
     if (dir.len == 0) return capi.mapError(error.NotFound);
     out_buf.* = dupBytes(dir) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;

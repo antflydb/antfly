@@ -13,15 +13,112 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const DB = @import("../db.zig").DB;
+const std = @import("std");
+const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
+const db_mod = @import("../db.zig");
+const DB = db_mod.DB;
 
-/// Per-kind index state owned by `DB`. Each kind keeps its runtimes and
-/// background work here; see `SUBSYSTEMS.md` for the kinds still to move.
+/// Index state owned by `DB`, grouped by index kind. Each kind keeps its
+/// runtimes and background work in its own subsystem. Range splits touch every
+/// kind, so their state stays here: the shadow index manager that builds the
+/// new range's indexes, and the lock that serializes swapping in a split's
+/// primary documents and indexes.
 pub const Indexes = struct {
-    graph: @import("graph.zig").GraphIndexes = .{},
+    generation_replace_mutex: std.atomic.Mutex = .unlocked,
+    split_shadow: ?*db_mod.ShadowState = null,
+
+    text: @import("text.zig").TextIndexes = .{},
     sparse: @import("sparse.zig").SparseIndexes = .{},
+    graph: @import("graph.zig").GraphIndexes = .{},
+    relational: @import("relational.zig").RelationalIndexes = .{},
+    algebraic: @import("algebraic.zig").AlgebraicIndexes = .{},
+    repair: @import("repair.zig").RepairIndexes = .{},
 
     pub fn dbPtr(self: *Indexes) *DB {
         return @alignCast(@fieldParentPtr("indexes", self));
+    }
+
+    pub fn dbConstPtr(self: *const Indexes) *const DB {
+        return @alignCast(@fieldParentPtr("indexes", self));
+    }
+
+    pub fn createSplitShadow(self: *Indexes, split_key: []const u8, original_range_end: []const u8) !void {
+        const db = self.dbPtr();
+        var replication_mutation = db.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try db.enforceReplicationWriteGate();
+        try db.lockApplyForPortableRuntime();
+        defer db.core.unlockApply();
+        if (self.split_shadow != null) return error.ShadowIndexManagerExists;
+
+        const base_path = try std.fmt.allocPrint(db.alloc, "{s}/.shadow-{d}", .{ db.core.path, db_mod.monotonicTimeNs() });
+        errdefer db.alloc.free(base_path);
+        const indexes_path = try std.fmt.allocPrint(db.alloc, "{s}/indexes", .{base_path});
+        errdefer db.alloc.free(indexes_path);
+
+        try db_mod.ensureDirPath(indexes_path);
+
+        const shadow_manager = try db.alloc.create(db_mod.index_manager_mod.IndexManager);
+        errdefer db.alloc.destroy(shadow_manager);
+        shadow_manager.* = try db_mod.index_manager_mod.IndexManager.initWithOptions(
+            db.alloc,
+            base_path,
+            db.index_backends,
+        );
+        errdefer shadow_manager.deinit();
+
+        const shadow_start = try db.alloc.dupe(u8, split_key);
+        errdefer db.alloc.free(shadow_start);
+        const shadow_end = try db.alloc.dupe(u8, original_range_end);
+        errdefer db.alloc.free(shadow_end);
+        shadow_manager.updateRange(.{ .start = shadow_start, .end = shadow_end });
+
+        try db.core.registerShadowIndexes(db.alloc, shadow_manager);
+
+        const shadow = try db.alloc.create(db_mod.ShadowState);
+        shadow.* = .{
+            .manager = shadow_manager,
+            .base_path = base_path,
+            .indexes_path = indexes_path,
+            .range_start = shadow_start,
+            .range_end = shadow_end,
+        };
+        self.split_shadow = shadow;
+        if (db.transaction_recovery_local_context) |ctx| {
+            ctx.split_shadow = self.split_shadow;
+        }
+    }
+
+    pub fn closeSplitShadow(self: *Indexes) !void {
+        const db = self.dbPtr();
+        var replication_mutation = db.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try db.enforceReplicationWriteGate();
+        try db.lockApplyForPortableRuntime();
+        defer db.core.unlockApply();
+        try self.closeSplitShadowLocked();
+    }
+
+    pub fn closeSplitShadowLocked(self: *Indexes) !void {
+        const db = self.dbPtr();
+        try db_mod.waitForSplitShadowDrainLocked(db, false);
+        const shadow = self.split_shadow orelse return;
+        if (db.transaction_recovery_local_context) |ctx| {
+            ctx.split_shadow = null;
+        }
+        shadow.manager.deinit();
+        db.alloc.destroy(shadow.manager);
+        db.alloc.free(shadow.base_path);
+        db.alloc.free(shadow.indexes_path);
+        db.alloc.free(shadow.range_start);
+        db.alloc.free(shadow.range_end);
+        db.alloc.destroy(shadow);
+        self.split_shadow = null;
+    }
+
+    pub fn splitShadowDir(self: *Indexes) []const u8 {
+        const shadow = self.split_shadow orelse return "";
+        return shadow.indexes_path;
     }
 };

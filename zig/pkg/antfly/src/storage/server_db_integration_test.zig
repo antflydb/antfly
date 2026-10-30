@@ -656,7 +656,7 @@ test "db repair activation restarts unjournaled source races without penalizing 
         activation.publication_digest = activation.digest();
         try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
         for (0..8) |_| {
-            const step = try db.advanceIndexRepairIntent(alloc, repair_id, .{ .max_activation_pause_ms = 1 });
+            const step = try db.indexes.repair.advanceIntent(alloc, repair_id, .{ .max_activation_pause_ms = 1 });
             try std.testing.expect(!step.repaired and !step.terminal);
             if (step.busy) break;
         } else return error.TestExpectedYield;
@@ -676,7 +676,7 @@ test "db repair activation restarts unjournaled source races without penalizing 
             try txn.commit();
         } else try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"title\":\"beta\"}" }}, .sync_level = .write }, .{ .term = 1, .index = 4 });
         if (unjournaled) {
-            const stale = try db.advanceIndexRepairIntent(alloc, repair_id, .{ .max_activation_pause_ms = 5_000 });
+            const stale = try db.indexes.repair.advanceIntent(alloc, repair_id, .{ .max_activation_pause_ms = 5_000 });
             try std.testing.expect(!stale.repaired and !stale.terminal);
             var reset = try engine.test_support.loadIndexRepairEntryById(engine.test_support.dbPointer(&db), alloc, repair_id);
             defer reset.deinit(alloc);
@@ -684,7 +684,7 @@ test "db repair activation restarts unjournaled source races without penalizing 
             try std.testing.expectEqual(@as(u32, 0), reset.intent.failure_streak);
             try std.testing.expectEqual(@as(u64, 0), reset.intent.next_retry_at_ms);
         }
-        const resumed = try db.advanceIndexRepairIntent(alloc, repair_id, .{ .max_activation_pause_ms = 5_000 });
+        const resumed = try db.indexes.repair.advanceIntent(alloc, repair_id, .{ .max_activation_pause_ms = 5_000 });
         try std.testing.expect(resumed.repaired);
         if (!unjournaled) try std.testing.expectEqual(@as(u64, 0), resumed.documents_reprocessed);
         var result = try db.search(alloc, .{ .index_name = "text", .query = .{ .match = .{ .field = "_all", .text = "beta" } }, .limit = 1 });
@@ -785,12 +785,12 @@ test "db repair activation automatically schedules bounded historical adoption a
         }
         try engine.test_support.refreshArtifactProjections(engine.test_support.dbPointer(&db), alloc, "historic", plan.plan(), .{ .time_budget_ns = null });
         {
-            var state = try db.loadIndexRepairState(alloc);
+            var state = try db.indexes.repair.loadState(alloc);
             defer state.deinit(alloc);
             try std.testing.expectEqual(@as(usize, 1), state.entries.items.len);
         }
         try engine.test_support.refreshArtifactProjections(engine.test_support.dbPointer(&db), alloc, "historic", plan.plan(), .{ .time_budget_ns = null });
-        var before = try db.loadIndexRepairState(alloc);
+        var before = try db.indexes.repair.loadState(alloc);
         defer before.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 2), before.entries.items.len);
         for (before.entries.items) |entry| {
@@ -799,7 +799,7 @@ test "db repair activation automatically schedules bounded historical adoption a
             try std.testing.expect(!engine.test_support.indexRepairIntentBlocksService(entry.intent));
         }
         try engine.test_support.refreshArtifactProjections(engine.test_support.dbPointer(&db), alloc, "historic", plan.plan(), .{ .time_budget_ns = null });
-        var after = try db.loadIndexRepairState(alloc);
+        var after = try db.indexes.repair.loadState(alloc);
         defer after.deinit(alloc);
         try std.testing.expectEqual(before.control_revision, after.control_revision);
     }
@@ -823,9 +823,9 @@ test "db repair activation automatically schedules bounded historical adoption a
         defer paused.deinit(alloc);
         try std.testing.expectEqual(index_repair_state.Automation.paused, paused.intent.automation);
     }
-    try std.testing.expect((try db.advanceIndexRepairIntent(alloc, second, .{ .max_activation_pause_ms = 5_000 })).repaired);
-    try std.testing.expect(try db.resumeAutomaticIndexRepair(alloc, "first", first));
-    try std.testing.expect((try db.advanceIndexRepairIntent(alloc, first, .{ .max_activation_pause_ms = 5_000 })).repaired);
+    try std.testing.expect((try db.indexes.repair.advanceIntent(alloc, second, .{ .max_activation_pause_ms = 5_000 })).repaired);
+    try std.testing.expect(try db.indexes.repair.resumeAutomatic(alloc, "first", first));
+    try std.testing.expect((try db.indexes.repair.advanceIntent(alloc, first, .{ .max_activation_pause_ms = 5_000 })).repaired);
     var plan = try db.core.index_manager.acquireWritePlanSnapshot();
     defer plan.release();
     for (0..16) |_| {
@@ -1629,15 +1629,15 @@ test "db transaction recovery borrowed execution observes split shadow lifetime"
         .kind = .full_text,
         .config_json = "{\"field\":\"title\"}",
     });
-    try db.createShadowIndexManager("doc:m", "");
+    try db.indexes.createSplitShadow("doc:m", "");
     try std.testing.expect(recovery_ctx.split_shadow != null);
-    try std.testing.expect(recovery_ctx.split_shadow.?.manager == db.shadow.?.manager);
-    try std.testing.expect(activeSplitShadow(&recovery_execution) == db.shadow.?);
+    try std.testing.expect(recovery_ctx.split_shadow.?.manager == db.indexes.split_shadow.?.manager);
+    try std.testing.expect(activeSplitShadow(&recovery_execution) == db.indexes.split_shadow.?);
     // Ticket counters and synchronization must have one address even though
     // the execution view was captured before the split began.
-    try std.testing.expect(&activeSplitShadow(&recovery_execution).?.next_ticket == &db.shadow.?.next_ticket);
+    try std.testing.expect(&activeSplitShadow(&recovery_execution).?.next_ticket == &db.indexes.split_shadow.?.next_ticket);
 
-    try db.closeShadowIndexManager();
+    try db.indexes.closeSplitShadow();
     try std.testing.expect(recovery_ctx.split_shadow == null);
     try std.testing.expect(activeSplitShadow(&recovery_execution) == null);
 }
@@ -4188,7 +4188,7 @@ test "server ordered graph cleanup applies complete planner pages and duplicate 
         try server_test_adapter.applyOrdered(&db, req, .{ .term = 1, .index = index });
     }
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, key));
-    try std.testing.expect((try db.prepareGraphEndpointCleanupBatch(alloc)) == null);
+    try std.testing.expect((try db.indexes.graph.prepareEndpointCleanupBatch(alloc)) == null);
 }
 
 test "server group timestamp survives relational schema upgrade and reopen" {

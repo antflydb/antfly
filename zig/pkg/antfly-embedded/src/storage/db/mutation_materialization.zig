@@ -3386,7 +3386,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn applyDerivedBatchProfiled(self: anytype, batch: derived_types.DerivedBatch, profile: ?*BatchProfile) !void {
             var ctx = self.batchContext();
             try applyDerivedBatchContextProfiled(&ctx, batch, profile);
-            if (S.ownerField(self, "text_merge_runtime").*) |runtime| {
+            if (S.ownerField(self, "indexes").text.merge_runtime) |runtime| {
                 runtime.notify();
             }
             if (S.ownerField(self, "indexes").sparse.compaction_runtime) |runtime| runtime.notify();
@@ -3440,7 +3440,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn applyDerivedBatchTargetsProfiled(self: anytype, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile) !void {
             var ctx = self.batchContext();
             try applyDerivedBatchTargetsContextProfiled(&ctx, batch, index_names, profile);
-            if (S.ownerField(self, "text_merge_runtime").*) |runtime| {
+            if (S.ownerField(self, "indexes").text.merge_runtime) |runtime| {
                 runtime.notify();
             }
             if (S.ownerField(self, "indexes").sparse.compaction_runtime) |runtime| runtime.notify();

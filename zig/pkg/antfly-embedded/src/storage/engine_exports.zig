@@ -475,11 +475,11 @@ fn advanceArtifactFootprintPage(self: *DB) engine.Outcome(bool) {
 }
 
 fn runGraphMetricServiceMaintenanceJsonAlloc(self: *DB, alloc: std.mem.Allocator, body: []const u8) engine.Outcome([]u8) {
-    return .{ .value = self.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.runMetricServiceMaintenanceJsonAlloc(alloc, body) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn scheduleGraphMetricBuild(self: *DB, alloc: std.mem.Allocator, index_name: []const u8, metric_name: []const u8, force: bool) engine.Outcome(types.GraphMetricStatus) {
-    return .{ .value = self.scheduleGraphMetricBuild(alloc, index_name, metric_name, force) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.scheduleMetricBuild(alloc, index_name, metric_name, force) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: std.mem.Allocator) engine.Outcome(usize) {
@@ -515,7 +515,7 @@ fn initOptionalTransactionRuntime(self: *DB, cfg: @import("db/maintenance/transa
 }
 
 fn initOptionalTextMergeRuntime(self: *DB, cfg: @import("db/maintenance/text_merge_runtime.zig").Config) engine.Outcome(void) {
-    return .{ .value = self.initOptionalTextMergeRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.text.initMergeRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn initOptionalSparseCompactionRuntime(self: *DB, cfg: @import("db/maintenance/sparse_compaction_runtime.zig").Config) engine.Outcome(void) {
@@ -523,7 +523,7 @@ fn initOptionalSparseCompactionRuntime(self: *DB, cfg: @import("db/maintenance/s
 }
 
 fn initOptionalGraphMetricRuntime(self: *DB, cfg: @import("db/maintenance/graph_metric_runtime.zig").Config) engine.Outcome(void) {
-    return .{ .value = self.initOptionalGraphMetricRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.initMetricRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn initOptionalRuntimes(self: *DB, opts: *db.OpenOptions) engine.Outcome(void) {
@@ -535,11 +535,11 @@ fn startOptionalRuntimes(self: *DB) engine.Outcome(void) {
 }
 
 fn rebuildIndexWithShadowReplacementOwned(self: *DB, alloc: std.mem.Allocator, cfg: types.IndexConfig, options: types.ArtifactRepairRunOptions, durable_repair_id: ?u128, yield_progress: *DB.ShadowIndexReplacementResult) engine.Outcome(DB.ShadowIndexReplacementResult) {
-    return .{ .value = self.rebuildIndexWithShadowReplacementOwned(alloc, cfg, options, durable_repair_id, yield_progress) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.repair.rebuildWithShadowReplacementOwned(alloc, cfg, options, durable_repair_id, yield_progress) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn advanceIndexRepairIntent(self: *DB, alloc: std.mem.Allocator, repair_id: u128, options: types.ArtifactRepairRunOptions) engine.Outcome(DB.IndexRepairAdvanceResult) {
-    return .{ .value = self.advanceIndexRepairIntent(alloc, repair_id, options) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.repair.advanceIntent(alloc, repair_id, options) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn rehydrateSchemaJson(self: *DB, schema_json: []const u8) engine.Outcome(bool) {
@@ -682,11 +682,11 @@ fn ensureRelationalIndexesReady(self: *DB, names: []const []const u8, cancellati
 }
 
 fn runRelationalColumnMaintenancePass(self: *DB) engine.Outcome(usize) {
-    return .{ .value = self.runRelationalColumnMaintenancePass() catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.relational.runColumnMaintenancePass() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn rebuildRelationalColumns(self: *DB) engine.Outcome(bool) {
-    return .{ .value = self.rebuildRelationalColumns() catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.relational.rebuildColumns() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: std.mem.Allocator) engine.Outcome(usize) {
@@ -900,7 +900,7 @@ fn listArtifactRepairIssues(self: *DB, alloc: std.mem.Allocator, artifact_kind: 
 }
 
 fn hasPendingIndexRepairIntents(self: *const DB, alloc: std.mem.Allocator) engine.Outcome(bool) {
-    return .{ .value = self.hasPendingIndexRepairIntents(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.repair.hasPendingIntents(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn completedManagedDenseGenerationIsServiceable(self: *DB, alloc: std.mem.Allocator, index_name: []const u8) engine.Outcome(bool) {
@@ -1120,35 +1120,35 @@ fn waitForCurrentSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLeve
 }
 
 fn refreshGraphMetric(self: *DB, alloc: std.mem.Allocator, index_name: []const u8, metric_name: []const u8) engine.Outcome(types.GraphMetricStatus) {
-    return .{ .value = self.refreshGraphMetric(alloc, index_name, metric_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.refreshMetric(alloc, index_name, metric_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn rebuildGraphMetric(self: *DB, alloc: std.mem.Allocator, index_name: []const u8, metric_name: []const u8) engine.Outcome(types.GraphMetricStatus) {
-    return .{ .value = self.rebuildGraphMetric(alloc, index_name, metric_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.rebuildMetric(alloc, index_name, metric_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn pauseGraphMetricMaintenance(self: *DB, alloc: std.mem.Allocator, index_name: []const u8, metric_name: []const u8) engine.Outcome(types.GraphMetricStatus) {
-    return .{ .value = self.pauseGraphMetricMaintenance(alloc, index_name, metric_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.pauseMetricMaintenance(alloc, index_name, metric_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn resumeGraphMetricMaintenance(self: *DB, alloc: std.mem.Allocator, index_name: []const u8, metric_name: []const u8) engine.Outcome(types.GraphMetricStatus) {
-    return .{ .value = self.resumeGraphMetricMaintenance(alloc, index_name, metric_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.resumeMetricMaintenance(alloc, index_name, metric_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn ensureGraphMetricPlannedBuild(self: *DB, alloc: std.mem.Allocator, index_name: []const u8, metric_name: []const u8, target_generation: u64) engine.Outcome(types.GraphMetricStatus) {
-    return .{ .value = self.ensureGraphMetricPlannedBuild(alloc, index_name, metric_name, target_generation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.ensureMetricPlannedBuild(alloc, index_name, metric_name, target_generation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runGraphMetricPlannedWorkerPageStepAt(self: *DB, index_name: []const u8, metric_name: []const u8, worker_id: []const u8, now_ms: u64) engine.Outcome(@import("../graph/graph.zig").GraphIndex.GraphMetricBuildWorkerStepResult) {
-    return .{ .value = self.runGraphMetricPlannedWorkerPageStepAt(index_name, metric_name, worker_id, now_ms) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.runMetricPlannedWorkerPageStepAt(index_name, metric_name, worker_id, now_ms) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runGraphMetricPlannedCoordinatorStepAt(self: *DB, index_name: []const u8, metric_name: []const u8, now_ms: u64) engine.Outcome(@import("../graph/graph.zig").GraphIndex.GraphMetricBuildWorkerStepResult) {
-    return .{ .value = self.runGraphMetricPlannedCoordinatorStepAt(index_name, metric_name, now_ms) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.runMetricPlannedCoordinatorStepAt(index_name, metric_name, now_ms) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runGraphMetricPlannedDrain(self: *DB, alloc: std.mem.Allocator, index_name: []const u8, metric_name: []const u8, target_generation: u64, options: @import("../graph/graph.zig").GraphIndex.GraphMetricPlannedDrainOptions) engine.Outcome(types.GraphMetricStatus) {
-    return .{ .value = self.runGraphMetricPlannedDrain(alloc, index_name, metric_name, target_generation, options) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.runMetricPlannedDrain(alloc, index_name, metric_name, target_generation, options) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn refreshDensePostingPayloadPageBestEffort(self: *DB) engine.Outcome(DB.PostingRefreshProgress) {
@@ -1343,7 +1343,7 @@ fn trySnapshotTextMemoryAttributionStats(self: *DB) engine.Outcome(?@import("db/
 }
 
 fn trySnapshotTextMergeStats(self: *DB) engine.Outcome(?types.TextMergeStats) {
-    return .{ .value = self.trySnapshotTextMergeStats() };
+    return .{ .value = self.indexes.text.trySnapshotMergeStats() };
 }
 
 fn hasActiveDenseBulkWork(self: *const DB) engine.Outcome(bool) {
@@ -1375,7 +1375,7 @@ fn advanceGeneratedArtifactCleanupPage(self: *DB, index_name: ?[]const u8) engin
 }
 
 fn loadIndexRepairState(self: *const DB, alloc: std.mem.Allocator) engine.Outcome(@import("db/derived/index_repair_state.zig").State) {
-    return .{ .value = self.loadIndexRepairState(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.repair.loadState(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn getRange(self: *DB) engine.Outcome(types.ByteRange) {
@@ -1554,7 +1554,7 @@ fn relationalTopologyStatus(self: *DB) engine.Outcome(DB.RelationalTopologyStatu
 }
 fn failGraphMetricPlannedBuild(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8, failure_name: []const u8) engine.Outcome(types.GraphMetricStatus) {
     const failure = @import("storage_engine_errors").fromName(failure_name);
-    return .{ .value = self.failGraphMetricPlannedBuild(alloc, index_name, metric_name, failure) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.graph.failMetricPlannedBuild(alloc, index_name, metric_name, failure) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 fn runDenseArtifactRebuildMaintenanceWithProgress(self: *DB, alloc: Allocator, context: ?*anyopaque, hook: ?db.ReplayProgressHook, dispatch: @import("named_callback.zig").Dispatch) engine.Outcome(bool) {
     const Proxy = struct {
@@ -1593,7 +1593,7 @@ fn reprocessDocumentArtifact(self: *DB, alloc: std.mem.Allocator, doc_key: []con
 }
 
 fn indexRepairIntentSummary(self: *DB, alloc: std.mem.Allocator) engine.Outcome(DB.IndexRepairIntentSummary) {
-    return .{ .value = self.indexRepairIntentSummary(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.indexes.repair.intentSummary(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn repairArtifactIssuesWithRequest(self: *DB, alloc: std.mem.Allocator, req: types.ArtifactRepairRunRequest) engine.Outcome(types.ArtifactRepairResult) {

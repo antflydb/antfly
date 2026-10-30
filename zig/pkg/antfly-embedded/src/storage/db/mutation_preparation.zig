@@ -1910,7 +1910,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .backend_runtime = S.ownerField(receiver, "backend_runtime").*,
                 .secret_store = &S.ownerField(receiver, "secret_store").*,
                 .remote_content = &S.ownerField(receiver, "remote_content").*,
-                .shadow = &S.ownerField(receiver, "shadow").*,
+                .shadow = &S.ownerField(receiver, "indexes").split_shadow,
                 .transaction_recovery_local_context = &S.ownerField(receiver, "transaction_recovery_local_context").*,
             } else null;
             return prepareRelationalRowsOwned(allocator_guard, io, if (owner) |*view| view else null, writes, validator, table_schema, physical_layout, write_plan, retain_text_roots, preparation_timestamp_ns, rows, durable_rows, restore_timestamps, preserve_logical_values);
@@ -1925,7 +1925,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             backend_runtime: @FieldType(Execution, "backend_runtime"),
             secret_store: *const @FieldType(Execution, "secret_store"),
             remote_content: *const @FieldType(Execution, "remote_content"),
-            shadow: *const @FieldType(Execution, "shadow"),
+            shadow: *const @FieldType(@FieldType(Execution, "indexes"), "split_shadow"),
             transaction_recovery_local_context: *const @FieldType(Execution, "transaction_recovery_local_context"),
 
             fn requiresLogicalRoot(self: *const @This()) bool {

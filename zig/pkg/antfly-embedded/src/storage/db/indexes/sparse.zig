@@ -67,7 +67,7 @@ pub const SparseIndexes = struct {
             DB.scheduleMaintenanceRestartContext(
                 db.async_context,
                 db.backend_runtime.durable_jobs,
-                db.repair_cleanup_owner_id,
+                db.indexes.repair.cleanup_owner_id,
                 .sparse_compaction,
             );
         };

@@ -458,7 +458,7 @@ test "db graph runtime personalized graph metric seeds shape top-k and rerank or
     try std.testing.expect(f_position_hub < f_position_b);
 
     // Global published ranking is dominated by the hub, unlike the seeded one.
-    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "rank");
+    var refreshed = try db.indexes.graph.refreshMetric(alloc, "graph_idx", "rank");
     defer refreshed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
     var global = try db.search(alloc, .{

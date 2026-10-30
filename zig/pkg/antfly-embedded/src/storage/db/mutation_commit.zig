@@ -3290,15 +3290,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
                 // Completion errors happen after commit. Keep this outside the
                 // preparation retry handler so they cannot replay the user batch.
-                try self.finishBatchGraphEndpointCleanup(req, opts);
+                try self.indexes.graph.finishBatchEndpointCleanup(req, opts);
                 return;
             }
         }
 
         pub fn clearActiveIndexRepairsLocked(self: anytype) void {
-            var it = S.ownerField(self, "active_index_repairs").*.keyIterator();
+            var it = S.ownerField(self, "indexes").repair.active.keyIterator();
             while (it.next()) |key_ptr| S.ownerField(self, "alloc").*.free(@constCast(key_ptr.*));
-            S.ownerField(self, "active_index_repairs").*.clearRetainingCapacity();
+            S.ownerField(self, "indexes").repair.active.clearRetainingCapacity();
         }
 
         pub fn clearBulkIngestIdentityAllNewLocked(self: anytype) void {
@@ -4247,7 +4247,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // The context is updated under the primary apply fence during split setup
             // and teardown; a copied wrapper must not capture stale split ownership.
             if (S.ownerField(self, "transaction_recovery_local_context").*) |ctx| return ctx.split_shadow;
-            return S.ownerField(self, "shadow").*;
+            return S.ownerField(self, "indexes").split_shadow;
         }
 
         pub fn appendNeighborContextHintsToRecord(ctx: *const BatchExecutionContext, record: *change_journal_mod.Record, keys_to_add: []const []const u8) !void {

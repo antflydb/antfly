@@ -14637,7 +14637,7 @@ pub const ProvisionedTableWriteSource = struct {
             group_operation_active = true;
         }
 
-        const final_repair_summary = try db.indexRepairIntentSummary(alloc);
+        const final_repair_summary = try db.indexes.repair.intentSummary(alloc);
         const final_index_load_failure = try managedDbHasIndexLoadFailure(alloc, db);
         const final_automatic_queue = db.core.index_manager.failedIndexLoadRecoveryQueueState(.rebuild_from_artifacts);
         const final_automatic_discovery_pending = automaticIndexRepairDiscoveryPendingAtFinalAudit(
@@ -16519,7 +16519,7 @@ pub const ProvisionedTableWriteSource = struct {
         var stats = db_mod.types.TextMergeStats{};
         var observed = false;
         for (cache.entries.items) |entry| {
-            const entry_stats = entry.db.trySnapshotTextMergeStats() orelse continue;
+            const entry_stats = entry.db.indexes.text.trySnapshotMergeStats() orelse continue;
             observed = true;
             db_mod.types.accumulateTextMergeStats(&stats, entry_stats);
         }
@@ -16598,7 +16598,7 @@ pub const ProvisionedTableWriteSource = struct {
             // so it can be reported and backoff normally. Treating it as cache
             // contention would retain the fallback cursor forever without
             // ever surfacing corrupt or unavailable repair state.
-            const has_intents = cached.db.hasPendingIndexRepairIntents(std.heap.page_allocator) catch return .pending;
+            const has_intents = cached.db.indexes.repair.hasPendingIntents(std.heap.page_allocator) catch return .pending;
             return if (has_intents) .pending else .clean;
         }
         return if (foreground_blocked) .busy else .absent;
@@ -19234,7 +19234,7 @@ pub const ProvisionedTableWriteSource = struct {
                 }
                 if (reconcile_summary.indexes_pending != 0) {
                     _ = try cached.db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
-                    if (try cached.db.hasPendingIndexRepairIntents(alloc)) {
+                    if (try cached.db.indexes.repair.hasPendingIntents(alloc)) {
                         // Reconciliation owns admission, while the DataServer's
                         // capacity-fenced scheduler owns corpus work. The
                         // caller publishes this debt edge once per group so it
@@ -19439,7 +19439,7 @@ pub const ProvisionedTableWriteSource = struct {
                 if (self.local_index_repair_debt_hook == null)
                     _ = try db.finalizeDenseProjectionLifecycleForIdle();
                 _ = try db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
-                if (try db.hasPendingIndexRepairIntents(alloc)) {
+                if (try db.indexes.repair.hasPendingIntents(alloc)) {
                     if (self.local_index_repair_debt_hook != null) {
                         try appendStructuralRuntimeStatusObservation(
                             self,
@@ -28220,7 +28220,7 @@ fn recordLocalIndexCreateRepairDebt(
 ) void {
     const pending = repair_group_ids orelse return;
     if (!db.pendingWorkStats().repair_metadata_rebuild_pending) {
-        const has_intents = db.hasPendingIndexRepairIntents(alloc) catch true;
+        const has_intents = db.indexes.repair.hasPendingIntents(alloc) catch true;
         if (!has_intents) return;
     }
     // installLocalIndexWriteCapability reserves one slot per group before any
@@ -31139,7 +31139,7 @@ fn catchUpManagedDb(
     // An unavailable checkpoint is not proof that repair debt is absent. Let
     // the scheduler retain this exact route and apply its normal error
     // backoff instead of publishing a false completion edge.
-    const initial_index_repair_intents = try db.hasPendingIndexRepairIntents(alloc);
+    const initial_index_repair_intents = try db.indexes.repair.hasPendingIntents(alloc);
     const initial_index_repair_debt = initial_index_load_failure or initial_index_repair_intents;
     const initial_repair_debt = had_debt or
         repair_metadata_rebuild_pending or
@@ -31435,7 +31435,7 @@ fn catchUpManagedDb(
         made_progress = made_progress or discovery.discovered != 0;
         automatic_discovery_pending = discovery.automaticDiscoveryPending();
     }
-    var repair_summary = try db.indexRepairIntentSummary(alloc);
+    var repair_summary = try db.indexes.repair.intentSummary(alloc);
     if (repair_summary.runnable != 0) {
         progress_ctx.phase = .artifact_rebuild;
         try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
@@ -31453,7 +31453,7 @@ fn catchUpManagedDb(
         repaired_indexes = repair.repaired;
         degraded_indexes = repair.degraded;
         made_progress = made_progress or repair.attempted != 0 or repair.repaired != 0 or repair.discovered != 0;
-        repair_summary = try db.indexRepairIntentSummary(alloc);
+        repair_summary = try db.indexes.repair.intentSummary(alloc);
         if (repair_summary.runnable != 0) {
             return .{
                 .had_debt = true,
@@ -31553,7 +31553,7 @@ fn catchUpManagedDb(
             };
         }
     }
-    repair_summary = try db.indexRepairIntentSummary(alloc);
+    repair_summary = try db.indexes.repair.intentSummary(alloc);
     if (repair_summary.terminal != 0) {
         return .{
             .had_debt = true,
@@ -42567,7 +42567,7 @@ fn implementationTests() type {
             try std.testing.expect(!db.local_execution.optional_runtime_workers_enabled);
             try std.testing.expect(db.ttl_runtime == null);
             try std.testing.expect(db.transaction_runtime == null);
-            try std.testing.expect(db.text_merge_runtime == null);
+            try std.testing.expect(db.indexes.text.merge_runtime == null);
         }
 
         test "managed startup catch-up reclaims due obsolete primary run files" {
@@ -42953,7 +42953,7 @@ fn implementationTests() type {
                 try catchUpManagedIndexCreate(alloc, &db, "full_text_index_v1", true),
             );
 
-            const summary = try db.indexRepairIntentSummary(alloc);
+            const summary = try db.indexes.repair.intentSummary(alloc);
             try std.testing.expectEqual(@as(usize, 1), summary.runnable);
             const stats = try db.stats(alloc);
             defer db_mod.types.freeDBStats(alloc, stats);
@@ -43109,7 +43109,7 @@ fn implementationTests() type {
             };
             const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
             try db.runUntilIdle();
-            const completed = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+            const completed = try db.indexes.repair.advanceIntent(alloc, repair_id, .{});
             try std.testing.expect(completed.repaired);
             try std.testing.expect(try db.completedManagedDenseGenerationIsServiceable(alloc, cfg.name));
 
@@ -49495,8 +49495,8 @@ fn implementationTests() type {
             const resident_db = &write_cache.entries.items[0].db;
             var repair_clock = @import("antfly_platform").clock.ManualClock{};
             repair_clock.setRealtimeNs(backend_runtime.ptr().clock().nowRealtimeNs());
-            resident_db.index_repair_clock = repair_clock.clock();
-            defer resident_db.index_repair_clock = null;
+            resident_db.indexes.repair.clock = repair_clock.clock();
+            defer resident_db.indexes.repair.clock = null;
 
             const AdmissionBoundary = struct {
                 var observations: usize = 0;
@@ -49545,7 +49545,7 @@ fn implementationTests() type {
                 );
                 // Honor the repair owner's audit wake instead of spinning
                 // before its deadline or sleeping in wall-clock time.
-                const repair = try resident_db.indexRepairIntentSummary(alloc);
+                const repair = try resident_db.indexes.repair.intentSummary(alloc);
                 if (repair.earliest_retry_at_ms > repair_clock.clock().nowRealtimeMs()) {
                     repair_clock.setRealtimeNs(repair.earliest_retry_at_ms *| std.time.ns_per_ms);
                 }
@@ -57243,7 +57243,7 @@ fn implementationTests() type {
                 .force = true,
             }, .{ .defer_durable_index_repair_execution = true });
             queued.deinit(alloc);
-            try std.testing.expect(try cached.db.hasPendingIndexRepairIntents(alloc));
+            try std.testing.expect(try cached.db.indexes.repair.hasPendingIntents(alloc));
             cached.deinit(alloc);
 
             var status_io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -57470,7 +57470,7 @@ fn implementationTests() type {
                 .force = true,
             }, .{ .defer_durable_index_repair_execution = true });
             defer queued.deinit(alloc);
-            try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+            try std.testing.expect(try db.indexes.repair.hasPendingIntents(alloc));
 
             var source = ProvisionedTableWriteSource.init(path, NoCatalog.iface());
             defer source.deinit();

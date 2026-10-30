@@ -22,7 +22,19 @@ const Indexes = @import("mod.zig").Indexes;
 
 /// Graph index state owned by `DB.indexes`.
 pub const GraphIndexes = struct {
+    cleanup_owner: @import("../graph_cleanup_owner.zig").Owner = .{},
+    metrics: Metrics = .{},
     replacement: Replacement = .{},
+
+    /// Graph metric materialization: the optional runtime and idle-time maintenance settings.
+    pub const Metrics = struct {
+        owner: @import("../local_runtime_owner.zig").RuntimeOwner(db_mod.graph_metric_runtime_mod.GraphMetricRuntime) = .{},
+        runtime: ?*db_mod.graph_metric_runtime_mod.GraphMetricRuntime = null,
+        idle_maintenance: db_mod.OpenOptions.GraphMetricIdleMaintenanceMode = .auto,
+        idle_planned_options: db_mod.index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions = .{},
+        idle_auto_options: db_mod.index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions = .{},
+        idle_degree_canary_options: db_mod.index_manager_mod.IndexManager.GraphMetricDegreeCanaryOptions = .{},
+    };
 
     /// Background replacement: builds the new generation in a shadow catalog, catches it up with the live tail, then cuts over.
     pub const Replacement = struct {
@@ -268,7 +280,7 @@ pub const GraphIndexes = struct {
                 // Clock correction is local maintenance, not a replicated
                 // command. Leave queued jobs untouched when writes are denied
                 // or source authority requires ordered application.
-                if (!try db.canRunLocalGraphEndpointCleanup()) continue;
+                if (!try db.indexes.graph.canRunLocalEndpointCleanup()) continue;
                 // Persist the correction once. Taking min(now + limit) only
                 // in memory on every poll would slide the deadline forever.
                 var owner = db.acquireReplicationMutationShared();
@@ -646,7 +658,7 @@ pub const GraphIndexes = struct {
         // A wait observes accepted work even when this owner cannot choose
         // local effects. Leave denied/ordered work queued, as the replacement
         // scheduler does, rather than turning the observation into a write.
-        if (db_mod.monotonicTimeNs() >= deadline or !try db.canRunLocalGraphEndpointCleanup()) return;
+        if (db_mod.monotonicTimeNs() >= deadline or !try db.indexes.graph.canRunLocalEndpointCleanup()) return;
         try db.enforceReplicationWriteGate();
         if (db.enrichment_runtime) |runtime| {
             if (!db.local_execution.optional_runtime_workers_enabled and !runtime.isStarted() and producer_target > runtime.stats().applied_sequence) {
@@ -714,5 +726,707 @@ pub const GraphIndexes = struct {
         const db = self.dbPtr();
         if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("finishBackgroundGraphReplacement", .{ db, name, generation });
         return self.advanceReplacementForIdentityUntil(null, .{ .name = name, .generation = generation }, .cutover);
+    }
+
+    pub fn initMetricRuntime(self: *GraphIndexes, cfg: db_mod.graph_metric_runtime_mod.Config) !void {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("initOptionalGraphMetricRuntime", .{ db, cfg });
+        if (comptime builtin.os.tag == .freestanding) return;
+        if (!db.start_index_workers) return;
+        // Manual backends with only filesystem authority cannot own a
+        // background worker. Their caller drives maintenance explicitly.
+        if (db.backend_runtime.io() == null) return;
+        const resources = db.core.asyncResources();
+        self.metrics.owner = try @TypeOf(self.metrics.owner).create(db.runtime_alloc, .{
+            db.runtime_alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            db.backend_runtime,
+            cfg.forDbOwner(),
+        });
+        const runtime = self.metrics.owner.runtime.?;
+        self.metrics.runtime = runtime;
+        resources.index_manager.graph_metric_notify = .{ .ptr = runtime, .notify = db_mod.graph_metric_runtime_mod.GraphMetricRuntime.notifyOpaque };
+    }
+
+    pub fn drainStandaloneEndpointCleanup(self: *GraphIndexes) !bool {
+        return self.drainStandaloneEndpointCleanupWithOptions(.{}, std.math.maxInt(usize));
+    }
+
+    fn drainStandaloneEndpointCleanupWithOptions(self: *GraphIndexes, opts: db_mod.BatchExecutionOptions, max_pages: usize) !bool {
+        const db = self.dbPtr();
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return false;
+        // Most batches create no endpoint jobs. Avoid authority probes and
+        // maintenance admission altogether on their completion path.
+        if (!try db.core.store.hasGraphEndpointCleanup()) return false;
+        if (!try self.canRunLocalEndpointCleanup()) return false;
+        var pages: usize = 0;
+        while (pages < max_pages and try db.core.store.hasGraphEndpointCleanup()) {
+            if (!try self.canRunLocalEndpointCleanup()) break;
+            // The primary mutation is already durable. Cancellation can leave
+            // queued maintenance for the resident owner, but must never interrupt
+            // a page halfway through its atomic commit. Explicit drains use .none.
+            if (opts.visibility_cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+            try db.batchInternal(.{ .graph_endpoint_cleanup = true, .sync_level = .write }, null, .{
+                .document_child_range_dispatcher = opts.document_child_range_dispatcher,
+                .committed_batch_effects_observer = opts.committed_batch_effects_observer,
+            });
+            pages += 1;
+        }
+        return pages != 0;
+    }
+
+    /// Shared completion for ordinary, profiled, callback and transaction
+    /// batches, after the serialized primary apply section has finished.
+    /// Replicated apply must only execute its exact command; its owner drives
+    /// cleanup independently through subsequent ordered Raft entries.
+    pub fn finishBatchEndpointCleanup(self: *GraphIndexes, req: db_mod.types.BatchRequest, opts: db_mod.BatchExecutionOptions) !void {
+        const db = self.dbPtr();
+        if (req.graph_endpoint_cleanup or !opts.wait_for_sync_level or
+            opts.ordered_apply_receipt != null or opts.replication_applied_lsn_marker != null or
+            opts.native_initial_child_entry != null or opts.restore_staging != null or
+            req.restore_staging_scope != null or req.restore_staging != null) return;
+        // Weak sync levels pay for at most one bounded maintenance page.
+        // Durable jobs continue through the resident scheduler; full_index
+        // and explicit maintenance retain complete cleanup guarantees.
+        const max_pages: usize = if (req.sync_level == .full_index) std.math.maxInt(usize) else 1;
+        const drained = try self.drainStandaloneEndpointCleanupWithOptions(opts, max_pages);
+        // A resident worker can finish before the foreground queue probe.
+        // Deletes/transforms must still include its newly committed replay cut.
+        if (req.sync_level == .full_index and (drained or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0))
+            try db.waitForCurrentSyncLevelWithCancellation(.full_index, opts.visibility_cancellation);
+    }
+
+    /// Local maintenance follows the same captured write admission as user writes.
+    /// A retained standby/fenced generation may open and replay exact commands,
+    /// but cannot choose cleanup effects or mutate its local directory on its own.
+    fn endpointCleanupWriteAuthority(self: *GraphIndexes) !bool {
+        const db = self.dbPtr();
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return false;
+        return if (db.local_execution.replication_write_gate) |gate| gate.allowsBackgroundWrite() else true;
+    }
+
+    fn canRunLocalEndpointCleanup(self: *GraphIndexes) !bool {
+        const db = self.dbPtr();
+        if (!try self.endpointCleanupWriteAuthority()) return false;
+        return !try db.maintenanceRequiresOrderedApply();
+    }
+
+    pub fn startEndpointCleanupWorker(self: *GraphIndexes) void {
+        const db = self.dbPtr();
+        if (comptime builtin.os.tag == .freestanding) return;
+        if (!db.stable_address or !db.local_execution.optional_runtime_workers_enabled or db.open_mode != .writer) return;
+        if (!(self.canRunLocalEndpointCleanup() catch false)) return;
+        self.cleanup_owner.start(self.cleanupPort());
+    }
+
+    fn cleanupPort(self: *GraphIndexes) @import("../graph_cleanup_owner.zig").Owner.Port {
+        const db = self.dbPtr();
+        return .{ .ptr = db, .runtime = db.backend_runtime, .run = cleanupPage };
+    }
+
+    fn cleanupPage(ptr: *anyopaque) !bool {
+        const db: *DB = @ptrCast(@alignCast(ptr));
+        return db.indexes.graph.runStandaloneEndpointCleanupStep();
+    }
+
+    pub fn stopEndpointCleanupWorker(self: *GraphIndexes) void {
+        const db = self.dbPtr();
+        self.cleanup_owner.stop(db.backend_runtime.io());
+    }
+
+    fn endpointCleanupWorkerStep(self: *GraphIndexes) ?u64 {
+        return self.cleanup_owner.step(self.cleanupPort());
+    }
+
+    /// Every enqueue path is serviced independently of subsequent foreground
+    /// writes. Each scheduler turn commits at most one bounded page.
+    pub fn runStandaloneEndpointCleanupStep(self: *GraphIndexes) !bool {
+        const db = self.dbPtr();
+        if (!try self.canRunLocalEndpointCleanup()) return false;
+        if (!try db.core.store.hasGraphEndpointCleanup()) {
+            // A ready directory needs no work. Idle owners must not contend
+            // with user mutations for the apply lock every scheduler turn.
+            if (try db.core.store.graphIncomingDirectoryReady()) return false;
+            try db.lockApplyForPortableRuntime();
+            defer db.core.unlockApply();
+            if (!try self.canRunLocalEndpointCleanup()) return false;
+            if (db.core.index_manager.hasGraphIndexes() and !try db.core.store.graphIncomingDirectoryReady())
+                return !try db.core.store.backfillGraphIncomingDirectoryPage();
+            return false;
+        }
+        try db.batchInternal(.{ .graph_endpoint_cleanup = true, .sync_level = .write }, null, .{});
+        return true;
+    }
+
+    /// The leader selects exact identities before proposal. Followers apply
+    /// these afterimages rather than consulting their local directory progress.
+    pub fn prepareEndpointCleanupBatch(self: *GraphIndexes, alloc: Allocator) !?DB.GraphEndpointCleanupBatch {
+        const db = self.dbPtr();
+        if (!try self.endpointCleanupWriteAuthority()) return null;
+        if (!try db.core.store.hasGraphEndpointCleanup() and try db.core.store.graphIncomingDirectoryReady()) return null;
+        try db.lockApplyForPortableRuntime();
+        defer db.core.unlockApply();
+        if (!try self.endpointCleanupWriteAuthority()) return null;
+        if (!try db.core.store.hasGraphEndpointCleanup()) {
+            // Build local directory coverage ahead of future endpoint deletes,
+            // without proposing empty Raft maintenance entries.
+            if (db.core.index_manager.hasGraphIndexes() and !try db.core.store.graphIncomingDirectoryReady())
+                _ = try db.core.store.backfillGraphIncomingDirectoryPage();
+            return null;
+        }
+        var page = (try db.core.store.prepareGraphEndpointCleanupPage(alloc)) orelse return null;
+        errdefer page.deinit();
+        const replay_writes = try db_mod.graphCleanupReplayWritesAlloc(alloc, page);
+        errdefer alloc.free(replay_writes);
+        return .{ .page = page, .graph_deletes = try db_mod.graphEndpointCleanupDeletesAlloc(alloc, page), .replay_writes = replay_writes };
+    }
+
+    pub fn requireEndpointCleanupReady(self: *GraphIndexes) !void {
+        const db = self.dbPtr();
+        if (!try db.core.store.graphEndpointCleanupBlocksReads()) return;
+        return error.StorageBusy;
+    }
+
+    /// Endpoint deletion is a document mutation, including TTL and deletes
+    /// prepared by another transaction. Reuse the durable shared read guards
+    /// so it cannot enqueue cleanup after an inline relationship votes prepared.
+    /// The guards survive restart and are released atomically with resolution.
+    /// Fact-owned projections deliberately have an independent lifecycle.
+    pub fn prepareEndpointDependenciesLocked(
+        self: *GraphIndexes,
+        alloc: Allocator,
+        scratch: Allocator,
+        txn_id: db_mod.types.TxnId,
+        intents: []const db_mod.transactions_mod.WriteIntent,
+        schema_view: ?db_mod.schema_registry_mod.SchemaView,
+        predicates: *std.ArrayListUnmanaged(db_mod.transactions_mod.VersionPredicate),
+    ) !void {
+        const db = self.dbPtr();
+        if (!db.core.hasGraphIndexes()) return;
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        var targets = std.StringHashMapUnmanaged(void).empty;
+        defer targets.deinit(scratch);
+        var read = try db.core.store.beginProbeTxn();
+        defer read.abort();
+        const owning_table: ?[]const u8 = db.local_execution.row_policy_table_name orelse (read.get(db_mod.internal_keys.graph_owning_table_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        });
+        var rows = std.heap.ArenaAllocator.init(alloc);
+        defer rows.deinit();
+        const row_alloc = rows.allocator();
+        for (intents) |intent| {
+            if (db_mod.isMetadataKey(intent.key)) continue;
+            const value = intent.value orelse continue;
+            defer _ = rows.reset(.retain_capacity);
+            var prepared: ?db_mod.mapper.PreparedRelationalWrite = if (intent.prepared_row != null) prepared_row: {
+                const view = schema_view orelse return error.PreparedGenerationChanged;
+                break :prepared_row try db_mod.mapper.PreparedRelationalWrite.initFromIntent(row_alloc, intent.key, value, view.validator(), view.tableSchema().*, view.physicalLayout(), intent.prepared_row);
+            } else null;
+            defer if (prepared) |*row| row.deinit(row_alloc);
+            var parsed: ?std.json.Parsed(std.json.Value) = if (prepared == null)
+                try std.json.parseFromSlice(std.json.Value, row_alloc, value, .{ .parse_numbers = false })
+            else
+                null;
+            defer if (parsed) |*root| root.deinit();
+            if (prepared) |*row| {
+                // AROW columns are lazy; materialize only fields consumed by
+                // graph mappings before planning durable endpoint guards.
+                for (db.core.graphIndexes()) |entry| {
+                    for (entry.edge_type_configs) |edge_cfg| {
+                        if (edge_cfg.field_name) |name| try row.requireLogicalField(name);
+                    }
+                }
+            }
+            const root = if (prepared) |*row| row.parsedValue() else parsed.?.value;
+            var extracted = if (prepared) |*row| row.takeExtracted() else try db_mod.mapper.extractWriteFromParsed(row_alloc, intent.key, value, root);
+            defer extracted.deinit(row_alloc);
+            try db_mod.augmentExtractedWriteWithGraphFieldEdgesParsed(db, row_alloc, intent.key, root, &extracted);
+            for (extracted.graph_writes) |edge| {
+                if (edge.owner_document.len != 0 and !std.mem.eql(u8, edge.owner_document, edge.source)) continue;
+                if (edge.owner.len != 0 and !std.mem.eql(u8, edge.owner, edge.source)) continue;
+                var table_scratch = db_mod.graph_metadata_tables.Scratch.init(row_alloc, null);
+                defer table_scratch.deinit();
+                const source_table = try table_scratch.table(edge.metadata_json, "source_table");
+                const target_table = try table_scratch.table(edge.metadata_json, "target_table");
+                if (!db_mod.graph_metadata_tables.inlineEndpointsAreLocal(source_table, target_table, owning_table)) continue;
+                if (targets.contains(edge.target)) continue;
+                const target = try scratch.dupe(u8, edge.target);
+                // Request preparation owns all predicate bytes until prepare.
+                const job = try db_mod.internal_keys.graphEndpointCleanupKeyAlloc(scratch, target);
+                _ = read.get(job) catch |err| switch (err) {
+                    error.NotFound => {
+                        if (!try manager.hasSharedReadDependency(txn_id, target)) {
+                            if (predicates.items.len >= db_mod.transactions_mod.max_read_guards_per_transaction) return error.TransactionTooLarge;
+                            const version = (try db_mod.ttl_mod.readTimestamp(db.core.store, alloc, target)) orelse 0;
+                            try predicates.append(alloc, .{ .key = target, .expected_version = version });
+                        }
+                        try targets.put(scratch, target, {});
+                        continue;
+                    },
+                    else => return err,
+                };
+                return error.IntegrityTopologyBusy;
+            }
+        }
+    }
+
+    pub fn runMetricMaintenanceForIdle(self: *GraphIndexes) !usize {
+        const db = self.dbPtr();
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        while (true) {
+            db_mod.lockApply(db);
+            if (!db.core.index_manager.graphRetirementAdmissionOpen()) {
+                db.core.unlockApply();
+                return error.IntegrityTopologyBusy;
+            }
+            const more = db.core.index_manager.runGraphOwnershipCleanupStep() catch |err| {
+                db.core.unlockApply();
+                return err;
+            };
+            db.core.unlockApply();
+            if (!more) break;
+        }
+        // Planned maintenance uses the same catalog pins and transaction
+        // fences as background workers. Never hold the ingest lock while
+        // draining graph computation; graph writes may supersede a build.
+        switch (self.metrics.idle_maintenance) {
+            .auto => return self.runMetricPlannedAutoMaintenanceForIdle(),
+            .planned => return self.drainMetricPlannedIdle(),
+            else => {},
+        }
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        return switch (self.metrics.idle_maintenance) {
+            .legacy => try db.core.index_manager.runGraphMetricMaintenance(),
+            .planned, .auto => unreachable,
+            .degree_canary => try self.runMetricDegreeCanaryMaintenanceForIdleLocked(),
+        };
+    }
+
+    fn metricPlannedProgress(result: db_mod.index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult) usize {
+        return result.planning_steps + result.builds_started + result.pages_completed + result.phases_advanced + result.published;
+    }
+
+    fn drainMetricPlannedIdle(self: *GraphIndexes) !usize {
+        const db = self.dbPtr();
+        const result = try db.core.index_manager.runGraphMetricPlannedMaintenance(self.metrics.idle_planned_options);
+        if (result.budget_exhausted) return error.RunUntilIdleDidNotConverge;
+        return metricPlannedProgress(result);
+    }
+
+    fn runMetricPlannedAutoMaintenanceForIdle(self: *GraphIndexes) !usize {
+        const db = self.dbPtr();
+        const result = try db.core.index_manager.runGraphMetricPlannedAutoMaintenance(
+            self.metrics.idle_planned_options,
+            self.metrics.idle_auto_options,
+        );
+        if (result.budget_exhausted) return error.RunUntilIdleDidNotConverge;
+        const progressed = metricPlannedProgress(result);
+        const after = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(self.metrics.idle_auto_options);
+        if (!after.shouldRunPlanned() and after.ineligible_queued != 0) {
+            // Admission caps must not silently select unlimited local compute.
+            return error.RunUntilIdleDidNotConverge;
+        }
+        return progressed;
+    }
+
+    fn runMetricDegreeCanaryMaintenanceForIdleLocked(self: *GraphIndexes) !usize {
+        const db = self.dbPtr();
+        const decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(self.metrics.idle_degree_canary_options);
+        if (decision.shouldRunPlanned()) return try self.drainMetricPlannedIdle();
+        if (decision.active_degree_builds != 0 or decision.blocked_active_non_degree != 0) {
+            return error.RunUntilIdleDidNotConverge;
+        }
+        return try db.core.index_manager.runGraphMetricMaintenance();
+    }
+
+    pub fn runMetricPlannedMaintenanceForIdle(
+        self: *GraphIndexes,
+        options: db_mod.index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
+    ) !db_mod.index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        const db = self.dbPtr();
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        return try db.core.index_manager.runGraphMetricPlannedMaintenance(options);
+    }
+
+    pub fn runMetricServiceMaintenanceJsonAlloc(self: *GraphIndexes, alloc: Allocator, body: []const u8) ![]u8 {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("runGraphMetricServiceMaintenanceJsonAlloc", .{ db, alloc, body });
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        var parsed = std.json.parseFromSlice(DB.GraphMetricServiceMaintenanceRequest, alloc, if (body.len == 0) "{}" else body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return error.InvalidGraphMetricRuntimeConfig;
+        defer parsed.deinit();
+
+        var manual_clock = db_mod.platform_clock.ManualClock{};
+        if (parsed.value.now_ms) |now_ms| manual_clock.setRealtimeNs(now_ms *| std.time.ns_per_ms);
+        const resources = db.core.asyncResources();
+        var runtime = try db_mod.graph_metric_runtime_mod.GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            db.backend_runtime,
+            .{
+                .start_background_loop = false,
+                .role = parsed.value.role,
+                .runtime_id = parsed.value.runtime_id,
+                .lease_owned = parsed.value.lease_owned,
+                .owner_id = parsed.value.owner_id,
+                .lease_ttl_ms = parsed.value.lease_ttl_ms,
+                .coordinator_start_background_builds = parsed.value.start_background_builds,
+                .planned_options = .{
+                    .worker_id = parsed.value.worker_id orelse "",
+                    .worker_ids = parsed.value.worker_ids orelse &.{},
+                    .max_rounds = parsed.value.max_rounds,
+                    .max_metrics_per_round = parsed.value.max_metrics_per_round,
+                    .max_pages_per_round = parsed.value.max_pages_per_round,
+                },
+                .clock = if (parsed.value.now_ms != null) manual_clock.clock() else db_mod.platform_clock.Clock.real(),
+            },
+        );
+        var preserve_lease = false;
+        defer if (preserve_lease) runtime.deinitPreserveLease() else runtime.deinit();
+
+        if (parsed.value.action == .release) {
+            const released = try runtime.ownership.releaseHeldLease();
+            var current_lease = try runtime.ownership.loadLease(alloc);
+            defer if (current_lease) |*lease| db_mod.lease_mod.deinitRecord(alloc, lease);
+            var runtime_stats = runtime.stats();
+            runtime_stats.shutdown = true;
+            return try std.json.Stringify.valueAlloc(alloc, .{
+                .released = released,
+                .lease_owner_id_hash = if (current_lease) |lease| db_mod.graph_metric_runtime_mod.identityHash(lease.owner_id) else 0,
+                .lease_expires_at_ms = if (current_lease) |lease| lease.expires_at_ms else 0,
+                .stats = runtime_stats,
+            }, .{ .emit_null_optional_fields = false });
+        }
+
+        const result: db_mod.index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult = if (parsed.value.action == .tick) try runtime.runOnceDetailed() else .{};
+        const runtime_stats = runtime.stats();
+        preserve_lease = parsed.value.preserve_lease_after_tick and parsed.value.lease_owned and parsed.value.action == .tick and runtime_stats.has_lease;
+        return try std.json.Stringify.valueAlloc(alloc, .{
+            .result = result,
+            .stats = runtime_stats,
+        }, .{ .emit_null_optional_fields = false });
+    }
+
+    pub fn refreshMetric(self: *GraphIndexes, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !db_mod.types.GraphMetricStatus {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("refreshGraphMetric", .{ db, alloc, index_name, metric_name });
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        const entry = db.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.enableGraphMetric(metric_name);
+        var status = try entry.index.runGraphMetric(metric_name);
+        defer status.deinit(entry.index.alloc);
+        const cloned = try DB.cloneGraphMetricStatusFromGraph(alloc, status);
+        if (self.metrics.runtime) |runtime| runtime.notify();
+        return cloned;
+    }
+
+    pub fn rebuildMetric(self: *GraphIndexes, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !db_mod.types.GraphMetricStatus {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("rebuildGraphMetric", .{ db, alloc, index_name, metric_name });
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        const entry = db.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.enableGraphMetric(metric_name);
+        var status = try entry.index.runGraphMetric(metric_name);
+        defer status.deinit(entry.index.alloc);
+        const cloned = try DB.cloneGraphMetricStatusFromGraph(alloc, status);
+        if (self.metrics.runtime) |runtime| runtime.notify();
+        return cloned;
+    }
+
+    /// Durably enqueue metric work and return immediately. Public control-plane
+    /// actions use this path so request latency is independent of graph size;
+    /// the bounded maintenance runtime performs and checkpoints the build.
+    pub fn scheduleMetricBuild(
+        self: *GraphIndexes,
+        alloc: Allocator,
+        index_name: []const u8,
+        metric_name: []const u8,
+        force: bool,
+    ) !db_mod.types.GraphMetricStatus {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("scheduleGraphMetricBuild", .{ db, alloc, index_name, metric_name, force });
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        const owned_status = blk: {
+            db_mod.lockApply(db);
+            defer db.core.unlockApply();
+            try self.requireEndpointCleanupReady();
+            if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+            const entry = db.core.graphIndex(index_name) orelse return error.IndexNotFound;
+            var current = try entry.index.graphMetricStatus(metric_name);
+            defer current.deinit(entry.index.alloc);
+            if (current.state == .disabled) {
+                try entry.index.enableGraphMetric(metric_name);
+                current.deinit(entry.index.alloc);
+                current = try entry.index.graphMetricStatus(metric_name);
+            }
+            if (!force and current.state == .fresh) {
+                break :blk try DB.cloneGraphMetricStatusFromGraph(alloc, current);
+            }
+            const target_generation = @max(current.edge_generation, current.target_edge_generation);
+            // Force means "build another immutable score epoch", not
+            // "unpublish first". Repeated requests remain idempotent while a
+            // build is active, and readers keep the verified prior epoch until
+            // the new pointer is atomically published.
+            var scheduled = entry.index.queueGraphMetricBuild(metric_name, target_generation) catch |err| switch (err) {
+                // A newer edge snapshot may be queued while the prior bounded
+                // build is still active. Treat repeated control-plane actions
+                // as accepted and expose the active/queued generations in the
+                // returned status instead of turning a safe retry into a 500.
+                error.GraphMetricBuildAlreadyRunning => break :blk try DB.cloneGraphMetricStatusFromGraph(alloc, current),
+                else => return err,
+            };
+            defer scheduled.deinit(db.core.index_manager.alloc);
+            break :blk try DB.cloneGraphMetricStatusFromGraph(alloc, scheduled);
+        };
+        if (self.metrics.runtime) |runtime| runtime.notify();
+        return owned_status;
+    }
+
+    pub fn deleteMetricMaterialization(self: *GraphIndexes, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !db_mod.types.GraphMetricStatus {
+        const db = self.dbPtr();
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        const entry = db.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.deleteGraphMetricMaterialization(metric_name);
+        var status = try entry.index.graphMetricStatus(metric_name);
+        defer status.deinit(entry.index.alloc);
+        const cloned = try DB.cloneGraphMetricStatusFromGraph(alloc, status);
+        if (self.metrics.runtime) |runtime| runtime.notify();
+        return cloned;
+    }
+
+    pub fn pauseMetricMaintenance(self: *GraphIndexes, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !db_mod.types.GraphMetricStatus {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("pauseGraphMetricMaintenance", .{ db, alloc, index_name, metric_name });
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        const entry = db.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        var status = try entry.index.pauseGraphMetricMaintenance(metric_name);
+        defer status.deinit(entry.index.alloc);
+        return try DB.cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn resumeMetricMaintenance(self: *GraphIndexes, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !db_mod.types.GraphMetricStatus {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("resumeGraphMetricMaintenance", .{ db, alloc, index_name, metric_name });
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        const entry = db.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        var status = try entry.index.resumeGraphMetricMaintenance(metric_name);
+        defer status.deinit(entry.index.alloc);
+        return try DB.cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn ensureMetricPlannedBuild(
+        self: *GraphIndexes,
+        alloc: Allocator,
+        index_name: []const u8,
+        metric_name: []const u8,
+        target_generation: u64,
+    ) !db_mod.types.GraphMetricStatus {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("ensureGraphMetricPlannedBuild", .{ db, alloc, index_name, metric_name, target_generation });
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        var status = try db.core.index_manager.ensureGraphMetricPlannedBuild(index_name, metric_name, target_generation);
+        defer status.deinit(db.core.index_manager.alloc);
+        return try DB.cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    fn runMetricPlannedWorkerPageStep(self: *GraphIndexes, index_name: []const u8, metric_name: []const u8, worker_id: []const u8) !db_mod.graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const db = self.dbPtr();
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        return try db.core.index_manager.runGraphMetricPlannedWorkerPageStep(index_name, metric_name, worker_id);
+    }
+
+    pub fn runMetricPlannedWorkerPageStepAt(self: *GraphIndexes, index_name: []const u8, metric_name: []const u8, worker_id: []const u8, now_ms: u64) !db_mod.graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("runGraphMetricPlannedWorkerPageStepAt", .{ db, index_name, metric_name, worker_id, now_ms });
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        return try db.core.index_manager.runGraphMetricPlannedWorkerPageStepAt(index_name, metric_name, worker_id, now_ms);
+    }
+
+    fn runMetricPlannedCoordinatorStep(self: *GraphIndexes, index_name: []const u8, metric_name: []const u8) !db_mod.graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const db = self.dbPtr();
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        return try db.core.index_manager.runGraphMetricPlannedCoordinatorStep(index_name, metric_name);
+    }
+
+    pub fn runMetricPlannedCoordinatorStepAt(self: *GraphIndexes, index_name: []const u8, metric_name: []const u8, now_ms: u64) !db_mod.graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("runGraphMetricPlannedCoordinatorStepAt", .{ db, index_name, metric_name, now_ms });
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        return try db.core.index_manager.runGraphMetricPlannedCoordinatorStepAt(index_name, metric_name, now_ms);
+    }
+
+    pub fn failMetricPlannedBuild(self: *GraphIndexes, alloc: Allocator, index_name: []const u8, metric_name: []const u8, err: anyerror) !db_mod.types.GraphMetricStatus {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("failGraphMetricPlannedBuild", .{ db, alloc, index_name, metric_name, @errorName(err) });
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        var status = try db.core.index_manager.failGraphMetricPlannedBuild(index_name, metric_name, err);
+        defer status.deinit(db.core.index_manager.alloc);
+        return try DB.cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn runMetricPlannedDrain(self: *GraphIndexes, alloc: Allocator, index_name: []const u8, metric_name: []const u8, target_generation: u64, options: db_mod.graph_mod.GraphIndex.GraphMetricPlannedDrainOptions) !db_mod.types.GraphMetricStatus {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("runGraphMetricPlannedDrain", .{ db, alloc, index_name, metric_name, target_generation, options });
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        try self.requireEndpointCleanupReady();
+        if (!db.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        var status = try db.core.index_manager.runGraphMetricPlannedDrain(index_name, metric_name, target_generation, options);
+        defer status.deinit(db.core.index_manager.alloc);
+        return try DB.cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn runMetricPlannedCoordinatorSweep(self: *GraphIndexes, options: db_mod.index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepOptions) !db_mod.index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        const db = self.dbPtr();
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        // Planned graph work is generation-fenced and storage-transactional.
+        // IndexManager pins catalog lifetime without blocking foreground apply.
+        return try db.core.index_manager.runGraphMetricPlannedCoordinatorSweep(options);
+    }
+
+    pub fn runMetricPlannedWorkerSweep(self: *GraphIndexes, options: db_mod.index_manager_mod.IndexManager.GraphMetricPlannedWorkerSweepOptions) !db_mod.index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        const db = self.dbPtr();
+        if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return error.ReadOnly;
+        return try db.core.index_manager.runGraphMetricPlannedWorkerSweep(options);
+    }
+
+    pub fn populateMetricStatusStats(alloc: Allocator, item: *db_mod.types.DBIndexStats, graph_index: *db_mod.graph_mod.GraphIndex) !void {
+        if (graph_index.metric_configs.len == 0) return;
+        const statuses = try alloc.alloc(db_mod.types.GraphMetricStatus, graph_index.metric_configs.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (statuses[0..initialized]) |*status| status.deinit(alloc);
+            alloc.free(statuses);
+        }
+        for (graph_index.metric_configs, 0..) |cfg, i| {
+            var status = try graph_index.graphMetricStatus(cfg.name);
+            defer status.deinit(graph_index.alloc);
+            statuses[i] = try DB.cloneGraphMetricStatusFromGraph(alloc, status);
+            initialized += 1;
+        }
+        item.graph_metric_status = statuses;
+    }
+
+    pub fn metricRuntimeStats(self: *GraphIndexes) db_mod.types.GraphMetricRuntimeStats {
+        const runtime = self.metrics.runtime orelse return .{};
+        const runtime_snapshot = runtime.stats();
+        const total = runtime_snapshot.total_result;
+        const last = runtime_snapshot.last_result;
+        return .{
+            .enabled = runtime_snapshot.enabled,
+            .role = switch (runtime_snapshot.role) {
+                .combined => .combined,
+                .coordinator => .coordinator,
+                .worker => .worker,
+                .worker_pool => .worker_pool,
+            },
+            .runtime_id_hash = runtime_snapshot.runtime_id_hash,
+            .owner_id_hash = runtime_snapshot.owner_id_hash,
+            .lease_key_hash = runtime_snapshot.lease_key_hash,
+            .worker_id_hash = runtime_snapshot.worker_id_hash,
+            .worker_count = @intCast(runtime_snapshot.worker_count),
+            .lease_owned = runtime_snapshot.lease_owned,
+            .has_lease = runtime_snapshot.has_lease,
+            .acquisition_count = runtime_snapshot.acquisition_count,
+            .takeover_count = runtime_snapshot.takeover_count,
+            .lease_acquire_failures = runtime_snapshot.lease_acquire_failures,
+            .lost_leases = runtime_snapshot.lost_leases,
+            .last_acquired_ms = runtime_snapshot.last_acquired_ms,
+            .lease_expires_at_ms = runtime_snapshot.lease_expires_at_ms,
+            .lease_renew_after_ms = runtime_snapshot.lease_renew_after_ms,
+            .renewal_count = runtime_snapshot.renewal_count,
+            .started = runtime_snapshot.started,
+            .shutdown = runtime_snapshot.shutdown,
+            .notified = runtime_snapshot.notified,
+            .ticks_started = runtime_snapshot.ticks_started,
+            .ticks_completed = runtime_snapshot.ticks_completed,
+            .durable_progress_ticks = runtime_snapshot.durable_progress_ticks,
+            .idle_ticks = runtime_snapshot.idle_ticks,
+            .error_ticks = runtime_snapshot.error_ticks,
+            .last_error_name = if (runtime_snapshot.last_error_name) |name| db_mod.types.RuntimeErrorName.init(name) else null,
+            .total_metrics_scanned = @intCast(total.metrics_scanned),
+            .total_active_builds = @intCast(total.active_builds),
+            .total_builds_started = @intCast(total.builds_started),
+            .total_worker_steps = @intCast(total.worker_steps),
+            .total_coordinator_steps = @intCast(total.coordinator_steps),
+            .total_retired_input_records = @intCast(total.retired_input_records),
+            .total_pages_claimed = @intCast(total.pages_claimed),
+            .total_pages_completed = @intCast(total.pages_completed),
+            .total_phases_advanced = @intCast(total.phases_advanced),
+            .total_published = @intCast(total.published),
+            .total_failed_builds = @intCast(total.failed_builds),
+            .last_metrics_scanned = @intCast(last.metrics_scanned),
+            .last_active_builds = @intCast(last.active_builds),
+            .last_builds_started = @intCast(last.builds_started),
+            .last_worker_steps = @intCast(last.worker_steps),
+            .last_coordinator_steps = @intCast(last.coordinator_steps),
+            .last_retired_input_records = @intCast(last.retired_input_records),
+            .last_pages_claimed = @intCast(last.pages_claimed),
+            .last_pages_completed = @intCast(last.pages_completed),
+            .last_phases_advanced = @intCast(last.phases_advanced),
+            .last_published = @intCast(last.published),
+            .last_failed_builds = @intCast(last.failed_builds),
+            .last_budget_exhausted = last.budget_exhausted,
+        };
     }
 };

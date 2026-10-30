@@ -521,7 +521,7 @@ fn runConfigured(io: std.Io, alloc: std.mem.Allocator, db_path: []const u8, cli:
     });
     defer db.close();
 
-    const runtime = db.graph_metric_runtime orelse return error.GraphMetricRuntimeNotInitialized;
+    const runtime = db.indexes.graph.metrics.runtime orelse return error.GraphMetricRuntimeNotInitialized;
     var total = SweepResult{};
     var ticks_executed: usize = 0;
     var idle_streak: usize = 0;

@@ -1999,7 +1999,7 @@ pub fn repairStorageKernelOwnerDb(
 ) !StorageKernelReconcileResult {
     if (comptime storage_engine.enabled) return storage_engine.call("writeRepairStorageKernelOwnerDb", .{ alloc, db, target_index_name, advance_index_repair, options });
     var result: StorageKernelReconcileResult = .{};
-    var repair_summary = db.indexRepairIntentSummaryForIndex(alloc, target_index_name) catch |err| switch (err) {
+    var repair_summary = db.indexes.repair.intentSummaryForIndex(alloc, target_index_name) catch |err| switch (err) {
         error.DurableIndexRepairStateUnavailable => if (target_index_name != null or advance_index_repair) return err else db_mod.DB.IndexRepairIntentSummary{},
         else => return err,
     };
@@ -2018,7 +2018,7 @@ pub fn repairStorageKernelOwnerDb(
         result.repair_busy = repair.busy;
         result.repair_disk_waits = repair.disk_waits;
         result.next_retry_at_ms = repair.next_retry_at_ms;
-        repair_summary = try db.indexRepairIntentSummaryForIndex(alloc, target_index_name);
+        repair_summary = try db.indexes.repair.intentSummaryForIndex(alloc, target_index_name);
         result.repair_remaining = repair_summary.runnable + repair_summary.paused + repair_summary.terminal;
         result.repair_terminal = repair_summary.terminal;
         result.next_retry_at_ms = repair_summary.earliest_retry_at_ms;
@@ -2179,11 +2179,11 @@ pub fn applyGraphMetricActionToDb(
     action: []const u8,
 ) !db_mod.types.GraphMetricStatus {
     if (comptime storage_engine.enabled) return storage_engine.call("writeApplyGraphMetricActionToDb", .{ alloc, db, index_name, metric_name, action });
-    if (std.mem.eql(u8, action, "refresh")) return try db.scheduleGraphMetricBuild(alloc, index_name, metric_name, false);
-    if (std.mem.eql(u8, action, "rebuild")) return try db.scheduleGraphMetricBuild(alloc, index_name, metric_name, true);
-    if (std.mem.eql(u8, action, "delete")) return try db.deleteGraphMetricMaterialization(alloc, index_name, metric_name);
-    if (std.mem.eql(u8, action, "pause")) return try db.pauseGraphMetricMaintenance(alloc, index_name, metric_name);
-    if (std.mem.eql(u8, action, "resume")) return try db.resumeGraphMetricMaintenance(alloc, index_name, metric_name);
+    if (std.mem.eql(u8, action, "refresh")) return try db.indexes.graph.scheduleMetricBuild(alloc, index_name, metric_name, false);
+    if (std.mem.eql(u8, action, "rebuild")) return try db.indexes.graph.scheduleMetricBuild(alloc, index_name, metric_name, true);
+    if (std.mem.eql(u8, action, "delete")) return try db.indexes.graph.deleteMetricMaterialization(alloc, index_name, metric_name);
+    if (std.mem.eql(u8, action, "pause")) return try db.indexes.graph.pauseMetricMaintenance(alloc, index_name, metric_name);
+    if (std.mem.eql(u8, action, "resume")) return try db.indexes.graph.resumeMetricMaintenance(alloc, index_name, metric_name);
     return error.InvalidGraphMetricAction;
 }
 
@@ -2197,11 +2197,11 @@ pub fn runGraphMetricMaintenanceOrActionJsonAlloc(
 ) ![]u8 {
     if (comptime storage_engine.enabled) return storage_engine.call("writeRunGraphMetricMaintenanceOrActionJsonAlloc", .{ alloc, db, body });
     var parsed = std.json.parseFromSlice(GraphMetricGroupActionRequest, alloc, body, .{ .ignore_unknown_fields = true }) catch
-        return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+        return try db.indexes.graph.runMetricServiceMaintenanceJsonAlloc(alloc, body);
     defer parsed.deinit();
-    const operation = parsed.value.operation orelse return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+    const operation = parsed.value.operation orelse return try db.indexes.graph.runMetricServiceMaintenanceJsonAlloc(alloc, body);
     if (!std.mem.eql(u8, operation, graph_metric_group_action_operation)) {
-        return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+        return try db.indexes.graph.runMetricServiceMaintenanceJsonAlloc(alloc, body);
     }
     if (parsed.value.index_name.len == 0 or parsed.value.metric_name.len == 0 or parsed.value.action.len == 0) {
         return error.InvalidGraphMetricAction;

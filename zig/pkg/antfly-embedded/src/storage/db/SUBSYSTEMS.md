@@ -9,21 +9,20 @@ into subsystem structs that own that state, and where each field goes.
 
 Subsystems are grouped by what they own. Index state is grouped by index kind
 under `indexes`, so everything about one kind (its runtimes, background work and
-replacement) lives in one place.
+replacement) lives in one place. Dense vector state lives in the catalog's index
+manager, so `indexes` has no `dense` subsystem yet.
 
 ```
 DB              core: identity, backends, runtime wiring, status
-├─ indexes      catalog operations shared by all kinds; pause and restart index
-│  │            runtimes around structural mutations
-│  ├─ text      merge runtime
-│  ├─ dense     auto bulk ingest
+├─ indexes      range split shadow index manager and replacement lock
+│  ├─ text      segment merge runtime
 │  ├─ sparse    compaction runtime
-│  ├─ graph     replacement, metrics, cleanup
+│  ├─ graph     replacement, metrics, endpoint cleanup
 │  ├─ relational column maintenance, rewrite caches
-│  ├─ algebraic HLL owner
-│  └─ repair    cross-kind repair intents, shadow repairs
+│  ├─ algebraic HLL maintenance lane
+│  └─ repair    repair intents and scheduler, leases, shadow rebuilds, activation
 ├─ enrichment   enrichment, resolution and promotion runtimes, artifact scheduling
-├─ documents    authority backfill and repair, group sources
+├─ documents    authority backfill and repair, group sources, bulk ingest
 ├─ query        schema identity, leases, warming, row policy
 ├─ recovery     transactions, publication, portable activation, restore, source pins
 ├─ ttl          TTL cleanup runtime
@@ -35,6 +34,7 @@ Call sites read as the path to the state they act on:
 ```zig
 _ = try db.indexes.graph.advanceReplacement();
 db.indexes.sparse.restartCompaction("drop", name);
+_ = try db.indexes.repair.advanceIntent(alloc, repair_id, .{});
 _ = try db.documents.advanceAuthorityBackfillPage();
 ```
 
@@ -48,8 +48,10 @@ subsystem steps up through its parent.
 ```zig
 // indexes/mod.zig
 pub const Indexes = struct {
-    graph: GraphIndexes = .{},
+    text: TextIndexes = .{},
     sparse: SparseIndexes = .{},
+    graph: GraphIndexes = .{},
+    ...
 
     pub fn dbPtr(self: *Indexes) *DB {
         return @alignCast(@fieldParentPtr("indexes", self));
@@ -118,18 +120,17 @@ Moved fields show their new path. The rest show where they will go.
 | Subsystem | DB fields |
 |---|---|
 | `DB` (core) | `alloc`, `runtime_alloc`, `core`, `root_incarnation`, `async_context`, `backend_runtime`, `backend_owner_id`, `open_mode`, `primary_backend`, `primary_lsm_storage`, `physical_root_mode`, `index_backends`, `generation_read_lease`, `closed`, `stable_address`, `local_execution`, `executor`, `owned_backend_runtime`, `owned_resource_manager`, `capacity_source`, `secret_store`, `remote_content`, `start_index_workers`, `start_independent_maintenance`, `resolver_workers_enabled`, `source_vector_storage`, `status_owner_epoch`, `status_publication_mutex`, `status_publication_revision` |
-| `indexes` | `generation_replace_mutex` |
-| `indexes.text` | `text_merge_owner`, `text_merge_runtime` |
-| `indexes.dense` | `bulk_ingest_session`, `bulk_identity` |
+| `indexes` (moved) | `generation_replace_mutex`, `split_shadow` (was `shadow`) |
+| `indexes.text` (moved) | `merge_owner`, `merge_runtime` |
 | `indexes.sparse` (moved) | `compaction_owner`, `compaction_runtime` |
-| `indexes.graph` (replacement moved) | `replacement.mutex`, `replacement.manager`, `replacement.catalog_generation`, `replacement.progress`; to move: `graph_cleanup_owner`, `graph_metric_idle_maintenance`, `graph_metric_idle_planned_options`, `graph_metric_idle_auto_options`, `graph_metric_idle_degree_canary_options`, `graph_metric_owner`, `graph_metric_runtime` |
-| `indexes.relational` | `rewrite_program_cache`, `rewrite_tail_cache`, `relational_columns_building`, `relational_columns_rebuild_requested`, `relational_column_maintenance` |
-| `indexes.algebraic` | `algebraic_hll_owner_id` |
-| `indexes.repair` | `index_repair_clock`, `repair_cleanup_owner_id`, `index_repair_mutex`, `active_index_repairs`, `shadow_index_repair_hook`, `shadow` |
+| `indexes.graph` (moved) | `replacement.mutex`, `replacement.manager`, `replacement.catalog_generation`, `replacement.progress`, `cleanup_owner`, `metrics.owner`, `metrics.runtime`, `metrics.idle_maintenance`, `metrics.idle_planned_options`, `metrics.idle_auto_options`, `metrics.idle_degree_canary_options` |
+| `indexes.relational` (moved) | `rewrite_program_cache`, `rewrite_tail_cache`, `columns_building`, `columns_rebuild_requested`, `column_maintenance` |
+| `indexes.algebraic` (moved) | `hll_owner_id` |
+| `indexes.repair` (moved) | `clock`, `cleanup_owner_id`, `mutex`, `active`, `shadow_hook` |
 | `enrichment` | `enrichment_owner`, `enrichment_append_context`, `enrichment_runtime`, `artifact_repair_metadata_due_ns`, `artifact_repair_metadata_pending`, `artifact_footprint_pending`, `artifact_producer_baseline_pending`, `artifact_producer_scheduler`, `embedding_activity`, `managed_admission` |
 | `enrichment.resolution` | `resolution_append_context`, `resolution_owner`, `resolution_runtime`, `resolution_candidate_source`, `resolution_embedder` |
 | `enrichment.promotion` | `promotion_owner_bundle`, `promotion_runtime`, `entity_sink`, `promotion_owner`, `entity_sink_missing_policy` |
-| `documents` (authority moved) | `authority.backfill_active`, `authority.backfill_requested`, `authority.backfill_mutex`, `authority.backfill_restart`, `authority.repairs`, `authority.repairs_yield_sweep`; to move: `group_source_owner`, `borrowed_group_source_state` |
+| `documents` (authority moved) | `authority.backfill_active`, `authority.backfill_requested`, `authority.backfill_mutex`, `authority.backfill_restart`, `authority.repairs`, `authority.repairs_yield_sweep`; to move: `group_source_owner`, `borrowed_group_source_state`, `bulk_ingest_session`, `bulk_identity` |
 | `query` | `query_schema_identity`, `resolver_query_schema_mutex`, `resolver_query_schema_epoch`, `resolver_query_schema_digest`, `retained_value_scope`, `retained_query_lease`, `retained_remote_query_lease`, `native_query_warming`, `owned_row_policy_authority_secret`, `owned_row_policy_authority_issuer`, `owned_row_policy_table_name` |
 | `recovery` | `transaction_recovery_identity_context`, `transaction_recovery_local_context`, `transaction_owner`, `transaction_runtime`, `publication_recovery`, `snapshot_publication_mutex`, `portable_runtime_activation_attempts`, `portable_runtime_activation_mutex`, `portable_activation_recovery`, `restore_decoder_cache`, `graph_restore_parse_cache`, `graph_restore_parse_count_for_test`, `source_pin_cleanup` |
 | `ttl` | `ttl_owner`, `ttl_cleanup_context`, `ttl_runtime` |
@@ -140,14 +141,14 @@ Moved fields show their new path. The rest show where they will go.
 Move self-contained areas first; they need no changes to `DB.open` beyond
 dropping fields that now have defaults.
 
-1. `indexes.graph.replacement`, `indexes.sparse` and `documents.authority`
-   (done).
-2. The rest of `indexes`: `text`, `graph` metrics and cleanup, `algebraic`,
-   `dense`, then `relational` and `repair`, which touch the catalog more.
-3. `ttl`, `maintenance` and the rest of `documents`.
-4. `enrichment` with `resolution` and `promotion`, which share append contexts
+1. `indexes` with every index kind, and `documents.authority` (done).
+2. `ttl`, `maintenance` and the rest of `documents`.
+3. `enrichment` with `resolution` and `promotion`, which share append contexts
    and must move together.
-5. `recovery` and `query`.
+4. `recovery` and `query`.
+
+Query-time graph metric methods (`executeGraphMetricQueries`,
+`applyGraphMetricRerank`) stay on `DB` and move with `query`.
 
 `AsyncContext` mirrors several runtime pointers (for example
 `async_context.sparse_compaction_runtime`) for background workers that only
@@ -157,4 +158,6 @@ subsystem.
 `local_mutation.zig`'s prepared-batch view mirrors `DB` field paths so shared
 code can read either owner through `ownerField`. When a moved field is read
 that way, the view carries the same subsystem path (it now has an `indexes`
-field whose `sparse.compaction_runtime` is set from the async context).
+field that carries the text and sparse runtimes from the async context, the
+repair cleanup owner, the relational rewrite caches, the split shadow and the
+active repair set).

@@ -1282,7 +1282,7 @@ test "storage owner runtime status distinguishes absent and busy source vectors"
         defer handle.db.close();
         const handle_id = try registerTestHandle(&handle);
         defer unregisterTestHandle(handle_id);
-        handle.db.backend_runtime.durable_jobs.drainOwner(handle.db.repair_cleanup_owner_id);
+        handle.db.backend_runtime.durable_jobs.drainOwner(handle.db.indexes.repair.cleanup_owner_id);
         var response: kernel_owner_abi.OwnedBytes = .{};
         if (handle.db.local_execution.source_vectors.load(.acquire)) |source| {
             // Holding the mutex on this thread makes both the missing-field
