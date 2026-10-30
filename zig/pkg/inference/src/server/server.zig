@@ -7702,8 +7702,9 @@ pub const Node = struct {
             item.source_fingerprint = if (image.source_fingerprint) |value| try allocator.dupe(u8, value) else null;
             item.page_number = image.page_number;
         }
+        const usage = try readers_api.measuredUsage(out);
         const execution = try qwenReadExecution(allocator, results);
-        return .{ .items = out, .execution = execution };
+        return .{ .items = out, .execution = execution, .usage = usage };
     }
 
     const ConcurrentOcrBenchTask = struct {
@@ -11383,6 +11384,14 @@ pub const Node = struct {
             observer.emit(.{ .phase = .model });
             break :tokens count;
         } else 0;
+        // The reference device path has no resident workspace to size from
+        // tokens, so plan its encoder bytes from the exact prepared request.
+        const reference_encoder_bytes: ?usize = if ((backend == .metal or backend == .cuda) and execution_options.metal_execution_policy != .optimized_v2) bytes: {
+            failure.* = .{ .stage = "tokenizing" };
+            const planned = try boundary_executor.referenceEncoderDeviceBytes(if (backend == .cuda) .cuda else .metal, scratch, &config, loaded.getTokenizer(), &request, execution_options);
+            failure.* = .{ .stage = "model" };
+            break :bytes planned;
+        } else null;
         const execution_mutex = loaded.targetInferenceExecutionMutex();
         const effective = control orelse InferenceExecutionControl{};
         // A waiting GPU boundary request cannot use the session workspace
@@ -11410,24 +11419,30 @@ pub const Node = struct {
             var device_lease: ?runtime.tier.memory.AdmissionLease = null;
             defer if (device_lease) |*owned| owned.release();
             if (backend == .metal or backend == .cuda) {
-                const full_device_bytes = try boundary_executor.deviceScratchUpperBound(execution_options);
+                if (workspace_plan) |plan| {
+                    request_options.device.max_encoder_device_bytes = try plan.requestEncoderLimit(execution_options.device.max_encoder_device_bytes);
+                    request_options.profile_encoder_device_limit = execution_options.device.max_encoder_device_bytes;
+                } else if (reference_encoder_bytes) |needed| {
+                    // Size the encoder owner to this request instead of the
+                    // configured ceiling; the profile keeps the declared one.
+                    request_options.device.max_encoder_device_bytes = needed;
+                    request_options.profile_encoder_device_limit = execution_options.device.max_encoder_device_bytes;
+                }
+                const request_device_bytes = try boundary_executor.deviceScratchUpperBound(request_options);
+                // The optimized path's per-run ceiling includes the whole
+                // borrowed workspace, which the controller owns through a
+                // separate persistent lease. The reference path has none, so
+                // its run reserves only what this request plans to use.
+                const run_device_bytes = if (workspace_plan == null) request_device_bytes else try boundary_executor.deviceScratchUpperBound(execution_options);
                 const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                     self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu)),
                     self.config.generation_budget_overrides.scratch_limit_bytes,
                     working_bytes,
-                    full_device_bytes,
+                    run_device_bytes,
                 );
-                if (workspace_plan) |plan| {
-                    request_options.device.max_encoder_device_bytes = try plan.requestEncoderLimit(execution_options.device.max_encoder_device_bytes);
-                    request_options.profile_encoder_device_limit = execution_options.device.max_encoder_device_bytes;
-                }
-                const request_device_bytes = try boundary_executor.deviceScratchUpperBound(request_options);
-                // The per-run ceiling includes the whole borrowed workspace.
-                // The controller owns that buffer through a separate persistent
-                // lease, so only the remaining capacity is requested here.
                 budget.* = runtime.tier.memory.RunBudget.init(device_limits);
                 try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = working_bytes, .scratch_tier = .host });
-                try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = full_device_bytes, .scratch_tier = .backend });
+                try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = run_device_bytes, .scratch_tier = .backend });
                 if (workspace_plan) |plan| if (plan.replacement_amounts) |amounts| {
                     workspace_permit = try self.model_manager.acquireRunResourceAmounts(.gpu, device_limits, amounts);
                 };
@@ -33128,6 +33143,7 @@ test "Qwen3-VL encoded read results own page identities and report serial execut
             defer batch.deinit(allocator);
             try std.testing.expectEqual(@as(i64, 21), batch.usage.?.prompt_tokens);
             try std.testing.expectEqual(@as(i64, 4), batch.usage.?.completion_tokens);
+            try std.testing.expectEqual(@as(i64, 25), batch.usage.?.total_tokens);
             try std.testing.expectEqual(readers_api.Completion.complete, batch.items[0].completion);
             try std.testing.expectEqual(readers_api.Completion.length, batch.items[1].completion);
             try std.testing.expectEqual(@as(?usize, 11), batch.items[1].prompt_tokens);
