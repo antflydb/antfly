@@ -5055,42 +5055,31 @@ jobs transfer request-local payload leases while releasing query scratch at
 completion; repeated references to one field can share the retained bytes.
 
 
-The [final ownership qualification](../../../docs/design/antfly-grep.md#final-ownership-and-capability-qualification-2026-10-29)
-compares the exact prior PR runtime with the same main revision and toolchain.
-All 91 native steps, 47 standalone ABI checks and 57 HTTP integration cases
-pass (seven optional HTTP profiles skipped). The warm matrix measures about
-5.5–6% lower CPU for small scalar/nested-medium batches and about 4.1% for repeated
-512×512 media references. Other cases vary or regress, including large/wide
-source reads; the design preserves the complete controls and independent repeats.
-These changes bound retained selected buffers and remove concurrent media
-completion copies; they do not establish universal throughput gains, sparse
-LSM reads, a process RSS bound or zero provider cost. Public API and ASCH25
-remain unchanged.
+The [current ownership and transport qualification](../../../docs/design/antfly-grep.md#batch-cancellation-and-structured-native-media-2026-10-30)
+records the contracts, complete paired controls, independent repeats and artifact
+identities. Selected LSM reads borrow one admitted point until selected spans
+are copied. Controlled batches retain one bounded scratch owner while polling
+cancellation/deadlines between whole-value reads and retiring payload pins per
+document. The persisted-row fixture uses 32.3% fewer scratch allocations.
 
+Gateway media jobs transfer request-local payload leases and release completed
+parsing scratch. Compatible native generators/deciders reuse verified codec
+bytes under a 1 MiB soft retention cap. Structured generation adapts message
+headers before serialization and passes borrowed attachments through the shared
+native handler, preserving options, tool history, token budgets, usage,
+completion and request controls. Older linked runtimes keep the JSON fallback;
+worker protocol 7 requires a matching explicitly configured worker CLI.
 
-The [borrowed-point and native-media follow-up](../../../docs/design/antfly-grep.md#borrowed-selected-points-and-verified-native-media-2026-10-29)
-merges main `c912271651`. Selected LSM reads can borrow one admitted point until
-selected spans are copied, while batches reuse bounded metadata scratch.
-Compatible named native generators and generated deciders reuse verified codec
-bytes with a 1 MiB soft retention cap. Native token budgets and cancellation
-survive attachment adaptation, and temporary JSON frames refund allocation
-credit after every invocation.
+The isolated structured-transport tool allocates 9,913 bytes per invocation for a
+1 MiB synthetic payload versus 8,402,713 through JSON/framing (99.88% less). It excludes
+source verification, caller-retained inputs, fixed dispatch, process transfer
+and model work. The 44-control whole-query matrix remains mixed/mostly flat;
+the design records the repeated wide conditional-read regression alongside the
+gains. These results do not establish universal latency, RSS or provider-cost
+improvements.
 
-Qualification includes the 102-step native check, subsequent 71-step media
-checks with 73 gateway cases, the 71-step release build, and 57 real-server
-indexed tests (seven optional profiles skipped). The design records all 44
-paired controls and independent repeats. Whole-query timings are mostly flat;
-initial large regressions and a shared-media gain did not reproduce. The
-isolated 1 MiB JSON transport stage measures about 10–19% lower elapsed time,
-with about 33% more allocated bytes; tiny transport inputs are slower.
-Ownership and budget guarantees are directly tested. These measurements do not
-establish universal speed, process RSS or provider-cost improvements.
-
-The [batch cancellation and structured-media follow-up](../../../docs/design/antfly-grep.md#batch-cancellation-and-structured-native-media-2026-10-30)
-keeps one native scratch owner across selected-copy batches while polling between
-whole-value reads. Its persisted-row fixture uses 32.3% fewer scratch allocations.
-Structured native generation also passes verified codec bytes through borrowed
-attachments with compact canonical metadata, preserving generation options and
-request controls. Worker protocol 7 requires a matching explicitly configured
-worker CLI. Physical-read probes still fetch complete checksummed/compressed
-blocks; this follow-up introduces no document-format migration.
+Physical-read probes still fetch complete checksummed/compressed blocks.
+Selected retention is not sparse storage I/O. Public HTTP/query syntax, the
+document schema and ASCH25 remain unchanged; this follow-up introduces no
+persistent-format migration. Earlier qualification runs and rejected experiments
+remain in the linked design history.

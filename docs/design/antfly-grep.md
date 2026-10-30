@@ -2518,8 +2518,10 @@ alternating rounds of 64 iterations cover 64-byte, 256 KiB and 1 MiB inputs,
 check delivered bytes/references/options, and verify all measured allocations
 are freed. Source authorization, codec/source materialization, caller-retained
 inputs, fixed runtime dispatch and model execution are outside its scope.
-Its timings therefore cannot be compared directly with the earlier encoder-only
-benchmark or described as inference/provider-billing savings.
+The tool constructs codec-sized synthetic payloads and preverified views; it
+does not decode/validate an image or qualify a model. Its timings therefore
+cannot be compared directly with the earlier encoder-only benchmark or
+described as inference/provider-billing savings.
 
 ### Release transport measurements and artifact identity
 
@@ -2572,3 +2574,165 @@ passed the earlier full pass and the unchanged-source repeat. Real-server
 indexed integration passes 57 cases, including persisted upgrade/rollback and
 permission checks; seven optional profiling cases are skipped unless their
 report environment variables are set.
+
+
+### Whole-query controls for the controlled-batch follow-up
+
+The paired server hashes above were measured over five alternating rounds with
+50 queries per phase (100 for the 64-document batch cases). The following table
+retains all 44 controls, including ingestion, ordinary full-value paths and
+regressions. CPU/elapsed figures are milliseconds per request; RSS is sampled
+process peak MiB and is neither retained allocation volume nor a memory bound.
+The host is shared and the filesystem/storage caches are warm after ingestion.
+Source controls use ASCII, escaped, tiny and wide metadata shapes; `wide-large`
+requests 60 metadata outputs with 1 MiB values, `wide-small` uses 64 KiB values,
+and `small64` uses the tiny-value fixture with 60 metadata outputs. The batch
+controls select metadata across 64 documents with scalar or nested metadata.
+Source/batch controls compare exact returned values, IDs, computed outputs,
+scores and totals after sorting hits by ID; they do not qualify result order.
+Media controls verify source materialization reaches the expected `ModelRequired`
+gate without resolving or calling a model.
+
+These server controls exercise projection/materialization without model
+inference. They do not exercise the new structured native-generation invocation
+measured by the separate transport tool. Media materialization is mostly flat;
+the transport-stage reduction must not be substituted for those whole-query
+measurements. CPU, elapsed time and process RSS vary independently.
+
+Source projections:
+| Workload/phase | CPU ms baseline → candidate | Elapsed ms baseline → candidate | RSS MiB baseline → candidate |
+|---|---:|---:|---:|
+| escaped / ingest | 146.851 → 157.636 | 168.056 → 240.231 | 176.422 → 173.578 |
+| escaped / ordinary | 9.262 → 9.166 | 12.627 → 12.677 | 145.531 → 133.320 |
+| escaped / full | 16.982 → 17.246 | 19.834 → 20.304 | 99.188 → 96.078 |
+| escaped / reference_full | 32.157 → 32.755 | 35.060 → 36.063 | 108.922 → 106.352 |
+| escaped / conditional | 1.056 → 1.058 | 2.129 → 2.261 | 93.062 → 96.156 |
+| escaped / reference | 16.670 → 17.139 | 17.782 → 18.439 | 93.188 → 95.516 |
+| large / ingest | 181.479 → 187.713 | 284.960 → 283.428 | 254.344 → 254.094 |
+| large / ordinary | 17.364 → 17.702 | 25.683 → 26.142 | 362.000 → 371.508 |
+| large / full | 22.686 → 23.325 | 30.588 → 31.345 | 496.188 → 461.805 |
+| large / reference_full | 36.710 → 36.270 | 45.566 → 45.142 | 465.188 → 536.867 |
+| large / conditional | 1.446 → 1.514 | 3.022 → 3.217 | 443.289 → 393.188 |
+| large / reference | 17.538 → 17.929 | 20.078 → 20.653 | 386.664 → 348.047 |
+| small64 / ingest | 31.223 → 27.486 | 18.516 → 17.226 | 132.109 → 131.875 |
+| small64 / ordinary | 0.600 → 0.633 | 1.528 → 1.721 | 135.703 → 135.719 |
+| small64 / full | 2.050 → 1.915 | 3.218 → 3.333 | 144.422 → 140.312 |
+| small64 / reference_full | 2.061 → 1.871 | 3.325 → 3.016 | 139.766 → 140.094 |
+| small64 / conditional | 2.121 → 2.054 | 3.293 → 3.636 | 145.594 → 146.102 |
+| small64 / reference | 2.092 → 2.204 | 3.269 → 3.799 | 145.930 → 135.359 |
+| wide-large / ingest | 178.304 → 186.654 | 184.443 → 245.917 | 254.438 → 248.688 |
+| wide-large / ordinary | 16.695 → 16.715 | 23.087 → 22.823 | 367.281 → 347.328 |
+| wide-large / full | 23.873 → 23.940 | 30.419 → 30.287 | 518.523 → 471.469 |
+| wide-large / reference_full | 37.233 → 36.761 | 44.510 → 43.233 | 496.539 → 457.586 |
+| wide-large / conditional | 2.497 → 2.992 | 3.915 → 4.999 | 429.672 → 391.906 |
+| wide-large / reference | 18.417 → 19.107 | 19.895 → 21.181 | 371.797 → 331.023 |
+| wide-small / ingest | 46.702 → 45.273 | 32.631 → 28.583 | 142.531 → 146.828 |
+| wide-small / ordinary | 1.670 → 1.595 | 3.266 → 3.092 | 153.344 → 151.312 |
+| wide-small / full | 3.383 → 3.259 | 5.222 → 4.798 | 161.641 → 162.516 |
+| wide-small / reference_full | 4.395 → 4.218 | 6.561 → 6.048 | 156.266 → 156.797 |
+| wide-small / conditional | 2.261 → 2.075 | 3.729 → 3.137 | 161.781 → 162.719 |
+| wide-small / reference | 3.243 → 3.031 | 4.591 → 4.129 | 153.734 → 163.078 |
+
+Batch projections:
+| Workload/phase | CPU ms baseline → candidate | Elapsed ms baseline → candidate | RSS MiB baseline → candidate |
+|---|---:|---:|---:|
+| nested-large / read | 4.457 → 4.674 | 5.804 → 6.294 | 446.164 → 507.891 |
+| nested-medium / read | 2.359 → 2.331 | 3.189 → 3.136 | 180.609 → 179.594 |
+| nested-small / read | 2.260 → 2.201 | 3.064 → 2.949 | 166.047 → 166.141 |
+| scalar-large / read | 4.032 → 3.845 | 5.497 → 4.987 | 421.000 → 413.766 |
+| scalar-small / read | 2.905 → 3.001 | 4.823 → 5.034 | 150.719 → 150.062 |
+
+Media materialization:
+| Workload/phase | CPU ms baseline → candidate | Elapsed ms baseline → candidate | RSS MiB baseline → candidate |
+|---|---:|---:|---:|
+| large_distinct_unique / read | 13.413 → 13.132 | 6.102 → 6.162 | 214.688 → 199.062 |
+| large_distinct_unique_eight / read | 29.378 → 29.368 | 12.992 → 13.217 | 252.094 → 254.672 |
+| skewed_distinct_eight / read | 18.056 → 18.185 | 15.542 → 16.108 | 220.781 → 206.008 |
+| large_512_distinct_unique_eight / read | 100.245 → 102.518 | 62.579 → 63.970 | 272.594 → 275.828 |
+| large_shared_duplicates / read | 11.102 → 10.917 | 12.216 → 11.830 | 167.133 → 191.828 |
+| large_distinct_repeated_refs / read | 12.349 → 12.528 | 7.940 → 8.242 | 207.312 → 205.938 |
+| large_512_distinct_repeated_refs / read | 45.709 → 45.911 | 45.659 → 46.062 | 319.906 → 317.562 |
+| tiny_shared_duplicates / read | 0.299 → 0.292 | 0.826 → 0.768 | 154.516 → 154.500 |
+| medium_shared_duplicates / read | 1.007 → 1.077 | 1.598 → 1.745 | 158.141 → 158.234 |
+
+
+### Independent repeated source controls
+
+The wide 1 MiB, tiny/wide and escaped workloads were repeated with seven
+alternating rounds and 100 queries per phase using the same immutable binary
+hashes. These retain both improved and slower cases. Tiny-value ordinary/full reads improve in the repeat; reference elapsed remains
+1.7% higher. The escaped ingestion surge does not reproduce. Wide conditional
+CPU/elapsed remain about 7.1%/14.6% higher
+(initially 19.8%/27.7%). That residual is recorded, not hidden by averaging other
+phases into a single speedup. Allocation reduction alone does not establish
+lower whole-query CPU or latency. Shared-host background work and sampled RSS
+also prevent universal latency or footprint conclusions.
+
+| Workload/phase | CPU ms baseline → candidate | Elapsed ms baseline → candidate | RSS MiB baseline → candidate |
+|---|---:|---:|---:|
+| wide-large / ingest | 176.626 → 165.608 | 205.122 → 190.613 | 275.938 → 276.969 |
+| wide-large / ordinary | 15.689 → 15.722 | 20.938 → 21.393 | 497.406 → 539.914 |
+| wide-large / full | 22.691 → 22.378 | 28.633 → 28.032 | 631.172 → 641.047 |
+| wide-large / reference_full | 34.948 → 34.449 | 41.301 → 39.345 | 616.938 → 637.625 |
+| wide-large / conditional | 2.327 → 2.492 | 3.470 → 3.975 | 569.875 → 626.516 |
+| wide-large / reference | 17.458 → 17.789 | 18.723 → 19.443 | 413.312 → 619.531 |
+| small64 / ingest | 25.872 → 26.667 | 14.330 → 15.441 | 131.688 → 131.719 |
+| small64 / ordinary | 0.546 → 0.511 | 1.409 → 1.334 | 135.781 → 135.797 |
+| small64 / full | 1.803 → 1.758 | 2.788 → 2.651 | 142.305 → 140.266 |
+| small64 / reference_full | 1.912 → 1.841 | 3.039 → 2.856 | 139.812 → 140.016 |
+| small64 / conditional | 1.872 → 1.850 | 2.823 → 2.775 | 91.922 → 123.062 |
+| small64 / reference | 1.930 → 1.918 | 2.855 → 2.903 | 66.609 → 123.281 |
+| escaped / ingest | 149.326 → 149.024 | 153.738 → 159.535 | 177.781 → 180.781 |
+| escaped / ordinary | 9.249 → 9.380 | 12.493 → 13.007 | 109.539 → 134.359 |
+| escaped / full | 17.783 → 17.419 | 21.314 → 20.559 | 85.594 → 94.625 |
+| escaped / reference_full | 33.054 → 32.162 | 37.069 → 35.259 | 98.125 → 108.453 |
+| escaped / conditional | 1.255 → 1.311 | 2.727 → 2.766 | 85.969 → 85.469 |
+| escaped / reference | 17.418 → 17.617 | 19.196 → 19.402 | 81.125 → 84.922 |
+
+Representative paired commands (set `CANDIDATE` and `BASELINE` to the captured
+release executables; keep raw output under ignored `output/`):
+
+```sh
+uv run --project zig/e2e/antfly python zig/e2e/antfly/bench_source_projection.py \
+  "$CANDIDATE" --baseline "$BASELINE" --rounds 7 --queries-per-phase 100 \
+  --workload ascii --value-bytes 1048576 --metadata-outputs 60 \
+  --output output/source-wide-large.json
+uv run --project zig/e2e/antfly python zig/e2e/antfly/bench_projection_batches.py \
+  "$CANDIDATE" --baseline "$BASELINE" --rounds 5 --queries-per-phase 100 \
+  --documents 64 --metadata-shape nested --value-bytes 1048576 \
+  --output output/batches-nested-large.json
+uv run --project zig/e2e/antfly python zig/e2e/antfly/bench_media_materialization.py \
+  "$CANDIDATE" --baseline "$BASELINE" --rounds 5 --queries-per-phase 50 \
+  --workload large_distinct_unique_eight --output output/media-distinct.json
+```
+
+
+### Integration after the latest main merge
+
+The branch subsequently merged fetched `origin/main` through `1d7ac5468b`
+(source commit `8bf0a8ae40`). All 17 source hashes from the paired
+qualification remain unchanged; the main merge adds separately validated
+upstream changes. Post-merge native validation passes 98/98 build steps and
+204/204 standard-runner tests, plus 213 query contracts, 94 logical cases
+(one optional skip), 49 runtime ABI, 32 provider, 73 gateway and 24 catalog
+source-owner cases. The host target includes 25 native fixtures. There are no
+failed or leaked tests in this pass. The earlier hydration-lease timing failure
+does not recur.
+
+The stripped ReleaseFast server builds 71/71 steps; the standalone CLI
+build also passes. Real-server indexed integration then passes 57 cases with
+7 optional profiling skips using these captured executables:
+
+- `antfly`, 235,402,360 bytes, SHA-256
+  `18c7b4b001d466af3848415f9e70c91c372b3809906548e6a3fcf256405944e0`.
+- `antfly-grep`, 7,596,584 bytes, SHA-256
+  `4a3e8a1559f839a1b7faac29b76778299da592b911a7bedcb75f35e8b1d9d87d`.
+
+These post-merge executables qualify integration and are distinct from the
+same-main paired benchmark artifacts above; their sizes/timings must not be
+attributed solely to this follow-up. License headers, the 2,334-file Apache
+boundary, storage-control catalog and formatting checks pass. The ignored
+`batch2-postmerge-manifest.json` retains the final artifact/source identities.
+Raw qualification files stay outside the tracked source tree. Full GitHub PR
+CI still requires the repository maintainer approval; these local checks do
+not bypass that gate.
