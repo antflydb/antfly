@@ -1428,7 +1428,11 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
     const a = arena.allocator();
     var root: Json = .{ .object = .empty };
     if (server.publicInferenceEnabled()) if (server.antfly_provider) |provider| if (provider.list_models_json) |list| {
-        const bytes = list(provider.ptr, a) catch null;
+        const bytes = list(provider.ptr, a) catch |err| blk: {
+            // The catalog degrades to empty, so say why instead of failing silently.
+            std.log.warn("model catalog listing failed: {s}", .{@errorName(err)});
+            break :blk null;
+        };
         if (bytes) |value| root = std.json.parseFromSliceLeaky(Json, a, value, .{}) catch .{ .object = .empty };
     };
     if (root != .object) root = .{ .object = .empty };
