@@ -93,6 +93,14 @@ hand-written kernels and leaves an empty region), add the region to
 `codegen_main.zig`, `zig build tile-kernel-codegen -- --write`, add a spec,
 and check against the old file.
 
+## MSL templates for near-copy kernels
+
+Hand-written Metal kernels that differed only in integer constants or
+scalar types are folded into MSL templates with
+`template [[host_name("...")]]` instances, so pipeline names stay the same.
+`scripts/tile/verify_msl_templates.py <old> <new>` expands every instance
+and requires it to equal the old kernel text exactly.
+
 Changing CUDA source means regenerating the checked-in PTX/fatbin/cubin
 with the pinned toolkit (CUDA 13.2, V13.2.86). Without a local install, the
 PyPI wheels reproduce the checked-in artifacts byte for byte:
