@@ -407,3 +407,13 @@ hosted workload's thirty-second rounds and advancing fences cannot be repaired
 by extending a stale lease; fresh admission must remain cheap. These local
 samples do not establish a fourfold improvement, provider placement latency,
 physical cold-isolate qualification, or complete provider diagnostics.
+
+
+The committed implementation is `15d985712741f68f0ea708e1fc2d065ae3fb9859`. Its clean rebuild
+matches all three module variants in all four frozen experiment snapshots. The
+new closure is `examples/cloudflare-serverless/dist/qualification/native-read-batch-1793335521328/evidence.json`:
+71 artifacts, 118,665,969 bytes, manifest SHA-256
+`ffdf8d5ef4e39d6b47c114ad6f1fda17742ec37bdc78213f953246f43e2c4056`. All 1,224 artifacts in the nine preceding closures
+remain hash-valid. The new closure also verifies independently, preserves earlier
+failed/sandbox-denied attempts and does not alter any preceding closure. Cache
+collection honored the active-build guard. No hosted resources were created.
