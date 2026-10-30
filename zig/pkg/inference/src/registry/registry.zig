@@ -29,6 +29,7 @@ const gliner_boundary = @import("../models/gliner_boundary.zig");
 const gliner_qualification = @import("../models/gliner_boundary_qualification.zig");
 const boundary_bundle = @import("../models/gliner_boundary_bundle.zig");
 const decide_qualification = @import("../models/gliner_decide_qualification.zig");
+const specialty_qualification = @import("../models/gliner_specialty_qualification.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const managed_receipt = @import("managed_receipt.zig");
 const c_file = @import("../util/c_file.zig");
@@ -1355,6 +1356,48 @@ fn decideIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const mani
     return decideIdentity(allocator, manifest) != null;
 }
 
+fn specialtyIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) ?specialty_qualification.Identity {
+    if (manifest.gliner_specialty_profile == null or manifest.gliner_architecture != .span) return null;
+    const weight_path = manifest.safetensors_path orelse return null;
+    var reader = safetensors_mod.MMapReader.openFileAbsolute(allocator, weight_path) catch return null;
+    defer reader.deinit();
+    var all_f32 = true;
+    var tensors = reader.header.tensors.iterator();
+    while (tensors.next()) |entry| if (entry.value_ptr.dtype != .f32) {
+        all_f32 = false;
+        break;
+    };
+    const identity = specialty_qualification.Identity{
+        .encoder_family = switch (manifest.gliner_span_encoder_family) {
+            .deberta => .deberta,
+            .modern_bert => .modern_bert,
+            .unknown => return null,
+        },
+        .geometry = .{
+            .hidden_size = manifest.hidden_size,
+            .intermediate_size = manifest.intermediate_size,
+            .num_hidden_layers = manifest.num_hidden_layers,
+            .num_attention_heads = manifest.num_attention_heads,
+            .vocab_size = manifest.bert_vocab_size,
+            .max_position_embeddings = manifest.max_position_embeddings,
+        },
+        .markers = .{
+            .p = manifest.gliner_token_p,
+            .c = manifest.gliner_token_c,
+            .e = manifest.gliner_token_e,
+            .r = manifest.gliner_token_r,
+            .l = manifest.gliner_token_l,
+            .sep_struct = manifest.gliner_token_sep_struct,
+            .sep_text = manifest.gliner_token_sep_text,
+        },
+        .inventory = .{ .count = reader.header.tensors.count(), .all_f32 = all_f32 },
+        .weight = specialty_qualification.Digest.ofMapped(reader.file_bytes),
+        .sidecars = manifest.glinerSpanSidecars() catch return null,
+    };
+    if (specialty_qualification.qualify(identity) == null) return null;
+    return identity;
+}
+
 fn isKnownDecideSource(source: managed_receipt.DownloadSource) bool {
     return std.ascii.eqlIgnoreCase(source.owner, "fastino") and
         (std.ascii.eqlIgnoreCase(source.name, "GLiNER2.5-Decide") or
@@ -1366,6 +1409,15 @@ fn isKnownDecideStagingSource(allocator: std.mem.Allocator, dest_dir: []const u8
     defer plan.deinit();
     const source = plan.parsed.value.source orelse return false;
     return isKnownDecideSource(source);
+}
+
+fn isKnownSpecialtyStagingSource(allocator: std.mem.Allocator, dest_dir: []const u8) !bool {
+    var plan = try managed_receipt.loadValidatedPlan(allocator, std.Options.debug_io, dest_dir);
+    defer plan.deinit();
+    const source = plan.parsed.value.source orelse return false;
+    return std.ascii.eqlIgnoreCase(source.owner, "fastino") and
+        (std.ascii.eqlIgnoreCase(source.name, "gliner2-privacy-filter-PII-multi") or
+            std.ascii.eqlIgnoreCase(source.name, "gliguard-LLMGuardrails-300M"));
 }
 
 fn isGlinerDecisionCandidate(manifest: *const manifest_mod.ModelManifest) bool {
@@ -1386,6 +1438,55 @@ fn appendQualifiedDecisionCapabilities(allocator: std.mem.Allocator, qualified: 
     if (!qualified) return;
     try appendUniqueOwnedString(allocator, capabilities, "classification");
     try appendUniqueOwnedString(allocator, capabilities, "typed_decisions");
+}
+
+fn appendQualifiedSpecialtyContract(
+    allocator: std.mem.Allocator,
+    profile: ?specialty_qualification.Profile,
+    tasks: *std.ArrayListUnmanaged([]const u8),
+    capabilities: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const exact = profile orelse return;
+    switch (exact) {
+        .pii_multi => {
+            try appendUniqueOwnedString(allocator, tasks, "extract");
+            try appendUniqueOwnedString(allocator, capabilities, "extraction");
+        },
+        .gliguard => {
+            // Existing public GLiNER schema-v2 API presents [L] classifier
+            // output on the extract route; classification is the sole model
+            // capability, not a generic classifier endpoint.
+            try appendUniqueOwnedString(allocator, tasks, "extract");
+            try appendUniqueOwnedString(allocator, capabilities, "classification");
+        },
+    }
+}
+
+test "specialty publication is narrow and never grants typed decisions" {
+    const allocator = std.testing.allocator;
+    inline for (.{ specialty_qualification.Profile.pii_multi, specialty_qualification.Profile.gliguard }) |profile| {
+        var tasks = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (tasks.items) |item| allocator.free(item);
+            tasks.deinit(allocator);
+        }
+        var capabilities = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (capabilities.items) |item| allocator.free(item);
+            capabilities.deinit(allocator);
+        }
+        try appendQualifiedSpecialtyContract(allocator, profile, &tasks, &capabilities);
+        try std.testing.expectEqual(@as(usize, 1), tasks.items.len);
+        try std.testing.expectEqual(@as(usize, 1), capabilities.items.len);
+        try std.testing.expect(!taskListContains(capabilities.items, "typed_decisions"));
+        if (profile == .pii_multi) {
+            try std.testing.expectEqualStrings("extract", tasks.items[0]);
+            try std.testing.expectEqualStrings("extraction", capabilities.items[0]);
+        } else {
+            try std.testing.expectEqualStrings("extract", tasks.items[0]);
+            try std.testing.expectEqualStrings("classification", capabilities.items[0]);
+        }
+    }
 }
 
 test "GLiNER qualified Decide publication emits complete extractor contract and unqualified candidates emit none" {
@@ -1924,9 +2025,13 @@ fn synthesizePulledModelManifestJsonInternal(
     const qualified_boundary = if (boundary_identity) |identity| gliner_qualification.hasQualifiedIdentity(identity) else false;
     const decide_identity = decideIdentity(allocator, &manifest);
     const qualified_decide = decide_identity != null;
+    const specialty_identity = specialtyIdentity(allocator, &manifest);
+    const specialty_profile = if (specialty_identity) |identity| specialty_qualification.qualify(identity) else null;
+    const specialty_candidate = manifest.gliner_specialty_profile != null;
     const qualified_boundary_decide = boundaryDecisionIdentityIsQualified(allocator, &manifest);
     const decision_candidate = isGlinerDecisionCandidate(&manifest);
     const known_decide_source = source == .staging_plan and try isKnownDecideStagingSource(allocator, dest_dir);
+    const known_specialty_source = source == .staging_plan and try isKnownSpecialtyStagingSource(allocator, dest_dir);
     // Preserve the reviewed original Decide source's fail-closed pull
     // contract. Other valid future span-family artifacts may be installed,
     // but remain unadvertised until their exact bytes join the qualification
@@ -1934,7 +2039,10 @@ fn synthesizePulledModelManifestJsonInternal(
     if (!qualified_decide and (known_decide_source or
         (decision_candidate and (tasks_csv != null or capabilities_csv != null))))
         return error.UnsupportedGlinerDecisionArtifact;
+    if ((specialty_candidate or known_specialty_source) and specialty_profile == null)
+        return error.UnsupportedGlinerSpecialtyArtifact;
     if (qualified_decide) manifest.gliner_classification_head = .label_marker_mlp;
+    if (specialty_profile != null and specialty_profile.? == .gliguard) manifest.gliner_classification_head = .label_marker_mlp;
 
     if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary and (tasks_csv != null or capabilities_csv != null))
         return error.UnsupportedGlinerBoundaryRuntime;
@@ -1944,7 +2052,7 @@ fn synthesizePulledModelManifestJsonInternal(
         for (tasks.items) |task| allocator.free(task);
         tasks.deinit(allocator);
     }
-    if (!decision_candidate or qualified_decide) {
+    if ((!decision_candidate or qualified_decide) and specialty_profile == null) {
         if (tasks_csv) |csv| {
             try appendCsvTasks(allocator, &tasks, csv);
             try appendSupplementalTasks(allocator, &manifest, &tasks, qualified_boundary);
@@ -1960,6 +2068,10 @@ fn synthesizePulledModelManifestJsonInternal(
         try appendQualifiedDecisionTasks(allocator, true, &tasks);
     }
     if (qualified_boundary_decide) try appendUniqueOwnedString(allocator, &tasks, "decide");
+    if (specialty_profile) |profile| switch (profile) {
+        .pii_multi => try appendUniqueOwnedString(allocator, &tasks, "extract"),
+        .gliguard => try appendUniqueOwnedString(allocator, &tasks, "extract"),
+    };
 
     // A read-only LightOnOCR installation still loads the integrated decoder.
     // Tasks select public routes; they must not replace its runtime identity.
@@ -1987,7 +2099,7 @@ fn synthesizePulledModelManifestJsonInternal(
         for (capabilities.items) |cap| allocator.free(cap);
         capabilities.deinit(allocator);
     }
-    if (!decision_candidate or qualified_decide) {
+    if ((!decision_candidate or qualified_decide) and specialty_profile == null) {
         try appendInferredCapabilities(allocator, &manifest, tasks.items, &capabilities, qualified_boundary);
         if (capabilities_csv) |csv| try appendCsvCapabilities(allocator, &capabilities, csv);
     }
@@ -2008,6 +2120,20 @@ fn synthesizePulledModelManifestJsonInternal(
         for (capabilities.items) |capability| if (!std.mem.eql(u8, capability, "classification") and !std.mem.eql(u8, capability, "typed_decisions")) return error.InvalidModelManifest;
     }
     if (qualified_boundary_decide) try appendUniqueOwnedString(allocator, &capabilities, "typed_decisions");
+    if (specialty_profile) |profile| switch (profile) {
+        .pii_multi => try appendUniqueOwnedString(allocator, &capabilities, "extraction"),
+        .gliguard => try appendUniqueOwnedString(allocator, &capabilities, "classification"),
+    };
+    if (specialty_profile) |profile| {
+        for (tasks.items) |task| switch (profile) {
+            .pii_multi => if (!std.mem.eql(u8, task, "extract")) return error.InvalidModelManifest,
+            .gliguard => if (!std.mem.eql(u8, task, "extract")) return error.InvalidModelManifest,
+        };
+        for (capabilities.items) |capability| switch (profile) {
+            .pii_multi => if (!std.mem.eql(u8, capability, "extraction")) return error.InvalidModelManifest,
+            .gliguard => if (!std.mem.eql(u8, capability, "classification")) return error.InvalidModelManifest,
+        };
+    }
     // Reserved public capability: neither an alias nor a caller-supplied CSV
     // may publish it for a merely similar boundary artifact.
     // EmbeddingGemma 2 decides by embedding similarity, not typed decisions;
@@ -2036,7 +2162,7 @@ fn synthesizePulledModelManifestJsonInternal(
         try body.appendSlice(allocator, ",\"inputs\":");
         try appendJsonStringArray(&body, allocator, inputs.items);
     }
-    if (qualified_decide)
+    if (qualified_decide or (specialty_profile != null and specialty_profile.? == .gliguard))
         try body.appendSlice(allocator, ",\"gliner_classification_head\":\"label_marker_mlp\"");
     if (qualified_boundary or qualified_decide) {
         const limits = try qualifiedLimitsJsonAlloc(allocator, boundary_identity, decide_identity);

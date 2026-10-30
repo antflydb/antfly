@@ -929,8 +929,8 @@ fn countLstmForwardFromCt(
 
 /// CountLSTM (v1) forward pass (count=1 at inference time):
 /// projector(concat([GRU(pos[0], h_0=label), label])), projector = 2H→4H→H.
-/// Only the label markers take this path (a handful of rows), so the GRU gate
-/// math stays on the host like the v2 fallback.
+/// Metal keeps the position-zero GRU and projector resident; other backends
+/// and later count positions retain the reference host fallback.
 fn countLstmV1ForwardFromCt(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -954,6 +954,18 @@ pub fn countLstmV1AtStep(
     if (num_labels == 0) {
         const empty_shape = [_]i32{ 0, @intCast(H) };
         return cb.fromFloat32Shape(&.{}, &empty_shape);
+    }
+    // Entity extraction uses only the first learned count position. Reuse the
+    // resident CountLSTMv2 GRU without its residual; v1 concatenates the raw
+    // h1 with the original labels before its own projector. Never recover h1
+    // by subtracting h0 from a rounded h1+h0 result.
+    if (step == 0) {
+        if (try cb.glinerLabelGru(label_ct, num_labels, H, false)) |gru_ct| {
+            defer cb.free(gru_ct);
+            const cat_ct = try cb.concat(gru_ct, label_ct, num_labels, H, H);
+            defer cb.free(cat_ct);
+            return countLstmV1Project(cb, cat_ct, num_labels, H);
+        }
     }
     const label_embs = try cb.toFloat32(label_ct, allocator);
     defer allocator.free(label_embs);
@@ -985,6 +997,10 @@ pub fn countLstmV1AtStep(
     const cat_ct = try cb.fromFloat32Shape(cat, &cat_shape);
     defer cb.free(cat_ct);
 
+    return countLstmV1Project(cb, cat_ct, num_labels, H);
+}
+
+fn countLstmV1Project(cb: *const ComputeBackend, cat_ct: CT, num_labels: usize, H: usize) !CT {
     const w0 = try cb.getWeight("count_embed.projector.0.weight");
     defer cb.free(w0);
     const b0 = try cb.getWeight("count_embed.projector.0.bias");

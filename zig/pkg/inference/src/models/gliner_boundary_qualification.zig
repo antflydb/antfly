@@ -1309,7 +1309,9 @@ test "boundary qualification Transformers wrapper has exactly the original fp32 
         try require(identity, entry.backend, entry.features, entry.lengths);
         count += 1;
     }
-    try std.testing.expectEqual(@as(usize, 8), count);
+    // Six original wrapper rows, two CUDA base rows, and the bounded CUDA and
+    // Metal batch profiles all authenticate the same original FP32 identity.
+    try std.testing.expectEqual(@as(usize, 10), count);
     for (0..4) |index| {
         var changed = identity;
         changed.sidecars[index].sha256[0] = 'f';

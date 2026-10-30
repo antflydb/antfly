@@ -78,6 +78,11 @@ pub const Options = struct {
     threshold: f32 = 0.5,
     word_splitter: processor.WordSplitter = .whitespace,
     overlap: boundary.OverlapPolicy = .flat,
+    /// Distinguishes the public default from a caller-selected policy.
+    /// Qualified legacy span checkpoints use their historical greedy decoder
+    /// only when both `overlap` and its `flat_ner` compatibility alias are
+    /// omitted. Explicit policies retain the version-2 decoder contract.
+    overlap_explicit: bool = false,
     offset_unit: boundary.OffsetUnit = .utf8_bytes,
     include_confidence: bool = false,
     include_spans: bool = false,
@@ -284,6 +289,7 @@ pub fn parseOptions(value: Value) !Options {
     options.include_confidence = try boolValue(object, "include_confidence", false);
     options.include_spans = try boolValue(object, "include_spans", false);
     options.offset_unit = try enumeration(boundary.OffsetUnit, object, "offset_unit", .utf8_bytes);
+    options.overlap_explicit = object.contains("overlap") or object.contains("flat_ner");
     options.overlap = if (try boolValue(object, "flat_ner", true)) .flat else .allow;
     if (object.get("overlap")) |raw| {
         const name = try string(raw);
@@ -888,6 +894,25 @@ test "extraction v2 decoder omission preserves per-task profiles and explicit na
     var explicit_null = try std.json.parseFromSlice(Value, a, "{\"decoder\":{\"algorithm\":null}}", .{});
     defer explicit_null.deinit();
     try std.testing.expectError(error.InvalidExtractionRequest, parseOptions(explicit_null.value));
+}
+
+test "extraction v2 preserves overlap option presence" {
+    const a = std.testing.allocator;
+    var omitted = try std.json.parseFromSlice(Value, a, "{}", .{});
+    defer omitted.deinit();
+    try std.testing.expect(!(try parseOptions(omitted.value)).overlap_explicit);
+
+    var explicit_flat = try std.json.parseFromSlice(Value, a, "{\"overlap\":\"flat\"}", .{});
+    defer explicit_flat.deinit();
+    const flat = try parseOptions(explicit_flat.value);
+    try std.testing.expect(flat.overlap_explicit);
+    try std.testing.expectEqual(boundary.OverlapPolicy.flat, flat.overlap);
+
+    var legacy_allow = try std.json.parseFromSlice(Value, a, "{\"flat_ner\":false}", .{});
+    defer legacy_allow.deinit();
+    const allow = try parseOptions(legacy_allow.value);
+    try std.testing.expect(allow.overlap_explicit);
+    try std.testing.expectEqual(boundary.OverlapPolicy.allow, allow.overlap);
 }
 
 test "extraction v2 wire exposes search ceilings and fails closed on unsupported beam width" {

@@ -1,0 +1,73 @@
+{
+  "format_version": 1,
+  "status": "captured_locked_cpu_fp32",
+  "oracle": {
+    "upstream_repo": "https://github.com/fastino-ai/GLiNER2",
+    "upstream_commit": "3c913c7369301133d3b7699252074c4303ada50e",
+    "source_archive_sha256": "5a73e45dfcf04c0d85d591dc940eab4ba2bffbb91823067b207c794b4578fb6a",
+    "source_tree_sha256": "042ea6064ddb439ccff6c6ac5eb7850dac6d9cc74bc33cbef40928e8f653b020",
+    "python": "3.12.3",
+    "packages": {
+      "PyYAML":"6.0.3", "accelerate":"1.10.1", "huggingface-hub":"0.36.0",
+      "numpy":"2.3.5", "packaging":"25.0", "peft":"0.17.1",
+      "psutil":"7.1.3", "pydantic":"2.12.3", "requests":"2.32.5",
+      "safetensors":"0.7.0", "scipy":"1.16.3", "tokenizers":"0.21.4",
+      "torch":"2.9.1", "transformers":"4.55.4", "urllib3":"2.5.0"
+    },
+    "device": "cpu",
+    "dtype": "float32",
+    "torch_threads": 2
+  },
+  "models": {
+    "pii_multi": {
+      "repo": "fastino/gliner2-privacy-filter-PII-multi",
+      "revision": "1cb4166094dc58fa8d836429f060d6c95f62b495",
+      "license": "apache-2.0",
+      "model_safetensors_size": 1228421964,
+      "model_safetensors_sha256": "0280f6f39f6012da50b6640bad438d9b7e763a1b0102094115d1b710c4dd79b6",
+      "tensor_inventory": {"count":227,"all_f32":true},
+      "tokenizer_json_size": 16020604,
+      "tokenizer_json_sha256": "f6df10ec83bea993035b2dd7c39345a3d4fcf23421c2adb6cb4ffc1e6d1bc4b5",
+      "metadata_fixtures": {
+        "config.json": {"size_bytes":252,"sha256":"164f17362bcf9d114067d3465e7374bfdd79ce6b605acb745de5a49dabb9595c"},
+        "encoder_config/config.json": {"size_bytes":895,"sha256":"f27dd63cc43a248d2566f0b6ad7a115db353676ce0561dcbca45bac766464c1a"},
+        "tokenizer_config.json": {"size_bytes":711,"sha256":"233beed1f1095cccfc7907cde31a8d90a0c6aa4fdfaf6493f8e55fd162e81ae6"}
+      }
+    },
+    "gliguard": {
+      "repo": "fastino/gliguard-LLMGuardrails-300M",
+      "revision": "7776816b54581f37b90dd2de12dbe13123229a9b",
+      "license": "apache-2.0",
+      "model_safetensors_size": 833938108,
+      "model_safetensors_sha256": "03132cef1def4bb172b586e662ffc3c30f76034411fc21cd309dd8f1b627c466",
+      "tensor_inventory": {"count":255,"all_f32":true},
+      "tokenizer_json_size": 8333952,
+      "tokenizer_json_sha256": "3ad87d9ffe669147063e70850927dd2da90249e2acc5c8527f1eb65df467bcc8",
+      "metadata_fixtures": {
+        "config.json": {"size_bytes":283,"sha256":"ff16ad09c871fe218f786e8c498a615b9ecc26de85b0b7bd2fb03baacba8170b"},
+        "encoder_config/config.json": {"size_bytes":895,"sha256":"f75950b8f8a0d6e6d54f7976af63de8163f14dbc04a1505378bc5423566aa36d"},
+        "tokenizer_config.json": {"size_bytes":711,"sha256":"233beed1f1095cccfc7907cde31a8d90a0c6aa4fdfaf6493f8e55fd162e81ae6"}
+      }
+    }
+  },
+  "cases": {
+    "path": "cases.json",
+    "sha256": "09657d5743bb3978511dec2e5631d3804544db59790e5febaed4233ab8f5df46"
+  },
+  "captures": {
+    "pii_multi": {
+      "path": "pii_multi_oracle.json",
+      "sha256": "ff6e8905bac207e4d38b8172f4d1e37ece002406fc8a2150bb4774ba3f65ef6f",
+      "size_bytes": 742304,
+      "case_count": 14,
+      "maximum_active_tokens": 250
+    },
+    "gliguard": {
+      "path": "gliguard_oracle.json",
+      "sha256": "75a544807d536a8b1e5e14a18961c86831b6466d3ca0d00c6ddd9f85be942f97",
+      "size_bytes": 36382,
+      "case_count": 7,
+      "maximum_active_tokens": 271
+    }
+  }
+}

@@ -716,6 +716,10 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
     prefer_bf16_fallback: bool = false,
     prefer_f16_mps_fallback: bool = false,
     prefer_f32_mps_fallback: bool = false,
+    /// A qualified artifact may require its requested dense fallback precision.
+    /// Ordinary preferences retain legacy reuse of any compatible dense slot.
+    /// The first policy using this is exact PII DeBERTa F32 Metal mirrors.
+    require_preferred_dense_precision: bool = false,
 };
 
 pub const DecoderRuntimeEnsureLinearSlotRequest = struct {

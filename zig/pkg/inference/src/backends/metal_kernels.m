@@ -6870,7 +6870,7 @@ typedef struct termite_metal_gliner_word_embeddings_f32_params {
 typedef struct termite_metal_gliner_gru_combine_f32_params {
     uint32_t rows;
     uint32_t dim;
-    uint32_t reserved0;
+    uint32_t add_residual;
     uint32_t reserved1;
 } termite_metal_gliner_gru_combine_f32_params;
 
@@ -7998,7 +7998,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_dense_pair_direct_params { uint rows; uint in_dim; uint out_dim; uint reserved; };\n"
            "struct termite_metal_gliner_boundary_params { uint kind; uint dims[8]; float scalars[4]; };\n"
            "struct termite_metal_gliner_word_embeddings_f32_params { uint batch; uint seq_len; uint hidden_size; uint num_words; };\n"
-           "struct termite_metal_gliner_gru_combine_f32_params { uint rows; uint dim; uint reserved0; uint reserved1; };\n"
+           "struct termite_metal_gliner_gru_combine_f32_params { uint rows; uint dim; uint add_residual; uint reserved1; };\n"
            "struct termite_metal_argmax_axis_f32_params { uint outer; uint axis_dim; uint inner; uint reserved; };\n"
            "struct termite_metal_convert_dtype_f32_params { uint elem_count; uint kind; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_sdpa_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint bias_mode; uint has_mask; uint layout; uint reserved1; };\n"
@@ -13119,7 +13119,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float r = 1.0f / (1.0f + exp(-(gi[gate_base] + gh[gate_base])));\n"
            "    float z = 1.0f / (1.0f + exp(-(gi[gate_base + p.dim] + gh[gate_base + p.dim])));\n"
            "    float n = tanh(gi[gate_base + p.dim * 2u] + r * gh[gate_base + p.dim * 2u]);\n"
-           "    float h0 = label_embeddings[gid]; float h1 = (1.0f - z) * n + z * h0; output[gid] = h1 + h0;\n"
+           "    float h0 = label_embeddings[gid]; float h1 = (1.0f - z) * n + z * h0; output[gid] = p.add_residual != 0u ? h1 + h0 : h1;\n"
            "}\n"
            "kernel void termite_argmax_axis_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_argmax_axis_f32_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint out_total = p.outer * p.inner; if (gid >= out_total || p.axis_dim == 0u || p.inner == 0u) return;\n"
@@ -39863,6 +39863,15 @@ int termite_metal_decode_runtime_prepare_linear_generated_f32(
         NULL, bias, in_dim, out_dim, shared_if_unified != 0, NULL, 0, NULL, context, fill);
 }
 
+int termite_metal_decode_runtime_linear_slot_dtype(
+    termite_metal_decode_runtime *runtime,
+    size_t slot
+) {
+    if (runtime == NULL || slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY ||
+        runtime->linear_slot_prepared[slot] == 0) return -1;
+    return (int)runtime->linear_weight_dtypes[slot];
+}
+
 int termite_metal_decode_runtime_prefer_linear_mps(
     termite_metal_decode_runtime *runtime,
     size_t slot
@@ -53235,6 +53244,7 @@ int termite_metal_decode_runtime_gliner_gru_combine_f32_device(
     size_t gh_offset,
     size_t rows,
     size_t dim,
+    int add_residual,
     void *output_handle,
     size_t output_offset
 ) {
@@ -53257,7 +53267,7 @@ int termite_metal_decode_runtime_gliner_gru_combine_f32_device(
         termite_metal_gliner_gru_combine_f32_params params = {
             .rows = (uint32_t)rows,
             .dim = (uint32_t)dim,
-            .reserved0 = 0,
+            .add_residual = add_residual != 0,
             .reserved1 = 0,
         };
         bool frame_owned = true;
@@ -71838,6 +71848,10 @@ int termite_metal_decode_runtime_memory_snapshot(
         termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->q8_qkv_packed_weight_buffers[slot], &snapshot->quant_linear_bytes);
         termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->dense_pair_packed_weight_buffers[slot], &snapshot->dense_linear_bytes);
         if (runtime->dense_pair_packed_weight_buffers[slot] != nil) {
+            snapshot->dense_linear_buffer_count += 1;
+        }
+        termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->dense_pair_packed_bias_buffers[slot], &snapshot->dense_linear_bytes);
+        if (runtime->dense_pair_packed_bias_buffers[slot] != nil) {
             snapshot->dense_linear_buffer_count += 1;
         }
         id<MTLBuffer> quant_buffer = runtime->quant_linear_weight_buffers[slot];
