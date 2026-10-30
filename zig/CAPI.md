@@ -288,6 +288,43 @@ every sidecar creator takes the exclusive inode fence before installing it.
 Reopened native writers discover pending generated enrichment in the durable
 journals of all tables and resume it through their shared maintenance owner.
 
+The busy timeout is an admission retry budget, not a deadline for the whole
+operation. Capacity-limited reads can need allocator verification too; they
+receive the same pre-execution admission retry as mutations. An expired budget
+prevents further contention waits and new attempts after backoff. A detached
+allocator proof already in progress can still admit the request after the
+budget expires when the tip is unchanged and the path lease is immediately
+available. The finished proof remains attached to that verified tip. A changed
+tip still requires a new proof; an exhausted budget returns `ANTFLY_BUSY` safely.
+A cancelled backoff returns before another lease acquisition or proof starts.
+Mutation bodies are never replayed by admission retries.
+
+Ordinary admission retries release registry references between attempts, so a
+concurrent close may invalidate the handle before it is reacquired. Prepared
+SQL retains its original references until its plan and shared preparation-budget
+bytes are freed. Close can therefore wait through SQL backoff or a slow proof,
+as with another in-flight call. Those references keep the connection and budget
+owner alive, not a foreground runtime generation; API/path locks are released
+during backoff so runtime refresh and competing publications can proceed.
+
+`antfly_db_pending_work_stats_json` exposes process-owner lifetime totals under
+`background_publications`: `allocator_proof_walks`, `allocator_proof_failures`,
+`allocator_proof_ns`, and `allocator_proof_max_ns`. These count completed detached
+graph walks from foreground and maintenance work, including failed/cancelled
+walks. Wall-clock nanoseconds measure the graph walk itself, excluding queue/lease waits
+and reader teardown. Totals survive foreground runtime refresh and are local to
+the process, not persistent file-wide counters. Reading diagnostics performs
+normal read admission and may itself require a proof on a capacity-limited tip.
+The same object reports `mutation_admission_count`, `mutation_admission_ns`,
+`mutation_admission_max_ns`, and `mutation_admission_log2_ns`. These measure
+successful mutation admission with a positive busy timeout, before the mutation
+body runs, including queueing, retries, and proof work. Zero-timeout calls keep
+their existing fast path and are not sampled. Reads and diagnostic calls are
+excluded. Histogram bucket `i` covers `[2^i, 2^(i+1)-1]` nanoseconds (bucket zero
+also includes zero; bucket 63 ends at `UINT64_MAX`), so percentile estimates are
+ranges rather than exact timings. A successfully admitted mutation can still
+fail later in its body; these counters do not assert mutation success.
+
 After an external commit or atomic file replacement, the shared owner reopens
 its cached runtime before the next operation. An in-process handoff between
 compatible connections reuses the live runtime. Streaming SQL cursors retain the

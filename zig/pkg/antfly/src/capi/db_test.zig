@@ -6914,8 +6914,8 @@ test "capi native bounded admission coalesces allocator proof outside publicatio
     };
     var probe = Probe{ .owner = owner, .path = path, .second = second };
     defer if (probe.worker) |worker| worker.join();
-    owner.test_capacity_wait = .{ .ptr = &probe, .notify = Probe.onWait };
-    defer owner.test_capacity_wait = null;
+    owner.test_allocator_wait = .{ .ptr = &probe, .notify = Probe.onWait };
+    defer owner.test_allocator_wait = null;
     owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.notify };
     defer owner.test_after_allocator_capture = null;
     {

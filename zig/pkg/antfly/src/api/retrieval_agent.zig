@@ -6454,7 +6454,7 @@ fn decisionApproved(
     for (decisions) |decision| {
         if (!std.mem.eql(u8, decision.question_id, question_id)) continue;
         if (decision.approved != null) return decision.approved.?;
-        if (decision.answer) |answer| return isAffirmativeAnswer(answer);
+        if (decision.answer.valueOrNull()) |answer| return isAffirmativeAnswer(answer);
         return false;
     }
     return false;
@@ -6519,7 +6519,7 @@ fn resolveAgenticDecisionSelection(
 ) !?usize {
     for (decisions) |decision| {
         if (!std.mem.eql(u8, decision.question_id, "select_query")) continue;
-        if (decision.answer) |answer| {
+        if (decision.answer.valueOrNull()) |answer| {
             switch (answer) {
                 .integer => |value| {
                     if (value < 0) return error.InvalidRetrievalAgentRequest;

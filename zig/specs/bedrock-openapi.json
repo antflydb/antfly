@@ -1,0 +1,4298 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Bedrock Runtime Converse (AWS Smithy projection)",
+    "version": "2023-09-30"
+  },
+  "paths": {
+    "/model/{modelId}/converse": {
+      "post": {
+        "operationId": "Converse",
+        "parameters": [
+          {
+            "name": "modelId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationalModelId",
+              "description": "<p>Specifies the model or throughput with which to run inference, or the prompt resource to use in inference. The value depends on the resource that you use:</p> <ul> <li> <p>If you use a base model, specify the model ID or its ARN. For a list of model IDs for base models, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/model-ids.html#model-ids-arns\">Amazon Bedrock base model IDs (on-demand throughput)</a> in the Amazon Bedrock User Guide.</p> </li> <li> <p>If you use an inference profile, specify the inference profile ID or its ARN. For a list of inference profile IDs, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference-support.html\">Supported Regions and models for cross-region inference</a> in the Amazon Bedrock User Guide.</p> </li> <li> <p>If you use a provisioned model, specify the ARN of the Provisioned Throughput. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/prov-thru-use.html\">Run inference using a Provisioned Throughput</a> in the Amazon Bedrock User Guide.</p> </li> <li> <p>If you use a custom model, first purchase Provisioned Throughput for it. Then specify the ARN of the resulting provisioned model. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/model-customization-use.html\">Use a custom model in Amazon Bedrock</a> in the Amazon Bedrock User Guide.</p> </li> <li> <p>To include a prompt that was defined in <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-management.html\">Prompt management</a>, specify the ARN of the prompt version to use.</p> </li> </ul> <p>The Converse API doesn't support <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/model-customization-import-model.html\">imported models</a>.</p>"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConverseRequestBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConverseResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/model/{modelId}/converse-stream": {
+      "post": {
+        "operationId": "ConverseStream",
+        "parameters": [
+          {
+            "name": "modelId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationalModelId",
+              "description": "<p>Specifies the model or throughput with which to run inference, or the prompt resource to use in inference. The value depends on the resource that you use:</p> <ul> <li> <p>If you use a base model, specify the model ID or its ARN. For a list of model IDs for base models, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/model-ids.html#model-ids-arns\">Amazon Bedrock base model IDs (on-demand throughput)</a> in the Amazon Bedrock User Guide.</p> </li> <li> <p>If you use an inference profile, specify the inference profile ID or its ARN. For a list of inference profile IDs, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference-support.html\">Supported Regions and models for cross-region inference</a> in the Amazon Bedrock User Guide.</p> </li> <li> <p>If you use a provisioned model, specify the ARN of the Provisioned Throughput. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/prov-thru-use.html\">Run inference using a Provisioned Throughput</a> in the Amazon Bedrock User Guide.</p> </li> <li> <p>If you use a custom model, first purchase Provisioned Throughput for it. Then specify the ARN of the resulting provisioned model. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/model-customization-use.html\">Use a custom model in Amazon Bedrock</a> in the Amazon Bedrock User Guide.</p> </li> <li> <p>To include a prompt that was defined in <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-management.html\">Prompt management</a>, specify the ARN of the prompt version to use.</p> </li> </ul> <p>The Converse API doesn't support <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/model-customization-import-model.html\">imported models</a>.</p>"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConverseStreamRequestBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/vnd.amazon.eventstream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary",
+                  "x-aws-event-payload": {
+                    "$ref": "#/components/schemas/ConverseStreamOutput"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AccountId": {
+        "type": "string",
+        "pattern": "^[0-9]{12}$"
+      },
+      "AdditionalModelResponseFieldPaths": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/String",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "maxItems": 10
+      },
+      "AnyToolChoice": {
+        "type": "object",
+        "properties": {},
+        "description": "<p>The model must request at least one tool (no text is generated). For example, <code>{\"any\" : {}}</code>. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html\">Call a tool with the Converse API</a> in the Amazon Bedrock User Guide.</p>"
+      },
+      "AppliedGuardrailDetails": {
+        "type": "object",
+        "properties": {
+          "guardrailId": {
+            "$ref": "#/components/schemas/GuardrailId",
+            "description": "<p>The unique ID of the guardrail that was applied.</p>"
+          },
+          "guardrailVersion": {
+            "$ref": "#/components/schemas/GuardrailVersion",
+            "description": "<p>The version of the guardrail that was applied.</p>"
+          },
+          "guardrailArn": {
+            "$ref": "#/components/schemas/GuardrailArn",
+            "description": "<p>The ARN of the guardrail that was applied.</p>"
+          },
+          "guardrailOrigin": {
+            "$ref": "#/components/schemas/GuardrailOriginList",
+            "description": "<p>The origin of how the guardrail was applied. This can be either requested at the API level or enforced at the account or organization level as a default guardrail.</p>"
+          },
+          "guardrailOwnership": {
+            "$ref": "#/components/schemas/GuardrailOwnership",
+            "description": "<p>The ownership type of the guardrail, indicating whether it is owned by the requesting account or is a cross-account guardrail shared from another AWS account.</p>"
+          }
+        },
+        "description": "<p>Details about the specific guardrail that was applied during this assessment, including its identifier, version, ARN, origin, and ownership information.</p>"
+      },
+      "AudioBlock": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/AudioFormat",
+            "description": "<p>The format of the audio data, such as MP3, WAV, FLAC, or other supported audio formats.</p>"
+          },
+          "source": {
+            "$ref": "#/components/schemas/AudioSource",
+            "description": "<p>The source of the audio data, which can be provided as raw bytes or an S3 location.</p>"
+          },
+          "error": {
+            "$ref": "#/components/schemas/ErrorBlock",
+            "description": "<p>Error information if the audio block could not be processed or contains invalid data.</p>"
+          }
+        },
+        "required": [
+          "format",
+          "source"
+        ],
+        "description": "<p>An audio content block that contains audio data in various supported formats.</p>"
+      },
+      "AudioFormat": {
+        "type": "string",
+        "enum": [
+          "mp3",
+          "opus",
+          "wav",
+          "aac",
+          "flac",
+          "mp4",
+          "ogg",
+          "mkv",
+          "mka",
+          "x-aac",
+          "m4a",
+          "mpeg",
+          "mpga",
+          "pcm",
+          "webm"
+        ]
+      },
+      "AudioSource": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AudioSourceBytesVariant"
+          },
+          {
+            "$ref": "#/components/schemas/AudioSourceS3LocationVariant"
+          }
+        ],
+        "description": "<p>The source of audio data, which can be provided either as raw bytes or a reference to an S3 location.</p>"
+      },
+      "AudioSourceBytesVariant": {
+        "type": "object",
+        "properties": {
+          "bytes": {
+            "$ref": "#/components/schemas/Blob",
+            "description": "<p>Audio data encoded in base64.</p>",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "bytes"
+        ],
+        "additionalProperties": false
+      },
+      "AudioSourceS3LocationVariant": {
+        "type": "object",
+        "properties": {
+          "s3Location": {
+            "$ref": "#/components/schemas/S3Location",
+            "description": "<p>A reference to audio data stored in an Amazon S3 bucket. To see which models support S3 uploads, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-supported-models-features.html\">Supported models and features for Converse</a>.</p>"
+          }
+        },
+        "required": [
+          "s3Location"
+        ],
+        "additionalProperties": false
+      },
+      "AutoToolChoice": {
+        "type": "object",
+        "properties": {},
+        "description": "<p>The Model automatically decides if a tool should be called or whether to generate text instead. For example, <code>{\"auto\" : {}}</code>. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html\">Call a tool with the Converse API</a> in the Amazon Bedrock User Guide</p>"
+      },
+      "AutomatedReasoningRuleIdentifier": {
+        "type": "string",
+        "pattern": "^[a-z0-9]{12}$",
+        "maxLength": 12
+      },
+      "Blob": {
+        "type": "string",
+        "format": "byte"
+      },
+      "Boolean": {
+        "type": "boolean"
+      },
+      "CacheDetail": {
+        "type": "object",
+        "properties": {
+          "ttl": {
+            "$ref": "#/components/schemas/CacheTTL",
+            "description": "<p>TTL duration for these cached tokens</p>"
+          },
+          "inputTokens": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>Number of tokens written to cache with this TTL (cache creation tokens)</p>",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "ttl",
+          "inputTokens"
+        ],
+        "description": "<p>Cache creation metrics for a specific TTL duration</p>"
+      },
+      "CacheDetailsList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/CacheDetail"
+        },
+        "description": "<p>List of cache details by TTL</p>"
+      },
+      "CachePointBlock": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/CachePointType",
+            "description": "<p>Specifies the type of cache point within the CachePointBlock.</p>"
+          },
+          "ttl": {
+            "$ref": "#/components/schemas/CacheTTL",
+            "description": "<p>Optional TTL duration for cache entries. When specified, enables extended TTL caching with the specified duration. When omitted, uses <code>type</code> value for caching behavior.</p>"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "description": "<p>Defines a section of content to be cached for reuse in subsequent API calls.</p>"
+      },
+      "CachePointType": {
+        "type": "string",
+        "enum": [
+          "default"
+        ]
+      },
+      "CacheTTL": {
+        "type": "string",
+        "enum": [
+          "5m",
+          "1h"
+        ],
+        "description": "<p>Time-to-live duration for ephemeral cache entries</p>"
+      },
+      "Citation": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The title or identifier of the source document being cited.</p>"
+          },
+          "source": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The source from the original search result that provided the cited content.</p>"
+          },
+          "sourceContent": {
+            "$ref": "#/components/schemas/CitationSourceContentList",
+            "description": "<p>The specific content from the source document that was referenced or cited in the generated response.</p>"
+          },
+          "location": {
+            "$ref": "#/components/schemas/CitationLocation",
+            "description": "<p>The precise location within the source document where the cited content can be found, including character positions, page numbers, or chunk identifiers.</p>"
+          }
+        },
+        "description": "<p>Contains information about a citation that references a specific source document. Citations provide traceability between the model's generated response and the source documents that informed that response.</p>"
+      },
+      "CitationGeneratedContent": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/CitationGeneratedContentTextVariant"
+          }
+        ],
+        "description": "<p>Contains the generated text content that corresponds to or is supported by a citation from a source document.</p>"
+      },
+      "CitationGeneratedContentList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/CitationGeneratedContent"
+        }
+      },
+      "CitationGeneratedContentTextVariant": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The text content that was generated by the model and is supported by the associated citation.</p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "CitationLocation": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/CitationLocationWebVariant"
+          },
+          {
+            "$ref": "#/components/schemas/CitationLocationDocumentCharVariant"
+          },
+          {
+            "$ref": "#/components/schemas/CitationLocationDocumentPageVariant"
+          },
+          {
+            "$ref": "#/components/schemas/CitationLocationDocumentChunkVariant"
+          },
+          {
+            "$ref": "#/components/schemas/CitationLocationSearchResultLocationVariant"
+          }
+        ],
+        "description": "<p>Specifies the precise location within a source document where cited content can be found. This can include character-level positions, page numbers, or document chunks depending on the document type and indexing method.</p>"
+      },
+      "CitationLocationDocumentCharVariant": {
+        "type": "object",
+        "properties": {
+          "documentChar": {
+            "$ref": "#/components/schemas/DocumentCharLocation",
+            "description": "<p>The character-level location within the document where the cited content is found.</p>"
+          }
+        },
+        "required": [
+          "documentChar"
+        ],
+        "additionalProperties": false
+      },
+      "CitationLocationDocumentChunkVariant": {
+        "type": "object",
+        "properties": {
+          "documentChunk": {
+            "$ref": "#/components/schemas/DocumentChunkLocation",
+            "description": "<p>The chunk-level location within the document where the cited content is found, typically used for documents that have been segmented into logical chunks.</p>"
+          }
+        },
+        "required": [
+          "documentChunk"
+        ],
+        "additionalProperties": false
+      },
+      "CitationLocationDocumentPageVariant": {
+        "type": "object",
+        "properties": {
+          "documentPage": {
+            "$ref": "#/components/schemas/DocumentPageLocation",
+            "description": "<p>The page-level location within the document where the cited content is found.</p>"
+          }
+        },
+        "required": [
+          "documentPage"
+        ],
+        "additionalProperties": false
+      },
+      "CitationLocationSearchResultLocationVariant": {
+        "type": "object",
+        "properties": {
+          "searchResultLocation": {
+            "$ref": "#/components/schemas/SearchResultLocation",
+            "description": "<p>The search result location where the cited content is found, including the search result index and block positions within the content array.</p>"
+          }
+        },
+        "required": [
+          "searchResultLocation"
+        ],
+        "additionalProperties": false
+      },
+      "CitationLocationWebVariant": {
+        "type": "object",
+        "properties": {
+          "web": {
+            "$ref": "#/components/schemas/WebLocation",
+            "description": "<p>The web URL that was cited for this reference.</p>"
+          }
+        },
+        "required": [
+          "web"
+        ],
+        "additionalProperties": false
+      },
+      "CitationSourceContent": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/CitationSourceContentTextVariant"
+          }
+        ],
+        "description": "<p>Contains the actual text content from a source document that is being cited or referenced in the model's response.</p>"
+      },
+      "CitationSourceContentDelta": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>An incremental update to the text content from the source document that is being cited.</p>"
+          }
+        },
+        "description": "<p>Contains incremental updates to the source content text during streaming responses, allowing clients to build up the cited content progressively.</p>"
+      },
+      "CitationSourceContentList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/CitationSourceContent"
+        }
+      },
+      "CitationSourceContentListDelta": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/CitationSourceContentDelta"
+        }
+      },
+      "CitationSourceContentTextVariant": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The text content from the source document that is being cited.</p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "Citations": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/Citation"
+        }
+      },
+      "CitationsConfig": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "$ref": "#/components/schemas/Boolean",
+            "description": "<p>Specifies whether citations from the selected document should be used in the model's response. When set to true, the model can generate citations that reference the source documents used to inform the response.</p>"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "description": "<p>Configuration settings for enabling and controlling document citations in Converse API responses. When enabled, the model can include citation information that links generated content back to specific source documents.</p>"
+      },
+      "CitationsContentBlock": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/CitationGeneratedContentList",
+            "description": "<p>The generated content that is supported by the associated citations.</p>"
+          },
+          "citations": {
+            "$ref": "#/components/schemas/Citations",
+            "description": "<p>An array of citations that reference the source documents used to generate the associated content.</p>"
+          }
+        },
+        "description": "<p>A content block that contains both generated text and associated citation information. This block type is returned when document citations are enabled, providing traceability between the generated content and the source documents that informed the response.</p>"
+      },
+      "CitationsDelta": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The title or identifier of the source document being cited.</p>"
+          },
+          "source": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The source from the original search result that provided the cited content.</p>"
+          },
+          "sourceContent": {
+            "$ref": "#/components/schemas/CitationSourceContentListDelta",
+            "description": "<p>The specific content from the source document that was referenced or cited in the generated response.</p>"
+          },
+          "location": {
+            "$ref": "#/components/schemas/CitationLocation",
+            "description": "<p>Specifies the precise location within a source document where cited content can be found. This can include character-level positions, page numbers, or document chunks depending on the document type and indexing method.</p>"
+          }
+        },
+        "description": "<p>Contains incremental updates to citation information during streaming responses. This allows clients to build up citation data progressively as the response is generated.</p>"
+      },
+      "ContentBlock": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ContentBlockTextVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockImageVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockDocumentVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockVideoVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockAudioVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockToolUseVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockToolResultVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockGuardContentVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockCachePointVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockReasoningContentVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockCitationsContentVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockSearchResultVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockToolAdditionVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockToolRemovalVariant"
+          }
+        ],
+        "description": "<p>A block of content for a message that you pass to, or receive from, a model with the <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html\">Converse</a> or <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html\">ConverseStream</a> API operations.</p>"
+      },
+      "ContentBlockAudioVariant": {
+        "type": "object",
+        "properties": {
+          "audio": {
+            "$ref": "#/components/schemas/AudioBlock",
+            "description": "<p>An audio content block containing audio data in the conversation.</p>"
+          }
+        },
+        "required": [
+          "audio"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockCachePointVariant": {
+        "type": "object",
+        "properties": {
+          "cachePoint": {
+            "$ref": "#/components/schemas/CachePointBlock",
+            "description": "<p>CachePoint to include in the message.</p>"
+          }
+        },
+        "required": [
+          "cachePoint"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockCitationsContentVariant": {
+        "type": "object",
+        "properties": {
+          "citationsContent": {
+            "$ref": "#/components/schemas/CitationsContentBlock",
+            "description": "<p>A content block that contains both generated text and associated citation information, providing traceability between the response and source documents.</p>"
+          }
+        },
+        "required": [
+          "citationsContent"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockDelta": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ContentBlockDeltaTextVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockDeltaToolUseVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockDeltaToolResultVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockDeltaReasoningContentVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockDeltaCitationVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockDeltaImageVariant"
+          }
+        ],
+        "description": "<p>A block of content in a streaming response.</p>"
+      },
+      "ContentBlockDeltaCitationVariant": {
+        "type": "object",
+        "properties": {
+          "citation": {
+            "$ref": "#/components/schemas/CitationsDelta",
+            "description": "<p>Incremental citation information that is streamed as part of the response generation process.</p>"
+          }
+        },
+        "required": [
+          "citation"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockDeltaEvent": {
+        "type": "object",
+        "properties": {
+          "delta": {
+            "$ref": "#/components/schemas/ContentBlockDelta",
+            "description": "<p>The delta for a content block delta event.</p>"
+          },
+          "contentBlockIndex": {
+            "$ref": "#/components/schemas/NonNegativeInteger",
+            "description": "<p>The block index for a content block delta event. </p>"
+          }
+        },
+        "required": [
+          "delta",
+          "contentBlockIndex"
+        ],
+        "description": "<p>The content block delta event.</p>"
+      },
+      "ContentBlockDeltaImageVariant": {
+        "type": "object",
+        "properties": {
+          "image": {
+            "$ref": "#/components/schemas/ImageBlockDelta",
+            "description": "<p>A streaming delta event containing incremental image data.</p>"
+          }
+        },
+        "required": [
+          "image"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockDeltaReasoningContentVariant": {
+        "type": "object",
+        "properties": {
+          "reasoningContent": {
+            "$ref": "#/components/schemas/ReasoningContentBlockDelta",
+            "description": "<p>Contains content regarding the reasoning that is carried out by the model. Reasoning refers to a Chain of Thought (CoT) that the model generates to enhance the accuracy of its final response.</p>"
+          }
+        },
+        "required": [
+          "reasoningContent"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockDeltaTextVariant": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The content text.</p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockDeltaToolResultVariant": {
+        "type": "object",
+        "properties": {
+          "toolResult": {
+            "$ref": "#/components/schemas/ToolResultBlocksDelta",
+            "description": "<p>An incremental update that contains the results from a tool call.</p>"
+          }
+        },
+        "required": [
+          "toolResult"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockDeltaToolUseVariant": {
+        "type": "object",
+        "properties": {
+          "toolUse": {
+            "$ref": "#/components/schemas/ToolUseBlockDelta",
+            "description": "<p>Information about a tool that the model is requesting to use.</p>"
+          }
+        },
+        "required": [
+          "toolUse"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockDocumentVariant": {
+        "type": "object",
+        "properties": {
+          "document": {
+            "$ref": "#/components/schemas/DocumentBlock",
+            "description": "<p>A document to include in the message.</p>"
+          }
+        },
+        "required": [
+          "document"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockGuardContentVariant": {
+        "type": "object",
+        "properties": {
+          "guardContent": {
+            "$ref": "#/components/schemas/GuardrailConverseContentBlock",
+            "description": "<p>Contains the content to assess with the guardrail. If you don't specify <code>guardContent</code> in a call to the Converse API, the guardrail (if passed in the Converse API) assesses the entire message.</p> <p>For more information, see <i>Use a guardrail with the Converse API</i> in the <i>Amazon Bedrock User Guide</i>.</p>"
+          }
+        },
+        "required": [
+          "guardContent"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockImageVariant": {
+        "type": "object",
+        "properties": {
+          "image": {
+            "$ref": "#/components/schemas/ImageBlock",
+            "description": "<p>Image to include in the message. </p> <note> <p>This field is only supported by Anthropic Claude 3 models.</p> </note>"
+          }
+        },
+        "required": [
+          "image"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockReasoningContentVariant": {
+        "type": "object",
+        "properties": {
+          "reasoningContent": {
+            "$ref": "#/components/schemas/ReasoningContentBlock",
+            "description": "<p>Contains content regarding the reasoning that is carried out by the model. Reasoning refers to a Chain of Thought (CoT) that the model generates to enhance the accuracy of its final response.</p>"
+          }
+        },
+        "required": [
+          "reasoningContent"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockSearchResultVariant": {
+        "type": "object",
+        "properties": {
+          "searchResult": {
+            "$ref": "#/components/schemas/SearchResultBlock",
+            "description": "<p>Search result to include in the message.</p>"
+          }
+        },
+        "required": [
+          "searchResult"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockStart": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ContentBlockStartToolUseVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockStartToolResultVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ContentBlockStartImageVariant"
+          }
+        ],
+        "description": "<p>Content block start information.</p>"
+      },
+      "ContentBlockStartEvent": {
+        "type": "object",
+        "properties": {
+          "start": {
+            "$ref": "#/components/schemas/ContentBlockStart",
+            "description": "<p>Start information about a content block start event. </p>"
+          },
+          "contentBlockIndex": {
+            "$ref": "#/components/schemas/NonNegativeInteger",
+            "description": "<p>The index for a content block start event.</p>"
+          }
+        },
+        "required": [
+          "start",
+          "contentBlockIndex"
+        ],
+        "description": "<p>Content block start event.</p>"
+      },
+      "ContentBlockStartImageVariant": {
+        "type": "object",
+        "properties": {
+          "image": {
+            "$ref": "#/components/schemas/ImageBlockStart",
+            "description": "<p>The initial event indicating the start of a streaming image block.</p>"
+          }
+        },
+        "required": [
+          "image"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockStartToolResultVariant": {
+        "type": "object",
+        "properties": {
+          "toolResult": {
+            "$ref": "#/components/schemas/ToolResultBlockStart",
+            "description": "<p>The </p>"
+          }
+        },
+        "required": [
+          "toolResult"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockStartToolUseVariant": {
+        "type": "object",
+        "properties": {
+          "toolUse": {
+            "$ref": "#/components/schemas/ToolUseBlockStart",
+            "description": "<p>Information about a tool that the model is requesting to use.</p>"
+          }
+        },
+        "required": [
+          "toolUse"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockStopEvent": {
+        "type": "object",
+        "properties": {
+          "contentBlockIndex": {
+            "$ref": "#/components/schemas/NonNegativeInteger",
+            "description": "<p>The index for a content block.</p>"
+          }
+        },
+        "required": [
+          "contentBlockIndex"
+        ],
+        "description": "<p>A content block stop event.</p>"
+      },
+      "ContentBlockTextVariant": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>Text to include in the message.</p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockToolAdditionVariant": {
+        "type": "object",
+        "properties": {
+          "toolAddition": {
+            "$ref": "#/components/schemas/ToolAdditionBlock"
+          }
+        },
+        "required": [
+          "toolAddition"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockToolRemovalVariant": {
+        "type": "object",
+        "properties": {
+          "toolRemoval": {
+            "$ref": "#/components/schemas/ToolRemovalBlock"
+          }
+        },
+        "required": [
+          "toolRemoval"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockToolResultVariant": {
+        "type": "object",
+        "properties": {
+          "toolResult": {
+            "$ref": "#/components/schemas/ToolResultBlock",
+            "description": "<p>The result for a tool request that a model makes.</p>"
+          }
+        },
+        "required": [
+          "toolResult"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockToolUseVariant": {
+        "type": "object",
+        "properties": {
+          "toolUse": {
+            "$ref": "#/components/schemas/ToolUseBlock",
+            "description": "<p>Information about a tool use request from a model.</p>"
+          }
+        },
+        "required": [
+          "toolUse"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlockVideoVariant": {
+        "type": "object",
+        "properties": {
+          "video": {
+            "$ref": "#/components/schemas/VideoBlock",
+            "description": "<p>Video to include in the message. </p>"
+          }
+        },
+        "required": [
+          "video"
+        ],
+        "additionalProperties": false
+      },
+      "ContentBlocks": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/ContentBlock"
+        }
+      },
+      "ConversationRole": {
+        "type": "string",
+        "enum": [
+          "user",
+          "assistant",
+          "system"
+        ]
+      },
+      "ConversationalModelId": {
+        "type": "string",
+        "pattern": "^(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:(([0-9]{12}:custom-model/[a-z0-9-]{1,63}[.]{1}[a-z0-9-]{1,63}/[a-z0-9]{12})|(:foundation-model/[a-z0-9-]{1,63}[.]{1}[a-z0-9-]{1,63}([.:]?[a-z0-9-]{1,63}))|([0-9]{12}:imported-model/[a-z0-9]{12})|([0-9]{12}:provisioned-model/[a-z0-9]{12})|([0-9]{12}:custom-model-deployment/[a-z0-9]{12})|([0-9]{12}:(inference-profile|application-inference-profile)/[a-zA-Z0-9-:.]+)))|([a-z0-9-]{1,63}[.]{1}[a-z0-9-]{1,63}([.:]?[a-z0-9-]{1,63}))|(([0-9a-zA-Z][_-]?)+)|([a-zA-Z0-9-:.]+)|(^(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:prompt/[0-9a-zA-Z]{10}(?::[0-9]{1,5})?))$|(^arn:aws:sagemaker:[a-z0-9-]+:[0-9]{12}:endpoint/[a-zA-Z0-9-]+$)|(^arn:aws(-[^:]+)?:bedrock:([0-9a-z-]{1,20}):([0-9]{12}):(default-)?prompt-router/[a-zA-Z0-9-:.]+$)$",
+        "minLength": 1,
+        "maxLength": 2048
+      },
+      "ConverseMetrics": {
+        "type": "object",
+        "properties": {
+          "latencyMs": {
+            "$ref": "#/components/schemas/Long",
+            "description": "<p>The latency of the call to <code>Converse</code>, in milliseconds. </p>"
+          }
+        },
+        "required": [
+          "latencyMs"
+        ],
+        "description": "<p>Metrics for a call to <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html\">Converse</a>.</p>"
+      },
+      "ConverseOutput": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ConverseOutputMessageVariant"
+          }
+        ],
+        "description": "<p>The output from a call to <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html\">Converse</a>.</p>"
+      },
+      "ConverseOutputMessageVariant": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "$ref": "#/components/schemas/Message",
+            "description": "<p>The message that the model generates.</p>"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "ConverseRequestBody": {
+        "type": "object",
+        "properties": {
+          "messages": {
+            "$ref": "#/components/schemas/Messages",
+            "description": "<p>The messages that you want to send to the model.</p>"
+          },
+          "system": {
+            "$ref": "#/components/schemas/SystemContentBlocks",
+            "description": "<p>A prompt that provides instructions or context to the model about the task it should perform, or the persona it should adopt during the conversation.</p>"
+          },
+          "inferenceConfig": {
+            "$ref": "#/components/schemas/InferenceConfiguration",
+            "description": "<p>Inference parameters to pass to the model. <code>Converse</code> and <code>ConverseStream</code> support a base set of inference parameters. If you need to pass additional parameters that the model supports, use the <code>additionalModelRequestFields</code> request field.</p>"
+          },
+          "toolConfig": {
+            "$ref": "#/components/schemas/ToolConfiguration",
+            "description": "<p>Configuration information for the tools that the model can use when generating a response. </p> <p>For information about models that support tool use, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html#conversation-inference-supported-models-features\">Supported models and model features</a>.</p>"
+          },
+          "guardrailConfig": {
+            "$ref": "#/components/schemas/GuardrailConfiguration",
+            "description": "<p>Configuration information for a guardrail that you want to use in the request. If you include <code>guardContent</code> blocks in the <code>content</code> field in the <code>messages</code> field, the guardrail operates only on those messages. If you include no <code>guardContent</code> blocks, the guardrail operates on all messages in the request body and in any included prompt resource.</p>"
+          },
+          "additionalModelRequestFields": {
+            "$ref": "#/components/schemas/Document",
+            "description": "<p>Additional inference parameters that the model supports, beyond the base set of inference parameters that <code>Converse</code> and <code>ConverseStream</code> support in the <code>inferenceConfig</code> field. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters.html\">Model parameters</a>.</p>"
+          },
+          "promptVariables": {
+            "$ref": "#/components/schemas/PromptVariableMap",
+            "description": "<p>Contains a map of variables in a prompt from Prompt management to objects containing the values to fill in for them when running model invocation. This field is ignored if you don't specify a prompt resource in the <code>modelId</code> field.</p>"
+          },
+          "additionalModelResponseFieldPaths": {
+            "$ref": "#/components/schemas/AdditionalModelResponseFieldPaths",
+            "description": "<p>Additional model parameters field paths to return in the response. <code>Converse</code> and <code>ConverseStream</code> return the requested fields as a JSON Pointer object in the <code>additionalModelResponseFields</code> field. The following is example JSON for <code>additionalModelResponseFieldPaths</code>.</p> <p> <code>[ \"/stop_sequence\" ]</code> </p> <p>For information about the JSON Pointer syntax, see the <a href=\"https://datatracker.ietf.org/doc/html/rfc6901\">Internet Engineering Task Force (IETF)</a> documentation.</p> <p> <code>Converse</code> and <code>ConverseStream</code> reject an empty JSON Pointer or incorrectly structured JSON Pointer with a <code>400</code> error code. if the JSON Pointer is valid, but the requested field is not in the model response, it is ignored by <code>Converse</code>.</p>",
+            "maxItems": 10
+          },
+          "requestMetadata": {
+            "$ref": "#/components/schemas/RequestMetadata",
+            "description": "<p>Key-value pairs that you can use to filter invocation logs.</p>"
+          },
+          "performanceConfig": {
+            "$ref": "#/components/schemas/PerformanceConfiguration",
+            "description": "<p>Model performance settings for the request.</p>"
+          },
+          "serviceTier": {
+            "$ref": "#/components/schemas/ServiceTier",
+            "description": "<p>Specifies the processing tier configuration used for serving the request.</p>"
+          },
+          "outputConfig": {
+            "$ref": "#/components/schemas/OutputConfig",
+            "description": "<p>Output configuration for a model response.</p>"
+          }
+        }
+      },
+      "ConverseResponse": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "$ref": "#/components/schemas/ConverseOutput",
+            "description": "<p>The result from the call to <code>Converse</code>.</p>"
+          },
+          "stopReason": {
+            "$ref": "#/components/schemas/StopReason",
+            "description": "<p>The reason why the model stopped generating output.</p>"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/TokenUsage",
+            "description": "<p>The total number of tokens used in the call to <code>Converse</code>. The total includes the tokens input to the model and the tokens generated by the model.</p>"
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/ConverseMetrics",
+            "description": "<p>Metrics for the call to <code>Converse</code>.</p>"
+          },
+          "additionalModelResponseFields": {
+            "$ref": "#/components/schemas/Document",
+            "description": "<p>Additional fields in the response that are unique to the model. </p>"
+          },
+          "trace": {
+            "$ref": "#/components/schemas/ConverseTrace",
+            "description": "<p>A trace object that contains information about the Guardrail behavior.</p>"
+          },
+          "performanceConfig": {
+            "$ref": "#/components/schemas/PerformanceConfiguration",
+            "description": "<p>Model performance settings for the request.</p>"
+          },
+          "serviceTier": {
+            "$ref": "#/components/schemas/ServiceTier",
+            "description": "<p>Specifies the processing tier configuration used for serving the request.</p>"
+          }
+        },
+        "required": [
+          "output",
+          "stopReason",
+          "usage",
+          "metrics"
+        ]
+      },
+      "ConverseStreamMetadataEvent": {
+        "type": "object",
+        "properties": {
+          "usage": {
+            "$ref": "#/components/schemas/TokenUsage",
+            "description": "<p>Usage information for the conversation stream event.</p>"
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/ConverseStreamMetrics",
+            "description": "<p>The metrics for the conversation stream metadata event.</p>"
+          },
+          "trace": {
+            "$ref": "#/components/schemas/ConverseStreamTrace",
+            "description": "<p>The trace object in the response from <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html\">ConverseStream</a> that contains information about the guardrail behavior.</p>"
+          },
+          "performanceConfig": {
+            "$ref": "#/components/schemas/PerformanceConfiguration",
+            "description": "<p>Model performance configuration metadata for the conversation stream event.</p>"
+          },
+          "serviceTier": {
+            "$ref": "#/components/schemas/ServiceTier",
+            "description": "<p>Specifies the processing tier configuration used for serving the request.</p>"
+          }
+        },
+        "required": [
+          "usage",
+          "metrics"
+        ],
+        "description": "<p>A conversation stream metadata event.</p>"
+      },
+      "ConverseStreamMetrics": {
+        "type": "object",
+        "properties": {
+          "latencyMs": {
+            "$ref": "#/components/schemas/Long",
+            "description": "<p>The latency for the streaming request, in milliseconds.</p>"
+          }
+        },
+        "required": [
+          "latencyMs"
+        ],
+        "description": "<p>Metrics for the stream.</p>"
+      },
+      "ConverseStreamOutput": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ConverseStreamOutputMessageStartVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ConverseStreamOutputContentBlockStartVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ConverseStreamOutputContentBlockDeltaVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ConverseStreamOutputContentBlockStopVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ConverseStreamOutputMessageStopVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ConverseStreamOutputMetadataVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ConverseStreamOutputInternalServerExceptionVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ConverseStreamOutputModelStreamErrorExceptionVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ConverseStreamOutputValidationExceptionVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ConverseStreamOutputThrottlingExceptionVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ConverseStreamOutputServiceUnavailableExceptionVariant"
+          }
+        ],
+        "description": "<p>The messages output stream</p>"
+      },
+      "ConverseStreamOutputContentBlockDeltaVariant": {
+        "type": "object",
+        "properties": {
+          "contentBlockDelta": {
+            "$ref": "#/components/schemas/ContentBlockDeltaEvent",
+            "description": "<p>The messages output content block delta.</p>"
+          }
+        },
+        "required": [
+          "contentBlockDelta"
+        ],
+        "additionalProperties": false
+      },
+      "ConverseStreamOutputContentBlockStartVariant": {
+        "type": "object",
+        "properties": {
+          "contentBlockStart": {
+            "$ref": "#/components/schemas/ContentBlockStartEvent",
+            "description": "<p>Start information for a content block.</p>"
+          }
+        },
+        "required": [
+          "contentBlockStart"
+        ],
+        "additionalProperties": false
+      },
+      "ConverseStreamOutputContentBlockStopVariant": {
+        "type": "object",
+        "properties": {
+          "contentBlockStop": {
+            "$ref": "#/components/schemas/ContentBlockStopEvent",
+            "description": "<p>Stop information for a content block.</p>"
+          }
+        },
+        "required": [
+          "contentBlockStop"
+        ],
+        "additionalProperties": false
+      },
+      "ConverseStreamOutputInternalServerExceptionVariant": {
+        "type": "object",
+        "properties": {
+          "internalServerException": {
+            "$ref": "#/components/schemas/InternalServerException",
+            "description": "<p>An internal server error occurred. Retry your request.</p>"
+          }
+        },
+        "required": [
+          "internalServerException"
+        ],
+        "additionalProperties": false
+      },
+      "ConverseStreamOutputMessageStartVariant": {
+        "type": "object",
+        "properties": {
+          "messageStart": {
+            "$ref": "#/components/schemas/MessageStartEvent",
+            "description": "<p>Message start information.</p>"
+          }
+        },
+        "required": [
+          "messageStart"
+        ],
+        "additionalProperties": false
+      },
+      "ConverseStreamOutputMessageStopVariant": {
+        "type": "object",
+        "properties": {
+          "messageStop": {
+            "$ref": "#/components/schemas/MessageStopEvent",
+            "description": "<p>Message stop information.</p>"
+          }
+        },
+        "required": [
+          "messageStop"
+        ],
+        "additionalProperties": false
+      },
+      "ConverseStreamOutputMetadataVariant": {
+        "type": "object",
+        "properties": {
+          "metadata": {
+            "$ref": "#/components/schemas/ConverseStreamMetadataEvent",
+            "description": "<p>Metadata for the converse output stream.</p>"
+          }
+        },
+        "required": [
+          "metadata"
+        ],
+        "additionalProperties": false
+      },
+      "ConverseStreamOutputModelStreamErrorExceptionVariant": {
+        "type": "object",
+        "properties": {
+          "modelStreamErrorException": {
+            "$ref": "#/components/schemas/ModelStreamErrorException",
+            "description": "<p>A streaming error occurred. Retry your request.</p>"
+          }
+        },
+        "required": [
+          "modelStreamErrorException"
+        ],
+        "additionalProperties": false
+      },
+      "ConverseStreamOutputServiceUnavailableExceptionVariant": {
+        "type": "object",
+        "properties": {
+          "serviceUnavailableException": {
+            "$ref": "#/components/schemas/ServiceUnavailableException",
+            "description": "<p>The service isn't currently available. For troubleshooting this error, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/troubleshooting-api-error-codes.html#ts-service-unavailable\">ServiceUnavailable</a> in the Amazon Bedrock User Guide</p>"
+          }
+        },
+        "required": [
+          "serviceUnavailableException"
+        ],
+        "additionalProperties": false
+      },
+      "ConverseStreamOutputThrottlingExceptionVariant": {
+        "type": "object",
+        "properties": {
+          "throttlingException": {
+            "$ref": "#/components/schemas/ThrottlingException",
+            "description": "<p>Your request was denied due to exceeding the account quotas for <i>Amazon Bedrock</i>. For troubleshooting this error, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/troubleshooting-api-error-codes.html#ts-throttling-exception\">ThrottlingException</a> in the Amazon Bedrock User Guide.</p>"
+          }
+        },
+        "required": [
+          "throttlingException"
+        ],
+        "additionalProperties": false
+      },
+      "ConverseStreamOutputValidationExceptionVariant": {
+        "type": "object",
+        "properties": {
+          "validationException": {
+            "$ref": "#/components/schemas/ValidationException",
+            "description": "<p>The input fails to satisfy the constraints specified by <i>Amazon Bedrock</i>. For troubleshooting this error, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/troubleshooting-api-error-codes.html#ts-validation-error\">ValidationError</a> in the Amazon Bedrock User Guide.</p>"
+          }
+        },
+        "required": [
+          "validationException"
+        ],
+        "additionalProperties": false
+      },
+      "ConverseStreamRequestBody": {
+        "type": "object",
+        "properties": {
+          "messages": {
+            "$ref": "#/components/schemas/Messages",
+            "description": "<p>The messages that you want to send to the model.</p>"
+          },
+          "system": {
+            "$ref": "#/components/schemas/SystemContentBlocks",
+            "description": "<p>A prompt that provides instructions or context to the model about the task it should perform, or the persona it should adopt during the conversation.</p>"
+          },
+          "inferenceConfig": {
+            "$ref": "#/components/schemas/InferenceConfiguration",
+            "description": "<p>Inference parameters to pass to the model. <code>Converse</code> and <code>ConverseStream</code> support a base set of inference parameters. If you need to pass additional parameters that the model supports, use the <code>additionalModelRequestFields</code> request field.</p>"
+          },
+          "toolConfig": {
+            "$ref": "#/components/schemas/ToolConfiguration",
+            "description": "<p>Configuration information for the tools that the model can use when generating a response.</p> <p>For information about models that support streaming tool use, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html#conversation-inference-supported-models-features\">Supported models and model features</a>.</p>"
+          },
+          "guardrailConfig": {
+            "$ref": "#/components/schemas/GuardrailStreamConfiguration",
+            "description": "<p>Configuration information for a guardrail that you want to use in the request. If you include <code>guardContent</code> blocks in the <code>content</code> field in the <code>messages</code> field, the guardrail operates only on those messages. If you include no <code>guardContent</code> blocks, the guardrail operates on all messages in the request body and in any included prompt resource.</p>"
+          },
+          "additionalModelRequestFields": {
+            "$ref": "#/components/schemas/Document",
+            "description": "<p>Additional inference parameters that the model supports, beyond the base set of inference parameters that <code>Converse</code> and <code>ConverseStream</code> support in the <code>inferenceConfig</code> field. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters.html\">Model parameters</a>.</p>"
+          },
+          "promptVariables": {
+            "$ref": "#/components/schemas/PromptVariableMap",
+            "description": "<p>Contains a map of variables in a prompt from Prompt management to objects containing the values to fill in for them when running model invocation. This field is ignored if you don't specify a prompt resource in the <code>modelId</code> field.</p>"
+          },
+          "additionalModelResponseFieldPaths": {
+            "$ref": "#/components/schemas/AdditionalModelResponseFieldPaths",
+            "description": "<p>Additional model parameters field paths to return in the response. <code>Converse</code> and <code>ConverseStream</code> return the requested fields as a JSON Pointer object in the <code>additionalModelResponseFields</code> field. The following is example JSON for <code>additionalModelResponseFieldPaths</code>.</p> <p> <code>[ \"/stop_sequence\" ]</code> </p> <p>For information about the JSON Pointer syntax, see the <a href=\"https://datatracker.ietf.org/doc/html/rfc6901\">Internet Engineering Task Force (IETF)</a> documentation.</p> <p> <code>Converse</code> and <code>ConverseStream</code> reject an empty JSON Pointer or incorrectly structured JSON Pointer with a <code>400</code> error code. if the JSON Pointer is valid, but the requested field is not in the model response, it is ignored by <code>Converse</code>.</p>",
+            "maxItems": 10
+          },
+          "requestMetadata": {
+            "$ref": "#/components/schemas/RequestMetadata",
+            "description": "<p>Key-value pairs that you can use to filter invocation logs.</p>"
+          },
+          "performanceConfig": {
+            "$ref": "#/components/schemas/PerformanceConfiguration",
+            "description": "<p>Model performance settings for the request.</p>"
+          },
+          "serviceTier": {
+            "$ref": "#/components/schemas/ServiceTier",
+            "description": "<p>Specifies the processing tier configuration used for serving the request.</p>"
+          },
+          "outputConfig": {
+            "$ref": "#/components/schemas/OutputConfig",
+            "description": "<p>Output configuration for a model response.</p>"
+          }
+        }
+      },
+      "ConverseStreamTrace": {
+        "type": "object",
+        "properties": {
+          "guardrail": {
+            "$ref": "#/components/schemas/GuardrailTraceAssessment",
+            "description": "<p>The guardrail trace object. </p>"
+          },
+          "promptRouter": {
+            "$ref": "#/components/schemas/PromptRouterTrace",
+            "description": "<p>The request's prompt router.</p>"
+          }
+        },
+        "description": "<p>The trace object in a response from <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html\">ConverseStream</a>.</p>"
+      },
+      "ConverseTrace": {
+        "type": "object",
+        "properties": {
+          "guardrail": {
+            "$ref": "#/components/schemas/GuardrailTraceAssessment",
+            "description": "<p>The guardrail trace object. </p>"
+          },
+          "promptRouter": {
+            "$ref": "#/components/schemas/PromptRouterTrace",
+            "description": "<p>The request's prompt router.</p>"
+          }
+        },
+        "description": "<p>The trace object in a response from <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html\">Converse</a>.</p>"
+      },
+      "Document": {},
+      "DocumentBlock": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/DocumentFormat",
+            "description": "<p>The format of a document, or its extension.</p>"
+          },
+          "name": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>A name for the document. The name can only contain the following characters:</p> <ul> <li> <p>Alphanumeric characters</p> </li> <li> <p>Whitespace characters (no more than one in a row)</p> </li> <li> <p>Hyphens</p> </li> <li> <p>Parentheses</p> </li> <li> <p>Square brackets</p> </li> </ul> <note> <p>This field is vulnerable to prompt injections, because the model might inadvertently interpret it as instructions. Therefore, we recommend that you specify a neutral name.</p> </note>",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "source": {
+            "$ref": "#/components/schemas/DocumentSource",
+            "description": "<p>Contains the content of the document.</p>"
+          },
+          "context": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>Contextual information about how the document should be processed or interpreted by the model when generating citations.</p>"
+          },
+          "citations": {
+            "$ref": "#/components/schemas/CitationsConfig",
+            "description": "<p>Configuration settings that control how citations should be generated for this specific document.</p>"
+          }
+        },
+        "required": [
+          "name",
+          "source"
+        ],
+        "description": "<p>A document to include in a message.</p>"
+      },
+      "DocumentCharLocation": {
+        "type": "object",
+        "properties": {
+          "documentIndex": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The index of the document within the array of documents provided in the request.</p>",
+            "minimum": 0
+          },
+          "start": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The starting character position of the cited content within the document.</p>",
+            "minimum": 0
+          },
+          "end": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The ending character position of the cited content within the document.</p>",
+            "minimum": 0
+          }
+        },
+        "description": "<p>Specifies a character-level location within a document, providing precise positioning information for cited content using start and end character indices.</p>"
+      },
+      "DocumentChunkLocation": {
+        "type": "object",
+        "properties": {
+          "documentIndex": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The index of the document within the array of documents provided in the request.</p>",
+            "minimum": 0
+          },
+          "start": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The starting chunk identifier or index of the cited content within the document.</p>",
+            "minimum": 0
+          },
+          "end": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The ending chunk identifier or index of the cited content within the document.</p>",
+            "minimum": 0
+          }
+        },
+        "description": "<p>Specifies a chunk-level location within a document, providing positioning information for cited content using logical document segments or chunks.</p>"
+      },
+      "DocumentContentBlock": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/DocumentContentBlockTextVariant"
+          }
+        ],
+        "description": "<p>Contains the actual content of a document that can be processed by the model and potentially cited in the response.</p>"
+      },
+      "DocumentContentBlockTextVariant": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The text content of the document.</p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "DocumentContentBlocks": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/DocumentContentBlock"
+        }
+      },
+      "DocumentFormat": {
+        "type": "string",
+        "enum": [
+          "pdf",
+          "csv",
+          "doc",
+          "docx",
+          "xls",
+          "xlsx",
+          "html",
+          "txt",
+          "md"
+        ]
+      },
+      "DocumentPageLocation": {
+        "type": "object",
+        "properties": {
+          "documentIndex": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The index of the document within the array of documents provided in the request.</p>",
+            "minimum": 0
+          },
+          "start": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The starting page number of the cited content within the document.</p>",
+            "minimum": 0
+          },
+          "end": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The ending page number of the cited content within the document.</p>",
+            "minimum": 0
+          }
+        },
+        "description": "<p>Specifies a page-level location within a document, providing positioning information for cited content using page numbers.</p>"
+      },
+      "DocumentSource": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/DocumentSourceBytesVariant"
+          },
+          {
+            "$ref": "#/components/schemas/DocumentSourceS3LocationVariant"
+          },
+          {
+            "$ref": "#/components/schemas/DocumentSourceTextVariant"
+          },
+          {
+            "$ref": "#/components/schemas/DocumentSourceContentVariant"
+          }
+        ],
+        "description": "<p>Contains the content of a document.</p>"
+      },
+      "DocumentSourceBytesVariant": {
+        "type": "object",
+        "properties": {
+          "bytes": {
+            "$ref": "#/components/schemas/Blob",
+            "description": "<p>The raw bytes for the document. If you use an Amazon Web Services SDK, you don't need to encode the bytes in base64.</p>",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "bytes"
+        ],
+        "additionalProperties": false
+      },
+      "DocumentSourceContentVariant": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/DocumentContentBlocks",
+            "description": "<p>The structured content of the document source, which may include various content blocks such as text, images, or other document elements.</p>"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "additionalProperties": false
+      },
+      "DocumentSourceS3LocationVariant": {
+        "type": "object",
+        "properties": {
+          "s3Location": {
+            "$ref": "#/components/schemas/S3Location",
+            "description": "<p>The location of a document object in an Amazon S3 bucket. To see which models support S3 uploads, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-supported-models-features.html\">Supported models and features for Converse</a>.</p>"
+          }
+        },
+        "required": [
+          "s3Location"
+        ],
+        "additionalProperties": false
+      },
+      "DocumentSourceTextVariant": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The text content of the document source.</p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "Double": {
+        "type": "number"
+      },
+      "ErrorBlock": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>A human-readable error message describing what went wrong during content processing.</p>"
+          }
+        },
+        "description": "<p>A block containing error information when content processing fails.</p>"
+      },
+      "Float": {
+        "type": "number"
+      },
+      "GuardrailArn": {
+        "type": "string",
+        "pattern": "^(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:guardrail/[a-z0-9]+)$",
+        "maxLength": 2048
+      },
+      "GuardrailAssessment": {
+        "type": "object",
+        "properties": {
+          "topicPolicy": {
+            "$ref": "#/components/schemas/GuardrailTopicPolicyAssessment",
+            "description": "<p>The topic policy.</p>"
+          },
+          "contentPolicy": {
+            "$ref": "#/components/schemas/GuardrailContentPolicyAssessment",
+            "description": "<p>The content policy.</p>"
+          },
+          "wordPolicy": {
+            "$ref": "#/components/schemas/GuardrailWordPolicyAssessment",
+            "description": "<p>The word policy.</p>"
+          },
+          "sensitiveInformationPolicy": {
+            "$ref": "#/components/schemas/GuardrailSensitiveInformationPolicyAssessment",
+            "description": "<p>The sensitive information policy.</p>"
+          },
+          "contextualGroundingPolicy": {
+            "$ref": "#/components/schemas/GuardrailContextualGroundingPolicyAssessment",
+            "description": "<p>The contextual grounding policy used for the guardrail assessment.</p>"
+          },
+          "automatedReasoningPolicy": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningPolicyAssessment",
+            "description": "<p>The automated reasoning policy assessment results, including logical validation findings for the input content.</p>"
+          },
+          "invocationMetrics": {
+            "$ref": "#/components/schemas/GuardrailInvocationMetrics",
+            "description": "<p>The invocation metrics for the guardrail assessment.</p>"
+          },
+          "appliedGuardrailDetails": {
+            "$ref": "#/components/schemas/AppliedGuardrailDetails"
+          }
+        },
+        "description": "<p>A behavior assessment of the guardrail policies used in a call to the Converse API. </p>"
+      },
+      "GuardrailAssessmentList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailAssessment"
+        }
+      },
+      "GuardrailAssessmentListMap": {
+        "type": "object",
+        "propertyNames": {
+          "$ref": "#/components/schemas/String"
+        },
+        "additionalProperties": {
+          "$ref": "#/components/schemas/GuardrailAssessmentList"
+        }
+      },
+      "GuardrailAssessmentMap": {
+        "type": "object",
+        "propertyNames": {
+          "$ref": "#/components/schemas/String"
+        },
+        "additionalProperties": {
+          "$ref": "#/components/schemas/GuardrailAssessment"
+        }
+      },
+      "GuardrailAutomatedReasoningDifferenceScenarioList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailAutomatedReasoningScenario"
+        },
+        "maxItems": 2
+      },
+      "GuardrailAutomatedReasoningFinding": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningFindingValidVariant"
+          },
+          {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningFindingInvalidVariant"
+          },
+          {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningFindingSatisfiableVariant"
+          },
+          {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningFindingImpossibleVariant"
+          },
+          {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningFindingTranslationAmbiguousVariant"
+          },
+          {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningFindingTooComplexVariant"
+          },
+          {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningFindingNoTranslationsVariant"
+          }
+        ],
+        "description": "<p>Represents a logical validation result from automated reasoning policy evaluation. The finding indicates whether claims in the input are logically valid, invalid, satisfiable, impossible, or have other logical issues.</p>"
+      },
+      "GuardrailAutomatedReasoningFindingImpossibleVariant": {
+        "type": "object",
+        "properties": {
+          "impossible": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningImpossibleFinding",
+            "description": "<p>Contains the result when the automated reasoning evaluation determines that no valid logical conclusions can be drawn due to contradictions in the premises or policy rules themselves.</p>"
+          }
+        },
+        "required": [
+          "impossible"
+        ],
+        "additionalProperties": false
+      },
+      "GuardrailAutomatedReasoningFindingInvalidVariant": {
+        "type": "object",
+        "properties": {
+          "invalid": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningInvalidFinding",
+            "description": "<p>Contains the result when the automated reasoning evaluation determines that the claims in the input are logically invalid and contradict the established premises or policy rules.</p>"
+          }
+        },
+        "required": [
+          "invalid"
+        ],
+        "additionalProperties": false
+      },
+      "GuardrailAutomatedReasoningFindingList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailAutomatedReasoningFinding"
+        }
+      },
+      "GuardrailAutomatedReasoningFindingNoTranslationsVariant": {
+        "type": "object",
+        "properties": {
+          "noTranslations": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningNoTranslationsFinding",
+            "description": "<p>Contains the result when the automated reasoning evaluation cannot extract any relevant logical information from the input that can be validated against the policy rules.</p>"
+          }
+        },
+        "required": [
+          "noTranslations"
+        ],
+        "additionalProperties": false
+      },
+      "GuardrailAutomatedReasoningFindingSatisfiableVariant": {
+        "type": "object",
+        "properties": {
+          "satisfiable": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningSatisfiableFinding",
+            "description": "<p>Contains the result when the automated reasoning evaluation determines that the claims in the input could be either true or false depending on additional assumptions not provided in the input context.</p>"
+          }
+        },
+        "required": [
+          "satisfiable"
+        ],
+        "additionalProperties": false
+      },
+      "GuardrailAutomatedReasoningFindingTooComplexVariant": {
+        "type": "object",
+        "properties": {
+          "tooComplex": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningTooComplexFinding",
+            "description": "<p>Contains the result when the automated reasoning evaluation cannot process the input due to its complexity or volume exceeding the system's processing capacity for logical analysis.</p>"
+          }
+        },
+        "required": [
+          "tooComplex"
+        ],
+        "additionalProperties": false
+      },
+      "GuardrailAutomatedReasoningFindingTranslationAmbiguousVariant": {
+        "type": "object",
+        "properties": {
+          "translationAmbiguous": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningTranslationAmbiguousFinding",
+            "description": "<p>Contains the result when the automated reasoning evaluation detects that the input has multiple valid logical interpretations, requiring additional context or clarification to proceed with validation.</p>"
+          }
+        },
+        "required": [
+          "translationAmbiguous"
+        ],
+        "additionalProperties": false
+      },
+      "GuardrailAutomatedReasoningFindingValidVariant": {
+        "type": "object",
+        "properties": {
+          "valid": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningValidFinding",
+            "description": "<p>Contains the result when the automated reasoning evaluation determines that the claims in the input are logically valid and definitively true based on the provided premises and policy rules.</p>"
+          }
+        },
+        "required": [
+          "valid"
+        ],
+        "additionalProperties": false
+      },
+      "GuardrailAutomatedReasoningImpossibleFinding": {
+        "type": "object",
+        "properties": {
+          "translation": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningTranslation",
+            "description": "<p>The logical translation of the input that this finding evaluates.</p>"
+          },
+          "contradictingRules": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningRuleList",
+            "description": "<p>The automated reasoning policy rules that contradict the claims and/or premises in the input.</p>"
+          },
+          "logicWarning": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningLogicWarning",
+            "description": "<p>Indication of a logic issue with the translation without needing to consider the automated reasoning policy rules.</p>"
+          }
+        },
+        "description": "<p>Indicates that no valid claims can be made due to logical contradictions in the premises or rules.</p>"
+      },
+      "GuardrailAutomatedReasoningInputTextReference": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningStatementNaturalLanguageContent",
+            "description": "<p>The specific text from the original input that this reference points to.</p>"
+          }
+        },
+        "description": "<p>References a portion of the original input text that corresponds to logical elements.</p>"
+      },
+      "GuardrailAutomatedReasoningInputTextReferenceList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailAutomatedReasoningInputTextReference"
+        }
+      },
+      "GuardrailAutomatedReasoningInvalidFinding": {
+        "type": "object",
+        "properties": {
+          "translation": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningTranslation",
+            "description": "<p>The logical translation of the input that this finding invalidates.</p>"
+          },
+          "contradictingRules": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningRuleList",
+            "description": "<p>The automated reasoning policy rules that contradict the claims in the input.</p>"
+          },
+          "logicWarning": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningLogicWarning",
+            "description": "<p>Indication of a logic issue with the translation without needing to consider the automated reasoning policy rules.</p>"
+          }
+        },
+        "description": "<p>Indicates that the claims are logically false and contradictory to the established rules or premises.</p>"
+      },
+      "GuardrailAutomatedReasoningLogicWarning": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningLogicWarningType",
+            "description": "<p>The category of the detected logical issue, such as statements that are always true or always false.</p>"
+          },
+          "premises": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningStatementList",
+            "description": "<p>The logical statements that serve as premises under which the claims are validated.</p>"
+          },
+          "claims": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningStatementList",
+            "description": "<p>The logical statements that are validated while assuming the policy and premises.</p>"
+          }
+        },
+        "description": "<p>Identifies logical issues in the translated statements that exist independent of any policy rules, such as statements that are always true or always false.</p>"
+      },
+      "GuardrailAutomatedReasoningLogicWarningType": {
+        "type": "string",
+        "enum": [
+          "ALWAYS_FALSE",
+          "ALWAYS_TRUE"
+        ]
+      },
+      "GuardrailAutomatedReasoningNoTranslationsFinding": {
+        "type": "object",
+        "properties": {},
+        "description": "<p>Indicates that no relevant logical information could be extracted from the input for validation.</p>"
+      },
+      "GuardrailAutomatedReasoningPoliciesProcessed": {
+        "type": "integer"
+      },
+      "GuardrailAutomatedReasoningPolicyAssessment": {
+        "type": "object",
+        "properties": {
+          "findings": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningFindingList",
+            "description": "<p>List of logical validation results produced by evaluating the input content against automated reasoning policies.</p>"
+          }
+        },
+        "description": "<p>Contains the results of automated reasoning policy evaluation, including logical findings about the validity of claims made in the input content.</p>"
+      },
+      "GuardrailAutomatedReasoningPolicyUnitsProcessed": {
+        "type": "integer"
+      },
+      "GuardrailAutomatedReasoningPolicyVersionArn": {
+        "type": "string",
+        "pattern": "^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:automated-reasoning-policy/[a-z0-9]{12}(:([1-9][0-9]{0,11}))?$",
+        "maxLength": 2048
+      },
+      "GuardrailAutomatedReasoningRule": {
+        "type": "object",
+        "properties": {
+          "identifier": {
+            "$ref": "#/components/schemas/AutomatedReasoningRuleIdentifier",
+            "description": "<p>The unique identifier of the automated reasoning rule.</p>"
+          },
+          "policyVersionArn": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningPolicyVersionArn",
+            "description": "<p>The ARN of the automated reasoning policy version that contains this rule.</p>"
+          }
+        },
+        "description": "<p>References a specific automated reasoning policy rule that was applied during evaluation.</p>"
+      },
+      "GuardrailAutomatedReasoningRuleList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailAutomatedReasoningRule"
+        }
+      },
+      "GuardrailAutomatedReasoningSatisfiableFinding": {
+        "type": "object",
+        "properties": {
+          "translation": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningTranslation",
+            "description": "<p>The logical translation of the input that this finding evaluates.</p>"
+          },
+          "claimsTrueScenario": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningScenario",
+            "description": "<p>An example scenario demonstrating how the claims could be logically true.</p>"
+          },
+          "claimsFalseScenario": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningScenario",
+            "description": "<p>An example scenario demonstrating how the claims could be logically false.</p>"
+          },
+          "logicWarning": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningLogicWarning",
+            "description": "<p>Indication of a logic issue with the translation without needing to consider the automated reasoning policy rules.</p>"
+          }
+        },
+        "description": "<p>Indicates that the claims could be either true or false depending on additional assumptions not provided in the input.</p>"
+      },
+      "GuardrailAutomatedReasoningScenario": {
+        "type": "object",
+        "properties": {
+          "statements": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningStatementList",
+            "description": "<p>List of logical assignments and statements that define this scenario.</p>"
+          }
+        },
+        "description": "<p>Represents a logical scenario where claims can be evaluated as true or false, containing specific logical assignments.</p>"
+      },
+      "GuardrailAutomatedReasoningStatement": {
+        "type": "object",
+        "properties": {
+          "logic": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningStatementLogicContent",
+            "description": "<p>The formal logical representation of the statement.</p>"
+          },
+          "naturalLanguage": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningStatementNaturalLanguageContent",
+            "description": "<p>The natural language explanation of the logical statement.</p>"
+          }
+        },
+        "description": "<p>A logical statement that includes both formal logic representation and natural language explanation.</p>"
+      },
+      "GuardrailAutomatedReasoningStatementList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailAutomatedReasoningStatement"
+        }
+      },
+      "GuardrailAutomatedReasoningStatementLogicContent": {
+        "type": "string",
+        "maxLength": 1000
+      },
+      "GuardrailAutomatedReasoningStatementNaturalLanguageContent": {
+        "type": "string",
+        "maxLength": 1000
+      },
+      "GuardrailAutomatedReasoningTooComplexFinding": {
+        "type": "object",
+        "properties": {},
+        "description": "<p>Indicates that the input exceeds the processing capacity due to the volume or complexity of the logical information.</p>"
+      },
+      "GuardrailAutomatedReasoningTranslation": {
+        "type": "object",
+        "properties": {
+          "premises": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningStatementList",
+            "description": "<p>The logical statements that serve as the foundation or assumptions for the claims.</p>"
+          },
+          "claims": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningStatementList",
+            "description": "<p>The logical statements that are being validated against the premises and policy rules.</p>"
+          },
+          "untranslatedPremises": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningInputTextReferenceList",
+            "description": "<p>References to portions of the original input text that correspond to the premises but could not be fully translated.</p>"
+          },
+          "untranslatedClaims": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningInputTextReferenceList",
+            "description": "<p>References to portions of the original input text that correspond to the claims but could not be fully translated.</p>"
+          },
+          "confidence": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningTranslationConfidence",
+            "description": "<p>A confidence score between 0 and 1 indicating how certain the system is about the logical translation.</p>"
+          }
+        },
+        "description": "<p>Contains the logical translation of natural language input into formal logical statements, including premises, claims, and confidence scores.</p>"
+      },
+      "GuardrailAutomatedReasoningTranslationAmbiguousFinding": {
+        "type": "object",
+        "properties": {
+          "options": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningTranslationOptionList",
+            "description": "<p>Different logical interpretations that were detected during translation of the input.</p>"
+          },
+          "differenceScenarios": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningDifferenceScenarioList",
+            "description": "<p>Scenarios showing how the different translation options differ in meaning.</p>"
+          }
+        },
+        "description": "<p>Indicates that the input has multiple valid logical interpretations, requiring additional context or clarification.</p>"
+      },
+      "GuardrailAutomatedReasoningTranslationConfidence": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+      },
+      "GuardrailAutomatedReasoningTranslationList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailAutomatedReasoningTranslation"
+        }
+      },
+      "GuardrailAutomatedReasoningTranslationOption": {
+        "type": "object",
+        "properties": {
+          "translations": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningTranslationList",
+            "description": "<p>Example translations that provide this possible interpretation of the input.</p>"
+          }
+        },
+        "description": "<p>Represents one possible logical interpretation of ambiguous input content.</p>"
+      },
+      "GuardrailAutomatedReasoningTranslationOptionList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailAutomatedReasoningTranslationOption"
+        },
+        "maxItems": 2
+      },
+      "GuardrailAutomatedReasoningValidFinding": {
+        "type": "object",
+        "properties": {
+          "translation": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningTranslation",
+            "description": "<p>The logical translation of the input that this finding validates.</p>"
+          },
+          "claimsTrueScenario": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningScenario",
+            "description": "<p>An example scenario demonstrating how the claims are logically true.</p>"
+          },
+          "supportingRules": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningRuleList",
+            "description": "<p>The automated reasoning policy rules that support why this result is considered valid.</p>"
+          },
+          "logicWarning": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningLogicWarning",
+            "description": "<p>Indication of a logic issue with the translation without needing to consider the automated reasoning policy rules.</p>"
+          }
+        },
+        "description": "<p>Indicates that the claims are definitively true and logically implied by the premises, with no possible alternative interpretations.</p>"
+      },
+      "GuardrailConfiguration": {
+        "type": "object",
+        "properties": {
+          "guardrailIdentifier": {
+            "$ref": "#/components/schemas/GuardrailIdentifier",
+            "description": "<p>The identifier for the guardrail.</p>"
+          },
+          "guardrailVersion": {
+            "$ref": "#/components/schemas/GuardrailVersion",
+            "description": "<p>The version of the guardrail.</p>"
+          },
+          "trace": {
+            "$ref": "#/components/schemas/GuardrailTrace",
+            "description": "<p>The trace behavior for the guardrail.</p>"
+          }
+        },
+        "description": "<p>Configuration information for a guardrail that you use with the <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html\">Converse</a> operation.</p>"
+      },
+      "GuardrailContentFilter": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/GuardrailContentFilterType",
+            "description": "<p>The guardrail type.</p>"
+          },
+          "confidence": {
+            "$ref": "#/components/schemas/GuardrailContentFilterConfidence",
+            "description": "<p>The guardrail confidence.</p>"
+          },
+          "filterStrength": {
+            "$ref": "#/components/schemas/GuardrailContentFilterStrength",
+            "description": "<p>The filter strength setting for the guardrail content filter.</p>"
+          },
+          "action": {
+            "$ref": "#/components/schemas/GuardrailContentPolicyAction",
+            "description": "<p>The guardrail action.</p>"
+          },
+          "detected": {
+            "$ref": "#/components/schemas/Boolean",
+            "description": "<p>Indicates whether content that breaches the guardrail configuration is detected.</p>"
+          }
+        },
+        "required": [
+          "type",
+          "confidence",
+          "action"
+        ],
+        "description": "<p>The content filter for a guardrail.</p>"
+      },
+      "GuardrailContentFilterConfidence": {
+        "type": "string",
+        "enum": [
+          "NONE",
+          "LOW",
+          "MEDIUM",
+          "HIGH"
+        ]
+      },
+      "GuardrailContentFilterList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailContentFilter"
+        }
+      },
+      "GuardrailContentFilterStrength": {
+        "type": "string",
+        "enum": [
+          "NONE",
+          "LOW",
+          "MEDIUM",
+          "HIGH"
+        ]
+      },
+      "GuardrailContentFilterType": {
+        "type": "string",
+        "enum": [
+          "INSULTS",
+          "HATE",
+          "SEXUAL",
+          "VIOLENCE",
+          "MISCONDUCT",
+          "PROMPT_ATTACK"
+        ]
+      },
+      "GuardrailContentPolicyAction": {
+        "type": "string",
+        "enum": [
+          "BLOCKED",
+          "NONE"
+        ]
+      },
+      "GuardrailContentPolicyAssessment": {
+        "type": "object",
+        "properties": {
+          "filters": {
+            "$ref": "#/components/schemas/GuardrailContentFilterList",
+            "description": "<p>The content policy filters.</p>"
+          }
+        },
+        "required": [
+          "filters"
+        ],
+        "description": "<p>An assessment of a content policy for a guardrail.</p>"
+      },
+      "GuardrailContentPolicyImageUnitsProcessed": {
+        "type": "integer"
+      },
+      "GuardrailContentPolicyUnitsProcessed": {
+        "type": "integer"
+      },
+      "GuardrailContextualGroundingFilter": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/GuardrailContextualGroundingFilterType",
+            "description": "<p>The contextual grounding filter type.</p>"
+          },
+          "threshold": {
+            "$ref": "#/components/schemas/Double",
+            "description": "<p>The threshold used by contextual grounding filter to determine whether the content is grounded or not.</p>",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "score": {
+            "$ref": "#/components/schemas/Double",
+            "description": "<p>The score generated by contextual grounding filter.</p>",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "action": {
+            "$ref": "#/components/schemas/GuardrailContextualGroundingPolicyAction",
+            "description": "<p>The action performed by the guardrails contextual grounding filter.</p>"
+          },
+          "detected": {
+            "$ref": "#/components/schemas/Boolean",
+            "description": "<p>Indicates whether content that fails the contextual grounding evaluation (grounding or relevance score less than the corresponding threshold) was detected.</p>"
+          }
+        },
+        "required": [
+          "type",
+          "threshold",
+          "score",
+          "action"
+        ],
+        "description": "<p>The details for the guardrails contextual grounding filter.</p>"
+      },
+      "GuardrailContextualGroundingFilterType": {
+        "type": "string",
+        "enum": [
+          "GROUNDING",
+          "RELEVANCE"
+        ]
+      },
+      "GuardrailContextualGroundingFilters": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailContextualGroundingFilter"
+        }
+      },
+      "GuardrailContextualGroundingPolicyAction": {
+        "type": "string",
+        "enum": [
+          "BLOCKED",
+          "NONE"
+        ]
+      },
+      "GuardrailContextualGroundingPolicyAssessment": {
+        "type": "object",
+        "properties": {
+          "filters": {
+            "$ref": "#/components/schemas/GuardrailContextualGroundingFilters",
+            "description": "<p>The filter details for the guardrails contextual grounding filter.</p>"
+          }
+        },
+        "description": "<p>The policy assessment details for the guardrails contextual grounding filter.</p>"
+      },
+      "GuardrailContextualGroundingPolicyUnitsProcessed": {
+        "type": "integer"
+      },
+      "GuardrailConverseContentBlock": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/GuardrailConverseContentBlockTextVariant"
+          },
+          {
+            "$ref": "#/components/schemas/GuardrailConverseContentBlockImageVariant"
+          }
+        ],
+        "description": "<p/> <p>A content block for selective guarding with the <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html\">Converse</a> or <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html\">ConverseStream</a> API operations. </p>"
+      },
+      "GuardrailConverseContentBlockImageVariant": {
+        "type": "object",
+        "properties": {
+          "image": {
+            "$ref": "#/components/schemas/GuardrailConverseImageBlock",
+            "description": "<p>Image within converse content block to be evaluated by the guardrail.</p>"
+          }
+        },
+        "required": [
+          "image"
+        ],
+        "additionalProperties": false
+      },
+      "GuardrailConverseContentBlockTextVariant": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/GuardrailConverseTextBlock",
+            "description": "<p>The text to guard.</p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "GuardrailConverseContentQualifier": {
+        "type": "string",
+        "enum": [
+          "grounding_source",
+          "query",
+          "guard_content"
+        ]
+      },
+      "GuardrailConverseContentQualifierList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailConverseContentQualifier"
+        }
+      },
+      "GuardrailConverseImageBlock": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/GuardrailConverseImageFormat",
+            "description": "<p>The format details for the image type of the guardrail converse image block.</p>"
+          },
+          "source": {
+            "$ref": "#/components/schemas/GuardrailConverseImageSource",
+            "description": "<p>The image source (image bytes) of the guardrail converse image block.</p>"
+          }
+        },
+        "required": [
+          "format",
+          "source"
+        ],
+        "description": "<p>An image block that contains images that you want to assess with a guardrail.</p>"
+      },
+      "GuardrailConverseImageFormat": {
+        "type": "string",
+        "enum": [
+          "png",
+          "jpeg"
+        ]
+      },
+      "GuardrailConverseImageSource": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/GuardrailConverseImageSourceBytesVariant"
+          }
+        ],
+        "description": "<p>The image source (image bytes) of the guardrail converse image source.</p>"
+      },
+      "GuardrailConverseImageSourceBytesVariant": {
+        "type": "object",
+        "properties": {
+          "bytes": {
+            "$ref": "#/components/schemas/Blob",
+            "description": "<p>The raw image bytes for the image.</p>",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "bytes"
+        ],
+        "additionalProperties": false
+      },
+      "GuardrailConverseTextBlock": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The text that you want to guard.</p>"
+          },
+          "qualifiers": {
+            "$ref": "#/components/schemas/GuardrailConverseContentQualifierList",
+            "description": "<p>The qualifier details for the guardrails contextual grounding filter.</p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "description": "<p>A text block that contains text that you want to assess with a guardrail. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_GuardrailConverseContentBlock.html\">GuardrailConverseContentBlock</a>.</p>"
+      },
+      "GuardrailCoverage": {
+        "type": "object",
+        "properties": {
+          "textCharacters": {
+            "$ref": "#/components/schemas/GuardrailTextCharactersCoverage",
+            "description": "<p>The text characters of the guardrail coverage details.</p>"
+          },
+          "images": {
+            "$ref": "#/components/schemas/GuardrailImageCoverage",
+            "description": "<p>The guardrail coverage for images (the number of images that guardrails guarded).</p>"
+          }
+        },
+        "description": "<p>The action of the guardrail coverage details.</p>"
+      },
+      "GuardrailCustomWord": {
+        "type": "object",
+        "properties": {
+          "match": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The match for the custom word.</p>"
+          },
+          "action": {
+            "$ref": "#/components/schemas/GuardrailWordPolicyAction",
+            "description": "<p>The action for the custom word.</p>"
+          },
+          "detected": {
+            "$ref": "#/components/schemas/Boolean",
+            "description": "<p>Indicates whether custom word content that breaches the guardrail configuration is detected.</p>"
+          }
+        },
+        "required": [
+          "match",
+          "action"
+        ],
+        "description": "<p>A custom word configured in a guardrail.</p>"
+      },
+      "GuardrailCustomWordList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailCustomWord"
+        }
+      },
+      "GuardrailId": {
+        "type": "string",
+        "pattern": "^([a-z0-9]+)$",
+        "maxLength": 2048
+      },
+      "GuardrailIdentifier": {
+        "type": "string",
+        "pattern": "^(|([a-z0-9]+)|(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:guardrail/[a-z0-9]+))$",
+        "maxLength": 2048
+      },
+      "GuardrailImageCoverage": {
+        "type": "object",
+        "properties": {
+          "guarded": {
+            "$ref": "#/components/schemas/ImagesGuarded",
+            "description": "<p>The count (integer) of images guardrails guarded.</p>"
+          },
+          "total": {
+            "$ref": "#/components/schemas/ImagesTotal",
+            "description": "<p>Represents the total number of images (integer) that were in the request (guarded and unguarded).</p>"
+          }
+        },
+        "description": "<p>The details of the guardrail image coverage.</p>"
+      },
+      "GuardrailInvocationMetrics": {
+        "type": "object",
+        "properties": {
+          "guardrailProcessingLatency": {
+            "$ref": "#/components/schemas/GuardrailProcessingLatency",
+            "description": "<p>The processing latency details for the guardrail invocation metrics.</p>"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/GuardrailUsage",
+            "description": "<p>The usage details for the guardrail invocation metrics.</p>"
+          },
+          "guardrailCoverage": {
+            "$ref": "#/components/schemas/GuardrailCoverage",
+            "description": "<p>The coverage details for the guardrail invocation metrics.</p>"
+          }
+        },
+        "description": "<p>The invocation metrics for the guardrail.</p>"
+      },
+      "GuardrailManagedWord": {
+        "type": "object",
+        "properties": {
+          "match": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The match for the managed word.</p>"
+          },
+          "type": {
+            "$ref": "#/components/schemas/GuardrailManagedWordType",
+            "description": "<p>The type for the managed word.</p>"
+          },
+          "action": {
+            "$ref": "#/components/schemas/GuardrailWordPolicyAction",
+            "description": "<p>The action for the managed word.</p>"
+          },
+          "detected": {
+            "$ref": "#/components/schemas/Boolean",
+            "description": "<p>Indicates whether managed word content that breaches the guardrail configuration is detected.</p>"
+          }
+        },
+        "required": [
+          "match",
+          "type",
+          "action"
+        ],
+        "description": "<p>A managed word configured in a guardrail.</p>"
+      },
+      "GuardrailManagedWordList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailManagedWord"
+        }
+      },
+      "GuardrailManagedWordType": {
+        "type": "string",
+        "enum": [
+          "PROFANITY"
+        ]
+      },
+      "GuardrailOrigin": {
+        "type": "string",
+        "enum": [
+          "REQUEST",
+          "ACCOUNT_ENFORCED",
+          "ORGANIZATION_ENFORCED"
+        ]
+      },
+      "GuardrailOriginList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailOrigin"
+        }
+      },
+      "GuardrailOutputText": {
+        "type": "string"
+      },
+      "GuardrailOwnership": {
+        "type": "string",
+        "enum": [
+          "SELF",
+          "CROSS_ACCOUNT"
+        ]
+      },
+      "GuardrailPiiEntityFilter": {
+        "type": "object",
+        "properties": {
+          "match": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The PII entity filter match.</p>"
+          },
+          "type": {
+            "$ref": "#/components/schemas/GuardrailPiiEntityType",
+            "description": "<p>The PII entity filter type.</p>"
+          },
+          "action": {
+            "$ref": "#/components/schemas/GuardrailSensitiveInformationPolicyAction",
+            "description": "<p>The PII entity filter action.</p>"
+          },
+          "detected": {
+            "$ref": "#/components/schemas/Boolean",
+            "description": "<p>Indicates whether personally identifiable information (PII) that breaches the guardrail configuration is detected.</p>"
+          }
+        },
+        "required": [
+          "match",
+          "type",
+          "action"
+        ],
+        "description": "<p>A Personally Identifiable Information (PII) entity configured in a guardrail.</p>"
+      },
+      "GuardrailPiiEntityFilterList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailPiiEntityFilter"
+        }
+      },
+      "GuardrailPiiEntityType": {
+        "type": "string",
+        "enum": [
+          "ADDRESS",
+          "AGE",
+          "AWS_ACCESS_KEY",
+          "AWS_SECRET_KEY",
+          "CA_HEALTH_NUMBER",
+          "CA_SOCIAL_INSURANCE_NUMBER",
+          "CREDIT_DEBIT_CARD_CVV",
+          "CREDIT_DEBIT_CARD_EXPIRY",
+          "CREDIT_DEBIT_CARD_NUMBER",
+          "DRIVER_ID",
+          "EMAIL",
+          "INTERNATIONAL_BANK_ACCOUNT_NUMBER",
+          "IP_ADDRESS",
+          "LICENSE_PLATE",
+          "MAC_ADDRESS",
+          "NAME",
+          "PASSWORD",
+          "PHONE",
+          "PIN",
+          "SWIFT_CODE",
+          "UK_NATIONAL_HEALTH_SERVICE_NUMBER",
+          "UK_NATIONAL_INSURANCE_NUMBER",
+          "UK_UNIQUE_TAXPAYER_REFERENCE_NUMBER",
+          "URL",
+          "USERNAME",
+          "US_BANK_ACCOUNT_NUMBER",
+          "US_BANK_ROUTING_NUMBER",
+          "US_INDIVIDUAL_TAX_IDENTIFICATION_NUMBER",
+          "US_PASSPORT_NUMBER",
+          "US_SOCIAL_SECURITY_NUMBER",
+          "VEHICLE_IDENTIFICATION_NUMBER"
+        ]
+      },
+      "GuardrailProcessingLatency": {
+        "type": "integer"
+      },
+      "GuardrailRegexFilter": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The regex filter name.</p>"
+          },
+          "match": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The regesx filter match.</p>"
+          },
+          "regex": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The regex query.</p>"
+          },
+          "action": {
+            "$ref": "#/components/schemas/GuardrailSensitiveInformationPolicyAction",
+            "description": "<p>The region filter action.</p>"
+          },
+          "detected": {
+            "$ref": "#/components/schemas/Boolean",
+            "description": "<p>Indicates whether custom regex entities that breach the guardrail configuration are detected.</p>"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "description": "<p>A Regex filter configured in a guardrail.</p>"
+      },
+      "GuardrailRegexFilterList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailRegexFilter"
+        }
+      },
+      "GuardrailSensitiveInformationPolicyAction": {
+        "type": "string",
+        "enum": [
+          "ANONYMIZED",
+          "BLOCKED",
+          "NONE"
+        ]
+      },
+      "GuardrailSensitiveInformationPolicyAssessment": {
+        "type": "object",
+        "properties": {
+          "piiEntities": {
+            "$ref": "#/components/schemas/GuardrailPiiEntityFilterList",
+            "description": "<p>The PII entities in the assessment.</p>"
+          },
+          "regexes": {
+            "$ref": "#/components/schemas/GuardrailRegexFilterList",
+            "description": "<p>The regex queries in the assessment.</p>"
+          }
+        },
+        "required": [
+          "piiEntities",
+          "regexes"
+        ],
+        "description": "<p>The assessment for a Personally Identifiable Information (PII) policy. </p>"
+      },
+      "GuardrailSensitiveInformationPolicyFreeUnitsProcessed": {
+        "type": "integer"
+      },
+      "GuardrailSensitiveInformationPolicyUnitsProcessed": {
+        "type": "integer"
+      },
+      "GuardrailStreamConfiguration": {
+        "type": "object",
+        "properties": {
+          "guardrailIdentifier": {
+            "$ref": "#/components/schemas/GuardrailIdentifier",
+            "description": "<p>The identifier for the guardrail.</p>"
+          },
+          "guardrailVersion": {
+            "$ref": "#/components/schemas/GuardrailVersion",
+            "description": "<p>The version of the guardrail.</p>"
+          },
+          "trace": {
+            "$ref": "#/components/schemas/GuardrailTrace",
+            "description": "<p>The trace behavior for the guardrail.</p>"
+          },
+          "streamProcessingMode": {
+            "$ref": "#/components/schemas/GuardrailStreamProcessingMode",
+            "description": "<p>The processing mode. </p> <p>The processing mode. For more information, see <i>Configure streaming response behavior</i> in the <i>Amazon Bedrock User Guide</i>. </p>"
+          }
+        },
+        "description": "<p>Configuration information for a guardrail that you use with the <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html\">ConverseStream</a> action. </p>"
+      },
+      "GuardrailStreamProcessingMode": {
+        "type": "string",
+        "enum": [
+          "sync",
+          "async"
+        ]
+      },
+      "GuardrailTextCharactersCoverage": {
+        "type": "object",
+        "properties": {
+          "guarded": {
+            "$ref": "#/components/schemas/TextCharactersGuarded",
+            "description": "<p>The text characters that were guarded by the guardrail coverage.</p>"
+          },
+          "total": {
+            "$ref": "#/components/schemas/TextCharactersTotal",
+            "description": "<p>The total text characters by the guardrail coverage.</p>"
+          }
+        },
+        "description": "<p>The guardrail coverage for the text characters.</p>"
+      },
+      "GuardrailTopic": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The name for the guardrail.</p>"
+          },
+          "type": {
+            "$ref": "#/components/schemas/GuardrailTopicType",
+            "description": "<p>The type behavior that the guardrail should perform when the model detects the topic.</p>"
+          },
+          "action": {
+            "$ref": "#/components/schemas/GuardrailTopicPolicyAction",
+            "description": "<p>The action the guardrail should take when it intervenes on a topic.</p>"
+          },
+          "detected": {
+            "$ref": "#/components/schemas/Boolean",
+            "description": "<p>Indicates whether topic content that breaches the guardrail configuration is detected.</p>"
+          }
+        },
+        "required": [
+          "name",
+          "type",
+          "action"
+        ],
+        "description": "<p>Information about a topic guardrail.</p>"
+      },
+      "GuardrailTopicList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailTopic"
+        }
+      },
+      "GuardrailTopicPolicyAction": {
+        "type": "string",
+        "enum": [
+          "BLOCKED",
+          "NONE"
+        ]
+      },
+      "GuardrailTopicPolicyAssessment": {
+        "type": "object",
+        "properties": {
+          "topics": {
+            "$ref": "#/components/schemas/GuardrailTopicList",
+            "description": "<p>The topics in the assessment.</p>"
+          }
+        },
+        "required": [
+          "topics"
+        ],
+        "description": "<p>A behavior assessment of a topic policy.</p>"
+      },
+      "GuardrailTopicPolicyUnitsProcessed": {
+        "type": "integer"
+      },
+      "GuardrailTopicType": {
+        "type": "string",
+        "enum": [
+          "DENY"
+        ]
+      },
+      "GuardrailTrace": {
+        "type": "string",
+        "enum": [
+          "enabled",
+          "disabled",
+          "enabled_full"
+        ]
+      },
+      "GuardrailTraceAssessment": {
+        "type": "object",
+        "properties": {
+          "modelOutput": {
+            "$ref": "#/components/schemas/ModelOutputs",
+            "description": "<p>The output from the model.</p>"
+          },
+          "inputAssessment": {
+            "$ref": "#/components/schemas/GuardrailAssessmentMap",
+            "description": "<p>The input assessment.</p>"
+          },
+          "outputAssessments": {
+            "$ref": "#/components/schemas/GuardrailAssessmentListMap",
+            "description": "<p>the output assessments.</p>"
+          },
+          "actionReason": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>Provides the reason for the action taken when harmful content is detected.</p>"
+          }
+        },
+        "description": "<p>A Top level guardrail trace object. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseTrace.html\">ConverseTrace</a>.</p>"
+      },
+      "GuardrailUsage": {
+        "type": "object",
+        "properties": {
+          "topicPolicyUnits": {
+            "$ref": "#/components/schemas/GuardrailTopicPolicyUnitsProcessed",
+            "description": "<p>The topic policy units processed by the guardrail.</p>"
+          },
+          "contentPolicyUnits": {
+            "$ref": "#/components/schemas/GuardrailContentPolicyUnitsProcessed",
+            "description": "<p>The content policy units processed by the guardrail.</p>"
+          },
+          "wordPolicyUnits": {
+            "$ref": "#/components/schemas/GuardrailWordPolicyUnitsProcessed",
+            "description": "<p>The word policy units processed by the guardrail.</p>"
+          },
+          "sensitiveInformationPolicyUnits": {
+            "$ref": "#/components/schemas/GuardrailSensitiveInformationPolicyUnitsProcessed",
+            "description": "<p>The sensitive information policy units processed by the guardrail.</p>"
+          },
+          "sensitiveInformationPolicyFreeUnits": {
+            "$ref": "#/components/schemas/GuardrailSensitiveInformationPolicyFreeUnitsProcessed",
+            "description": "<p>The sensitive information policy free units processed by the guardrail.</p>"
+          },
+          "contextualGroundingPolicyUnits": {
+            "$ref": "#/components/schemas/GuardrailContextualGroundingPolicyUnitsProcessed",
+            "description": "<p>The contextual grounding policy units processed by the guardrail.</p>"
+          },
+          "contentPolicyImageUnits": {
+            "$ref": "#/components/schemas/GuardrailContentPolicyImageUnitsProcessed",
+            "description": "<p>The content policy image units processed by the guardrail.</p>"
+          },
+          "automatedReasoningPolicyUnits": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningPolicyUnitsProcessed",
+            "description": "<p>The number of text units processed by the automated reasoning policy.</p>"
+          },
+          "automatedReasoningPolicies": {
+            "$ref": "#/components/schemas/GuardrailAutomatedReasoningPoliciesProcessed",
+            "description": "<p>The number of automated reasoning policies that were processed during the guardrail evaluation.</p>"
+          }
+        },
+        "required": [
+          "topicPolicyUnits",
+          "contentPolicyUnits",
+          "wordPolicyUnits",
+          "sensitiveInformationPolicyUnits",
+          "sensitiveInformationPolicyFreeUnits",
+          "contextualGroundingPolicyUnits"
+        ],
+        "description": "<p>The details on the use of the guardrail.</p>"
+      },
+      "GuardrailVersion": {
+        "type": "string",
+        "pattern": "^(|([1-9][0-9]{0,7})|(DRAFT))$"
+      },
+      "GuardrailWordPolicyAction": {
+        "type": "string",
+        "enum": [
+          "BLOCKED",
+          "NONE"
+        ]
+      },
+      "GuardrailWordPolicyAssessment": {
+        "type": "object",
+        "properties": {
+          "customWords": {
+            "$ref": "#/components/schemas/GuardrailCustomWordList",
+            "description": "<p>Custom words in the assessment.</p>"
+          },
+          "managedWordLists": {
+            "$ref": "#/components/schemas/GuardrailManagedWordList",
+            "description": "<p>Managed word lists in the assessment.</p>"
+          }
+        },
+        "required": [
+          "customWords",
+          "managedWordLists"
+        ],
+        "description": "<p>The word policy assessment.</p>"
+      },
+      "GuardrailWordPolicyUnitsProcessed": {
+        "type": "integer"
+      },
+      "ImageBlock": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/ImageFormat",
+            "description": "<p>The format of the image.</p>"
+          },
+          "source": {
+            "$ref": "#/components/schemas/ImageSource",
+            "description": "<p>The source for the image.</p>"
+          },
+          "error": {
+            "$ref": "#/components/schemas/ErrorBlock",
+            "description": "<p>Error information if the image block could not be processed or contains invalid data.</p>"
+          }
+        },
+        "required": [
+          "format",
+          "source"
+        ],
+        "description": "<p>Image content for a message.</p>"
+      },
+      "ImageBlockDelta": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/ImageSource",
+            "description": "<p>The incremental image source data for this delta event.</p>"
+          },
+          "error": {
+            "$ref": "#/components/schemas/ErrorBlock",
+            "description": "<p>Error information if this image delta could not be processed.</p>"
+          }
+        },
+        "description": "<p>A streaming delta event that contains incremental image data during streaming responses.</p>"
+      },
+      "ImageBlockStart": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/ImageFormat",
+            "description": "<p>The format of the image data that will be streamed in subsequent delta events.</p>"
+          }
+        },
+        "required": [
+          "format"
+        ],
+        "description": "<p>The initial event in a streaming image block that indicates the start of image content.</p>"
+      },
+      "ImageFormat": {
+        "type": "string",
+        "enum": [
+          "png",
+          "jpeg",
+          "gif",
+          "webp"
+        ]
+      },
+      "ImageSource": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ImageSourceBytesVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ImageSourceS3LocationVariant"
+          }
+        ],
+        "description": "<p>The source for an image.</p>"
+      },
+      "ImageSourceBytesVariant": {
+        "type": "object",
+        "properties": {
+          "bytes": {
+            "$ref": "#/components/schemas/Blob",
+            "description": "<p>The raw image bytes for the image. If you use an AWS SDK, you don't need to encode the image bytes in base64.</p>",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "bytes"
+        ],
+        "additionalProperties": false
+      },
+      "ImageSourceS3LocationVariant": {
+        "type": "object",
+        "properties": {
+          "s3Location": {
+            "$ref": "#/components/schemas/S3Location",
+            "description": "<p>The location of an image object in an Amazon S3 bucket. To see which models support S3 uploads, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-supported-models-features.html\">Supported models and features for Converse</a>.</p>"
+          }
+        },
+        "required": [
+          "s3Location"
+        ],
+        "additionalProperties": false
+      },
+      "ImagesGuarded": {
+        "type": "integer"
+      },
+      "ImagesTotal": {
+        "type": "integer"
+      },
+      "InferenceConfiguration": {
+        "type": "object",
+        "properties": {
+          "maxTokens": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The maximum number of tokens to allow in the generated response. The default value is the maximum allowed value for the model that you are using. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters.html\">Inference parameters for foundation models</a>. </p>",
+            "minimum": 1
+          },
+          "temperature": {
+            "$ref": "#/components/schemas/Float",
+            "description": "<p>The likelihood of the model selecting higher-probability options while generating a response. A lower value makes the model more likely to choose higher-probability options, while a higher value makes the model more likely to choose lower-probability options.</p> <p>The default value is the default value for the model that you are using. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters.html\">Inference parameters for foundation models</a>. </p>",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "topP": {
+            "$ref": "#/components/schemas/Float",
+            "description": "<p>The percentage of most-likely candidates that the model considers for the next token. For example, if you choose a value of 0.8 for <code>topP</code>, the model selects from the top 80% of the probability distribution of tokens that could be next in the sequence.</p> <p>The default value is the default value for the model that you are using. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters.html\">Inference parameters for foundation models</a>. </p>",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "stopSequences": {
+            "$ref": "#/components/schemas/NonEmptyStringList",
+            "description": "<p>A list of stop sequences. A stop sequence is a sequence of characters that causes the model to stop generating the response. </p>",
+            "maxItems": 2500
+          }
+        },
+        "description": "<p>Base inference parameters to pass to a model in a call to <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html\">Converse</a> or <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html\">ConverseStream</a>. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters.html\">Inference parameters for foundation models</a>.</p> <p>If you need to pass additional parameters that the model supports, use the <code>additionalModelRequestFields</code> request field in the call to <code>Converse</code> or <code>ConverseStream</code>. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters.html\">Model parameters</a>.</p>"
+      },
+      "Integer": {
+        "type": "integer"
+      },
+      "InternalServerException": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "$ref": "#/components/schemas/NonBlankString"
+          }
+        },
+        "description": "<p>An internal server error occurred. For troubleshooting this error, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/troubleshooting-api-error-codes.html#ts-internal-failure\">InternalFailure</a> in the Amazon Bedrock User Guide</p>"
+      },
+      "InvokedModelId": {
+        "type": "string",
+        "pattern": "^(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}::foundation-model/[a-z0-9-]{1,63}[.]{1}[a-z0-9-]{1,63}([a-z0-9-]{1,63}[.]){0,2}[a-z0-9-]{1,63}([:][a-z0-9-]{1,63}){0,2})|(arn:aws(|-us-gov|-cn|-iso|-iso-b):bedrock:(|[0-9a-z-]{1,20}):(|[0-9]{12}):inference-profile/[a-zA-Z0-9-:.]+)$"
+      },
+      "JsonSchemaDefinition": {
+        "type": "object",
+        "properties": {
+          "schema": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p> The JSON schema to constrain the model's output. For more information, see <a href=\"https://json-schema.org/understanding-json-schema/reference\">JSON Schema Reference</a>. </p>"
+          },
+          "name": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p> The name of the JSON schema. </p>"
+          },
+          "description": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p> A description of the JSON schema. </p>"
+          }
+        },
+        "required": [
+          "schema"
+        ],
+        "description": "<p> JSON schema structured output format options. </p>"
+      },
+      "Long": {
+        "type": "integer"
+      },
+      "Message": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/ConversationRole",
+            "description": "<p>The role that the message plays in the message.</p>"
+          },
+          "content": {
+            "$ref": "#/components/schemas/ContentBlocks",
+            "description": "<p>The message content. Note the following restrictions:</p> <ul> <li> <p>You can include up to 20 images. Each image's size, height, and width must be no more than 3.75 MB, 8000 px, and 8000 px, respectively.</p> </li> <li> <p>You can include up to five documents. Each document's size must be no more than 4.5 MB.</p> </li> <li> <p>If you include a <code>ContentBlock</code> with a <code>document</code> field in the array, you must also include a <code>ContentBlock</code> with a <code>text</code> field.</p> </li> <li> <p>You can only include images and documents if the <code>role</code> is <code>user</code>.</p> </li> </ul>"
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "description": "<p>A message input, or returned from, a call to <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html\">Converse</a> or <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html\">ConverseStream</a>.</p>"
+      },
+      "MessageStartEvent": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/ConversationRole",
+            "description": "<p>The role for the message.</p>"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "description": "<p>The start of a message.</p>"
+      },
+      "MessageStopEvent": {
+        "type": "object",
+        "properties": {
+          "stopReason": {
+            "$ref": "#/components/schemas/StopReason",
+            "description": "<p>The reason why the model stopped generating output.</p>"
+          },
+          "additionalModelResponseFields": {
+            "$ref": "#/components/schemas/Document",
+            "description": "<p>The additional model response fields.</p>"
+          }
+        },
+        "required": [
+          "stopReason"
+        ],
+        "description": "<p>The stop event for a message.</p>"
+      },
+      "Messages": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/Message"
+        }
+      },
+      "ModelOutputs": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/GuardrailOutputText"
+        }
+      },
+      "ModelStreamErrorException": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "$ref": "#/components/schemas/NonBlankString"
+          },
+          "originalStatusCode": {
+            "$ref": "#/components/schemas/StatusCode",
+            "description": "<p>The original status code.</p>"
+          },
+          "originalMessage": {
+            "$ref": "#/components/schemas/NonBlankString",
+            "description": "<p>The original message.</p>"
+          }
+        },
+        "description": "<p>An error occurred while streaming the response. Retry your request.</p>"
+      },
+      "NonBlankString": {
+        "type": "string",
+        "pattern": "^[\\s\\S]*$"
+      },
+      "NonEmptyString": {
+        "type": "string",
+        "minLength": 1
+      },
+      "NonEmptyStringList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/NonEmptyString"
+        }
+      },
+      "NonNegativeInteger": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "OutputConfig": {
+        "type": "object",
+        "properties": {
+          "textFormat": {
+            "$ref": "#/components/schemas/OutputFormat",
+            "description": "<p>Structured output parameters to control the model's text response. </p>"
+          },
+          "effort": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The effort level for the model to use when generating a response. Higher effort levels allow the model to spend more time reasoning before responding. Supported values are <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, and <code>max</code>.</p> <note> <p>When extended thinking is disabled, the effort level is capped at <code>high</code>. Use effort <code>high</code> or below, or enable thinking to use higher effort levels.</p> </note>",
+            "maxLength": 16
+          }
+        },
+        "description": "<p>Output configuration for a model response in a call to <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html\">Converse</a> or <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html\">ConverseStream</a>.</p>"
+      },
+      "OutputFormat": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/OutputFormatType",
+            "description": "<p> The type of structured output format. </p>"
+          },
+          "structure": {
+            "$ref": "#/components/schemas/OutputFormatStructure",
+            "description": "<p> The structure that the model's output must adhere to. </p>"
+          }
+        },
+        "required": [
+          "type",
+          "structure"
+        ],
+        "description": "<p> Structured output parameters to control the model's response. </p>"
+      },
+      "OutputFormatStructure": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/OutputFormatStructureJsonSchemaVariant"
+          }
+        ],
+        "description": "<p> The structure that the model's output must adhere to. </p>"
+      },
+      "OutputFormatStructureJsonSchemaVariant": {
+        "type": "object",
+        "properties": {
+          "jsonSchema": {
+            "$ref": "#/components/schemas/JsonSchemaDefinition",
+            "description": "<p> A JSON schema structure that the model's output must adhere to. </p>"
+          }
+        },
+        "required": [
+          "jsonSchema"
+        ],
+        "additionalProperties": false
+      },
+      "OutputFormatType": {
+        "type": "string",
+        "enum": [
+          "json_schema"
+        ],
+        "description": "<p> The type of structured output format. Available options are: json_schema. </p>"
+      },
+      "PerformanceConfigLatency": {
+        "type": "string",
+        "enum": [
+          "standard",
+          "optimized"
+        ]
+      },
+      "PerformanceConfiguration": {
+        "type": "object",
+        "properties": {
+          "latency": {
+            "$ref": "#/components/schemas/PerformanceConfigLatency",
+            "description": "<p>To use a latency-optimized version of the model, set to <code>optimized</code>.</p>"
+          }
+        },
+        "description": "<p>Performance settings for a model.</p>"
+      },
+      "PromptRouterTrace": {
+        "type": "object",
+        "properties": {
+          "invokedModelId": {
+            "$ref": "#/components/schemas/InvokedModelId",
+            "description": "<p>The ID of the invoked model.</p>"
+          }
+        },
+        "description": "<p>A prompt router trace.</p>"
+      },
+      "PromptVariableMap": {
+        "type": "object",
+        "propertyNames": {
+          "$ref": "#/components/schemas/String"
+        },
+        "additionalProperties": {
+          "$ref": "#/components/schemas/PromptVariableValues"
+        }
+      },
+      "PromptVariableValues": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/PromptVariableValuesTextVariant"
+          }
+        ],
+        "description": "<p>Contains a map of variables in a prompt from Prompt management to an object containing the values to fill in for them when running model invocation. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-management-how.html\">How Prompt management works</a>.</p>"
+      },
+      "PromptVariableValuesTextVariant": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The text value that the variable maps to.</p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "ReasoningContentBlock": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ReasoningContentBlockReasoningTextVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ReasoningContentBlockRedactedContentVariant"
+          }
+        ],
+        "description": "<p>Contains content regarding the reasoning that is carried out by the model with respect to the content in the content block. Reasoning refers to a Chain of Thought (CoT) that the model generates to enhance the accuracy of its final response.</p>"
+      },
+      "ReasoningContentBlockDelta": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ReasoningContentBlockDeltaTextVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ReasoningContentBlockDeltaRedactedContentVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ReasoningContentBlockDeltaSignatureVariant"
+          }
+        ],
+        "description": "<p>Contains content regarding the reasoning that is carried out by the model with respect to the content in the content block. Reasoning refers to a Chain of Thought (CoT) that the model generates to enhance the accuracy of its final response.</p>"
+      },
+      "ReasoningContentBlockDeltaRedactedContentVariant": {
+        "type": "object",
+        "properties": {
+          "redactedContent": {
+            "$ref": "#/components/schemas/Blob",
+            "description": "<p>The content in the reasoning that was encrypted by the model provider for safety reasons. The encryption doesn't affect the quality of responses.</p>"
+          }
+        },
+        "required": [
+          "redactedContent"
+        ],
+        "additionalProperties": false
+      },
+      "ReasoningContentBlockDeltaSignatureVariant": {
+        "type": "object",
+        "properties": {
+          "signature": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>A token that verifies that the reasoning text was generated by the model. If you pass a reasoning block back to the API in a multi-turn conversation, include the text and its signature unmodified.</p>"
+          }
+        },
+        "required": [
+          "signature"
+        ],
+        "additionalProperties": false
+      },
+      "ReasoningContentBlockDeltaTextVariant": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The reasoning that the model used to return the output.</p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "ReasoningContentBlockReasoningTextVariant": {
+        "type": "object",
+        "properties": {
+          "reasoningText": {
+            "$ref": "#/components/schemas/ReasoningTextBlock",
+            "description": "<p>The reasoning that the model used to return the output.</p>"
+          }
+        },
+        "required": [
+          "reasoningText"
+        ],
+        "additionalProperties": false
+      },
+      "ReasoningContentBlockRedactedContentVariant": {
+        "type": "object",
+        "properties": {
+          "redactedContent": {
+            "$ref": "#/components/schemas/Blob",
+            "description": "<p>The content in the reasoning that was encrypted by the model provider for safety reasons. The encryption doesn't affect the quality of responses.</p>"
+          }
+        },
+        "required": [
+          "redactedContent"
+        ],
+        "additionalProperties": false
+      },
+      "ReasoningTextBlock": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The reasoning that the model used to return the output.</p>"
+          },
+          "signature": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>A token that verifies that the reasoning text was generated by the model. If you pass a reasoning block back to the API in a multi-turn conversation, include the text and its signature unmodified.</p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "description": "<p>Contains the reasoning that the model used to return the output.</p>"
+      },
+      "RequestMetadata": {
+        "type": "object",
+        "propertyNames": {
+          "$ref": "#/components/schemas/String",
+          "pattern": "^[a-zA-Z0-9\\s:_@$#=/+,-.]{1,256}$",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "additionalProperties": {
+          "$ref": "#/components/schemas/String",
+          "pattern": "^[a-zA-Z0-9\\s:_@$#=/+,-.]{0,256}$",
+          "minLength": 0,
+          "maxLength": 256
+        },
+        "minProperties": 1,
+        "maxProperties": 16
+      },
+      "S3Location": {
+        "type": "object",
+        "properties": {
+          "uri": {
+            "$ref": "#/components/schemas/S3Uri",
+            "description": "<p>An object URI starting with <code>s3://</code>.</p>"
+          },
+          "bucketOwner": {
+            "$ref": "#/components/schemas/AccountId",
+            "description": "<p>If the bucket belongs to another AWS account, specify that account's ID.</p>"
+          }
+        },
+        "required": [
+          "uri"
+        ],
+        "description": "<p>A storage location in an Amazon S3 bucket.</p>"
+      },
+      "S3Uri": {
+        "type": "string",
+        "pattern": "^s3://[a-z0-9][\\.\\-a-z0-9]{1,61}[a-z0-9](/.*)?$",
+        "minLength": 1,
+        "maxLength": 1024
+      },
+      "SearchResultBlock": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The source URL or identifier for the content.</p>"
+          },
+          "title": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>A descriptive title for the search result.</p>"
+          },
+          "content": {
+            "$ref": "#/components/schemas/SearchResultContentBlocks",
+            "description": "<p>An array of search result content block.</p>"
+          },
+          "citations": {
+            "$ref": "#/components/schemas/CitationsConfig",
+            "description": "<p>Configuration setting for citations</p>"
+          }
+        },
+        "required": [
+          "source",
+          "title",
+          "content"
+        ],
+        "description": "<p>A search result block that enables natural citations with proper source attribution for retrieved content.</p> <note> <p>This field is only supported by Anthropic Claude Opus 4.1, Opus 4, Sonnet 4.5, Sonnet 4, Sonnet 3.7, and 3.5 Haiku models.</p> </note>"
+      },
+      "SearchResultContentBlock": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The actual text content</p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "description": "<p>A block within a search result that contains the content.</p>"
+      },
+      "SearchResultContentBlocks": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/SearchResultContentBlock"
+        }
+      },
+      "SearchResultLocation": {
+        "type": "object",
+        "properties": {
+          "searchResultIndex": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The index of the search result content block where the cited content is found.</p>",
+            "minimum": 0
+          },
+          "start": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The starting position in the content array where the cited content begins.</p>",
+            "minimum": 0
+          },
+          "end": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The ending position in the content array where the cited content ends.</p>",
+            "minimum": 0
+          }
+        },
+        "description": "<p>Specifies a search result location within the content array, providing positioning information for cited content using search result index and block positions.</p>"
+      },
+      "ServiceTier": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/ServiceTierType",
+            "description": "<p>Specifies the processing tier type used for serving the request.</p>"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "description": "<p>Specifies the processing tier configuration used for serving the request.</p>"
+      },
+      "ServiceTierType": {
+        "type": "string",
+        "enum": [
+          "priority",
+          "default",
+          "flex",
+          "reserved"
+        ]
+      },
+      "ServiceUnavailableException": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "$ref": "#/components/schemas/NonBlankString"
+          }
+        },
+        "description": "<p>The service isn't currently available. For troubleshooting this error, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/troubleshooting-api-error-codes.html#ts-service-unavailable\">ServiceUnavailable</a> in the Amazon Bedrock User Guide</p>"
+      },
+      "SpecificToolChoice": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/ToolName",
+            "description": "<p>The name of the tool that the model must request. </p>"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "description": "<p>The model must request a specific tool. For example, <code>{\"tool\" : {\"name\" : \"Your tool name\"}}</code>. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html\">Call a tool with the Converse API</a> in the Amazon Bedrock User Guide</p> <note> <p>This field is only supported by Anthropic Claude 3 models.</p> </note>"
+      },
+      "StatusCode": {
+        "type": "integer",
+        "minimum": 100,
+        "maximum": 599
+      },
+      "StopReason": {
+        "type": "string",
+        "enum": [
+          "end_turn",
+          "tool_use",
+          "max_tokens",
+          "stop_sequence",
+          "guardrail_intervened",
+          "content_filtered",
+          "malformed_model_output",
+          "malformed_tool_use",
+          "model_context_window_exceeded"
+        ]
+      },
+      "String": {
+        "type": "string"
+      },
+      "SystemContentBlock": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/SystemContentBlockTextVariant"
+          },
+          {
+            "$ref": "#/components/schemas/SystemContentBlockGuardContentVariant"
+          },
+          {
+            "$ref": "#/components/schemas/SystemContentBlockCachePointVariant"
+          }
+        ],
+        "description": "<p>Contains configurations for instructions to provide the model for how to handle input. To learn more, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-call.html\">Using the Converse API</a>.</p>"
+      },
+      "SystemContentBlockCachePointVariant": {
+        "type": "object",
+        "properties": {
+          "cachePoint": {
+            "$ref": "#/components/schemas/CachePointBlock",
+            "description": "<p>CachePoint to include in the system prompt.</p>"
+          }
+        },
+        "required": [
+          "cachePoint"
+        ],
+        "additionalProperties": false
+      },
+      "SystemContentBlockGuardContentVariant": {
+        "type": "object",
+        "properties": {
+          "guardContent": {
+            "$ref": "#/components/schemas/GuardrailConverseContentBlock",
+            "description": "<p>A content block to assess with the guardrail. Use with the <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html\">Converse</a> or <a href=\"https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html\">ConverseStream</a> API operations. </p> <p>For more information, see <i>Use a guardrail with the Converse API</i> in the <i>Amazon Bedrock User Guide</i>.</p>"
+          }
+        },
+        "required": [
+          "guardContent"
+        ],
+        "additionalProperties": false
+      },
+      "SystemContentBlockTextVariant": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/NonEmptyString",
+            "description": "<p>A system prompt for the model. </p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "SystemContentBlocks": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/SystemContentBlock"
+        }
+      },
+      "SystemTool": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/ToolName",
+            "description": "<p>The name of the system-defined tool that you want to call. </p>"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "description": "<p>Specifies a system-defined tool for the model to use. <i>System-defined tools</i> are tools that are created and provided by the model provider.</p>"
+      },
+      "TextCharactersGuarded": {
+        "type": "integer"
+      },
+      "TextCharactersTotal": {
+        "type": "integer"
+      },
+      "ThrottlingException": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "$ref": "#/components/schemas/NonBlankString"
+          }
+        },
+        "description": "<p>Your request was denied due to exceeding the account quotas for <i>Amazon Bedrock</i>. For troubleshooting this error, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/troubleshooting-api-error-codes.html#ts-throttling-exception\">ThrottlingException</a> in the Amazon Bedrock User Guide</p>"
+      },
+      "TokenUsage": {
+        "type": "object",
+        "properties": {
+          "inputTokens": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The number of tokens sent in the request to the model.</p>",
+            "minimum": 0
+          },
+          "outputTokens": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The number of tokens that the model generated for the request.</p>",
+            "minimum": 0
+          },
+          "totalTokens": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The total of input tokens and tokens generated by the model.</p>",
+            "minimum": 0
+          },
+          "cacheReadInputTokens": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The number of input tokens read from the cache for the request.</p>",
+            "minimum": 0
+          },
+          "cacheWriteInputTokens": {
+            "$ref": "#/components/schemas/Integer",
+            "description": "<p>The number of input tokens written to the cache for the request.</p>",
+            "minimum": 0
+          },
+          "cacheDetails": {
+            "$ref": "#/components/schemas/CacheDetailsList",
+            "description": "<p>Detailed breakdown of cache writes by TTL. Empty if no cache creation occurred. Sorted by TTL duration (1h before 5m).</p>"
+          }
+        },
+        "required": [
+          "inputTokens",
+          "outputTokens",
+          "totalTokens"
+        ],
+        "description": "<p>The tokens used in a message API inference call. </p>"
+      },
+      "Tool": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ToolToolSpecVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ToolSystemToolVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ToolCachePointVariant"
+          }
+        ],
+        "description": "<p>Information about a tool that you can use with the Converse API. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html\">Call a tool with the Converse API</a> in the Amazon Bedrock User Guide.</p>"
+      },
+      "ToolAdditionBlock": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "$ref": "#/components/schemas/ToolReference",
+            "description": "<p>A reference to the tool to add to the available tool set.</p>"
+          }
+        },
+        "required": [
+          "tool"
+        ],
+        "description": "<p>A content block for adding a tool to the available tool set mid-conversation. Each block references a single tool via its <code>tool</code> field. Use within a <code>system</code> role message to make a tool available without re-sending the full tool configuration.</p>"
+      },
+      "ToolCachePointVariant": {
+        "type": "object",
+        "properties": {
+          "cachePoint": {
+            "$ref": "#/components/schemas/CachePointBlock",
+            "description": "<p>CachePoint to include in the tool configuration.</p>"
+          }
+        },
+        "required": [
+          "cachePoint"
+        ],
+        "additionalProperties": false
+      },
+      "ToolChoice": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ToolChoiceAutoVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ToolChoiceAnyVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ToolChoiceToolVariant"
+          }
+        ],
+        "description": "<p>Determines which tools the model should request in a call to <code>Converse</code> or <code>ConverseStream</code>. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html\">Call a tool with the Converse API</a> in the Amazon Bedrock User Guide.</p>"
+      },
+      "ToolChoiceAnyVariant": {
+        "type": "object",
+        "properties": {
+          "any": {
+            "$ref": "#/components/schemas/AnyToolChoice",
+            "description": "<p>The model must request at least one tool (no text is generated).</p>"
+          }
+        },
+        "required": [
+          "any"
+        ],
+        "additionalProperties": false
+      },
+      "ToolChoiceAutoVariant": {
+        "type": "object",
+        "properties": {
+          "auto": {
+            "$ref": "#/components/schemas/AutoToolChoice",
+            "description": "<p>(Default). The Model automatically decides if a tool should be called or whether to generate text instead. </p>"
+          }
+        },
+        "required": [
+          "auto"
+        ],
+        "additionalProperties": false
+      },
+      "ToolChoiceToolVariant": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "$ref": "#/components/schemas/SpecificToolChoice",
+            "description": "<p>The Model must request the specified tool. Only supported by Anthropic Claude 3 and Amazon Nova models. </p>"
+          }
+        },
+        "required": [
+          "tool"
+        ],
+        "additionalProperties": false
+      },
+      "ToolConfiguration": {
+        "type": "object",
+        "properties": {
+          "tools": {
+            "$ref": "#/components/schemas/Tools",
+            "description": "<p>An array of tools that you want to pass to a model. </p>",
+            "minItems": 1
+          },
+          "toolChoice": {
+            "$ref": "#/components/schemas/ToolChoice",
+            "description": "<p>If supported by model, forces the model to request a tool. </p>"
+          }
+        },
+        "required": [
+          "tools"
+        ],
+        "description": "<p>Configuration information for the tools that you pass to a model. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html\">Tool use (function calling)</a> in the Amazon Bedrock User Guide.</p>"
+      },
+      "ToolInputSchema": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ToolInputSchemaJsonVariant"
+          }
+        ],
+        "description": "<p>The schema for the tool. The top level schema type must be <code>object</code>. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html\">Call a tool with the Converse API</a> in the Amazon Bedrock User Guide.</p>"
+      },
+      "ToolInputSchemaJsonVariant": {
+        "type": "object",
+        "properties": {
+          "json": {
+            "$ref": "#/components/schemas/Document",
+            "description": "<p>The JSON schema for the tool. For more information, see <a href=\"https://json-schema.org/understanding-json-schema/reference\">JSON Schema Reference</a>.</p>"
+          }
+        },
+        "required": [
+          "json"
+        ],
+        "additionalProperties": false
+      },
+      "ToolName": {
+        "type": "string",
+        "pattern": "^[a-zA-Z0-9_-]+$",
+        "minLength": 1,
+        "maxLength": 64
+      },
+      "ToolReference": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The type of tool reference.</p>",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "name": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The name of the tool. Must match the name of a tool declared in the top-level tool configuration.</p>",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "serverName": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The name of the MCP server that provides the tool. Required when referencing an MCP tool.</p>",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "description": "<p>A reference to a tool in the tool configuration. Used with <code>ToolAdditionBlock</code> and <code>ToolRemovalBlock</code> to identify which tool to add or remove mid-conversation.</p>"
+      },
+      "ToolRemovalBlock": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "$ref": "#/components/schemas/ToolReference",
+            "description": "<p>A reference to the tool to remove from the available tool set.</p>"
+          }
+        },
+        "required": [
+          "tool"
+        ],
+        "description": "<p>A content block for removing a tool from the available tool set mid-conversation. Each block references a single tool via its <code>tool</code> field. Use within a <code>system</code> role message to remove a tool without re-sending the full tool configuration.</p>"
+      },
+      "ToolResultBlock": {
+        "type": "object",
+        "properties": {
+          "toolUseId": {
+            "$ref": "#/components/schemas/ToolUseId",
+            "description": "<p>The ID of the tool request that this is the result for. </p>"
+          },
+          "content": {
+            "$ref": "#/components/schemas/ToolResultContentBlocks",
+            "description": "<p>The content for tool result content block.</p>"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ToolResultStatus",
+            "description": "<p>The status for the tool result content block.</p> <note> <p>This field is only supported by Amazon Nova and Anthropic Claude 3 and 4 models.</p> </note>"
+          },
+          "type": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The type for the tool result content block.</p>"
+          }
+        },
+        "required": [
+          "toolUseId",
+          "content"
+        ],
+        "description": "<p>A tool result block that contains the results for a tool request that the model previously made. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html\">Call a tool with the Converse API</a> in the Amazon Bedrock User Guide.</p>"
+      },
+      "ToolResultBlockDelta": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ToolResultBlockDeltaTextVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ToolResultBlockDeltaJsonVariant"
+          }
+        ],
+        "description": "<p>Contains incremental updates to tool results information during streaming responses. This allows clients to build up tool results data progressively as the response is generated.</p>"
+      },
+      "ToolResultBlockDeltaJsonVariant": {
+        "type": "object",
+        "properties": {
+          "json": {
+            "$ref": "#/components/schemas/Document",
+            "description": "<p>The JSON schema for the tool result content block. see <a href=\"https://json-schema.org/understanding-json-schema/reference\">JSON Schema Reference</a>.</p>"
+          }
+        },
+        "required": [
+          "json"
+        ],
+        "additionalProperties": false
+      },
+      "ToolResultBlockDeltaTextVariant": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The reasoning the model used to return the output.</p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "ToolResultBlockStart": {
+        "type": "object",
+        "properties": {
+          "toolUseId": {
+            "$ref": "#/components/schemas/ToolUseId",
+            "description": "<p>The ID of the tool that was used to generate this tool result block.</p>"
+          },
+          "type": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The type for the tool that was used to generate this tool result block.</p>"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ToolResultStatus",
+            "description": "<p>The status of the tool result block.</p>"
+          }
+        },
+        "required": [
+          "toolUseId"
+        ],
+        "description": "<p>The start of a tool result block. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html\">Call a tool with the Converse API</a> in the Amazon Bedrock User Guide.</p>"
+      },
+      "ToolResultBlocksDelta": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/ToolResultBlockDelta"
+        }
+      },
+      "ToolResultContentBlock": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ToolResultContentBlockJsonVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ToolResultContentBlockTextVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ToolResultContentBlockImageVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ToolResultContentBlockDocumentVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ToolResultContentBlockVideoVariant"
+          },
+          {
+            "$ref": "#/components/schemas/ToolResultContentBlockSearchResultVariant"
+          }
+        ],
+        "description": "<p>The tool result content block. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html\">Call a tool with the Converse API</a> in the Amazon Bedrock User Guide.</p>"
+      },
+      "ToolResultContentBlockDocumentVariant": {
+        "type": "object",
+        "properties": {
+          "document": {
+            "$ref": "#/components/schemas/DocumentBlock",
+            "description": "<p>A tool result that is a document.</p>"
+          }
+        },
+        "required": [
+          "document"
+        ],
+        "additionalProperties": false
+      },
+      "ToolResultContentBlockImageVariant": {
+        "type": "object",
+        "properties": {
+          "image": {
+            "$ref": "#/components/schemas/ImageBlock",
+            "description": "<p>A tool result that is an image. </p> <note> <p>This field is only supported by Amazon Nova and Anthropic Claude 3 and 4 models.</p> </note>"
+          }
+        },
+        "required": [
+          "image"
+        ],
+        "additionalProperties": false
+      },
+      "ToolResultContentBlockJsonVariant": {
+        "type": "object",
+        "properties": {
+          "json": {
+            "$ref": "#/components/schemas/Document",
+            "description": "<p>A tool result that is JSON format data. </p>"
+          }
+        },
+        "required": [
+          "json"
+        ],
+        "additionalProperties": false
+      },
+      "ToolResultContentBlockSearchResultVariant": {
+        "type": "object",
+        "properties": {
+          "searchResult": {
+            "$ref": "#/components/schemas/SearchResultBlock",
+            "description": "<p>A tool result that is a search result.</p>"
+          }
+        },
+        "required": [
+          "searchResult"
+        ],
+        "additionalProperties": false
+      },
+      "ToolResultContentBlockTextVariant": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>A tool result that is text. </p>"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "ToolResultContentBlockVideoVariant": {
+        "type": "object",
+        "properties": {
+          "video": {
+            "$ref": "#/components/schemas/VideoBlock",
+            "description": "<p>A tool result that is video.</p>"
+          }
+        },
+        "required": [
+          "video"
+        ],
+        "additionalProperties": false
+      },
+      "ToolResultContentBlocks": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/ToolResultContentBlock"
+        }
+      },
+      "ToolResultStatus": {
+        "type": "string",
+        "enum": [
+          "success",
+          "error"
+        ]
+      },
+      "ToolSpecification": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/ToolName",
+            "description": "<p>The name for the tool.</p>"
+          },
+          "description": {
+            "$ref": "#/components/schemas/NonEmptyString",
+            "description": "<p>The description for the tool.</p>"
+          },
+          "inputSchema": {
+            "$ref": "#/components/schemas/ToolInputSchema",
+            "description": "<p>The input schema for the tool in JSON format.</p>"
+          },
+          "strict": {
+            "$ref": "#/components/schemas/Boolean",
+            "description": "<p>Flag to enable structured output enforcement on a tool usage response.</p>"
+          }
+        },
+        "required": [
+          "name",
+          "inputSchema"
+        ],
+        "description": "<p>The specification for the tool. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html\">Call a tool with the Converse API</a> in the Amazon Bedrock User Guide.</p>"
+      },
+      "ToolSystemToolVariant": {
+        "type": "object",
+        "properties": {
+          "systemTool": {
+            "$ref": "#/components/schemas/SystemTool",
+            "description": "<p>Specifies the system-defined tool that you want use.</p>"
+          }
+        },
+        "required": [
+          "systemTool"
+        ],
+        "additionalProperties": false
+      },
+      "ToolToolSpecVariant": {
+        "type": "object",
+        "properties": {
+          "toolSpec": {
+            "$ref": "#/components/schemas/ToolSpecification",
+            "description": "<p>The specfication for the tool. </p>"
+          }
+        },
+        "required": [
+          "toolSpec"
+        ],
+        "additionalProperties": false
+      },
+      "ToolUseBlock": {
+        "type": "object",
+        "properties": {
+          "toolUseId": {
+            "$ref": "#/components/schemas/ToolUseId",
+            "description": "<p>The ID for the tool request.</p>"
+          },
+          "name": {
+            "$ref": "#/components/schemas/ToolName",
+            "description": "<p>The name of the tool that the model wants to use.</p>"
+          },
+          "input": {
+            "$ref": "#/components/schemas/Document",
+            "description": "<p>The input to pass to the tool. </p>"
+          },
+          "type": {
+            "$ref": "#/components/schemas/ToolUseType",
+            "description": "<p>The type for the tool request.</p>"
+          }
+        },
+        "required": [
+          "toolUseId",
+          "name",
+          "input"
+        ],
+        "description": "<p>A tool use content block. Contains information about a tool that the model is requesting be run., The model uses the result from the tool to generate a response. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html\">Call a tool with the Converse API</a> in the Amazon Bedrock User Guide.</p>"
+      },
+      "ToolUseBlockDelta": {
+        "type": "object",
+        "properties": {
+          "input": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The input for a requested tool.</p>"
+          }
+        },
+        "required": [
+          "input"
+        ],
+        "description": "<p>The delta for a tool use block.</p>"
+      },
+      "ToolUseBlockStart": {
+        "type": "object",
+        "properties": {
+          "toolUseId": {
+            "$ref": "#/components/schemas/ToolUseId",
+            "description": "<p>The ID for the tool request.</p>"
+          },
+          "name": {
+            "$ref": "#/components/schemas/ToolName",
+            "description": "<p>The name of the tool that the model is requesting to use.</p>"
+          },
+          "type": {
+            "$ref": "#/components/schemas/ToolUseType",
+            "description": "<p>The type for the tool request.</p>"
+          }
+        },
+        "required": [
+          "toolUseId",
+          "name"
+        ],
+        "description": "<p>The start of a tool use block. For more information, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html\">Call a tool with the Converse API</a> in the Amazon Bedrock User Guide.</p>"
+      },
+      "ToolUseId": {
+        "type": "string",
+        "pattern": "^[a-zA-Z0-9_.:-]+$",
+        "minLength": 1,
+        "maxLength": 64
+      },
+      "ToolUseType": {
+        "type": "string",
+        "enum": [
+          "server_tool_use"
+        ]
+      },
+      "Tools": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/Tool"
+        }
+      },
+      "ValidationException": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "$ref": "#/components/schemas/NonBlankString"
+          }
+        },
+        "description": "<p>The input fails to satisfy the constraints specified by <i>Amazon Bedrock</i>. For troubleshooting this error, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/troubleshooting-api-error-codes.html#ts-validation-error\">ValidationError</a> in the Amazon Bedrock User Guide</p>"
+      },
+      "VideoBlock": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/VideoFormat",
+            "description": "<p>The block's format.</p>"
+          },
+          "source": {
+            "$ref": "#/components/schemas/VideoSource",
+            "description": "<p>The block's source.</p>"
+          }
+        },
+        "required": [
+          "format",
+          "source"
+        ],
+        "description": "<p>A video block.</p>"
+      },
+      "VideoFormat": {
+        "type": "string",
+        "enum": [
+          "mkv",
+          "mov",
+          "mp4",
+          "webm",
+          "flv",
+          "mpeg",
+          "mpg",
+          "wmv",
+          "three_gp"
+        ]
+      },
+      "VideoSource": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/VideoSourceBytesVariant"
+          },
+          {
+            "$ref": "#/components/schemas/VideoSourceS3LocationVariant"
+          }
+        ],
+        "description": "<p>A video source. You can upload a smaller video as a base64-encoded string as long as the encoded file is less than 25MB. You can also transfer videos up to 1GB in size from an S3 bucket.</p>"
+      },
+      "VideoSourceBytesVariant": {
+        "type": "object",
+        "properties": {
+          "bytes": {
+            "$ref": "#/components/schemas/Blob",
+            "description": "<p>Video content encoded in base64.</p>",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "bytes"
+        ],
+        "additionalProperties": false
+      },
+      "VideoSourceS3LocationVariant": {
+        "type": "object",
+        "properties": {
+          "s3Location": {
+            "$ref": "#/components/schemas/S3Location",
+            "description": "<p>The location of a video object in an Amazon S3 bucket. To see which models support S3 uploads, see <a href=\"https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-supported-models-features.html\">Supported models and features for Converse</a>.</p>"
+          }
+        },
+        "required": [
+          "s3Location"
+        ],
+        "additionalProperties": false
+      },
+      "WebLocation": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The URL that was cited when performing a web search.</p>"
+          },
+          "domain": {
+            "$ref": "#/components/schemas/String",
+            "description": "<p>The domain that was cited when performing a web search.</p>"
+          }
+        },
+        "description": "<p>Provides the URL and domain information for the website that was cited when performing a web search.</p>"
+      }
+    }
+  }
+}

@@ -320,7 +320,7 @@ antfly query --table wikipedia \
   --limit 5
 ```
 
-Concrete visual descriptions ("red sports car", "mountain landscape") work better than abstract ones. The same pipeline enriches your own documents: PDFs and scans are read with OCR ([LightOnOCR-3](/docs/guides/models/lightonocr3) locally, or a connected provider), and audio is transcribed before indexing. See [Multimodal Embeddings](/docs/guides/multimodal) and [Index Recorded Calls and Podcasts](/docs/guides/transcription).
+Concrete visual descriptions ("red sports car", "mountain landscape") work better than abstract ones. The same pipeline enriches your own documents: PDFs and scans are read with OCR ([LightOnOCR-3](/docs/guides/models/lightonocr3) locally, or a connected provider), and audio is transcribed before indexing. See [Index PDFs and Scanned Documents](/docs/guides/index-documents) and [Index Recorded Calls and Podcasts](/docs/guides/transcription).
 </Steps>
 
 ## RAG (Retrieval-Augmented Generation)
@@ -569,6 +569,6 @@ You have a running instance, an indexed table, and an agent that knows Antfly. E
 - [Route Tickets with Retrieval](/docs/guides/ticket-routing): tickets stream out of Postgres and get a team from the resolved ones that look like them
 - [Power a Coding Copilot's Retrieval](/docs/guides/coding-copilot-retrieval): a repo index that answers symbol lookups and intent questions, sized to a context budget
 - [Tune Hybrid Search](/docs/guides/hybrid-search): fusion, reranking, and pruning, and which of them your data needs
-- [Multimodal Embeddings](/docs/guides/multimodal): the image index from this page in depth, plus audio, PDFs, and your own vectors
+- [Multimodal Embeddings](/docs/guides/multimodal): the image index from this page in depth, plus audio and your own vectors
 
 For production, the [Antfly Operator](/docs/operator/getting-started/quickstart) deploys on Kubernetes, and [backup and restore](/docs/api/data-operations) protects what you loaded.

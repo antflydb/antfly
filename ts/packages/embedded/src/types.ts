@@ -96,7 +96,7 @@ export interface OpenOptions {
   generatedEnrichmentReplay?: boolean;
   mapSize?: Uint64Like;
   ttlCleanup?: TTLCleanupOptions;
-  /** Milliseconds to retry while another writer holds the writer lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0 (default) fails immediately. */
+  /** Milliseconds to retry Lite admission while another process holds the writer lease or advances the allocator checkpoint (ANTFLY_BUSY), like sqlite3_busy_timeout. Mutation bodies are never replayed by this admission retry. 0 (default) fails immediately. */
   busyTimeoutMs?: Uint64Like;
   inferenceHostBudgetMb?: number;
   inferenceBackendBudgetMb?: number;

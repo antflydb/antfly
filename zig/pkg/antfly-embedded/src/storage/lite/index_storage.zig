@@ -54,6 +54,7 @@ pub const Store = struct {
     const vtable: StorageIo.VTable = .{
         .private_scratch_directory = privateScratchDirectory,
         .create_dir_path = createDirPath,
+        .virtual_directories = true,
         .read_file_alloc = readFileAlloc,
         .read_file_range_alloc = readFileRangeAlloc,
         .open_immutable_source = openImmutableSource,

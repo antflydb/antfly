@@ -54,6 +54,20 @@ as prose with a verification command, whether or not it is also listed in
 - Concept pages set `sidebar: concepts` and take a noun title: "Document Engine",
   "Antfly Lite". The `description` says what the page explains.
 
+`sidebar` picks the site section, and `order` sorts within it (unique per section; unset
+sorts last, by title):
+
+| `sidebar` | Section | Holds |
+|---|---|---|
+| `getting-started` | Getting Started | The Quickstart |
+| omitted | Build | Outcome guides, such as the use-case walkthroughs |
+| `concepts` | Concepts | How search, indexes, graphs, and Lite work |
+| `ingest` | Ingest and Enrich | Getting data in: documents and OCR, media, transcription, CDC |
+| `inference` | Inference | The model runtime, providers hub, and model compatibility |
+
+Pages under `providers/` and `models/` need no `sidebar`; they nest under Inference as
+Providers and Models. An unknown `sidebar` value lists the page under Build.
+
 ## Guide anatomy
 
 Target 120 to 200 lines. Every guide uses the same six h2 headings, in this order, so

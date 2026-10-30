@@ -41,7 +41,7 @@ def management_plan(project, image=None):
     )
     if not match or match[1] != RUNTIME["image"].rsplit("@", 1)[1]:
         raise ValueError(
-            "Supply the published, verified RC.6 multi-platform image digest recorded in runtime.json"
+            "Supply the published, verified RC.7 multi-platform image digest recorded in runtime.json"
         )
 
     def binding(name, bucket, prefix, mode):

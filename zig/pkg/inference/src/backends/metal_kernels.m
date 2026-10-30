@@ -37609,6 +37609,23 @@ int termite_metal_decode_runtime_prepare_layer_norm_owned_shared(
     return termite_metal_decode_runtime_prepare_layer_norm_storage(runtime, slot, weight, bias, hidden_size, true);
 }
 
+#ifdef ANTFLY_METAL_TEST_FORCE_HOST_OUTPUT_COPY
+static _Thread_local bool termite_metal_test_reject_host_output_no_copy = false;
+
+void termite_metal_test_force_host_output_copy(int enabled) {
+    termite_metal_test_reject_host_output_no_copy = enabled != 0;
+}
+#endif
+
+static id<MTLBuffer> termite_metal_host_output_no_copy(id<MTLDevice> device, void *output, size_t bytes) {
+#ifdef ANTFLY_METAL_TEST_FORCE_HOST_OUTPUT_COPY
+    // Some devices accept unaligned pointers. Force allocation failure in the
+    // calling test only so fallback coverage is hardware-independent.
+    if (termite_metal_test_reject_host_output_no_copy) return nil;
+#endif
+    return antfly_observe_metal_buffer([device newBufferWithBytesNoCopy:output length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+}
+
 int termite_metal_decode_runtime_apply_layer_norm(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -37629,7 +37646,7 @@ int termite_metal_decode_runtime_apply_layer_norm(
         id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         BOOL output_borrowed = YES;
-        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        id<MTLBuffer> output_buffer = termite_metal_host_output_no_copy(runtime->device, output, bytes);
         if (output_buffer == nil) {
             output_borrowed = NO;
             output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
@@ -37642,12 +37659,8 @@ int termite_metal_decode_runtime_apply_layer_norm(
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_host_io_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -9;
-        id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
-        const BOOL planned_encoder = (encoder != nil);
-        if (!planned_encoder) {
-            encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_RMS_NORM);
-            if (encoder == nil) return -10;
-        }
+        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_RMS_NORM);
+        if (encoder == nil) return -10;
         termite_metal_planned_encoder_range accesses[4];
         if (termite_metal_planned_range_make(input_buffer, 0, bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -10) != 0 ||
             termite_metal_planned_range_make(runtime->layer_norm_weight_buffers[slot], 0, runtime->layer_norm_weight_buffers[slot].length, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -10) != 0 ||
@@ -37664,8 +37677,13 @@ int termite_metal_decode_runtime_apply_layer_norm(
         [encoder setBuffer:output_buffer offset:0 atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
         [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-        if (!planned_encoder) [encoder endEncoding];
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
+        [encoder endEncoding];
+        // The host-I/O command buffer drains prior frames and always waits,
+        // including when the caller entered with a planned compute scope.
+        const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
+        if (finish_rc != 0) return finish_rc;
+        if (!output_borrowed) memcpy(output, output_buffer.contents, bytes);
+        return 0;
     }
 }
 
@@ -60652,7 +60670,7 @@ int termite_metal_decode_runtime_apply_attention_residual_tl1(
         id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         BOOL output_borrowed = YES;
-        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        id<MTLBuffer> output_buffer = termite_metal_host_output_no_copy(runtime->device, output, hidden_bytes);
         if (output_buffer == nil) {
             output_borrowed = NO;
             output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
@@ -60666,7 +60684,9 @@ int termite_metal_decode_runtime_apply_attention_residual_tl1(
         if (rc != 0) return rc;
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -4;
+        if (!output_borrowed) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -60700,7 +60720,7 @@ int termite_metal_decode_runtime_apply_attention_residual_tl2(
         id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         BOOL output_borrowed = YES;
-        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        id<MTLBuffer> output_buffer = termite_metal_host_output_no_copy(runtime->device, output, hidden_bytes);
         if (output_buffer == nil) {
             output_borrowed = NO;
             output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
@@ -60714,7 +60734,9 @@ int termite_metal_decode_runtime_apply_attention_residual_tl2(
         if (rc != 0) return rc;
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -4;
+        if (!output_borrowed) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 

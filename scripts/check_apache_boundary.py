@@ -160,6 +160,9 @@ SOURCE_MODULES = {
     "cloudflare_api": (
         "zig/pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig",
     ),
+    "bedrock_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/bedrock_api/root.zig",
+    ),
     "anthropic_api": (
         "zig/pkg/antfly-embedded/src/openapi/generated/anthropic_api/root.zig",
     ),

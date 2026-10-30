@@ -615,7 +615,7 @@ const Run = struct {
     fn clarificationAnswer(self: *const Run) ?std.json.Value {
         const decisions = self.request.decisions orelse return null;
         for (decisions) |decision| {
-            if (std.mem.eql(u8, decision.question_id, "research_scope")) return decision.answer orelse .{ .string = "" };
+            if (std.mem.eql(u8, decision.question_id, "research_scope")) return decision.answer.valueOrNull() orelse .{ .string = "" };
         }
         return null;
     }
