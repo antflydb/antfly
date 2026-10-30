@@ -1,0 +1,182 @@
+---
+title: "Build a Knowledge Graph from Your Docs"
+description: "A table that extracts entities and relations from each document, resolves them into one entity table, and answers search and graph queries over both"
+order: 3
+---
+
+<Questions>
+- How do I build a knowledge graph from my documents automatically?
+- How do I extract entities and relations with GLiNER in Antfly?
+- How do I merge mentions of the same thing across documents into one node?
+- How do I go from a search hit to the entities it mentions?
+- Which documents mention a given entity?
+</Questions>
+
+## The Result
+
+Each document you write is chunked and embedded for search, and GLiNER extracts the components it mentions and how they relate. Mentions of the same name in different documents resolve to one entity, so one query reaches from an entity to every related entity and section:
+
+```json
+{"key": "entity/backup_service", "table": "entities", "depth": 1,
+ "document": {"canonical_name": "backup service", "entity_type": "component"},
+ "path_edges": [{"type": "depends_on", "weight": 0.985,
+   "from": {"key": "entity/storage_engine", "table": "entities"},
+   "to": {"key": "entity/backup_service", "table": "entities"}, "direction": "in"}]}
+```
+
+## Before You Start
+
+The embedding and extraction models pulled:
+
+```bash
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1
+antfly inference pull fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d --tasks extract
+antfly inference list
+```
+
+`antfly inference list` shows one `embedder` and one `extractor` line. Then, in another terminal, Antfly running in standalone mode:
+
+```bash
+antfly standalone
+```
+
+## Build It
+
+### 1. Create the Entity Table
+
+The resolver promotes each canonical entity into this table, so it must exist first:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/entities \
+  -H 'Content-Type: application/json' -d '{"num_shards": 1}'
+```
+
+### 2. Create the Docs Table
+
+`chunk_vectors` chunks and embeds each `body` for semantic search. `knowledge` is a graph index: an `extractor` produces entities and relations per document, `source` turns each relation into an edge, and the resolver gives every mention a key such as `entity/storage_engine`, adding a `mentions` edge from the document to it.
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/docs \
+  -H 'Content-Type: application/json' -d '{
+  "num_shards": 1,
+  "indexes": {
+    "chunk_vectors": {
+      "type": "embeddings",
+      "sources": [{"artifact": "chunk_dense"}],
+      "embedder": {"provider": "antfly", "model": "Qwen/Qwen3-Embedding-0.6B-GGUF"},
+      "distance_metric": "cosine",
+      "enrichments": [
+        {"name": "chunks", "kind": "chunk", "field": "body",
+         "chunker_json": "{\"provider\":\"antfly\",\"model\":\"fixed\",\"text\":{\"target_tokens\":400,\"overlap_tokens\":40}}"},
+        {"name": "chunk_dense", "kind": "embedding", "field": "body",
+         "source_artifact_name": "chunks", "expected_dims": 1024}
+      ]
+    },
+    "knowledge": {
+      "type": "graph",
+      "artifact": {
+        "name": "relations", "kind": "asset", "content_type": "application/json",
+        "source": {"type": "field", "value": "body"},
+        "producer_json": {"type": "extractor", "config": {
+          "provider": "antfly", "model": "fastino/gliner2.5-base-v1",
+          "schema": {
+            "entities": ["component", "subsystem", "protocol", "model", "format"],
+            "relations": [{"type": "depends_on"}, {"type": "implements"}, {"type": "owns"}]
+          },
+          "options": {"include_confidence": true, "include_spans": true}
+        }}
+      },
+      "source": {
+        "artifact": "relations", "path": "$.relations[*]",
+        "format": "extraction_relation", "mention_edge_type": "mentions",
+        "edge": {"type": "{{ _item.type }}", "weight": "{{ _item.score }}"}
+      },
+      "edge_types": [{"name": "mentions"}, {"name": "depends_on"}, {"name": "implements"}, {"name": "owns"}],
+      "resolvers": [{
+        "name": "entities", "table": "entities",
+        "source_artifact": "relations", "resolution_artifact": "entity_resolution",
+        "key_template": "entity/{{ slug _entity.text }}",
+        "min_confidence": 0.5, "config_generation": 1
+      }]
+    }
+  }
+}'
+```
+
+### 3. Write Documents
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/docs/batch \
+  -H 'Content-Type: application/json' -d '{"inserts": {
+  "storage": {"title": "Storage engine", "body": "The storage engine depends on the LSM tree for durable writes. Each shard owns one LSM tree and writes segments in the AFB format."},
+  "backups": {"title": "Backups", "body": "The backup service depends on the storage engine and writes portable archives in the AFB format. The metadata server owns the backup schedule."},
+  "raft": {"title": "Raft consensus", "body": "The metadata server depends on Raft to replicate table definitions. Each shard group implements Raft with its own leader."}
+}}'
+```
+
+### 4. Wait for Enrichment
+
+```bash
+antfly index wait --table docs --index chunk_vectors --until complete --timeout 10m
+antfly index wait --table docs --index knowledge --until complete --timeout 10m
+```
+
+On an Apple silicon laptop both waits return in under 30 seconds for these three documents. The `entities` table now holds one document per entity, such as `{"canonical_name": "Raft", "entity_type": "protocol"}`.
+
+### 5. Search, Then Walk the Graph
+
+`$query_results` seeds a traversal from the hybrid search hits, so one request returns the matching sections and the entities they mention:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/docs/query \
+  -H 'Content-Type: application/json' -d '{
+  "full_text_search": {"match": "storage writes", "field": "body"},
+  "semantic_search": "how are writes made durable",
+  "indexes": ["chunk_vectors"], "limit": 2, "fields": ["title"],
+  "graph_queries": {"related": {"index": "knowledge", "traverse": {
+    "start": {"result_ref": "$query_results", "limit": 2},
+    "direction": "both", "max_depth": 2, "include_documents": true, "fields": ["title"]
+  }}}
+}'
+```
+
+The hits are `storage` and `backups`, and `graph_results.related.nodes` lists `entity/afb_format`, `entity/shard`, `entity/storage_engine`, `entity/backup_service`, and `entity/metadata_server`.
+
+### 6. Explore One Entity
+
+Start from an entity to see what relates to it and which sections mention it. Entities live in another table, so name it in `identities`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/docs/query \
+  -H 'Content-Type: application/json' -d '{
+  "limit": 0,
+  "graph_queries": {"neighbors": {"index": "knowledge", "traverse": {
+    "start": {"identities": [{"key": "entity/storage_engine", "table": "entities"}]},
+    "direction": "both", "max_depth": 1, "include_paths": true,
+    "include_documents": true, "fields": ["title", "canonical_name", "entity_type"]
+  }}}
+}'
+```
+
+The result is `entity/backup_service` over a `depends_on` edge, plus the `storage` and `backups` sections over `mentions` edges.
+
+## Tradeoffs
+
+The extraction schema decides what the graph can answer. GLiNER only finds the entity labels and relation types you list, so name the things your readers ask about ("component", "protocol") rather than generic labels, and keep relation types few and specific. `min_confidence` trades recall for precision: below about 0.5, weak mentions mint entities that connect unrelated sections. The resolver keys entities by name alone, so "the storage engine" in two documents becomes one node, but two different things with the same name also merge. The embedder and the extractor share Antfly Inference's memory, so extraction can wait while chunks are embedded; the graph lags the vector index during a large ingest.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "build a knowledge graph of the components in my design docs and show me what depends on the storage engine", and use this page to judge the result.
+
+## Next Steps
+
+- The [antfly-docs-knowledge-base example](https://github.com/antflydb/antfly/tree/main/examples/antfly-docs-knowledge-base) builds the same graph over Antfly's own docs, on embedded Antfly Lite or a server.
+- [Tree and Graph Navigation](/docs/guides/graph-navigation) to let the retrieval agent walk this graph when it answers a question.
+- [Artifact-Backed Indexes](/docs/guides/artifact-indexes) for edge metadata, temporal filters, and path queries over the same index.
