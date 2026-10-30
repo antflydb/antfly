@@ -929,8 +929,8 @@ fn countLstmForwardFromCt(
 
 /// CountLSTM (v1) forward pass (count=1 at inference time):
 /// projector(concat([GRU(pos[0], h_0=label), label])), projector = 2H→4H→H.
-/// Only the label markers take this path (a handful of rows), so the GRU gate
-/// math stays on the host like the v2 fallback.
+/// Slot zero uses the fused device GRU when supported, then device concat and
+/// projection. Other slots retain the count-aware host recurrence.
 fn countLstmV1ForwardFromCt(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -954,6 +954,9 @@ pub fn countLstmV1AtStep(
     if (num_labels == 0) {
         const empty_shape = [_]i32{ 0, @intCast(H) };
         return cb.fromFloat32Shape(&.{}, &empty_shape);
+    }
+    if (step == 0) {
+        if (try countLstmV1SlotZeroResident(cb, label_ct, num_labels, H)) |resident| return resident;
     }
     const label_embs = try cb.toFloat32(label_ct, allocator);
     defer allocator.free(label_embs);
@@ -985,6 +988,25 @@ pub fn countLstmV1AtStep(
     const cat_ct = try cb.fromFloat32Shape(cat, &cat_shape);
     defer cb.free(cat_ct);
 
+    return countLstmV1Project(cb, cat_ct, num_labels, H);
+}
+
+/// Returns null only when the backend does not implement the fused GRU. A
+/// specialty GPU executor must reject null rather than read label states back.
+pub fn countLstmV1SlotZeroResident(
+    cb: *const ComputeBackend,
+    label_ct: CT,
+    num_labels: usize,
+    H: usize,
+) !?CT {
+    const gru_ct = (try cb.glinerLabelGru(label_ct, num_labels, H, false)) orelse return null;
+    defer cb.free(gru_ct);
+    const cat_ct = try cb.concat(gru_ct, label_ct, num_labels, H, H);
+    defer cb.free(cat_ct);
+    return try countLstmV1Project(cb, cat_ct, num_labels, H);
+}
+
+fn countLstmV1Project(cb: *const ComputeBackend, cat_ct: CT, num_labels: usize, H: usize) !CT {
     const w0 = try cb.getWeight("count_embed.projector.0.weight");
     defer cb.free(w0);
     const b0 = try cb.getWeight("count_embed.projector.0.bias");
@@ -1556,4 +1578,28 @@ test "getSpanInfo derives width from span_idx layout" {
     try std.testing.expectEqual(@as(usize, 2), info.max_width);
     try std.testing.expectEqualSlices(u32, &.{ 0, 0, 1, 1, 2, 2 }, info.start_indices);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 1, 2, 2, 0 }, info.end_indices);
+}
+
+test "GLiNER GRU residual native CountLSTM v1 slot zero preserves direct state" {
+    const a = std.testing.allocator;
+    var store = try ContextualHeadFixture.init(a);
+    defer store.deinitOwned();
+    try ContextualHeadFixture.linear(&store, "count_embed.projector.0", 8, 4, 0);
+    try ContextualHeadFixture.linear(&store, "count_embed.projector.2", 2, 8, 0);
+    const bias = store.resident_weights.getPtr("count_embed.gru.bias_ih_l0").?.tensor.asFloat32Mut();
+    bias[2] = -100;
+    bias[3] = -100;
+    bias[4] = 0.25541282;
+    bias[5] = 0.25541282;
+    var compute = ContextualHeadFixture.native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const labels = try cb.fromFloat32Shape(&.{ 16777216, -16777216, 2, -3 }, &.{ 2, 2 });
+    defer cb.free(labels);
+    try std.testing.expect((try countLstmV1SlotZeroResident(&cb, labels, 2, 2)) == null);
+    const projected = try countLstmV1AtStep(&cb, a, labels, 2, 2, 0);
+    defer cb.free(projected);
+    const got = try cb.toFloat32(projected, a);
+    defer a.free(got);
+    for (got) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.25), value, 0.000001);
 }

@@ -7328,6 +7328,7 @@ pub fn decoderRuntimeGlinerGruCombineF32Device(
     gh: MetalTensor,
     rows: usize,
     dim: usize,
+    add_residual: bool,
     output_shape: []const i32,
 ) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
@@ -7349,6 +7350,7 @@ pub fn decoderRuntimeGlinerGruCombineF32Device(
         gh.deviceByteOffset(),
         rows,
         dim,
+        @intFromBool(add_residual),
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
@@ -22512,6 +22514,7 @@ pub extern fn termite_metal_decode_runtime_gliner_gru_combine_f32_device(
     gh_offset: usize,
     rows: usize,
     dim: usize,
+    add_residual: u32,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;

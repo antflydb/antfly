@@ -52,8 +52,21 @@ pub const Loopback = struct {
         return initWithCapacity(a, node, 2);
     }
 
+    pub const Limits = struct {
+        transport_memory_limit_bytes: usize = 16 * 1024 * 1024,
+        max_request_body_bytes: usize = 64 * 1024,
+    };
+
     pub fn initWithCapacity(a: Allocator, node: *Node, capacity: u32) !*Loopback {
+        return initWithLimits(a, node, capacity, .{});
+    }
+
+    /// Explicit limits belong to the test listener owner. Existing fixtures
+    /// retain their original transport and ingress limits through the wrapper.
+    pub fn initWithLimits(a: Allocator, node: *Node, capacity: u32, limits: Limits) !*Loopback {
         if (capacity == 0 or capacity > 16) return error.InvalidLoopbackCapacity;
+        if (limits.transport_memory_limit_bytes == 0 or limits.max_request_body_bytes == 0) return error.InvalidLoopbackLimits;
+        const body_buffer_bytes = try std.math.mul(usize, capacity, limits.max_request_body_bytes);
         // Caller-owned listeners need the same exclusive startup precondition
         // as Node.serve. Publish the resource owner before request workers can
         // race its lazy creation; this neither loads a model nor reserves work.
@@ -61,7 +74,7 @@ pub const Loopback = struct {
         const self = try a.create(Loopback);
         errdefer a.destroy(self);
         self.allocator = a;
-        self.budget = .{ .backing = a, .limit = 16 * 1024 * 1024 };
+        self.budget = .{ .backing = a, .limit = limits.transport_memory_limit_bytes };
         const transport_allocator = self.budget.allocator();
         self.server_io = Io.Threaded.init(transport_allocator, .{ .concurrent_limit = .limited(2 * capacity + 2) });
         errdefer self.server_io.deinit();
@@ -72,7 +85,7 @@ pub const Loopback = struct {
         self.server = httpx.Server.initWithConfig(transport_allocator, self.server_io.io(), .{
             .host = "127.0.0.1",
             .port = 0,
-            .max_body_size = 64 * 1024,
+            .max_body_size = limits.max_request_body_bytes,
             .max_headers = 32,
             .max_connections = capacity,
             .max_request_tasks = capacity,
@@ -83,7 +96,7 @@ pub const Loopback = struct {
             .keep_alive_timeout_ms = short_timeout_ms,
             .keep_alive = false,
             .max_requests_per_connection = 1,
-            .request_body_buffer_budget_bytes = capacity * 64 * 1024,
+            .request_body_buffer_budget_bytes = body_buffer_bytes,
         });
         errdefer self.server.deinit();
         // The ingress deadline is fixed by this test owner, never by request

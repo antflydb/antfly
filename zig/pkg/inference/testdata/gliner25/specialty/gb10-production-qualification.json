@@ -1,0 +1,2225 @@
+{
+  "format_version": 1,
+  "status": "passed",
+  "campaign": "original FP32 GLiNER2 specialty production on NVIDIA GB10",
+  "assembled_unix_seconds": 1793341301.471543,
+  "source": {
+    "git_commit": "aa583335143f59bf904b0faa3cfd2eb9aeedf399",
+    "source_sha256": "473a568bfe242cf86f80dc4bbba395798a918e1dc0057cc63656a4e0d4a3073b",
+    "source_file_count": 1129,
+    "binding_scope": "Observed source files and commit; binary SHA identifies the executable. This does not attest reproducible compilation."
+  },
+  "binaries": {
+    "server": {
+      "path": "../../../zig-out/bin/antfly-inference-dev",
+      "sha256": "079ca98ab412687d1e1bf1aef42f316870e281ac624e869ddec8778ebe08aeca"
+    },
+    "tests": {
+      "path": "../../../.zig-cache/o/5aea2780458bea822032825523eb06ae/test",
+      "sha256": "a64b1cfcc73d13e5e8f6bca64e8a3c639614d245e2c5f688af48f998f022864b"
+    }
+  },
+  "build": {
+    "zig_version": "0.17.0",
+    "builds": {
+      "server": {
+        "command": [
+          "zig",
+          "build",
+          "-Dcuda=true",
+          "-Doptimize=ReleaseFast",
+          "-Dstrip=true",
+          "-Dinference-compile-memory-mb=24576"
+        ],
+        "returncode": 0,
+        "cwd": "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference",
+        "log": "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/.specialty-production-final-build.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "effective_flags": {
+          "cuda": true,
+          "metal": false,
+          "cuda_artifacts": "fatbin",
+          "optimize": "ReleaseFast",
+          "strip": true
+        }
+      },
+      "tests": {
+        "command": [
+          "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/.zig-cache/o/5aea2780458bea822032825523eb06ae/test",
+          "--test-filter",
+          "specialty",
+          "--test-filter",
+          "GLiNER GRU residual",
+          "--test-filter",
+          "gliner span v2",
+          "--test-filter",
+          "gliner boundary",
+          "--test-filter",
+          "GLiNER contextual",
+          "--test-filter",
+          "GLiNER complete batched head",
+          "--test-filter",
+          "GLiNER default revisions",
+          "--test-filter",
+          "GLiNER span backend",
+          "--test-filter",
+          "extraction v2"
+        ],
+        "returncode": 1,
+        "compile_command": [
+          "zig",
+          "build",
+          "test-inference-unit",
+          "-Dcuda=true",
+          "-Doptimize=ReleaseFast",
+          "-Dtest-filter=specialty",
+          "-Dtest-filter=GLiNER GRU residual",
+          "-Dtest-filter=gliner span v2",
+          "-Dtest-filter=gliner boundary",
+          "-Dtest-filter=GLiNER contextual",
+          "-Dtest-filter=GLiNER complete batched head",
+          "-Dtest-filter=GLiNER default revisions",
+          "-Dtest-filter=GLiNER span backend",
+          "-Dtest-filter=extraction v2"
+        ],
+        "compile_returncode": 0,
+        "compile_log": "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/.specialty-production-final-tests-build.log",
+        "compile_log_sha256": "6b21e656d333dde7a0af20817d7f11c6248a46631494ad1668d39cf0c3ceed4a",
+        "compile_scope": "Compile completed and emitted this exact executable. Initial sandboxed execution lacked GPU/socket access. Final recorded command executed the same binary with access.",
+        "log": "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/.specialty-production-final-regressions.log",
+        "log_sha256": "20f81669a150e4cdf6924059629460372eaaf39f30fda703b164f3906d7efc7a",
+        "effective_flags": {
+          "cuda": true,
+          "metal": false,
+          "cuda_artifacts": "fatbin",
+          "optimize": "ReleaseFast",
+          "strip": false
+        },
+        "environment": {
+          "ZIG_GLOBAL_CACHE_DIR": "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/.zig-cache/global",
+          "CUDA_CACHE_PATH": "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/.zig-cache/cuda-driver",
+          "ANTFLY_GLINER_PII_MODEL_DIR": "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/.specialty-artifacts/pii",
+          "ANTFLY_GLINER_PII_CAPTURE": "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/.specialty-artifacts/pii/oracle.json",
+          "ANTFLY_GLIGUARD_MODEL_DIR": "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/.specialty-artifacts/gliguard",
+          "ANTFLY_GLIGUARD_CAPTURE": "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/.specialty-artifacts/gliguard/oracle.json",
+          "ANTFLY_GLINER25_BASE_MODEL_DIR": "/home/tim/antfly/.worktrees/qualify-gliner25-cuda/.benchmark-results/gliner25-cuda/models/base",
+          "ANTFLY_GLINER25_BASE_TRANSFORMERS_MODEL_DIR": "/home/tim/antfly/.worktrees/qualify-gliner25-cuda/.benchmark-results/gliner25-cuda/models/base-transformers",
+          "ANTFLY_GLINER25_MULTI_MODEL_DIR": "/home/tim/antfly/.worktrees/qualify-gliner25-cuda/.benchmark-results/gliner25-cuda/models/multi",
+          "ANTFLY_GLINER25_MULTI_V1_MODEL_DIR": "/home/tim/antfly/.worktrees/qualify-gliner25-cuda/.benchmark-results/gliner25-cuda/models/multi",
+          "ANTFLY_GLINER_DECIDE_MODEL": "/home/tim/antfly/.worktrees/qualify-gliner25-cuda/.benchmark-results/gliner25-cuda/deploy-models/decide-fp32",
+          "ANTFLY_GLINER25_DECIDE_MODEL_DIR": "/home/tim/antfly/.worktrees/qualify-gliner25-cuda/.benchmark-results/gliner25-cuda/deploy-models/decide-fp32",
+          "ANTFLY_GLINER_DECIDE_Q8_MODEL": "/home/tim/antfly/.worktrees/qualify-gliner25-cuda/.benchmark-results/gliner25-cuda/deploy-models/decide-q8",
+          "ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR": "/home/tim/antfly/.worktrees/qualify-gliner25-cuda/.benchmark-results/gliner25-cuda/deploy-models/decide-q8",
+          "ANTFLY_GLINER_DECIDE_BACKEND": "cuda",
+          "ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE": "f32",
+          "ANTFLY_CUDA_DEBERTA_GENERATED_TC_AUTO": "0"
+        },
+        "execution_outcome": "one documented default-native-Q8 baseline failure; all FP32 specialty and CUDA tests pass"
+      }
+    }
+  },
+  "cuda_compiler_version": "13.2.86",
+  "cuda_artifact_files": {
+    "inference_cuda_kernels.cu": "c5d6c077b4ed9d2db8b9f4ea1727186baafec7fbdd3a1cf1ebf803c204d8bb99",
+    "inference_cuda_kernels.ptx": "bc1efe91598c0acf1da2a643c53d9c77111da12be2d680e1efa8d90f85966ff6",
+    "inference_cuda_kernels.fatbin": "8ae691349ede2f7f8cbc83c2c280e734edad7e4176b74319d0cd49b5004d496e",
+    "inference_cuda_kernels_sm89.cubin": "836eeaff8916680c4be32b1da5459ae479ee629b8fad42b565ec5487247c2070"
+  },
+  "hardware": {
+    "nvidia_smi": "NVIDIA GB10, GPU-3bd71415-6064-a1a7-5d0e-4e12158b383a, 12.1, 580.178.04, [N/A]",
+    "platform": "Linux-7.0.0-1019-nvidia-aarch64-with-glibc2.39",
+    "machine": "aarch64",
+    "python": "3.12.3"
+  },
+  "artifact_manifest_sha256": "8845b1acdee019db2f8b58850359f2443b459200fc843fb925539bccc55784ad",
+  "model_pins": {
+    "pii": {
+      "repository": "fastino/gliner2-privacy-filter-PII-multi",
+      "revision": "1cb4166094dc58fa8d836429f060d6c95f62b495",
+      "files": {
+        "config.json": {
+          "size_bytes": 252,
+          "sha256": "164f17362bcf9d114067d3465e7374bfdd79ce6b605acb745de5a49dabb9595c"
+        },
+        "encoder_config/config.json": {
+          "size_bytes": 895,
+          "sha256": "f27dd63cc43a248d2566f0b6ad7a115db353676ce0561dcbca45bac766464c1a"
+        },
+        "tokenizer.json": {
+          "size_bytes": 16020604,
+          "sha256": "f6df10ec83bea993035b2dd7c39345a3d4fcf23421c2adb6cb4ffc1e6d1bc4b5"
+        },
+        "tokenizer_config.json": {
+          "size_bytes": 711,
+          "sha256": "233beed1f1095cccfc7907cde31a8d90a0c6aa4fdfaf6493f8e55fd162e81ae6"
+        },
+        "model.safetensors": {
+          "size_bytes": 1228421964,
+          "sha256": "0280f6f39f6012da50b6640bad438d9b7e763a1b0102094115d1b710c4dd79b6"
+        }
+      },
+      "tensor_count": 227,
+      "tensor_inventory_sha256": "da0f9c4734366524e15b20254cf6053c24aa31a738aa4c1c38be9ac01d2e842b",
+      "marker_ids": {
+        "[SEP_STRUCT]": 250102,
+        "[SEP_TEXT]": 250103,
+        "[P]": 250104,
+        "[C]": 250105,
+        "[E]": 250106,
+        "[R]": 250107,
+        "[L]": 250108
+      },
+      "oracle": {
+        "path": "pii/oracle.json",
+        "size_bytes": 3532851,
+        "sha256": "eb694cac399bf4c40b9bbab8d1cc50820190bbf59142c42e427e8833dfb8f3ff"
+      }
+    },
+    "gliguard": {
+      "repository": "fastino/gliguard-LLMGuardrails-300M",
+      "revision": "7776816b54581f37b90dd2de12dbe13123229a9b",
+      "files": {
+        "config.json": {
+          "size_bytes": 283,
+          "sha256": "ff16ad09c871fe218f786e8c498a615b9ecc26de85b0b7bd2fb03baacba8170b"
+        },
+        "encoder_config/config.json": {
+          "size_bytes": 895,
+          "sha256": "f75950b8f8a0d6e6d54f7976af63de8163f14dbc04a1505378bc5423566aa36d"
+        },
+        "tokenizer.json": {
+          "size_bytes": 8333952,
+          "sha256": "3ad87d9ffe669147063e70850927dd2da90249e2acc5c8527f1eb65df467bcc8"
+        },
+        "tokenizer_config.json": {
+          "size_bytes": 711,
+          "sha256": "233beed1f1095cccfc7907cde31a8d90a0c6aa4fdfaf6493f8e55fd162e81ae6"
+        },
+        "model.safetensors": {
+          "size_bytes": 833938108,
+          "sha256": "03132cef1def4bb172b586e662ffc3c30f76034411fc21cd309dd8f1b627c466"
+        }
+      },
+      "tensor_count": 255,
+      "tensor_inventory_sha256": "7e4bd8ff91dbb1749232e1119385eddd59fe9bef523098567d64c7c40e274f0b",
+      "marker_ids": {
+        "[SEP_STRUCT]": 128001,
+        "[SEP_TEXT]": 128002,
+        "[P]": 128003,
+        "[C]": 128004,
+        "[E]": 128005,
+        "[R]": 128006,
+        "[L]": 128007
+      },
+      "oracle": {
+        "path": "gliguard/oracle.json",
+        "size_bytes": 74265,
+        "sha256": "52d2cccfa21b18505e54f0fe98fbd8750538ebc1421e870a6bb544f13909fbb7"
+      }
+    }
+  },
+  "managed_install": {
+    "pii": {
+      "verified_pulls": 2,
+      "manifest": {
+        "type": "extractor",
+        "tasks": [
+          "extract"
+        ],
+        "inputs": [
+          "text"
+        ],
+        "capabilities": [
+          "named_entity_recognition"
+        ],
+        "gliner_specialty_profile": "pii",
+        "qualified_limits": {
+          "specialty": {
+            "sequence_tokens": 512,
+            "physical_batch_items": 1
+          }
+        }
+      }
+    },
+    "gliguard": {
+      "verified_pulls": 2,
+      "manifest": {
+        "type": "extractor",
+        "tasks": [
+          "extract"
+        ],
+        "inputs": [
+          "text"
+        ],
+        "capabilities": [
+          "classification"
+        ],
+        "gliner_specialty_profile": "gliguard",
+        "qualified_limits": {
+          "specialty": {
+            "sequence_tokens": 512,
+            "physical_batch_items": 8
+          }
+        },
+        "gliner_classification_head": "label_marker_mlp"
+      }
+    }
+  },
+  "artifact_drift": {
+    "matrix_rows": 36,
+    "instance_and_cold_extraction_probes": 72,
+    "negative_rows": 28,
+    "variants_in_order": [
+      "valid",
+      "asserted_valid",
+      "managed_valid",
+      "raw_config_drift",
+      "asserted_config_drift",
+      "managed_config_drift",
+      "managed_wrong_revision",
+      "managed_missing_revision",
+      "managed_wrong_format",
+      "managed_missing_format",
+      "asserted_wrong_profile",
+      "asserted_wrong_capability",
+      "asserted_decide_claim",
+      "asserted_malformed_capabilities",
+      "asserted_malformed_tasks",
+      "raw_wrong_weights",
+      "raw_fp16",
+      "managed_valid"
+    ]
+  },
+  "soak": {
+    "duration_seconds": 300.43886677594855,
+    "concurrency": 8,
+    "requests": 5545,
+    "items": 27616,
+    "coordinate_unit_validations": 69,
+    "versionless_cases": 23,
+    "ragged_items": {
+      "pii": 12,
+      "gliguard": 11
+    },
+    "public_maximum_request_items": 128,
+    "maximum_confidence_abs_error": 2.086162567138672e-06,
+    "host_pss_gate": {
+      "late_window_median_growth_bytes": 31390720,
+      "maximum_growth_bytes": 67108864,
+      "scope": "Linux process-group proportional set size; includes CUDA mapped host pages; excludes GPU-private memory"
+    },
+    "maximum_sampled_pss_bytes": 1002404864,
+    "catalog": {
+      "pii": {
+        "capabilities": [
+          "named_entity_recognition",
+          "extraction"
+        ],
+        "inputs": [
+          "text"
+        ],
+        "inference_capabilities": {
+          "version": 4,
+          "task": "extract",
+          "input_modalities": [
+            "text"
+          ],
+          "accepted_mime_types": [
+            "text/plain"
+          ],
+          "input_granularity": "item",
+          "output": "extraction",
+          "result_cardinality": "one_per_item",
+          "prompt_policy": "structured_schema",
+          "borrowed_attachments": false,
+          "framed_attachments": true,
+          "generation_grammar_v1": false,
+          "generation_token_logprobs_v1": false,
+          "model_aware_chunking_v1": false,
+          "numeric_responses_v1": false,
+          "rerank_documents_v1": false,
+          "image_transform": null,
+          "task_limits": {
+            "max_text_bytes_per_item": null,
+            "max_input_tokens_per_item": null,
+            "max_output_tokens_per_item": null,
+            "max_candidates_per_request": 128,
+            "max_schema_bytes": null
+          },
+          "batch": {
+            "mode": "serial_compatibility",
+            "preferred_items": 8,
+            "max_items": 128,
+            "max_encoded_media_bytes": 0,
+            "max_decoded_pixels": null,
+            "max_media_parts_per_item": 0,
+            "per_item_failures": false
+          }
+        },
+        "compatibility": "compatible",
+        "qualified_limits": {
+          "specialty": {
+            "sequence_tokens": 512,
+            "physical_batch_items": 1
+          }
+        }
+      },
+      "gliguard": {
+        "capabilities": [
+          "classification",
+          "zero_shot",
+          "multi_label"
+        ],
+        "inputs": [
+          "text"
+        ],
+        "inference_capabilities": {
+          "version": 4,
+          "task": "extract",
+          "input_modalities": [
+            "text"
+          ],
+          "accepted_mime_types": [
+            "text/plain"
+          ],
+          "input_granularity": "item",
+          "output": "extraction",
+          "result_cardinality": "one_per_item",
+          "prompt_policy": "structured_schema",
+          "borrowed_attachments": false,
+          "framed_attachments": true,
+          "generation_grammar_v1": false,
+          "generation_token_logprobs_v1": false,
+          "model_aware_chunking_v1": false,
+          "numeric_responses_v1": false,
+          "rerank_documents_v1": false,
+          "image_transform": null,
+          "task_limits": {
+            "max_text_bytes_per_item": null,
+            "max_input_tokens_per_item": null,
+            "max_output_tokens_per_item": null,
+            "max_candidates_per_request": 128,
+            "max_schema_bytes": null
+          },
+          "batch": {
+            "mode": "serial_compatibility",
+            "preferred_items": 8,
+            "max_items": 128,
+            "max_encoded_media_bytes": 0,
+            "max_decoded_pixels": null,
+            "max_media_parts_per_item": 0,
+            "per_item_failures": false
+          }
+        },
+        "compatibility": "compatible",
+        "qualified_limits": {
+          "specialty": {
+            "sequence_tokens": 512,
+            "physical_batch_items": 8
+          }
+        }
+      }
+    },
+    "idle_admission": {
+      "antfly_inference_admission_host_weight_bytes": 277099992,
+      "antfly_inference_admission_backend_weight_bytes": 4640310162,
+      "antfly_inference_admission_host_kv_bytes": 0,
+      "antfly_inference_admission_backend_kv_bytes": 0,
+      "antfly_inference_admission_host_scratch_bytes": 0,
+      "antfly_inference_admission_backend_scratch_bytes": 0,
+      "antfly_inference_admission_host_total_bytes": 277099992,
+      "antfly_inference_admission_backend_total_bytes": 4640310162
+    },
+    "backend_environment": {
+      "ANTFLY_INFERENCE_REQUIRED_BACKEND": "cuda",
+      "ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE": "f32",
+      "ANTFLY_CUDA_DEBERTA_GENERATED_TC_AUTO": "0"
+    },
+    "server_command": [
+      "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/zig-out/bin/antfly-inference-dev",
+      "run",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18985",
+      "--models-dir",
+      "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/.specialty-artifacts/production-managed",
+      "--max-loaded-models",
+      "2",
+      "--max-concurrent-requests",
+      "8",
+      "--kernel-jit-mode",
+      "off",
+      "--host-budget-mb",
+      "8192",
+      "--backend-budget-mb",
+      "12288",
+      "--combined-budget-mb",
+      "20480",
+      "--scratch-budget-mb",
+      "4096"
+    ]
+  },
+  "public_http": {
+    "validated_cases": 23,
+    "maximum_confidence_abs_error": 2.086162567138672e-06,
+    "timing_scope": "Loopback HTTP request send through complete response read; separate TCP request per sample; excludes model load, validation, warmups, and client JSON decode/checks",
+    "timings": [
+      {
+        "profile": "pii",
+        "id": "language_en",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 46,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 32.517575,
+          "p95": 32.6986774,
+          "samples": [
+            32.581495,
+            32.517575,
+            32.307017,
+            31.886653,
+            32.727973
+          ]
+        },
+        "items_per_second": 30.752600709001207,
+        "prepared_tokens_per_second": 1414.6196326140555
+      },
+      {
+        "profile": "pii",
+        "id": "language_fr",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 54,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 33.911337,
+          "p95": 34.074692,
+          "samples": [
+            33.982264,
+            32.61671,
+            33.168161,
+            34.097799,
+            33.911337
+          ]
+        },
+        "items_per_second": 29.488663334034865,
+        "prepared_tokens_per_second": 1592.3878200378826
+      },
+      {
+        "profile": "pii",
+        "id": "language_es",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 44,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 32.633254,
+          "p95": 32.9635382,
+          "samples": [
+            32.080587,
+            32.633254,
+            32.981218,
+            31.76115,
+            32.892819
+          ]
+        },
+        "items_per_second": 30.643588285740673,
+        "prepared_tokens_per_second": 1348.3178845725897
+      },
+      {
+        "profile": "pii",
+        "id": "language_de",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 47,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 32.653365,
+          "p95": 33.2870716,
+          "samples": [
+            32.653365,
+            31.721119,
+            32.192667,
+            33.350511,
+            33.033314
+          ]
+        },
+        "items_per_second": 30.624715094447385,
+        "prepared_tokens_per_second": 1439.3616094390272
+      },
+      {
+        "profile": "pii",
+        "id": "language_it",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 49,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 32.968083,
+          "p95": 33.453195199999996,
+          "samples": [
+            32.059484,
+            33.50483,
+            32.968083,
+            32.938771,
+            33.246656
+          ]
+        },
+        "items_per_second": 30.3323672171051,
+        "prepared_tokens_per_second": 1486.2859936381499
+      },
+      {
+        "profile": "pii",
+        "id": "language_pt",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 46,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 32.769013,
+          "p95": 33.084558,
+          "samples": [
+            33.099233,
+            32.328521,
+            32.769013,
+            33.025858,
+            31.730319
+          ]
+        },
+        "items_per_second": 30.51663472439649,
+        "prepared_tokens_per_second": 1403.7651973222385
+      },
+      {
+        "profile": "pii",
+        "id": "language_nl",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 47,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 32.384441,
+          "p95": 32.997807200000004,
+          "samples": [
+            32.256827,
+            33.053986,
+            32.31129,
+            32.384441,
+            32.773092
+          ]
+        },
+        "items_per_second": 30.879026134803436,
+        "prepared_tokens_per_second": 1451.3142283357615
+      },
+      {
+        "profile": "pii",
+        "id": "all_42_labels",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 207,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 56.318823,
+          "p95": 56.8569492,
+          "samples": [
+            56.38919,
+            56.973889,
+            56.318823,
+            56.216648,
+            56.284487
+          ]
+        },
+        "items_per_second": 17.756052891943426,
+        "prepared_tokens_per_second": 3675.502948632289
+      },
+      {
+        "profile": "pii",
+        "id": "repeated_unicode",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 55,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 33.207745,
+          "p95": 33.3441784,
+          "samples": [
+            33.207745,
+            32.909812,
+            33.360927,
+            32.386537,
+            33.277184
+          ]
+        },
+        "items_per_second": 30.113456966138468,
+        "prepared_tokens_per_second": 1656.2401331376159
+      },
+      {
+        "profile": "pii",
+        "id": "cross_label_overlap",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 47,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 32.774069,
+          "p95": 33.6177628,
+          "samples": [
+            31.882046,
+            32.774069,
+            32.144027,
+            33.744283,
+            33.111682
+          ]
+        },
+        "items_per_second": 30.51192697495084,
+        "prepared_tokens_per_second": 1434.0605678226896
+      },
+      {
+        "profile": "pii",
+        "id": "no_pii",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 25,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 30.501341,
+          "p95": 30.9315152,
+          "samples": [
+            30.094,
+            31.027447,
+            30.501341,
+            29.940274,
+            30.547788
+          ]
+        },
+        "items_per_second": 32.78544376130873,
+        "prepared_tokens_per_second": 819.6360940327181
+      },
+      {
+        "profile": "pii",
+        "id": "threshold_one",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 27,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 30.30515,
+          "p95": 30.881012799999997,
+          "samples": [
+            30.30515,
+            30.232686,
+            30.294702,
+            30.509804,
+            30.973815
+          ]
+        },
+        "items_per_second": 32.997691811457784,
+        "prepared_tokens_per_second": 890.9376789093602
+      },
+      {
+        "profile": "gliguard",
+        "id": "prompt_safety",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 26,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 19.074576,
+          "p95": 19.4891564,
+          "samples": [
+            19.074576,
+            19.562666,
+            19.195118,
+            19.044224,
+            18.611028
+          ]
+        },
+        "items_per_second": 52.42580490386785,
+        "prepared_tokens_per_second": 1363.070927500564
+      },
+      {
+        "profile": "gliguard",
+        "id": "prompt_toxicity",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 86,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 24.885909,
+          "p95": 25.92588,
+          "samples": [
+            25.014004,
+            26.153849,
+            24.761878,
+            24.553321,
+            24.885909
+          ]
+        },
+        "items_per_second": 40.1833824916743,
+        "prepared_tokens_per_second": 3455.77089428399
+      },
+      {
+        "profile": "gliguard",
+        "id": "jailbreak_detection",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 78,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 23.705393,
+          "p95": 23.886868800000002,
+          "samples": [
+            23.391332,
+            23.914718,
+            23.371876,
+            23.705393,
+            23.775472
+          ]
+        },
+        "items_per_second": 42.18449362978289,
+        "prepared_tokens_per_second": 3290.3905031230656
+      },
+      {
+        "profile": "gliguard",
+        "id": "response_safety",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 30,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 19.129967,
+          "p95": 19.847928,
+          "samples": [
+            18.621188,
+            18.697684,
+            19.129967,
+            19.942247,
+            19.470652
+          ]
+        },
+        "items_per_second": 52.27400549096608,
+        "prepared_tokens_per_second": 1568.2201647289826
+      },
+      {
+        "profile": "gliguard",
+        "id": "response_toxicity",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 90,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 24.714087,
+          "p95": 25.2262128,
+          "samples": [
+            24.611096,
+            24.914164,
+            25.304225,
+            24.631607,
+            24.714087
+          ]
+        },
+        "items_per_second": 40.462753084910645,
+        "prepared_tokens_per_second": 3641.647777641958
+      },
+      {
+        "profile": "gliguard",
+        "id": "response_refusal",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 31,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 19.431645,
+          "p95": 19.7103776,
+          "samples": [
+            19.776489,
+            19.431645,
+            19.059776,
+            19.445932,
+            19.380493
+          ]
+        },
+        "items_per_second": 51.462446951866404,
+        "prepared_tokens_per_second": 1595.3358555078585
+      },
+      {
+        "profile": "gliguard",
+        "id": "composed_all_six",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 268,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 56.412664,
+          "p95": 56.876889999999996,
+          "samples": [
+            56.926739,
+            56.412664,
+            56.677494,
+            55.285396,
+            56.032124
+          ]
+        },
+        "items_per_second": 17.726516159563037,
+        "prepared_tokens_per_second": 4750.706330762894
+      },
+      {
+        "profile": "gliguard",
+        "id": "benign_composed",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 160,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 35.474987,
+          "p95": 36.0416372,
+          "samples": [
+            34.638563,
+            34.716003,
+            35.918886,
+            36.072325,
+            35.474987
+          ]
+        },
+        "items_per_second": 28.188875728129233,
+        "prepared_tokens_per_second": 4510.220116500677
+      },
+      {
+        "profile": "gliguard",
+        "id": "multiple_toxicity_labels",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 177,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 37.7529,
+          "p95": 38.2805612,
+          "samples": [
+            37.7529,
+            38.373021,
+            37.683876,
+            37.910722,
+            36.614895
+          ]
+        },
+        "items_per_second": 26.488031383019585,
+        "prepared_tokens_per_second": 4688.381554794467
+      },
+      {
+        "profile": "gliguard",
+        "id": "fallback",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 76,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 23.98099,
+          "p95": 24.151113799999997,
+          "samples": [
+            24.158813,
+            23.39434,
+            23.920223,
+            23.98099,
+            24.120317
+          ]
+        },
+        "items_per_second": 41.69969630111184,
+        "prepared_tokens_per_second": 3169.1769188845
+      },
+      {
+        "profile": "gliguard",
+        "id": "task_label_order",
+        "request_items": 1,
+        "physical_batch_items": 1,
+        "prepared_tokens_per_item": 44,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 21.004173,
+          "p95": 21.0776922,
+          "samples": [
+            20.03655,
+            20.724304,
+            21.085916,
+            21.004173,
+            21.044797
+          ]
+        },
+        "items_per_second": 47.60958691399085,
+        "prepared_tokens_per_second": 2094.821824215597
+      }
+    ],
+    "backend_environment": {
+      "ANTFLY_INFERENCE_REQUIRED_BACKEND": "cuda",
+      "ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE": "f32",
+      "ANTFLY_CUDA_DEBERTA_GENERATED_TC_AUTO": "0"
+    },
+    "server_command": [
+      "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/zig-out/bin/antfly-inference-dev",
+      "run",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18984",
+      "--models-dir",
+      "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/.specialty-artifacts",
+      "--max-loaded-models",
+      "2",
+      "--max-concurrent-requests",
+      "8",
+      "--kernel-jit-mode",
+      "off",
+      "--host-budget-mb",
+      "8192",
+      "--backend-budget-mb",
+      "12288",
+      "--combined-budget-mb",
+      "20480",
+      "--scratch-budget-mb",
+      "4096",
+      "--preload-model",
+      "extractor:cuda:pii",
+      "--preload-model",
+      "extractor:cuda:gliguard"
+    ]
+  },
+  "public_http_batch8": {
+    "validated_cases": 23,
+    "maximum_confidence_abs_error": 2.086162567138672e-06,
+    "timing_scope": "Loopback HTTP request send through complete response read; separate TCP request per sample; excludes model load, validation, warmups, and client JSON decode/checks",
+    "timings": [
+      {
+        "profile": "gliguard",
+        "id": "prompt_safety",
+        "request_items": 8,
+        "physical_batch_items": 8,
+        "prepared_tokens_per_item": 26,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 32.721659,
+          "p95": 32.9028798,
+          "samples": [
+            32.721659,
+            32.231952,
+            32.748539,
+            32.941465,
+            32.389759
+          ]
+        },
+        "items_per_second": 244.48638132925961,
+        "prepared_tokens_per_second": 6356.64591456075
+      },
+      {
+        "profile": "gliguard",
+        "id": "composed_all_six",
+        "request_items": 8,
+        "physical_batch_items": 8,
+        "prepared_tokens_per_item": 268,
+        "warmups": 2,
+        "iterations": 5,
+        "latency_ms": {
+          "median": 296.144347,
+          "p95": 297.193065,
+          "samples": [
+            295.461823,
+            297.381021,
+            296.144347,
+            296.441241,
+            294.76761
+          ]
+        },
+        "items_per_second": 27.013853484091662,
+        "prepared_tokens_per_second": 7239.7127337365655
+      }
+    ],
+    "backend_environment": {
+      "ANTFLY_INFERENCE_REQUIRED_BACKEND": "cuda",
+      "ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE": "f32",
+      "ANTFLY_CUDA_DEBERTA_GENERATED_TC_AUTO": "0"
+    },
+    "server_command": [
+      "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/zig-out/bin/antfly-inference-dev",
+      "run",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18984",
+      "--models-dir",
+      "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/.specialty-artifacts",
+      "--max-loaded-models",
+      "2",
+      "--max-concurrent-requests",
+      "8",
+      "--kernel-jit-mode",
+      "off",
+      "--host-budget-mb",
+      "8192",
+      "--backend-budget-mb",
+      "12288",
+      "--combined-budget-mb",
+      "20480",
+      "--scratch-budget-mb",
+      "4096",
+      "--preload-model",
+      "extractor:cuda:pii",
+      "--preload-model",
+      "extractor:cuda:gliguard"
+    ]
+  },
+  "diagnostic_policies": {
+    "auto": {
+      "validated_cases": 23,
+      "maximum_confidence_abs_error": 2.086162567138672e-06,
+      "timing_scope": "Loopback HTTP request send through complete response read; separate TCP request per sample; excludes model load, validation, warmups, and client JSON decode/checks",
+      "backend_environment": {
+        "ANTFLY_INFERENCE_REQUIRED_BACKEND": "cuda",
+        "ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE": "auto",
+        "ANTFLY_CUDA_DEBERTA_GENERATED_TC_AUTO": "1"
+      },
+      "server_command": [
+        "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/zig-out/bin/antfly-inference-dev",
+        "run",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18984",
+        "--models-dir",
+        "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/.specialty-artifacts",
+        "--max-loaded-models",
+        "2",
+        "--max-concurrent-requests",
+        "8",
+        "--kernel-jit-mode",
+        "off",
+        "--host-budget-mb",
+        "8192",
+        "--backend-budget-mb",
+        "12288",
+        "--combined-budget-mb",
+        "20480",
+        "--scratch-budget-mb",
+        "4096",
+        "--preload-model",
+        "extractor:cuda:pii",
+        "--preload-model",
+        "extractor:cuda:gliguard"
+      ]
+    },
+    "streaming-f16": {
+      "validated_cases": 23,
+      "maximum_confidence_abs_error": 2.086162567138672e-06,
+      "timing_scope": "Loopback HTTP request send through complete response read; separate TCP request per sample; excludes model load, validation, warmups, and client JSON decode/checks",
+      "backend_environment": {
+        "ANTFLY_INFERENCE_REQUIRED_BACKEND": "cuda",
+        "ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE": "streaming-f16",
+        "ANTFLY_CUDA_DEBERTA_GENERATED_TC_AUTO": "1"
+      },
+      "server_command": [
+        "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/zig-out/bin/antfly-inference-dev",
+        "run",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18984",
+        "--models-dir",
+        "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/.specialty-artifacts",
+        "--max-loaded-models",
+        "2",
+        "--max-concurrent-requests",
+        "8",
+        "--kernel-jit-mode",
+        "off",
+        "--host-budget-mb",
+        "8192",
+        "--backend-budget-mb",
+        "12288",
+        "--combined-budget-mb",
+        "20480",
+        "--scratch-budget-mb",
+        "4096",
+        "--preload-model",
+        "extractor:cuda:pii",
+        "--preload-model",
+        "extractor:cuda:gliguard"
+      ]
+    },
+    "materialized-f16": {
+      "validated_cases": 23,
+      "maximum_confidence_abs_error": 2.086162567138672e-06,
+      "timing_scope": "Loopback HTTP request send through complete response read; separate TCP request per sample; excludes model load, validation, warmups, and client JSON decode/checks",
+      "backend_environment": {
+        "ANTFLY_INFERENCE_REQUIRED_BACKEND": "cuda",
+        "ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE": "materialized-f16",
+        "ANTFLY_CUDA_DEBERTA_GENERATED_TC_AUTO": "1"
+      },
+      "server_command": [
+        "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/zig-out/bin/antfly-inference-dev",
+        "run",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18984",
+        "--models-dir",
+        "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/.specialty-artifacts",
+        "--max-loaded-models",
+        "2",
+        "--max-concurrent-requests",
+        "8",
+        "--kernel-jit-mode",
+        "off",
+        "--host-budget-mb",
+        "8192",
+        "--backend-budget-mb",
+        "12288",
+        "--combined-budget-mb",
+        "20480",
+        "--scratch-budget-mb",
+        "4096",
+        "--preload-model",
+        "extractor:cuda:pii",
+        "--preload-model",
+        "extractor:cuda:gliguard"
+      ]
+    },
+    "generated-tc": {
+      "validated_cases": 23,
+      "maximum_confidence_abs_error": 2.086162567138672e-06,
+      "timing_scope": "Loopback HTTP request send through complete response read; separate TCP request per sample; excludes model load, validation, warmups, and client JSON decode/checks",
+      "backend_environment": {
+        "ANTFLY_INFERENCE_REQUIRED_BACKEND": "cuda",
+        "ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE": "generated-tc",
+        "ANTFLY_CUDA_DEBERTA_GENERATED_TC_AUTO": "1"
+      },
+      "server_command": [
+        "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/zig-out/bin/antfly-inference-dev",
+        "run",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18984",
+        "--models-dir",
+        "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/.specialty-artifacts",
+        "--max-loaded-models",
+        "2",
+        "--max-concurrent-requests",
+        "8",
+        "--kernel-jit-mode",
+        "off",
+        "--host-budget-mb",
+        "8192",
+        "--backend-budget-mb",
+        "12288",
+        "--combined-budget-mb",
+        "20480",
+        "--scratch-budget-mb",
+        "4096",
+        "--preload-model",
+        "extractor:cuda:pii",
+        "--preload-model",
+        "extractor:cuda:gliguard"
+      ]
+    }
+  },
+  "sanitizers": {
+    "memory": {
+      "tools": [
+        "memcheck",
+        "initcheck"
+      ],
+      "kernel_regex": null,
+      "all_kernel_coverage": true,
+      "vendor_library_scope": "No kernel-name filtering; project and vendor-library launches remain eligible",
+      "lanes": [
+        {
+          "tool": "memcheck",
+          "suite": "gru",
+          "elapsed_seconds": 1.9307288989657536,
+          "oracle_cases": 0,
+          "error_counts": [
+            0
+          ],
+          "racecheck_counts": [],
+          "leak_counts": [
+            [
+              0,
+              0
+            ]
+          ]
+        },
+        {
+          "tool": "memcheck",
+          "suite": "pii-head",
+          "elapsed_seconds": 26.330831211991608,
+          "oracle_cases": 12,
+          "error_counts": [
+            0
+          ],
+          "racecheck_counts": [],
+          "leak_counts": [
+            [
+              0,
+              0
+            ]
+          ]
+        },
+        {
+          "tool": "memcheck",
+          "suite": "gliguard-head",
+          "elapsed_seconds": 30.98719514696859,
+          "oracle_cases": 11,
+          "error_counts": [
+            0
+          ],
+          "racecheck_counts": [],
+          "leak_counts": [
+            [
+              0,
+              0
+            ]
+          ]
+        },
+        {
+          "tool": "initcheck",
+          "suite": "gru",
+          "elapsed_seconds": 1.5747224150691181,
+          "oracle_cases": 0,
+          "error_counts": [
+            0
+          ],
+          "racecheck_counts": [],
+          "leak_counts": []
+        },
+        {
+          "tool": "initcheck",
+          "suite": "pii-head",
+          "elapsed_seconds": 21.200276807998307,
+          "oracle_cases": 12,
+          "error_counts": [
+            0
+          ],
+          "racecheck_counts": [],
+          "leak_counts": []
+        },
+        {
+          "tool": "initcheck",
+          "suite": "gliguard-head",
+          "elapsed_seconds": 26.82051481900271,
+          "oracle_cases": 11,
+          "error_counts": [
+            0
+          ],
+          "racecheck_counts": [],
+          "leak_counts": []
+        }
+      ],
+      "sanitizer": {
+        "path": "/usr/local/cuda-13.0/bin/compute-sanitizer",
+        "sha256": "5cba659e1cd603aa2370e103425f184368e6ed405da90ce85743c4399c324dbc",
+        "version": "NVIDIA (R) Compute Sanitizer\nCopyright (c) 2020-2025 NVIDIA Corporation\nVersion 2025.3.1.0 (build 36400806) (public-release)",
+        "injection_libraries": {}
+      }
+    },
+    "synchronization": {
+      "tools": [
+        "racecheck",
+        "synccheck"
+      ],
+      "kernel_regex": "^termite_.*",
+      "all_kernel_coverage": false,
+      "vendor_library_scope": "Unmatched cuBLAS/vendor kernels are excluded; vendor-library coverage is not claimed",
+      "lanes": [
+        {
+          "tool": "racecheck",
+          "suite": "gru",
+          "elapsed_seconds": 1.8345075380057096,
+          "oracle_cases": 0,
+          "error_counts": [],
+          "racecheck_counts": [
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "leak_counts": []
+        },
+        {
+          "tool": "racecheck",
+          "suite": "pii-head",
+          "elapsed_seconds": 123.57190329907462,
+          "oracle_cases": 12,
+          "error_counts": [],
+          "racecheck_counts": [
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "leak_counts": []
+        },
+        {
+          "tool": "racecheck",
+          "suite": "gliguard-head",
+          "elapsed_seconds": 164.1847714810865,
+          "oracle_cases": 11,
+          "error_counts": [],
+          "racecheck_counts": [
+            [
+              0,
+              0,
+              0
+            ]
+          ],
+          "leak_counts": []
+        },
+        {
+          "tool": "synccheck",
+          "suite": "gru",
+          "elapsed_seconds": 1.4354675050126389,
+          "oracle_cases": 0,
+          "error_counts": [
+            0
+          ],
+          "racecheck_counts": [],
+          "leak_counts": []
+        },
+        {
+          "tool": "synccheck",
+          "suite": "pii-head",
+          "elapsed_seconds": 8.612401593942195,
+          "oracle_cases": 12,
+          "error_counts": [
+            0
+          ],
+          "racecheck_counts": [],
+          "leak_counts": []
+        },
+        {
+          "tool": "synccheck",
+          "suite": "gliguard-head",
+          "elapsed_seconds": 8.361710596014746,
+          "oracle_cases": 11,
+          "error_counts": [
+            0
+          ],
+          "racecheck_counts": [],
+          "leak_counts": []
+        }
+      ],
+      "sanitizer": {
+        "path": "/usr/local/cuda-13.0/bin/compute-sanitizer",
+        "sha256": "5cba659e1cd603aa2370e103425f184368e6ed405da90ce85743c4399c324dbc",
+        "version": "NVIDIA (R) Compute Sanitizer\nCopyright (c) 2020-2025 NVIDIA Corporation\nVersion 2025.3.1.0 (build 36400806) (public-release)",
+        "injection_libraries": {}
+      }
+    },
+    "scope": "memcheck/initcheck cover unfiltered kernels; racecheck/synccheck cover ^termite_.* project kernels. Unmatched vendor-library race/synchronization instrumentation is excluded.",
+    "complete_unfiltered_four_tool_campaign": false
+  },
+  "regressions": {
+    "selected": 287,
+    "passed": 224,
+    "skipped": 62,
+    "failed": 1,
+    "leaked": 0,
+    "status": "documented_out_of_scope_baseline_failure",
+    "baseline_exception": {
+      "test": "extractors.gliner_span_v2_executor.test.gliner span v2 GLiNER2.5-Decide Q8_0 bundle native parity",
+      "native_q8_qualified": false,
+      "raw_result_remains_failed": true,
+      "absolute_error": 0.06692218780517578,
+      "unchanged_absolute_threshold": 0.05,
+      "historical_log_sha256": "e74b321a1a2fae78656a8221b5e2c64c2ccce0abb2924618885e3a6e2e600c82",
+      "preexisting_documentation_sha256": "39823106bcd5c9ded0c6d31e9715883ce773ffe6a94b402da841e4cdd5f3c36d"
+    },
+    "skipped_tests": [
+      "architectures.gliner.boundary_engine.test.gliner boundary engine Python parity pinned small checkpoint CPU encoder and routing",
+      "architectures.gliner.boundary_engine_device_test.test.gliner boundary device Metal relative attention and physical integer gathers",
+      "architectures.gliner.boundary_engine_device_test.test.gliner boundary device Metal pinned small encoder routes and resident head parity",
+      "architectures.gliner.boundary_reduced_device_test.test.gliner boundary device Metal reduced linear and embedding preserve native bytes",
+      "architectures.gliner.boundary_scorer_device_test.test.gliner boundary device Metal pinned small full inference pipeline parity",
+      "architectures.gliner.boundary_scorer_device_test.test.gliner boundary device Metal pinned base full inference pipeline parity",
+      "architectures.gliner.boundary_scorer_device_test.test.gliner boundary device Metal pinned multi full inference pipeline parity",
+      "extractors.gliner_boundary_long_tasks_test.test.gliner boundary learned multi window native pinned small task ownership and retry",
+      "extractors.gliner_boundary_long_tasks_test.test.gliner boundary learned multi window Metal pinned small semantic task parity and retry",
+      "extractors.gliner_boundary_long_tasks_test.test.gliner boundary learned multi window CUDA pinned small semantic task parity and retry",
+      "server.model_manager.test.gliner boundary cache pinned small Metal handle retention eviction and reload",
+      "gliner_boundary_export.test.gliner boundary conversion pinned small FP32 roundtrip and same size substitution",
+      "ops.metal_compute.test.metal GLiNER GRU residual modes preserve cancellation-sensitive state on device",
+      "pipelines.gliner_boundary_pipeline.test.gliner boundary pipeline Python parity pinned small checkpoint all inference tasks",
+      "pipelines.gliner_boundary_pipeline.test.gliner boundary pipeline pinned multilingual Decide family reference",
+      "pipelines.gliner_boundary_pipeline.test.gliner boundary pipeline pinned multilingual Decide endpoint bounds",
+      "pipelines.gliner_boundary_pipeline.test.gliner boundary pipeline pinned multilingual Decide classification floor",
+      "pipelines.gliner_boundary_pipeline.test.gliner boundary pipeline pinned multilingual Decide general classification bounds",
+      "pipelines.gliner_boundary_pipeline.test.gliner boundary pipeline pinned multilingual Decide general entity bounds",
+      "pipelines.gliner_boundary_pipeline.test.gliner boundary pipeline pinned multilingual Decide clean entity short bound",
+      "pipelines.gliner_boundary_pipeline.test.gliner boundary pipeline pinned multilingual Decide source word floor",
+      "pipelines.gliner_boundary_pipeline.test.gliner boundary pipeline Python parity converted fp16 encoder base checkpoint all inference tasks native",
+      "pipelines.gliner_boundary_pipeline.test.gliner boundary pipeline Python parity converted fp16 encoder base checkpoint all inference tasks metal",
+      "extractors.gliner_boundary_long_executor.test.gliner boundary long executor pinned small one-window task parity and global admission",
+      "extractors.gliner_boundary_long_executor.test.gliner boundary long executor pinned small Metal one-window task parity and global admission",
+      "extractors.gliner_boundary_executor.test.gliner boundary executor pinned small production session and wire parity",
+      "extractors.gliner_boundary_executor.test.gliner boundary executor pinned small converted FP32 session and wire parity",
+      "extractors.gliner_boundary_executor.test.gliner boundary executor pinned small Metal converted FP32 session and wire parity",
+      "extractors.gliner_boundary_executor.test.gliner boundary executor pinned small window batch shares admission and recovers atomically",
+      "extractors.gliner_boundary_executor.test.gliner boundary executor pinned small Metal window batch shares admission and recovers atomically",
+      "extractors.gliner_span_v2_executor.test.gliner span v2 GLiNER2.5-Decide Metal parity",
+      "extractors.gliner_span_v2_executor.test.gliner span v2 GLiNER2.5-Decide Q8_0 bundle Metal parity",
+      "extractors.gliner_span_v2_executor.test.gliner span v2 GLiNER2.5-Decide Metal latency profile",
+      "extractors.gliner_specialty_parity_test.test.gliner specialty PII pinned Metal head oracle",
+      "extractors.gliner_specialty_parity_test.test.gliner specialty GLiGuard pinned Metal classifier oracle",
+      "server.gliner_boundary_service_test.test.gliner boundary v2 pinned small HTTP handler qualification and atomic recovery",
+      "server.gliner_boundary_service_test.test.gliner boundary provider extractDirect upgrades a plain request for the qualified base checkpoint",
+      "server.gliner_boundary_service_test.test.gliner boundary provider extractDirect throughput on a real corpus matches a live HTTP baseline",
+      "server.gliner_boundary_service_test.test.gliner boundary provider extractDirect throughput on a real corpus fp32 native",
+      "server.gliner_boundary_service_test.test.gliner boundary provider extractDirect throughput on a real corpus fp32 Metal",
+      "server.gliner_boundary_service_test.test.gliner boundary provider extractDirect throughput on a real corpus fp16 encoder native",
+      "server.gliner_boundary_service_test.test.gliner boundary provider extractDirect throughput on a real corpus fp16 encoder Metal",
+      "server.gliner_boundary_service_test.test.gliner boundary long executor HTTP canonical schema_version 2 shape for a real multi-window document with relations Metal",
+      "server.gliner_boundary_service_test.test.gliner boundary long executor HTTP canonical schema_version 2 shape for a real multi-window document with relations fp16 encoder native",
+      "server.gliner_boundary_service_test.test.gliner boundary long executor HTTP canonical schema_version 2 shape for a real multi-window document with relations fp16 encoder Metal",
+      "server.gliner_boundary_service_test.test.gliner boundary long executor provider extractDirect canonical schema_version 2 relations shape for a windowed request Metal",
+      "server.gliner_boundary_service_test.test.gliner boundary long executor provider extractDirect canonical schema_version 2 relations shape for a windowed request fp16 encoder native",
+      "server.gliner_boundary_service_test.test.gliner boundary long executor provider extractDirect canonical schema_version 2 relations shape for a windowed request fp16 encoder Metal",
+      "server.gliner_boundary_service_test.test.gliner boundary long executor HTTP canonical schema_version 2 shape for the corpus-maximum real section fp16 encoder",
+      "server.gliner_boundary_service_test.test.gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-maximum real section fp16 encoder",
+      "server.gliner_boundary_service_test.test.gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-minimum real section Metal",
+      "server.gliner_boundary_service_test.test.gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-minimum real section fp16 encoder native",
+      "server.gliner_boundary_service_test.test.gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-minimum real section fp16 encoder Metal",
+      "server.gliner_boundary_service_test.test.gliner boundary long executor fp32 vs fp16 encoder parity on real long documents native",
+      "server.gliner_boundary_service_test.test.gliner boundary long executor fp32 vs fp16 encoder parity on real long documents Metal",
+      "server.gliner_boundary_socket_test.test.gliner boundary socket pinned small real HTTP success atomic recovery and metrics",
+      "server.gliner_boundary_concurrency_test.test.gliner boundary socket pinned small concurrent admission rejection release and retry",
+      "server.gliner_boundary_metal_socket_test.test.gliner boundary socket pinned small Metal managed HTTP success atomic recovery and residency",
+      "server.gliner_boundary_metal_socket_test.test.gliner boundary socket pinned small Metal admits concurrent extracts and serializes execution",
+      "server.gliner_specialty_service_test.test.GLiNER specialty PII public HTTP Metal",
+      "server.gliner_specialty_service_test.test.GLiNER specialty GLiGuard public HTTP Metal",
+      "server.gliner_boundary_queued_cancellation_test.test.gliner boundary socket pinned small Metal queued cancellation releases admission before unlock and retries"
+    ]
+  },
+  "cuda_owned_buffer_receipts": [
+    {
+      "profile": "pii",
+      "backend": "cuda",
+      "cases": 12,
+      "timings": [
+        {
+          "id": "language_en",
+          "prepared_tokens": 46,
+          "samples_ns": [
+            32952826,
+            31859977,
+            31288096,
+            31435646,
+            31138466
+          ],
+          "h2d_bytes": 36640,
+          "d2h_bytes": 10800,
+          "allocations": 0
+        },
+        {
+          "id": "language_fr",
+          "prepared_tokens": 54,
+          "samples_ns": [
+            32225188,
+            32012182,
+            31801961,
+            32782812,
+            32733501
+          ],
+          "h2d_bytes": 42120,
+          "d2h_bytes": 11600,
+          "allocations": 0
+        },
+        {
+          "id": "language_es",
+          "prepared_tokens": 44,
+          "samples_ns": [
+            31671115,
+            30470187,
+            31497741,
+            30666568,
+            30959636
+          ],
+          "h2d_bytes": 33400,
+          "d2h_bytes": 8400,
+          "allocations": 0
+        },
+        {
+          "id": "language_de",
+          "prepared_tokens": 47,
+          "samples_ns": [
+            30959445,
+            31748778,
+            30662057,
+            31137490,
+            30393100
+          ],
+          "h2d_bytes": 34520,
+          "d2h_bytes": 7600,
+          "allocations": 0
+        },
+        {
+          "id": "language_it",
+          "prepared_tokens": 49,
+          "samples_ns": [
+            30866439,
+            31189602,
+            31979367,
+            31597501,
+            32228148
+          ],
+          "h2d_bytes": 36400,
+          "d2h_bytes": 8400,
+          "allocations": 0
+        },
+        {
+          "id": "language_pt",
+          "prepared_tokens": 46,
+          "samples_ns": [
+            31582429,
+            31368640,
+            30707481,
+            31386976,
+            31248418
+          ],
+          "h2d_bytes": 33920,
+          "d2h_bytes": 7600,
+          "allocations": 0
+        },
+        {
+          "id": "language_nl",
+          "prepared_tokens": 47,
+          "samples_ns": [
+            31233090,
+            31176450,
+            30657833,
+            31025925,
+            31245490
+          ],
+          "h2d_bytes": 36560,
+          "d2h_bytes": 10000,
+          "allocations": 0
+        },
+        {
+          "id": "all_42_labels",
+          "prepared_tokens": 207,
+          "samples_ns": [
+            54845048,
+            55652286,
+            54849160,
+            53923380,
+            54681066
+          ],
+          "h2d_bytes": 134040,
+          "d2h_bytes": 81040,
+          "allocations": 0
+        },
+        {
+          "id": "repeated_unicode",
+          "prepared_tokens": 55,
+          "samples_ns": [
+            31652844,
+            32258036,
+            32233285,
+            32645360,
+            32896972
+          ],
+          "h2d_bytes": 39960,
+          "d2h_bytes": 6800,
+          "allocations": 0
+        },
+        {
+          "id": "cross_label_overlap",
+          "prepared_tokens": 47,
+          "samples_ns": [
+            31478895,
+            31280114,
+            31062548,
+            31892953,
+            31091299
+          ],
+          "h2d_bytes": 35960,
+          "d2h_bytes": 12720,
+          "allocations": 0
+        },
+        {
+          "id": "no_pii",
+          "prepared_tokens": 25,
+          "samples_ns": [
+            28593973,
+            29734470,
+            29592232,
+            29378219,
+            29383258
+          ],
+          "h2d_bytes": 19160,
+          "d2h_bytes": 2320,
+          "allocations": 0
+        },
+        {
+          "id": "threshold_one",
+          "prepared_tokens": 27,
+          "samples_ns": [
+            29200637,
+            29000080,
+            29752742,
+            29720134,
+            29386187
+          ],
+          "h2d_bytes": 20360,
+          "d2h_bytes": 2320,
+          "allocations": 0
+        }
+      ],
+      "elapsed_ns": 1986075739,
+      "h2d_bytes": 18288520,
+      "d2h_bytes": 10641920,
+      "kernel_launches": 63350,
+      "gru_calls": 362,
+      "gru_no_residual_calls": 362,
+      "device_alloc_calls": 42,
+      "initial_device_memory": {
+        "limit": 18446744073709551615,
+        "live": 1228920916,
+        "peak": 1228920916
+      },
+      "final_device_memory": {
+        "limit": 18446744073709551615,
+        "live": 1462869588,
+        "peak": 1462869588
+      },
+      "max_reserved_scratch_bytes": 534864896,
+      "reserved_physical_peak_bytes": 1763785812,
+      "idle_admission": {
+        "host_weight_bytes": 176983256,
+        "backend_weight_bytes": 2763949419,
+        "host_kv_bytes": 0,
+        "backend_kv_bytes": 0,
+        "host_scratch_bytes": 0,
+        "backend_scratch_bytes": 0
+      }
+    },
+    {
+      "profile": "gliguard",
+      "backend": "cuda",
+      "cases": 11,
+      "timings": [
+        {
+          "id": "prompt_safety",
+          "prepared_tokens": 26,
+          "samples_ns": [
+            19300976,
+            18319212,
+            17924369,
+            17750627,
+            19654684
+          ],
+          "h2d_bytes": 15600,
+          "d2h_bytes": 40,
+          "allocations": 0
+        },
+        {
+          "id": "prompt_toxicity",
+          "prepared_tokens": 86,
+          "samples_ns": [
+            23822136,
+            23286382,
+            23818568,
+            24269987,
+            26314905
+          ],
+          "h2d_bytes": 51860,
+          "d2h_bytes": 300,
+          "allocations": 0
+        },
+        {
+          "id": "jailbreak_detection",
+          "prepared_tokens": 78,
+          "samples_ns": [
+            27425851,
+            27235341,
+            23258639,
+            22301787,
+            23411053
+          ],
+          "h2d_bytes": 47000,
+          "d2h_bytes": 240,
+          "allocations": 0
+        },
+        {
+          "id": "response_safety",
+          "prepared_tokens": 30,
+          "samples_ns": [
+            18253645,
+            18278845,
+            18238718,
+            18579114,
+            19556621
+          ],
+          "h2d_bytes": 18000,
+          "d2h_bytes": 40,
+          "allocations": 0
+        },
+        {
+          "id": "response_toxicity",
+          "prepared_tokens": 90,
+          "samples_ns": [
+            25053481,
+            23886360,
+            24994441,
+            24271539,
+            25013545
+          ],
+          "h2d_bytes": 54260,
+          "d2h_bytes": 300,
+          "allocations": 0
+        },
+        {
+          "id": "response_refusal",
+          "prepared_tokens": 31,
+          "samples_ns": [
+            19127715,
+            18990788,
+            18469179,
+            19647388,
+            19847449
+          ],
+          "h2d_bytes": 18600,
+          "d2h_bytes": 40,
+          "allocations": 0
+        },
+        {
+          "id": "composed_all_six",
+          "prepared_tokens": 268,
+          "samples_ns": [
+            55842187,
+            54376829,
+            55261474,
+            55386369,
+            55587999
+          ],
+          "h2d_bytes": 161720,
+          "d2h_bytes": 960,
+          "allocations": 0
+        },
+        {
+          "id": "benign_composed",
+          "prepared_tokens": 160,
+          "samples_ns": [
+            34166904,
+            33561903,
+            33898076,
+            34628243,
+            34797760
+          ],
+          "h2d_bytes": 96540,
+          "d2h_bytes": 580,
+          "allocations": 0
+        },
+        {
+          "id": "multiple_toxicity_labels",
+          "prepared_tokens": 177,
+          "samples_ns": [
+            36371837,
+            36286574,
+            36154560,
+            36667225,
+            36574843
+          ],
+          "h2d_bytes": 106740,
+          "d2h_bytes": 580,
+          "allocations": 0
+        },
+        {
+          "id": "fallback",
+          "prepared_tokens": 76,
+          "samples_ns": [
+            22809861,
+            22367979,
+            22196349,
+            22639976,
+            22630056
+          ],
+          "h2d_bytes": 45840,
+          "d2h_bytes": 280,
+          "allocations": 0
+        },
+        {
+          "id": "task_label_order",
+          "prepared_tokens": 44,
+          "samples_ns": [
+            19373392,
+            19815371,
+            19561197,
+            19941913,
+            20016024
+          ],
+          "h2d_bytes": 26440,
+          "d2h_bytes": 80,
+          "allocations": 0
+        }
+      ],
+      "elapsed_ns": 1491218246,
+      "h2d_bytes": 17072984,
+      "d2h_bytes": 7096,
+      "kernel_launches": 17367,
+      "gru_calls": 0,
+      "gru_no_residual_calls": 0,
+      "device_alloc_calls": 50,
+      "initial_device_memory": {
+        "limit": 18446744073709551615,
+        "live": 834433620,
+        "peak": 834433620
+      },
+      "final_device_memory": {
+        "limit": 18446744073709551615,
+        "live": 1188345428,
+        "peak": 1188345428
+      },
+      "max_reserved_scratch_bytes": 1108475904,
+      "reserved_physical_peak_bytes": 1942909524,
+      "idle_admission": {
+        "host_weight_bytes": 100116736,
+        "backend_weight_bytes": 1876360743,
+        "host_kv_bytes": 0,
+        "backend_kv_bytes": 0,
+        "host_scratch_bytes": 0,
+        "backend_scratch_bytes": 0
+      }
+    }
+  ],
+  "memory_scope": "Owned CUDA buffers and admission reservations; vendor/driver-private allocations excluded. Host process-group PSS is reported separately.",
+  "runtime_library_provenance": {
+    "format_version": 1,
+    "status": "captured",
+    "captured_unix_seconds": 1793339640.0876074,
+    "scope": "Actual mapped CUDA libraries and binary hashes of the owned final GB10 soak supervisor and GPU worker; read-only /proc snapshot",
+    "processes": [
+      {
+        "pid": 2004961,
+        "pgid": 2004961,
+        "server_binary_sha256": "079ca98ab412687d1e1bf1aef42f316870e281ac624e869ddec8778ebe08aeca",
+        "libraries": {}
+      },
+      {
+        "pid": 2004962,
+        "pgid": 2004961,
+        "server_binary_sha256": "079ca98ab412687d1e1bf1aef42f316870e281ac624e869ddec8778ebe08aeca",
+        "libraries": {
+          "/usr/local/cuda-13.0/targets/sbsa-linux/lib/libcublasLt.so.13.1.1.3": {
+            "size_bytes": 629945952,
+            "sha256": "930418840b747413584867cb7167dd5911dcf4184135589e0334527e9abbac9f"
+          },
+          "/usr/lib/aarch64-linux-gnu/libcuda.so.580.178.04": {
+            "size_bytes": 96460560,
+            "sha256": "b11359b073ae9e49df81dc4f5c156378bd97fb9f6197ef64edc46e22c670bed4"
+          }
+        }
+      }
+    ],
+    "CUDA_CACHE_PATH": "/home/tim/antfly/.worktrees/feat-gliner2-privacy-gpu/zig/pkg/inference/.zig-cache/cuda-driver"
+  },
+  "metal_qualification": {
+    "executed": false,
+    "qualified": false
+  },
+  "reproducible_build_attested": false,
+  "references": [
+    {
+      "path": "manifest.json",
+      "sha256": "8845b1acdee019db2f8b58850359f2443b459200fc843fb925539bccc55784ad",
+      "size_bytes": 3957
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-source-frozen.json",
+      "sha256": "91c031caac11b70d2933f7f076d714b35854bfdf123fa97a932e558be137c996",
+      "size_bytes": 147423
+    },
+    {
+      "path": "../../../.specialty-production-final-regressions.log",
+      "sha256": "20f81669a150e4cdf6924059629460372eaaf39f30fda703b164f3906d7efc7a",
+      "size_bytes": 56951
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-native-q8-baseline.json",
+      "sha256": "72d0a6b31314ca17e6a68792a127ebe90672d26447c10ace4a8bc841db779e6e",
+      "size_bytes": 8463
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-native-q8-current-full.log",
+      "sha256": "20f81669a150e4cdf6924059629460372eaaf39f30fda703b164f3906d7efc7a",
+      "size_bytes": 56951
+    },
+    {
+      "path": "../../../../../../../qualify-gliner25-cuda/.benchmark-results/gliner25-cuda/batch-gate-final.log",
+      "sha256": "e74b321a1a2fae78656a8221b5e2c64c2ccce0abb2924618885e3a6e2e600c82",
+      "size_bytes": 20391
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-native-q8-historical-full.log",
+      "sha256": "e74b321a1a2fae78656a8221b5e2c64c2ccce0abb2924618885e3a6e2e600c82",
+      "size_bytes": 20391
+    },
+    {
+      "path": "../../../scripts/gliner25/CUDA.md",
+      "sha256": "39823106bcd5c9ded0c6d31e9715883ce773ffe6a94b402da841e4cdd5f3c36d",
+      "size_bytes": 41200
+    },
+    {
+      "path": "../../../src/ops/native_compute.zig",
+      "sha256": "de6f0f48fe6261c82ebc953dc6611eb8f6eda21dbcf5ad3a1ecd16bde3d3175c",
+      "size_bytes": 2566050
+    },
+    {
+      "path": "../../../src/backends/native.zig",
+      "sha256": "bb7b8a0c9b4fcb8396397c18a3e7db199f4e1049087b8f81c74dd6f6d33d6137",
+      "size_bytes": 13556
+    },
+    {
+      "path": "../../../src/graph/quant_matmul.zig",
+      "sha256": "ebd78236578a6671316cc2929e6236f5cf7371df79cb81b271965e6db578a6a0",
+      "size_bytes": 34840
+    },
+    {
+      "path": "../../../src/gguf/quant_codec.zig",
+      "sha256": "8be37848076ad923bf3139f557c1b3b4130ffb6b6e3aed822d1de0cba561abe4",
+      "size_bytes": 213423
+    },
+    {
+      "path": "../../../src/gguf/tensor_types.zig",
+      "sha256": "323e617a454ac26b2b4c862d2b46b7d9ed81fe6b43704b3cd77e41d9c6c0393c",
+      "size_bytes": 13576
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-build-receipt.json",
+      "sha256": "b185d5274726e52289a537f10c375f0cd100105c416557d57123f7834646e7a9",
+      "size_bytes": 6229
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-cuda-artifacts.json",
+      "sha256": "3f4adbf739f1c16e8af0ff6ba6d3b5829f713adbaf25b251f442259ba9957ebd",
+      "size_bytes": 1883
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-managed-install.json",
+      "sha256": "055c995eb63f73b50af97932d5f17b0bb77d1e9f139a370a02fa6a314d4877a8",
+      "size_bytes": 22602
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-artifact-drift.json",
+      "sha256": "d0ca1e2771ed05f601af55bf05654f049a68e6c50ec992cd31993b8a349e3c50",
+      "size_bytes": 72786
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-soak.json",
+      "sha256": "ba0439c848f0fcb426c02663578670614d01dd38bc51baaaf658790115e553f9",
+      "size_bytes": 1424613
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-http.json",
+      "sha256": "488efbb9051458f215ed137db560b8a942c1cd8e0592c080a57c81e54682a9a1",
+      "size_bytes": 48248
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-http-batch8.json",
+      "sha256": "a7e03b2e8879daa87955470dfe775c3f89cfac60115a5324f5370beda6e9fce9",
+      "size_bytes": 37086
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-memory.json",
+      "sha256": "330a5db186f68c96da7b45a0698290b2f7dcb1561364755d0dab92069150469a",
+      "size_bytes": 196210
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-sync.json",
+      "sha256": "7ed707604f9375132d015773446720b711016571f040c0bc1ccb79d15802352a",
+      "size_bytes": 193229
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-policy-auto.json",
+      "sha256": "aacacc19bfb7f084fd95f63e846c4d16f65b596a38cc30d1e55a503d86cef288",
+      "size_bytes": 36899
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-policy-streaming-f16.json",
+      "sha256": "a2579294051c4a15ebc65b34c30455dfa62956e75d3202f918486556ec3fa600",
+      "size_bytes": 36926
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-policy-materialized-f16.json",
+      "sha256": "c71eb2d6ff36ffd7a335bd1789ecad45525728c2767c6f674f19271562499f5e",
+      "size_bytes": 36936
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-policy-generated-tc.json",
+      "sha256": "e5c0775102732c7621a767c14186af57a6d8dcb406ade8db74e3dbb40cab580c",
+      "size_bytes": 36923
+    },
+    {
+      "path": "../../../.specialty-production-final-build.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    {
+      "path": "../../../.specialty-production-cuda-artifact-check.log",
+      "sha256": "37998e6f72030e651cb42bab6e120fb76ac8a542619c4978b449b514fd0f8084",
+      "size_bytes": 61577
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-managed-install.pii.pull-1.log",
+      "sha256": "2796f94700d4b5784f3e370410685a3c28a397a1b4c28a57f2e6883d8135353f",
+      "size_bytes": 691
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-managed-install.pii.pull-2.log",
+      "sha256": "62b1023138c45871d4f101f8d01189dc8ec7773648d376a3101a9406e74dbc43",
+      "size_bytes": 691
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-managed-install.gliguard.pull-1.log",
+      "sha256": "ec694f296df61c1849da9efac95d4ba054bce4c39af1ec8f60b6d0e43e172b1c",
+      "size_bytes": 683
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-managed-install.gliguard.pull-2.log",
+      "sha256": "ec694f296df61c1849da9efac95d4ba054bce4c39af1ec8f60b6d0e43e172b1c",
+      "size_bytes": 683
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-managed-install.list.log",
+      "sha256": "4fead3d23dd652b9ff4e24236b9930008507f5bab5dcbc4808576e40683b91fd",
+      "size_bytes": 103
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-artifact-drift.server.log",
+      "sha256": "d1e340796c876ead4c6f6a08ac7e9e3d82f47492e0f50b16e58723c366ff0dbc",
+      "size_bytes": 37338
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-http.server.log",
+      "sha256": "6ca5bb7623a9bde91af9dcb4d9e2b8af34e5ff94237309a775466582542514f2",
+      "size_bytes": 4194
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-http-batch8.server.log",
+      "sha256": "eb7858d49676b2659981c20bfc8e493d73f6d7feafb52ce9783265644620c955",
+      "size_bytes": 4194
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-policy-auto.server.log",
+      "sha256": "e1b2fdf77f9dcc28d35e3021457f3a2fe833adf355e9c1a50b157583a29c8a47",
+      "size_bytes": 4194
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-policy-streaming-f16.server.log",
+      "sha256": "7fcbe1eb1fb2e64d79def4c2fa65965668b7e4ad1e9cfba4ec3a03d785b01ec7",
+      "size_bytes": 4194
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-policy-materialized-f16.server.log",
+      "sha256": "da05092f37a648ccc9fe7e9927fccf422d095b5a903e5a2e64c5e1c84795218a",
+      "size_bytes": 4194
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-policy-generated-tc.server.log",
+      "sha256": "3dcc9fc5c217e5d843734174e35bf50992f62f5296a50031a50513f1dc9a356d",
+      "size_bytes": 4194
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-soak.server.log",
+      "sha256": "9a9aec0d70d8bdd14c4d9db471bda3ee9f74b4969da64299b774621549416a3d",
+      "size_bytes": 7379
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-memory.memcheck.gru.log",
+      "sha256": "106db6c4f9ca99289507cf6b92e7bc772954417061c6c6e53805761c0d12a13e",
+      "size_bytes": 268
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-memory.memcheck.pii-head.log",
+      "sha256": "cba79a2692f3a1978e74cef920fa66f8c10d0694c323e06efdecacb6c5e6f903",
+      "size_bytes": 565
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-memory.memcheck.gliguard-head.log",
+      "sha256": "4703328b4a28de8355670ed83b2e75c3cfac8184241375537acb167d2b7ef1d5",
+      "size_bytes": 608
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-memory.initcheck.gru.log",
+      "sha256": "669d21f8684072b3ccfdbcd809544d7f67c8ad0dfcde6f2cb6adbca25a3f3da8",
+      "size_bytes": 212
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-memory.initcheck.pii-head.log",
+      "sha256": "caca46b11c2eed5d7cf1c8da6cad1c236b1d250e7506745b933d0a4da2a0ebc5",
+      "size_bytes": 509
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-memory.initcheck.gliguard-head.log",
+      "sha256": "8387781c2d46efdde88eeb446cd4fea90c2700072137add2707d6ae1d0b6ad7e",
+      "size_bytes": 552
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-sync.racecheck.gru.log",
+      "sha256": "fd4620991b20d7acf4052dae14d3c863317bc41f22665c2dd1371a5d93b63c58",
+      "size_bytes": 956
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-sync.racecheck.pii-head.log",
+      "sha256": "80d667647521df4db9bfcb514a43b6bb4ceb4b0b92a06d468fade22070853159",
+      "size_bytes": 1219
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-sync.racecheck.gliguard-head.log",
+      "sha256": "ea947e07cdcf053cdcbfc5592937a8277e6e5b30cf11cb0ad8e93ef1fb32b4af",
+      "size_bytes": 1273
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-sync.synccheck.gru.log",
+      "sha256": "6d8047097d52d1675e23126430a73c1685985c5086c1fddc1b5a3941b000663e",
+      "size_bytes": 918
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-sync.synccheck.pii-head.log",
+      "sha256": "f778cf270739d0925ac2f5f143d99561c80b57a12fdad9c9b22b6cb0c396fbf2",
+      "size_bytes": 1181
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-sanitizers-sync.synccheck.gliguard-head.log",
+      "sha256": "9d31902673923874f411383c4c54e5bbcf8bd3c201d138e501f5279eedc81545",
+      "size_bytes": 1235
+    },
+    {
+      "path": "../../../../../../.specialty-artifacts/production-final-runtime-libraries.json",
+      "sha256": "a7a74c691fc5d6bf5738cbd8734e19b134d0d04a6fcb86ce96f4b349123f24d9",
+      "size_bytes": 1148
+    }
+  ]
+}

@@ -24,17 +24,18 @@ const Loopback = @import("gliner_boundary_socket_test.zig").Loopback;
 const Io = std.Io;
 const factory = @import("../architectures/session_factory.zig");
 
-fn queuedCancellation(node: *Node, transport: *Loopback, directory: []const u8, path: []const u8, body: []const u8, expected: []const u8) !void {
+pub fn queuedCancellation(node: *Node, transport: *Loopback, directory: []const u8, path: []const u8, body: []const u8, expected: []const u8) !void {
     var handle = node.model_manager.acquireLoadedModel(directory) orelse return error.MissingLoadedModel;
     defer handle.release();
     const loaded = handle.get();
-    const boundary = loaded.manifest.gliner_architecture == .boundary;
+    const boundary = loaded.manifest.gliner_architecture == .boundary or loaded.manifest.gliner_specialty_profile != null;
     const queue = if (boundary) &loaded.gliner_boundary_admission_lock else loaded.targetInferenceExecutionMutex() orelse return error.MissingCudaExecutionMutex;
     try std.testing.expect(queue.tryLock());
     var held = true;
     defer if (held) queue.unlock();
     const domain = node.model_manager.resource_domain orelse return error.MissingResourceDomain;
     const retained = domain.admission.snapshot();
+    const expected_handles = loaded.active_handles + 1;
     const before = factory.getCudaRuntimeStats(loaded.session).?;
     var peer = try transport.connect();
     var open = true;
@@ -53,7 +54,7 @@ fn queuedCancellation(node: *Node, transport: *Loopback, directory: []const u8, 
             defer node.model_manager.load_lock.unlock();
             handles = loaded.active_handles;
         }
-        if (handles == 2) break;
+        if (handles == expected_handles) break;
         if (platform.time.monotonicNs() >= deadline) return error.QueueAdmissionTimeout;
         try std.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
@@ -74,7 +75,7 @@ fn queuedCancellation(node: *Node, transport: *Loopback, directory: []const u8, 
     peer.close();
     open = false;
     try transport.idle();
-    try std.testing.expectEqual(@as(usize, 1), loaded.active_handles);
+    try std.testing.expectEqual(expected_handles - 1, loaded.active_handles);
     try std.testing.expectEqual(retained, domain.admission.snapshot());
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
     try std.testing.expectEqual(before.kernel_launches, factory.getCudaRuntimeStats(loaded.session).?.kernel_launches);

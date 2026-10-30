@@ -44,6 +44,8 @@ const document = @import("../pipelines/gliner_boundary_long_document.zig");
 
 pub const Options = struct {
     modern_span_extraction: bool = false,
+    /// Bound only after exact original FP32 artifact qualification.
+    specialty_profile: ?@import("../models/gliner_specialty_qualification.zig").Profile = null,
     /// Admitted accelerator classification rows per physical forward.
     classification_batch_items: usize = 1,
     max_response_bytes: usize = 64 * 1024 * 1024,
@@ -80,8 +82,8 @@ fn progress(options: Options, index: ?usize, stage: []const u8) !void {
     if (options.failure) |failure| failure.* = .{ .input_index = index, .stage = stage };
 }
 
-/// Classification is the only span task on this route; entity, relation and
-/// structure extraction for span checkpoints stay on schema_version 1.
+/// Legacy span classification, declared modern span tasks and exactly
+/// qualified specialty tasks share the schema-v2 route.
 pub fn preflight(request: *const wire.Request, options: Options) !void {
     try boundary_executor.preflight(request, .{ .control = options.control, .failure = options.failure, .max_response_bytes = options.max_response_bytes, .pipeline = options.pipeline });
     for (request.items, 0..) |item, index| {
@@ -89,7 +91,14 @@ pub fn preflight(request: *const wire.Request, options: Options) !void {
         const schema = item.compiled.schema;
         const spans = schema.entities.len != 0 or schema.relations.len != 0;
         if (schema.classifications.len == 0 and !spans) return error.UnsupportedGlinerSpanV2Task;
-        if (spans and !options.modern_span_extraction) return error.UnsupportedGlinerSpanV2Task;
+        if (options.specialty_profile) |specialty| {
+            if (item.options.long_document.mode != .reject) return error.UnsupportedGlinerSpanV2Task;
+            switch (specialty) {
+                .pii => if (schema.entities.len == 0 or schema.classifications.len != 0 or schema.relations.len != 0) return error.UnsupportedGlinerSpanV2Task,
+                .gliguard => if (spans) return error.UnsupportedGlinerSpanV2Task,
+            }
+        }
+        if (spans and !options.modern_span_extraction and options.specialty_profile != .pii) return error.UnsupportedGlinerSpanV2Task;
         if (schema.entity_attributes.len != 0 or schema.structures.len != 0 or schema.joint_ie != null) return error.UnsupportedGlinerSpanV2Task;
         for (schema.entities) |entity| if (entity.validators.len != 0) return error.UnsupportedGlinerSpanV2Task;
         for (schema.relations) |relation| if (relation.source != null or relation.target != null) return error.UnsupportedGlinerSpanV2Task;
@@ -420,12 +429,17 @@ pub const PreparedItem = struct {
 
 /// Tokenizes and splits one item. Needs no backend or model lock.
 pub fn prepareItem(allocator: Allocator, tokenizer: Tokenizer, item: *const wire.Item, processor_options: processor.Options, options: Options) !PreparedItem {
+    if (options.specialty_profile != null and item.options.long_document.mode != .reject) return error.UnsupportedGlinerSpanV2Task;
+    var bounded_processor_options = processor_options;
+    if (options.specialty_profile != null) {
+        bounded_processor_options.max_sequence_tokens = @min(bounded_processor_options.max_sequence_tokens, 512);
+    }
     if (item.options.long_document.mode == .window) return @import("gliner_span_long_executor.zig").prepare(allocator, tokenizer, item, processor_options, options);
     const classifications = item.compiled.schema.classifications;
     if (item.compiled.schema.entities.len != 0 or item.compiled.schema.relations.len != 0) {
         const batches = try allocator.alloc(processor.PreparedBatch, 1);
         errdefer allocator.free(batches);
-        batches[0] = try processor.prepare(allocator, tokenizer, &.{.{ .text = item.text, .schema = &item.compiled }}, processor_options);
+        batches[0] = try processor.prepare(allocator, tokenizer, &.{.{ .text = item.text, .schema = &item.compiled }}, bounded_processor_options);
         errdefer batches[0].deinit();
         const ranges = try allocator.alloc(TaskRange, 1);
         ranges[0] = .{ .start = 0, .end = classifications.len };
@@ -433,7 +447,7 @@ pub fn prepareItem(allocator: Allocator, tokenizer: Tokenizer, item: *const wire
     }
     var lengths = try PromptLengths.init(allocator, tokenizer, item, processor_options);
     defer lengths.deinit(allocator);
-    const ranges = try planTaskRanges(allocator, classifications.len, options.max_prompt_tokens, &lengths, PromptLengths.measure);
+    const ranges = try planTaskRanges(allocator, classifications.len, if (options.specialty_profile != null) 0 else options.max_prompt_tokens, &lengths, PromptLengths.measure);
     errdefer allocator.free(ranges);
     if (ranges.len > options.max_sequences_per_item) return error.ExtractionSchemaLimitExceeded;
     const batches = try allocator.alloc(processor.PreparedBatch, ranges.len);
@@ -446,7 +460,7 @@ pub fn prepareItem(allocator: Allocator, tokenizer: Tokenizer, item: *const wire
     for (ranges, batches) |range, *batch| {
         const view = classificationView(&item.compiled, range);
         // Enforces processor_options.max_sequence_tokens on every sequence.
-        batch.* = try processor.prepare(allocator, tokenizer, &.{.{ .text = item.text, .schema = &view }}, processor_options);
+        batch.* = try processor.prepare(allocator, tokenizer, &.{.{ .text = item.text, .schema = &view }}, bounded_processor_options);
         prepared += 1;
         prompt_tokens = try std.math.add(usize, prompt_tokens, batch.samples[0].input_ids.len);
     }
@@ -540,6 +554,36 @@ pub fn deviceScratchUpperBound(config: EncoderConfig, tokens: usize) !usize {
         total = try std.math.add(usize, total, try std.math.mul(usize, 8 * 6 * f, try std.math.mul(usize, tokens, h)));
     // Allocator rounding and transient copies.
     return std.math.mul(usize, total, 2);
+}
+
+/// Complete request reservation using the prepared shape, including span
+/// construction, CountLSTM projection, scoring and readback staging. PII span
+/// items execute serially; classification batches reserve every physical row.
+pub fn plannedDeviceScratchUpperBound(config: EncoderConfig, request: *const wire.Request, request_plan: *const Plan, options: Options) !usize {
+    if (request.items.len != request_plan.items.len) return error.InvalidExtractionInput;
+    const encoder = try std.math.mul(usize, try deviceScratchUpperBound(config, maxPlannedSequenceTokens(request_plan)), classificationBatchItems(request, request_plan, options));
+    var head_peak: usize = 0;
+    const H: usize = config.hiddenSize();
+    for (request.items, request_plan.items) |item, prepared| {
+        for (prepared.batches) |batch| {
+            const sample = batch.samples[0];
+            var labels: usize = sample.classification_labels.len;
+            for (sample.groups) |group| labels = @max(labels, group.child_markers.len);
+            var elements = try std.math.mul(usize, 12 * H, labels);
+            if (item.compiled.schema.entities.len != 0 or item.compiled.schema.relations.len != 0) {
+                const rows = try std.math.mul(usize, sample.words.len, 8);
+                // Span start/end and gathered pairs coexist with the 4H MLP
+                // intermediates. Device frees release these before label scores.
+                elements = try std.math.add(usize, elements, try std.math.mul(usize, 16 * H, rows));
+                elements = try std.math.add(usize, elements, try std.math.mul(usize, 4 * H, sample.words.len));
+                // Scores coexist with staging during readback; the next label
+                // replaces disposable candidate/selection scratch.
+                elements = try std.math.add(usize, elements, try std.math.mul(usize, 2 * labels, rows));
+            }
+            head_peak = @max(head_peak, try std.math.mul(usize, 2 * @sizeOf(f32), elements));
+        }
+    }
+    return std.math.add(usize, encoder, try std.math.mul(usize, head_peak, classificationBatchItems(request, request_plan, options)));
 }
 
 /// DeBERTa span checkpoints retain their established request ceiling. A
@@ -639,7 +683,8 @@ fn canBatchClassifications(request: *const wire.Request, request_plan: *const Pl
 /// their single-sequence reservation even when ordinary items support batching.
 pub fn classificationBatchItems(request: *const wire.Request, request_plan: *const Plan, options: Options) usize {
     if (options.classification_batch_items <= 1 or request.items.len <= 1 or !canBatchClassifications(request, request_plan)) return 1;
-    return @min(options.classification_batch_items, request.items.len);
+    const admitted = if (options.specialty_profile == .gliguard) @min(options.classification_batch_items, 8) else options.classification_batch_items;
+    return @min(admitted, request.items.len);
 }
 
 test "gliner span v2 batch admission preserves serial scratch for split tasks" {
@@ -673,7 +718,7 @@ fn plannedClassificationBatch(cb: *const compute.ComputeBackend, allocator: Allo
     }
     while (built < result.len) {
         try progress(options, built, "encoder");
-        const n = @min(options.classification_batch_items, result.len - built);
+        const n = @min(classificationBatchItems(request, request_plan, options), result.len - built);
         const samples = try allocator.alloc(processor.Sample, n);
         defer allocator.free(samples);
         const counts = try allocator.alloc([]const usize, n);
@@ -719,11 +764,22 @@ pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, c
         if (remaining_values == 0) return error.ExtractionOutputLimitExceeded;
         try progress(options, index, "encoder");
         if (item.compiled.schema.entities.len != 0 or item.compiled.schema.relations.len != 0) {
-            if (config != .modern_bert or !options.modern_span_extraction) return error.UnsupportedGlinerSpanV2Task;
+            if (options.specialty_profile == .pii) {
+                if (config != .deberta) return error.UnsupportedGlinerSpanV2Task;
+            } else if (config != .modern_bert or !options.modern_span_extraction) return error.UnsupportedGlinerSpanV2Task;
             var native_options = item.options.native(options.pipeline);
             native_options.control = options.control;
             native_options.max_output_values = remaining_values;
-            var extracted = if (prepared_item.document != null)
+            var extracted = if (options.specialty_profile == .pii) pii: {
+                const sample = prepared_item.batches[0].samples[0];
+                const mask = try allocator.alloc(i64, sample.input_ids.len);
+                defer allocator.free(mask);
+                @memset(mask, 1);
+                cb.preferEagerQuantMirrors(true);
+                const hidden = try deberta_arch.forwardCtProfiled(cb, allocator, config.deberta, sample.input_ids, mask, 1, sample.input_ids.len, deberta_mod.glinerPrefersWeightMirrors(config.deberta), null);
+                defer cb.free(hidden);
+                break :pii try @import("gliner_span_extraction.zig").runFromHidden(cb, allocator, hidden, config.hiddenSize(), sample, &item.compiled, native_options, .{ .confidence_first_greedy = !item.options.overlap_explicit, .require_device_gru = true });
+            } else if (prepared_item.document != null)
                 try @import("gliner_span_long_executor.zig").extract(cb, allocator, config.modern_bert, item, prepared_item, native_options)
             else
                 try @import("gliner_span_extraction.zig").run(cb, allocator, config.modern_bert, prepared_item.batches[0].samples[0], &item.compiled, native_options);
@@ -1328,4 +1384,66 @@ test "gliner span v2 GLiNER2.5-Decide Q8 CUDA classification oracle parity" {
     if (!@import("build_options").enable_cuda) return error.SkipZigTest;
     const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER_DECIDE_Q8_MODEL") orelse return error.SkipZigTest;
     try testDecideParity(directory, .cuda, 5e-2);
+}
+
+test "gliner specialty profiles restrict tasks and preserve overlap omission" {
+    const a = std.testing.allocator;
+    var pii = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"pii","schema":{"entities":["email","name"]},"inputs":[{"content":"a@example.com"}]}
+    , .{});
+    defer pii.deinit();
+    try preflight(&pii, .{ .specialty_profile = .pii });
+    try std.testing.expect(!pii.items[0].options.overlap_explicit);
+    try std.testing.expectError(error.UnsupportedGlinerSpanV2Task, preflight(&pii, .{ .specialty_profile = .gliguard }));
+    pii.items[0].options.long_document.mode = .window;
+    try std.testing.expectError(error.UnsupportedGlinerSpanV2Task, preflight(&pii, .{ .specialty_profile = .pii }));
+    var guard = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"guard","schema":{"classifications":[{"name":"safety","labels":["safe","unsafe"]}]},"inputs":[{"content":"hello"}],"options":{"overlap":"flat"}}
+    , .{});
+    defer guard.deinit();
+    try std.testing.expect(guard.items[0].options.overlap_explicit);
+    try preflight(&guard, .{ .specialty_profile = .gliguard });
+    try std.testing.expectError(error.UnsupportedGlinerSpanV2Task, preflight(&guard, .{ .specialty_profile = .pii }));
+}
+
+test "gliner specialty scratch reserves prepared span geometry and every physical classification row" {
+    const a = std.testing.allocator;
+    var pii = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"pii","schema":{"entities":["name"]},"inputs":[{"content":"x"}]}
+    , .{});
+    defer pii.deinit();
+    const config = EncoderConfig{ .deberta = .{ .hidden_size = 768, .intermediate_size = 3072, .num_attention_heads = 12 } };
+    // Only slice cardinalities are inspected. Avoid model or token buffers in
+    // this geometry test; fake prepared values are never executed or deinit'd.
+    const words: [64]processor.Word = undefined;
+    const ids: [512]i64 = undefined;
+    const markers: [42]usize = undefined;
+    var groups = [_]processor.Group{std.mem.zeroes(processor.Group)};
+    groups[0].child_markers = markers[0..2];
+    var samples = [_]processor.Sample{std.mem.zeroes(processor.Sample)};
+    samples[0].input_ids = &ids;
+    samples[0].words = words[0..8];
+    samples[0].groups = &groups;
+    var batches: [1]processor.PreparedBatch = undefined;
+    batches[0].samples = &samples;
+    var ranges = [_]TaskRange{.{ .start = 0, .end = 0 }};
+    var items = [_]PreparedItem{.{ .ranges = &ranges, .batches = &batches, .prompt_tokens = 512 }};
+    var request_plan = Plan{ .items = &items, .prompt_tokens = 512 };
+    const small = try plannedDeviceScratchUpperBound(config, &pii, &request_plan, .{ .specialty_profile = .pii });
+    samples[0].words = &words;
+    groups[0].child_markers = &markers;
+    const large = try plannedDeviceScratchUpperBound(config, &pii, &request_plan, .{ .specialty_profile = .pii });
+    const encoder = try deviceScratchUpperBound(config, 512);
+    try std.testing.expect(large > small);
+    try std.testing.expect(large >= encoder + 64 * 8 * 768 * @sizeOf(f32));
+    var guard = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"guard","schema":{"classifications":[{"name":"safety","labels":["safe","unsafe"]}]},"inputs":[{"content":"one"},{"content":"two"}]}
+    , .{});
+    defer guard.deinit();
+    var paired = [_]PreparedItem{ items[0], items[0] };
+    request_plan.items = &paired;
+    ranges[0].end = 1;
+    const serial = try plannedDeviceScratchUpperBound(config, &guard, &request_plan, .{ .specialty_profile = .gliguard });
+    const batched = try plannedDeviceScratchUpperBound(config, &guard, &request_plan, .{ .specialty_profile = .gliguard, .classification_batch_items = 8 });
+    try std.testing.expectEqual(2 * serial, batched);
 }

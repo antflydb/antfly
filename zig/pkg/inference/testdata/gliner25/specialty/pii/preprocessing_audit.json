@@ -1,0 +1,10 @@
+{
+  "profile": "pii",
+  "frozen_commit": "3c913c7369301133d3b7699252074c4303ada50e",
+  "current_commit": "ca4f68235b50fe4c3ecf3876851d748fe4b15c6c",
+  "frozen_source_sha256": "042ea6064ddb439ccff6c6ac5eb7850dac6d9cc74bc33cbef40928e8f653b020",
+  "current_source_sha256": "4161a4db09200628accc6558eca4a89082beb2e7b661fe5ae7bd0d93750447de",
+  "cases": 12,
+  "preprocessing_equal": true,
+  "differences": []
+}

@@ -29,6 +29,7 @@ const gliner_boundary = @import("../models/gliner_boundary.zig");
 const gliner_qualification = @import("../models/gliner_boundary_qualification.zig");
 const boundary_bundle = @import("../models/gliner_boundary_bundle.zig");
 const decide_qualification = @import("../models/gliner_decide_qualification.zig");
+const specialty_qualification = @import("../models/gliner_specialty_qualification.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const managed_receipt = @import("managed_receipt.zig");
 const c_file = @import("../util/c_file.zig");
@@ -814,7 +815,7 @@ pub const ModelRegistry = struct {
         var existing = try manifest_mod.loadFromManagedPlanDir(self.allocator, dest_dir);
         defer existing.deinit();
         if (existing.model_manifest_path != null and tasks_csv == null and capabilities_csv == null and
-            !isGlinerDecisionCandidate(&existing))
+            !isGlinerDecisionCandidate(&existing) and existing.gliner_specialty_profile == null)
         {
             if (!existing.laya_declared or !existing.hasCapability("typed_decisions") or existing.hasTask("decide")) return;
 
@@ -1282,8 +1283,8 @@ test "boundary typed decisions require exact multi-Decide identity independent o
 /// The published Decide contract is granted only to the reviewed checkpoint
 /// bytes. Repository/path spelling is intentionally irrelevant: local copies
 /// of the same immutable artifact qualify, while changed weights fail closed.
-fn decideIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) ?decide_qualification.Identity {
-    if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or manifest.gliner_architecture != .span or !manifest.gliner_span_declared) return null;
+fn spanIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) ?decide_qualification.Identity {
+    if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or manifest.gliner_architecture != .span or (!manifest.gliner_span_declared and manifest.gliner_specialty_profile == null)) return null;
     var weight: decide_qualification.Digest = undefined;
     var companion: ?decide_qualification.Digest = null;
     var inventory: decide_qualification.TensorInventory = undefined;
@@ -1347,6 +1348,11 @@ fn decideIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.Mo
             .special_tokens_map = manifest.gliner_span_special_tokens_digest,
         },
     };
+    return identity;
+}
+
+fn decideIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) ?decide_qualification.Identity {
+    const identity = spanIdentity(allocator, manifest) orelse return null;
     if (decide_qualification.qualifiedVariant(identity) == null) return null;
     return identity;
 }
@@ -1366,6 +1372,17 @@ fn isKnownDecideStagingSource(allocator: std.mem.Allocator, dest_dir: []const u8
     defer plan.deinit();
     const source = plan.parsed.value.source orelse return false;
     return isKnownDecideSource(source);
+}
+
+fn isKnownSpecialtyStagingSource(allocator: std.mem.Allocator, dest_dir: []const u8) !bool {
+    var plan = try managed_receipt.loadValidatedPlan(allocator, std.Options.debug_io, dest_dir);
+    defer plan.deinit();
+    const source = plan.parsed.value.source orelse return false;
+    for (specialty_qualification.artifacts) |artifact| {
+        const name = artifact.repository["fastino/".len..];
+        if (std.ascii.eqlIgnoreCase(source.owner, "fastino") and std.ascii.eqlIgnoreCase(source.name, name)) return true;
+    }
+    return false;
 }
 
 fn isGlinerDecisionCandidate(manifest: *const manifest_mod.ModelManifest) bool {
@@ -1922,7 +1939,14 @@ fn synthesizePulledModelManifestJsonInternal(
     // where the artifact was just staged to disk.
     const boundary_identity = boundaryIdentity(allocator, &manifest);
     const qualified_boundary = if (boundary_identity) |identity| gliner_qualification.hasQualifiedIdentity(identity) else false;
-    const decide_identity = decideIdentity(allocator, &manifest);
+    const span_identity = spanIdentity(allocator, &manifest);
+    const specialty_profile: ?specialty_qualification.Profile = if (manifest.gliner_specialty_profile != null) blk: {
+        const identity = span_identity orelse return error.UnsupportedGlinerSpecialtyArtifact;
+        break :blk try specialty_qualification.require(identity);
+    } else null;
+    if (specialty_profile == null and source == .staging_plan and try isKnownSpecialtyStagingSource(allocator, dest_dir))
+        return error.UnsupportedGlinerSpecialtyArtifact;
+    const decide_identity = if (span_identity) |identity| if (decide_qualification.qualifiedVariant(identity) != null) identity else null else null;
     const qualified_decide = decide_identity != null;
     const qualified_boundary_decide = boundaryDecisionIdentityIsQualified(allocator, &manifest);
     const decision_candidate = isGlinerDecisionCandidate(&manifest);
@@ -2007,6 +2031,11 @@ fn synthesizePulledModelManifestJsonInternal(
         for (tasks.items) |task| if (!std.mem.eql(u8, task, "extract") and !std.mem.eql(u8, task, "decide")) return error.InvalidModelManifest;
         for (capabilities.items) |capability| if (!std.mem.eql(u8, capability, "classification") and !std.mem.eql(u8, capability, "typed_decisions")) return error.InvalidModelManifest;
     }
+    if (specialty_profile) |profile| {
+        const allowed_capability = if (profile == .pii) "named_entity_recognition" else "classification";
+        for (tasks.items) |task| if (!std.mem.eql(u8, task, "extract")) return error.InvalidModelManifest;
+        for (capabilities.items) |capability| if (!std.mem.eql(u8, capability, allowed_capability)) return error.InvalidModelManifest;
+    }
     if (qualified_boundary_decide) try appendUniqueOwnedString(allocator, &capabilities, "typed_decisions");
     // Reserved public capability: neither an alias nor a caller-supplied CSV
     // may publish it for a merely similar boundary artifact.
@@ -2036,13 +2065,22 @@ fn synthesizePulledModelManifestJsonInternal(
         try body.appendSlice(allocator, ",\"inputs\":");
         try appendJsonStringArray(&body, allocator, inputs.items);
     }
-    if (qualified_decide)
+    if (specialty_profile) |profile| {
+        try body.appendSlice(allocator, ",\"gliner_specialty_profile\":");
+        try appendJsonString(&body, allocator, @tagName(profile));
+    }
+    if (qualified_decide or specialty_profile == .gliguard)
         try body.appendSlice(allocator, ",\"gliner_classification_head\":\"label_marker_mlp\"");
     if (qualified_boundary or qualified_decide) {
         const limits = try qualifiedLimitsJsonAlloc(allocator, boundary_identity, decide_identity);
         defer allocator.free(limits);
         try body.appendSlice(allocator, ",\"qualified_limits\":");
         try body.appendSlice(allocator, limits);
+    }
+    if (specialty_profile != null) {
+        try body.appendSlice(allocator, ",\"qualified_limits\":{\"specialty\":{\"sequence_tokens\":512,\"physical_batch_items\":");
+        try body.appendSlice(allocator, if (specialty_profile == .pii) "1" else "8");
+        try body.appendSlice(allocator, "}}");
     }
     if (sparse_3d_output_layout) |layout| {
         try body.appendSlice(allocator, ",\"sparse_3d_output_layout\":");
@@ -3047,4 +3085,64 @@ test "gliner boundary Transformers wrapper pull manifest qualifies the unchanged
     const unreviewed = try synthesizePulledModelManifestJson(a, directory, null, null);
     defer a.free(unreviewed);
     try std.testing.expect(std.mem.indexOf(u8, unreviewed, "\"tasks\":[\"extract\"]") == null);
+}
+
+test "specialty managed pull requalifies existing task manifests before publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    inline for (.{ specialty_qualification.Profile.pii, specialty_qualification.Profile.gliguard }) |profile| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "encoder_config");
+        var artifacts: std.ArrayList(managed_receipt.ArtifactReceipt) = .empty;
+        defer artifacts.deinit(a);
+        inline for (.{ "config.json", "encoder_config/config.json", "tokenizer_config.json" }) |name| {
+            const bytes = try fixtures.fixtureBytes(a, "specialty/" ++ @tagName(profile) ++ "/" ++ name);
+            defer a.free(bytes);
+            try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+            try artifacts.append(a, .{ .path = name, .size = bytes.len });
+        }
+        const artifact = specialty_qualification.artifacts[@backingInt(profile)];
+        const tokenizer = try std.json.Stringify.valueAlloc(a, .{ .added_tokens = .{
+            .{ .id = artifact.markers.p, .content = "[P]" },
+            .{ .id = artifact.markers.c, .content = "[C]" },
+            .{ .id = artifact.markers.e, .content = "[E]" },
+            .{ .id = artifact.markers.r, .content = "[R]" },
+            .{ .id = artifact.markers.l, .content = "[L]" },
+            .{ .id = artifact.markers.sep_struct, .content = "[SEP_STRUCT]" },
+            .{ .id = artifact.markers.sep_text, .content = "[SEP_TEXT]" },
+        } }, .{});
+        defer a.free(tokenizer);
+        try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+        try artifacts.append(a, .{ .path = "tokenizer.json", .size = tokenizer.len });
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "" });
+        try artifacts.append(a, .{ .path = "model.safetensors", .size = 0 });
+        const manifest_json = try std.json.Stringify.valueAlloc(a, .{
+            .type = "extractor",
+            .tasks = .{"extract"},
+            .inputs = .{"text"},
+            .capabilities = .{if (profile == .pii) "named_entity_recognition" else "classification"},
+            .gliner_specialty_profile = @tagName(profile),
+        }, .{});
+        defer a.free(manifest_json);
+        try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = manifest_json });
+        try artifacts.append(a, .{ .path = "model_manifest.json", .size = manifest_json.len });
+        const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(path);
+        try download.beginManagedDownload(a, io, path);
+        const plan = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{
+            .version = 2,
+            .source = .{ .owner = "fastino", .name = artifact.repository["fastino/".len..], .variant = "auto", .requested_revision = artifact.revision, .resolved_revision = artifact.revision, .selected_format = "safetensors" },
+            .artifacts = artifacts.items,
+        }, .{});
+        defer a.free(plan);
+        try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.plan_filename, .data = plan });
+        var registry = ModelRegistry.init(a, path);
+        defer registry.deinit();
+        // An existing Antfly task manifest cannot bypass authentication of
+        // the staged weights/tokenizer. Neither fixture is a pinned artifact.
+        try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, registry.writePulledModelManifest(io, path, null, null));
+        try std.testing.expectEqual(download.ManagedDownloadState.incomplete, download.managedDownloadState(a, io, path));
+    }
 }

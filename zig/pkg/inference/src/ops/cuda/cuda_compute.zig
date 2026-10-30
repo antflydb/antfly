@@ -1292,6 +1292,8 @@ pub const RuntimeStats = struct {
     from_float32_calls: usize = 0,
     from_float32_bytes: usize = 0,
     to_float32_calls: usize = 0,
+    gliner_label_gru_calls: usize = 0,
+    gliner_label_gru_no_residual_calls: usize = 0,
     to_float32_bytes: usize = 0,
     training_input_uploads: usize = 0,
     training_input_upload_bytes: usize = 0,
@@ -3723,6 +3725,9 @@ pub const CudaCompute = struct {
 
     /// Laya parity requires FP32 execution even for reduced-storage source tensors.
     strict_f32_weights: bool = false,
+    /// Artifact-qualified specialty span models retain FP32 attention even
+    /// when global diagnostic environment switches request reduced precision.
+    qualified_span_fp32: bool = false,
     laya_optimizations: bool = false,
     gliner_encoder_attention: bool = false,
     gliner_mixed_attention: bool = false,
@@ -4033,11 +4038,13 @@ pub const CudaCompute = struct {
         return &self.ctx;
     }
 
-    pub const EmbeddingGemma2TrainingAllocationStats = struct {
+    pub const AllocationStats = struct {
         limit: usize,
         live: usize,
         peak: usize,
     };
+
+    pub const EmbeddingGemma2TrainingAllocationStats = AllocationStats;
 
     /// Applies to every physical DeviceBuffer owned by this CUDA context,
     /// including loaded base weights, BF16 mirrors, adapter state, tape, and
@@ -4048,9 +4055,16 @@ pub const CudaCompute = struct {
         try self.ctx.device_allocations.setLimit(bytes);
     }
 
-    pub fn embeddingGemma2TrainingAllocationStats(self: *CudaCompute) EmbeddingGemma2TrainingAllocationStats {
+    /// Physical owned CUDA buffers, including resident weights and cached
+    /// temporaries. Driver/library-private allocations require separate headroom.
+    /// Peak is the lifetime high-water mark of this compute context.
+    pub fn allocationStats(self: *CudaCompute) AllocationStats {
         const value = self.ctx.device_allocations.snapshot();
         return .{ .limit = value.limit, .live = value.live, .peak = value.peak };
+    }
+
+    pub fn embeddingGemma2TrainingAllocationStats(self: *CudaCompute) EmbeddingGemma2TrainingAllocationStats {
+        return self.allocationStats();
     }
 
     pub fn embeddingGemma2TrainingCublasLt(self: *CudaCompute) !*cublaslt_mod.CublasLt {
@@ -17505,6 +17519,20 @@ const CudaDebertaInvalidModeWarning = struct {
     var emitted = std.atomic.Value(bool).init(false);
 };
 
+fn debertaAttentionExecutionMode(qualified_span_fp32: bool, requested: CudaDebertaAttentionMode) CudaDebertaAttentionMode {
+    return if (qualified_span_fp32) .fused_f32 else requested;
+}
+
+test "specialty FP32 attention policy cannot be overridden by reduced precision diagnostics" {
+    inline for (std.meta.tags(CudaDebertaAttentionMode)) |mode| {
+        try std.testing.expectEqual(CudaDebertaAttentionMode.fused_f32, debertaAttentionExecutionMode(true, mode));
+        try std.testing.expectEqual(mode, debertaAttentionExecutionMode(false, mode));
+    }
+    // The generated-auto path additionally requires .auto; the qualified
+    // effective mode is never .auto even if its environment flag is enabled.
+    try std.testing.expect(debertaAttentionExecutionMode(true, .auto) != .auto);
+}
+
 fn cudaDebertaAttentionMode() CudaDebertaAttentionMode {
     if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE")) |value| {
         if (parseCudaDebertaAttentionMode(value)) |mode| return mode;
@@ -18022,8 +18050,11 @@ fn glinerLabelGruCombined(ctx: *anyopaque, request: *const ops.GlinerLabelGruCom
         gh_tensor.buffer,
         request.num_labels,
         request.hidden_size,
+        request.add_residual,
     );
     self.stats.launch_other += 1;
+    self.stats.gliner_label_gru_calls += 1;
+    if (!request.add_residual) self.stats.gliner_label_gru_no_residual_calls += 1;
     return try createTensor(self, device, shape, label_count);
 }
 
@@ -25881,7 +25912,7 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    const attention_mode = cudaDebertaAttentionMode();
+    const attention_mode = debertaAttentionExecutionMode(self.qualified_span_fp32, cudaDebertaAttentionMode());
     if ((attention_mode == .generated_tc or (attention_mode == .auto and cudaDebertaGeneratedTcAutoEnabled())) and seq_len <= 256 and head_dim == 64) {
         const requested_variant = cudaDebertaGeneratedTcVariant();
         const launched_m32 = if (requested_variant != .m16)
@@ -26268,6 +26299,8 @@ fn trainingRuntimeStatsOp(ctx: *anyopaque) ops.TrainingRuntimeStats {
         .download_last_bytes = @intCast(stats.download_last_bytes),
         .download_previous_bytes = @intCast(stats.download_previous_bytes),
         .to_float32_calls = @intCast(stats.to_float32_calls),
+        .gliner_label_gru_calls = @intCast(stats.gliner_label_gru_calls),
+        .gliner_label_gru_no_residual_calls = @intCast(stats.gliner_label_gru_no_residual_calls),
         .download_alloc_calls = @intCast(stats.download_alloc_calls),
         .stream_synchronizations = @intCast(stats.stream_syncs),
         .upload_synchronizations = @intCast(stats.upload_syncs),
@@ -35452,4 +35485,35 @@ test "LightOnOCR3 CUDA burst readback retains admission source and unique pendin
     try fourth.copy(std.mem.sliceAsBytes(got[0..1]));
     try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -91))), got[0]);
     fourth.deinit();
+}
+
+test "cuda GLiNER GRU residual modes preserve cancellation-sensitive state on device" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const labels = [_]f32{ 16777216, -16777216, 2, -3, 0, 5 };
+    var gates: [18]f32 = @splat(0);
+    for (0..2) |row| for (0..3) |col| {
+        gates[row * 9 + 3 + col] = -100;
+        gates[row * 9 + 6 + col] = 0.25541282;
+    };
+    const label_ct = try cb.fromFloat32Shape(&labels, &.{ 2, 3 });
+    defer cb.free(label_ct);
+    const gi = try cb.fromFloat32Shape(&gates, &.{ 2, 9 });
+    defer cb.free(gi);
+    const zero_gates: [18]f32 = @splat(0);
+    const gh = try cb.fromFloat32Shape(&zero_gates, &.{ 2, 9 });
+    defer cb.free(gh);
+    const out = try cb.fromFloat32Shape(&labels, &.{ 2, 3 });
+    defer cb.free(out);
+    for ([_]bool{ false, true }) |add_residual| {
+        const before = cb.trainingRuntimeStats();
+        try compute.kernels.launchGlinerGruCombineF32(&compute.ctx, tensorFromCt(out).buffer, tensorFromCt(label_ct).buffer, tensorFromCt(gi).buffer, tensorFromCt(gh).buffer, 2, 3, add_residual);
+        try std.testing.expectEqual(before.d2h_bytes, cb.trainingRuntimeStats().d2h_bytes);
+        try std.testing.expectEqual(before.h2d_bytes, cb.trainingRuntimeStats().h2d_bytes);
+        const got = try cb.toFloat32(out, std.testing.allocator);
+        defer std.testing.allocator.free(got);
+        for (got, labels) |value, label| try std.testing.expectApproxEqAbs(@as(f32, 0.25) + (if (add_residual) label else 0), value, 0.000001);
+    }
 }

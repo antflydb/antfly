@@ -52,6 +52,7 @@ const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const gliner_boundary_model = @import("../models/gliner_boundary.zig");
 const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
+const gliner_specialty_qualification = @import("../models/gliner_specialty_qualification.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const gpt_model_mod = @import("../models/gpt.zig");
 const model_compatibility = @import("../models/compatibility.zig");
@@ -3124,6 +3125,10 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .@"error" = "INCOMPATIBLE_MODEL",
             .message = "model artifact is incompatible with the available runtime",
         }),
+        error.UnsupportedGlinerSpecialtyArtifact => ctx.status(400).json(.{
+            .@"error" = "INVALID_MODEL",
+            .message = "GLiNER specialty artifacts must match the qualified FP32 checkpoint and provenance",
+        }),
         error.ResourceLimitExceeded => ctx.status(400).json(.{
             .@"error" = "MODEL_RESOURCE_LIMIT",
             .message = "model resource plan exceeds the configured inference budget",
@@ -3859,7 +3864,8 @@ test "direct generation rejects non-generator manifests before execution" {
 }
 
 fn usesDeclaredSpanV2Route(manifest: manifest_mod.ModelManifest) bool {
-    return manifest.gliner_architecture == .span and manifest.gliner_span_declared;
+    return manifest.gliner_architecture == .span and
+        (manifest.gliner_span_declared or manifest.gliner_specialty_profile != null);
 }
 
 fn spanRequiresQualifiedDecisionIdentity(manifest: manifest_mod.ModelManifest) bool {
@@ -3868,7 +3874,8 @@ fn spanRequiresQualifiedDecisionIdentity(manifest: manifest_mod.ModelManifest) b
 }
 
 fn requiresQualifiedSpanClassification(manifest: manifest_mod.ModelManifest) bool {
-    return usesDeclaredSpanV2Route(manifest) and spanRequiresQualifiedDecisionIdentity(manifest);
+    return usesDeclaredSpanV2Route(manifest) and
+        (manifest.gliner_specialty_profile != null or spanRequiresQualifiedDecisionIdentity(manifest));
 }
 
 /// A cheap listing selects the V2 route; the consumed manifest closes the
@@ -3935,6 +3942,8 @@ test "qualified GLiNER classification routes close legacy fallback and preserve 
 }
 
 fn decideExecutionContract(manifest: manifest_mod.ModelManifest) ?decide_mod.ExecutionContract {
+    // Specialty extraction profiles never grant the separate Decide contract.
+    if (manifest.gliner_specialty_profile != null) return null;
     // Boundary listings deliberately fail hasCapability(): they do not carry
     // the consumed artifact identity or selected backend needed for public
     // qualification.  A pull-generated manifest may still declare this
@@ -3964,6 +3973,46 @@ test "declared marker-head span model selects span v2 before legacy decision rou
         .gliner_classification_head = .label_marker_mlp,
     };
     try std.testing.expect(usesDeclaredSpanV2Route(manifest));
+}
+
+test "GLiNER specialty profiles select extraction v2 without granting Decide" {
+    inline for (.{ gliner_specialty_qualification.Profile.pii, gliner_specialty_qualification.Profile.gliguard }) |profile| {
+        const manifest = manifest_mod.ModelManifest{
+            .allocator = std.testing.allocator,
+            .gliner_architecture = .span,
+            .gliner_span_encoder_family = .deberta,
+            .gliner_specialty_profile = profile,
+        };
+        try std.testing.expect(usesDeclaredSpanV2Route(manifest));
+        try std.testing.expect(!manifest.gliner_span_declared);
+        try std.testing.expect(requiresQualifiedSpanClassification(manifest));
+        try std.testing.expectError(error.UnsupportedClassificationExtraction, requireLegacyClassification(manifest));
+        try std.testing.expect(decideExecutionContract(manifest) == null);
+        try std.testing.expectEqual(.native_gliner_span_extraction, resolvedExecutorKind("extract", &manifest));
+    }
+}
+
+test "GLiNER specialty public batch limits preserve configured cardinality" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    inline for (.{ gliner_specialty_qualification.Profile.pii, gliner_specialty_qualification.Profile.gliguard }) |profile| {
+        const manifest = manifest_mod.ModelManifest{
+            .allocator = std.testing.allocator,
+            .model_type = .extractor,
+            .gliner_architecture = .span,
+            .gliner_span_encoder_family = .deberta,
+            .gliner_specialty_profile = profile,
+        };
+        node.session_manager.required_backend = .cuda;
+        const contract = try resolvedInferenceExecutorContract(&node, "extract", &manifest);
+        try std.testing.expectEqual(max_serial_family_batch_items, contract.batch.max_items);
+        try std.testing.expectEqual(@as(usize, if (profile == .gliguard and build_options.enable_cuda) 8 else 1), contract.batch.preferred_items);
+        node.config.request_limits.max_items_per_request = 12;
+        const narrowed = try resolvedInferenceExecutorContract(&node, "extract", &manifest);
+        try std.testing.expectEqual(@as(?usize, 12), narrowed.max_items_per_request);
+        try std.testing.expectError(error.InferenceBatchTooLarge, validateTextExecutorInvocation(narrowed, 13, &.{"hello"}, 0, 1, 1, 0));
+        node.config.request_limits.max_items_per_request = null;
+    }
 }
 
 test "typed decision execution contracts distinguish span boundary and Laya" {
@@ -11458,7 +11507,21 @@ pub const Node = struct {
         const loaded = handle.get();
         const backend = loaded.session.backend();
         if (backend != .native and backend != .metal and backend != .cuda) return error.UnsupportedExtractionBackend;
-        const qualified_identity: ?gliner_decide_qualification.Identity = if (require_qualification or spanRequiresQualifiedDecisionIdentity(loaded.manifest))
+        const specialty_profile: ?gliner_specialty_qualification.Profile = if (loaded.manifest.gliner_specialty_profile != null)
+            try gliner_specialty_qualification.require(try session_factory.getGlinerDecisionIdentity(loaded.session))
+        else
+            null;
+        options.specialty_profile = specialty_profile;
+        if (specialty_profile != null) {
+            if (decision != null) return error.UnsupportedClassificationExtraction;
+            options.max_prompt_tokens = 0;
+            options.max_sequences_per_item = 1;
+            options.processor.max_sequence_tokens = 512;
+            options.processor.max_batch_tokens = 512;
+            options.classification_batch_items = if (specialty_profile == .gliguard and (backend == .cuda or backend == .metal)) 8 else 1;
+            try span_v2_executor.preflight(request, options);
+        }
+        const qualified_identity: ?gliner_decide_qualification.Identity = if (specialty_profile == null and (require_qualification or spanRequiresQualifiedDecisionIdentity(loaded.manifest)))
             try session_factory.getGlinerDecisionIdentity(loaded.session)
         else
             null;
@@ -11482,7 +11545,7 @@ pub const Node = struct {
             .deberta => |value| .{ .deberta = value },
             .modern_bert => |value| .{ .modern_bert = value },
         };
-        if (!spanV2BackendSupported(config, backend, qualified_variant)) return error.UnsupportedExtractionBackend;
+        if (specialty_profile == null and !spanV2BackendSupported(config, backend, qualified_variant)) return error.UnsupportedExtractionBackend;
         // The executor's generic DeBERTa default is 512. An exact qualified
         // identity supplies its own measured ceiling. FP32 and Q8 evidence
         // independently cover the 1B's 1024-token budget.
@@ -11546,7 +11609,7 @@ pub const Node = struct {
         var device_lease: ?runtime.tier.memory.AdmissionLease = null;
         defer if (device_lease) |*owned| owned.release();
         if (backend == .metal or backend == .cuda) {
-            const device_bytes = try std.math.mul(usize, try span_v2_executor.deviceScratchUpperBound(config, longest), span_v2_executor.classificationBatchItems(request, &request_plan, options));
+            const device_bytes = try span_v2_executor.plannedDeviceScratchUpperBound(config, request, &request_plan, options);
             const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                 self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu)),
                 self.config.generation_budget_overrides.scratch_limit_bytes,
@@ -11594,13 +11657,16 @@ pub const Node = struct {
         if (request.schema_version == null or request.schema_version == 1) upgrade: {
             const io = self.session_manager.io orelse break :upgrade;
             const explicit_v1 = request.schema_version != null;
-            const native_v2 = !explicit_v1 and self.resolvesToNativeExtractionV2(io, model_name);
+            var specialty = false;
+            const has_native_v2 = self.resolvesToNativeExtractionV2(io, model_name, &specialty);
+            if (explicit_v1 and specialty) return error.UnsupportedExtractionSchemaVersion;
+            const native_v2 = !explicit_v1 and has_native_v2;
             var schema = std.json.parseFromSlice(std.json.Value, allocator, request.schema_json, .{}) catch break :upgrade;
             defer schema.deinit();
             if (!native_v2 and !self.resolvesToSpanClassification(io, model_name, schema.value, explicit_v1)) break :upgrade;
             var options = std.json.parseFromSlice(std.json.Value, allocator, if (request.options_json.len > 0) request.options_json else "{}", .{}) catch break :upgrade;
             defer options.deinit();
-            const legacy_classification = schemaIsClassificationOnly(schema.value) and legacy: {
+            const legacy_classification = !specialty and schemaIsClassificationOnly(schema.value) and legacy: {
                 validateLegacyDirectExtractionExtensions(self, supplied_request) catch break :legacy false;
                 break :legacy true;
             };
@@ -19501,6 +19567,7 @@ pub const Node = struct {
         defer model_handle.release();
         const model = model_handle.get();
         validateTextEntityExtractionManifest(&model.manifest) catch |err| switch (err) {
+            error.UnsupportedExtractionSchemaVersion => return extractionV2FailureResponse(ctx, err, .{}),
             error.InvalidModelForExtraction => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",
                 .message = "model does not support entity extraction",
@@ -22769,7 +22836,8 @@ pub const Node = struct {
     /// geometry once a session loads. Fails closed to `false` (leave the
     /// request alone) on any resolution error, so it can never itself turn a
     /// valid request into a rejection.
-    fn resolvesToNativeExtractionV2(self: *Node, io: std.Io, model_name: []const u8) bool {
+    fn resolvesToNativeExtractionV2(self: *Node, io: std.Io, model_name: []const u8, specialty: *bool) bool {
+        specialty.* = false;
         if (model_name.len == 0) return false;
         var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
         defer arena.deinit();
@@ -22777,7 +22845,9 @@ pub const Node = struct {
         const model_path = self.resolveRequestModelPath(scratch, io, model_name, "extractors") catch return false;
         var manifest = manifest_mod.loadListingFromDir(scratch, model_path) catch return false;
         defer manifest.deinit();
-        return manifest.gliner_architecture == .boundary or manifest.gliner_classification_head == .label_marker_mlp;
+        specialty.* = manifest.gliner_specialty_profile != null;
+        return manifest.gliner_architecture == .boundary or manifest.gliner_classification_head == .label_marker_mlp or
+            manifest.gliner_specialty_profile != null;
     }
 
     /// A classification-only request on a declared gliner2 2.x span
@@ -22839,10 +22909,13 @@ pub const Node = struct {
         const model_value = parsed.value.object.get("model") orelse return null;
         if (model_value != .string or model_value.string.len == 0) return null;
         const schema = parsed.value.object.getPtr("schema") orelse return null;
-        if (explicit_v1 or !self.resolvesToNativeExtractionV2(io, model_value.string)) {
+        var specialty = false;
+        const has_native_v2 = self.resolvesToNativeExtractionV2(io, model_value.string, &specialty);
+        if (explicit_v1 and specialty) return error.UnsupportedExtractionSchemaVersion;
+        if (explicit_v1 or !has_native_v2) {
             if (!self.resolvesToSpanClassification(io, model_value.string, schema.*, explicit_v1)) return null;
         }
-        const legacy_classification = schemaIsClassificationOnly(schema.*) and legacy: {
+        const legacy_classification = !specialty and schemaIsClassificationOnly(schema.*) and legacy: {
             extraction_v2.validateLegacy(parsed.value) catch break :legacy false;
             break :legacy true;
         };
@@ -24974,6 +25047,7 @@ fn nliEntailmentIndex(id2label: ?[]const []const u8) ?usize {
 }
 
 fn manifestSupportsZeroShotClassification(manifest: *const manifest_mod.ModelManifest) bool {
+    if (manifest.gliner_specialty_profile) |profile| return profile == .gliguard;
     if (model_caps.hasCapability(manifest.capabilities, "zero_shot")) return true;
     if (std.mem.eql(u8, manifest.gliner_model_type, "gliner2")) return true;
     return manifest.model_type == .classifier and nliEntailmentIndex(manifest.id2label) != null;
@@ -25209,6 +25283,7 @@ fn canonicalExtractionOperation(schema: extraction_api.ExtractionSchema) !Canoni
 /// with an extraction-capable head and standard BIO token recognizers. Reject
 /// other model families before constructing a pipeline or running inference.
 fn validateTextEntityExtractionManifest(manifest: *const manifest_mod.ModelManifest) !void {
+    if (manifest.gliner_specialty_profile != null) return error.UnsupportedExtractionSchemaVersion;
     if (manifest.model_type != .extractor) return error.InvalidModelForExtraction;
     if (!model_caps.modelAcceptsInput(manifest, "text")) return error.UnsupportedInput;
     if (manifest.gliner_model_type.len > 0 and !model_caps.modelSupportsCapability(
@@ -25879,6 +25954,7 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.MissingStructureSchema,
         error.MixedExtractionOperations,
         error.UnsupportedClassificationExtraction,
+        error.UnsupportedExtractionSchemaVersion,
         error.UnsupportedInput,
         error.UnsupportedRelationExtraction,
         error.InvalidMaxTokens,
@@ -25886,6 +25962,7 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.GlinerDecisionArtifactMismatch,
         error.MissingGlinerDecisionIdentity,
         error.UnsupportedGlinerDecisionArtifact,
+        error.UnsupportedGlinerSpecialtyArtifact,
         error.UnsupportedGlinerDecisionBackend,
         => ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) }),
         error.UnsupportedRebelEntityLabels,
@@ -25917,6 +25994,7 @@ test {
     _ = @import("gliner_boundary_concurrency_test.zig");
     _ = @import("gliner_boundary_metal_socket_test.zig");
     _ = @import("gliner_family_cuda_socket_test.zig");
+    _ = @import("gliner_specialty_service_test.zig");
     _ = @import("gliner_family_metal_batch_test.zig");
     _ = @import("gliner_boundary_queued_cancellation_test.zig");
     _ = @import("embed_direct_vs_http_bench_test.zig");
@@ -26021,9 +26099,46 @@ test "gliner boundary v2 direct cancellation and HTTP capacity use existing admi
         .inputs = &.{.{ .content_json = "\"John\"" }},
         .schema_json = "{\"entities\":[\"person\"]}",
     };
+    // A caller cancelled before public API entry never reaches dispatch,
+    // metrics, model resolution or admission. Preserve that early return.
+    resetRequestWorkTestCounters();
     try std.testing.expectError(error.Cancelled, node.extractDirectWithControl(allocator, "demo", direct, .{ .check_fn = Cancel.check }));
     try std.testing.expectError(error.Cancelled, node.extractV2DirectJsonWithControl(allocator, json, .{ .check_fn = Cancel.check }));
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(u64, 0), node.metrics.extraction_v2.requests.get(.direct));
+    try std.testing.expectEqual(@as(u64, 0), node.metrics.extraction_v2.outcomes.get(.cancelled));
+    try std.testing.expectEqual(@as(u64, 0), node.metrics.extract_requests.impl.count);
+    try std.testing.expectEqual(@as(u64, 0), node.metrics.errors_total.impl.count);
+    try std.testing.expectEqual(@as(i64, 0), node.metrics.requests_active.impl.value);
+    try std.testing.expectEqual(@as(i64, 0), node.metrics.extraction_v2.active.impl.value);
+
+    // Cancellation after public entry is an observed extraction request. Both
+    // typed and JSON entry points must record its outcome and unwind admission.
+    const CancelAfterEntry = struct {
+        node: *Node,
+        saw_public_entry: bool = false,
+        saw_observed_entry: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.node.metrics.extraction_v2.active.impl.value != 0) {
+                self.saw_observed_entry = true;
+                return error.Cancelled;
+            }
+            self.saw_public_entry = true;
+        }
+    };
+    var typed_cancel = CancelAfterEntry{ .node = &node };
+    var json_cancel = CancelAfterEntry{ .node = &node };
+    try std.testing.expectError(error.Cancelled, node.extractDirectWithControl(allocator, "demo", direct, .{ .ptr = &typed_cancel, .check_fn = CancelAfterEntry.check }));
+    try std.testing.expectError(error.Cancelled, node.extractV2DirectJsonWithControl(allocator, json, .{ .ptr = &json_cancel, .check_fn = CancelAfterEntry.check }));
+    try std.testing.expect(typed_cancel.saw_public_entry and typed_cancel.saw_observed_entry);
+    try std.testing.expect(json_cancel.saw_public_entry and json_cancel.saw_observed_entry);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(u64, 2), node.metrics.extraction_v2.requests.get(.direct));
+    try std.testing.expectEqual(@as(u64, 2), node.metrics.extraction_v2.outcomes.get(.cancelled));
     try node.inference_admission.reserveUnits(1);
     defer node.inference_admission.releaseReservedUnits(1);
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
@@ -27586,6 +27701,47 @@ test "executor capability resolution never advertises raw documents" {
     try std.testing.expect(chunk.text and chunk.image and chunk.audio and !chunk.document);
 }
 
+test "specialty catalog advertises entity-only PII and classification-only GLiGuard" {
+    const a = std.testing.allocator;
+    inline for (.{ gliner_specialty_qualification.Profile.pii, gliner_specialty_qualification.Profile.gliguard }) |profile| {
+        const capabilities: []const []const u8 = if (profile == .pii) &.{"named_entity_recognition"} else &.{"classification"};
+        const manifest = manifest_mod.ModelManifest{
+            .allocator = a,
+            .model_type = .extractor,
+            .gliner_model_type = "gliner2",
+            .gliner_specialty_profile = profile,
+            .tasks = @constCast(&[_][]const u8{"extract"}),
+            .capabilities = @constCast(capabilities),
+            .inputs = @constCast(&[_][]const u8{"text"}),
+        };
+        const zero_shot = manifestSupportsZeroShotClassification(&manifest);
+        try std.testing.expectEqual(profile == .gliguard, zero_shot);
+        try std.testing.expect(manifestMatchesModelListingTask("extractors", "extractor", &manifest));
+        try std.testing.expect(!manifestMatchesModelListingTask("deciders", "extractor", &manifest));
+        var body = std.ArrayListUnmanaged(u8).empty;
+        defer body.deinit(a);
+        try appendModelInfo(&body, a, "extractor", manifest.gliner_model_type, capabilities, manifest.inputs, zero_shot, false, false, .native_gliner_span_extraction, null, "extractors", 16 * 1024 * 1024, 32 * 1024 * 1024, false, "compatible", false, .{});
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, body.items, .{});
+        defer parsed.deinit();
+        const published = parsed.value.object.get("capabilities").?.array.items;
+        const expected: []const []const u8 = if (profile == .pii)
+            &.{ "named_entity_recognition", "extraction" }
+        else
+            &.{ "classification", "zero_shot", "multi_label" };
+        try std.testing.expectEqual(expected.len, published.len);
+        for (expected, published) |wanted, actual| try std.testing.expectEqualStrings(wanted, actual.string);
+    }
+    // Even an explicit classification hint cannot promote the qualified
+    // entity-only PII profile through the family zero-shot fallback.
+    const forged_pii = manifest_mod.ModelManifest{
+        .allocator = a,
+        .gliner_model_type = "gliner2",
+        .gliner_specialty_profile = .pii,
+        .capabilities = @constCast(&[_][]const u8{"zero_shot"}),
+    };
+    try std.testing.expect(!manifestSupportsZeroShotClassification(&forged_pii));
+}
+
 test "REBEL catalog advertises generic entity schema independently of model names" {
     var body = std.ArrayListUnmanaged(u8).empty;
     defer body.deinit(std.testing.allocator);
@@ -28208,6 +28364,7 @@ pub fn resolvedExecutorKind(
         return .native_florence_reader;
     if (std.mem.eql(u8, resolved_task, "extract")) {
         if (manifest.gliner_architecture == .boundary) return .native_gliner_extraction;
+        if (manifest.gliner_specialty_profile != null) return .native_gliner_span_extraction;
         if (manifest.isSplitGlinerBundle()) return .native_gliner_span_extraction;
     }
     if (std.mem.eql(u8, resolved_task, "rerank")) return resolvedRerankExecutorKind(manifest);
@@ -28602,7 +28759,14 @@ fn resolvedInferenceExecutorContract(
     var implementation = resolvedExecutorBatchImplementation(resolved_task, executor_kind);
     const cuda_decide_batch = build_options.enable_cuda and node.session_manager.required_backend == .cuda;
     const metal_decide_batch = build_options.enable_metal and node.session_manager.required_backend == .metal;
-    if ((cuda_decide_batch or metal_decide_batch) and
+    if (manifest.gliner_specialty_profile) |profile| {
+        if (std.mem.eql(u8, resolved_task, "extract")) implementation = .{
+            .mode = if (profile == .gliguard and (cuda_decide_batch or metal_decide_batch)) .native else .serial_compatibility,
+            .preferred_items = if (profile == .gliguard and (cuda_decide_batch or metal_decide_batch)) 8 else 1,
+            .max_items = resolvedTaskMaxItems(resolved_task),
+            .per_item_failures = false,
+        };
+    } else if ((cuda_decide_batch or metal_decide_batch) and
         std.mem.eql(u8, resolved_task, "extract") and
         manifest.gliner_classification_head == .label_marker_mlp and manifest.gliner_span_encoder_family == .deberta)
     {
@@ -33386,6 +33550,18 @@ test "fail-fast embedding capacity response exposes retry contract" {
     try std.testing.expectEqual(@as(u16, 503), saturated_item.status);
     try std.testing.expect(saturated_item.retryable);
     try std.testing.expectEqual(@as(?i64, transient_capacity_retry_after_ms), saturated_item.retry_after_ms);
+}
+
+test "specialty model load artifact drift is a client error" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/models/instances");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try modelLoadFailureResponse(&ctx, error.UnsupportedGlinerSpecialtyArtifact);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "INVALID_MODEL") != null);
 }
 
 test "cold model load executor saturation exposes retry contract" {
