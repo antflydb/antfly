@@ -91,9 +91,9 @@ class CatalogTests(unittest.TestCase):
                         return
                     after = body.get("search_after", [""])[0]
                     rows = test.records
-                    selected = body.get("query", {}).get("conjuncts")
+                    selected = body.get("query", {}).get("doc_id", {}).get("ids")
                     if selected:
-                        selected_id = selected[1]["equals"]
+                        selected_id = selected[0]
                         rows = [row for row in rows if row["_id"] == selected_id]
                     hits = [row for row in rows if row["_id"] > after][: body["limit"]]
                     snapshot = (
@@ -206,6 +206,16 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(b"retry budget", result.stdout)
         self.assertEqual(len(self.pages), 3)
+        for page in self.pages[:2]:
+            policy = page["execution"]["value_verification"]
+            self.assertTrue(policy["allow_scan"])
+            self.assertEqual(policy["max_documents"], 10000)
+            self.assertEqual(policy["max_bytes"], 32 * 1024 * 1024)
+        selected = self.pages[2]
+        self.assertEqual(
+            selected["query"], {"doc_id": {"ids": [self.records[0]["_id"]]}}
+        )
+        self.assertFalse(selected["execution"]["value_verification"]["allow_scan"])
         self.assertEqual(self.pages[1]["remote_snapshot"], "catalog-1")
         self.assertEqual(self.pages[1]["search_after"], [self.records[63]["_id"]])
         self.assertIn(
