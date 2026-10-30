@@ -118,167 +118,49 @@ prompts for prompt-side tasks and `Response: ...` or
 `Prompt: ...\nResponse: ...` for response-side tasks. Antfly returns task
 classifications; the caller owns input formatting and final moderation policy.
 
-## GB10 initial production qualification
+## GB10 CUDA validation
 
-This initial baseline describes CLI SHA-256
-`079ca98ab412687d1e1bf1aef42f316870e281ac624e869ddec8778ebe08aeca`.
-Its production receipt and measurements remain historical evidence for that
-executable. The performance follow-up below uses a different candidate.
+The original FP32 models were validated against 23 pinned upstream cases,
+including the seven documented PII languages, all 42 PII labels, all six
+GLiGuard tasks, composed tasks, Unicode offsets, overlap and empty results.
+Native and CUDA outputs matched labels, spans and order; maximum public
+confidence error was `6.32e-6` against the unchanged `5e-4` gate.
 
-On 2026-10-30, both original checkpoints passed native and NVIDIA GB10 CUDA
-head parity and public HTTP validation against all 23 frozen cases. Entity
-text, coordinates, classification labels, and ordering match exactly; maximum
-public confidence error was `2.09e-6` against the `5e-4` gate.
+On NVIDIA GB10, all 46 matched workloads (each case with one and eight request
+items) were faster than pinned PyTorch CUDA by **1.32–2.19×** in median latency.
+Each case used 10 warmups and 50 measured iterations. Representative medians:
 
-The [production qualification receipt](../../testdata/gliner25/specialty/gb10-production-qualification.json)
-binds the release CLI and test executable, source fingerprint, original model
-and oracle pins, CUDA artifacts, driver and cuBLAS Lt library hashes, backend
-settings, numerical results, serving costs, and sanitizer scope. The
-[reproduction commands](../../scripts/gliner25/specialty/README.md) rebuild and
-rerun each gate. Metal hardware qualification was not run.
+| Workload | Request items | Antfly CUDA HTTP | PyTorch CUDA |
+|---|---:|---:|---:|
+| PII English | 1 | 7.89 ms | 11.56 ms |
+| PII full 42-label schema | 1 | 14.92 ms | 19.83 ms |
+| GLiGuard prompt safety | 1 | 6.37 ms | 10.21 ms |
+| GLiGuard all six tasks | 1 | 16.72 ms | 22.00 ms |
+| GLiGuard prompt safety | 8 | 9.77 ms | 20.43 ms |
+| GLiGuard all six tasks | 8 | 80.11 ms | 148.90 ms |
 
-Official canonical pulls and re-pulls passed for both models. The full artifact
-matrix passed 72 load/extraction probes across 36 cases, including FP16,
-changed FP32 weights, configuration drift, invalid declarations, provenance
-drift, and recovery. The five-minute managed-model soak passed 5,545 requests
-and 27,616 output items at concurrency eight with zero retries. It also checked
-all public offset units, versionless requests, ragged schemas, catalog
-capabilities, chunked and maximum requests, rejection/retry, unload/reload, and
-shutdown. Late-window host PSS growth was 29.9 MiB against a 64 MiB bound;
-request admission ledgers returned to their initial idle values.
+Both implementations used FP32 with TF32 disabled. The Python baseline used
+pinned eager PyTorch `2.9.1+cu128` and `PYTORCH_JIT=0` because its NVRTC cannot
+target SM121. Antfly includes the full loopback HTTP exchange; Python measures
+the in-process public API. Loading, warmup and allocation profiling are outside
+the latency measurements. Results apply to this host and these workloads.
 
-The native/CUDA service tests passed 128 items at 512 prepared tokens each,
-513-token rejection, cancellation while queued, scratch denial/retry,
-eight concurrent requests, in-use unload refusal, and fresh qualified reload.
-Owned CUDA-buffer growth was 223 MiB against a 510 MiB scratch reservation for
-PII and 338 MiB against 1,057 MiB for GLiGuard. Driver and library-private
-allocations are outside that buffer meter. Warm timed service requests needed
-no new device allocations. PII dispatched its GRU without residual addition;
-GLiGuard dispatched no GRU or span head.
+Serving checks covered 128 items at 512 prepared tokens each, 513-token
+rejection, cancellation, scratch denial/retry, concurrency and unload/reload.
+The 300-second soak at concurrency eight completed 11,277 requests with zero
+retries and 176 KiB of late-window host PSS growth against a 64 MiB bound.
+Owned CUDA-buffer growth stayed within scratch reservations, and warm service
+requests required no new device allocations. Driver/library-private GPU
+allocations are outside that buffer meter.
 
-All 12 final sanitizer lanes passed. Memcheck and initcheck covered all kernels
-for both complete model fixtures and both GRU residual modes. Racecheck and
-synccheck covered Antfly kernels matching `^termite_.*`; unmatched vendor
-kernels are excluded from those two tools. The receipts retain this distinction
-and do not claim a fully unfiltered four-tool campaign.
+All 12 sanitizer lanes passed. Memcheck and initcheck were unfiltered;
+racecheck and synccheck covered project kernels matching `^termite_.*`,
+excluding unmatched vendor kernels. Metal hardware qualification was not run.
 
-Initial baseline medians in milliseconds on the same GB10 host:
-
-| Workload | Prepared tokens | PyTorch CPU | PyTorch CUDA | Antfly CUDA HTTP |
-|---|---:|---:|---:|---:|
-| PII English | 46 | 209.21 | 12.33 | 32.52 |
-| PII full 42-label schema | 207 | 280.34 | 20.50 | 56.32 |
-| GLiGuard prompt safety | 26 | 169.65 | 10.93 | 19.07 |
-| GLiGuard all six tasks | 268 | 306.08 | 22.69 | 56.41 |
-
-Initial baseline eight-item GLiGuard HTTP throughput was 244 items/s for safety and 27 items/s
-for all six tasks, versus 372 and 53 items/s through the pinned Python CUDA
-API. HTTP measurements include transport, parsing and presentation; the Python
-measurements cover the in-process API. Model load, warmup and separate
-allocation profiling are excluded. The pinned PyTorch CUDA runtime used
-`PYTORCH_JIT=0` because its NVRTC cannot target SM121; TF32 was disabled. CUPTI
-transfer counters were unavailable on GB10; allocator counters and Antfly's
-transfer counters remain recorded separately. The [pinned Python benchmark
-baseline](../../testdata/gliner25/specialty/gb10_qualification.json) retains
-the package versions and per-case allocation evidence.
-
-The broader regression run recorded 224 passes, 62 skips, zero leaks, and one
-pre-existing default-native-Q8 Decide failure. Its exact `0.0669221878` logit
-error exceeds that test's `0.05` gate and matches the preserved historical run.
-[Native Q8 was already documented as unqualified](../../scripts/gliner25/CUDA.md#production-serving-checks-on-gb10),
-and its implementation and numerical tolerance are unchanged. The production
-receipt preserves the failed raw result and pinned baseline evidence. This
-exception applies to the existing native Q8 model; the new FP32 specialty
-checks all passed. Quantization remains outside this release.
-
-## GB10 performance follow-up
-
-The [performance comparison receipt](../../testdata/gliner25/specialty/gb10-performance-comparison.json)
-passes **all 46 matched cases**: all 23 frozen cases with one request item and
-again with eight request items. Every case used 10 warmups and 50 measured
-iterations. Antfly's median was lower in every comparison, with speedups from
-**1.316× to 2.189×**. Eight-item PII requests still execute serially; GLiGuard
-uses physical batches of eight. These results apply to this GB10 host and
-the pinned eager PyTorch baseline, without a claim about other runtimes or
-unmeasured workloads.
-
-Representative latency in milliseconds, shown as median / p95:
-
-| Workload | Request items | Prepared tokens per item | Antfly CUDA HTTP | PyTorch CUDA | Median speedup |
-|---|---:|---:|---:|---:|---:|
-| PII English | 1 | 46 | 7.887 / 8.052 | 11.556 / 12.270 | 1.465× |
-| PII full 42-label schema | 1 | 207 | 14.916 / 15.938 | 19.827 / 20.130 | 1.329× |
-| GLiGuard prompt safety | 1 | 26 | 6.374 / 6.511 | 10.207 / 10.792 | 1.601× |
-| GLiGuard all six tasks | 1 | 268 | 16.720 / 17.477 | 22.004 / 22.590 | 1.316× |
-| GLiGuard prompt safety | 8 | 26 | 9.767 / 10.449 | 20.427 / 21.136 | 2.091× |
-| GLiGuard all six tasks | 8 | 268 | 80.105 / 81.532 | 148.905 / 149.801 | 1.859× |
-
-The candidate CLI SHA-256 is
-`c96c022a00b6f7d874bca31838344e537cd5520253568435f8db85da393f643d`;
-its captured source fingerprint is
-`c6989938cea70b8f7deb35e3a2921fb94cada9b7f8db75a7b9f93316f98ef0df`.
-The associated test executable SHA-256 is
-`1a88bae2d61f5649ed392ce7bd7cbe06ab4863a6f0755fc34a4275978a3dbc71`.
-The comparison retains every raw timing sample, input receipt hashes, candidate
-binary hash, model/source/runtime pins and hardware identity. HTTP receipts
-validate all frozen outputs and record both loaded instances using CUDA.
-The source fingerprint identifies observed inputs; it does not attest a
-reproducible compilation.
-
-The follow-up enables the existing fused FP32 DeBERTa attention path for
-qualified specialty models on GB10, uses strict FP32 cuBLAS Lt projections with
-one bounded 32 MiB workspace reserved per execution, and keeps FFN output
-projections on that path. It caches unchanged attention masks, avoids
-full tokenizer scans during extraction metadata lookup, and skips redundant
-task-length preparation when splitting is disabled. The fused attention kernel
-also gains a block barrier between consuming the shared maximum and reusing
-its storage for the softmax denominator, fixing a race exposed during this
-qualification. The original FP32 artifacts and numerical tolerances are
-unchanged; FP16 and TF32 are not used.
-
-The first optimized candidate exposed physical retention in SMP allocator
-slabs during concurrent request teardown. Five short-lived extraction heaps
-now use the process allocator: the bounded execution heap, version-probe heap,
-request-upgrade arena and two metadata-resolution arenas. Admission wrappers
-and limits are unchanged. The corrected candidate passed the same 300-second
-soak at concurrency eight: **11,277 requests and 56,419 output items**, with
-**180,224 bytes (176 KiB)** of late-window host PSS growth against the unchanged
-64 MiB limit. Admission returned to its initial idle state; unload, reload and
-recovery passed for both models. Driver/library-private GPU allocations remain
-outside the host PSS meter.
-
-The baseline uses pinned PyTorch `2.9.1+cu128`, CUDA, four CPU threads, and
-`PYTORCH_JIT=0`. Its CUDA 12.8 NVRTC cannot target SM121, so the pinned upstream
-model runs eagerly. FP32 matmul precision is `highest`, both TF32 switches are
-disabled, and capture hooks are absent. Antfly timings include the complete
-loopback HTTP exchange and response serialization; PyTorch timings cover the
-in-process public API with preprocessing, model execution, decoding and
-formatting. Both exclude model loading and warmup. This is a conservative
-comparison of public serving latency, with different transport boundaries.
-
-The [completed follow-up qualification receipt](../../testdata/gliner25/specialty/gb10-performance-qualification.json)
-binds this optimized executable and its test binary to the unchanged FP32
-artifacts, source fingerprint, CUDA artifacts and runtime libraries. Selected
-specialty and Decide regressions recorded **50 Zig passes and nine skips**;
-all **75 Python tests** passed. Skips include Metal and the unconfigured native
-Q8 diagnostic; this follow-up does not qualify native Q8. Public outputs match
-the frozen fixtures exactly, with maximum confidence error `6.32e-6` against
-the unchanged `5e-4` gate.
-
-All 72 artifact load/extraction checks passed. Native and CUDA service tests
-covered 128 items at 512 prepared tokens each, over-limit rejection, cancellation,
-concurrency, scratch denial/retry and qualified unload/reload. Owned CUDA-buffer
-growth was **255.115 MiB / 369.548 MiB** for PII / GLiGuard, within reservations
-of **542.087 MiB / 1,089.125 MiB**. Warm per-case service measurements used no
-new device allocations; vendor and driver-private allocations are outside
-that buffer meter.
-
-All **12 sanitizer lanes** passed. Memcheck and initcheck covered unfiltered
-kernels for both complete head fixtures and both GRU residual modes. Racecheck
-and synccheck covered project kernels matching `^termite_.*`, excluding
-unmatched vendor kernels. This scope is retained explicitly in the receipt;
-it is not a fully unfiltered four-tool campaign. Metal hardware qualification
-remains unexecuted.
+[Reproduction commands](../../scripts/gliner25/specialty/README.md) keep model
+weights, full intermediate captures and machine-specific receipts in the
+ignored `.specialty-artifacts/` directory. Only small regression fixtures and
+immutable input pins are checked in.
 
 Pinned upstream references: [PII model card](https://huggingface.co/fastino/gliner2-privacy-filter-PII-multi/blob/1cb4166094dc58fa8d836429f060d6c95f62b495/README.md),
 [GLiGuard task reference](https://huggingface.co/fastino/gliguard-LLMGuardrails-300M/blob/7776816b54581f37b90dd2de12dbe13123229a9b/README.md),

@@ -49,7 +49,8 @@ pub fn verifyCapture(profile: qualification.Profile, bytes: []const u8) !void {
 
 test "gliner specialty frozen PII oracle rejects drift" {
     const a = std.testing.allocator;
-    const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(a, "specialty/pii/oracle.json");
+    const capture = platform.env.getenv("ANTFLY_GLINER_PII_CAPTURE") orelse return error.SkipZigTest;
+    const bytes = try @import("../util/c_file.zig").readFileMax(a, capture, 64 * 1024 * 1024);
     defer a.free(bytes);
     try verifyCapture(.pii, bytes);
     bytes[bytes.len / 2] ^= 1;
@@ -59,7 +60,8 @@ test "gliner specialty frozen PII oracle rejects drift" {
 
 test "gliner specialty frozen GLiGuard oracle rejects drift" {
     const a = std.testing.allocator;
-    const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(a, "specialty/gliguard/oracle.json");
+    const capture = platform.env.getenv("ANTFLY_GLIGUARD_CAPTURE") orelse return error.SkipZigTest;
+    const bytes = try @import("../util/c_file.zig").readFileMax(a, capture, 64 * 1024 * 1024);
     defer a.free(bytes);
     try verifyCapture(.gliguard, bytes);
     bytes[bytes.len / 2] ^= 1;

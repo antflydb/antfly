@@ -210,7 +210,7 @@ def qualify(args, report):
         for profile, pin in manifest['models'].items():
             source = source_for_profile(args.artifacts_root, profile, pin)
             sources[profile] = source
-            oracle_path = MANIFEST.parent / pin['oracle']['path']
+            oracle_path = args.artifacts_root / pin['oracle']['path']
             if sha256(oracle_path) != pin['oracle']['sha256'] or oracle_path.stat().st_size != pin['oracle']['size_bytes']:
                 raise ValueError(f'frozen oracle drift: {oracle_path}')
             references[profile] = json.loads(oracle_path.read_text())['cases'][0]
