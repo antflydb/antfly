@@ -21,8 +21,10 @@ const external = @import("../external_source/types.zig");
 const ranges = @import("lake_range_io.zig");
 const types = @import("../../storage/rowsource/types.zig");
 const A = std.mem.Allocator;
+const Admission = @import("lake_parquet_admission.zig");
 pub const Cursor = struct {
     a: A,
+    admission: *Admission,
     reader: parquet.ObjectRangeReader,
     inventory: external.Inventory,
     file: external.FileEntry,
@@ -48,6 +50,8 @@ pub const Cursor = struct {
         select: ?*const fn (*anyopaque, types.ColumnBatch) anyerror![]const bool = null,
     };
     const Column = struct {
+        credit: ?*Admission.Credit = null,
+        dictionary_credit: ?*Admission.Credit = null,
         required: bool = true,
         projection: ?*@import("lake_parquet_selected.zig") = null,
         directory: ?@import("lake_parquet_metadata.zig").PageDirectory = null,
@@ -73,9 +77,10 @@ pub const Cursor = struct {
             refs: std.atomic.Value(usize) = .init(1),
             value: T = undefined,
             dictionary: ?*SharedDictionary = null,
-            fn create(a: A) !*@This() {
+            credit: *Admission.Credit,
+            fn create(a: A, credit: *Admission.Credit) !*@This() {
                 const owner = try a.create(@This());
-                owner.* = .{ .a = a, .budget = .{ .backing = a, .limit = std.math.maxInt(usize) } };
+                owner.* = .{ .a = a, .credit = credit.retain(), .budget = .{ .backing = credit.owner.allocator(), .limit = std.math.maxInt(usize) } };
                 return owner;
             }
             fn retain(self: *@This()) *@This() {
@@ -91,14 +96,16 @@ pub const Cursor = struct {
                 if (initialized) self.value.deinit(self.budget.allocator());
                 std.debug.assert(self.budget.live == 0);
                 if (self.dictionary) |dictionary| dictionary.release();
+                const credit = self.credit;
                 a.destroy(self);
+                credit.release();
             }
             fn bytes(self: *const @This()) usize {
                 return @sizeOf(@This()) +| self.budget.live +| if (self.dictionary) |dictionary| @sizeOf(SharedDictionary) +| dictionary.budget.live else 0;
             }
             fn stabilize(self: *@This(), a: A) void {
                 self.a = a;
-                self.budget.backing = a;
+                // The heap-owned admission allocator already has stable lifetime.
             }
         };
     }
@@ -116,27 +123,33 @@ pub const Cursor = struct {
             } else return error.ParquetColumnNotFound;
             column.* = .{ .chunk = chunk, .offset = chunk.file_offset };
         }
-        return .{ .a = a, .reader = reader, .inventory = inventory, .file = file, .group = group, .columns = columns, .limits = limits, .output = std.heap.ArenaAllocator.init(a) };
+        return .{ .a = a, .admission = try Admission.create(a, limits.max_decoded_bytes, limits.max_struct_allocation_bytes, limits.max_input_bytes), .reader = reader, .inventory = inventory, .file = file, .group = group, .columns = columns, .limits = limits, .output = std.heap.ArenaAllocator.init(a) };
     }
     pub fn deinit(self: *Cursor) void {
         for (self.columns) |*column| {
-            if (column.projection) |projection| projection.destroyWithAllocator(self.a);
+            if (column.projection) |projection| projection.destroyWithAllocator(self.admission.allocator());
             if (column.decoded) |decoded| decoded.release();
             if (column.cached) |lease| lease.release();
             if (column.directory_lease) |lease| lease.release() else if (column.directory) |*directory| directory.deinit();
             if (column.dictionary_lease) |lease| lease.release() else if (column.dictionary_owner) |owner| owner.release();
+            if (column.credit) |credit| credit.release();
+            if (column.dictionary_credit) |credit| credit.release();
         }
+        self.admission.release();
         self.a.free(self.columns);
         self.output.deinit();
     }
     pub fn retainColumns(self: *Cursor, a: A) !?types.ColumnOwner {
         for (self.columns) |column| if (column.projection != null or (column.cached == null and column.decoded == null)) return null;
         const Held = union(enum) {
-            cached: @import("lake_decoded_cache.zig").Lease,
+            cached: struct { lease: @import("lake_decoded_cache.zig").Lease, credit: *Admission.Credit },
             local: *SharedColumns,
             fn release(held: @This()) void {
                 switch (held) {
-                    .cached => |lease| lease.release(),
+                    .cached => |cached| {
+                        cached.lease.release();
+                        cached.credit.release();
+                    },
                     .local => |owner| owner.release(),
                 }
             }
@@ -157,7 +170,7 @@ pub const Cursor = struct {
         var bytes: usize = 0;
         for (self.columns, owner.held) |column, *held| {
             if (column.cached) |cached| {
-                held.* = .{ .cached = cached.retain() };
+                held.* = .{ .cached = .{ .lease = cached.retain(), .credit = column.credit.?.retain() } };
                 bytes +|= cached.item.budget.live;
                 if (cached.item.dependency) |dependency| bytes +|= dependency.budget.live;
             } else {
@@ -169,7 +182,12 @@ pub const Cursor = struct {
         return .{ .ptr = owner, .release_fn = Owner.release, .retained_bytes = bytes };
     }
     fn read(self: *Cursor, offset: u64, len: usize) !ranges.RangeLease {
-        return self.reader.readPlannedLease(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = len }, .purpose = .parquet_column_chunk });
+        const context: @import("lake_read_context.zig").Context = if (self.shared_reader) |reader| reader.context else .{};
+        try self.admission.reserveInput(len, context);
+        errdefer self.admission.releaseInput(len, context);
+        const lease = try self.reader.readPlannedLease(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = len }, .purpose = .parquet_column_chunk });
+        errdefer lease.release();
+        return self.admission.wrapInput(lease, len, context);
     }
     fn loadIndex(self: *Cursor, column: *Column) !void {
         if (column.index_loaded) return;
@@ -220,17 +238,39 @@ pub const Cursor = struct {
         defer if (bounds) |bytes| bytes.release();
         return try @import("lake_parquet_metadata.zig").parsePageDirectory(a, offsets.bytes, if (bounds) |v| v.bytes else null, column.chunk, self.group.row_count, self.limits.max_struct_allocation_bytes / @max(@as(usize, 1), self.columns.len));
     }
-    fn advance(self: *Cursor, column: *Column) !void {
-        if (column.projection) |projection| projection.destroyWithAllocator(self.a);
+    fn retire(self: *Cursor, column: *Column) void {
+        if (column.projection) |projection| projection.destroyWithAllocator(self.admission.allocator());
         column.projection = null;
         if (column.decoded) |decoded| decoded.release();
         column.decoded = null;
         if (column.cached) |lease| lease.release();
         column.cached = null;
+        if (column.credit) |credit| credit.release();
+        column.credit = null;
         column.first += column.count;
         column.count = 0;
         column.consumed = 0;
         column.pruned = false;
+    }
+    fn cachedCredit(self: *Cursor, column: *const Column, lease: @import("lake_decoded_cache.zig").Lease, raw: usize) !*Admission.Credit {
+        const credit = try self.admission.claim(raw, column.dictionary_credit);
+        errdefer credit.release();
+        try self.chargeCached(column, lease, credit, raw);
+        return credit;
+    }
+    fn chargeCached(_: *Cursor, column: *const Column, lease: @import("lake_decoded_cache.zig").Lease, credit: *Admission.Credit, raw: usize) !void {
+        var bytes = lease.item.budget.live;
+        if (lease.item.dependency) |dictionary| {
+            const covered = if (column.dictionary_lease) |held| held.item == dictionary else false;
+            if (!covered) {
+                bytes +|= dictionary.budget.live;
+                try credit.growRaw(raw +| dictionary.payload.dictionary.retainedBytes());
+            }
+        }
+        try credit.cached(bytes);
+    }
+    fn advance(self: *Cursor, column: *Column) !void {
+        self.retire(column);
         try self.loadIndex(column);
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         while (column.offset < end) {
@@ -269,6 +309,8 @@ pub const Cursor = struct {
                 }
             }
             if (try self.cachedIndexedPage(column)) |lease| {
+                errdefer lease.release();
+                column.credit = try self.cachedCredit(column, lease, lease.item.parquet_page_header.?.header.uncompressed_page_size);
                 column.cached = lease;
                 const parsed = lease.item.parquet_page_header.?;
                 column.offset += parsed.header_len + parsed.header.compressed_page_size;
@@ -293,9 +335,7 @@ pub const Cursor = struct {
                     continue;
                 }
             }
-            const dictionary_bytes = if (column.dictionary) |dictionary| dictionary.retainedBytes() else 0;
-            const share = @max(@as(usize, 1), self.columns.len);
-            if (len > self.limits.max_input_bytes / share or parsed.header.uncompressed_page_size +| dictionary_bytes > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
+            if (len > self.limits.max_input_bytes or parsed.header.uncompressed_page_size > self.limits.max_decoded_bytes) return error.ParquetPageTooLarge;
             var cache_key: ?[32]u8 = null;
             if (self.shared_reader) |reader| if (parsed.header.page_type == .data_page or parsed.header.page_type == .data_page_v2) {
                 // Resource policy is checked for each consumer, independently
@@ -307,8 +347,8 @@ pub const Cursor = struct {
                     errdefer lease.release();
                     var admission = self.limits;
                     admission.max_rows = @max(admission.max_rows, parsed.header.value_count);
-                    admission.max_struct_allocation_bytes /= share;
                     _ = try parquet.admitColumnMaterialization(parsed.header.value_count, 1, admission);
+                    column.credit = try self.cachedCredit(column, lease, parsed.header.uncompressed_page_size);
                     column.cached = lease;
                     column.offset += len;
                     column.count = parsed.header.value_count;
@@ -329,6 +369,8 @@ pub const Cursor = struct {
             defer if (encoded_lease) |lease| lease.release();
             const encoded = if (encoded_lease) |lease| lease.bytes else probe.lease.bytes[0..len];
             column.offset += len;
+            const credit = try self.admission.claim(parsed.header.uncompressed_page_size, if (parsed.header.page_type == .dictionary_page) null else column.dictionary_credit);
+            defer credit.release();
             switch (parsed.header.page_type) {
                 .dictionary_page => {
                     if (column.dictionary != null or column.first != 0) return error.InvalidParquetPage;
@@ -337,27 +379,37 @@ pub const Cursor = struct {
                         defer self.a.free(interpretation);
                         const key = try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset - len, .len = len }, .purpose = .parquet_column_chunk }, interpretation);
                         var loader = struct {
+                            admission: *Admission,
                             chunk: external.ColumnChunk,
                             header: @TypeOf(parsed.header),
                             bytes: []const u8,
                             fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
                                 const value: *@This() = @ptrCast(@alignCast(raw));
-                                const decoded = try decodeDictionaryAlloc(item.arena.allocator(), value.chunk, value.header, value.bytes);
+                                var loading: Admission.Loading = undefined;
+                                try loading.begin(value.admission, item);
+                                defer loading.end();
+                                const decoded = decodeDictionaryAlloc(item.arena.allocator(), value.chunk, value.header, value.bytes) catch |err| {
+                                    if (loading.failed) return error.ParquetPageTooLarge;
+                                    return err;
+                                };
                                 item.payload = .{ .dictionary = decoded };
                             }
-                        }{ .chunk = column.chunk, .header = parsed.header, .bytes = encoded[parsed.header_len..] };
-                        const lease = try reader.cache.decoded.acquire(key, @min(reader.cache.decoded.max_loading_bytes, self.limits.max_decoded_bytes / share *| 4), reader.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
+                        }{ .admission = self.admission, .chunk = column.chunk, .header = parsed.header, .bytes = encoded[parsed.header_len..] };
+                        const lease = try reader.cache.decoded.acquire(key, @min(reader.cache.decoded.max_loading_bytes, self.limits.max_decoded_bytes *| 4), reader.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
                         errdefer lease.release();
-                        if (lease.item.payload.dictionary.retainedBytes() > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
+                        try credit.growRaw(lease.item.payload.dictionary.retainedBytes());
+                        try credit.cached(lease.item.budget.live);
+                        column.dictionary_credit = credit.retain();
                         column.dictionary_lease = lease;
                         column.dictionary = lease.item.payload.dictionary;
                     } else {
-                        const owner = try SharedDictionary.create(self.a);
+                        const owner = try SharedDictionary.create(self.a, credit);
                         var initialized = false;
                         errdefer owner.discard(initialized);
                         owner.value = try decodeDictionaryAlloc(owner.budget.allocator(), column.chunk, parsed.header, encoded[parsed.header_len..]);
                         initialized = true;
-                        if (owner.value.retainedBytes() > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
+                        try credit.growRaw(owner.value.retainedBytes());
+                        column.dictionary_credit = credit.retain();
                         column.dictionary_owner = owner;
                         column.dictionary = owner.value;
                     }
@@ -378,8 +430,9 @@ pub const Cursor = struct {
             for (self.selected[0..considered]) |active| survivors += @intFromBool(active);
             const sparse = considered != 0 and survivors <= considered / 2;
             if ((!column.required and sparse) or (column.required and self.filter != null and self.filter.?.encoded and self.filter.?.select != null and !std.mem.eql(u8, column.chunk.logical_type, "decimal"))) {
-                if (try @import("lake_parquet_selected.zig").create(self.a, column.chunk, parsed.header, encoded[parsed.header_len..], column.dictionary, self.limits.max_decoded_bytes / share *| 2 +| self.limits.max_struct_allocation_bytes / share)) |projection| {
+                if (try @import("lake_parquet_selected.zig").create(self.admission.allocator(), column.chunk, parsed.header, encoded[parsed.header_len..], column.dictionary, self.limits.max_decoded_bytes *| 2 +| self.limits.max_struct_allocation_bytes)) |projection| {
                     column.projection = projection;
+                    column.credit = credit.retain();
                     self.encoded_predicate_pages += @intFromBool(column.required);
                     column.count = count;
                     column.consumed = @intCast(self.position - column.first);
@@ -390,8 +443,6 @@ pub const Cursor = struct {
             }
             var limits = self.limits;
             limits.decimal_representation = .native_decimal;
-            limits.max_decoded_bytes = self.limits.max_decoded_bytes / share - dictionary_bytes;
-            limits.max_struct_allocation_bytes /= @max(@as(usize, 1), self.columns.len);
             limits.page_row_count = count;
             limits.preserve_dictionary = true;
             limits.page_encoding = parsed.header.encoding;
@@ -409,19 +460,27 @@ pub const Cursor = struct {
                     fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
                         const value: *@This() = @ptrCast(@alignCast(raw));
                         const cursor = value.cursor;
-                        const decoded = try parquet.buildSupportedColumnsAllocWithLimits(item.arena.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits);
+                        var loading: Admission.Loading = undefined;
+                        try loading.begin(cursor.admission, item);
+                        defer loading.end();
+                        const decoded = parquet.buildSupportedColumnsAllocWithLimits(item.arena.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits) catch |err| {
+                            if (loading.failed) return error.ParquetPageTooLarge;
+                            return err;
+                        };
                         item.payload = .{ .columns = decoded.columns };
                         item.parquet_page_header = value.parsed;
                         if (value.dictionary) |dictionary| dictionary.cache.depend(.{ .cache = dictionary.cache, .item = item }, dictionary);
                     }
                 }{ .cursor = self, .input = &input, .limits = limits, .dictionary = column.dictionary_lease, .parsed = parsed };
-                const lease = try cache.acquire(key, @min(cache.max_loading_bytes, self.limits.max_decoded_bytes / share *| 4 +| self.limits.max_struct_allocation_bytes), self.shared_reader.?.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
+                const lease = try cache.acquire(key, @min(cache.max_loading_bytes, self.limits.max_decoded_bytes *| 4 +| self.limits.max_struct_allocation_bytes), self.shared_reader.?.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
+                errdefer lease.release();
+                try self.chargeCached(column, lease, credit, parsed.header.uncompressed_page_size);
                 column.cached = lease;
             } else {
                 // Uncached page leases retain their dictionary owner across
                 // cursor advancement and closure without copying dictionary values.
                 limits.borrow_dictionary = true;
-                const owner = try SharedColumns.create(self.a);
+                const owner = try SharedColumns.create(self.a, credit);
                 var initialized = false;
                 errdefer owner.discard(initialized);
                 owner.value = try parquet.buildSupportedColumnsAllocWithLimits(owner.budget.allocator(), self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
@@ -429,6 +488,7 @@ pub const Cursor = struct {
                 if (column.dictionary_owner) |dictionary| owner.dictionary = dictionary.retain();
                 column.decoded = owner;
             }
+            column.credit = credit.retain();
             column.count = count;
             column.consumed = @intCast(self.position - column.first);
             self.pages_decoded += 1;
@@ -478,16 +538,14 @@ pub const Cursor = struct {
         const row_end = std.math.add(u64, entry.first, count) catch return error.ParquetRowGroupRowCountMismatch;
         if (count == 0 or row_end > self.group.row_count or
             (row_end == self.group.row_count and column.offset + entry.len != end)) return error.ParquetRowGroupRowCountMismatch;
-        const share = @max(@as(usize, 1), self.columns.len);
-        const dictionary_bytes = if (column.dictionary) |dictionary| dictionary.retainedBytes() else 0;
-        if (entry.len > self.limits.max_input_bytes / share or parsed.header.uncompressed_page_size +| dictionary_bytes > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
+        if (entry.len > self.limits.max_input_bytes or parsed.header.uncompressed_page_size > self.limits.max_decoded_bytes) return error.ParquetPageTooLarge;
         var admission = self.limits;
         admission.max_rows = @max(admission.max_rows, count);
-        admission.max_struct_allocation_bytes /= share;
         _ = try parquet.admitColumnMaterialization(count, 1, admission);
         return lease;
     }
     fn headerRead(self: *Cursor, column: *const Column) !HeaderRead {
+        if (self.limits.max_input_bytes == 0) return error.ParquetPageTooLarge;
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         if (column.offset >= end) return error.InvalidParquetPage;
         if (self.indexedPage(column)) |entry| {
@@ -495,7 +553,7 @@ pub const Cursor = struct {
             // admission before the GET and validate the encoded header against
             // the directory before trusting either lengths or row ordinals.
             if (entry.len > end - column.offset) return error.InvalidParquetMetadata;
-            if (entry.len > self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len)) return error.ParquetPageTooLarge;
+            if (entry.len > self.limits.max_input_bytes) return error.ParquetPageTooLarge;
             const lease = try self.read(column.offset, entry.len);
             errdefer lease.release();
             const parsed = try page.parsePageHeader(lease.bytes);
@@ -505,13 +563,13 @@ pub const Cursor = struct {
             if (len != entry.len or parsed.header.value_count != entry.rows) return error.InvalidParquetMetadata;
             return .{ .parsed = parsed, .lease = lease };
         }
-        var probe_size: usize = @intCast(@min(end - column.offset, 512));
+        var probe_size: usize = @intCast(@min(end - column.offset, @min(self.limits.max_input_bytes, 512)));
         while (true) {
             const probe_lease = try self.read(column.offset, probe_size);
             errdefer probe_lease.release();
             const probe = probe_lease.bytes;
             const parsed = page.parsePageHeader(probe) catch |err| {
-                const next_size = @min(end - column.offset, @min(probe_size * 2, 64 * 1024));
+                const next_size = @min(end - column.offset, @min(probe_size * 2, @min(self.limits.max_input_bytes, 64 * 1024)));
                 if (next_size == probe_size) return err;
                 probe_lease.release();
                 probe_size = @intCast(next_size);
@@ -565,7 +623,7 @@ pub const Cursor = struct {
                 continue;
             }
             planned += 1;
-            const limit = self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len);
+            const limit = self.limits.max_input_bytes;
             if (self.indexedPage(column)) |entry| {
                 if (entry.len > limit or entry.len > end - column.offset) continue;
                 if (column.required and self.prune_page != null and !self.prune_page.?(self.prune_ptr.?, column.chunk, entry)) continue;
@@ -595,25 +653,33 @@ pub const Cursor = struct {
         try reader.prefetch(reads[0..count]);
     }
     const DecodeStats = struct { pages: usize, dictionaries: usize, encoded_predicates: usize };
-    const DecodeAllocator = @import("../../sql/parallel_scheduler.zig").LockedAllocator;
     fn decode(template: Cursor, column: *Column, a: A) anyerror!DecodeStats {
-        // A worker mutates its own column only. The scoped allocator serializes
-        // admission/arena mutations, while provider I/O and decoding overlap.
+        // A worker mutates its own column only. Heap-owned admission serializes
+        // allocator mutations while provider I/O and decoding overlap.
         var worker = template;
         worker.a = a;
         worker.pages_decoded = 0;
         worker.dictionary_decodes = 0;
         worker.encoded_predicate_pages = 0;
-        try worker.advance(column);
+        worker.advance(column) catch |err| {
+            if (err == error.OutOfMemory and worker.admission.memory.isLocallyExhausted()) return error.ParquetPageTooLarge;
+            return err;
+        };
         return .{ .pages = worker.pages_decoded, .dictionaries = worker.dictionary_decodes, .encoded_predicates = worker.encoded_predicate_pages };
     }
     fn advanceColumns(self: *Cursor, required_only: bool) !void {
-        // Scoped decode locks never escape into retained page allocators.
+        // Outer metadata owners return to the coordinator allocator after joining;
+        // retained payloads keep the stable heap-owned admission allocator.
         defer for (self.columns) |column| {
-            if (column.projection) |projection| projection.stabilize(self.a);
+            if (column.projection) |projection| projection.stabilize(self.admission.allocator());
             if (column.decoded) |owner| owner.stabilize(self.a);
             if (column.dictionary_owner) |owner| owner.stabilize(self.a);
         };
+        // Retire the whole advancing cohort before admitting replacement pages.
+        // Otherwise a pending worker's expired page can reject a healthy sibling.
+        for (self.columns) |*column| {
+            if ((!required_only or column.required) and column.first + column.count <= self.position) self.retire(column);
+        }
         // Index arenas outlive this call. Their backing allocator must be the
         // cursor allocator, never the temporary worker locking adapter.
         for (self.columns) |*column| {
@@ -623,15 +689,17 @@ pub const Cursor = struct {
         if (io == null or self.columns.len < 2) {
             for (self.columns) |*column| {
                 if (required_only and !column.required) continue;
-                if (column.first + column.count <= self.position) try self.advance(column);
+                if (column.first + column.count <= self.position) self.advance(column) catch |err| {
+                    if (err == error.OutOfMemory and self.admission.memory.isLocallyExhausted()) return error.ParquetPageTooLarge;
+                    return err;
+                };
                 column.consumed = @intCast(self.position - column.first);
             }
             return;
         }
-        var allocator: DecodeAllocator = .{ .backing = self.a };
         var pending: [4]?@import("../../sql/parallel_scheduler.zig").Task(anyerror!DecodeStats) = @splat(null);
         // Every worker joins on all error/cancellation paths before the scoped
-        // allocator or the cursor metadata can leave scope.
+        // cursor metadata can leave scope.
         defer for (&pending) |*future| if (future.*) |*active| {
             _ = active.cancel(io.?) catch {};
             future.* = null;
@@ -642,8 +710,8 @@ pub const Cursor = struct {
                 while (next_column < self.columns.len and ((required_only and !self.columns[next_column].required) or self.columns[next_column].first + self.columns[next_column].count > self.position)) next_column += 1;
                 if (next_column == self.columns.len) break;
                 const column = &self.columns[next_column];
-                future.* = @import("../../sql/parallel_scheduler.zig").global().submit(io.?, (self.limits.max_input_bytes +| self.limits.max_decoded_bytes) / self.columns.len, decode, .{ self.*, column, allocator.allocator() }) orelse {
-                    const stats = try decode(self.*, column, allocator.allocator());
+                future.* = @import("../../sql/parallel_scheduler.zig").global().submit(io.?, self.limits.max_input_bytes +| self.limits.max_decoded_bytes, decode, .{ self.*, column, self.admission.backing.allocator() }) orelse {
+                    const stats = try decode(self.*, column, self.admission.backing.allocator());
                     self.pages_decoded += stats.pages;
                     self.dictionary_decodes += stats.dictionaries;
                     self.encoded_predicate_pages += stats.encoded_predicates;

@@ -2279,3 +2279,54 @@ still use field-major hydration and exact, bounded fragment selection.
 These in-memory ownership and callback changes use runtime ABI **73**. The
 stored-source recipe remains **v10**, reader protocol **96**, with `AFOV0005`:
 there is no new on-disk encoding in this refinement.
+
+### Live page admission and compiled result bindings
+
+Parquet cursor admission follows live bytes rather than assigning every column an
+identical fraction of the cursor budget. A large string page can share a cohort
+with many small scalar pages when their combined footprint fits. The existing
+input, uncompressed-data and structural limits remain authoritative. The cursor
+checks uncompressed page evidence cumulatively, and admits actual decoded vector,
+allocator capacity and decompression allocations against the combined decoded
+and structural allowance. This does not turn the decoded allowance into a new
+response-size limit or replace the enclosing statement and delivery budgets.
+Optional page-directory admission remains separately bounded and can fall back
+to sequential page discovery.
+
+A heap-owned admission owner survives cursor teardown when results still retain
+its pages. Reference-counted credits pin dictionary evidence and cached arena
+capacity through the last result lease. Cache hits reapply the consuming cursor's
+limits; cache keys do not contain query quotas. A loading adapter composes the
+cache's existing global loader admission with the initiating cursor's live-byte
+admission, then removes only the cursor's transient charge before publication.
+Shared cache waiters each admit the immutable result under their own limits.
+Local decoding keeps a stable admitted allocator rather than a stack-scoped
+worker allocator. Dictionaries shared by local pages stay charged until their
+last dependent page retires.
+
+The coordinator retires every expired page in an advancing cohort before
+scheduling replacements. Encoded ranges use separate transient input credits;
+parallel readers wait on a condition variable when the same input allowance is
+busy. Deadlines and cancellation remain active while waiting. All scheduled
+workers join before metadata is destroyed. These limits apply to one cursor's
+live cohort and its retained leases; the statement, shared scheduler, global
+cache and response delivery each retain their existing independent admission.
+
+Horizontal result composition compiles field lookup once per distinct parent
+schema. One row-selection map is shared by all physical columns, and aligned
+stored columns reuse their existing NULL flags. The page retains only parents
+used by the output. A cell no longer carries a copied column descriptor or
+searches column names during composition. Generic readers still traverse the
+same immutable bindings and keep JSON null separate from SQL NULL.
+
+Global text planning resolves term frequencies through bounded exact multi-seek
+batches. Routing pages are shared within a batch; missing terms, duplicates and
+caller order are preserved before the recent-WAL contribution is added with
+checked arithmetic. Chunked JSON output copies escape-free strings directly;
+mixed content uses vector classification to copy clean runs and visits the
+canonical encoder only for actual escape bytes. Unicode-escape and byte-array
+output options keep the standard encoder's semantics.
+
+These additional in-memory layout changes advance runtime ABI to **74**. Stored
+source recipe **v10**, reader protocol **96**, `AFOV0005` and persisted artifacts
+are unchanged.

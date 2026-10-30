@@ -10696,3 +10696,146 @@ test "external lake optional OffsetIndex local admission falls back to bounded s
         }
     };
 }
+
+test "external lake Parquet live admission fits unequal pages and fences cached retained leases" {
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    const body = try a.alloc(u8, 256 * 1024);
+    defer a.free(body);
+    @memset(body, 'x');
+    var chunks: [66]external_source.ColumnChunk = undefined;
+    var names: [66][]const u8 = undefined;
+    var buffers: [66][16]u8 = undefined;
+    for (&chunks, &names, &buffers, 0..) |*chunk, *name, *buffer, i| {
+        name.* = try std.fmt.bufPrint(buffer, "column_{d}", .{i});
+        const offset = bytes.items.len;
+        for (0..2) |_| {
+            if (i == 0) try appendPlainByteArrayDataPage(&bytes, a, &.{body}) else try appendPlainI64DataPage(&bytes, a, &.{@intCast(i)});
+        }
+        chunk.* = .{ .column_id = @constCast(name.*), .file_offset = offset, .compressed_len = bytes.items.len - offset, .uncompressed_len = bytes.items.len - offset, .physical_type = @constCast(if (i == 0) "byte_array" else "int64"), .encoding = @constCast("plain") };
+    }
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", bytes.items, .{});
+    defer put.deinit(a);
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 2, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = 2, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const serving = @import("lake_serving_cache.zig");
+    var cache = serving.Cache.init(a);
+    defer cache.deinit();
+    var reader: serving.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(client), .scope = @splat(0), .context = .{ .io = std.testing.io } };
+    defer reader.drain(true);
+    // Equal shares allowed only 31 KiB for the large string. The complete
+    // 66-column cohort fits the unchanged 2 MiB budgets, cold and warm.
+    for (0..3) |pass| {
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &names, .{ .max_input_bytes = 2 * 1024 * 1024, .max_decoded_bytes = 2 * 1024 * 1024, .max_struct_allocation_bytes = 2 * 1024 * 1024 });
+        defer cursor.deinit();
+        if (pass != 0) cursor.shared_reader = &reader;
+        for (0..2) |_| {
+            const batch = (try cursor.next()).?;
+            try std.testing.expectEqualStrings(body, batch.columns[0].values.bytes[0]);
+            for (batch.columns[1..], 1..) |column, i| try std.testing.expectEqual(@as(i64, @intCast(i)), try column.integerAt(0));
+        }
+        try std.testing.expect(try cursor.next() == null);
+        try std.testing.expect(cursor.admission.peak <= 4 * 1024 * 1024);
+    }
+    // A page fits individually but the sum of two retained cohorts does not.
+    // Releasing the old result refunds its credit even on failed advancement.
+    for ([_]bool{ false, true }) |cached| {
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &names, .{ .max_input_bytes = 512 * 1024, .max_decoded_bytes = 384 * 1024, .max_struct_allocation_bytes = 2 * 1024 * 1024 });
+        defer cursor.deinit();
+        if (cached) cursor.shared_reader = &reader;
+        _ = (try cursor.next()).?;
+        const held = (try cursor.retainColumns(a)).?;
+        try std.testing.expectError(error.ParquetPageTooLarge, cursor.next());
+        held.release();
+        // Failed page advancement is terminal for this cursor; a healthy new
+        // request must still reuse the global cache under its own policy.
+    }
+    // Result leases remain valid after cursor teardown and own final refunds.
+    var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &names, .{});
+    cursor.shared_reader = &reader;
+    const batch = (try cursor.next()).?;
+    const vector = batch.columns[0];
+    const held = (try cursor.retainColumns(a)).?;
+    cursor.deinit();
+    try std.testing.expectEqualStrings(body, vector.values.bytes[0]);
+    held.release();
+}
+
+test "external lake Parquet live admission refunds faults dictionary credits and cancelled input waits" {
+    const Admission = @import("lake_parquet_admission.zig");
+    const Run = struct {
+        fn run(a: Allocator) !void {
+            const state = try Admission.create(a, 4096, 4096, 512);
+            defer state.release();
+            const dictionary = try state.claim(1024, null);
+            defer dictionary.release();
+            const data = try state.claim(2048, dictionary);
+            defer data.release();
+            const allocation = try state.allocator().alloc(u8, 2048);
+            defer state.allocator().free(allocation);
+            try data.cached(1024);
+            {
+                const context: @import("lake_read_context.zig").Context = .{};
+                try state.reserveInput(5, context);
+                var wrapped = false;
+                defer if (!wrapped) state.releaseInput(5, context);
+                const input = try a.dupe(u8, "input");
+                errdefer if (!wrapped) a.free(input);
+                const lease = try state.wrapInput(.{ .bytes = input, .owner = .{ .allocation = a } }, 5, context);
+                wrapped = true;
+                defer lease.release();
+                try std.testing.expectEqualStrings("input", lease.bytes);
+            }
+            try std.testing.expectError(error.ParquetPageTooLarge, state.claim(2048, null));
+            try state.reserveInput(512, .{ .io = std.testing.io });
+            defer state.releaseInput(512, .{ .io = std.testing.io });
+            const Cancel = struct {
+                fn check(_: *anyopaque) !void {
+                    return error.Canceled;
+                }
+            };
+            var marker: u8 = 0;
+            try std.testing.expectError(error.Canceled, state.reserveInput(1, .{ .io = std.testing.io, .checkpoint = .{ .ptr = &marker, .check = Cancel.check } }));
+            try std.testing.expectEqual(@as(usize, 512), state.input);
+        }
+    };
+    try Run.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+}
+
+test "external lake Parquet live admission wakes parallel input waiters without raising quota" {
+    const Admission = @import("lake_parquet_admission.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const state = try Admission.create(a, 4096, 4096, 512);
+    defer state.release();
+    try state.reserveInput(512, .{ .io = io });
+    const Waiting = struct {
+        started: std.Io.Event = .unset,
+        io: std.Io,
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.started.set(self.io);
+        }
+        fn run(self: *@This(), owner: *Admission) !void {
+            const context: @import("lake_read_context.zig").Context = .{ .io = self.io, .checkpoint = .{ .ptr = self, .check = checkpoint } };
+            try owner.reserveInput(512, context);
+            defer owner.releaseInput(512, context);
+            try std.testing.expectEqual(@as(usize, 512), owner.input);
+        }
+    };
+    var waiting: Waiting = .{ .io = io };
+    var future = try io.concurrent(Waiting.run, .{ &waiting, state });
+    defer _ = future.cancel(io) catch {};
+    try waiting.started.wait(io);
+    state.releaseInput(512, .{ .io = io });
+    try future.await(io);
+    try std.testing.expectEqual(@as(usize, 0), state.input);
+}

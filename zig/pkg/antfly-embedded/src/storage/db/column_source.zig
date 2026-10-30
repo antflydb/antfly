@@ -98,51 +98,91 @@ pub const Page = struct {
     }
 
     const Binding = struct { source: Row, column: rows.ColumnVector };
+    const JoinedRow = struct { parent: usize, index: usize };
     const JoinedColumn = struct {
         page: *Page,
-        bindings: []const Binding,
+        parents: []const *Page,
+        rows_: []const JoinedRow,
+        columns: []const rows.ColumnVector,
+        stored: ?rows.ColumnVector,
+        fn binding(self: *const @This(), index: usize) Binding {
+            if (self.stored) |column| return .{ .source = .{ .page = self.parents[0], .index = if (self.parents[0].selection) |selection| selection[index] else index }, .column = column };
+            const row_ = self.rows_[index];
+            return .{ .source = .{ .page = self.parents[row_.parent], .index = row_.index }, .column = self.columns[row_.parent] };
+        }
         fn read(raw: *const anyopaque, index: usize) !std.json.Value {
             const self: *const @This() = @ptrCast(@alignCast(raw));
-            if (index >= self.bindings.len) return error.RowSourceColumnLengthMismatch;
+            if (index >= self.page.len) return error.RowSourceColumnLengthMismatch;
             @import("antfly_platform").sync.lockYielding(&self.page.decode_mutex);
             defer self.page.decode_mutex.unlock();
-            const binding = self.bindings[index];
-            return binding.source.cell(self.page.arena.allocator(), binding.column);
+            const bound = self.binding(index);
+            return bound.source.cell(self.page.arena.allocator(), bound.column);
         }
     };
-    /// Horizontal composition retains immutable parent pages, never JSON row
-    /// trees or provider callbacks. Bindings preserve the original null domain.
+    /// Compile schema bindings once per distinct parent, and share row selection
+    /// across all columns. No cell owns a repeated ColumnVector descriptor.
     pub fn join(a: A, fields: []const []const u8, physical: []const ?Row, stored: *Page) !*Page {
         if (physical.len != stored.len) return error.RowSourceColumnLengthMismatch;
         const self = try a.create(Page);
         self.* = .{ .a = a, .arena = .init(a), .columns = &.{}, .len = stored.len, .composite = true };
         errdefer self.release();
         const pa = self.arena.allocator();
+        var parent_ids: std.AutoHashMapUnmanaged(*Page, usize) = .empty;
+        var parents: std.ArrayList(*Page) = .empty;
+        try parent_ids.put(pa, stored, 0);
+        try parents.append(pa, stored);
+        const selected = try pa.alloc(JoinedRow, physical.len);
+        for (physical, selected) |source, *target| {
+            if (source) |row_| {
+                const entry = try parent_ids.getOrPut(pa, row_.page);
+                if (!entry.found_existing) {
+                    entry.value_ptr.* = parents.items.len;
+                    try parents.append(pa, row_.page);
+                }
+                target.* = .{ .parent = entry.value_ptr.*, .index = row_.index };
+            } else target.* = .{ .parent = 0, .index = 0 };
+        }
+        const schemas = try pa.alloc(std.StringHashMapUnmanaged(rows.ColumnVector), parents.items.len);
+        for (parents.items, schemas) |parent, *schema| {
+            schema.* = .empty;
+            for (parent.columns) |column| {
+                const entry = try schema.getOrPut(pa, column.name);
+                if (!entry.found_existing) entry.value_ptr.* = column;
+            }
+        }
+        const used = try pa.alloc(bool, parents.items.len);
+        @memset(used, false);
         const columns = try pa.alloc(rows.ColumnVector, fields.len);
         const states = try pa.alloc(JoinedColumn, fields.len);
         for (fields, columns, states) |name, *column, *state| {
-            const bindings = try pa.alloc(Binding, stored.len);
-            const nulls = try pa.alloc(u8, stored.len);
-            for (bindings, nulls, physical, 0..) |*binding, *flag, left, i| {
-                const right: Row = .{ .page = stored, .index = i };
-                binding.* = for (stored.columns) |candidate| {
-                    if (std.mem.eql(u8, candidate.name, name)) break .{ .source = right, .column = candidate };
-                } else if (left) |source_row| for (source_row.page.columns) |candidate| {
-                    if (std.mem.eql(u8, candidate.name, name)) break .{ .source = source_row, .column = candidate };
-                } else return error.RowSourceColumnNotFound else return error.RowSourceColumnNotFound;
-                flag.* = @intFromBool(binding.column.nulls.isNull(binding.source.index));
-                const parent = binding.source.page;
-                const held = for (self.native_leases.items) |lease| {
-                    if (lease.ptr == @as(*anyopaque, @ptrCast(parent))) break true;
-                } else false;
-                if (!held) {
-                    parent.retain();
-                    try self.adoptNativeLease(.{ .ptr = parent, .release_fn = releaseParent, .retained_bytes = parent.retainedBytes() });
+            const stored_column = schemas[0].get(name);
+            const bound: []rows.ColumnVector = if (stored_column != null) &.{} else try pa.alloc(rows.ColumnVector, parents.items.len);
+            if (stored_column == null) {
+                for (schemas, 0..) |schema, i| {
+                    // The stored parent may also be a physical parent. Only
+                    // actually selected schemas need to contain this field.
+                    bound[i] = schema.get(name) orelse undefined;
                 }
-            }
-            state.* = .{ .page = self, .bindings = bindings };
-            column.* = .{ .name = try pa.dupe(u8, name), .nulls = .{ .bytes = nulls }, .values = .{ .encoded = .{ .ptr = state, .begin = 0, .count = stored.len, .kind = .json, .read = JoinedColumn.read } } };
+                for (physical, selected) |source, row_| {
+                    if (source == null or schemas[row_.parent].get(name) == null) return error.RowSourceColumnNotFound;
+                    used[row_.parent] = true;
+                }
+            } else used[0] = true;
+            state.* = .{ .page = self, .parents = parents.items, .rows_ = selected, .columns = bound, .stored = stored_column };
+            const nulls: @FieldType(rows.ColumnVector, "nulls") = if (stored_column != null and stored.selection == null) stored_column.?.nulls else flags: {
+                const flags = try pa.alloc(u8, stored.len);
+                for (flags, 0..) |*flag, i| {
+                    const binding_ = state.binding(i);
+                    flag.* = @intFromBool(binding_.column.nulls.isNull(binding_.source.index));
+                }
+                break :flags .{ .bytes = flags };
+            };
+            column.* = .{ .name = try pa.dupe(u8, name), .nulls = nulls, .values = .{ .encoded = .{ .ptr = state, .begin = 0, .count = stored.len, .kind = .json, .read = JoinedColumn.read } } };
         }
+        for (parents.items, used) |parent, needed| if (needed) {
+            parent.retain();
+            try self.adoptNativeLease(.{ .ptr = parent, .release_fn = releaseParent, .retained_bytes = parent.retainedBytes() });
+        };
         self.columns = columns;
         return self;
     }
@@ -588,7 +628,13 @@ pub const Prepared = struct {
                     } else {
                         try w.beginWriteRaw();
                         try w.writer.writeByte('"');
-                        for (v.parts) |part| try std.json.Stringify.encodeJsonStringChars(part, w.options, w.writer);
+                        for (v.parts) |part| {
+                            if (w.options.escape_unicode) {
+                                try std.json.Stringify.encodeJsonStringChars(part, w.options, w.writer);
+                            } else if (v.encoded_len == v.length + 2) {
+                                try w.writer.writeAll(part);
+                            } else try writeEscaped(part, w.writer);
+                        }
                         try w.writer.writeByte('"');
                         w.endWriteRaw();
                     }
@@ -638,6 +684,36 @@ pub const Prepared = struct {
             if (field.value == .raw) field.value.raw = try a.dupe(u8, field.value.raw);
         }
         return .{ .fields = fields, .encoded_len = self.encoded_len };
+    }
+    /// SIMD classification skips clean runs, including UTF-8. Only actual JSON
+    /// escapes visit the standard encoder; Unicode escaping uses its full path.
+    fn writeEscaped(bytes: []const u8, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const V = @Vector(32, u8);
+        var at: usize = 0;
+        var begin: usize = 0;
+        while (bytes.len - at >= 32) {
+            const block: V = bytes[at..][0..32].*;
+            const escapes = (block < @as(V, @splat(0x20))) | (block == @as(V, @splat('"'))) | (block == @as(V, @splat('\\')));
+            const mask: u32 = @bitCast(escapes);
+            if (mask == 0) {
+                at += 32;
+                continue;
+            }
+            at += @ctz(mask);
+            try writer.writeAll(bytes[begin..at]);
+            try std.json.Stringify.encodeJsonStringChars(bytes[at..][0..1], .{}, writer);
+            at += 1;
+            begin = at;
+        }
+        while (at < bytes.len) : (at += 1) {
+            const byte = bytes[at];
+            if (byte < 0x20 or byte == '"' or byte == '\\') {
+                try writer.writeAll(bytes[begin..at]);
+                try std.json.Stringify.encodeJsonStringChars(bytes[at..][0..1], .{}, writer);
+                begin = at + 1;
+            }
+        }
+        try writer.writeAll(bytes[begin..]);
     }
     fn stringLength(bytes: []const u8) !usize {
         return (try stringStats(bytes)).length;
@@ -880,7 +956,7 @@ pub const Row = struct {
             if (!std.mem.eql(u8, name, column.name) or column.nulls.isNull(self.index)) continue;
             if (self.page.composite) {
                 const joined: *const Page.JoinedColumn = @ptrCast(@alignCast(column.values.encoded.ptr));
-                const binding = joined.bindings[self.index];
+                const binding = joined.binding(self.index);
                 return binding.source.textLength(binding.column.name);
             }
             if (self.chunks(column)) |parts| return parts.length;
@@ -896,7 +972,7 @@ pub const Row = struct {
         if (column.nulls.isNull(self.index)) return null;
         if (self.page.composite) {
             const joined: *const Page.JoinedColumn = @ptrCast(@alignCast(column.values.encoded.ptr));
-            const binding = joined.bindings[self.index];
+            const binding = joined.binding(self.index);
             return binding.source.chunks(binding.column);
         }
         if (self.page.chunked_columns) |slots| for (slots, self.page.columns) |slot, candidate| if (slot) |state| {
@@ -907,7 +983,7 @@ pub const Row = struct {
     fn preparedCell(self: Row, a: A, scratch: A, column: rows.ColumnVector) !Prepared.Value {
         if (self.page.composite) {
             const joined: *const Page.JoinedColumn = @ptrCast(@alignCast(column.values.encoded.ptr));
-            const binding = joined.bindings[self.index];
+            const binding = joined.binding(self.index);
             return binding.source.preparedCell(a, scratch, binding.column);
         }
         if (self.chunks(column)) |parts| return .{ .chunked = parts };
@@ -918,7 +994,7 @@ pub const Row = struct {
         if (self.chunks(column)) |parts| return .{ .string = try parts.materialize(a) };
         if (self.page.composite) {
             const joined: *const Page.JoinedColumn = @ptrCast(@alignCast(column.values.encoded.ptr));
-            const binding = joined.bindings[self.index];
+            const binding = joined.binding(self.index);
             return binding.source.cell(a, binding.column);
         }
         return switch (column.values) {
@@ -1457,4 +1533,79 @@ test "external lake typed delivery joins native and physical pages without mater
     try Run.run(std.testing.allocator);
     var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{});
+}
+
+test "external lake chunked delivery preserves canonical escaping options and vector boundaries" {
+    const a = std.testing.allocator;
+    var controls: [256]u8 = undefined;
+    for (&controls, 0..) |*byte, index| byte.* = @intCast(index % 128);
+    for ([_][]const u8{ &controls, "plain UTF-8 🙂 café", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\\\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\t🙂" }) |text| {
+        const parts = [_][]const u8{ text[0..1], text[1..] };
+        const prepared: Prepared.Value = .{ .chunked = .{ .parts = &parts, .length = text.len, .encoded_len = try Prepared.stringLength(text) } };
+        for ([_]std.json.Stringify.Options{ .{}, .{ .escape_unicode = true }, .{ .emit_strings_as_arrays = true } }) |options| {
+            const canonical = try std.json.Stringify.valueAlloc(a, text, options);
+            defer a.free(canonical);
+            const actual = try std.json.Stringify.valueAlloc(a, prepared, options);
+            defer a.free(actual);
+            try std.testing.expectEqualStrings(canonical, actual);
+            if (!options.escape_unicode and !options.emit_strings_as_arrays) try std.testing.expectEqual(actual.len, try prepared.length());
+        }
+    }
+}
+
+test "external lake typed delivery compiles distinct reordered schemas and retains only used parents" {
+    const a = std.testing.allocator;
+    const first = try Page.native(a, &.{ "counter", "flag" }, 2);
+    defer first.release();
+    try first.setNative(1, 0, .{ .integer = 9007199254740993 });
+    try first.setNative(1, 1, .{ .bool = true });
+    try first.finishNative();
+    const second = try Page.native(a, &.{ "flag", "counter" }, 1);
+    defer second.release();
+    try second.setNative(0, 0, .{ .bool = false });
+    try second.setNative(0, 1, .{ .integer = -9007199254740993 });
+    try second.finishNative();
+    const stored = try Page.native(a, &.{"body"}, 2);
+    defer stored.release();
+    try stored.setNative(0, 0, .{ .string = "first" });
+    try stored.setNative(1, 0, .{ .string = "second" });
+    try stored.finishNative();
+    const selected = [_]?Row{ .{ .page = first, .index = 1 }, .{ .page = second, .index = 0 } };
+    const native_only = try Page.join(a, &.{"body"}, &selected, stored);
+    defer native_only.release();
+    try std.testing.expectEqual(@as(usize, 1), first.refs.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), second.refs.load(.monotonic));
+    const physical_only = try Page.join(a, &.{ "counter", "flag" }, &selected, stored);
+    defer physical_only.release();
+    try std.testing.expectEqual(@as(usize, 2), stored.refs.load(.monotonic)); // Only native_only pins it.
+    for ([_]i64{ 9007199254740993, -9007199254740993 }, 0..) |expected, i| {
+        const row_ = physical_only.row(i);
+        defer row_.deinit();
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const object = try row_.value(&scratch);
+        try std.testing.expectEqual(expected, object.object.get("counter").?.integer);
+        try std.testing.expectEqual(i == 0, object.object.get("flag").?.bool);
+    }
+}
+
+test "external lake typed delivery preserves stored parent selection and null domains" {
+    const a = std.testing.allocator;
+    const source = try Page.native(a, &.{"value"}, 3);
+    defer source.release();
+    try source.setNative(0, 0, .{ .integer = 10 });
+    try source.setNative(2, 0, .{ .integer = 30 });
+    try source.finishNative();
+    source.retain();
+    const stored = try Page.borrow(a, .{ .snapshot = .{ .table_id = "test", .snapshot_id = "one" }, .row_refs = &.{ .{ .relational_key = "one" }, .{ .relational_key = "two" }, .{ .relational_key = "three" } }, .columns = source.columns }, &.{ 2, 1, 0 }, .{ .ptr = source, .release_fn = Page.releaseParent, .retained_bytes = source.retainedBytes() });
+    defer stored.release();
+    const joined = try Page.join(a, &.{"value"}, &.{ null, null, null }, stored);
+    defer joined.release();
+    for ([_]?i64{ 30, null, 10 }, 0..) |expected, i| {
+        const row_ = joined.row(i);
+        defer row_.deinit();
+        const actual = try row_.cell(a, joined.columns[0]);
+        if (expected) |value| try std.testing.expectEqual(value, actual.integer) else try std.testing.expect(actual == .null);
+        try std.testing.expectEqual(expected == null, joined.columns[0].nulls.isNull(i));
+    }
 }

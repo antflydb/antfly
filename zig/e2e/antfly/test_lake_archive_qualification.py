@@ -2410,3 +2410,136 @@ def test_dense_highlights_preserve_results_and_structured_deadlines(
                     renamed.rename(path)
         finally:
             client.session.close()
+
+
+@pytest.mark.parametrize("source_format", ["parquet", "iceberg"])
+def test_unequal_wide_parquet_pages_preserve_typed_sql_across_restart(
+    tmp_path, source_format
+):
+    """Real independent writers exercise wide, unequal pages cold and warm."""
+    import importlib.util
+
+    import conftest as harness
+
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
+    if not binary.is_file():
+        pytest.skip("Build the Antfly binary first")
+    spec = importlib.util.spec_from_file_location(
+        "unequal_pages_e2e",
+        Path(__file__).resolve().parents[2] / "tools" / "benchmark_lake_archive.py",
+    )
+    bench = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = bench
+    spec.loader.exec_module(bench)
+    data = {"id": [0], "body": ["needle " + "x" * (256 * 1024) + '\n"\\🙂']}
+    for i in range(64):
+        data[f"value_{i:02}"] = [None if i == 3 else 9007199254740993 + i]
+    rows = pa.table(
+        data,
+        schema=pa.schema(
+            [
+                pa.field(name, pa.string() if name == "body" else pa.int64())
+                for name in data
+            ]
+        ),
+    )
+    root = tmp_path / "fixture"
+    if source_format == "parquet":
+        archive = tmp_path / "archive.parquet"
+        pq.write_table(
+            rows,
+            archive,
+            use_dictionary=False,
+            write_batch_size=1,
+            data_page_size=256 * 1024,
+        )
+        uri = bench.import_fixture(root, [archive], "unequal-pages")["manifest_uri"]
+    else:
+        pytest.importorskip("pyiceberg")
+        pytest.importorskip("fastavro")
+        from pyiceberg.catalog.sql import SqlCatalog
+        from pyiceberg.schema import Schema
+        from pyiceberg.types import LongType, NestedField, StringType
+        from test_iceberg_sql import _export_table
+
+        catalog = SqlCatalog(
+            "unequal",
+            uri=f"sqlite:///{tmp_path}/catalog.db",
+            warehouse=(tmp_path / "warehouse").as_uri(),
+        )
+        catalog.create_namespace("unequal")
+        table = catalog.create_table(
+            "unequal.items",
+            schema=Schema(
+                *[
+                    NestedField(
+                        i + 1,
+                        name,
+                        StringType() if name == "body" else LongType(),
+                        required=False,
+                    )
+                    for i, name in enumerate(data)
+                ]
+            ),
+        )
+        table.append(rows)
+        _export_table(table, root)
+        uri = root.as_uri()
+    definition = {
+        "schema": {
+            "storage_mode": "relational",
+            "default_type": "row",
+            "base_source": {
+                "kind": "external",
+                "format": source_format,
+                "table_id": "unequal-pages",
+                "uri": uri,
+                "object_mutability": "immutable",
+                "row_identity": {"key_columns": ["id"]},
+            },
+            "document_schemas": {
+                "row": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            name: {
+                                "type": "string" if name == "body" else "integer",
+                                "nullable": True,
+                            }
+                            for name in data
+                        },
+                    }
+                }
+            },
+        },
+        "indexes": {},
+    }
+    with bench.managed_server(
+        harness.StandaloneAntflyServer,
+        binary,
+        _write_remote_content_e2e_config(tmp_path),
+        tmp_path,
+        api_root=harness.ANTFLY_PUBLIC_API_ROOT,
+    ) as server:
+        client = bench.Client(server, 120)
+        try:
+            client.call("POST", f"/tables/{bench.TABLE}", definition)
+            client.ready([])
+            for restart in (False, True):
+                if restart:
+                    server.restart()
+                for _ in range(2):
+                    value = client.call(
+                        "POST",
+                        "/sql",
+                        {"statement": f"SELECT * FROM {bench.TABLE} ORDER BY id"},
+                    )
+                    assert len(value["rows"]) == 1, value
+                    assert value["rows"][0] == [
+                        str(values[0]) if isinstance(values[0], int) else values[0]
+                        for values in data.values()
+                    ]
+        finally:
+            client.session.close()
