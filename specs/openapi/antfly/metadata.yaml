@@ -12461,7 +12461,7 @@ paths:
       operationId: ingestLakeChanges
       tags: [table_management]
       summary: ingestLakeChanges
-      description: Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table admin permission and iceberg_writer policy.
+      description: Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table write permission without a row filter and iceberg_writer policy. Catalog initialization, file commits and maintenance require table admin permission.
       requestBody:
         required: true
         content:
