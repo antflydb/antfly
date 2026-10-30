@@ -41,3 +41,11 @@ test('fused read admission returns exact rows and selected pins in one native ob
  assert.deepEqual(result,{rows:['one','tail'],pin:'protected'});
  assert.deepEqual(samples.filter(sample=>sample.event==='antfly.coordinator_snapshot_native').map(sample=>sample.action),['observe_read']);
 });
+
+
+test('latency diagnostics distinguish timing and capacity telemetry from explicit recovered resource failures',async()=>{
+ const{inspectLatencyLog}=await import('../qualification/latency-log.mjs');
+ assert.equal(inspectLatencyLog(JSON.stringify({event:'antfly.operation',native_cpu_ms:2,wasm_pool_limit_bytes:33554432})).failure,null);
+ for(const value of[{event:'antfly.resource_failure',failure_code:'SQLITE_NOMEM'},{event:'antfly.checkpoint_deferred',error:'Error: SQLITE_NOMEM'},Error('out of memory: SQLITE_NOMEM'),'out of memory: SQLITE_NOMEM',{error:{message:'SQLITE_NOMEM'}}])assert.equal(inspectLatencyLog(value).failure,'SQLITE_NOMEM');
+ assert.equal(inspectLatencyLog({failure_code:'CPULimitExceeded'}).failure,'CPULimitExceeded');
+});
