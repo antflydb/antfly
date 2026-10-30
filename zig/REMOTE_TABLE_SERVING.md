@@ -2236,3 +2236,46 @@ or delete markers, and deletes only exact versions absent from every live closur
 Map pages are reachability roots. Completed collections persist a paged mark set,
 and vacuum then removes unmarked map records, visiting at most four radix leaves
 per pass with a durable cursor.
+
+### Shared source navigation and composed typed delivery
+
+Native source-offset roots and dictionary pages have an optional immutable
+interpretation capability on the segment source. The serving provider keys its
+bounded decoded cache by connection scope, authenticated directory identity,
+source interval, codec interpretation and validation parameters. Roots retain
+page ceilings and source-order summaries; dictionary pages retain validated
+terms and block references. Query matchers, selected masks, density plans,
+source readers and operation callbacks never enter those cached values. Every
+hit checks the current read capability and its original authority/deadline
+hooks. Decoders borrow the source only while loading; admission pressure falls
+back to call-scoped decoding. Each interpretation has a 1-MiB loading bound and
+shares the existing global byte/entry/singleflight limits. Contiguous and other
+providers without this capability retain exact local decoding.
+
+Partial native source coverage composes with Parquet column pages instead of
+merging owned JSON row trees. The result page retains each distinct parent page
+once and binds output rows and fields to their original physical vectors. The
+bindings preserve requested field order, exact scalar types, SQL NULL flags and
+non-null JSON nulls. Source preparation follows those bindings directly; generic
+vector readers retain an on-demand materialization boundary. Explicit virtual
+`_id` comes from already-admitted hit identity, so combining it with stored
+columns does not reopen the original Parquet object.
+
+Large projected native strings retain bounded UTF-8 chunks. Full projection
+decodes each physical text page once, carries an incomplete code point into the
+next page, and reclaims compressed/decompression scratch immediately. Prepared
+wire values know their exact canonical JSON length and escape chunks directly
+into response residency or the existing response spool. They need no contiguous
+full-string allocation or provider callback during transport. Page leases keep
+all borrowed chunk bytes alive until preparation/spooling consumes them. Nested
+projection, computed expressions and generic value consumers can explicitly
+materialize a string when their semantics require it.
+
+Highlight routing inspects an existing scalar's length before building a JSON
+projection view. A large returned string can therefore keep the stored-offset
+snippet path without first making a full-string scratch copy. Hidden fields
+still use field-major hydration and exact, bounded fragment selection.
+
+These in-memory ownership and callback changes use runtime ABI **73**. The
+stored-source recipe remains **v10**, reader protocol **96**, with `AFOV0005`:
+there is no new on-disk encoding in this refinement.

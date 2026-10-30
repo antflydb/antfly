@@ -1988,3 +1988,88 @@ the final focused qualification and retains its frozen executable identity.
 The latest-main source `c532682337` also passes 32 API/75 shared cases and all
 48 real-file cases before admission refinement. These stage-specific counts are
 not combined into a distinct-test or final-runtime full-suite claim.
+
+## Shared navigation, typed composition and chunked strings
+
+[Retained comparison](native-typed-navigation-and-chunked-delivery-v1-observation.json)
+qualifies runtime `f6f37aa34a` against control `503044369d` on common main
+`e5aad86397`. The control includes the inference-owner objectstore import needed
+by main's GCS credential contract. Corrected helpers are pinned at
+`52961fac46`; frozen executable SHA-256 values and every sample are retained.
+The 336-request record comprises 224 same-main requests and a separately labelled
+112-request historical v9 reference. Neither executable changes during a run.
+
+The runtime shares validated immutable source-offset roots/dictionaries through
+the existing bounded decoded cache. Matchers and selected masks remain local.
+Mixed physical/native result pages retain original typed vectors through parent
+leases, preserving SQL NULL and exact integers. Large native strings decode into
+UTF-8 chunks and escape directly into response residency/spooling; generic value
+consumers keep an explicit materialization boundary. Inspecting projected text
+length before highlight routing avoids a hidden contiguous scratch copy.
+See [ownership and admission](../../REMOTE_TABLE_SERVING.md#shared-source-navigation-and-composed-typed-delivery).
+Runtime ABI is **73**; recipe **v10**, reader protocol **96**, and `AFOV0005` stay
+unchanged on disk.
+
+Same-main medians, warm shared-host local Debug milliseconds:
+
+| Shape | Old → new, primary | Old → new, reverse |
+| --- | ---: | ---: |
+| Prefix matching 20,000 terms | 91.80 → 79.12 | 92.33 → 78.86 |
+| Native large strings and four integer columns | 51.39 → 40.05 | 55.52 → 41.65 |
+| Native large strings only | 49.54 → 39.69 | 57.15 → 40.34 |
+| Mixed explicit identity, strings and integers* | 44.40 → 40.99 | 50.57 → 42.57 |
+| Mixed explicit identity and strings* | 43.53 → 40.09 | 49.54 → 40.03 |
+| Regular 2-MiB one-hit control | 10.96 → 10.95 | 11.19 → 11.39 |
+| Sparse 32-KiB one-hit control | 10.10 → 9.89 | 10.12 → 10.37 |
+| Early cluster with mixed-term remainder | 12.10 → 11.98 | 12.25 → 12.98 |
+
+Both orders support **13.8–14.6%** faster broad-term highlighting and
+**19.9–29.4%** faster native large-string delivery. Regular/sparse controls range
+from 2.1% faster to 2.5% slower; the cluster control is 1.0% faster in primary and
+**5.9% slower (0.72 ms)** in reverse. No additional latency win is claimed for
+those controls. Publication and artifact-store observations remain in the record;
+single readiness samples and superseded artifact totals do not isolate build CPU
+or live representation size.
+
+*The baseline silently omits explicitly requested source `_id` when combined
+with covered fields. The refined runtime supplies it directly from admitted hit
+identity and does not reopen Parquet for it. These **7.7–19.2%** faster mixed
+measurements include a correctness change and are not identical-output speedups.
+The helper explicitly characterizes the known baseline defect using
+`--baseline-missing-identity`; refined requests must return every requested field.
+Complete physical-source hits/totals agree after excluding only source `_id`;
+complete native/layout results agree without exclusions. Every refined identity,
+UTF-8/escaped value, null and integer above `2^53` is independently asserted.
+
+The historical v9 comparison uses source `fd30bc6ffd` on main `04dd50548a`, so it
+is not a same-main causal comparison. Regular/sparse one-hit medians are 5.4–8.1%
+faster in the refined executable in both orders. The earlier 11.8–14.6% one-hit
+regression did not reproduce in this run; this does not establish that it was
+causally removed. Historical broad/cluster results are retained separately and
+are not substituted for the same-main comparison.
+
+Native qualification passes **32 API + 80 shared checks**, with no failures,
+skips or leaks. Three repeated source selections perform **two immutable decodes
+and three raw reads**, retaining no query lease; current deadlines still reject
+cache hits. Typed composition exercises reordered parents, SQL NULL versus JSON
+null, canonical integers, UTF-8 chunk escaping, generic materialization and every
+allocation failure. **48 real Parquet/Iceberg E2E cases pass in 369.78 s** against
+the frozen refined executable. They include an 8-MiB Unicode projection with
+explicit identity and highlights while originals are unavailable, before and
+after restart. Existing 500-ms success and independent 1-ms failure cases remain.
+
+Reproduce from the worktree root with `highlight_refinements.py` and
+`typed_navigation.py`, each taking `LABEL IMMUTABLE_BINARY RUNTIME_SOURCE_COMMIT`.
+Only the known control uses the latter helper's explicit baseline-identity flag.
+Run old/new then new/old with fresh labels. The large-string fixture uses twelve
+rows, six physical columns, bounded Parquet pages and one-row writer batches.
+Combining a large string with 64 columns exceeded the existing equal-share scan
+page budget even with bounded pages; that failed setup is not included as a
+latency sample, no limit was raised, and the prior 64-column fixture remains a
+separate qualification.
+
+No task-owned build/E2E/cleanup overlaps these measurements. Other native builds
+run on the shared machine; `make gc` safely skipped while one was active. These
+are warm local Debug observations with readiness warming and retained caches.
+There is no Release, cloud, empty-cache, archive-scale or full-query-memory claim.
+Real-provider retention enforcement remains separately deferred.
