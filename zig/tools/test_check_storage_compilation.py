@@ -15,17 +15,23 @@
 
 """Test measurement accounting without invoking a compiler."""
 
+import errno
 import importlib.util
 import json
 import os
 import shutil
-import subprocess
 import unittest
 import sys
 import tempfile
 import threading
 from unittest import mock
 from pathlib import Path
+
+try:
+    from .fixture_process import run_fixture_build
+except ImportError:
+    from fixture_process import run_fixture_build
+
 
 SPEC = importlib.util.spec_from_file_location(
     "check_storage_compilation",
@@ -254,6 +260,7 @@ class BuildFailureEvidence(unittest.TestCase):
             self.assertEqual(timeout_seconds, 3600 if label.endswith("cold") else 1800)
             self.assertEqual(compiler_timeout_seconds, 1800)
             local_cache = cwd / command[command.index("--cache-dir") + 1]
+            self.assertEqual(command[command.index("--build-file") + 1], "./build.zig")
             self.assertNotIn("--global-cache-dir", command)
             self.assertEqual(env["ZIG_LOCAL_CACHE_DIR"], ".zig-cache")
             self.assertIn("-Dstrip=true", command)
@@ -511,6 +518,66 @@ class BuildFailureEvidence(unittest.TestCase):
 
 
 class ParallelAuditIsolation(unittest.TestCase):
+    def test_workspace_clone_preserves_source_metadata_and_private_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = measurement.AuditWorkspace(root / "baseline", 2)
+            cloned = measurement.AuditWorkspace(root / "worker", 1)
+            source.cwd.mkdir(parents=True)
+            owned = source.cwd / "owned.zig"
+            owned.write_text("original")
+            owned.chmod(0o640)
+            os.utime(owned, ns=(1_600_000_000_000_000_000,) * 2)
+            (source.cwd / "internal").symlink_to(owned)
+            external = root / "immutable.zig"
+            external.write_text("external")
+            (source.cwd / "external").symlink_to(external)
+            for cache in (source.local_cache, source.global_cache):
+                (cache / "o/hash").mkdir(parents=True)
+                (cache / "o/hash/bytes").write_text("cached")
+            measurement.clone_audit_workspace(source, cloned)
+            copied = cloned.cwd / "owned.zig"
+            self.assertEqual(copied.stat().st_mtime_ns, owned.stat().st_mtime_ns)
+            self.assertEqual(copied.stat().st_mode, owned.stat().st_mode)
+            self.assertNotEqual(copied.stat().st_ino, owned.stat().st_ino)
+            copied.write_text("worker edit")
+            self.assertEqual(owned.read_text(), "original")
+            shutil.rmtree(source.root)
+            self.assertEqual((cloned.cwd / "internal").read_text(), "worker edit")
+            self.assertEqual((cloned.cwd / "external").read_text(), "external")
+
+    def test_cache_seed_crosses_filesystems_without_aliasing_mutable_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, target = root / "phase", root / "fixture"
+            entries = (
+                "o/hash/maker",
+                "h/input",
+                "o/hash/input.lock",
+                "p/source.tar.gz",
+            )
+            for relative in entries:
+                path = source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(relative)
+                os.utime(path, ns=(1_600_000_000_000_000_000,) * 2)
+            with mock.patch.object(
+                measurement.os,
+                "link",
+                side_effect=OSError(errno.EXDEV, "different device"),
+            ) as link:
+                measurement.clone_audit_cache(source, target)
+            self.assertEqual(link.call_count, 2)
+            for relative in entries:
+                original, cloned = source / relative, target / relative
+                self.assertEqual(cloned.read_bytes(), original.read_bytes())
+                self.assertEqual(cloned.stat().st_mtime_ns, original.stat().st_mtime_ns)
+                self.assertNotEqual(cloned.stat().st_ino, original.stat().st_ino)
+            (target / "h/input").write_text("worker revision")
+            shutil.rmtree(source)
+            self.assertEqual((target / "o/hash/maker").read_text(), "o/hash/maker")
+            self.assertEqual((target / "h/input").read_text(), "worker revision")
+
     def test_cache_clones_share_immutable_objects_and_keep_manifests_private(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -620,6 +687,7 @@ class ParallelAuditIsolation(unittest.TestCase):
         )
 
         def fake_build(command, cwd, *, progress, env, **kwargs):
+            self.assertEqual(command[command.index("--build-file") + 1], "./build.zig")
             current = {
                 source
                 for source in sources
@@ -732,27 +800,62 @@ class StorageCompilationDiscovery(unittest.TestCase):
             raise unittest.SkipTest("Zig is required for build-graph regression tests")
         cls.temp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.temp.cleanup)
-        cls.root = Path(cls.temp.name)
+        cls.root = Path(cls.temp.name) / "zig"
+        cls.root.mkdir()
         fixtures = cls.root / "tools/fixtures"
         fixtures.mkdir(parents=True)
         source = Path(__file__).parent / "fixtures"
         shutil.copyfile(source / "storage_compilation.zig", cls.root / "build.zig")
         shutil.copyfile(source / "build_profiles.zig", fixtures / "build_profiles.zig")
+        (cls.root / "consumer.zig").write_text(
+            "pub export fn _start() void {}\n"
+            "pub export fn wWinMainCRTStartup() void {}\n"
+            "pub export fn fixtureValue() u32 { return 1; }\n"
+            'pub export fn specLength() usize { return @embedFile("external.yaml").len; }\n'
+        )
+        shared_c = cls.root / "shared-c"
+        shared_c.mkdir()
+        (shared_c / "api.yaml").write_text("openapi: 3.1.0\n")
+        (cls.root.parent / "public.yaml").symlink_to(shared_c / "api.yaml")
+        (shared_c / "native.h").write_text("#define FIXTURE_VALUE 9\n")
+        (shared_c / "native.c").write_text(
+            '#include "native.h"\nint fixture_native(void) { return FIXTURE_VALUE; }\n'
+        )
+        (shared_c / "native_batch.c").write_text(
+            "int fixture_native_batch(void) { return 3; }\n"
+        )
+        for name in ("native.c", "native_batch.c"):
+            (cls.root / name).symlink_to(shared_c / name)
         (cls.root / "project_build.zig").write_text(r"""
 const std = @import("std");
 pub fn create(b: *std.Build) ?void {
     const omit = b.option([]const u8, "omit", "Omit a required consumer");
     const target = b.standardTargetOptions(.{});
     const files = b.addWriteFiles();
-    const root = files.add("main.zig", "pub fn main() void {}\n");
+    // These artifacts are inspected, never executed. Keep native compilation
+    // and generated-source cache inputs without compiling startup, compiler-rt
+    // or UBSan once per synthetic consumer in every isolated cold cache.
+    const root = files.addCopyFile(b.path("consumer.zig"), "main.zig");
+    const native = b.addLibrary(.{
+        .name = "fixture-native", .linkage = .static, .use_llvm = true,
+        .root_module = b.createModule(.{ .target = target, .optimize = .debug, .strip = true }),
+    });
+    native.root_module.addCSourceFile(.{ .file = b.path("native.c") });
+    native.root_module.addCSourceFiles(.{ .root = b.path("."), .files = &.{"native_batch.c"} });
     inline for (.{
         "storage-owner-tests", "storage-owner-source-tests", "storage-owner-enrichment-tests",
         "api-table-read-tests", "api-table-write-tests", "api-table-write-lifecycle-tests", "data-runtime-tests",
     }) |name| {
         if (omit == null or !std.mem.eql(u8, omit.?, name)) {
             const exe = b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
-                .root_source_file = root, .target = target, .optimize = .debug,
+                .root_source_file = root, .target = target, .optimize = .debug, .strip = true,
             }) });
+            exe.root_module.addAnonymousImport("external.yaml", .{ .root_source_file = b.path("../public.yaml") });
+            exe.use_llvm = true;
+            exe.root_module.linkLibrary(native);
+            exe.entry = .disabled;
+            exe.bundle_compiler_rt = false;
+            exe.bundle_ubsan_rt = false;
             b.step(name, name).dependOn(&exe.step);
         }
     }
@@ -773,33 +876,63 @@ pub fn create(b: *std.Build) ?void {
 """)
 
     def build(self, *args):
-        return subprocess.run(
-            [self.zig, "build", "check-storage-compilation", "-j2", *args],
+        return run_fixture_build(
+            [
+                self.zig,
+                "build",
+                "--build-file",
+                "./build.zig",
+                "check-storage-compilation",
+                "-j2",
+                *args,
+            ],
             cwd=self.root,
             # Fixture-generated sources belong to its own lifetime, even when
             # the caller configures a disposable phase cache for other builds.
             env={**os.environ, "ZIG_LOCAL_CACHE_DIR": str(self.root / ".zig-cache")},
-            text=True,
-            capture_output=True,
             timeout=120,
         )
 
     def test_cloned_compiler_caches_relocate_without_rebuilding_generated_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            baseline = root / "baseline"
+            baseline = root / "baseline" / "zig"
             shutil.copytree(
                 self.root,
                 baseline,
                 ignore=shutil.ignore_patterns(".zig-cache", ".zig-global-cache"),
+                # Immutable authored providers retain the real checkout's
+                # identity; the mutation input below remains a private copy.
+                symlinks=True,
             )
 
+            # API archives embed schemas outside the Zig build root. Keep
+            # those immutable authored inputs visible in both source overlays.
+            (baseline.parent / "public.yaml").symlink_to(
+                self.root.parent / "public.yaml"
+            )
+
+            # This regression owns a cold local target cache, not a second
+            # compiler bootstrap. Reuse the phase's immutable host toolchain
+            # objects through a private global-cache snapshot. Both checkouts
+            # still own their manifests and survive deletion of the baseline.
+            inherited_global = os.environ.get("ZIG_GLOBAL_CACHE_DIR")
+            if inherited_global and Path(inherited_global).is_dir():
+                measurement.clone_audit_cache(
+                    Path(inherited_global).resolve(), baseline / ".zig-global-cache"
+                )
+
             def build_at(checkout):
-                result = subprocess.run(
+                # Discovery/missing-owner cases below still cover all seven
+                # consumers. One native generated-source consumer exercises
+                # the complete relocation/invalidation lifecycle here.
+                result = run_fixture_build(
                     [
                         self.zig,
                         "build",
-                        "check-storage-compilation",
+                        "--build-file",
+                        "./build.zig",
+                        "storage-owner-tests",
                         "-j1",
                         "--cache-dir",
                         ".zig-cache",
@@ -814,48 +947,56 @@ pub fn create(b: *std.Build) ?void {
                         "ZIG_LOCAL_CACHE_DIR": ".zig-cache",
                         "ZIG_GLOBAL_CACHE_DIR": ".zig-global-cache",
                     },
-                    capture_output=True,
-                    text=True,
                     timeout=120,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 return result.stderr
 
-            project = baseline / "project_build.zig"
-            project.write_text(
-                project.read_text().replace(
-                    ".optimize = .debug,", ".optimize = .debug, .strip = true,"
-                )
-            )
             build_at(baseline)
-            clone = root / "clone"
-            shutil.copytree(
-                baseline,
-                clone,
-                ignore=shutil.ignore_patterns(".zig-cache", ".zig-global-cache"),
+            clone = root / "clone" / "zig"
+            measurement.clone_audit_workspace(
+                measurement.AuditWorkspace(baseline.parent, 1),
+                measurement.AuditWorkspace(clone.parent, 1),
             )
-            for name in (".zig-cache", ".zig-global-cache"):
-                measurement.clone_audit_cache(
-                    baseline / name, clone / name, rebase_from=baseline, rebase_to=clone
-                )
             output = build_at(clone)
             self.assertIn("cached", output)
             self.assertNotRegex(output, r"compile (?:exe|lib) .* success")
+            # Canonicalizing external schema identities must retain content
+            # invalidation in both workspaces, not just hide relocation misses.
+            schema = self.root / "shared-c/api.yaml"
+            schema.write_text(schema.read_text() + "# schema revision\n")
+            for checkout in (clone, baseline):
+                self.assertRegex(build_at(checkout), r"compile exe .* success")
+                self.assertNotRegex(
+                    build_at(checkout), r"compile (?:exe|lib) .* success"
+                )
             # The clone's new source revision and manifests are private. The
             # original still gets real compiler hits after that revision.
-            project = clone / "project_build.zig"
-            project.write_text(
-                project.read_text().replace(
-                    "pub fn main() void {}",
-                    "pub fn main() void { var x: u8 = 1; x += 1; }",
+            # Change the tracked generator input, preserving a real source
+            # invalidation without recompiling the host build runner itself.
+            consumer = measurement.own(clone.parent, "zig/consumer.zig")
+            consumer.write_text(
+                consumer.read_text().replace(
+                    "pub export fn fixtureValue() u32 { return 1; }",
+                    "pub export fn fixtureValue() u32 { return 2; }",
                 )
             )
             output = build_at(clone)
             self.assertRegex(output, r"compile exe .* success")
             output = build_at(baseline)
             self.assertNotRegex(output, r"compile (?:exe|lib) .* success")
-            for name in (".zig-cache", ".zig-global-cache"):
-                shutil.rmtree(baseline / name)
+            shutil.rmtree(baseline.parent)
+            output = build_at(clone)
+            self.assertNotRegex(output, r"compile (?:exe|lib) .* success")
+            # Canonical authored identities must still track a worker taking
+            # private ownership of a provider and changing its actual bytes.
+            native = measurement.own(clone.parent, "zig/native.c")
+            native.write_text(
+                native.read_text().replace("FIXTURE_VALUE;", "FIXTURE_VALUE + 1;")
+            )
+            (clone / "native.h").write_text("#define FIXTURE_VALUE 9\n")
+            output = build_at(clone)
+            self.assertRegex(output, r"compile lib fixture-native .* success")
             output = build_at(clone)
             self.assertNotRegex(output, r"compile (?:exe|lib) .* success")
 

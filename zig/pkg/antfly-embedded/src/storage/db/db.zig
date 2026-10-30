@@ -78569,7 +78569,7 @@ test "db canonicalizes positional extractor endpoints once resolution lands" {
     // id-less mention its decimal array position as the local id, and the
     // materializer derives the same identity for `entity_index` endpoints,
     // so resolution injection canonicalizes them like id-carrying payloads
-    // (the examples/dogfood extractor shape).
+    // (the examples/antfly-docs-knowledge-base extractor shape).
     try db.addIndex(.{
         .name = "gliner_graph",
         .kind = .graph,
@@ -143323,8 +143323,14 @@ test "analyzed contributions preserve exact postings across analyzers and reclam
     const positions = [_]u32{ 0, 1, 4000, 4000, 3, std.math.maxInt(u32), 0 };
     const digest: [32]u8 = @splat(93);
     cache.put(digest, &.{.{ .term = "term", .positions = &positions }}, positions.len, 8192);
+    // Diagnostic totals must retain all 64 bits on both native and WASM.
+    const high: u64 = 0x1_0000_0000;
+    cache.hits.store(high, .monotonic);
+    cache.tokens_reused.store(high, .monotonic);
     var lease = cache.borrow(digest).?;
     defer lease.deinit();
+    try std.testing.expectEqual(high + 1, cache.hits.load(.monotonic));
+    try std.testing.expectEqual(high + positions.len, cache.tokens_reused.load(.monotonic));
     var iterator = lease.hitAt(0).iterator();
     var decoded: u32 = undefined;
     for (positions) |position| {

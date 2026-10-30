@@ -1,44 +1,54 @@
 name: Better Auth compatibility
 on:
   workflow_call:
-  schedule:
-    - cron: '17 9 * * *'
-  workflow_dispatch:
+    inputs:
+      head_sha:
+        type: string
+        default: ''
+      artifact_suite:
+        description: Shared Zig E2E artifact family (base or full)
+        type: string
+        required: true
+      versions:
+        description: Better Auth compatibility matrix
+        type: string
+        default: '["supported"]'
 permissions:
   contents: read
+  actions: read
 jobs:
-  native:
-    runs-on: arc-antfly-heavy
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: ./.github/actions/load-toolchain-policy
-        id: toolchain
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
-        with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-      - name: Build native test artifacts
-        working-directory: zig
-        run: ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache" ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global" zig build libantfly antfly -Doptimize=ReleaseFast -j1 --maxrss 30064771072
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        with:
-          name: auth-native
-          path: zig/zig-out
-          retention-days: 1
   compatibility:
-    needs: native
+    name: compatibility (${{ matrix.version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["supported","latest","beta"]' || '["supported"]') }}
+        version: ${{ fromJSON(inputs.versions) }}
     continue-on-error: ${{ matrix.version != 'supported' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          name: auth-native
-          path: zig/zig-out
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - name: Download shared E2E library
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: libantfly-e2e-${{ inputs.artifact_suite }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/auth-library
+      - name: Download shared E2E server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: antfly-e2e-${{ inputs.artifact_suite }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/auth-server
+      - name: Install shared E2E artifacts
+        run: |
+          mkdir -p zig/zig-out
+          tar -xzf "$RUNNER_TEMP/auth-library/"*.tar.gz -C zig/zig-out
+          tar -xzf "$RUNNER_TEMP/auth-server/"*.tar.gz -C zig
+          test -s zig/zig-out/lib/libantfly.so
+          test -s zig/zig-out/bin/antfly
+          chmod +x zig/zig-out/bin/antfly
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version-file: ts/package.json
@@ -65,6 +75,11 @@ jobs:
           pnpm --filter @antfly/sdk exec vitest run test/sql.test.ts
           pnpm --filter @antfly/better-auth test
           pnpm --filter @antfly/better-auth test:integration
+      - name: Test installed npm packages outside the workspace
+        if: matrix.version == 'supported'
+        env:
+          ANTFLY_LIBRARY: ${{ github.workspace }}/zig/zig-out/lib/libantfly.so
+        run: node ts/packages/better-auth/test/package-consumer.mjs
       - name: Test remote transport
         env:
           ANTFLY_AUTH_TEST_BINARY: ${{ github.workspace }}/zig/zig-out/bin/antfly
@@ -81,7 +96,7 @@ jobs:
             -e BETTER_AUTH_SECRET="ci-only-secret-at-least-thirty-two-characters" \
             -e APP_ORIGIN=http://localhost:13029 antfly-auth-example
           trap 'docker logs antfly-auth-example; docker rm -f antfly-auth-example; docker volume rm auth-example-data' EXIT
-          for attempt in $(seq 1 60); do
+          for ((attempt=0; attempt<60; attempt++)); do
             if curl --fail --silent http://localhost:13029/ > /dev/null; then break; fi
             sleep 1
           done

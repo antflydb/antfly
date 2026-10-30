@@ -4,12 +4,15 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test test/host.test.mjs test/collection.test.mjs test/batch.test.mjs test/r2-coordinator.test.mjs test/performance.test.mjs test/publication-protocol.test.mjs test/gate.test.mjs test/exact-search.test.mjs test/metrics-tail.test.mjs test/independent-counters.test.mjs test/coverage-seed-resume.test.mjs test/persisted-diagnostics.test.mjs test/file-bucket.test.mjs test/invocation-accounting.test.mjs test/latency-experiments.test.mjs test/provider-contracts.test.mjs test/proof-overlap.test.mjs test/logpush-probe.test.mjs test/otel-evidence.test.mjs test/tail-counter.test.mjs test/tail-counter-evidence.test.mjs test/paired-observer.test.mjs test/paired-observer-client.test.mjs test/paired-evidence-reader.test.mjs test/paired-export-receiver.test.mjs test/read-view-lease.test.mjs test/private-phase-profile.test.mjs",
+    "test": "node --test test/host.test.mjs test/collection.test.mjs test/batch.test.mjs test/r2-coordinator.test.mjs test/performance.test.mjs test/publication-protocol.test.mjs test/gate.test.mjs test/exact-search.test.mjs test/metrics-tail.test.mjs test/independent-counters.test.mjs test/coverage-seed-resume.test.mjs test/persisted-diagnostics.test.mjs test/file-bucket.test.mjs test/invocation-accounting.test.mjs test/latency-experiments.test.mjs test/provider-contracts.test.mjs test/proof-overlap.test.mjs test/logpush-probe.test.mjs test/otel-evidence.test.mjs test/tail-counter.test.mjs test/tail-counter-evidence.test.mjs test/paired-observer.test.mjs test/mail.test.mjs test/mail-ui.test.mjs test/paired-observer-client.test.mjs test/paired-evidence-reader.test.mjs test/paired-export-receiver.test.mjs test/read-view-lease.test.mjs test/private-phase-profile.test.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "deploy:r2": "wrangler deploy --config wrangler.r2.jsonc",
     "test:workerd": "node test/prepare-worker.mjs && node --test test/workerd.test.mjs test/r2-workerd.test.mjs test/split-workerd.test.mjs test/qualification-workerd.test.mjs test/logpush-workerd.test.mjs test/paired-observer-workerd.test.mjs test/paired-export-workerd.test.mjs",
-    "test:native": "node test/native.mjs"
+    "test:native": "node test/native.mjs",
+    "test:mail": "node --test test/mail.test.mjs test/mail-ui.test.mjs",
+    "test:mail-workerd": "node test/prepare-mail-worker.mjs && node --test test/mail-workerd.test.mjs",
+    "dev:mail": "node dev-mail.mjs"
   },
   "devDependencies": {
     "binaryen": "132.0.0",
@@ -17,6 +20,10 @@
     "miniflare": "5.20261019.2-beta",
     "undici": "7.29.1",
     "wrangler": "4.152.0",
-    "ws": "8.21.0"
+    "ws": "8.21.0",
+    "jsdom": "29.1.1"
+  },
+  "dependencies": {
+    "postal-mime": "4.2.0"
   }
 }

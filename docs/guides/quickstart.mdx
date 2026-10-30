@@ -92,11 +92,7 @@ antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
 antfly inference list
 ```
 
-EmbeddingGemma2 embeds text and images in the same 768-dimensional space.
-Antfly applies its retrieval roles automatically: index and artifact writes use
-the document role, while semantic searches use the query role. The pinned BF16
-safetensors bundle runs on native CPU, Metal, or CUDA. See the
-[EmbeddingGemma2 guide](/docs/guides/embeddinggemma2) for backend and model details.
+EmbeddingGemma2 embeds text and images in the same 768-dimensional space and runs on CPU, Metal, or CUDA.
 
 <Callout type="info">
 The running process picks up the new model on its next model-list or inference
@@ -117,15 +113,12 @@ One article per line, each with `title`, `body`, and `url`. 2,446 of the 10,000 
 
 ## Create a Table
 
-Create a table with a text embedding index for semantic search:
+Create a table with a text embedding index for semantic search. Each step shows the CLI and the equivalent HTTP request; the [SDKs](/docs/reference/sdks) for Go, TypeScript, Python, and Rust take the same request bodies.
 
 <Tabs defaultValue="cli">
   <TabsList>
     <TabsTrigger value="cli">CLI</TabsTrigger>
     <TabsTrigger value="curl">cURL</TabsTrigger>
-    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
-    <TabsTrigger value="python">Python</TabsTrigger>
-    <TabsTrigger value="go">Go</TabsTrigger>
   </TabsList>
 
   <TabsContent value="cli">
@@ -176,102 +169,6 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/wikipedia \
 ```
   </TabsContent>
 
-  <TabsContent value="typescript">
-```typescript
-import { AntflyClient } from '@antfly/sdk';
-
-const client = new AntflyClient({
-  baseUrl: 'http://127.0.0.1:8080',
-});
-
-await client.tables.create('wikipedia', {
-  indexes: {
-    title_body: {
-      type: 'embeddings',
-      template: '{{title}} {{body}}',
-      embedder: {
-        provider: 'antfly',
-        model: 'google/embeddinggemma-2:bf16-safetensors-bundle-v1',
-      },
-      chunker: {
-        provider: 'antfly',
-        text: { target_tokens: 200, overlap_tokens: 25 },
-      },
-    },
-  },
-});
-```
-  </TabsContent>
-
-  <TabsContent value="python">
-```python
-from antfly import AntflyClient
-
-client = AntflyClient(base_url='http://127.0.0.1:8080')
-
-client.create_table(
-    name='wikipedia',
-    indexes={
-        'title_body': {
-            'type': 'embeddings',
-            'template': '{{title}} {{body}}',
-            'embedder': {
-                'provider': 'antfly',
-                'model': 'google/embeddinggemma-2:bf16-safetensors-bundle-v1',
-            },
-            'chunker': {
-                'provider': 'antfly',
-                'text': {'target_tokens': 200, 'overlap_tokens': 25},
-            },
-        },
-    },
-)
-```
-  </TabsContent>
-
-  <TabsContent value="go">
-```go
-import (
-	"context"
-	"fmt"
-	"log"
-	"net/http"
-
-	antfly "github.com/antflydb/antfly/go/pkg/sdk"
-	"github.com/antflydb/antfly/go/pkg/sdk/query"
-)
-
-ctx := context.Background()
-client, err := antfly.NewAntflyClient("http://127.0.0.1:8080", http.DefaultClient)
-if err != nil {
-	log.Fatal(err)
-}
-
-embedder, err := antfly.NewIndexEmbedderConfig(antfly.AntflyEmbedderConfig{
-	Model: "google/embeddinggemma-2:bf16-safetensors-bundle-v1",
-})
-if err != nil { log.Fatal(err) }
-
-titleBody, err := antfly.NewCreateIndexRequest(antfly.EmbeddingsIndexConfig{
-	Template: "{{title}} {{body}}",
-	Embedder: *embedder,
-	Chunker: antfly.ChunkerConfig{
-		Provider: antfly.ChunkerProviderAntfly,
-		Text: antfly.TextChunkOptions{
-			TargetTokens: 200,
-			OverlapTokens: 25,
-		},
-	},
-})
-if err != nil { log.Fatal(err) }
-
-err = client.CreateTable(ctx, "wikipedia", antfly.CreateTableRequest{
-	Indexes: map[string]antfly.CreateIndexRequest{"title_body": *titleBody},
-})
-if err != nil { log.Fatal(err) }
-```
-  </TabsContent>
-
 </Tabs>
 
 Verify the table and index were created:
@@ -295,7 +192,7 @@ antfly load --table wikipedia \
 
 The CLI reads the JSONL and batches it for you. `--sync-level full_text` returns once each batch is keyword-searchable; embeddings keep generating in the background. (An application that owns its own ingestion uses the SDK [batch operations](/docs/api/data-operations) with bounded batches and retries.)
 
-Embedding generation runs in the background. Wait until 10% of documents have searchable embeddings; skipped documents are excluded:
+Wait until 10% of documents have searchable embeddings:
 
 ```bash
 antfly index wait --table wikipedia \
@@ -304,28 +201,18 @@ antfly index wait --table wikipedia \
   --timeout 45m
 ```
 
-Continue as soon as it returns. Results improve as the remaining documents are indexed; `antfly index list --table wikipedia` shows progress. To wait for the full corpus instead, use `--until complete`. Timing depends on hardware. If the wait times out, do not press on; see [Troubleshooting](#troubleshooting).
-
-The index turns `queryable_partial` as soon as a generation is published. Antfly
-keeps that snapshot across restarts. The remaining embeddings resume in the
-background. `complete` means every source outcome and the final vector
-publication have settled.
-
-Articles can produce multiple chunks, so `SEARCHABLE` in the status output may exceed the document count, and `avg_embeddings` measures chunk embeddings per second, not documents.
+Continue as soon as it returns; results improve as the rest of the corpus is indexed, and `antfly index list --table wikipedia` shows progress (counts are per chunk, so they can exceed the article count). Use `--until complete` to wait for everything. If the wait times out, see [Troubleshooting](#troubleshooting).
 
 ## Search
 
 ### Full-Text Search
 
-Search for articles containing specific terms:
+Search for articles containing specific terms. Each `antfly query` flag maps to the matching snake_case field on `POST /db/v1/query`, so the remaining searches show only the CLI:
 
 <Tabs defaultValue="cli">
   <TabsList>
     <TabsTrigger value="cli">CLI</TabsTrigger>
     <TabsTrigger value="curl">cURL</TabsTrigger>
-    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
-    <TabsTrigger value="python">Python</TabsTrigger>
-    <TabsTrigger value="go">Go</TabsTrigger>
   </TabsList>
 
   <TabsContent value="cli">
@@ -350,67 +237,12 @@ curl -X POST http://127.0.0.1:8080/db/v1/query \
 ```
   </TabsContent>
 
-  <TabsContent value="typescript">
-```typescript
-const results = await client.query({
-  table: 'wikipedia',
-  full_text_search: { query: 'body:"Korea"' },
-  fields: ['title', 'url'],
-  limit: 5,
-});
-
-for (const hit of results?.hits?.hits ?? []) {
-  console.log(hit._id, hit._source);
-}
-```
-  </TabsContent>
-
-  <TabsContent value="python">
-```python
-results = client.query(
-    table='wikipedia',
-    full_text_search={'query': 'body:"Korea"'},
-    fields=['title', 'url'],
-    limit=5,
-)
-
-for hit in results.responses[0].hits.hits:
-    print(hit.field_id, hit.field_source)
-```
-  </TabsContent>
-
-  <TabsContent value="go">
-```go
-fullText := query.NewQueryString(`body:"Korea"`)
-results, err := client.Query(ctx, antfly.QueryRequest{
-	Table:          "wikipedia",
-	FullTextSearch: &fullText,
-	Fields:         []string{"title", "url"},
-	Limit:          5,
-})
-if err != nil {
-	log.Fatal(err)
-}
-fmt.Printf("%+v\n", results)
-```
-  </TabsContent>
-
 </Tabs>
 
 ### Semantic Search
 
 Find articles semantically similar to a natural language query:
 
-<Tabs defaultValue="cli">
-  <TabsList>
-    <TabsTrigger value="cli">CLI</TabsTrigger>
-    <TabsTrigger value="curl">cURL</TabsTrigger>
-    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
-    <TabsTrigger value="python">Python</TabsTrigger>
-    <TabsTrigger value="go">Go</TabsTrigger>
-  </TabsList>
-
-  <TabsContent value="cli">
 ```bash
 antfly query --table wikipedia \
   --semantic-search "anatomy and physiology" \
@@ -418,70 +250,6 @@ antfly query --table wikipedia \
   --fields "title,url" \
   --limit 5
 ```
-  </TabsContent>
-
-  <TabsContent value="curl">
-```bash
-curl -X POST http://127.0.0.1:8080/db/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "table": "wikipedia",
-    "semantic_search": "anatomy and physiology",
-    "indexes": ["title_body"],
-    "fields": ["title", "url"],
-    "limit": 5
-  }'
-```
-  </TabsContent>
-
-  <TabsContent value="typescript">
-```typescript
-const results = await client.query({
-  table: 'wikipedia',
-  semantic_search: 'anatomy and physiology',
-  indexes: ['title_body'],
-  fields: ['title', 'url'],
-  limit: 5,
-});
-
-for (const hit of results?.hits?.hits ?? []) {
-  console.log(hit._id, hit._source);
-}
-```
-  </TabsContent>
-
-  <TabsContent value="python">
-```python
-results = client.query(
-    table='wikipedia',
-    semantic_search='anatomy and physiology',
-    indexes=['title_body'],
-    fields=['title', 'url'],
-    limit=5,
-)
-
-for hit in results.responses[0].hits.hits:
-    print(hit.field_id, hit.field_source)
-```
-  </TabsContent>
-
-  <TabsContent value="go">
-```go
-results, err := client.Query(ctx, antfly.QueryRequest{
-	Table:          "wikipedia",
-	SemanticSearch: "anatomy and physiology",
-	Indexes:        []string{"title_body"},
-	Fields:         []string{"title", "url"},
-	Limit:          5,
-})
-if err != nil {
-	log.Fatal(err)
-}
-fmt.Printf("%+v\n", results)
-```
-  </TabsContent>
-
-</Tabs>
 
 ## Hybrid Search & Reranking
 
@@ -493,26 +261,8 @@ Pull the reranker model:
 antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
 ```
 
-<Callout type="info">
-The running process picks up the new model on its next model-list or inference
-request. The Antfarm dashboard refreshes its model list about every 30 seconds,
-so allow up to a minute for it to appear there.
-</Callout>
+The first query loads the model, so it can take tens of seconds.
 
-The Q8 model is about 610 MiB and runs on native CPU or Metal. The first query
-loads it; reranking full articles can take tens of seconds, especially while
-indexing continues.
-
-<Tabs defaultValue="cli">
-  <TabsList>
-    <TabsTrigger value="cli">CLI</TabsTrigger>
-    <TabsTrigger value="curl">cURL</TabsTrigger>
-    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
-    <TabsTrigger value="python">Python</TabsTrigger>
-    <TabsTrigger value="go">Go</TabsTrigger>
-  </TabsList>
-
-  <TabsContent value="cli">
 ```bash
 antfly query --table wikipedia \
   --full-text-search 'body:Einstein' \
@@ -527,91 +277,6 @@ antfly query --table wikipedia \
     }' \
   --pruner '{"min_score_ratio": 0.01}'
 ```
-  </TabsContent>
-
-  <TabsContent value="curl">
-```bash
-curl -X POST http://127.0.0.1:8080/db/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "table": "wikipedia",
-    "full_text_search": {"query": "body:Einstein"},
-    "semantic_search": "theory of relativity and physics",
-    "indexes": ["title_body"],
-    "fields": ["title", "url"],
-    "limit": 10,
-    "reranker": {
-      "provider": "antfly",
-      "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
-      "field": "body"
-    },
-    "pruner": {"min_score_ratio": 0.01}
-  }'
-```
-  </TabsContent>
-
-  <TabsContent value="typescript">
-```typescript
-const results = await client.query({
-  table: 'wikipedia',
-  full_text_search: { query: 'body:Einstein' },
-  semantic_search: 'theory of relativity and physics',
-  indexes: ['title_body'],
-  fields: ['title', 'url'],
-  limit: 10,
-  reranker: {
-    provider: 'antfly',
-    model: 'ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0',
-    field: 'body',
-  },
-  pruner: { min_score_ratio: 0.01 },
-});
-```
-  </TabsContent>
-
-  <TabsContent value="python">
-```python
-results = client.query(
-    table='wikipedia',
-    full_text_search={'query': 'body:Einstein'},
-    semantic_search='theory of relativity and physics',
-    indexes=['title_body'],
-    fields=['title', 'url'],
-    limit=10,
-    reranker={
-        'provider': 'antfly',
-        'model': 'ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0',
-        'field': 'body',
-    },
-    pruner={'min_score_ratio': 0.01},
-)
-```
-  </TabsContent>
-
-  <TabsContent value="go">
-```go
-reranker, err := antfly.NewRerankerConfig(antfly.AntflyRerankerConfig{
-	Model: "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
-})
-if err != nil { log.Fatal(err) }
-reranker.Field = "body"
-fullText = query.NewQueryString("body:Einstein")
-results, err := client.Query(ctx, antfly.QueryRequest{
-	Table:          "wikipedia",
-	FullTextSearch: &fullText,
-	SemanticSearch: "theory of relativity and physics",
-	Indexes:        []string{"title_body"},
-	Fields:         []string{"title", "url"},
-	Limit:          10,
-	Reranker:       reranker,
-	Pruner:         antfly.Pruner{MinScoreRatio: 0.01},
-})
-if err != nil { log.Fatal(err) }
-fmt.Printf("%+v\n", results)
-```
-  </TabsContent>
-
-</Tabs>
 
 Reranking changes the order and keeps the count. Pruning changes the count: `min_score_ratio` keeps only results scoring at least that fraction of the top result, and `max_score_gap_percent` stops at the first sharp drop. [Tune Hybrid Search](/docs/guides/hybrid-search) covers both in depth.
 
@@ -620,37 +285,10 @@ Reranking changes the order and keeps the count. Pruning changes the count: `min
 EmbeddingGemma2 places text and images in one embedding space, so you can describe a picture in words and get the articles whose thumbnails match.
 
 <Steps>
-### Confirm the EmbeddingGemma2 model is available
-
-Use the model already installed for text search. Confirm it appears in the list:
-
-```bash
-antfly inference list
-```
-
-If you skipped the [model installation step](#install-the-text-embedding-model),
-complete it before adding this index.
-
-<Callout type="info">
-The running process picks up the new model on its next model-list or inference
-request. The Antfarm dashboard refreshes its model list about every 30 seconds,
-so allow up to a minute for it to appear there.
-</Callout>
-
 ### Add an image index to your table
 
-Add an EmbeddingGemma2 index to embed each article's Wikipedia thumbnail:
+Add a second index with the same [EmbeddingGemma2 model](#install-the-text-embedding-model), this time embedding each article's thumbnail:
 
-<Tabs defaultValue="cli">
-  <TabsList>
-    <TabsTrigger value="cli">CLI</TabsTrigger>
-    <TabsTrigger value="curl">cURL</TabsTrigger>
-    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
-    <TabsTrigger value="python">Python</TabsTrigger>
-    <TabsTrigger value="go">Go</TabsTrigger>
-  </TabsList>
-
-  <TabsContent value="cli">
 ```bash
 antfly index create --table wikipedia \
   --index thumbnail \
@@ -660,91 +298,8 @@ antfly index create --table wikipedia \
   --embedder '{"provider": "antfly", "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"}' \
   --distance-metric cosine
 ```
-  </TabsContent>
 
-  <TabsContent value="curl">
-```bash
-curl -X POST http://127.0.0.1:8080/db/v1/tables/wikipedia/indexes/thumbnail \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "embeddings",
-    "coverage_policy": "partial",
-    "template": "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
-    "embedder": {
-      "provider": "antfly",
-      "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
-    },
-    "distance_metric": "cosine"
-  }'
-```
-  </TabsContent>
-
-  <TabsContent value="typescript">
-```typescript
-const createdIndex = await client.indexes.create('wikipedia', 'thumbnail', {
-  type: 'embeddings',
-  coverage_policy: 'partial',
-  template: '{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}',
-  embedder: {
-    provider: 'antfly',
-    model: 'google/embeddinggemma-2:bf16-safetensors-bundle-v1',
-  },
-  distance_metric: 'cosine',
-});
-```
-  </TabsContent>
-
-  <TabsContent value="python">
-```python
-from antfly import (
-    CreateEmbeddingsIndexRequest,
-    CreateEmbeddingsIndexRequestType,
-    DerivedCoveragePolicy,
-    DistanceMetric,
-    antfly_embedder,
-)
-
-created_index = client.indexes.create(
-    'wikipedia',
-    'thumbnail',
-    CreateEmbeddingsIndexRequest(
-        type_=CreateEmbeddingsIndexRequestType.EMBEDDINGS,
-        coverage_policy=DerivedCoveragePolicy.PARTIAL,
-        template='{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}',
-        embedder=antfly_embedder('google/embeddinggemma-2:bf16-safetensors-bundle-v1'),
-        distance_metric=DistanceMetric.COSINE,
-    ),
-)
-```
-  </TabsContent>
-
-  <TabsContent value="go">
-```go
-embedder, err := antfly.NewIndexEmbedderConfig(antfly.AntflyEmbedderConfig{
-	Model: "google/embeddinggemma-2:bf16-safetensors-bundle-v1",
-})
-if err != nil { log.Fatal(err) }
-request, err := antfly.NewCreateIndexRequest(antfly.EmbeddingsIndexConfig{
-	CoveragePolicy: antfly.DerivedCoveragePolicyPartial,
-	Template:       "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
-	Embedder:       *embedder,
-	DistanceMetric: antfly.DistanceMetricCosine,
-})
-if err != nil { log.Fatal(err) }
-createdIndex, err := client.CreateIndex(ctx, "wikipedia", "thumbnail", *request)
-if err != nil { log.Fatal(err) }
-fmt.Printf("%+v\n", createdIndex)
-```
-  </TabsContent>
-
-</Tabs>
-
-Antfly probes the selected embedding model during creation and stores its
-dimension in the normalized index definition. Specify `dimension` only when
-you also want creation to verify an explicit expected size.
-
-Adding an index starts background image indexing. Articles without thumbnails
-are skipped; wait for 250 searchable images before continuing.
+Articles without thumbnails are skipped. Wait for 250 searchable images:
 
 ```bash
 antfly index wait --table wikipedia \
@@ -757,16 +312,6 @@ antfly index wait --table wikipedia \
 
 Describe what you want to see:
 
-<Tabs defaultValue="cli">
-  <TabsList>
-    <TabsTrigger value="cli">CLI</TabsTrigger>
-    <TabsTrigger value="curl">cURL</TabsTrigger>
-    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
-    <TabsTrigger value="python">Python</TabsTrigger>
-    <TabsTrigger value="go">Go</TabsTrigger>
-  </TabsList>
-
-  <TabsContent value="cli">
 ```bash
 antfly query --table wikipedia \
   --semantic-search "map of a country" \
@@ -774,63 +319,8 @@ antfly query --table wikipedia \
   --fields "title,url,thumbnail_url" \
   --limit 5
 ```
-  </TabsContent>
 
-  <TabsContent value="curl">
-```bash
-curl -X POST http://127.0.0.1:8080/db/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "table": "wikipedia",
-    "semantic_search": "map of a country",
-    "indexes": ["thumbnail"],
-    "fields": ["title", "url", "thumbnail_url"],
-    "limit": 5
-  }'
-```
-  </TabsContent>
-
-  <TabsContent value="typescript">
-```typescript
-const results = await client.query({
-  table: 'wikipedia',
-  semantic_search: 'map of a country',
-  indexes: ['thumbnail'],
-  fields: ['title', 'url', 'thumbnail_url'],
-  limit: 5,
-});
-```
-  </TabsContent>
-
-  <TabsContent value="python">
-```python
-results = client.query(
-    table='wikipedia',
-    semantic_search='map of a country',
-    indexes=['thumbnail'],
-    fields=['title', 'url', 'thumbnail_url'],
-    limit=5,
-)
-```
-  </TabsContent>
-
-  <TabsContent value="go">
-```go
-results, err := client.Query(ctx, antfly.QueryRequest{
-	Table:          "wikipedia",
-	SemanticSearch: "map of a country",
-	Indexes:        []string{"thumbnail"},
-	Fields:         []string{"title", "url", "thumbnail_url"},
-	Limit:          5,
-})
-if err != nil { log.Fatal(err) }
-fmt.Printf("%+v\n", results)
-```
-  </TabsContent>
-
-</Tabs>
-
-Concrete visual descriptions ("red sports car", "mountain landscape") work better than abstract ones. To search with an image instead of words, see [Multimodal Embeddings](/docs/guides/multimodal).
+Concrete visual descriptions ("red sports car", "mountain landscape") work better than abstract ones. The same pipeline enriches your own documents: PDFs and scans are read with OCR ([LightOnOCR-3](/docs/guides/lightonocr3) locally, or a connected provider), and audio is transcribed before indexing. See [Multimodal Embeddings](/docs/guides/multimodal) and [Index Recorded Calls and Podcasts](/docs/guides/transcription).
 </Steps>
 
 ## RAG (Retrieval-Augmented Generation)
@@ -846,7 +336,7 @@ antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 \
   --projector auto
 ```
 
-`--projector auto` includes image and audio support; try a local file with `antfly inference generate <model-dir> "Describe this input" --image ./photo.jpg` (`antfly inference list` prints the model directory) or `--audio ./clip.wav`, or use `--projector none` for a smaller, text-only download. The RAG example below uses text and limits output to 512 tokens per model turn. Hosted providers are [one section down](#rag-with-alternative-providers).
+`--projector auto` includes image and audio input; `--projector none` is a smaller, text-only download. To use a hosted model instead, skip to [RAG with alternative providers](#rag-with-alternative-providers).
 
 ### Build a query and generate an answer
 
@@ -857,8 +347,6 @@ to the query builder, searches, and answers from the results.
   <TabsList>
     <TabsTrigger value="cli">CLI</TabsTrigger>
     <TabsTrigger value="curl">cURL</TabsTrigger>
-    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
-    <TabsTrigger value="go">Go</TabsTrigger>
   </TabsList>
 
   <TabsContent value="cli">
@@ -903,76 +391,9 @@ curl -N -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
 ```
   </TabsContent>
 
-  <TabsContent value="typescript">
-```typescript
-const result = await client.retrievalAgent({
-  query: 'What are the major events in Korean history?',
-  queries: [{
-    table: 'wikipedia',
-    fields: ['title', 'body'],
-    limit: 5,
-  }],
-  generator: {
-    provider: 'antfly',
-    model: 'ggml-org/gemma-4-E4B-it-GGUF',
-    max_tokens: 512,
-  },
-  max_internal_iterations: 8,
-  stream: false,
-  steps: {
-    generation: { enabled: true },
-  },
-});
-```
-  </TabsContent>
-
-
-  <TabsContent value="go">
-```go
-generator, err := antfly.NewGeneratorConfig(antfly.AntflyGeneratorConfig{
-	Model: "ggml-org/gemma-4-E4B-it-GGUF",
-	MaxTokens: 512,
-})
-if err != nil { log.Fatal(err) }
-fields := []string{"title", "body"}
-result, err := client.RetrievalAgent(ctx, antfly.RetrievalAgentRequest{
-	Query: "What are the major events in Korean history?",
-	Queries: []antfly.RetrievalQueryRequest{{
-		Table:          "wikipedia",
-		Fields:         &fields,
-		Limit:          5,
-	}},
-	Generator:        *generator,
-	MaxInternalIterations: 8,
-	Steps: antfly.RetrievalAgentSteps{
-		Generation:     antfly.GenerationStepConfig{Enabled: true},
-	},
-})
-if err != nil { log.Fatal(err) }
-fmt.Printf("%+v\n", result)
-```
-  </TabsContent>
-
 </Tabs>
 
-The CLI and cURL commands stream Server-Sent Events as each step completes. A
-terminal `event: done` marks success; an error or incomplete stream makes the
-CLI exit nonzero. The SDK examples request structured JSON instead. Each
-example uses bounded, read-only tool calls and requests only a grounded answer.
-Use `--no-streaming` for JSON from the CLI.
-
-### Inspect a query plan (optional)
-
-To build a query without retrieving documents:
-
-```bash
-antfly agents query-builder --table wikipedia \
-  --intent "Find articles about anatomy" \
-  --generator '{"provider":"antfly","model":"ggml-org/gemma-4-E4B-it-GGUF","max_tokens":512,"temperature":0}' \
-  --max-internal-iterations 8
-```
-
-Add `--execute` to run the same composed retrieval workflow shown above.
+Both commands stream Server-Sent Events as each step completes and end with `event: done`. Use `--no-streaming` (or `"stream": false`) to get one JSON body with the answer and its sources. To see the query the agent would run without running it, use `antfly agents query-builder` with the same `--table`, `--intent`, and `--generator`.
 
 ### RAG with alternative providers
 
@@ -986,7 +407,7 @@ The same request runs against a hosted model or Ollama by changing the generator
   </TabsList>
 
   <TabsContent value="gemini">
-Requires a [Google AI API key](https://aistudio.google.com/apikey). The key is read by the standalone process, not the CLI, so export it in the terminal that runs `antfly standalone` and restart it:
+Requires a [Google AI API key](https://aistudio.google.com/apikey), exported in the terminal that runs `antfly standalone` (restart it after exporting):
 
 ```bash
 export GEMINI_API_KEY="your-api-key-here"
@@ -1003,7 +424,7 @@ antfly agents retrieval --table wikipedia \
   </TabsContent>
 
   <TabsContent value="openai">
-Requires an [OpenAI API key](https://platform.openai.com/api-keys). The generator defaults to `https://api.openai.com/v1` and reads `openai.api_key` from the configured secret store, with `OPENAI_API_KEY` as the environment fallback when enabled. The key is read by the standalone process, so export it in the terminal that runs `antfly standalone` and restart it:
+Requires an [OpenAI API key](https://platform.openai.com/api-keys), exported in the terminal that runs `antfly standalone` (restart it after exporting):
 
 ```bash
 export OPENAI_API_KEY="your-api-key-here"
@@ -1038,21 +459,7 @@ antfly agents retrieval --table wikipedia \
 
 </Tabs>
 
-Any of the four does the job. The two local options need no key and keep the data on the machine; the two hosted ones are faster on a laptop without a GPU.
-
-### Structured output
-
-`--no-streaming` returns one JSON body with the answer and its sources instead of streamed text:
-
-```bash
-antfly agents retrieval --table wikipedia \
-  --semantic-search "Explain the theory of relativity" \
-  --indexes "title_body" \
-  --fields "title,body,url" \
-  --limit 5 \
-  --generator '{"provider": "gemini", "model": "gemini-2.5-flash"}' \
-  --no-streaming --generate
-```
+Local models need no key and keep data on the machine; hosted ones are faster on a laptop without a GPU. Anthropic, Vertex, Bedrock, OpenRouter, and Cloudflare work the same way.
 
 ### Evaluation
 
@@ -1084,11 +491,7 @@ curl -N -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
   }'
 ```
 
-The scores arrive as an `eval` event in the stream.
-
-The evaluators:
-- **Retrieval metrics** (require `ground_truth.relevant_ids`): `recall`, `precision`, `ndcg`, `mrr`, `map`
-- **LLM-as-judge metrics** (require `judge` config): `relevance`, `faithfulness`, `completeness`, `coherence`, `safety`, `helpfulness`, `correctness`, `citation_quality`
+The scores arrive as an `eval` event in the stream. Judge metrics include `relevance`, `faithfulness`, `completeness`, and `citation_quality`; with `ground_truth.relevant_ids` you also get retrieval metrics such as `recall`, `ndcg`, and `mrr`.
 </Steps>
 
 ## Troubleshooting

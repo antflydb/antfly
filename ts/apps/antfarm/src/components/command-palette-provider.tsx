@@ -8,6 +8,7 @@ import {
   CommandItem,
   CommandList,
   CommandSeparator,
+  Spinner,
 } from "@antfly/design-system";
 import {
   ArrowUpDown,
@@ -18,7 +19,6 @@ import {
   HelpCircle,
   KeyRound,
   Library,
-  Loader2,
   Mic,
   Moon,
   Network,
@@ -305,7 +305,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
           <CommandEmpty>
             {isSearching ? (
               <div className="flex items-center justify-center gap-2 py-6">
-                <Loader2 className="h-4 w-4 animate-spin" />
+                <Spinner className="h-4 w-4" />
                 <span>Searching...</span>
               </div>
             ) : (

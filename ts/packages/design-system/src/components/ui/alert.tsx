@@ -49,8 +49,7 @@ function AlertTitle({ className, ...props }: React.ComponentProps<"div">) {
     <div
       data-slot="alert-title"
       className={cn(
-        // mono uppercase callout — label register, medium weight
-        "col-start-2 font-mono uppercase tracking-[0.08em] text-[11px] font-medium leading-none mb-[2px] text-foreground",
+        "col-start-2 font-sans text-sm font-medium leading-none mb-[2px] text-foreground",
         className
       )}
       {...props}
