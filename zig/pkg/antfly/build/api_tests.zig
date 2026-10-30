@@ -961,6 +961,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const file_owner_tests = b.addTest(.{ .name = "model-file-owner-tests", .root_module = file_owner_root, .filters = &.{ "native model files", "native model artifact receipts", "native model directory discovery", "embedded inference shared owner", "native model registry planning" }, .max_rss = 2 * 1024 * 1024 * 1024 });
     b.step("antfly-inference-file-owner-test", "Verify physical native model file I/O through real API-owned grants")
         .dependOn(&b.addRunArtifact(file_owner_tests).step);
+    const manifest_owner_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_manifest_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    manifest_owner_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    manifest_owner_root.addImport("antfly_local_sources", resource_forward_sources);
+    manifest_owner_root.addImport("inference_server", antfly_imports.inference_server);
+    const manifest_owner_tests = b.addTest(.{
+        .name = "model-manifest-owner-tests",
+        .root_module = manifest_owner_root,
+        .filters = &.{"model manifest owner"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-inference-manifest-owner-test", "Verify normal manifest preparation under original API-owned capacity")
+        .dependOn(&b.addRunArtifact(manifest_owner_tests).step);
     const http_cleanup_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/runnable_http_cleanup_test_root.zig"),
         .target = target,

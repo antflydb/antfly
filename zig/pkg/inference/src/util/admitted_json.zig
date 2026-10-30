@@ -43,3 +43,10 @@ pub fn parseWithRefusal(comptime T: type, allocator: std.mem.Allocator, input: [
     var context: Context = .{ .refusal = refusal };
     return decoder.parse(T, allocator, input, options, .{ .ptr = &context, .check = check });
 }
+
+/// Keep an enclosing synchronous execution refusal when a consumer translates
+/// syntax/schema errors or falls back to optional metadata.
+pub fn preserveRefusal(fallback: anyerror) anyerror {
+    execution.checkRetainedRefusal() catch |original| return original;
+    return fallback;
+}

@@ -74,7 +74,16 @@ fn checkSynchronousCheckpoint() !void {
     const checkpoint = synchronous_checkpoint orelse return;
     checking_synchronous_checkpoint = true;
     defer checking_synchronous_checkpoint = false;
-    try checkpoint.check_fn(checkpoint.context);
+    checkpoint.check_fn(checkpoint.context) catch |err| {
+        synchronous_refusal = err;
+        return err;
+    };
+}
+
+/// Observe the original synchronous refusal without polling or acquiring CPU.
+/// Best-effort metadata fallback must not revive a fenced preparation scope.
+pub fn checkRetainedRefusal() !void {
+    if (synchronous_refusal) |err| return err;
 }
 
 /// Park only a contended resource wait. Original cancellation/deadline checks
@@ -511,7 +520,12 @@ pub fn testSynchronousCheckpoint() !void {
     try control.check();
     var inner = CheckpointScope.init(.{ .context = &child, .check_fn = Probe.check });
     try std.testing.expectError(error.Forbidden, control.check());
+    child.fail = false;
+    try std.testing.expectError(error.Forbidden, checkRetainedRefusal());
+    try std.testing.expectError(error.Forbidden, control.check());
+    try std.testing.expectEqual(@as(usize, 1), child.calls);
     inner.deinit();
+    try checkRetainedRefusal();
     try control.check();
     if (comptime !@import("builtin").single_threaded) {
         const worker = try std.Thread.spawn(.{}, Probe.child, .{});

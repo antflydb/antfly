@@ -1820,3 +1820,39 @@ preparation, framework/vendor construction, mapped-page-fault scope and wider
 cross-engine/deployment evidence remain open. This is local deterministic
 integration; it adds no deployed inference or throughput claim. Full GNU
 qualification remains waived and the installed CLI is unchanged.
+
+### Manifest/configuration decoder and fallback integration
+
+Normal full-load, listing/candidate, capability and private-plan entry points now
+use admitted decoding. BERT/GPT, DeBERTa, ModernBERT, GLiNER and EmbeddingGemma
+config readers and tokenizer marker projection share the same bounded scanner.
+Raw embedder marker probes also checkpoint in 4 KiB chunks with marker/escape
+seam parity preserved. The first synchronous checkpoint refusal remains attached
+to its scope; optional metadata catches and public entry points inspect it
+without polling or treating it as absent/malformed metadata.
+
+From `zig/`, run `zig build antfly-inference-manifest-owner-test
+antfly-inference-file-owner-test antfly-inference-worker-provider-check -Dcuda=true
+-Doptimize=Debug -j1`. Run `inference-test-inference-unit` with the exact scoped
+prefixes in `manifest-preparation-v3.json`; avoid the broad `gliner boundary`
+selector, which includes unrelated device/socket qualification. The final run
+records 35/35 steps, two real-owner tests spanning all five entry points and the
+five cached file/registry ownership tests. Large inputs permit queued-query and
+control progress; compact inputs refuse every observed checkpoint while retaining
+the original root/team/bytes until finish. Private plans use actual transaction
+setup and hold the pull lock. Empty optional metadata cannot hide a retained
+refusal, and a retired scope permits a fresh call.
+
+The native selection passes 201 assertions with one unavailable optional sparse
+fixture skipped. It covers configuration compatibility, marker scan parity,
+bounded tokenizer projection, allocation failures and malformed-config fallback.
+`manifest-preparation-final.json` binds source snapshots, tested artifacts and
+verification. The broad first-run failure is preserved: an isolated direct-call
+cancellation-metrics assertion disagrees with the unchanged early precheck path.
+Its attribution is from source inspection, without a baseline rebuild; it remains
+open for the full design audit.
+
+The milestone covers these preparation paths, not deployed inference or throughput.
+Other materialization/preparation, framework/vendor construction, mapped-page
+faults and wider cross-engine/deployment evidence remain in the full goal. The
+full GNU qualification waiver is unchanged; the installed CLI was not rebuilt.

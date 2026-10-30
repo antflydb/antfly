@@ -5781,3 +5781,54 @@ model inference, throughput or mapped-page-fault qualification. Registry selecti
 and other preparation loops, framework/vendor construction and wider cross-engine
 and deployment evidence remain in the full goal. Full GNU qualification remains
 waived; the installed CLI has not been rebuilt for this milestone.
+
+### Manifest and configuration preparation retain their execution fence
+
+Full manifest loads, listing/candidate discovery, capability probes and private
+managed-plan loads now decode through the admitted JSON scanner. The delegated
+BERT/GPT, DeBERTa, ModernBERT, GLiNER and EmbeddingGemma configuration readers use
+that same scanner, including GLiNER bundle receipts. Tokenizer marker projection
+still skips vocabulary allocation, now with checked scanning of unknown trees
+and leading whitespace. Embedder marker probes check in 4 KiB intervals; the
+conservative scan overlaps chunk seams and the fused EmbeddingGemma vector scan
+retains its existing Unicode/marker semantics.
+
+A failed synchronous checkpoint retains its original cause until its scope is
+retired. Nested scopes restore their parent's state; unrelated workers inherit
+no callback. Best-effort metadata catches observe this retained refusal without
+polling again, preserving ordinary malformed-upstream-config fallback. Strict
+Antfly manifests remain fail-closed. Public load/probe entry points also inspect
+an already retained refusal, including paths that would otherwise report absent
+metadata. Candidate rejection cannot reinterpret an original refusal with a
+schema-error name as an unusable candidate.
+
+`manifest-preparation-v3.json` records 35/35 successful steps with unchanged
+inputs. Two API-owner tests exercise all five normal entry points with a queued
+query, control progress, original two-slot capacity and retained bytes. Physical
+wait lending is disabled in this fixture, so the queued query must progress at a
+CPU checkpoint. Large inputs produce more checkpoints than compact inputs;
+compact inputs refuse every observed checkpoint with cancellation, deadline,
+a one-shot lease fence and a normally suppressible schema-error name. The private
+plan fixture holds the actual pull lock and uses normal transaction setup.
+A separate empty-directory case prevents an existing refusal from becoming an
+absent capability or a fresh plan attempt, then verifies a fresh scope can retry.
+
+The same run passes 201 selected manifest/config/tokenizer/execution assertions;
+one optional sparse-model fixture is unavailable and skipped. Coverage includes
+marker seam/escape parity, bounded vocabulary projection, optional malformed
+config behavior, strict declaration rejection and allocation-failure cleanup.
+The five existing file/registry owner cases pass from their unchanged cached
+artifact, and the production worker-provider semantic check passes. The final
+receipt binds committed source snapshots and these exact artifacts. No installed
+CLI, deployed inference, throughput or full GNU qualification claim is added.
+
+The initially broad GLiNER selector also exposed a separate cancellation-metrics
+mismatch: `server.server.test.gliner boundary v2 direct cancellation and HTTP
+capacity use existing admission` expects two direct trace entries but sees zero.
+It reproduces alone. Source inspection shows the unchanged direct entry points
+check cancellation before reaching the extraction-v2 metric trace, ahead of the
+modified decoders; no baseline binary was rebuilt. The isolated log and source
+audit are retained as `manifest-preparation-v1-metrics-{isolated.log,audit.json}`.
+This remains an explicit full-goal audit item. Other preparation/materialization,
+framework/vendor construction, mapped-page-fault scope and wider cross-engine
+and deployment evidence also remain open. Full GNU qualification remains waived.

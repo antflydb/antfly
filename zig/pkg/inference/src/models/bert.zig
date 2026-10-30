@@ -19,6 +19,7 @@
 // Produces weight mappings from SafeTensors tensor names to model scope paths.
 
 const std = @import("std");
+const admitted_json = @import("../util/admitted_json.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
 const WeightMapping = @import("weight_source.zig").WeightMapping;
 
@@ -101,7 +102,7 @@ pub const Config = struct {
 
 /// Parse a BERT config from JSON bytes.
 pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    const parsed = try admitted_json.parse(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
     const obj = parsed.value.object;

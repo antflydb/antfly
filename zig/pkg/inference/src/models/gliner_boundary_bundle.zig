@@ -130,7 +130,7 @@ pub fn validate(receipt: Receipt) !void {
 
 pub fn parse(allocator: Allocator, bytes: []const u8) !Parsed {
     if (bytes.len > max_receipt_bytes) return error.GlinerBoundaryBundleLimitExceeded;
-    var parsed = try std.json.parseFromSlice(Receipt, allocator, bytes, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
+    var parsed = try @import("../util/admitted_json.zig").parse(Receipt, allocator, bytes, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
     errdefer parsed.deinit();
     try validate(parsed.value);
     return parsed;

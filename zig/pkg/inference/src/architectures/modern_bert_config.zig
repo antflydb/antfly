@@ -15,6 +15,7 @@
 
 //! Model configuration and geometry validation without execution backends.
 const std = @import("std");
+const admitted_json = @import("../util/admitted_json.zig");
 
 pub const Config = struct {
     /// Execution preference enabled by the measured GLiNER decision path.
@@ -72,7 +73,7 @@ pub fn isModernBertModel(model_type: []const u8) bool {
 /// the eager encoder. The public embedding checkpoints use the fused,
 /// bias-free layout.
 pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    const parsed = try admitted_json.parse(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
     if (parsed.value != .object) return error.InvalidModernBertConfig;

@@ -17,6 +17,7 @@
 //! Unknown subtrees are syntax-checked by the JSON scanner. Full tokenizer
 //! semantics and consumed artifact identity remain the model loader's job.
 const std = @import("std");
+const admitted_json = @import("../util/admitted_json.zig");
 
 pub const Fields = struct {
     added_tokens: ?std.json.Value = null,
@@ -24,15 +25,19 @@ pub const Fields = struct {
 };
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Fields) {
-    const trimmed = std.mem.trimStart(u8, bytes, " \t\r\n");
+    var start: usize = 0;
+    while (start < bytes.len and std.mem.indexOfScalar(u8, " \t\r\n", bytes[start]) != null) : (start += 1) {
+        if (start % 4096 == 0) try (@import("../execution_control.zig").InferenceExecutionControl{}).check();
+    }
+    const trimmed = bytes[start..];
     if (trimmed.len == 0 or trimmed[0] != '{') {
         // Preserve listing's historical behavior for valid non-object JSON;
         // malformed input must still fail instead of becoming empty metadata.
-        var ignored = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+        var ignored = try admitted_json.parse(std.json.Value, allocator, bytes, .{});
         defer ignored.deinit();
-        return std.json.parseFromSlice(Fields, allocator, "{}", .{});
+        return admitted_json.parse(Fields, allocator, "{}", .{});
     }
-    return std.json.parseFromSlice(Fields, allocator, bytes, .{ .ignore_unknown_fields = true });
+    return admitted_json.parse(Fields, allocator, bytes, .{ .ignore_unknown_fields = true });
 }
 
 test "tokenizer marker projection handles escaped fields and syntax errors" {
