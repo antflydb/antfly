@@ -2351,7 +2351,9 @@ pressure can fall back to independently owned bounded decoding.
 
 Result pages adopt decoded payload pins and borrow their UTF-8 chunks. A
 codepoint crossing a physical page boundary is copied into a tiny owned chunk;
-ordinary chunks share immutable page bytes. Pins outlive the corpus cursor and
+ordinary chunks share immutable page bytes. A synchronous optional transfer
+keeps the pin with its caller until the adopter consumes it, including a rejected
+foreign ABI call. Pins outlive the corpus cursor and
 release before the result arena. Result residency includes pinned arena capacity,
 including uncached values returned when residency is unavailable. Snippet reads
 reuse a decoded page transiently and copy only their requested interval. There

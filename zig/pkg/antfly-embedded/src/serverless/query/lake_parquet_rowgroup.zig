@@ -11021,3 +11021,48 @@ test "external lake Parquet page phases leave CPU admission free during delayed 
         try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
     }
 }
+
+test "external lake Parquet typed cache payload faults retain dictionary ownership after cursor teardown" {
+    const Scenario = struct {
+        fn run(a: Allocator) !void {
+            var bytes: std.ArrayList(u8) = .empty;
+            defer bytes.deinit(a);
+            try appendPlainI64DictionaryPage(&bytes, a, &.{ 11, 22 });
+            try appendOptionalDictionaryI64DataPageV2(&bytes, a, &.{ 0, null, 1 }, 1, &.{ 3, 0b10 });
+            var chunks = [_]external_source.ColumnChunk{.{ .column_id = @constCast("amount"), .file_offset = 0, .compressed_len = bytes.items.len, .uncompressed_len = bytes.items.len, .physical_type = @constCast("int64"), .encoding = @constCast("rle_dictionary"), .nullable = true }};
+            var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 3, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+            var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = @constCast("version"), .byte_len = bytes.items.len, .row_count = 3, .row_groups = &groups }};
+            const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+            const Reader = struct {
+                data: []const u8,
+                fn read(raw: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, offset: u64, len: usize) ![]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return allocator.dupe(u8, self.data[@intCast(offset)..][0..len]);
+                }
+            };
+            var source: Reader = .{ .data = bytes.items };
+            const serving = @import("lake_serving_cache.zig");
+            var cache = serving.Cache.init(a);
+            defer cache.deinit();
+            var memory = @import("../../storage/object_storage.zig").MemoryObjectStorage.init(a);
+            defer memory.deinit();
+            var shared: serving.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(memory.client()), .scope = @splat(0), .context = .{ .io = std.testing.io } };
+            defer shared.drain(true);
+            var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, .{ .ctx = &source, .read_range_alloc = Reader.read }, inventory, "data", 0, &.{"amount"}, .{});
+            var open = true;
+            defer if (open) cursor.deinit();
+            cursor.shared_reader = &shared;
+            const batch = (try cursor.next()).?;
+            const values = batch.columns[0];
+            const held = (try cursor.retainColumns(a)).?;
+            defer held.release();
+            cursor.deinit();
+            open = false;
+            try std.testing.expectEqual(@as(i64, 11), try values.integerAt(0));
+            try std.testing.expect(values.nulls.isNull(1));
+            try std.testing.expectEqual(@as(i64, 22), try values.integerAt(2));
+        }
+    };
+    try Scenario.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}

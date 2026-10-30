@@ -279,7 +279,9 @@ pub const Hydrator = struct {
             fn retain(raw: *anyopaque, lease: local.storage_rowsource_types.ColumnOwner) !void {
                 try @as(*@This(), @ptrCast(@alignCast(raw))).page.adoptNativeLease(lease);
             }
-            fn adoptText(raw: *anyopaque, lease: local.segment_source.Decoded) !void {
+            fn adoptText(raw: *anyopaque, transfer: *?local.segment_source.Decoded) !void {
+                const lease = transfer.* orelse return error.InvalidArgument;
+                transfer.* = null;
                 const output: *@This() = @ptrCast(@alignCast(raw));
                 const Pin = struct {
                     lease: local.segment_source.Decoded,

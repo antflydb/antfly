@@ -293,11 +293,16 @@ pub const Text = struct {
     /// release all adopted pins, including after a later chunk fails.
     pub const Retainer = struct {
         ptr: *anyopaque,
-        adopt: *const fn (*anyopaque, @import("../segment_source.zig").Decoded) anyerror!void,
+        adopt: *const fn (*anyopaque, *?@import("../segment_source.zig").Decoded) anyerror!void,
         dispatch: @import("antfly_runtime_abi").callback_abi.CallbackDispatch = Boundary.local_dispatch,
-        const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { adopt: *const fn (*anyopaque, @import("../segment_source.zig").Decoded) anyerror!void });
+        const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { adopt: *const fn (*anyopaque, *?@import("../segment_source.zig").Decoded) anyerror!void });
         fn retain(self: @This(), lease: @import("../segment_source.zig").Decoded) !void {
-            return Boundary.call("adopt", self.dispatch, self.adopt, .{ self.ptr, lease });
+            // A rejected foreign ABI contract never invokes the adopter. Keep
+            // ownership until the callback explicitly consumes the optional.
+            var owned: ?@import("../segment_source.zig").Decoded = lease;
+            defer if (owned) |held| held.release();
+            try Boundary.call("adopt", self.dispatch, self.adopt, .{ self.ptr, &owned });
+            if (owned != null) return error.InvalidArgument;
         }
     };
     const DecodedPage = struct { bytes: []const u8 };
@@ -937,11 +942,17 @@ test "highlight shared decoded text pages retain immutable chunks and fence auth
     const Pins = struct {
         items: std.ArrayList(source_module.Decoded) = .empty,
         reject: bool = false,
-        fn adopt(raw: *anyopaque, lease: source_module.Decoded) !void {
+        fn adopt(raw: *anyopaque, transfer: *?source_module.Decoded) !void {
+            const lease = transfer.* orelse return error.InvalidArgument;
+            transfer.* = null;
             const self: *@This() = @ptrCast(@alignCast(raw));
             errdefer lease.release();
             if (self.reject) return error.InjectedFailure;
             try self.items.append(std.testing.allocator, lease);
+        }
+        fn ignore(_: *anyopaque, _: *?source_module.Decoded) !void {}
+        fn rejectDispatch(_: *const @import("antfly_runtime_abi").native_abi.CallContract, _: *const anyopaque, _: *const anyopaque, _: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return @import("antfly_runtime_abi").error_abi.statusFromError(error.InvalidArgument);
         }
         fn deinit(self: *@This()) void {
             for (self.items.items) |lease| lease.release();
@@ -993,6 +1004,12 @@ test "highlight shared decoded text pages retain immutable chunks and fence auth
     var rejected: Pins = .{ .reject = true };
     defer rejected.deinit();
     try std.testing.expectError(error.InjectedFailure, text.readChunksRetained(output.allocator(), .none, .{ .ptr = &rejected, .adopt = Pins.adopt }));
+    const first_item: *Decoded.Item = @ptrCast(@alignCast(pins.items.items[0].item));
+    const refs = first_item.refs;
+    try std.testing.expectError(error.InvalidArgument, text.readChunksRetained(output.allocator(), .none, .{ .ptr = &pins, .adopt = Pins.adopt, .dispatch = Pins.rejectDispatch }));
+    try std.testing.expectEqual(refs, first_item.refs);
+    try std.testing.expectError(error.InvalidArgument, text.readChunksRetained(output.allocator(), .none, .{ .ptr = &pins, .adopt = Pins.ignore }));
+    try std.testing.expectEqual(refs, first_item.refs);
     // Uncached, retained results are reclaimed through the same result owner.
     provider.missing = false;
     var uncached = Provider{ .bytes = memory.out.items, .cache = .{ .a = a, .max_entries = 0 } };
