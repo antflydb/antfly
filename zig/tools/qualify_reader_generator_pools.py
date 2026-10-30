@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import re
 import struct
 import threading
 import time
@@ -69,7 +70,7 @@ class Probe:
         self.timeout = timeout
         self.results = []
 
-    def request(self, url, path, body=None):
+    def request(self, url, path, body=None, *, parse_json=True):
         headers = {"Content-Type": "application/json"}
         token = os.environ.get("ANTFLY_INFERENCE_TOKEN")
         if token:
@@ -81,10 +82,30 @@ class Probe:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return response.status, json.load(response)
+                return response.status, json.load(
+                    response
+                ) if parse_json else response.read(1024 * 1024).decode()
         except urllib.error.HTTPError as error:
             # Record synthetic inference results only; never record headers or token.
-            return error.code, json.loads(error.read(65536))
+            raw = error.read(65536)
+            return error.code, json.loads(raw) if parse_json else raw.decode()
+
+    def recurrent_placement(self, url):
+        status, metrics = self.request(url, "/metrics", parse_json=False)
+        assert status == 200, "recurrent placement metrics unavailable"
+        placement = {}
+        for kind in ("cuda", "host"):
+            values = re.findall(
+                rf"^antfly_inference_recurrent_{kind}_models[ \t]+([^\s]+)[ \t]*$",
+                metrics,
+                re.MULTILINE,
+            )
+            assert len(values) == 1, "missing or ambiguous recurrent placement gauge"
+            placement[kind] = float(values[0])
+        assert placement == {"cuda": 1, "host": 0}, (
+            f"expected one resident CUDA recurrent model without host fallback: {placement}"
+        )
+        return placement
 
     def instances(self, url, model):
         status, body = self.request(url, "/models/instances")
@@ -124,6 +145,11 @@ class Probe:
             "status": status,
             "text": text,
             "instances": self.instances(url, body["model"]),
+            **(
+                {"recurrent_placement": self.recurrent_placement(url)}
+                if path == "/read"
+                else {}
+            ),
         }
 
     def rejected(self, url, path, body, expected_code):

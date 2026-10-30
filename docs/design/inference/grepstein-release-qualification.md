@@ -57,6 +57,10 @@ that every corpus page fits. Do not retry an unchanged capped request forever.
 Measure the failing pages, then qualify a larger admitted output allowance or
 a bounded document refinement policy. A higher serving ceiling and the reader
 request must agree; increasing only one does not recover the missing tail.
+Also qualify the work-unit capacity: a single image with a 2048-token output
+allowance currently needs at least 12 generation admission units, exceeding
+the existing eight-unit serving profile. Raising only the token ceiling would
+still reject it. Keep request concurrency bounded while qualifying that change.
 Retry affected source versions after the policy change and require complete
 artifact coverage before semantic or graph enrichment. Avoid automatic image
 tiling without a tested ordering/deduplication policy.

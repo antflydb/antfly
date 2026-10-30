@@ -20,6 +20,45 @@ from qualify_reader_generator_pools import Probe
 
 
 class ProbeAssertionsTest(unittest.TestCase):
+    def test_reader_qualification_requires_actual_recurrent_placement(self):
+        probe = Probe(1)
+        for metrics in [
+            "antfly_inference_models_loaded 1\n",
+            "antfly_inference_recurrent_cuda_models 0\nantfly_inference_recurrent_host_models 1\n",
+            "antfly_inference_recurrent_cuda_models 1\nantfly_inference_recurrent_host_models 1\n",
+            "antfly_inference_recurrent_cuda_models 1\nantfly_inference_recurrent_cuda_models 1\nantfly_inference_recurrent_host_models 0\n",
+            "antfly_inference_recurrent_cuda_models NaN\nantfly_inference_recurrent_host_models 0\n",
+        ]:
+            with patch.object(probe, "request", return_value=(200, metrics)):
+                with self.assertRaises(AssertionError):
+                    probe.recurrent_placement("")
+        with patch.object(
+            probe,
+            "request",
+            return_value=(
+                200,
+                "# TYPE antfly_inference_recurrent_cuda_models gauge\nantfly_inference_recurrent_cuda_models 1\nantfly_inference_recurrent_host_models 0\n",
+            ),
+        ):
+            self.assertEqual({"cuda": 1, "host": 0}, probe.recurrent_placement(""))
+
+    def test_cuda_reader_instance_does_not_substitute_for_placement(self):
+        probe = Probe(1)
+        with patch.object(
+            probe,
+            "request",
+            side_effect=[
+                (200, {"data": [{"text": "invoice"}]}),
+                (200, {"data": [{"model": "reader", "backend": "cuda"}]}),
+                (
+                    200,
+                    "antfly_inference_recurrent_cuda_models 0\nantfly_inference_recurrent_host_models 1\n",
+                ),
+            ],
+        ):
+            with self.assertRaises(AssertionError):
+                probe.accepted("", "/read", {"model": "reader"}, ["invoice"])
+
     def test_policy_rejection_requires_the_exact_code(self):
         probe = Probe(1)
         for response in [
