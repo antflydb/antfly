@@ -11260,6 +11260,19 @@ pub fn lockWriterPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
     };
 }
 
+/// Wait in the operating system's lock queue rather than racing short unlock
+/// windows. Only an existing sidecar may be opened here: its creation must
+/// continue to exclude readers using the data inode as their lock authority.
+pub fn waitPathLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, writer: bool, deadline_ns: i96) !PathWriterLock {
+    const lock_path = try writerLockPathAlloc(allocator, io, path);
+    defer allocator.free(lock_path);
+    const file = try std.Io.Dir.cwd().openFile(io, lock_path, .{
+        .mode = if (writer) .read_write else .read_only,
+    });
+    const held = try @import("path_lock_wait.zig").lockUntil(file, io, if (writer) .exclusive else .shared, deadline_ns);
+    return .{ .io_impl = undefined, .borrowed_io = io, .file = held };
+}
+
 /// Read-only embedded calls coordinate with commits without reserving a writer.
 pub fn lockReaderPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
     const lock_path = try writerLockPathAlloc(allocator, io, path);

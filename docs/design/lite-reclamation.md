@@ -349,11 +349,14 @@ These fences allow the certificate catalog root to advance without reopening
 the database runtime and creating another set of leases.
 
 Contended path-lease admission uses randomized short sleeps, capped at four
-milliseconds. Long synchronized polling intervals let a hot writer repeatedly
-reacquire between other processes' attempts. The shorter staggered retries
-improve access to those brief unlock windows while retaining the original
-admission deadline and cancellation behavior. Qualification records CPU cost
-as well as progress for every writer.
+milliseconds only when a sidecar is absent or the executor cannot start a
+concurrent task. Normally, after the initial nonblocking attempt, admission
+joins the operating system's lock queue. A concurrent timer enforces the
+original deadline. Timeout and cancellation join the lock task before closing
+its descriptor, including when cancellation races a kernel grant. The first
+attempt still permits an uncontended acquisition after a slow allocator proof.
+Sidecar creation retains its inode fence. Qualification records CPU cost and
+progress for every writer rather than accepting aggregate throughput alone.
 
 Opening an immutable artifact publishes an inode-local lease alias. These
 metadata-only commits have their own allocation policy. Mixed groups retain

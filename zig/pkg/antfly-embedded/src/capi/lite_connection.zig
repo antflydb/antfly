@@ -1762,9 +1762,13 @@ pub const Connection = struct {
                 const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
                 if (remaining <= 0) return error.FileBusy;
                 if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| hook.notify(hook.ptr);
-                // A hot peer can reacquire between long polling intervals.
-                // Short, staggered retries give waiting processes a chance at
-                // brief unlock windows without synchronizing their wakeups.
+                if (native.waitPathLockWithIo(alloc, io, self.path, h.liteOpenModeCanWrite(self.options.open_mode), deadline)) |held| return held else |wait_err| switch (wait_err) {
+                    // Sidecar-free read-only snapshots retain their inode
+                    // authority. Resource-limited executors retain bounded
+                    // polling rather than making the deadline unbounded.
+                    error.FileNotFound, error.ConcurrencyUnavailable => {},
+                    else => return wait_err,
+                }
                 var entropy: [4]u8 = undefined;
                 io.random(&entropy);
                 const floor = @divTrunc(backoff, 2);
