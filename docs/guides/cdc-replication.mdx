@@ -194,7 +194,9 @@ Or keep it and mark it:
 ]
 ```
 
-Omit `on_delete` and Antfly derives `$unset` operations from the `on_update` paths, removing only the fields this source set. With neither set, a delete unsets every replicated column except the key fields.
+Omit `on_delete` entirely (or set it explicitly to `null`) on a source with no `on_update` either and Antfly defaults to `$delete_document`: with nothing configured, the table is a full mirror of the source, so a deleted source row deletes the document. Configure `on_delete` to anything else — including an explicit empty list, `"on_delete": []`, which leaves the document completely untouched — and that configuration wins; the default only applies when the field is unset.
+
+A source (or route) that configures `on_update` but not `on_delete` keeps the older behavior instead: Antfly derives `$unset` operations from the `on_update` paths, removing only the fields that source set, because several sources commonly feed one document this way (see below) and deleting the whole document would destroy the other sources' fields too. With neither `on_update` nor an explicit `on_delete`, that derivation has nothing to unset and falls back to a field-stripped stub (`{"id": ...}`) — this is the one case the document-delete default replaces.
 
 For deletes to arrive at all, the source table needs a replica identity. A primary key provides one. A table without one needs:
 
@@ -257,7 +259,7 @@ Replication runs one way. Antfly never writes back, so your application keeps it
 
 The cost of that arrangement is the replication slot. A slot makes PostgreSQL retain WAL until the subscriber has consumed it. While Antfly is up, that is a few seconds of WAL. While Antfly is down for a long stretch, PostgreSQL keeps every change since the last checkpoint, and disk usage grows until the stream resumes. Monitor slot lag the way you would for any logical subscriber (Antfly also reports `status.lag_records` and `status.lag_millis` in the table detail), and if you decommission an Antfly table, drop its slot in PostgreSQL rather than leaving it to hold WAL forever.
 
-That one-way flow is also why the delete decision is yours. PostgreSQL knows a row is gone; only you know whether the document should vanish from search or stay, marked inactive, so that history remains retrievable. `$delete_document` is right for data that should not be found once removed. A soft delete is right when the document is evidence, such as a resolved ticket that still teaches a classifier.
+That one-way flow is also why the delete decision is yours. PostgreSQL knows a row is gone; only you know whether the document should vanish from search or stay, marked inactive, so that history remains retrievable. `$delete_document` — the default for a table with no `on_update` either — is right for data that should not be found once removed. A soft delete is right when the document is evidence, such as a resolved ticket that still teaches a classifier; configure `on_delete` explicitly to get it.
 
 ## Use Agent Skills
 
