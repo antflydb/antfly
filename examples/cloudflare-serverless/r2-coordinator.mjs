@@ -298,7 +298,7 @@ export class R2CommitCoordinator extends DurableObject {
         trace.publicationId=committed.id;
         if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",trace_ids:inputs.map(input=>input.__trace_id).filter(Boolean),callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started,prepare_attempts:attempt+1,physical_r2:physical}));
         trace.emit(this.env.LOG_METRICS==="true");
-        return result.results.map((item,i)=>({...item,__publication:i===0?committed:{...committed,enqueue:false}}));
+        return result.results.map((item,i)=>({...item,...(this.env.METADATA_COMMIT_HINTS==="true"?{__metadata_hint:this.store.exportRootHint()}:{}),__publication:i===0?committed:{...committed,enqueue:false}}));
       }
       this.optimisticWal.clear();
     }
@@ -343,7 +343,7 @@ export class R2CommitCoordinator extends DurableObject {
       if(!committed.applied){prepared=null;await refresh();continue;}
       trace.publicationId=committed.publication.id;
       if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",trace_id:trace.id,trace_ids:inputs.map(input=>input.__trace_id).filter(Boolean),callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started,native_write_plan:true,prepare_attempts:prepareAttempts,finalize_attempts:finalizeAttempts,operations:ioBudget.operations,transferred_bytes:ioBudget.bytes,physical_r2:physical}));
-      return prepared.results.map((item,i)=>({...item,__publication:i===0?committed.publication:{...committed.publication,enqueue:false}}));
+      return prepared.results.map((item,i)=>({...item,...(this.env.METADATA_COMMIT_HINTS==="true"?{__metadata_hint:this.store.exportRootHint()}:{}),__publication:i===0?committed.publication:{...committed.publication,enqueue:false}}));
     }
     throw Error("WalCommitContended");
     }finally{trace.emit(this.env.LOG_METRICS==="true");}

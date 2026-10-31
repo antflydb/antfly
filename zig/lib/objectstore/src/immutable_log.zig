@@ -110,6 +110,10 @@ pub const ProofAuthority = struct {
         try self.current(proof.anchor);
     }
 };
+/// An advisory physical commit location, never an authority or a certificate.
+/// Native recovery loads the immutable frame and a fresh durable floor before
+/// deriving accepted state. No root bytes or proof clocks come from this hint.
+pub const ReadHint = struct { epoch: [16]u8, next: u64, revision: u64 };
 pub const CertifiedRecovery = struct { recovery: Recovery, proof: WriteProof };
 pub const ObservationMetrics = struct {
     cold_starts: u32 = 0,
@@ -121,6 +125,8 @@ pub const ObservationMetrics = struct {
     batch_waves: u32 = 0,
     prefetched_slots: u32 = 0,
     absence_rechecks: u32 = 0,
+    hint_accepted: u32 = 0,
+    hint_fallbacks: u32 = 0,
 };
 pub const Log = struct {
     client: Client,
@@ -396,6 +402,55 @@ pub const Log = struct {
         const cp = (try self.checkpoint(a)) orelse return error.ImmutableLogProofRequiresRecovery;
         const proof = try authority.issue(self, cp.state, anchor);
         return self.observeCertifiedMode(a, cp.state, authority, proof, true, null, anchor, 2);
+    }
+    /// A caller may carry a last acknowledged commit location across runtimes.
+    /// Authenticate its actual stored frame against the fresh GC floor; a lost,
+    /// stale, forged or retired hint falls back to that floor. A fresh next-slot
+    /// observation is still mandatory, under the original pre-I/O clock anchor.
+    pub fn observeHintCertified(self: Log, a: A, hint: ReadHint, authority: ProofAuthority) !CertifiedRecovery {
+        if (hint.next == 0 or hint.next > epoch_commits or hint.revision > 9_007_199_254_740_991) return error.InvalidImmutableLogHint;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const m = scratch.allocator();
+        const anchor = authority.now();
+        try authority.current(anchor);
+        const checkpoint_key = try std.fmt.allocPrint(m, "{s}/CHECKPOINT", .{self.prefix});
+        defer m.free(checkpoint_key);
+        const hint_key = try self.key(m, hint.epoch, hint.next - 1);
+        defer m.free(hint_key);
+        var client = self.client;
+        client.allocator = m;
+        const results = try client.getObjects(self.bucket, &.{
+            .{ .key = checkpoint_key, .options = .{ .skip_metadata_probe = true, .max_response_bytes = 16384, .cancellation = self.cancellation } },
+            .{ .key = hint_key, .options = .{ .skip_metadata_probe = true, .max_response_bytes = 16384, .cancellation = self.cancellation } },
+        });
+        defer {
+            for (results) |*result| if (result.*) |*value| value.deinit(m);
+            m.free(results);
+        }
+        try authority.current(anchor);
+        const stored_floor = results[0] orelse return error.ImmutableLogCheckpointMissing;
+        const cp = try std.json.parseFromSlice(Checkpoint, m, stored_floor.body, .{});
+        defer cp.deinit();
+        if (cp.value.format != 1) return error.InvalidImmutableLog;
+        try validate(cp.value.state);
+        var state = cp.value.state;
+        var accepted = false;
+        if (results[1]) |stored| {
+            const value = try frame(m, stored.body, hint.epoch, hint.next - 1);
+            if (value.kind == .commit and value.state.next == hint.next and value.state.revision == hint.revision and value.state.revision > state.revision) {
+                // Epoch collection first publishes a floor at or beyond every
+                // competing seal. An old delayed writer can recreate an orphan,
+                // but its revision can never outrun that fresh durable floor.
+                state = value.state;
+                accepted = true;
+            }
+        }
+        if (self.observation_metrics) |metrics| {
+            if (accepted) metrics.hint_accepted += 1 else metrics.hint_fallbacks += 1;
+        }
+        const proof = try authority.issue(self, state, anchor);
+        return self.observeCertifiedMode(a, state, authority, proof, true, null, anchor, 2);
     }
     /// Capture both independent proof objects in one native I/O wave. The
     /// certificate anchor precedes the batch; late responses cannot reset it.
@@ -1434,4 +1489,74 @@ test "immutable log checkpoint hint cannot publish after its original proof dead
     const accepted = try log.appendCertified(m, initial, "accepted", auth, try auth.issue(log, initial, auth.now()));
     try std.testing.expectError(error.ImmutableLogProofExpired, log.writeCheckpointHintCertified(m, accepted.recovery.state, auth, accepted.proof));
     try std.testing.expectEqual(initial.revision, (try log.checkpoint(m)).?.state.revision);
+}
+
+test "immutable log advisory commit locations authenticate stored state and still observe fresh appends" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var base = memory.client();
+    try base.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory, .read_batch_delay_ms = 1 };
+    var table: Client.VTable = undefined;
+    var metrics = ObservationMetrics{};
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "advisory", .owner = @splat(1), .io = std.testing.io, .read_batch = true, .observation_metrics = &metrics };
+    table.preferred_read_window = 4;
+    const auth = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const initial = (try log.recover(m, null, true)).state;
+    var accepted = CertifiedRecovery{ .recovery = .{ .state = initial }, .proof = try auth.issue(log, initial, auth.now()) };
+    for (0..32) |_| accepted = try log.appendCertified(m, accepted.recovery.state, "accepted", auth, accepted.proof);
+    const hint = ReadHint{ .epoch = accepted.recovery.state.epoch, .next = accepted.recovery.state.next, .revision = accepted.recovery.state.revision };
+    backend.scalar_reads = 0;
+    backend.batch_reads = 0;
+    metrics = .{};
+    const anchor = auth.now();
+    const observed = try log.observeHintCertified(m, hint, auth);
+    try std.testing.expectEqual(accepted.recovery.state.revision, observed.recovery.state.revision);
+    try std.testing.expectEqualDeep(anchor, observed.proof.anchor);
+    try std.testing.expectEqual(@as(usize, 1), backend.batch_reads);
+    try std.testing.expectEqual(@as(usize, 1), backend.scalar_reads);
+    try std.testing.expectEqual(@as(u32, 1), metrics.hint_accepted);
+    try std.testing.expectEqual(@as(u32, 0), metrics.slots_followed);
+    accepted = try log.appendCertified(m, accepted.recovery.state, "newer", auth, accepted.proof);
+    try std.testing.expectEqualStrings("newer", (try log.observeHintCertified(m, hint, auth)).recovery.state.root);
+    var forged = hint;
+    forged.revision += 100;
+    try std.testing.expectEqualStrings("newer", (try log.observeHintCertified(m, forged, auth)).recovery.state.root);
+    var missing = hint;
+    missing.epoch = @splat(99);
+    try std.testing.expectEqualStrings("newer", (try log.observeHintCertified(m, missing, auth)).recovery.state.root);
+    try std.testing.expectEqual(@as(u32, 2), metrics.hint_fallbacks);
+    try std.testing.expectError(error.InvalidImmutableLogHint, log.observeHintCertified(m, .{ .epoch = hint.epoch, .next = 0, .revision = hint.revision }, auth));
+
+    const old_key = try log.key(m, hint.epoch, hint.next - 1);
+    var old_frame = try base.getObject("db", old_key, .{});
+    defer old_frame.deinit(a);
+    var winner = log;
+    winner.owner = @splat(2);
+    const claimed = (try winner.recover(m, accepted.recovery.state, true)).state;
+    const next = try winner.appendCertified(m, claimed, "winner", auth, try auth.issue(winner, claimed, auth.now()));
+    // A pre-takeover hint follows the actual accepted seal, never its old owner.
+    try std.testing.expectEqualStrings("winner", (try log.observeHintCertified(m, hint, auth)).recovery.state.root);
+    var cp = (try winner.checkpoint(m)).?;
+    cp.written_ms = 0;
+    var receipt = try base.putObject("db", "advisory/CHECKPOINT", try std.json.Stringify.valueAlloc(m, cp, .{}), .{});
+    receipt.deinit(a);
+    try std.testing.expect(try winner.writeCheckpoint(m, next.recovery.state, true));
+    const epoch_prefix = try std.fmt.allocPrint(m, "advisory/epochs/{s}/", .{std.fmt.bytesToHex(hint.epoch, .lower)});
+    var objects = try base.listObjects("db", .{ .prefix = epoch_prefix, .recursive = true });
+    defer objects.deinit(a);
+    for (objects.entries) |object| try base.deleteObject("db", object.key, .{});
+    backend.time.wall_ms += 60001;
+    backend.time.mono_ms += 60001;
+    receipt = try base.putObject("db", old_key, old_frame.body, .{});
+    receipt.deinit(a);
+    // Even a physically recreated old frame cannot outrun the durable floor.
+    try std.testing.expectEqualStrings("winner", (try log.observeHintCertified(m, hint, auth)).recovery.state.root);
+    try std.testing.expectError(error.ImmutableLogProofExpired, log.appendCertified(m, accepted.recovery.state, "resurrected", auth, accepted.proof));
+    backend.read_batch_delay_ms = 30000;
+    try std.testing.expectError(error.ImmutableLogProofExpired, log.observeHintCertified(m, hint, auth));
 }

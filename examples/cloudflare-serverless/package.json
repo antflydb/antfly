@@ -12,7 +12,8 @@
     "test:native": "node test/native.mjs",
     "test:mail": "node --test test/mail.test.mjs test/mail-ui.test.mjs",
     "test:mail-workerd": "node test/prepare-mail-worker.mjs && node --test test/mail-workerd.test.mjs",
-    "dev:mail": "node dev-mail.mjs"
+    "dev:mail": "node dev-mail.mjs",
+    "test:metadata-hints-workerd": "node --test test/metadata-hint-workerd.test.mjs"
   },
   "devDependencies": {
     "binaryen": "132.0.0",

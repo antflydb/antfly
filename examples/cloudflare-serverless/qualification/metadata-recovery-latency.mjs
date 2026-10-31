@@ -37,6 +37,7 @@ for(const lag of lags){
    for(const which of order){let readerOffset=0,active=0,peak=0,gets=0,misses=0,elapsed=0,snapshot;const b=clone(mode==='cold'?tail:before),original=b.get.bind(b);let injected=0;b.get=async(...args)=>{gets++;peak=Math.max(peak,++active);try{if(injected)await new Promise(ok=>setTimeout(ok,injected));const v=await original(...args);if(!v)misses++;return v;}finally{active--;}};
     const observer=new R2CoordinatorStore(modules[which].module,b,'metadata-recovery-uniform',{clock:()=>Date.now()+readerOffset,onMetrics:s=>{if(s.event==='antfly.coordinator_snapshot')snapshot=s;}});observer.configureAuthority({mode:'r2-bounded'});
     if(mode!=='cold'){assert.equal(await observer.readOnly(tx=>tx.get('value')),0);const full=clone(mode==='advanced-floor'?advanced:tail);b.objects=full.objects;b.revision=full.revision;readerOffset+=31000;}
+    if(which&&process.argv.includes('--commit-hints'))observer.offerRootHint(writer.exportRootHint());
     gets=misses=peak=0;injected=delay;const started=performance.now();let failure=null,value;try{value=await observer.readOnly(tx=>tx.get('value'));assert.equal(value,lag);}catch(error){failure=String(error);elapsed=performance.now()-started;await error?.ioSettled;if(resourceFailureCode(error))throw error;}if(!failure)elapsed=performance.now()-started;assert.equal(active,0,'every physical read must settle');
     measurements[which].push({sample,elapsed_ms:elapsed,settlement_ms:Math.max(0,performance.now()-started-elapsed),verified:!failure,failure,gets,misses,peak_parallel_gets:peak,snapshot});
    }

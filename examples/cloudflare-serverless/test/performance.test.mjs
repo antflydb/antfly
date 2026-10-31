@@ -969,3 +969,10 @@ test('compute placement can differ from bucket hints without changing durable st
  const placed=placementEnv(env);for(const key of ['COMMITS','READERS','BUILDERS'])placed[key].getByName('actor');assert.ok(calls.every(c=>c.options.locationHint==='enam'));assert.equal(placed.COORDINATOR_STORAGE_ID,'durable');assert.equal(placed.R2_LOCATION_HINT,'wnam');
  assert.notEqual(placed.COMMITS.idFromName('actor'),placementEnv({...env,DO_LOCATION_HINT:'weur'}).COMMITS.idFromName('actor'));assert.throws(()=>placementEnv({...env,DO_LOCATION_HINT:'invalid'}),/InvalidRuntimePlacement/);
 });
+
+test('advisory metadata locations retain only bounded namespace-scoped values and consume the existing row allowance',async()=>{
+ const{store,bucket}=fixture();store.configureAuthority({mode:'r2-bounded'});await store.transaction(tx=>tx.put('value',1));const hint=store.exportRootHint();assert.ok(hint);assert.equal(Object.hasOwn(hint,'root'),false);assert.equal(Object.hasOwn(hint,'proof'),false);
+ const reader=new R2CoordinatorStore(module,bucket,'performance',{rowBudgetBytes:32768});assert.equal(reader.offerRootHint(hint),true);assert.ok(reader.cursorHintBytes<=4096);assert.notEqual(reader.rootHint.epoch,hint.epoch);const saved=[...reader.rootHint.epoch];hint.epoch[0]^=255;assert.deepEqual(reader.rootHint.epoch,saved);
+ for(const patch of[{namespace:'other'},{epoch:new Array(16)},{epoch:Array(16).fill(256)},{next:0},{next:65},{revision:2**53}])assert.equal(reader.offerRootHint({...hint,revision:hint.revision+1,...patch}),false);
+ for(let i=0;i<100;i++)reader.remember('key/'+i,'x'.repeat(512));assert.ok(reader.rowBytes+reader.hintBytes+reader.cursorHintBytes<=reader.rowBudgetBytes);assert.equal(reader.offerRootHint({...hint,revision:hint.revision}),false);
+});

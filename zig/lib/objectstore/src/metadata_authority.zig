@@ -27,6 +27,7 @@ pub const Authority = struct {
     journal_auth: ?journal.ProofAuthority = null,
     journal_proof: ?journal.WriteProof = null,
     journal_read_batch: bool = true,
+    journal_hint: ?journal.ReadHint = null,
     fn acceptJournal(self: *Authority, result: journal.CertifiedRecovery) journal.Recovery {
         self.journal_proof = result.proof;
         return result.recovery;
@@ -44,6 +45,20 @@ pub const Authority = struct {
     fn observedJournal(self: *Authority, a: A, state: ?journal.State, takeover: bool, follow_owners: bool, read_only: bool) !journal.Recovery {
         const auth = self.journal_auth orelse return if (follow_owners) self.log.observeCommitted(a, state) else if (read_only) self.log.observe(a, state.?) else self.log.recover(a, state, takeover);
         const anchor = auth.now();
+        if (follow_owners) if (self.journal_hint) |hint| {
+            const ahead = if (state) |s| hint.revision > s.revision and hint.revision - s.revision >= 8 else true;
+            const expired = if (state) |s| if (self.journal_proof) |proof| blk: {
+                auth.check(self.log, s, proof) catch |err| break :blk err == error.ImmutableLogProofExpired;
+                break :blk false;
+            } else true else true;
+            const newer = if (state) |s| hint.revision > s.revision else true;
+            if (newer and (ahead or expired)) {
+                if (state == null) if (self.log.observation_metrics) |metrics| {
+                    metrics.cold_starts += 1;
+                };
+                return self.acceptJournal(try self.log.observeHintCertified(a, hint, auth));
+            }
+        };
         if (state == null and follow_owners) {
             if (self.log.observeFromCheckpointCertified(a, auth)) |cold| return self.acceptJournal(cold) else |failure| switch (failure) {
                 error.ImmutableLogProofRequiresRecovery => {},

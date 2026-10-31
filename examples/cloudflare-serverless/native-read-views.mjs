@@ -32,6 +32,7 @@ export class NativeReadViews {
   this.background=background;this.leaseCapacity=env.FENCED_READ_LEASES==="false"?0:32768;
   this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,readBatch:env.NATIVE_METADATA_READ_BATCH!=="false",rowBudgetBytes:512*1024-this.leaseCapacity,readKernel:observation,cache,onMetrics,proofBudget:env.DETACHED_METADATA_PROOFS==="true"&&kernel.slots?.length?readAheadBudgetFor(kernel,Math.min(4,kernel.slots.length)):undefined,remoteCache:edgeCacheForEnv(env,{background})});
  }
+ offerRootHint(hint){return this.env.METADATA_COMMIT_HINTS==="true"&&this.store.offerRootHint(hint);}
  async leaseCache(){if(!this.leaseCapacity)return null;if(!this.leases){const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);this.leases??=new FencedReadLeases({scope:keys.wal.match(/wal-v1\/([a-f0-9]{64})\/HEAD$/)[1],clock:this.clock,maxBytes:this.leaseCapacity});}return this.leases;}
  async open(options={}){const cache=options.allow_cached?await this.leaseCache():null;try{return cache?await cache.run(options.required_visibility,'native',()=>this.freshOpen(options),options.onLease):await this.freshOpen(options);}catch(error){if(!/^(ReadSnapshotNeeds(?:Admission|Pin)|CoordinatorAuthorityMissing|CoordinatorRecovering)$/.test(error.message))this.leases?.clear();throw error;}}
  async admit(options,load){const cache=options.allow_cached?await this.leaseCache():null;return cache?cache.run(options.required_visibility,'rpc',load,options.onLease):load();}

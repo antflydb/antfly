@@ -155,6 +155,8 @@ export default {
         try { result.maintenance_pending = !await enqueue(env, "reindex", result.job_id); }
         catch { result.maintenance_pending = true; }
       }
+      const rootHint=result.__metadata_hint;delete result.__metadata_hint;
+      if(args.op==="mutate"&&env.METADATA_COMMIT_HINTS==="true"&&env.LOCAL_METADATA_READS==="true"&&env.DIRECT_READS==="true"&&env.SPLIT_RUNTIME==="true"&&!env.__ANTFLY_PHYSICAL_EPOCH&&rootHint)try{enableAppReads();directReadViews.get(env)?.offerRootHint(rootHint);}catch(error){console.error("Antfly metadata hint deferred",String(error));}
       const publication=result.__publication;delete result.__publication;
       if ((args.op === "mutate" && result.committed) || (args.op === "publish" && result.has_more) || (args.op === "enrich" && (result.wal_appends || result.yielded))) {
         if(args.op==="mutate"&&env.COORDINATOR_BACKEND==="r2"&&publication&&ctx?.waitUntil){

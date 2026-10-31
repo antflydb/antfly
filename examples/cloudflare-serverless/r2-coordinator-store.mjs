@@ -58,7 +58,7 @@ export class R2CoordinatorStore {
     this.rawTransport=raw;this.remoteCache=remoteCache;this.snapshotKernel=readKernel??kernel??new RequestPool(()=>instantiateHost(module,null,{clock}),1,{clock});this.snapshotReaders=0;this.proofBudget=proofBudget;
     this.transport = this.cache.wrap(this.remoteCache(async(request,body)=>instrumentTransport(raw,this.physical??={})(request,body),{budgetKey:()=>this.physical??={},onMetrics:sample=>{for(const[key,value]of Object.entries(sample)){this.physical??={};this.physical[key]=(this.physical[key]??0)+value;}}}), `coordinator/${namespace}`);
     this.pending = []; this.running = false; this.state = null;
-    this.rows=new Map();this.rowBytes=0;this.hintBytes=0;this.readHints=null;this.rowRevision=null;this.acquired=false;
+    this.rows=new Map();this.rowBytes=0;this.hintBytes=0;this.cursorHintBytes=0;this.rootHint=null;this.readHints=null;this.rowRevision=null;this.acquired=false;
     if(background)this.idleCheckpoint=new IdleCheckpoint({clock:this.clock,revision:()=>this.state?.revision??0,isIdle:()=>this.acquired&&!this.recovering,background,onError:error=>{try{this.onMetrics?.({event:"antfly.checkpoint_deferred",error:String(error)});}catch{}},checkpoint:options=>this.checkpointHint(options)});
   }
   configureAuthority(descriptor){
@@ -149,19 +149,32 @@ export class R2CoordinatorStore {
     } finally {if(!abandoned)await cleanup();if (this.host&&(!this.host.usable() || this.host.memoryBytes() >= 24 * 1024 * 1024)) this.host = null;}
   }
   chargeMetrics(sample){this.nativeCpuMs=(this.nativeCpuMs??0)+Math.max(0,(sample.elapsed_ms??0)-(sample.io_wait_ms??0));this.usedOperations=(this.usedOperations??0)+sample.operations;this.usedBytes=(this.usedBytes??0)+sample.transferred_bytes;try{this.onMetrics?.(sample);}catch{}}
+  exportRootHint(){
+    const state=this.state;
+    if(this.rootBackend!=="bounded_journal"||!this.acquired||!state||!Number.isSafeInteger(state.revision)||state.next<1||state.next>64)return;
+    return{namespace:this.namespace,epoch:[...state.epoch],next:state.next,revision:state.revision};
+  }
+  offerRootHint(hint){
+    if(!hint||typeof hint.namespace!=="string"||hint.namespace!==this.namespace||!Array.isArray(hint.epoch)||hint.epoch.length!==16||!Array.from(hint.epoch).every(n=>Number.isInteger(n)&&n>=0&&n<=255)||!Number.isSafeInteger(hint.next)||hint.next<1||hint.next>64||!Number.isSafeInteger(hint.revision)||hint.revision<1||this.rootHint&&hint.revision<=this.rootHint.revision)return false;
+    const value={namespace:hint.namespace,epoch:[...hint.epoch],next:hint.next,revision:hint.revision},charge=utf8.encode(JSON.stringify(value)).length*2+256;
+    if(charge>4096||charge+this.hintBytes>this.rowBudgetBytes)return false;
+    this.boundRows?.(this);this.rootHint=value;this.cursorHintBytes=charge;
+    while(this.rows.size&&this.rowBytes+this.hintBytes+charge>this.rowBudgetBytes){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
+    return true;
+  }
   setReadHints(namespace,generation,hints){
     const accepted=normalizeReadHints(namespace,generation,hints);
-    if(!accepted||this.readHints&&BigInt(accepted.version)<BigInt(this.readHints.version))return false;
+    if(!accepted||accepted.charge+this.cursorHintBytes>this.rowBudgetBytes||this.readHints&&BigInt(accepted.version)<BigInt(this.readHints.version))return false;
     this.boundRows?.(this);this.readHints=structuredClone(accepted);this.hintBytes=accepted.charge;
-    while(this.rows.size&&this.rowBytes+this.hintBytes>this.rowBudgetBytes){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
+    while(this.rows.size&&this.rowBytes+this.hintBytes+this.cursorHintBytes>this.rowBudgetBytes){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
     return true;
   }
   remember(key,value){
     this.boundRows?.(this);
     const previous=this.rows.get(key);if(previous)this.rowBytes-=previous.bytes;this.rows.delete(key);
     const bytes=utf8.encode(key).length+(value===undefined?0:utf8.encode(encode(value)).length)+128;
-    if(bytes>this.rowBudgetBytes-this.hintBytes)return;
-    while(this.rows.size>=256||this.rowBytes+this.hintBytes+bytes>this.rowBudgetBytes){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
+    if(bytes>this.rowBudgetBytes-this.hintBytes-this.cursorHintBytes)return;
+    while(this.rows.size>=256||this.rowBytes+this.hintBytes+this.cursorHintBytes+bytes>this.rowBudgetBytes){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
     this.rows.set(key,{value:structuredClone(value),bytes});this.rowBytes+=bytes;
   }
   // A preparation hint only. It carries no freshness claim; callers must
@@ -178,6 +191,7 @@ export class R2CoordinatorStore {
   async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background,deadlineMs:outerDeadlineMs=Infinity,readKeys,readPrefix}={}){
     if(this.ownerReady)await this.ownerReady;
     if(this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");
+    const capturedHint=this.rootHint?{epoch:[...this.rootHint.epoch],next:this.rootHint.next,revision:this.rootHint.revision}:null;
     const owned=this.acquired,captured=structuredClone(owned?this.state:(this.rootBackend==="bounded_journal"||this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=Math.min(this.clock()+5000,outerDeadlineMs),started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false,capsuleMetrics={};
     const monotonicDeadline=started+Math.max(0,Math.min(5000,deadlineMs-this.clock()));
     let proofPermit,failure,finalization;
@@ -196,7 +210,7 @@ export class R2CoordinatorStore {
     let snapshotProof=structuredClone(owned?this.journalProof:this.observedProof??null);
     const native=async(state,coordinate)=>{
       if(usedOperations>=254||usedBytes>=8*1024*1024)throw Error("ReadSnapshotNeedsAdmission");
-      const result=await this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{...this.rootOptions(),...(this.rootBackend==="bounded_journal"?{journal_proof:snapshotProof}:{}),owner:coordinate.action==="read"?state.owner:this.owner,state,...coordinate}},{transport,background:background??this.background,onIoSettled:sample=>this.onMetrics?.(sample),fairKey:this.namespace,priority,onStage:sample=>{if(sample.name==="kernel_queue"){onAdmission?.();capsuleMetrics.observation_queue_ms=(capsuleMetrics.observation_queue_ms??0)+sample.duration_ms;}if(sample.name==="wasm_instantiate")capsuleMetrics.observation_instantiate_ms=(capsuleMetrics.observation_instantiate_ms??0)+sample.duration_ms;},deadlineMs,maxOperations:254-usedOperations,maxTransferBytes:8*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,action:coordinate.action,...sample});}catch{}}});
+      const result=await this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{...this.rootOptions(),...(this.rootBackend==="bounded_journal"?{journal_proof:snapshotProof,...(capturedHint?{journal_hint:capturedHint}:{})}:{}),owner:coordinate.action==="read"?state.owner:this.owner,state,...coordinate}},{transport,background:background??this.background,onIoSettled:sample=>this.onMetrics?.(sample),fairKey:this.namespace,priority,onStage:sample=>{if(sample.name==="kernel_queue"){onAdmission?.();capsuleMetrics.observation_queue_ms=(capsuleMetrics.observation_queue_ms??0)+sample.duration_ms;}if(sample.name==="wasm_instantiate")capsuleMetrics.observation_instantiate_ms=(capsuleMetrics.observation_instantiate_ms??0)+sample.duration_ms;},deadlineMs,maxOperations:254-usedOperations,maxTransferBytes:8*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,action:coordinate.action,...sample});}catch{}}});
       if(Object.hasOwn(result,"journal_proof"))snapshotProof=result.journal_proof;for(const[key,value]of Object.entries(result.journal_observation??{}))if(Number.isSafeInteger(value)&&value>=0)capsuleMetrics['journal_'+key]=(capsuleMetrics['journal_'+key]??0)+value;return result;
     };
     this.snapshotReaders++;

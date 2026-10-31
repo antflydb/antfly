@@ -1245,7 +1245,7 @@ test('fresh WAL point updates and deletes defer base facts I/O, including resume
  bucket.get=async(key,...args)=>{const bytes=bucket.objects.get(key)?.body;if(forbid&&bytes&&new TextDecoder().decode(bytes.subarray(0,7))==='AFDFACT'){denied++;throw Error('UnexpectedObsoleteFactsRead');}return get(key,...args);};
  const{host}=await setup(bucket),native=(op,args={})=>request(op,args),body=text=>JSON.stringify({text});
  await host.request(native('mutate',{operation_id:'lazy-base',mutations:['updated','deleted','stable'].map(doc_id=>({kind:'upsert',doc_id,body:body(doc_id)}))}));await host.request(native('publish'));
- const reader=(await setup(bucket)).host,plan=(await reader.request(native('lookup',{doc_id:'updated',native_read_plan_mode:true}))).__read_plan;assert.ok(plan);
+ const reader=(await setup(bucket,raw=>async(req,body)=>req.op==='read_view_barrier'?{}:raw(req,body))).host,plan=(await reader.request(native('lookup',{doc_id:'updated',native_read_plan_mode:true}))).__read_plan;assert.ok(plan);
  const token=Array(16).fill(23),prepared=await reader.request(native('lookup',{doc_id:'updated',native_read_plan_mode:true,native_read_plan:plan,native_read_prepare:token}));assert.equal(prepared.__read_prepared,true);
  const changed=await host.request(native('mutate',{operation_id:'lazy-overlay',mutations:[{kind:'upsert',doc_id:'updated',body:body('fresh')},{kind:'delete',doc_id:'deleted'}]}));
  forbid=true;
