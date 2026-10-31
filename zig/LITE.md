@@ -1192,8 +1192,9 @@ remain compatible with older runtimes. Live seals use a cached chunked Merkle
 digest: warm updates hash changed chunks and bounded trie paths, while a cold
 ledger load constructs the cache once. This adds catalog writes without another
 checkpoint publication or durability barrier per transaction. Pending-retirement
-maps periodically rehash at cleanup boundaries, with the sweep amortized over
-prior removals, so missing-ID lookups do not degrade after long retirement churn.
+maps periodically rehash after removals during retirement service and journal
+replay, with the sweep amortized over prior removals. This also bounds missing-ID
+lookup work within one long turn, before persistence cleanup runs.
 Contended path leases join a cancelable kernel lock wait using a bounded,
 owner-scoped executor. Missing read-only sidecars and executor exhaustion retain
 short randomized retries, capped at four milliseconds. The configured busy

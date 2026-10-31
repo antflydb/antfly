@@ -491,19 +491,26 @@ pub const State = struct {
     fn removePending(self: *State, id: u64) bool {
         if (!self.pending.remove(id)) return false;
         self.pending_removals_since_rehash +|= 1;
+        // Both a collector turn and journal replay can remove thousands of
+        // entries before persistence cleanup. Neither caller retains a map
+        // entry pointer across this removal.
+        self.rehashPendingIfNeeded();
         return true;
     }
 
-    pub fn clean(self: *State) void {
+    fn rehashPendingIfNeeded(self: *State) void {
         // Monotonic retirement IDs eventually leave no genuinely empty hash
         // buckets, even when very few objects remain. Missing-key lookups then
-        // scan the entire retained capacity. Rehash without allocating at this
-        // stable boundary; the linear sweep is amortized over prior removals.
-        // No pending-entry pointer survives persistence/cleanup.
+        // scan the entire retained capacity. Rehash without allocating at safe
+        // boundaries; the linear sweep is amortized over prior removals.
         if (self.pending_removals_since_rehash >= @max(@as(usize, 64), @as(usize, self.pending.capacity()) / 16)) {
             self.pending.rehash(std.hash_map.AutoContext(u64){});
             self.pending_removals_since_rehash = 0;
         }
+    }
+
+    pub fn clean(self: *State) void {
+        self.rehashPendingIfNeeded();
         self.changes.clearRetainingCapacity();
         self.added.clearRetainingCapacity();
         self.completed.clearRetainingCapacity();
@@ -1217,7 +1224,7 @@ test "lite allocator v4 pending digest memory follows live chunks rather than hi
 }
 
 test "lite allocator v4 retirement churn keeps absent pending lookups bounded" {
-    for ([_]u32{ 256, 4096 }) |reserve| {
+    for ([_]u32{ 256, 4096 }) |reserve| for ([_]bool{ false, true }) |persist_each| {
         var state = State.init(std.testing.allocator);
         defer state.deinit();
         try state.ensure(2);
@@ -1229,7 +1236,13 @@ test "lite allocator v4 retirement churn keeps absent pending lookups bounded" {
         for (0..@as(usize, capacity) * 16) |_| {
             try state.retire(.{ .epoch = 1, .page = 2, .kind = .page });
             try state.complete(state.eligible(1, 1).?);
-            state.clean();
+            if (persist_each) state.clean();
+        }
+        if (!persist_each) {
+            // Keep the entire turn's persistence deltas: hash maintenance
+            // must not discard additions or completions before they persist.
+            try std.testing.expectEqual(@as(usize, capacity) * 16 + 1, state.added.items.len);
+            try std.testing.expectEqual(@as(usize, capacity) * 16, state.completed.items.len);
         }
         try std.testing.expectEqual(@as(usize, 1), state.pending.count());
         const absent = state.root.next_id;
@@ -1244,7 +1257,7 @@ test "lite allocator v4 retirement churn keeps absent pending lookups bounded" {
             index = (index + 1) & (capacity - 1);
         try std.testing.expect(probes <= 16);
         try expectDigestMatchesRebuild(&state);
-    }
+    };
 }
 
 test "lite allocator v4 canceled digest initialization retains no partial cache" {
