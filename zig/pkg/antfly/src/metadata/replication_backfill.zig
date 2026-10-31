@@ -115,6 +115,23 @@ fn ioNowMillis(io: std.Io) u64 {
     ));
 }
 
+/// Errors that end a whole round: this process lost the authority to run CDC,
+/// is shutting down, or cannot allocate. Any other error belongs to the one
+/// source being run, whose runner already recorded it on the source status,
+/// so the round continues with the remaining sources instead of starving them.
+fn replicationErrorEndsRound(err: anyerror) bool {
+    return switch (err) {
+        error.CdcWorkLeaseLost,
+        error.CdcWorkShuttingDown,
+        error.CdcWorkLeaseRenewalTimeout,
+        error.NotLeader,
+        error.MissingMetadataStore,
+        error.OutOfMemory,
+        => true,
+        else => false,
+    };
+}
+
 fn classifyReplicationError(err: anyerror) []const u8 {
     return switch (err) {
         error.ReplicationExactCutoverRequired,
@@ -1210,6 +1227,8 @@ pub const BackfillRoundSummary = struct {
     sources_skipped_complete: usize = 0,
     sources_completed: usize = 0,
     sources_yielded: usize = 0,
+    /// Sources whose error was recorded on their status; the round moved on.
+    sources_failed: usize = 0,
 };
 
 pub const StreamSummary = struct {
@@ -1232,6 +1251,8 @@ pub const StreamingRoundSummary = struct {
     sources_skipped_pending_snapshot: usize = 0,
     sources_polled: usize = 0,
     changes_applied: usize = 0,
+    /// Sources whose error was recorded on their status; the round moved on.
+    sources_failed: usize = 0,
 };
 
 pub const SnapshotBackfillCoordinator = struct {
@@ -1344,7 +1365,13 @@ pub const SnapshotBackfillCoordinator = struct {
                         );
                         continue;
                     }
-                    return err;
+                    if (replicationErrorEndsRound(err)) return err;
+                    std.log.warn(
+                        "metadata cdc snapshot source retryable error table={s} source={d} err={s}",
+                        .{ table.name, ordinal, @errorName(err) },
+                    );
+                    summary.sources_failed += 1;
+                    continue;
                 };
                 if (source_summary.snapshot_complete) {
                     summary.sources_completed += 1;
@@ -1840,7 +1867,13 @@ pub const StreamingReplicationCoordinator = struct {
                             .{ table.name, ordinal, @errorName(err) },
                         );
                     }
-                    return err;
+                    if (replicationErrorEndsRound(err)) return err;
+                    std.log.warn(
+                        "metadata cdc stream source error table={s} source={d} err={s}",
+                        .{ table.name, ordinal, @errorName(err) },
+                    );
+                    summary.sources_failed += 1;
+                    continue;
                 };
                 summary.sources_polled += 1;
                 summary.changes_applied += stream_summary.changes_applied;
@@ -4787,6 +4820,245 @@ test "metadata replication backfill coordinator resumes and then skips completed
     try std.testing.expectEqual(@as(usize, 0), second.sources_completed);
 }
 
+test "metadata replication backfill coordinator continues past one source's retryable failure" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-metadata-replication-backfill-coordinator-isolation";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+
+    const FakeExecutor = struct {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery, _: ?u64, _: ?CancellationToken) !foreign_mod.QueryResult {
+            var owned = prepared;
+            defer owned.deinit(inner_alloc);
+            if (std.mem.indexOf(u8, owned.sql_text, "unreachable_users") != null) return error.ForeignConnectionFailed;
+
+            const limit = parseSqlSuffixUsize(owned.sql_text, " LIMIT ") orelse 0;
+            const offset = testSnapshotDocOffset(owned);
+
+            const all_rows = [_][]const u8{
+                "{\"id\":\"doc:1\",\"name\":\"alpha\"}",
+                "{\"id\":\"doc:2\",\"name\":\"beta\"}",
+            };
+            if (offset >= all_rows.len) return .{ .rows = &.{}, .total = all_rows.len };
+
+            const count = @min(limit, all_rows.len - offset);
+            const rows = try inner_alloc.alloc(std.json.Value, count);
+            for (0..count) |i| {
+                rows[i] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, all_rows[offset + i], .{});
+            }
+            return .{ .rows = rows, .total = all_rows.len };
+        }
+
+        fn statistics(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !foreign_mod.TableStatistics {
+            return .{ .row_count = 2, .size_bytes = 64 };
+        }
+
+        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_mod.Column {
+            const columns = try inner_alloc.alloc(foreign_mod.Column, 1);
+            columns[0] = .{
+                .name = try inner_alloc.dupe(u8, "id"),
+                .data_type = try inner_alloc.dupe(u8, "text"),
+                .nullable = false,
+            };
+            return columns;
+        }
+    };
+
+    var registry = foreign_mod.Registry{};
+    defer registry.deinit(alloc);
+    try foreign_mod.registerPostgresExecutor(alloc, &registry, .{
+        .ptr = undefined,
+        .vtable = &.{
+            .query = FakeExecutor.query,
+            .statistics = FakeExecutor.statistics,
+            .discover_columns = FakeExecutor.discoverColumns,
+        },
+    });
+
+    var write_source = table_writes_api.BoundTableWriteSource.init("docs", &db);
+
+    const FakeService = struct {
+        alloc: Allocator,
+        table: metadata_table_manager.TableRecord,
+        statuses: std.ArrayListUnmanaged(metadata_table_manager.ReplicationSourceStatusRecord) = .empty,
+
+        pub fn deinit(self: *@This()) void {
+            for (self.statuses.items) |record| metadata_table_manager.freeReplicationSourceStatus(self.alloc, record);
+            self.statuses.deinit(self.alloc);
+        }
+
+        pub fn metadataStatus(_: *@This()) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        pub fn listProjectedTables(self: *@This(), inner_alloc: Allocator) ![]metadata_table_manager.TableRecord {
+            const out = try inner_alloc.alloc(metadata_table_manager.TableRecord, 1);
+            out[0] = .{
+                .table_id = self.table.table_id,
+                .name = try inner_alloc.dupe(u8, self.table.name),
+                .replication_sources_json = try inner_alloc.dupe(u8, self.table.replication_sources_json),
+            };
+            return out;
+        }
+
+        pub fn freeProjectedTables(_: *@This(), inner_alloc: Allocator, records: []metadata_table_manager.TableRecord) void {
+            for (records) |record| {
+                inner_alloc.free(record.name);
+                inner_alloc.free(record.replication_sources_json);
+            }
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedRanges(_: *@This(), inner_alloc: Allocator) ![]metadata_table_manager.RangeRecord {
+            const out = try inner_alloc.alloc(metadata_table_manager.RangeRecord, 1);
+            out[0] = .{
+                .group_id = 7001,
+                .table_id = 22,
+                .start_key = "",
+                .end_key = null,
+            };
+            return out;
+        }
+
+        pub fn freeProjectedRanges(_: *@This(), inner_alloc: Allocator, records: []metadata_table_manager.RangeRecord) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedStores(_: *@This(), inner_alloc: Allocator) ![]metadata_table_manager.StoreRecord {
+            return try inner_alloc.alloc(metadata_table_manager.StoreRecord, 0);
+        }
+
+        pub fn freeProjectedStores(_: *@This(), inner_alloc: Allocator, records: []metadata_table_manager.StoreRecord) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedPlacementIntents(_: *@This(), inner_alloc: Allocator) ![]raft_reconciler.PlacementIntent {
+            return try inner_alloc.alloc(raft_reconciler.PlacementIntent, 0);
+        }
+
+        pub fn freeProjectedPlacementIntents(_: *@This(), inner_alloc: Allocator, records: []raft_reconciler.PlacementIntent) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedSplitTransitions(_: *@This(), inner_alloc: Allocator) ![]metadata_transition_state.SplitTransitionRecord {
+            return try inner_alloc.alloc(metadata_transition_state.SplitTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedSplitTransitions(_: *@This(), inner_alloc: Allocator, records: []metadata_transition_state.SplitTransitionRecord) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedMergeTransitions(_: *@This(), inner_alloc: Allocator) ![]metadata_transition_state.MergeTransitionRecord {
+            return try inner_alloc.alloc(metadata_transition_state.MergeTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedMergeTransitions(_: *@This(), inner_alloc: Allocator, records: []metadata_transition_state.MergeTransitionRecord) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedReplicationSourceStatuses(self: *@This(), inner_alloc: Allocator) ![]metadata_table_manager.ReplicationSourceStatusRecord {
+            const out = try inner_alloc.alloc(metadata_table_manager.ReplicationSourceStatusRecord, self.statuses.items.len);
+            for (self.statuses.items, 0..) |record, i| {
+                out[i] = try metadata_table_manager.cloneReplicationSourceStatus(inner_alloc, record);
+            }
+            return out;
+        }
+
+        pub fn freeProjectedReplicationSourceStatuses(_: *@This(), inner_alloc: Allocator, records: []metadata_table_manager.ReplicationSourceStatusRecord) void {
+            for (records) |record| metadata_table_manager.freeReplicationSourceStatus(inner_alloc, record);
+            if (records.len > 0) inner_alloc.free(records);
+        }
+
+        pub fn upsertReplicationSourceStatus(self: *@This(), record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+            for (self.statuses.items) |*existing| {
+                if (existing.table_id == record.table_id and existing.source_ordinal == record.source_ordinal) {
+                    metadata_table_manager.freeReplicationSourceStatus(self.alloc, existing.*);
+                    existing.* = try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record);
+                    return;
+                }
+            }
+            try self.statuses.append(self.alloc, try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record));
+        }
+    };
+
+    var service: FakeService = .{
+        .alloc = alloc,
+        .table = .{
+            .table_id = 22,
+            .name = "docs",
+            .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"unreachable_users\",\"key_template\":\"id\"},{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\"}]",
+        },
+    };
+    defer service.deinit();
+
+    try service.upsertReplicationSourceStatus(.{
+        .table_id = 22,
+        .source_ordinal = 0,
+        .source_kind = "postgres",
+        .external_table = "unreachable_users",
+        .phase = "snapshot",
+        .checkpoint = "snapshot_keyset:[\"doc:1\"]",
+        .snapshot_offset = 1,
+        .cutover_mode = "exported_snapshot",
+        .prepared_checkpoint = "lsn:resume",
+        .last_error = "",
+        .lag_records = 0,
+        .updated_at_ms = 1,
+    });
+
+    try service.upsertReplicationSourceStatus(.{
+        .table_id = 22,
+        .source_ordinal = 1,
+        .source_kind = "postgres",
+        .external_table = "users",
+        .phase = "snapshot",
+        .checkpoint = "snapshot_keyset:[\"doc:1\"]",
+        .snapshot_offset = 1,
+        .cutover_mode = "exported_snapshot",
+        .prepared_checkpoint = "lsn:resume",
+        .last_error = "",
+        .lag_records = 0,
+        .updated_at_ms = 1,
+    });
+
+    var coordinator = SnapshotBackfillCoordinator{
+        .alloc = alloc,
+        .runner = .{
+            .alloc = alloc,
+            .registry = &registry,
+            .write_source = write_source.source(),
+            .batch_size = 1,
+        },
+    };
+
+    // The unreachable source is recorded and skipped; the healthy source
+    // after it still completes in the same round instead of being starved.
+    const summary = try coordinator.runRound(&service);
+    try std.testing.expectEqual(@as(usize, 2), summary.sources_considered);
+    try std.testing.expectEqual(@as(usize, 1), summary.sources_failed);
+    try std.testing.expectEqual(@as(usize, 1), summary.sources_completed);
+    var saw_failure = false;
+    var saw_completion = false;
+    for (service.statuses.items) |record| {
+        if (record.source_ordinal == 0) {
+            saw_failure = true;
+            try std.testing.expectEqualStrings("ForeignConnectionFailed", record.last_error);
+        } else if (record.source_ordinal == 1) {
+            saw_completion = true;
+            try std.testing.expectEqualStrings("cutover_prepared", record.phase);
+        }
+    }
+    try std.testing.expect(saw_failure and saw_completion);
+}
+
 test "metadata replication backfill marks existing-slot fallback as slot_resumed" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-metadata-replication-slot-resumed";
@@ -6282,7 +6554,11 @@ test "metadata replication stream coordinator recovers after transient polling f
         },
     };
 
-    try std.testing.expectError(error.ForeignQueryFailed, coordinator.runRound(&service));
+    // A source's failure is recorded on its status and ends only that
+    // source's turn; the round itself completes.
+    const failed_round = try coordinator.runRound(&service);
+    try std.testing.expectEqual(@as(usize, 1), failed_round.sources_failed);
+    try std.testing.expectEqual(@as(usize, 0), failed_round.sources_polled);
     try std.testing.expectEqualStrings("streaming_failed", status_sink.latest().phase);
     try std.testing.expect(status_sink.latest().last_error.len > 0);
     try std.testing.expectEqualStrings("retryable", status_sink.latest().failure_class);
@@ -6497,7 +6773,11 @@ test "metadata replication stream coordinator marks missing slot as terminal fai
         },
     };
 
-    try std.testing.expectError(error.ForeignReplicationSlotMissing, coordinator.runRound(&service));
+    // A source's failure is recorded on its status and ends only that
+    // source's turn; the round itself completes.
+    const failed_round = try coordinator.runRound(&service);
+    try std.testing.expectEqual(@as(usize, 1), failed_round.sources_failed);
+    try std.testing.expectEqual(@as(usize, 0), failed_round.sources_polled);
     try std.testing.expectEqualStrings("streaming_failed", status_sink.latest().phase);
     try std.testing.expectEqualStrings("terminal", status_sink.latest().failure_class);
     try std.testing.expectEqualStrings("ForeignReplicationSlotMissing", status_sink.latest().last_error);
