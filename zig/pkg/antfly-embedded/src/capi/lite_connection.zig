@@ -790,7 +790,7 @@ pub const Owner = struct {
             certified = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             if (try certified.?.inheritAllocatorCertificate()) {
                 options.allocator_verification_owner = &certified.?;
-            } else if (certified.?.header.indexed_reclamation) {
+            } else if (certified.?.header.indexed_reclamation and !try self.unindexedRuntimeOpen(&certified.?)) {
                 retained_turn = try self.retainMaintenanceTurnAssumeLocked();
                 if (!retained_turn) return error.FileBusy;
             }
@@ -835,6 +835,58 @@ pub const Owner = struct {
         }
         self.collectRetired();
         return replacement;
+    }
+
+    /// Unverified index opens must not publish reader leases into a peer's
+    /// proof. An explicitly empty index catalog opens no such readers. Inspect
+    /// it through a read-only store so diagnostics need not serialize behind
+    /// every owner's full graph walk after allocator-only housekeeping.
+    fn unindexedRuntimeOpen(self: *Owner, tip: *native.NativeFile) !bool {
+        var backend = try h.lite_backend.Handle.open(alloc, self.path, .{
+            .read_only = true,
+            .externally_locked = true,
+            .io = h.handleLockIo(),
+        });
+        defer backend.deinit();
+        const store = backend.native_docstore orelse return false;
+        if (!std.meta.eql(store.file.header, tip.header) or
+            (try store.file.file.stat(store.file.runtime())).inode != (try tip.file.stat(tip.runtime())).inode) return false;
+        // Initializing a missing root is a mutation, even with no indexes.
+        if (try backend.existingRootIncarnation("root") == null) return false;
+        var read = try store.beginRead();
+        defer read.abort();
+        const indexes = @import("../storage/db/catalog/index_manager.zig");
+        inline for (.{
+            .{ "\x00\x00__metadata__:indexes", indexes.deserializeCatalog, true },
+            .{ "\x00\x00__metadata__:enrichments", @import("../storage/db/catalog/enrichment_catalog.zig").deserializeCatalog, false },
+            .{ "\x00\x00__metadata__:resolvers", @import("../storage/db/catalog/resolver_catalog.zig").deserializeCatalog, false },
+        }) |catalog| {
+            const data = read.getOwned(alloc, catalog[0]) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (data) |bytes| {
+                defer alloc.free(bytes);
+                const configs = catalog[1](alloc, bytes) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return false,
+                };
+                defer {
+                    for (configs) |*config| config.deinit(alloc);
+                    alloc.free(configs);
+                }
+                if (configs.len != 0) return false;
+            } else if (catalog[2]) return false;
+        }
+        // Recovering an unfinished graph build can write cleanup metadata at
+        // open even after its index has been removed. Keep that path guarded.
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const row = cursor.seekAtOrAfter(indexes.graph_replacement_build_prefix) catch |err| switch (err) {
+            error.NotFound => return true,
+            else => return err,
+        };
+        return !std.mem.startsWith(u8, row.key, indexes.graph_replacement_build_prefix);
     }
 
     fn loadedIndexInputsUnchanged(root: *h.Handle, before: *native.NativeFile, after: *native.NativeFile) !bool {
@@ -3816,6 +3868,76 @@ test "issue1015 issue1431 unverified peer opens yield to a detached proof turn" 
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(peer_id, &writes, writes.len, null, 0, 0, 0));
     try std.testing.expectEqual(@as(u64, 1), peer_owner.publication_stats.allocator_proof_walks);
     try std.testing.expectEqual(@as(usize, 0), peer_owner.maintenance_turn_references);
+}
+
+test "issue1431 unindexed diagnostics do not wait for a peer allocator proof" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |unindexed| {
+        var fixture = try AdmissionFollowupFixture.init("unindexed-proof-diagnostic", 1000, .batch);
+        defer fixture.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+        const owner = fixture.connection.owner;
+        const io = h.handleLockIo();
+        {
+            var lease = try fixture.connection.acquire();
+            defer {
+                lease.close();
+                owner.gate.mutex.unlock(io);
+            }
+            try owner.current.?.db.addIndex(.{ .name = "proof-index", .kind = .full_text, .config_json = "{}" });
+            if (unindexed) try std.testing.expect(try owner.current.?.db.deleteIndex("proof-index"));
+        }
+        var expected: native.Header = undefined;
+        {
+            var lease = try native.lockWriterPathWithIo(alloc, io, fixture.path);
+            defer lease.close();
+            var foreign = try native.NativeFile.openWithIo(alloc, io, fixture.path, .{ .externally_locked = true, .no_sync = true });
+            defer foreign.close();
+            try foreign.putCatalogRecord("unsealed-status-tip", "peer proof in progress");
+            expected = foreign.header;
+            try std.testing.expect(!try foreign.inheritAllocatorCertificate());
+        }
+        owner.gate.mutex.lockUncancelable(io);
+        const retained = owner.retainMaintenanceTurnAssumeLocked();
+        owner.gate.mutex.unlock(io);
+        try std.testing.expect(try retained);
+        var held = true;
+        defer if (held) {
+            owner.gate.mutex.lockUncancelable(io);
+            owner.releaseMaintenanceTurnAssumeLocked();
+            owner.gate.mutex.unlock(io);
+        };
+        const peer = try open(fixture.path, .{ .profile = .native, .no_sync = false, .busy_timeout_ms = 0 }, false);
+        const peer_id = api.publishHandle(peer) catch |err| {
+            h.closeHandle(peer);
+            return err;
+        };
+        defer api.antfly_db_close(peer_id);
+        const peer_owner = peer.lite_connection.?.owner;
+        peer_owner.stopping.store(true, .release);
+        peer_owner.wake.set(io);
+        peer_owner.worker.?.join();
+        peer_owner.worker = null;
+        peer_owner.stopping.store(false, .release);
+        peer_owner.verification_cancel.requested.store(false, .release);
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&out);
+        try std.testing.expectEqual(if (unindexed) h.capi.ErrorCode.ok else h.capi.ErrorCode.busy, api.antfly_db_pending_work_stats_json(peer_id, &out));
+        try std.testing.expectEqual(@as(u64, 0), peer_owner.publication_stats.allocator_proof_walks);
+        {
+            var probe = try native.NativeFile.openWithIo(alloc, io, fixture.path, .{ .read_only = true, .internal_reader = true });
+            defer probe.close();
+            try std.testing.expect(std.meta.eql(expected, probe.header));
+        }
+        // The diagnostic exception grants no allocation authority.
+        const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("after-read"), .value = .fromSlice("{}"), .is_delete = false }};
+        try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_batch(peer_id, &writes, writes.len, null, 0, 0, 0));
+        owner.gate.mutex.lockUncancelable(io);
+        owner.releaseMaintenanceTurnAssumeLocked();
+        owner.gate.mutex.unlock(io);
+        held = false;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(peer_id, &writes, writes.len, null, 0, 0, 0));
+    }
 }
 
 test "issue1015 issue1431 warm SQL retains the incremental allocator digest" {
