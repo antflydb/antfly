@@ -8302,6 +8302,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             std.mem.writeInt(u64, out[0..8], state.epoch, .little);
             std.mem.writeInt(u64, out[8..16], state.completed_sequence, .little);
             std.mem.writeInt(u64, out[16..24], state.pending_issues, .little);
+            std.mem.writeInt(u64, out[24..32], state.queued_sequence, .little);
+            std.mem.writeInt(u64, out[32..40], state.queued_job_id, .little);
         }
 
         pub fn encodeArtifactRepairIssueValueAlloc(alloc: Allocator, issue: types.ArtifactRepairIssue) ![]u8 {
@@ -9294,11 +9296,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // This fence is an optimization, never authoritative repair debt. Treat a
             // malformed value as absent so metadata corruption cannot wedge repair;
             // the next issue transition overwrites or deletes it atomically.
-            if (raw.len != artifact_repair_completion_state_len) return null;
+            if (raw.len != 24 and raw.len != artifact_repair_completion_state_len) return null;
             return .{
                 .epoch = std.mem.readInt(u64, raw[0..8], .little),
                 .completed_sequence = std.mem.readInt(u64, raw[8..16], .little),
                 .pending_issues = std.mem.readInt(u64, raw[16..24], .little),
+                .queued_sequence = if (raw.len >= 40) std.mem.readInt(u64, raw[24..32], .little) else 0,
+                .queued_job_id = if (raw.len >= 40) std.mem.readInt(u64, raw[32..40], .little) else 0,
             };
         }
 
