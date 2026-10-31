@@ -26,6 +26,7 @@ import requests
 from conftest import (
     ANTFLY_PUBLIC_API_ROOT,
     DEFAULT_ANTFLY_BIN,
+    StandaloneAntflyServer,
     StatefulAntflyServer,
     internal_service_headers,
     lookup_key_path,
@@ -1914,3 +1915,29 @@ def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_
         status.get("last_error") == "ForeignReplicationSlotMissing"
         for status in failed_statuses
     ), f"slot loss was not surfaced explicitly\n{failed_statuses!r}"
+
+
+def test_standalone_rejects_postgres_replication_sources():
+    # Standalone does not run the CDC coordinators, so it must refuse a source
+    # it would otherwise accept and never ingest.
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    try:
+        response = requests.post(
+            server.api_url + "/tables/tickets",
+            json={
+                "replication_sources": [
+                    {
+                        "type": "postgres",
+                        "dsn": "postgres://antfly:secret@127.0.0.1:5432/support",
+                        "postgres_table": "public.tickets",
+                    }
+                ]
+            },
+            timeout=30,
+        )
+        assert response.status_code == 400, response.text
+        assert response.json()["error"] == "REPLICATION_SOURCES_REQUIRE_CLUSTER"
+        assert requests.post(server.api_url + "/tables/plain", json={}, timeout=30).ok
+    finally:
+        server.stop()
