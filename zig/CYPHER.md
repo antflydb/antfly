@@ -4966,3 +4966,12 @@ user nodes afterward. Native scan conversion and the streaming fold now apply
 reserved record. Such scanned records still contribute to physical progress
 and work accounting. This fixes a post-write reserved-record count mismatch
 caught by the new portable regression; its Debug run passes the 8 MiB limit.
+
+Virtual-label equalities remain native access hints: scalar predicates use the
+same compatibility rules as ordinary native equality scans and enable the
+retained relational reader's index planner. Full graph membership remains the
+residual authority check. Unsupported predicate values stay residual. The
+public relational regression requires an indexed virtual label to count one
+wide property within one scanned anchor, preventing a full-table scan regression.
+Every visited record consumes scan work; count argument work is charged only
+for admitted members, after label and policy checks.

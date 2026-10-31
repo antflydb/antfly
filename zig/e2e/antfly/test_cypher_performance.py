@@ -1577,6 +1577,7 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
                     "statement": f"CREATE TABLE {prefix} (id TEXT, tenant TEXT, body TEXT)"
                 },
             )
+            call("/sql", {"statement": f"CREATE INDEX {prefix}_id ON {prefix}(id)"})
         else:
             call(f"/tables/{prefix}", {"num_shards": 1})
         for start in range(0, 32, 4):
@@ -1602,12 +1603,25 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
                 "labels": [
                     {"name": "D", "table": prefix},
                     {"name": "A", "table": prefix, "where": {"tenant": "acme"}},
+                    {"name": "One", "table": prefix, "where": {"id": "n1"}},
                 ],
                 "relationships": [],
             },
         )
         count("D", admin, (32, 16))
         count("A", admin, (16, 8))
+        if relational:
+            indexed_label = call(
+                f"/graphs/{prefix}/query",
+                {
+                    "query": "MATCH (n:One) RETURN count(n.body)",
+                    "limits": {"memory_bytes": 8 << 20, "scanned_anchors": 1},
+                },
+            )
+            assert indexed_label["rows"] == [[{"type": "integer", "value": "1"}]], (
+                indexed_label
+            )
+            assert indexed_label["stats"]["scanned_anchors"] == 1, indexed_label
         measured = call(
             f"/graphs/{prefix}/query",
             {

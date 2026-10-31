@@ -394,7 +394,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     try checkpoint(fold.adapter);
                     if (fold.examined >= fold.input.max_examined) return error.CypherAnchorBudgetExceeded;
                     fold.examined += 1;
-                    try charge(fold, 1 + fold.projection.arguments.len);
+                    try charge(fold, 1);
                     // Scans account for physical progress but share point-read
                     // admission: receipts and reserved rows are never nodes.
                     if (comptime @hasDecl(DB, "cypherDocumentKeyAllowed")) if (!DB.cypherDocumentKeyAllowed(entry.id)) return;
@@ -418,6 +418,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     } orelse return;
                     var membership = fold.adapter.valueWork(scratch);
                     if (!try fold.adapter.graph.?.admits(counted_node, fold.input.node.labels[0], &membership)) return;
+                    try charge(fold, fold.projection.arguments.len);
                     fold.count += 1;
                     for (fold.projection.arguments, fold.counts) |argument_value, *count| {
                         const present = switch (argument_value) {
@@ -436,7 +437,28 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             self.read_fields = projection.fields;
             const db = try self.selected(table);
             const authorization = try self.readAuthorization(temporary, table);
-            const opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(input.max_examined + 1) });
+            var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(input.max_examined + 1) });
+            if (opts.relational_query) |*query| if (label.predicate.len != 0) {
+                var schema = acquireSchema(db) orelse return error.SchemaVersionChanged;
+                defer schema.release();
+                const Query = @TypeOf(query.*);
+                var conditions: std.ArrayList(Query.Condition) = .empty;
+                try conditions.appendSlice(temporary, query.conditions);
+                for (label.predicate) |entry| {
+                    if (conditions.items.len == 256) break;
+                    const column = for (schema.tableSchema().relational_columns) |column| {
+                        if (std.mem.eql(u8, column.name, entry.name)) break column;
+                    } else continue;
+                    // The same exact scalar admission used by ordinary native
+                    // equality scans. Unsupported values remain authoritative
+                    // graph membership checks after the storage reader.
+                    if (!filterCompatible(column.column_type, entry.value)) continue;
+                    const value = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, entry.value, .{}), .{ .parse_numbers = false });
+                    try conditions.append(temporary, .{ .column = entry.name, .op = .eq, .value = value });
+                }
+                query.conditions = conditions.items;
+                query.auto_index = true;
+            };
             try db.visitCypherDocuments(quota.allocator(), "", "", opts, .{ .borrow_documents = true, .context = &fold, .visit = Fold.visit });
             try checkpoint(self);
             const result: b.CountResult = .{ .count = fold.count, .counts = try a.dupe(usize, counts), .examined = fold.examined };
