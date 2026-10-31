@@ -164,6 +164,32 @@ the receipt again. The preliminary read conservatively reserves the entire
 254-operation / 8 MiB admission allowance inside the old parent budget, so replay
 safety does not increase resource ceilings.
 
+## Detached immutable misses
+
+With the existing `NATIVE_POINT_CONTINUATIONS=true` option, resident lookups use
+the common WASM host's `withPointReadDependencies` scheduler. Cache lookup stays
+outside the dependency wrapper: completed immutable hits execute immediately.
+A physical immutable miss unwinds the native call before starting external I/O,
+then resumes against the same captured cut and original lifetime. It creates no
+fresh authority, extends no pin and retains no native pointers.
+
+Only misses acquire a transcript permit. Warm reads therefore do not queue behind
+cold I/O holding all transcript permits. The owner pool has two native lanes and
+at most two 100 KiB transcript reservations; pending misses share the existing
+bounded native queue admission. Large dependencies fall back to the ordinary
+bounded native path rather than increasing retained space. Every replay and
+detached read shares the original 1,024-operation / 32 MiB query allowance.
+Native and detached I/O remain separately attributable in trace/physical metrics.
+
+The scheduler uses the shorter remaining wall/monotonic/read-lease lifetime at
+each phase. A timed-out I/O retains its permit, response space and submitting
+request's background lifetime until physical settlement. Late resource errors
+remain observable. Resource/integrity failures are not replayed. Tests cover warm
+progress with both cold permits occupied, timeout plus late `SQLITE_NOMEM`, queued
+expiry, oversized responses and older-module fallback. These tests do not resolve
+historical hosted allocator failures. Moving I/O outside native execution improves
+liveness; it does not increase cold-read throughput or guarantee better p95.
+
 ## Partitioning and replicas
 
 The current partition is the native namespace/incarnation. Existing tenant routes

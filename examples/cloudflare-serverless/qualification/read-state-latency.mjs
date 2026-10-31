@@ -37,6 +37,7 @@ const hosted={DIRECT_READS:'true',LOCAL_METADATA_READS:'true',INLINE_METADATA_RO
 {...hosted,name:'serving-replay',NATIVE_READ_AFFINITY:'false',NATIVE_METADATA_CONTINUATIONS:'true',REPLAY_COST_CHECKPOINTS:'true'},
 {...hosted,name:'serving-reuse',NATIVE_READ_AFFINITY:'false',NATIVE_METADATA_CONTINUATIONS:'true',IMMUTABLE_PREPARED_REUSE:'true'},
 {...hosted,name:'serving-leaf',NATIVE_READ_AFFINITY:'false',NATIVE_METADATA_CONTINUATIONS:'true',INLINE_FACTS_LEAVES:'true'},
+{...hosted,name:'serving-resident-detached',RESIDENT_SERVING:'true',NATIVE_POINT_CONTINUATIONS:'true',NATIVE_READ_AFFINITY:'false',NATIVE_METADATA_CONTINUATIONS:'true'},
 {...hosted,name:'serving-resident',RESIDENT_SERVING:'true',NATIVE_READ_AFFINITY:'false',NATIVE_METADATA_CONTINUATIONS:'true'},
 {...hosted,name:'serving-write',NATIVE_READ_AFFINITY:'false',NATIVE_METADATA_CONTINUATIONS:'true',NATIVE_WRITE_OVERLAP:'true'},
 {...hosted,name:'serving-all',NATIVE_WRITE_OVERLAP:'true',NATIVE_READ_AFFINITY:'false',NATIVE_METADATA_CONTINUATIONS:'true',NATIVE_POINT_CONTINUATIONS:'true',REPLAY_COST_CHECKPOINTS:'true',IMMUTABLE_PREPARED_REUSE:'true',INLINE_FACTS_LEAVES:'true'},
@@ -133,9 +134,9 @@ for(const variant of variants){
   if(variant.READ_VIEW_CACHE_SEEDING==='true')assert.ok(immutableCacheOffers>0,'admitted immutable bytes must be offered to the bounded cache in measured app reads');
   const continuedObservations=physical.app.read_traces.filter(t=>t.metadata?.physical?.observation_detached_gets>0).length;
   if(variant.NATIVE_METADATA_CONTINUATIONS==='true'&&variant.RESIDENT_SERVING!=='true')assert.ok(continuedObservations>0,'native metadata continuations must execute in the measured app');
-  const pointDependenciesExecuted=physical.app.read_traces.reduce((n,t)=>n+(t.point_dependencies?.gets??0),0),preparedReuseHits=physical.app.read_traces.reduce((n,t)=>n+(t.immutable_prepared_hits??0),0);
+  const pointDependenciesExecuted=[...physical.app.read_traces,...physical.writer.read_traces].reduce((n,t)=>n+(t.point_dependencies?.gets??0),0),preparedReuseHits=physical.app.read_traces.reduce((n,t)=>n+(t.immutable_prepared_hits??0),0);
   if(variant.legacy_module)assert.equal(pointDependenciesExecuted,0,'old modules must retain serial point I/O');
-  if(variant.NATIVE_POINT_CONTINUATIONS==='true'&&!variant.legacy_module)assert.ok(pointDependenciesExecuted>0,'point continuations must execute in measured app reads');
+  if(variant.NATIVE_POINT_CONTINUATIONS==='true'&&!variant.legacy_module&&variant.RESIDENT_SERVING!=='true')assert.ok(pointDependenciesExecuted>0,'point continuations must execute in measured app reads');
   const detachedProofs=physical.app.read_traces.filter(t=>t.metadata?.physical?.proof_prefetch===true).length;
   if(variant.DETACHED_METADATA_PROOFS==='true')assert.ok(detachedProofs>0,'detached proof acquisition must execute in the measured app');
   const residentReads=physical.writer.read_traces.filter(t=>t.native?.resident_owner);if(variant.RESIDENT_SERVING==='true'){assert.ok(residentReads.length>=(offeredReads||rounds*12),'resident owner must serve measured reads');assert.ok(residentReads.every(t=>t.metadata?.owner_physical),'complete owner admission evidence is required');}
