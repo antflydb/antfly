@@ -491,8 +491,16 @@ const BackendState = struct {
         };
     }
 
-    fn chat(ptr: *anyopaque, alloc: std.mem.Allocator, request: lib.ChatRequest) !lib.ChatResponse {
+    fn chat(ptr: *anyopaque, alloc: std.mem.Allocator, original_request: lib.ChatRequest) !lib.ChatResponse {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
+        const media = if (self.request_context) |context| context.verified_media else &.{};
+        var rendered = try @import("../inference/verified_messages.zig").materialize(@import("../sql/memory_budget.zig").reclaimingAllocator(alloc), original_request.messages, media);
+        defer if (rendered) |*value| value.deinit();
+        var body = try execution_context.materializeVerifiedJson(@import("../sql/memory_budget.zig").reclaimingAllocator(alloc), original_request.body_json, media);
+        defer body.deinit(@import("../sql/memory_budget.zig").reclaimingAllocator(alloc));
+        var request = original_request;
+        request.messages = if (rendered) |value| value.messages else original_request.messages;
+        request.body_json = body.bytes;
         var response = try chatResponseWithState(alloc, self, request);
         defer response.deinit();
         var result = lib.ChatResponse{ .allocator = alloc, .status = response.status.code, .body = try alloc.dupe(u8, response.body orelse "") };
@@ -563,8 +571,12 @@ const BackendState = struct {
         if (self.request_context) |context| if (context.submission) |callback| callback.notify(callback.ptr);
     }
 
-    fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
+    fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, original_messages: []const ChatMessage) !GenerateResult {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
+        const accepts_handles = self.provider == .embedded_antfly and self.provider.embedded_antfly.accepts_verified_media_handles;
+        var rendered = if (!accepts_handles) try @import("../inference/verified_messages.zig").materialize(@import("../sql/memory_budget.zig").reclaimingAllocator(alloc), original_messages, if (self.request_context) |context| context.verified_media else &.{}) else null;
+        defer if (rendered) |*value| value.deinit();
+        const messages = if (rendered) |value| value.messages else original_messages;
         if (self.request_context) |context| {
             try context.updateDetail(.executing, 0, 1, model, @tagName(std.meta.activeTag(self.provider)));
             const timeout_ms = try context.remainingTimeoutMs();

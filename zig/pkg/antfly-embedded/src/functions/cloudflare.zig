@@ -25,8 +25,8 @@ pub fn request(a: std.mem.Allocator, cfg: d.DeciderConfig, input: d.Input, quest
     var images: std.array_list.Managed(d.Json) = .init(a);
     var messages: std.array_list.Managed(d.Json) = .init(a);
     var total: usize = 0;
-    if (input == .messages) {
-        for (input.messages) |message| {
+    if (input != .text) {
+        for (input.messageItems()) |message| {
             var content: std.array_list.Managed(d.Json) = .init(a);
             const source = message.object.get("content").?;
             if (source == .string) {

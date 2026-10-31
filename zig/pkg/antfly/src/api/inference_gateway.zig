@@ -402,7 +402,7 @@ fn executeBounded(server: anytype, ctx: *httpx.Context, task: gateway.Task, back
         }
     };
     var policy = Policy{ .server = server, .task = task };
-    var media_lease = try source_media.resolveForExecution(a, request, execution.source_port, .{ .ptr = &policy, .retain = Policy.retain });
+    var media_lease = try source_media.resolveForExecution(a, request, execution.source_port, .{ .ptr = &policy, .retain = Policy.retain, .typed_payloads = if (server.antfly_provider) |provider| provider.accepts_verified_media_handles else false });
     execution.verified_media = media_lease.verified;
     defer media_lease.deinit();
     if (request != .object) return error.InvalidInferenceRequest;
@@ -1615,8 +1615,10 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
     var transport = bridge.Outbound{ .context = ctx };
     const observed = observation.stream(transport.stream());
     var guard = tasks.FallbackSink{ .downstream = observed };
-    const encoded = try payloads.encodeMetadata(ctx.allocator, body, options.attachments);
-    defer if (options.attachments != null) ctx.allocator.free(encoded);
+    const execution_context = @import("antfly_inference_execution_context");
+    var framed = try execution_context.encodeVerifiedGenerate(ctx.allocator, ctx.allocator, body, options.attachments, options.verified_media);
+    defer framed.deinit(ctx.allocator);
+    const encoded = framed.bytes;
     var owned_client: ?httpx.Client = null;
     defer if (owned_client) |*client| client.deinit();
     const client: ?*httpx.Client = if (owner == .target) null else if (std.mem.eql(u8, operation, "read"))
@@ -1625,7 +1627,7 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
         owned_client = httpx.Client.initWithConfig(ctx.allocator, server.inferenceIo(), .{ .keep_alive = false });
         break :blk &owned_client.?;
     };
-    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = if (options.attachments != null) httpx.attachment_envelope.content_type else "application/json", .attempt_observer = observeAttempt(ctx, options.attempt_observer) }) catch |err| {
+    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = framed.content_type, .attempt_observer = observeAttempt(ctx, options.attempt_observer) }) catch |err| {
         if (transport.started or guard.committed) return error.InferenceResponseCommitted;
         return guard.failure orelse err;
     };
@@ -1670,7 +1672,10 @@ fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, a
     try headers.append(a, .{ "X-Antfly-Inference-Attempts-Remaining", "1" });
     try headers.append(a, .{ "X-Antfly-Inference-Timeout-Ms", timeout_header });
     if (authorization) |value| try headers.append(a, .{ "Authorization", value });
-    const encoded = try payloads.encodeMetadata(a, body, execution_options.attachments);
+    const execution_context = @import("antfly_inference_execution_context");
+    var rendered = try execution_context.materializeVerifiedJson(a, body, execution_options.verified_media);
+    defer rendered.deinit(a);
+    const encoded = try payloads.encodeMetadata(a, rendered.bytes, execution_options.attachments);
     defer if (execution_options.attachments != null) a.free(encoded);
     try headers.append(a, .{ "Content-Type", if (execution_options.attachments != null) httpx.attachment_envelope.content_type else "application/json" });
     const options = httpx.RequestOptions{

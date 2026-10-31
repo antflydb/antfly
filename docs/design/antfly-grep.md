@@ -2736,3 +2736,282 @@ boundary, storage-control catalog and formatting checks pass. The ignored
 Raw qualification files stay outside the tracked source tree. Full GitHub PR
 CI still requires the repository maintainer approval; these local checks do
 not bypass that gate.
+
+
+## Bounded source codecs and shared worker payloads (2026-10-30)
+
+The next follow-up separates logical evidence from its transient transport
+representation. This changes neither public query/inference syntax nor the
+ASCH25 document format. Ordinary authorization, membership, revision, source
+identity, SHA-256, MIME and pixel checks still precede inference and cache reuse.
+
+### Admission and compatibility
+
+- Binary generation, for both typed messages and canonical structured JSON,
+  preserves the former 16 MiB HTTP attachment metadata ceiling. Raster/provider operations retain their 1 MiB metadata
+  ceiling. Worker admission checks the actual complete 64 MiB envelope, rather
+  than reserving the canonical worst-case metadata size for every call.
+- An explicit request context without a deadline remains unbounded. A missing
+  compatibility context retains the historical five-minute default; an explicit
+  absolute deadline is never extended.
+- Copy-backed projection batches check whether the first two physical values
+  fit before opening a scope or constructing Selection plans. Unknown capability
+  metadata defers admission until the actual scope mode is available, so genuine
+  selected reads can still batch small spans from large physical documents.
+  The existing 64-row, 1 MiB and 256-range bounds remain in force.
+
+### Ownership and representation
+
+Compatible native routes use a trusted producer callback that decodes and verifies
+source data URLs while query views are borrowed. The invocation retains codec
+buffers plus small content-addressed handles; it does not retain a second expanded
+URL. Independently authorized references share a codec only after verification.
+Their individual revision, permission, MIME, digest and pixel claims still apply.
+The table of codecs is allocated lazily, and completed rolling jobs release parse
+scratch before model execution.
+
+The existing 16 MiB expanded source-request limit bounds compact codec retention
+at 12 MiB, inside the shared 64 MiB gateway allocation budget. Legacy reuse hints
+that supplement a retained URL keep their smaller 1 MiB soft limit. Distinct
+locator/options claims do not charge the same verified codec repeatedly.
+The rolling four-job/8 MiB scratch admission policy remains in place; an oversized
+individual source runs alone with the established bounded response ceiling.
+
+Internal handles cannot be submitted as public image URLs. They are usable only
+with matching invocation-owned, verified codec sidecars. Logical evidence size,
+per-image token reservations and decoded-pixel admission do not shrink with the
+handle. Stable verified content identities preserve equivalent-request cache
+reuse after upgrade; previous URL-based entries naturally miss. Cancellation
+still spans source resolution and inference. Hosted/legacy consumers render data
+URLs lazily; route changes cannot send an internal handle to an unaware adapter.
+Only actual message image parts are rewritten, preserving text, tools, options
+and opaque number spellings. Resolved source parts in chat messages normalize to
+the existing `image_url` object shape, including nested detail; decision evidence
+keeps its existing `input_image` shape.
+
+Worker protocol **8** adds a unique physical payload table and a logical-slot
+mapping. Repeated immutable buffer views with the same MIME cross the process
+boundary once; the receiver expands descriptor headers that alias those bytes.
+Message indices, per-reference provenance and logical model admission remain
+intact. Invalid maps, unused payloads and out-of-range references are rejected.
+Identity maps are omitted and singleton calls avoid the interning hash table.
+Explicitly configured worker executables must match the exact protocol version.
+The existing native C attachment boundary and capability remain unchanged.
+
+The legacy/public HTTP framing fallback keeps its existing one-attachment-per-
+occurrence contract and bounded copies. Physical sharing belongs to the private
+worker provider transport. Source verification, storage block reads, model tensor
+preparation and inference still perform real work; these changes do not make
+search or model execution zero cost.
+
+### Qualification
+
+Use separate attribution runs with `bench_source_projection.py
+--profile-source-batch`; its admission/planning counters identify fast-path use
+and fallback without attributing unrelated wide-row regressions to batching.
+Normal paired timing runs leave this logging disabled. The opt-in native source
+preparation fixture uses real PNG codecs, multiple sizes and repeated references;
+its scope includes producer ownership/verification and normalization JSON, and
+excludes storage, fixed provider dispatch and model execution. The worker fixture
+measures real encoded frame bytes, receiver aliasing and allocated bytes.
+Raw results and binary/source manifests remain under ignored `output/`.
+
+
+Optimized qualification on the shared ARM64 macOS host passes the real source
+preparation fixture (5/5) and private worker transport fixture (9/9). The
+source fixture records the following allocation volumes per operation; these
+are allocated bytes, not peak RSS or allocation counts:
+
+| PNG codec bytes | Logical references | URL/evidence path | Codec/handle path |
+|---|---:|---:|---:|
+| 1,108 | 1 | 11,274 B | 3,708 B |
+| 65,835 | 1 | 626,164 B | 68,435 B |
+| 591,250 | 1 | 5,617,622 B | 593,850 B |
+| 1,050,904 | 1 | 9,984,336 B | 1,053,504 B |
+| 1,050,904 | 8 | 32,055,066 B | 1,055,306 B |
+
+Across all four sizes and 1/2/8-reference cases, allocation volume falls
+67–97%. Each case uses seven alternating rounds with sixteen operations per
+sample. This fixture includes actual producer ownership/verification and
+representative decision evidence JSON construction. It does not measure an
+entire gateway/native canonical invocation, storage, IPC or model execution;
+the former native generation route already adapted small verified images
+before canonical serialization. No whole-inference speedup follows from these
+isolated results.
+
+The actual worker encoder/parser carries eight shared 1 MiB logical payloads
+in 1,049,538 bytes, compared with 8,389,711 bytes for eight independently backed
+payloads. Sixteen-operation allocation volume is 25,333,248 versus 201,487,744
+bytes. The independent control contains different bytes, so this is a physical
+scaling and ownership comparison, not a same-input CPU or model-speed claim.
+Logical references and model admission remain unchanged.
+
+Portable worker fixtures also pass inside the available Linux VM: eight
+passes/one opt-in skip for worker framing and two passes for evidence. These
+are static x86_64-linux-musl ReleaseFast artifacts, executed in isolated,
+network-disabled, read-only Docker Desktop containers on the ARM64 Mac. This
+qualifies those contracts under emulation, not native Linux performance or full
+Linux server conformance. The immutable fixture and source manifests are
+`round3-micro-report.json` and `round3-linux-manifest.json` under ignored
+`output/projection-followup/`.
+
+
+Reproduce the whole-server controls with the checked-in drivers, using immutable
+ReleaseFast/stripped binaries built with the same pinned Zig and merged main:
+
+```sh
+python zig/e2e/antfly/bench_source_projection.py CANDIDATE --baseline BASELINE --rounds 5 --queries-per-phase 50 --workload ascii --value-bytes 262144 --output output/source-eligible.json
+python zig/e2e/antfly/bench_source_projection.py CANDIDATE --baseline BASELINE --rounds 5 --queries-per-phase 50 --workload ascii --value-bytes 786432 --metadata-outputs 60 --output output/source-pair-rejected.json
+python zig/e2e/antfly/bench_source_projection.py CANDIDATE --baseline BASELINE --rounds 1 --queries-per-phase 2 --workload ascii --value-bytes 786432 --metadata-outputs 60 --profile-source-batch --output output/source-attribution.json
+python zig/e2e/antfly/bench_projection_batches.py CANDIDATE --baseline BASELINE --rounds 5 --queries-per-phase 50 --metadata-shape scalar --value-bytes 16384 --documents 64 --output output/batches-scalar.json
+python zig/e2e/antfly/bench_media_materialization.py CANDIDATE --baseline BASELINE --rounds 5 --queries-per-phase 50 --workload tiny_shared_duplicates --output output/media-control.json
+```
+
+The source matrix additionally covers one-MiB wide values, small wide rows and
+escaped content. Projection controls include one-MiB scalar and 256-KiB nested
+metadata; media controls include eight distinct large images. Drivers alternate
+baseline/candidate order, assert response equivalence, record binary hashes and
+capture CPU, elapsed and sampled RSS. Admission counters belong only to separate
+attribution runs. Native fixtures are reachable through the existing
+`antfly-api-test`, `antfly-inference-host-test`, `lib-decisions-test` and
+`lib-structured-test` owners; `ANTFLY_BENCH_SOURCE_MEDIA=1` enables the opt-in
+codec/worker benchmark fixtures. The captured optimized compiler commands and
+per-sample results remain beside the ignored manifests.
+
+
+The source-frozen follow-up passes **98/98 native build steps** with 246 standard
+runner passes and one opt-in skip, plus the source-owner suites (213 query,
+94 logical/one opt-in skip, 49 runtime, 33 provider, 77 gateway/one opt-in skip,
+and 24 catalog contracts). Host ABI/transport coverage includes 25 fixtures.
+The stripped ReleaseFast server passes **71/71 build steps**, the standalone
+grep target **7/7**, and real-server indexed HTTP integration **57 passes with
+7 opt-in profiling skips**. There are no failed or leaked native cases. License
+headers, the 2,340-file Apache boundary, storage-control catalog and formatting
+checks pass.
+
+The paired executables include main `51864a57b0562353f8ce8db8889cf13738504367`
+merged at `d2e1fd944f12004255bb508d4865cfb8a6960ccc`; the baseline was captured
+before applying this follow-up and the candidate from the source-frozen changes
+on that same merge. Both use the pinned Zig 0.17.0, ReleaseFast, stripping and
+`-j2` on the shared M4 Max macOS host. The candidate used an isolated cache inside
+the worktree after the ordinary active cache disappeared during compilation;
+that failed attempt is not a qualification run. No production source changed
+during the successful native, optimized fixture, release or HTTP checks.
+
+- Baseline server SHA-256: `7ef6e7fea41908eedcd01416b297f10ca566366f116c251c00e84218e2bea395` (235,634,920 bytes).
+- Candidate server SHA-256: `f7291e7222f0296a6526342a8e66bd96844794a50e7cc31e5553176c92f14807` (235,702,616 bytes).
+- Candidate grep SHA-256: `e8f7f1ec76751de7cf1fc9157cc9d50a0d2ce41e795d9dfb32d8c18b28caaf25` (7,596,584 bytes).
+- Pinned compiler SHA-256: `1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523`.
+
+The server grows by 67,696 bytes
+(0.029%). Binary identities,
+all 23 source/driver hashes and compiler flags are retained in the ignored
+`round3-baseline-manifest.json` and `round3-candidate-manifest.json`. These do not
+claim native Linux/cold-storage performance or full GitHub CI approval.
+
+
+### Same-main whole-server controls
+
+All 35 initial warm synthetic controls pass response-equivalence checks, with
+five alternating baseline/candidate rounds and fifty reads per phase. Ingestion
+is measured once per fresh server; read rows summarize individual operations.
+CPU/elapsed values are milliseconds. Sampled RSS in MiB includes process state
+and prior phases and is not an allocation bound. These controls are separate
+from codec/worker microfixtures; legacy media controls deliberately do not
+establish the speed of native typed source execution.
+
+#### Source projections
+
+| Case / phase | CPU ms before → after | Elapsed ms before → after | RSS MiB before → after |
+|---|---:|---:|---:|
+| eligible / ingest | 57.970 → 59.139 | 41.535 → 41.445 | 182.547 → 182.422 |
+| eligible / ordinary | 3.928 → 3.773 | 5.565 → 5.352 | 186.734 → 186.266 |
+| eligible / full | 5.014 → 5.067 | 6.698 → 6.651 | 196.078 → 195.125 |
+| eligible / reference_full | 7.985 → 7.921 | 9.524 → 9.452 | 195.344 → 193.266 |
+| eligible / conditional | 0.778 → 0.749 | 1.442 → 1.389 | 196.672 → 196.922 |
+| eligible / reference | 4.388 → 4.433 | 5.111 → 5.158 | 196.703 → 196.938 |
+| escaped / ingest | 131.001 → 130.823 | 113.534 → 113.910 | 199.000 → 199.641 |
+| escaped / ordinary | 7.991 → 8.051 | 9.770 → 9.749 | 209.023 → 208.578 |
+| escaped / full | 16.742 → 16.057 | 19.109 → 17.586 | 216.422 → 215.922 |
+| escaped / reference_full | 29.515 → 29.354 | 30.625 → 30.381 | 218.500 → 215.859 |
+| escaped / conditional | 1.110 → 0.798 | 2.359 → 1.465 | 216.516 → 216.172 |
+| escaped / reference | 16.476 → 15.672 | 18.083 → 16.088 | 216.531 → 216.188 |
+| pair-rejected / ingest | 122.161 → 125.460 | 110.642 → 121.805 | 245.266 → 245.141 |
+| pair-rejected / ordinary | 10.613 → 10.449 | 14.069 → 13.780 | 403.531 → 402.836 |
+| pair-rejected / full | 15.230 → 15.696 | 18.319 → 18.985 | 600.172 → 599.906 |
+| pair-rejected / reference_full | 24.347 → 24.900 | 27.240 → 27.705 | 597.141 → 594.578 |
+| pair-rejected / conditional | 1.977 → 2.126 | 2.739 → 3.037 | 596.875 → 594.047 |
+| pair-rejected / reference | 12.612 → 12.819 | 13.209 → 13.480 | 596.875 → 594.250 |
+| wide-large / ingest | 154.337 → 158.657 | 153.578 → 190.677 | 278.406 → 275.406 |
+| wide-large / ordinary | 14.453 → 14.750 | 19.046 → 19.249 | 481.008 → 460.695 |
+| wide-large / full | 20.563 → 20.409 | 24.949 → 24.607 | 643.500 → 652.297 |
+| wide-large / reference_full | 32.590 → 32.495 | 36.403 → 36.350 | 642.766 → 647.281 |
+| wide-large / conditional | 2.158 → 2.092 | 3.013 → 2.924 | 636.062 → 644.844 |
+| wide-large / reference | 16.300 → 16.335 | 16.831 → 16.791 | 638.141 → 637.594 |
+| wide-small / ingest | 22.630 → 23.022 | 12.949 → 13.251 | 152.094 → 152.219 |
+| wide-small / ordinary | 0.382 → 0.351 | 0.920 → 0.875 | 155.562 → 155.844 |
+| wide-small / full | 1.644 → 1.650 | 2.373 → 2.401 | 159.547 → 159.812 |
+| wide-small / reference_full | 1.743 → 1.674 | 2.527 → 2.385 | 158.992 → 159.234 |
+| wide-small / conditional | 1.680 → 1.733 | 2.396 → 2.482 | 159.781 → 160.016 |
+| wide-small / reference | 1.716 → 1.753 | 2.423 → 2.486 | 160.031 → 160.094 |
+
+#### Projection batch controls
+
+| Case / phase | CPU ms before → after | Elapsed ms before → after | RSS MiB before → after |
+|---|---:|---:|---:|
+| nested-medium / read | 3.067 → 3.568 | 4.557 → 5.901 | 209.508 → 202.477 |
+| scalar-large / read | 4.334 → 4.508 | 6.003 → 6.108 | 442.547 → 367.555 |
+| scalar-small / read | 2.100 → 2.077 | 3.096 → 2.955 | 165.961 → 165.234 |
+
+#### Legacy media controls
+
+| Case / phase | CPU ms before → after | Elapsed ms before → after | RSS MiB before → after |
+|---|---:|---:|---:|
+| large_distinct_unique_eight / read | 28.754 → 27.526 | 14.312 → 15.245 | 257.969 → 242.109 |
+| tiny_shared_duplicates / read | 0.572 → 0.604 | 2.068 → 1.986 | 155.297 → 158.594 |
+
+
+Separate one-round/two-query attribution (excluded from those timings) confirms
+eligible batching: 24 attempts, 24 admitted batches, 64 loaded/planned rows.
+The rejected-pair control records 56 attempts, 56 preflight rejections, zero
+admitted rows and **zero planned rows**. The pre-existing baseline has no new
+counter fields; its empty counter list is not evidence of zero work. Candidate
+counters confirm fast-path/fallback behavior directly.
+
+The initial pair-rejected conditional read and nested metadata read are slower,
+and wide large-row ingestion has a higher elapsed median. All three controls
+are repeated independently with seven alternating rounds and one hundred reads
+per phase; initial rows remain recorded above rather than being replaced by
+selected repeats.
+
+
+### Independent whole-server repeats
+
+Seven alternating rounds, one hundred reads per phase. Same immutable binaries and corpus contracts as the initial matrix; response checks pass. Ingestion remains one measurement per fresh server.
+
+| Case / phase | CPU ms before → after | Elapsed ms before → after | RSS MiB before → after |
+|---|---:|---:|---:|
+| pair-rejected / ingest | 138.973 → 138.815 | 156.127 → 152.682 | 245.031 → 229.016 |
+| pair-rejected / ordinary | 11.843 → 11.806 | 15.659 → 15.993 | 423.336 → 396.336 |
+| pair-rejected / full | 17.437 → 16.477 | 21.785 → 20.233 | 457.297 → 473.227 |
+| pair-rejected / reference_full | 26.392 → 26.309 | 30.440 → 29.903 | 465.312 → 476.250 |
+| pair-rejected / conditional | 2.362 → 2.197 | 3.700 → 3.265 | 433.969 → 484.953 |
+| pair-rejected / reference | 13.442 → 13.446 | 14.297 → 14.715 | 241.234 → 479.641 |
+| nested-medium / read | 2.666 → 2.635 | 3.547 → 3.481 | 235.641 → 232.391 |
+| wide-large / ingest | 152.206 → 152.984 | 148.343 → 152.493 | 276.297 → 277.922 |
+| wide-large / ordinary | 14.591 → 14.088 | 18.750 → 18.100 | 647.680 → 685.328 |
+| wide-large / full | 20.122 → 20.129 | 24.128 → 23.945 | 747.000 → 747.953 |
+| wide-large / reference_full | 32.579 → 31.854 | 36.174 → 35.157 | 742.859 → 743.016 |
+| wide-large / conditional | 2.077 → 2.084 | 2.865 → 2.909 | 739.891 → 740.078 |
+| wide-large / reference | 16.204 → 16.095 | 16.684 → 16.572 | 733.328 → 733.094 |
+
+
+The longer repeats reverse the initial read regressions: rejected-pair
+conditional CPU/elapsed fall 7.0%/11.8%; nested metadata falls 1.2%/1.9%.
+Rejected-pair ordinary/reference elapsed remains 2.1%/2.9% higher, and wide
+large-row ingestion is 0.5% higher CPU/2.8% higher elapsed. Other repeated reads
+are mixed or close to flat. The allocation/wire reductions are structural;
+these shared-host whole-server timings do not establish universal speed or RSS
+improvements. After qualification, Ruff only wrapped two blocks in the driver;
+an AST-equivalence check records that formatting changed no behavior. Native
+source identities remain unchanged.

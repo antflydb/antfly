@@ -65,10 +65,17 @@ pub const Batch = struct {
     rows: []logical.Row = &.{},
     start: usize = 0,
     end: usize = 0,
+    profile: bool = false,
+    attempts: usize = 0,
+    admitted: usize = 0,
+    admitted_rows: usize = 0,
+    planned_rows: usize = 0,
+    preflight_rejects: usize = 0,
     pub fn init(a: A) Batch {
-        return .{ .a = a, .arena = .init(a) };
+        return .{ .a = a, .arena = .init(a), .profile = @import("antfly_platform").env.getenvBool("ANTFLY_BENCH_SOURCE_BATCH") };
     }
     pub fn deinit(self: *Batch) void {
+        if (self.profile) std.log.info("antfly_bench_source_batch attempts={d} admitted={d} rows={d} planned_rows={d} preflight_rejects={d}", .{ self.attempts, self.admitted, self.admitted_rows, self.planned_rows, self.preflight_rejects });
         self.arena.deinit();
     }
     pub fn reset(self: *Batch) void {
@@ -77,6 +84,15 @@ pub const Batch = struct {
         self.start = 0;
         self.end = 0;
     }
+    fn pairFits(authorities: []const conditional.Authority) bool {
+        var remaining: u64 = 1024 * 1024;
+        for (authorities) |authority| {
+            const proof = authority.source.proof orelse return false;
+            if (proof.bytes > remaining) return false;
+            remaining -= proof.bytes;
+        }
+        return true;
+    }
     pub fn at(self: *Batch, txn: *@import("../docstore.zig").DocStore.Txn, index: usize, physical: []const []const u8, ids: []const []const u8, authorities: []const conditional.Authority, req: @import("types.zig").SearchRequest, operands: *const OperandPlans) !?logical.Row {
         if (!req.include_all_fields and operands.read_set.len == 0) return null;
         if (index < self.end) return self.rows[index - self.start];
@@ -84,17 +100,36 @@ pub const Batch = struct {
         const full = req.include_all_fields or operands.full_read or operands.read_set.len > 64;
         const capacity = @min(ids.len - index, 64);
         if (capacity < 2) return null;
+        if (self.profile) self.attempts += 1;
         const first = authorities[index].source.proof orelse return null;
         // Capability metadata is available before opening a scope. Unsupported
         // and whole-value adapters keep the original cheap per-row fallback.
         if (first.bytes > 1024 * 1024 and
-            (full or (txn.readScopeRangeMode() orelse .full_value) != .selected_read)) return null;
+            (full or (if (txn.readScopeRangeMode()) |hint| hint != .selected_read else false)))
+        {
+            if (self.profile) self.preflight_rejects += 1;
+            return null;
+        }
+        // A single admissible copied value cannot form a batch. Reject the
+        // first two physical values before opening a scope or planning spans.
+        // Unknown capabilities must defer this decision: selected_read may
+        // legitimately admit small spans from much larger physical values.
+        if (full or (if (txn.readScopeRangeMode()) |hint| hint != .selected_read else false)) {
+            if (!pairFits(authorities[index..][0..2])) {
+                if (self.profile) self.preflight_rejects += 1;
+                return null;
+            }
+        }
         const a = self.arena.allocator();
         var scope = try txn.openReadScope(a);
         defer scope.close();
         // Unsupported adapters may retain entire values behind range-shaped
         // APIs. Keep whole-document admission unless ownership is explicit.
         const mode = scope.rangeReadMode();
+        if ((full or mode != .selected_read) and !pairFits(authorities[index..][0..2])) {
+            if (self.profile) self.preflight_rejects += 1;
+            return null;
+        }
         // A copied span still requires a whole-value read. Reject oversized
         // copy-backed batches before allocating/planning every remaining row.
         if (mode != .selected_read) if (authorities[index].source.proof) |proof| {
@@ -121,6 +156,7 @@ pub const Batch = struct {
             } else if (selective) {
                 if (authority.directory) |directory| {
                     if (proof.kind == @import("../internal_keys.zig").primary_kind and proof.bytes >= @import("../document_projection.zig").minimum_bytes) {
+                        if (self.profile) self.planned_rows += 1;
                         const planned = try logical.Selection.init(a, directory, proof, operands.read_set);
                         if (planned) |selection| {
                             const cached = try a.create(logical.Selection);
@@ -143,6 +179,10 @@ pub const Batch = struct {
         self.rows = try logical.loadPrepared(a, a, &checked, physical[index..end], ids[index..end], if (full) &.{} else operands.read_set, selected[0 .. end - index]);
         self.start = index;
         self.end = end;
+        if (self.profile) {
+            self.admitted += 1;
+            self.admitted_rows += end - index;
+        }
         return self.rows[0];
     }
 };
@@ -552,10 +592,28 @@ test "api query contract oversized copy batches use capability metadata without 
     const request: @import("types.zig").SearchRequest = .{ .include_all_fields = false };
     try std.testing.expect(try batch.at(&txn, 0, &physical, &physical, &authorities, request, &operands) == null);
     try std.testing.expectEqual(@as(usize, 0), opens);
-    // Unknown adapters retain the same conservative fallback.
-    vtable.read_scope_range_mode = null;
-    try std.testing.expect(try batch.at(&txn, 0, &physical, &physical, &authorities, request, &operands) == null);
+    // Neither individually fits together, so no scope or Selection is needed.
+    var medium = authority;
+    medium.source.proof.?.bytes = 750 * 1024;
+    const pair = [_]conditional.Authority{ medium, medium };
+    try std.testing.expect(try batch.at(&txn, 0, &physical, &physical, &pair, request, &operands) == null);
     try std.testing.expectEqual(@as(usize, 0), opens);
+    var small = authority;
+    small.source.proof.?.bytes = 32;
+    const mixed = [_]conditional.Authority{ medium, authority, small };
+    const three = [_][]const u8{ "a", "b", "c" };
+    try std.testing.expect(try batch.at(&txn, 0, &three, &three, &mixed, request, &operands) == null);
+    try std.testing.expectEqual(@as(usize, 0), opens);
+    // Unknown capability may be genuinely selective; inspect the actual scope.
+    vtable.read_scope_range_mode = null;
+    try std.testing.expectError(error.UnexpectedScope, batch.at(&txn, 0, &physical, &physical, &pair, request, &operands));
+    try std.testing.expectEqual(@as(usize, 1), opens);
+    opens = 0;
+    // Unknown adapters defer eligibility until their real capability is known.
+    vtable.read_scope_range_mode = null;
+    try std.testing.expectError(error.UnexpectedScope, batch.at(&txn, 0, &physical, &physical, &authorities, request, &operands));
+    try std.testing.expectEqual(@as(usize, 1), opens);
+    opens = 0;
     const uncertified = [_]conditional.Authority{ .{}, .{} };
     try std.testing.expect(try batch.at(&txn, 0, &physical, &physical, &uncertified, request, &operands) == null);
     try std.testing.expectEqual(@as(usize, 0), opens);

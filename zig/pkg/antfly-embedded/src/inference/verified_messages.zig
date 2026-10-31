@@ -77,3 +77,37 @@ pub fn prepare(a: std.mem.Allocator, messages: []const inference.ChatMessage, me
     moved = true;
     return .{ .arena = arena, .messages = copied, .attachments = attachments.items };
 }
+
+/// Render expanded URLs only for legacy/hosted consumers selected after source
+/// verification. Ordinary and already materialized messages allocate nothing.
+pub fn materialize(a: std.mem.Allocator, messages: []const inference.ChatMessage, media: []const inference.execution_context.VerifiedMedia) !?VerifiedMessages {
+    const has_handles = for (media) |item| {
+        if (item.logical_url_bytes != 0) break true;
+    } else false;
+    if (!has_handles) return null;
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    const scratch = arena.allocator();
+    const copied = try scratch.dupe(inference.ChatMessage, messages);
+    var urls: std.StringHashMapUnmanaged([]const u8) = .empty;
+    for (copied) |*message| if (message.content) |content| if (content == .parts) {
+        const parts = try scratch.dupe(inference.ContentPart, content.parts);
+        for (parts) |*part| {
+            if (part.* != .image_url) continue;
+            const found = for (media) |item| {
+                if (item.logical_url_bytes != 0 and item.matches(part.image_url.url)) break item;
+            } else continue;
+            const url = urls.get(found.url) orelse rendered: {
+                const prefix = try std.fmt.allocPrint(scratch, "data:{s};base64,", .{found.mime_type});
+                const data = try scratch.alloc(u8, prefix.len + std.base64.standard.Encoder.calcSize(found.bytes.len));
+                @memcpy(data[0..prefix.len], prefix);
+                _ = std.base64.standard.Encoder.encode(data[prefix.len..], found.bytes);
+                try urls.put(scratch, found.url, data);
+                break :rendered data;
+            };
+            part.image_url.url = url;
+        }
+        message.content = .{ .parts = parts };
+    };
+    return .{ .arena = arena, .messages = copied, .attachments = &.{} };
+}

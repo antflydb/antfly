@@ -5064,11 +5064,13 @@ document. The persisted-row fixture uses 32.3% fewer scratch allocations.
 
 Gateway media jobs transfer request-local payload leases and release completed
 parsing scratch. Compatible native generators/deciders reuse verified codec
-bytes under a 1 MiB soft retention cap. Structured generation adapts message
+bytes. Legacy hints supplementing a retained URL keep a 1 MiB soft cap;
+compact native payloads replace that URL and stay within the existing expanded
+request ceiling (at most 12 MiB of codecs). Structured generation adapts message
 headers before serialization and passes borrowed attachments through the shared
 native handler, preserving options, tool history, token budgets, usage,
 completion and request controls. Older linked runtimes keep the JSON fallback;
-worker protocol 7 requires a matching explicitly configured worker CLI.
+worker protocol 8 requires a matching explicitly configured worker CLI.
 
 The isolated structured-transport tool allocates 9,913 bytes per invocation for a
 1 MiB synthetic payload versus 8,402,713 through JSON/framing (99.88% less). It excludes
@@ -5083,3 +5085,21 @@ Selected retention is not sparse storage I/O. Public HTTP/query syntax, the
 document schema and ASCH25 remain unchanged; this follow-up introduces no
 persistent-format migration. Earlier qualification runs and rejected experiments
 remain in the linked design history.
+
+
+The [source-codec and payload-sharing contract](../../../docs/design/antfly-grep.md#bounded-source-codecs-and-shared-worker-payloads-2026-10-30)
+keeps compatible native source images as verified codecs and small internal
+handles, rendering expanded URLs only for legacy/hosted consumers. Logical
+request, image and token limits remain unchanged. Workers transfer each shared
+immutable payload once and retain separate logical references. Copy-backed
+projection batches reject ineligible pairs before opening scopes or planning
+spans. These are request-local changes with no document-format migration.
+
+
+The same-main follow-up qualifies 35 whole-server controls and independent
+seven-round repeats, with response-equivalence checks. Attribution confirms 56
+ineligible pairs rejected before any Selection planning, while eligible batches
+still run. The isolated source-preparation fixture allocates 67–97% fewer bytes;
+eight shared 1 MiB worker payloads use about 87% fewer wire bytes. These scoped
+results exclude model work and do not establish universal query speed, RSS or
+billing improvements. Initial and repeated slower cases remain in the design.

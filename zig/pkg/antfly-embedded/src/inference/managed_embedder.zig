@@ -377,6 +377,10 @@ pub const AntflyProvider = struct {
 
     document_json: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, bool, RequestContext) anyerror![]u8 = null,
 
+    /// Only the linked adapter understands invocation-local verified handles.
+    /// Custom callbacks retain legacy materialized URL messages by default.
+    accepts_verified_media_handles: bool = false,
+
     pub fn generateJsonWithAttachments(self: AntflyProvider, alloc: std.mem.Allocator, body: []const u8, attachments: []const @import("antfly_inference_work").Attachment, context: ?RequestContext) ![]u8 {
         const callback = self.generate_json_with_attachments orelse return error.UnsupportedGeneratorProvider;
         return AntflyProviderBoundary.call("generate_json_with_attachments", self.boundary_dispatch, callback, .{ self.ptr, alloc, body, attachments, context });

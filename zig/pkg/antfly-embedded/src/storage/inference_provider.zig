@@ -526,6 +526,7 @@ pub fn embeddedMemoryAdmissionStats(handle: *anyopaque) !inference_bridge.Memory
 
 pub fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) inference.managed_embedder.AntflyProvider {
     return .{
+        .accepts_verified_media_handles = true,
         .ptr = lifetime,
         .owns_invocation_admission = true,
         .typed_dense_results = true,
@@ -618,6 +619,20 @@ pub fn requestContextFromControls(deadline_ns: ?u64, cancellation: CancellationT
     };
 }
 
+// A present context with no deadline explicitly requests unbounded execution.
+// Only compatibility calls without a context acquire the historical default.
+fn providerDeadline(context: ?inference.RequestContext, now_ns: u64) ?u64 {
+    return if (context) |active| active.deadline_ns else now_ns +| 5 * std.time.ns_per_min;
+}
+
+test "provider registry gateway preserves explicit optional deadlines" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try std.testing.expectEqual(@as(?u64, 123 + 5 * std.time.ns_per_min), providerDeadline(null, 123));
+    try std.testing.expectEqual(@as(?u64, null), providerDeadline(.{ .io = io, .deadline_ns = null }, 123));
+    try std.testing.expectEqual(@as(?u64, 0), providerDeadline(.{ .io = io, .deadline_ns = 0 }, 123));
+    try std.testing.expectEqual(@as(?u64, 456), providerDeadline(.{ .io = io, .deadline_ns = 456 }, 123));
+}
+
 pub fn invokeInferenceProviderWithBinaryContext(
     comptime Result: type,
     alloc: std.mem.Allocator,
@@ -638,10 +653,7 @@ pub fn invokeInferenceProviderWithBinaryContext(
     var response_handle: ?*anyopaque = null;
     var response_json: inference_bridge.String = undefined;
     var numeric_result = inference_bridge.NumericResult{};
-    const effective_deadline_ns = if (request_context) |active|
-        active.deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_min
-    else
-        platform_time.monotonicNs() +| 5 * std.time.ns_per_min;
+    const effective_deadline_ns = providerDeadline(request_context, platform_time.monotonicNs());
     const RequestCancellation = struct {
         pub fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
             const context: *const ?inference.RequestContext = @ptrCast(@alignCast(raw orelse return 1));
@@ -670,8 +682,8 @@ pub fn invokeInferenceProviderWithBinaryContext(
         .handle = handle,
         .operation = @backingInt(operation),
         .request_json = inference_bridge.String.init(request_json),
-        .deadline_ns = effective_deadline_ns,
-        .has_deadline = 1,
+        .deadline_ns = effective_deadline_ns orelse 0,
+        .has_deadline = @intFromBool(effective_deadline_ns != null),
         .out_response_handle = &response_handle,
         .out_response_json = &response_json,
         .out_numeric_result = if (Result == [][]f32 or Result == []f32) &numeric_result else null,

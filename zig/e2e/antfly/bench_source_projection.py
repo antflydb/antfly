@@ -101,6 +101,11 @@ def main():
         default=1,
         help="repeat reads on each fresh server; keep parsing outside timings",
     )
+    parser.add_argument(
+        "--profile-source-batch",
+        action="store_true",
+        help="separate attribution run; emit batch admission/planning counters (adds logging overhead)",
+    )
     parser.add_argument("--shards", type=int, default=1)
     parser.add_argument(
         "--residual-filter",
@@ -202,6 +207,12 @@ def main():
     samples = []
     output_hashes = {}
     certificate_counts = []
+    previous_batch_profile = os.environ.get("ANTFLY_BENCH_SOURCE_BATCH")
+    if args.profile_source_batch:
+        os.environ["ANTFLY_BENCH_SOURCE_BATCH"] = "1"
+    else:
+        os.environ.pop("ANTFLY_BENCH_SOURCE_BATCH", None)
+    source_batch_counts = []
     previous_profile = os.environ.get("ANTFLY_BENCH_QUERY_PROFILE")
     os.environ["ANTFLY_BENCH_QUERY_PROFILE"] = "1"
     try:
@@ -429,6 +440,30 @@ def main():
                             "metadata update delivery differs"
                         )
                     logs = server.log_path.read_text(errors="replace")
+                    if args.profile_source_batch:
+                        keys = (
+                            "attempts",
+                            "admitted",
+                            "rows",
+                            "planned_rows",
+                            "preflight_rejects",
+                        )
+                        batch_counts = [
+                            dict(zip(keys, map(int, values)))
+                            for values in re.findall(
+                                r"antfly_bench_source_batch attempts=(\d+) "
+                                r"admitted=(\d+) rows=(\d+) planned_rows=(\d+) "
+                                r"preflight_rejects=(\d+)",
+                                logs,
+                            )
+                        ]
+                        source_batch_counts.append(
+                            {
+                                "variant": variant,
+                                "round": round_id,
+                                "counters": batch_counts,
+                            }
+                        )
                     counts = [
                         (int(a), int(b))
                         for a, b in re.findall(
@@ -485,6 +520,10 @@ def main():
                 finally:
                     server.stop()
     finally:
+        if previous_batch_profile is None:
+            os.environ.pop("ANTFLY_BENCH_SOURCE_BATCH", None)
+        else:
+            os.environ["ANTFLY_BENCH_SOURCE_BATCH"] = previous_batch_profile
         if previous_profile is None:
             os.environ.pop("ANTFLY_BENCH_QUERY_PROFILE", None)
         else:
@@ -519,7 +558,9 @@ def main():
                 }
             )
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "profile_source_batch": args.profile_source_batch,
+        "source_batch_counts": source_batch_counts,
         "workload": args.workload,
         "mask": args.mask,
         "shards": args.shards,

@@ -75,9 +75,84 @@ pub const TableSourceReference = struct {
     }
 };
 
+pub const media_handle_prefix = "antfly-verified:";
+pub const Media = struct { url: []const u8, bytes: []const u8, mime_type: []const u8, logical_url_bytes: usize, pixels: u64 };
 pub const Input = union(enum) {
     text: []const u8,
     messages: []const Json,
+    verified_messages: struct { messages: []const Json, media: []const Media },
+
+    /// Only trusted invocation sidecars can admit internal handles. Public JSON
+    /// parsing remains unchanged and rejects them without matching codec bytes.
+    pub fn descriptors(a: std.mem.Allocator, verified: anytype) ![]const Media {
+        const has_handles = for (verified) |source| {
+            if (source.logical_url_bytes != 0) break true;
+        } else false;
+        if (!has_handles) return &.{};
+        const media = try a.alloc(Media, verified.len);
+        for (media, verified) |*target, source| target.* = .{ .url = source.url, .bytes = source.bytes, .mime_type = source.mime_type, .logical_url_bytes = source.logical_url_bytes, .pixels = source.pixels };
+        return media;
+    }
+    pub fn fromJsonWithMedia(a: std.mem.Allocator, value: Json, verified: anytype) !Input {
+        if (value != .array) return fromJson(value);
+        return fromJsonWithDescriptors(value, try descriptors(a, verified));
+    }
+    pub fn fromJsonWithDescriptors(value: Json, media: []const Media) !Input {
+        if (value != .array or media.len == 0) return fromJson(value);
+        const result: Input = .{ .verified_messages = .{ .messages = value.array.items, .media = media } };
+        try result.validate();
+        return result;
+    }
+    pub fn messageItems(self: Input) []const Json {
+        return switch (self) {
+            .text => &.{},
+            .messages => |items| items,
+            .verified_messages => |v| v.messages,
+        };
+    }
+    pub fn mediaFor(self: Input, url: []const u8) ?Media {
+        if (self == .verified_messages) for (self.verified_messages.media) |media| {
+            if (media.logical_url_bytes != 0 and std.mem.eql(u8, media.url, url)) return media;
+        };
+        return null;
+    }
+    pub fn withMessages(self: Input, messages: []const Json) Input {
+        return if (self == .verified_messages) .{ .verified_messages = .{ .messages = messages, .media = self.verified_messages.media } } else .{ .messages = messages };
+    }
+
+    pub fn materialized(self: Input, a: std.mem.Allocator) !Input {
+        if (self != .verified_messages) return self;
+        // Only small headers are cloned; codec bytes are encoded lazily for an
+        // actual non-native consumer, with no untrusted URL fetching involved.
+        const messages = try a.dupe(Json, self.messageItems());
+        var rendered: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer rendered.deinit(a);
+        for (messages) |*message| {
+            message.object = try message.object.clone(a);
+            var content = message.object.get("content").?;
+            if (content != .array) continue;
+            const parts = try a.dupe(Json, content.array.items);
+            content.array.items = parts;
+            content.array.capacity = parts.len;
+            for (parts) |*part| {
+                const kind = part.object.get("type").?.string;
+                if (!std.mem.eql(u8, kind, "input_image")) continue;
+                const media = self.mediaFor(part.object.get("image_url").?.string) orelse continue;
+                const url = rendered.get(media.url) orelse lazy: {
+                    const prefix = try std.fmt.allocPrint(a, "data:{s};base64,", .{media.mime_type});
+                    const url = try a.alloc(u8, prefix.len + std.base64.standard.Encoder.calcSize(media.bytes.len));
+                    @memcpy(url[0..prefix.len], prefix);
+                    _ = std.base64.standard.Encoder.encode(url[prefix.len..], media.bytes);
+                    try rendered.put(a, media.url, url);
+                    break :lazy url;
+                };
+                part.object = try part.object.clone(a);
+                try part.object.put(a, "image_url", .{ .string = url });
+            }
+            try message.object.put(a, "content", content);
+        }
+        return .{ .messages = messages };
+    }
 
     pub fn fromJson(value: Json) !Input {
         const result: Input = switch (value) {
@@ -92,14 +167,14 @@ pub const Input = union(enum) {
     pub fn jsonValue(self: Input, a: std.mem.Allocator) Json {
         return switch (self) {
             .text => |s| .{ .string = s },
-            .messages => |items| .{ .array = .{ .items = @constCast(items), .capacity = items.len, .allocator = a, .pointer_stability = .{} } },
+            .messages, .verified_messages => .{ .array = .{ .items = @constCast(self.messageItems()), .capacity = self.messageItems().len, .allocator = a, .pointer_stability = .{} } },
         };
     }
 
     pub fn requireText(self: Input) ![]const u8 {
         return switch (self) {
             .text => |s| s,
-            .messages => error.UnsupportedInferenceFeature,
+            .messages, .verified_messages => error.UnsupportedInferenceFeature,
         };
     }
 
@@ -108,7 +183,7 @@ pub const Input = union(enum) {
     pub fn imageCount(self: Input) usize {
         if (self == .text) return 0;
         var count: usize = 0;
-        for (self.messages) |message| {
+        for (self.messageItems()) |message| {
             const content = message.object.get("content").?;
             if (content == .array) for (content.array.items) |part| {
                 if (std.mem.eql(u8, part.object.get("type").?.string, "input_image")) count += 1;
@@ -122,12 +197,17 @@ pub const Input = union(enum) {
     pub fn inlineImageBytes(self: Input) usize {
         if (self == .text) return 0;
         var bytes: usize = 0;
-        for (self.messages) |message| {
+        for (self.messageItems()) |message| {
             const content = message.object.get("content").?;
             if (content == .array) for (content.array.items) |part| {
                 if (!std.mem.eql(u8, part.object.get("type").?.string, "input_image")) continue;
                 const url = part.object.get("image_url").?.string;
-                if (std.mem.startsWith(u8, url, "data:")) bytes += (inlineImage(url) catch unreachable).encoded.len;
+                if (self.mediaFor(url)) |media| {
+                    // The compact body contains a handle, not base64. Discount
+                    // only its replacement bytes, leaving the same MIME prefix
+                    // as the legacy image URL for text-token accounting.
+                    bytes += url.len -| (13 + media.mime_type.len);
+                } else if (std.mem.startsWith(u8, url, "data:")) bytes += (inlineImage(url) catch unreachable).encoded.len;
             };
         }
         return bytes;
@@ -136,7 +216,8 @@ pub const Input = union(enum) {
     pub fn validate(self: Input) !void {
         switch (self) {
             .text => |s| _ = try nonempty(s),
-            .messages => |messages| {
+            .messages, .verified_messages => {
+                const messages = self.messageItems();
                 if (messages.len == 0 or messages.len > 128) return error.DecisionLimitExceeded;
                 var images: usize = 0;
                 for (messages) |message| {
@@ -161,7 +242,10 @@ pub const Input = union(enum) {
                             images += 1;
                             if (images > 128) return error.DecisionLimitExceeded;
                             const url = try string(part.object.get("image_url"));
-                            try validateImageUrl(url);
+                            if (std.mem.startsWith(u8, url, media_handle_prefix)) {
+                                const media = self.mediaFor(url) orelse return error.InvalidDecisionSpecification;
+                                if (media.bytes.len == 0 or media.logical_url_bytes == 0) return error.InvalidDecisionSpecification;
+                            } else try validateImageUrl(url);
                             if (part.object.get("detail")) |value| {
                                 const detail = try string(value);
                                 if (!std.mem.eql(u8, detail, "auto") and !std.mem.eql(u8, detail, "low") and !std.mem.eql(u8, detail, "high")) return error.InvalidDecisionSpecification;
@@ -181,7 +265,17 @@ pub const Input = union(enum) {
         var buffer: [1024]u8 = undefined;
         var counter = std.Io.Writer.Discarding.init(&buffer);
         try std.json.Stringify.value(self.jsonValue(a), .{}, &counter.writer);
-        return std.math.cast(usize, counter.fullCount()) orelse error.DecisionLimitExceeded;
+        var size = std.math.cast(usize, counter.fullCount()) orelse return error.DecisionLimitExceeded;
+        if (self != .verified_messages) return size;
+        for (self.messageItems()) |message| {
+            const content = message.object.get("content").?;
+            if (content == .array) for (content.array.items) |part| {
+                if (!std.mem.eql(u8, part.object.get("type").?.string, "input_image")) continue;
+                const url = part.object.get("image_url").?.string;
+                if (self.mediaFor(url)) |media| size = std.math.add(usize, size - url.len, media.logical_url_bytes) catch return error.DecisionLimitExceeded;
+            };
+        }
+        return size;
     }
 
     pub fn checkLimit(self: Input, a: std.mem.Allocator, limit: usize) !void {
@@ -257,4 +351,32 @@ test "decision functions evidence rejects malformed and unsupported media" {
     try message.object.put(a, "content", content);
     try std.testing.expectError(error.DecisionLimitExceeded, (Input{ .messages = &.{message} }).validate());
     _ = &content;
+}
+
+test "decision trusted handles preserve evidence limits and text accounting" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const handle = "antfly-verified:image/png:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const value = try std.json.parseFromSliceLeaky(Json, a, "[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Look\"},{\"type\":\"input_image\",\"image_url\":\"" ++ handle ++ "\"}]}]", .{});
+    try std.testing.expectError(error.InvalidDecisionSpecification, Input.fromJson(value));
+    const bytes = "codec";
+    const logical = 22 + std.base64.standard.Encoder.calcSize(bytes.len);
+    const views = [_]Media{.{ .url = handle, .bytes = bytes, .mime_type = "image/png", .logical_url_bytes = logical, .pixels = 1 }};
+    const trusted = try Input.fromJsonWithMedia(a, value, &views);
+    try std.testing.expectEqual(@as(usize, 1), trusted.imageCount());
+    const shared = try Input.fromJsonWithDescriptors(value, trusted.verified_messages.media);
+    try std.testing.expectEqual(trusted.verified_messages.media.ptr, shared.verified_messages.media.ptr);
+    const ordinary = try trusted.materialized(a);
+    try ordinary.validate();
+    const size = try ordinary.byteSize(a);
+    try std.testing.expectEqual(size, try trusted.byteSize(a));
+    try std.testing.expectError(error.DecisionLimitExceeded, trusted.checkLimit(a, size - 1));
+    try trusted.checkLimit(a, size);
+    const compact = try std.json.Stringify.valueAlloc(a, trusted.jsonValue(a), .{});
+    const expanded = try std.json.Stringify.valueAlloc(a, ordinary.jsonValue(a), .{});
+    try std.testing.expectEqual(expanded.len - ordinary.inlineImageBytes(), compact.len - trusted.inlineImageBytes());
+    var wrong = views;
+    wrong[0].url = "antfly-verified:wrong";
+    try std.testing.expectError(error.InvalidDecisionSpecification, Input.fromJsonWithMedia(a, value, &wrong));
 }

@@ -58,6 +58,10 @@ pub const VerifiedMedia = struct {
     url: []const u8,
     bytes: []const u8,
     mime_type: []const u8,
+    // Zero for legacy URL-backed values. Internal handles preserve the exact
+    // logical request size and dimensions without retaining expanded base64.
+    logical_url_bytes: usize = 0,
+    pixels: u64 = 0,
     pub fn matches(self: @This(), url: []const u8) bool {
         return self.url.len == url.len and (self.url.ptr == url.ptr or std.mem.eql(u8, self.url, url));
     }

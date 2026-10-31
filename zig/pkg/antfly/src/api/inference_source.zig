@@ -20,6 +20,9 @@ const images = @import("antfly_image");
 const A = std.mem.Allocator;
 const V = std.json.Value;
 pub const Reference = @import("antfly_decisions").evidence.TableSourceReference;
+// Compact native payloads replace the retained URL rather than supplement it.
+// The existing 16 MiB expanded request ceiling bounds useful codec retention.
+pub const max_typed_codec_bytes: usize = 12 * 1024 * 1024;
 pub const Port = struct {
     ptr: *anyopaque,
     /// Returned bytes belong to a. The host must recheck live table/row read
@@ -29,6 +32,9 @@ pub const Port = struct {
     /// Optional move-owned payloads. The consumer releases the lease before its
     /// allocator/budget dies, after the last provider read of the resolved input.
     lookup_owned: ?*const fn (*anyopaque, A, []const Reference) anyerror!PayloadLease = null,
+    /// Decode while producer views are live; return codecs and internal handles
+    /// only to compatible native executors. The same ACL query still owns reads.
+    lookup_verified_owned: ?*const fn (*anyopaque, A, []const Reference, usize) anyerror!PayloadLease = null,
 };
 pub const PayloadLease = struct {
     urls: []const []const u8 = &.{},
@@ -40,7 +46,7 @@ pub const PayloadLease = struct {
         self.* = .{};
     }
 };
-const Selected = struct { part: *V, reference: Reference };
+const Selected = struct { part: *V, reference: Reference, chat: bool };
 // Guard data before typed cloning or fixed-depth encoders. Recursion is bounded
 // before entry; strings/base64 are scalar nodes and are not walked bytewise.
 fn validateDepth(value: V, depth: usize) anyerror!void {
@@ -52,7 +58,7 @@ fn validateDepth(value: V, depth: usize) anyerror!void {
     }
 }
 
-fn collect(a: A, value: V, selected: *std.ArrayList(Selected)) !void {
+fn collect(a: A, value: V, selected: *std.ArrayList(Selected), chat: bool) !void {
     if (value != .array) return;
     for (value.array.items) |message| {
         if (message != .object) continue;
@@ -61,7 +67,15 @@ fn collect(a: A, value: V, selected: *std.ArrayList(Selected)) !void {
         for (content.array.items) |*part| {
             if (part.* != .object) continue;
             const kind = part.object.get("type") orelse continue;
-            if (kind != .string or !std.mem.eql(u8, kind.string, "input_image")) continue;
+            if (kind != .string) continue;
+            if (part.object.get("image_url")) |image| {
+                const url: ?[]const u8 = if (image == .string) image.string else if (image == .object) nested: {
+                    const url = image.object.get("url") orelse break :nested null;
+                    break :nested if (url == .string) url.string else null;
+                } else null;
+                if (url) |text| if (std.mem.startsWith(u8, text, "antfly-verified:")) return error.InvalidInferenceSource;
+            }
+            if (!std.mem.eql(u8, kind.string, "input_image")) continue;
             const source = part.object.get("source") orelse continue;
             if (part.object.contains("image_url")) return error.InvalidInferenceSource;
             var fields = part.object.iterator();
@@ -73,7 +87,7 @@ fn collect(a: A, value: V, selected: *std.ArrayList(Selected)) !void {
             const reference = std.json.parseFromValueLeaky(Reference, a, source, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceSource;
             try reference.validate();
             if (selected.items.len == 128) return error.InferenceRequestTooLarge;
-            try selected.append(a, .{ .part = part, .reference = reference });
+            try selected.append(a, .{ .part = part, .reference = reference, .chat = chat });
         }
     }
 }
@@ -96,6 +110,8 @@ pub const RetentionPolicy = struct {
     /// Exceeding this soft codec budget preserves ordinary verification and
     /// execution; it does not reject or truncate any source.
     max_bytes: usize = 1024 * 1024,
+    typed_payloads: bool = false,
+    max_typed_bytes: usize = max_typed_codec_bytes,
 };
 pub fn resolveForExecution(a: A, request: V, port: ?Port, policy: RetentionPolicy) !PayloadLease {
     return resolveMode(a, request, port, policy);
@@ -116,13 +132,13 @@ fn resolveMode(a: A, request: V, port: ?Port, policy: ?RetentionPolicy) !Payload
     if (request != .object) return .{};
     var selected: std.ArrayList(Selected) = .empty;
     defer selected.deinit(a);
-    if (request.object.get("input")) |input| try collect(a, input, &selected);
+    if (request.object.get("input")) |input| try collect(a, input, &selected, false);
     if (request.object.get("inputs")) |inputs| {
         if (inputs == .array) for (inputs.array.items) |input| {
-            if (input == .object) if (input.object.get("input")) |messages| try collect(a, messages, &selected);
+            if (input == .object) if (input.object.get("input")) |messages| try collect(a, messages, &selected, false);
         };
     }
-    if (request.object.get("messages")) |messages| try collect(a, messages, &selected);
+    if (request.object.get("messages")) |messages| try collect(a, messages, &selected, true);
     if (selected.items.len == 0) return .{};
     var retain_decoded = if (policy) |p| p.retain(p.ptr, request) else false;
     for (selected.items) |item| if (item.part.object.get("detail")) |detail| {
@@ -166,12 +182,23 @@ fn resolveMode(a: A, request: V, port: ?Port, policy: ?RetentionPolicy) !Payload
             try references.append(a, item.reference);
         }
     }
+    const typed_route = retain_decoded and policy.?.typed_payloads and authorized.lookup_verified_owned != null;
+    const retention_limit = if (typed_route) policy.?.max_typed_bytes else if (policy) |p| p.max_bytes else 0;
     if (retain_decoded) {
         var retained_bytes: usize = 0;
-        for (references.items) |reference| retained_bytes +|= reference.byte_length;
-        if (retained_bytes > policy.?.max_bytes) retain_decoded = false;
+        for (references.items, 0..) |reference, i| {
+            // Authorization and per-reference pixel limits are checked below.
+            // Retention is charged by the verified content identity rather than
+            // locator/options identity, so distinct claims can reuse one codec.
+            const seen = for (references.items[0..i]) |prior| {
+                if (reference.byte_length == prior.byte_length and std.mem.eql(u8, reference.sha256, prior.sha256) and std.mem.eql(u8, reference.mime_type, prior.mime_type)) break true;
+            } else false;
+            if (!seen) retained_bytes +|= reference.byte_length;
+        }
+        if (retained_bytes > retention_limit) retain_decoded = false;
     }
-    var lease: PayloadLease = if (authorized.lookup_owned) |owned| try owned(authorized.ptr, a, references.items) else .{ .urls = if (authorized.lookup_many) |batch| try batch(authorized.ptr, a, references.items) else sequential: {
+    const typed = retain_decoded and typed_route;
+    var lease: PayloadLease = if (typed) try authorized.lookup_verified_owned.?(authorized.ptr, a, references.items, retention_limit) else if (authorized.lookup_owned) |owned| try owned(authorized.ptr, a, references.items) else .{ .urls = if (authorized.lookup_many) |batch| try batch(authorized.ptr, a, references.items) else sequential: {
         const output = try a.alloc([]const u8, references.items.len);
         for (references.items, output) |reference, *url| url.* = try authorized.lookup(authorized.ptr, a, reference);
         break :sequential output;
@@ -181,7 +208,7 @@ fn resolveMode(a: A, request: V, port: ?Port, policy: ?RetentionPolicy) !Payload
     var moved = false;
     defer if (!moved) decoded.deinit();
     const Media = @import("antfly_inference_execution_context").VerifiedMedia;
-    const media: []Media = if (retain_decoded) try a.alloc(Media, references.items.len) else &.{};
+    const media: []Media = if (retain_decoded and !typed) try a.alloc(Media, references.items.len) else &.{};
     const urls = lease.urls;
     if (urls.len != references.items.len) return error.InferenceSourceMismatch;
     // Decode/inspect a distinct payload once per request. Matching references
@@ -189,6 +216,15 @@ fn resolveMode(a: A, request: V, port: ?Port, policy: ?RetentionPolicy) !Payload
     var verified: std.StringHashMapUnmanaged(Verified) = .empty;
     defer verified.deinit(a);
     for (references.items, urls, 0..) |reference, url, i| {
+        if (typed) {
+            if (lease.verified.len != references.items.len) return error.InferenceSourceMismatch;
+            const source = lease.verified[i];
+            var token: [128]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&token, "antfly-verified:{s}:{s}", .{ reference.mime_type, reference.sha256 });
+            if (!source.matches(url) or !std.mem.eql(u8, url, expected) or source.logical_url_bytes != 13 + reference.mime_type.len + std.base64.standard.Encoder.calcSize(reference.byte_length) or source.bytes.len != reference.byte_length or source.pixels == 0 or !std.mem.eql(u8, source.mime_type, reference.mime_type)) return error.InferenceSourceMismatch;
+            if (source.pixels > reference.max_pixels) return error.InferenceRequestTooLarge;
+            continue;
+        }
         const info = verified.get(url) orelse checked: {
             const info = try verifyInfoRetained(a, reference, url, if (retain_decoded) decoded.allocator() else null);
             try verified.put(a, url, info);
@@ -199,19 +235,35 @@ fn resolveMode(a: A, request: V, port: ?Port, policy: ?RetentionPolicy) !Payload
         if (retain_decoded) media[i] = .{ .url = url, .bytes = info.data, .mime_type = info.mime };
     }
     // Base64 data URLs have JSON-safe ASCII spellings, proven by verification.
-    // Replace exactly the serialized source value and the three extra key bytes;
-    // do not walk expanded image bytes through a second counting encoder.
+    // Decision URLs add two string quotes and three extra key bytes. Chat
+    // additionally wraps the URL in an object (+8) and shortens the type (-2).
+    // Do not walk expanded image bytes through another counting encoder.
     for (selected.items, slots) |item, slot| {
         var counter: std.Io.Writer.Discarding = .init(&.{});
         try std.json.Stringify.value(item.part.object.get("source").?, .{}, &counter.writer);
         const previous = std.math.cast(usize, counter.fullCount()) orelse return error.InferenceRequestTooLarge;
-        expanded = std.math.add(usize, expanded - previous, urls[slot].len + 5) catch return error.InferenceRequestTooLarge;
+        expanded = std.math.add(usize, expanded - previous, (if (typed) lease.verified[slot].logical_url_bytes else urls[slot].len) + @as(usize, if (item.chat) 11 else 5)) catch return error.InferenceRequestTooLarge;
         if (expanded > 16 * 1024 * 1024) return error.InferenceRequestTooLarge;
     }
     for (selected.items, slots) |item, slot| {
         _ = item.part.object.swapRemove("source");
-        try item.part.object.put(a, "image_url", .{ .string = urls[slot] });
+        if (item.chat) {
+            // Decision evidence and chat have different existing image shapes.
+            // Normalize locators into the downstream chat contract here, before
+            // native/vendor parsing and image admission.
+            var image: std.json.ObjectMap = .empty;
+            try image.put(a, "url", .{ .string = urls[slot] });
+            if (item.part.object.get("detail")) |detail| {
+                try image.put(a, "detail", detail);
+                _ = item.part.object.swapRemove("detail");
+            }
+            try item.part.object.put(a, "type", .{ .string = "image_url" });
+            try item.part.object.put(a, "image_url", .{ .object = image });
+        } else try item.part.object.put(a, "image_url", .{ .string = urls[slot] });
     }
+    // The typed producer already owns the complete invocation lease; it needs
+    // neither another descriptor table nor a wrapper around an empty decoder.
+    if (typed) return lease;
     if (retain_decoded) {
         const owner = try a.create(VerifiedPayloads);
         owner.* = .{ .a = a, .arena = decoded, .upstream = lease };
@@ -220,14 +272,14 @@ fn resolveMode(a: A, request: V, port: ?Port, policy: ?RetentionPolicy) !Payload
     }
     return lease;
 }
-const Verified = struct { bytes: usize, digest: [64]u8, mime: []const u8, pixels: u64, data: []const u8 = &.{} };
+pub const Verified = struct { bytes: usize, digest: [64]u8, mime: []const u8, pixels: u64, data: []const u8 = &.{} };
 fn verify(a: A, reference: Reference, url: []const u8) !void {
     _ = try verifyInfo(a, reference, url);
 }
 fn verifyInfo(a: A, reference: Reference, url: []const u8) !Verified {
     return verifyInfoRetained(a, reference, url, null);
 }
-fn verifyInfoRetained(a: A, reference: Reference, url: []const u8, retained: ?A) !Verified {
+pub fn verifyInfoRetained(a: A, reference: Reference, url: []const u8, retained: ?A) !Verified {
     const prefix = try std.fmt.allocPrint(a, "data:{s};base64,", .{reference.mime_type});
     defer a.free(prefix);
     if (!std.mem.startsWith(u8, url, prefix)) return error.InferenceSourceMismatch;
@@ -237,6 +289,7 @@ fn verifyInfoRetained(a: A, reference: Reference, url: []const u8, retained: ?A)
     const scratch = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(a);
     const bytes = try (retained orelse scratch).alloc(u8, length);
     defer if (retained == null) scratch.free(bytes);
+    errdefer if (retained) |owner| owner.free(bytes);
     std.base64.standard.Decoder.decode(bytes, encoded) catch return error.InferenceSourceMismatch;
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -642,4 +695,47 @@ test "httpx inference gateway verified bytes are invocation owned and policy is 
     state.url = "invalid";
     const failed = try std.json.parseFromSliceLeaky(V, temp, body, .{});
     try std.testing.expectError(error.InferenceSourceMismatch, resolveForExecution(temp, failed, port, policy));
+}
+
+test "httpx inference gateway retained codecs charge unique content across distinct claims" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7S8AAAAASUVORK5CYII=";
+    var bytes: [68]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&bytes, encoded);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const ref: Reference = .{ .table = "docs", .document_id = "a", .field = "image", .revision_field = "revision", .revision = "r1", .sha256 = &hex, .mime_type = "image/png", .byte_length = bytes.len, .max_pixels = 16 };
+    var other = ref;
+    other.document_id = "b";
+    other.max_pixels = 1;
+    const value = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, .{ .input = .{.{ .role = "user", .content = .{ .{ .type = "input_image", .source = ref }, .{ .type = "input_image", .source = other } } }} }, .{}), .{});
+    const State = struct {
+        calls: usize = 0,
+        fn lookup(raw: *anyopaque, _: A, _: Reference) ![]const u8 {
+            @as(*@This(), @ptrCast(@alignCast(raw))).calls += 1;
+            return "data:image/png;base64," ++ encoded;
+        }
+        fn policy(_: *anyopaque, _: V) bool {
+            return true;
+        }
+    };
+    var state: State = .{};
+    var lease = try resolveForExecution(a, value, .{ .ptr = &state, .lookup = State.lookup }, .{ .ptr = &state, .retain = State.policy, .max_bytes = 68 });
+    defer lease.deinit();
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+    try std.testing.expectEqual(@as(usize, 2), lease.verified.len);
+    try std.testing.expectEqual(lease.verified[0].bytes.ptr, lease.verified[1].bytes.ptr);
+    const forged = try std.json.parseFromSliceLeaky(V, a, "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"antfly-verified:image/png:forged\"}}]}]}", .{});
+    try std.testing.expectError(error.InvalidInferenceSource, resolveOwned(a, forged, null));
+    const chat = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, .{ .messages = .{.{ .role = "user", .content = .{.{ .type = "input_image", .source = ref, .detail = "low" }} }} }, .{}), .{});
+    var chat_lease = try resolveOwned(a, chat, .{ .ptr = &state, .lookup = State.lookup });
+    defer chat_lease.deinit();
+    const part = chat.object.get("messages").?.array.items[0].object.get("content").?.array.items[0];
+    try std.testing.expectEqualStrings("image_url", part.object.get("type").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64," ++ encoded, part.object.get("image_url").?.object.get("url").?.string);
+    try std.testing.expectEqualStrings("low", part.object.get("image_url").?.object.get("detail").?.string);
+    try std.testing.expect(!part.object.contains("source") and !part.object.contains("detail"));
 }

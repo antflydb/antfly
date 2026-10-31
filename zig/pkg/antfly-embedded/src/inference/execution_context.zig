@@ -242,6 +242,9 @@ pub fn encodeVerifiedGenerate(a: std.mem.Allocator, temporary: std.mem.Allocator
             var replacement: std.json.ObjectMap = .empty;
             try replacement.put(scratch, "type", .{ .string = "media" });
             try replacement.put(scratch, "mime_type", .{ .string = found.mime_type });
+            // Public HTTP generation requires one attachment per occurrence.
+            // Private worker transport can share bytes behind those logical
+            // slots without changing that cardinality contract.
             try replacement.put(scratch, "data", .{ .string = try std.fmt.allocPrint(scratch, "attachment:{d}", .{attachments.items.len}) });
             try attachments.append(scratch, .{ .mime_type = found.mime_type, .data = found.bytes });
             part.* = .{ .object = replacement };
@@ -285,4 +288,105 @@ test "httpx inference gateway verified attachment encoding preserves opaque numb
     var framed = try httpx.attachment_envelope.parseAlloc(a, encoded.bytes, .{});
     defer framed.deinit();
     inline for (.{ "18446744073709551617", "1e-400", ":-0" }) |number| try std.testing.expect(std.mem.indexOf(u8, framed.metadata, number) != null);
+}
+
+pub fn hasVerifiedHandles(media: []const VerifiedMedia) bool {
+    return for (media) |view| {
+        if (view.logical_url_bytes != 0) break true;
+    } else false;
+}
+
+/// Late route changes and legacy/hosted adapters materialize only verified
+/// handles in actual message image parts. Strings/tool arguments remain opaque.
+pub fn materializeVerifiedJson(a: std.mem.Allocator, body: []const u8, media: []const VerifiedMedia) !MediaEncoding {
+    if (!hasVerifiedHandles(media)) return .{ .bytes = body };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, body, .{ .parse_numbers = false, .duplicate_field_behavior = .@"error" });
+    const Render = struct {
+        a: std.mem.Allocator,
+        media: []const VerifiedMedia,
+        urls: std.StringHashMapUnmanaged([]const u8) = .empty,
+        changed: bool = false,
+        fn renderImage(self: *@This(), part: *std.json.Value) !void {
+            if (part.* != .object) return;
+            const kind = part.object.get("type") orelse return;
+            if (kind != .string) return;
+            const image = part.object.getPtr("image_url") orelse return;
+            const url = if (std.mem.eql(u8, kind.string, "input_image") and image.* == .string) image else if (std.mem.eql(u8, kind.string, "image_url") and image.* == .object) image.object.getPtr("url") orelse return else return;
+            if (url.* != .string) return;
+            const view = for (self.media) |view| {
+                if (view.logical_url_bytes != 0 and view.matches(url.string)) break view;
+            } else return;
+            const rendered = self.urls.get(view.url) orelse lazy: {
+                const prefix = try std.fmt.allocPrint(self.a, "data:{s};base64,", .{view.mime_type});
+                const data = try self.a.alloc(u8, prefix.len + std.base64.standard.Encoder.calcSize(view.bytes.len));
+                @memcpy(data[0..prefix.len], prefix);
+                _ = std.base64.standard.Encoder.encode(data[prefix.len..], view.bytes);
+                try self.urls.put(self.a, view.url, data);
+                break :lazy data;
+            };
+            url.* = .{ .string = rendered };
+            self.changed = true;
+        }
+        fn messages(self: *@This(), value_: std.json.Value) !void {
+            if (value_ != .array) return;
+            for (value_.array.items) |message| {
+                if (message != .object) continue;
+                const content = message.object.get("content") orelse continue;
+                if (content == .array) for (content.array.items) |*part| try self.renderImage(part);
+            }
+        }
+        fn request(self: *@This(), value_: std.json.Value) !void {
+            if (value_ != .object) return;
+            if (value_.object.get("messages")) |messages_| try self.messages(messages_);
+            if (value_.object.get("input")) |messages_| try self.messages(messages_);
+            if (value_.object.get("inputs")) |inputs| if (inputs == .array) for (inputs.array.items) |input| {
+                if (input == .object) if (input.object.get("input")) |messages_| try self.messages(messages_);
+            };
+        }
+    };
+    var render: Render = .{ .a = scratch, .media = media };
+    try render.request(value);
+    return if (render.changed) .{ .bytes = try std.json.Stringify.valueAlloc(a, value, .{}), .owned = true } else .{ .bytes = body };
+}
+
+test "execution context renders handles only in actual image parts on fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const handle = "antfly-verified:image/png:fixture";
+    const body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"" ++ handle ++ "\",\"detail\":\"auto\"}},{\"type\":\"text\",\"text\":\"" ++ handle ++ "\"}],\"tool_calls\":[{\"function\":{\"arguments\":\"" ++ handle ++ "\"}}]}],\"max_tokens\":37}";
+    const media = [_]VerifiedMedia{.{ .url = handle, .bytes = "codec", .mime_type = "image/png", .logical_url_bytes = 30, .pixels = 1 }};
+    var rendered = try materializeVerifiedJson(a, body, &media);
+    defer rendered.deinit(a);
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, rendered.bytes, .{});
+    const message = root.object.get("messages").?.array.items[0];
+    const parts = message.object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("data:image/png;base64,Y29kZWM=", parts[0].object.get("image_url").?.object.get("url").?.string);
+    try std.testing.expectEqualStrings(handle, parts[1].object.get("text").?.string);
+    try std.testing.expectEqualStrings(handle, message.object.get("tool_calls").?.array.items[0].object.get("function").?.object.get("arguments").?.string);
+    try std.testing.expectEqual(@as(i64, 37), root.object.get("max_tokens").?.integer);
+    var encoded = try encodeVerifiedGenerate(a, a, body, null, &media);
+    defer encoded.deinit(a);
+    var frame = try httpx.attachment_envelope.parseAlloc(a, encoded.bytes, .{});
+    defer frame.deinit();
+    try std.testing.expectEqual(@as(usize, 1), frame.attachments.len);
+    try std.testing.expectEqualStrings("codec", frame.attachments[0].data);
+}
+
+test "httpx inference gateway framed aliases retain one logical attachment per occurrence" {
+    const a = std.testing.allocator;
+    const body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"verified\"}},{\"type\":\"image_url\",\"image_url\":{\"url\":\"verified\"}}]}]}";
+    var encoded = try encodeVerifiedGenerate(a, a, body, null, &.{.{ .url = "verified", .bytes = "codec", .mime_type = "image/png" }});
+    defer encoded.deinit(a);
+    var frame = try httpx.attachment_envelope.parseAlloc(a, encoded.bytes, .{});
+    defer frame.deinit();
+    try std.testing.expectEqual(@as(usize, 2), frame.attachments.len);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, frame.metadata, .{});
+    defer parsed.deinit();
+    const parts = parsed.value.object.get("messages").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("attachment:0", parts[0].object.get("data").?.string);
+    try std.testing.expectEqualStrings("attachment:1", parts[1].object.get("data").?.string);
 }

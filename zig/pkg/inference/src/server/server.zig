@@ -14740,6 +14740,14 @@ pub const Node = struct {
         else
             (try ctx.body()) orelse
                 return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        if (borrowed) |items| httpx.attachment_envelope.validateBorrowed(request_json, items, .{
+            .max_metadata_bytes = @min(ctx.max_request_body_size, (httpx.attachment_envelope.Limits{}).max_metadata_bytes),
+            .max_attachment_bytes = requestMediaMaxBytes(self),
+            .max_total_attachment_bytes = requestMediaMaxBytes(self),
+        }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
+            .@"error" = attachmentEnvelopeErrorCode(err),
+            .message = attachmentEnvelopeErrorMessage(err),
+        });
         // Single JSON parse per request: only bodies that can carry
         // chat_template_kwargs (substring pre-gate, false positives harmless)
         // are parsed as an untyped Value, which then doubles as the kwargs
@@ -14790,14 +14798,6 @@ pub const Node = struct {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "kv_cache and cache_compaction_ratio are mutually exclusive" });
         }
         const selected_kv = if (body.kv_cache) |policy| std.mem.eql(u8, policy.mode, "select_v1") else false;
-        if (borrowed) |items| httpx.attachment_envelope.validateBorrowed(request_json, items, .{
-            .max_metadata_bytes = ctx.max_request_body_size,
-            .max_attachment_bytes = requestMediaMaxBytes(self),
-            .max_total_attachment_bytes = requestMediaMaxBytes(self),
-        }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
-            .@"error" = attachmentEnvelopeErrorCode(err),
-            .message = attachmentEnvelopeErrorMessage(err),
-        });
         const attachments: []const httpx.attachment_envelope.Attachment = if (borrowed) |items| items else if (attachment_envelope) |envelope|
             envelope.attachments
         else
