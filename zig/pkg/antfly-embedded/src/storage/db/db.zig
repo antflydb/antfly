@@ -11870,6 +11870,36 @@ pub const DB = struct {
         return false;
     }
 
+    /// Operator repair retries transient provider failures (admission
+    /// refusals, rate limits) with bounded backoff inside the pass, so a
+    /// briefly busy model does not leave the document failed. The shared
+    /// classifier decides what is transient; the attempt cap and the pass
+    /// budget bound the wait. Automatic repair never retries here.
+    fn reprocessArtifactIssueRetryingTransient(
+        self: *DB,
+        alloc: Allocator,
+        issue: types.ArtifactRepairIssue,
+        retry_transient: bool,
+        options: types.ArtifactRepairRunOptions,
+        budget_ns: *u64,
+    ) !bool {
+        const policy = types.repair_failure;
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            return self.reprocessArtifactIssue(alloc, issue) catch |err| {
+                if (!retry_transient or !policy.isTransient(err)) return err;
+                if (attempt >= policy.repair_transient_max_attempts) return err;
+                const delay_ns = policy.repairTransientBackoffNs(attempt);
+                if (delay_ns > budget_ns.*) return err;
+                budget_ns.* -= delay_ns;
+                try checkArtifactRepairCancelled(options);
+                sleepNs(delay_ns);
+                try checkArtifactRepairCancelled(options);
+                continue;
+            };
+        }
+    }
+
     fn reprocessArtifactIssue(
         self: *DB,
         alloc: Allocator,
@@ -16527,6 +16557,7 @@ pub const DB = struct {
         if (page.next_cursor) |cursor| {
             result.next_cursor = try alloc.dupe(u8, cursor);
         }
+        var transient_budget_ns: u64 = types.repair_failure.repair_transient_pass_budget_ns;
         for (page.issues) |*issue| {
             if (options.cancelled()) {
                 result.unresolved += 1;
@@ -16604,7 +16635,13 @@ pub const DB = struct {
                 }
             }
 
-            const reprocessed = self.reprocessArtifactIssue(alloc, issue.*) catch |err| switch (err) {
+            const reprocessed = self.reprocessArtifactIssueRetryingTransient(
+                alloc,
+                issue.*,
+                req.operator_initiated,
+                options,
+                &transient_budget_ns,
+            ) catch |err| switch (err) {
                 error.NotFound => {
                     try replaceRepairIssueLastError(alloc, issue, "source_document_missing");
                     _ = try self.saveArtifactRepairAttemptIfCurrent(alloc, issue.*, issue_revision);
@@ -16691,15 +16728,16 @@ pub const DB = struct {
         var result = try self.repairIndexGenerationIssuesWithRequest(alloc, req, options, lease_authority);
         errdefer result.deinit(alloc);
         if (req.control != null) return result;
-        // The durable generation-repair owner re-enters here with the lease
-        // already held. It must stay a bounded generation rebuild, so only
-        // operator entry retries enrichment documents.
-        if (lease_authority != .acquire) return result;
+        // Automatic, structural (index creation catch-up) and durable-owner
+        // repair stay bounded generation work and make no model calls. Only
+        // operator repair retries enrichment documents.
+        if (!req.operator_initiated or lease_authority != .acquire) return result;
         const index_name = req.index_name orelse return result;
         var enrichment = try self.repairArtifactIssuesWithRequestOptionsInternal(alloc, .{
             .target = .artifact,
             .index_name = index_name,
             .limit = if (req.limit == 0) @as(u32, 100) else req.limit,
+            .operator_initiated = true,
         }, options, .acquire);
         defer enrichment.deinit(alloc);
         mergeIndexEnrichmentRepairResult(&result, enrichment);
@@ -95626,10 +95664,23 @@ test "db index repair and rebuild retry permanently failed enrichment documents"
         }
 
         gated.allowAll();
+        // Automatic and structural repair (no operator flag) never call the
+        // provider for parked documents, even when the model is healthy.
+        const before_automatic = gated.snapshot();
+        var automatic = try db.repairArtifactIssuesWithRequest(alloc, .{
+            .target = .index,
+            .index_name = "dv_a",
+            .force = force,
+        });
+        defer automatic.deinit(alloc);
+        try std.testing.expectEqual(before_automatic.total_requests, gated.snapshot().total_requests);
+        try std.testing.expectEqual(@as(u64, 0), automatic.reprocessed);
+
         var repaired = try db.repairArtifactIssuesWithRequest(alloc, .{
             .target = .index,
             .index_name = "dv_a",
             .force = force,
+            .operator_initiated = true,
         });
         defer repaired.deinit(alloc);
         try std.testing.expect(repaired.reprocessed >= 1);
@@ -95643,6 +95694,144 @@ test "db index repair and rebuild retry permanently failed enrichment documents"
         defer index_page.deinit(alloc);
         for (index_page.issues) |issue| try std.testing.expect(issue.reason != .enrichment_failed);
     }
+}
+
+const ScriptedDenseEmbedder = struct {
+    failures_remaining: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
+    failure: anyerror = error.InvalidEmbeddingResponse,
+    calls: std.atomic.Value(usize) = .init(0),
+
+    fn embedDense(ptr: *anyopaque, alloc: Allocator, _: []const u8, text: []const u8, dims: u32) ![]f32 {
+        const self: *ScriptedDenseEmbedder = @ptrCast(@alignCast(ptr));
+        _ = self.calls.fetchAdd(1, .monotonic);
+        if (self.failures_remaining.load(.acquire) > 0) {
+            _ = self.failures_remaining.fetchSub(1, .acq_rel);
+            return self.failure;
+        }
+        if (dims != 3) return error.InvalidVectorDimensions;
+        const vector = try alloc.alloc(f32, 3);
+        const values = GateDenseEmbedder.vectorForText(text);
+        @memcpy(vector, &values);
+        return vector;
+    }
+
+    fn interface(self: *ScriptedDenseEmbedder) embedder_mod.DenseEmbedder {
+        return .{ .ptr = self, .dense_embed_fn = embedDense, .deinit_fn = null };
+    }
+};
+
+test "db operator repair retries transient admission refusals within the pass" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    // A permanent provider error parks the document immediately.
+    var scripted = ScriptedDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = scripted.interface(),
+            .inline_retry_max_attempts = 1,
+            .worker_retry_max_attempts = 2,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dv_a",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dense_v1\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"parked enrichment\"}" }},
+        .sync_level = .write,
+    });
+    const sequence = db.core.nextEnrichmentSequence();
+    db.runEnrichmentUntil(sequence) catch {};
+    {
+        const parked = try db.listArtifactRepairIssues(alloc, null, "dv_a", 0);
+        defer types.freeArtifactRepairIssues(alloc, parked);
+        try std.testing.expectEqual(@as(usize, 1), parked.len);
+    }
+
+    // The model now refuses admission twice, then serves the request.
+    scripted.failure = error.ResourceTemporarilyUnavailable;
+    scripted.failures_remaining.store(2, .release);
+    const calls_before = scripted.calls.load(.acquire);
+    var repaired = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .index_name = "dv_a",
+        .operator_initiated = true,
+    });
+    defer repaired.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repaired.repaired);
+    try std.testing.expectEqual(@as(u64, 0), repaired.failed);
+    try std.testing.expect(scripted.calls.load(.acquire) - calls_before >= 3);
+    const remaining = try db.listArtifactRepairIssues(alloc, null, "dv_a", 0);
+    defer types.freeArtifactRepairIssues(alloc, remaining);
+    for (remaining) |issue| try std.testing.expect(issue.reason != .enrichment_failed);
+}
+
+test "db operator repair leaves permanent failures with their error for the summary" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var scripted = ScriptedDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = scripted.interface(),
+            .inline_retry_max_attempts = 1,
+            .worker_retry_max_attempts = 2,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dv_a",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dense_v1\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"parked enrichment\"}" }},
+        .sync_level = .write,
+    });
+    db.runEnrichmentUntil(db.core.nextEnrichmentSequence()) catch {};
+
+    // A permanent error is not retried within the pass.
+    const calls_before = scripted.calls.load(.acquire);
+    var repaired = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .index_name = "dv_a",
+        .operator_initiated = true,
+    });
+    defer repaired.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), repaired.repaired);
+    try std.testing.expect(repaired.debt_remaining);
+    try std.testing.expect(scripted.calls.load(.acquire) - calls_before <= 2);
+
+    const remaining = try db.listArtifactRepairIssues(alloc, null, "dv_a", 0);
+    defer types.freeArtifactRepairIssues(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    const groups = try types.repair_failure.groupIssuesAlloc(alloc, remaining);
+    defer alloc.free(groups);
+    try std.testing.expectEqual(@as(usize, 1), groups.len);
+    try std.testing.expect(!groups[0].transient);
+
+    // Running repair again after the cause is fixed picks up the remainder.
+    scripted.failures_remaining.store(0, .release);
+    var again = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .index_name = "dv_a",
+        .operator_initiated = true,
+    });
+    defer again.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), again.repaired);
 }
 
 test "db chunked enrichment failure repair completes from request coverage" {

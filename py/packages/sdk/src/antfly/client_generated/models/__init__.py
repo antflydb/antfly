@@ -2139,6 +2139,7 @@ from .relational_unique_constraint import RelationalUniqueConstraint
 from .relational_unique_constraint_origin import RelationalUniqueConstraintOrigin
 from .rename_catalog_resource_request import RenameCatalogResourceRequest
 from .repair_issue_list_request import RepairIssueListRequest
+from .repair_remaining_failure import RepairRemainingFailure
 from .repair_run_request import RepairRunRequest
 from .repair_run_request_control import RepairRunRequestControl
 from .repair_target import RepairTarget
@@ -4444,6 +4445,7 @@ __all__ = (
     "RelationalUniqueConstraintOrigin",
     "RenameCatalogResourceRequest",
     "RepairIssueListRequest",
+    "RepairRemainingFailure",
     "RepairRunRequest",
     "RepairRunRequestControl",
     "RepairTarget",
