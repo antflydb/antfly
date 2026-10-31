@@ -2805,3 +2805,48 @@ than twice the native CPU of scan-resistant direct delivery in the measured
 65,536-row workload, and added payload writes. Automatic repacking is therefore
 not selected in production. A future cost model must qualify CPU, write
 amplification and actual storage latency together before choosing this strategy.
+
+Final qualification at runtime source
+`85a62db7644bdfde24b6f957d4d9f89f862c5371` is recorded in
+[scan-resistant-spill-v1-observation.json](scan-resistant-spill-v1-observation.json).
+Three alternating native pairs per size use the same executable:
+
+| Native rows | Small-cache median CPU | Gated-cache median CPU | Payload reads, control → candidate |
+| --- | ---: | ---: | ---: |
+| 32,768 | 3,871.526 ms | 509.115 ms | 32,768 → 2,048 |
+| 65,536 | 7,767.552 ms | 5,920.797 ms | 65,536 → 44,219 |
+
+At 65,536 rows, drain traffic falls from 565,954,122 to 356,600,362 bytes,
+with equal writes and the same 33,597,177-byte quota. The candidate's tracked peak
+is 17,160,685 bytes. At 32,768 rows, all three candidates perform exactly 2,048
+payload reads with zero rejected admissions. Capacity alone was insufficient
+proof of thrashing: the ungated prototype delayed fitting phase changes and
+performed 5,758 reads. The gate restores the original fitting read count.
+
+The complete publication comparison uses the previous frozen quota-residency
+binary and the final gated-policy binary, with three alternating pairs per size:
+
+| Real Parquet rows | Previous median publication | Candidate median publication | Observed candidate change |
+| --- | ---: | ---: | ---: |
+| 8,192 | 5,807.650 ms | 5,707.188 ms | 1.7% lower |
+| 65,536 | 43,842.417 ms | 45,140.032 ms | 3.0% higher |
+
+Every run verifies all rows and all ten columns after publication. One of three
+larger candidate pairs is slower, and samples overlap. These measurements do not
+establish an end-to-end publication speedup; the native spill result must not be
+presented as whole-publication throughput.
+
+The final typed-batch permutation experiment uses 11,222.832 ms CPU versus
+4,933.532 ms for direct delivery (2.27×), while reducing reads from 316,567,691 to
+35,894,469 bytes and increasing total writes from 7,307,465 to 30,802,081 bytes.
+The original sort workspace is 4 MiB and the unchanged post-sort quota is
+33,977,075 bytes. These results support retaining it as an experiment instead of
+automatic production selection on local spill storage.
+
+The final runtime passes 403 shared checks, 92 API checks and 50 real
+Parquet/Iceberg E2E cases (387.33 seconds), with no failures, skips or leaks in the
+native checks. The single-threaded publication-owner probe, Apache boundary,
+license headers, formatting and whitespace checks pass. The merged `origin/main`
+revision `0ff73ed56fb7acfbe4d6a14158f84c4b74c8dadb` changes documentation and
+examples; it leaves the qualified Zig runtime unchanged. Real-provider retention,
+RSS, cold-storage/archive scale and a full WASM bundle remain unqualified here.
