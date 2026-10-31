@@ -35,11 +35,29 @@ const backend_types = @import("antfly_local_sources").storage_backend_types;
 const secrets = @import("antfly_local_sources").common_secrets;
 const pattern_filter = @import("antfly_local_sources").search_pattern_filter;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
+const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
 
 const Allocator = std.mem.Allocator;
 // CDC checkpoints are external resume positions. Only publish progress after
-// the applied row is visible through query/index paths.
+// the applied row is visible through query/index paths. This level is safe
+// for streaming apply and for any snapshot write outside an open bulk-ingest
+// window, because the embedding/enrichment runtime can always see the write
+// it is asked to wait on.
 const cdc_apply_sync_level = db_mod.types.SyncLevel.full_index;
+// Snapshot batches applied *inside* a table's bulk-ingest window
+// (`beginBackfillBulkIngestWindow`..`finishBackfillBulkIngestWindow`) must
+// not request `.full_index`/`.enrichments`. Those levels wait on the
+// enrichment/dense-index replay runtime, but that runtime's replay session
+// is admission-gated against the very same open bulk-ingest session
+// (`dense_publication_admission.zig`) and fails with
+// `error.ReplayDocumentNotVisible` for as long as the window stays open.
+// Since the window only closes once every batch has been applied, waiting
+// for enrichment inside it deadlocks: `.write` only waits for the primary
+// write to be durable and visible through the ordinary (non-derived) read
+// path, which the window never blocks. Enrichment for snapshot-backfilled
+// rows then catches up asynchronously once the window closes, the same way
+// it does for any other `.write`-level write.
+const cdc_snapshot_window_sync_level = db_mod.types.SyncLevel.write;
 const default_prepared_snapshot_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const default_runtime_quantum_ns: u64 = 5 * std.time.ns_per_s;
 const snapshot_keyset_checkpoint_prefix = "snapshot_keyset:";
@@ -967,7 +985,7 @@ pub const SnapshotBackfillRunner = struct {
                         .op = .insert,
                         .checkpoint = empty_checkpoint,
                         .row = row,
-                    }, parsed);
+                    }, parsed, cdc_snapshot_window_sync_level);
                     try self.checkpointWork();
                 }
             } else {
@@ -976,7 +994,7 @@ pub const SnapshotBackfillRunner = struct {
 
                 try applyReplicationBatchRequired(self.alloc, self.write_source, table.name, .{
                     .writes = writes,
-                    .sync_level = cdc_apply_sync_level,
+                    .sync_level = cdc_snapshot_window_sync_level,
                 });
                 try self.checkpointWork();
             }
@@ -1733,7 +1751,9 @@ pub const StreamingReplicationRunner = struct {
                     status,
                 );
             }
-            const apply_summary = try applyReplicationChange(self.alloc, self.write_source, table.name, change, parsed);
+            // Streaming apply happens outside any bulk-ingest window, so the
+            // enrichment runtime can always see the row being waited on here.
+            const apply_summary = try applyReplicationChange(self.alloc, self.write_source, table.name, change, parsed, cdc_apply_sync_level);
             try self.reachLifecycle(
                 .stream_change_applied,
                 table.table_id,
@@ -2073,7 +2093,7 @@ fn parseReplicationSourceConfig(
         .routes = routes,
         .has_update_transforms = hasNonEmptyArrayField(source, "on_update"),
         .has_delete_transforms = hasNonEmptyArrayField(source, "on_delete"),
-        .delete_document_on_delete = arrayContainsDeleteDocumentOp(source, "on_delete"),
+        .delete_document_on_delete = deletesDocumentByDefault(source, "on_delete", "on_update"),
         .has_routes = routes.len > 0,
     };
     errdefer out.deinit(alloc);
@@ -2111,7 +2131,7 @@ fn parseReplicationRoutesAlloc(alloc: Allocator, value: std.json.Value) ![]Parse
                 if (delete_value == .null) null else try std.json.Stringify.valueAlloc(alloc, delete_value, .{})
             else
                 null,
-            .delete_document_on_delete = arrayContainsDeleteDocumentOp(item, "on_delete"),
+            .delete_document_on_delete = deletesDocumentByDefault(item, "on_delete", "on_update"),
         };
         initialized += 1;
     }
@@ -2134,6 +2154,31 @@ fn arrayContainsDeleteDocumentOp(value: std.json.Value, field: []const u8) bool 
         if (std.mem.eql(u8, op_value.string, "$delete_document")) return true;
     }
     return false;
+}
+
+/// CDC mirrors a source table, and a deleted source row should default to a
+/// deleted document rather than the field-stripped stub
+/// `autoUnsetTransformOpsAlloc` leaves behind. So an unconfigured `on_delete`
+/// (the field absent, or explicitly `null`) deletes the document by default
+/// -- but only when the source is a full mirror, i.e. `on_update` is also
+/// unconfigured. A source (or route) that configures `on_update` is, by
+/// construction, contributing only some of the document's fields -- several
+/// sources commonly feed one table this way -- and a delete from that
+/// source must stay scoped to the fields it owns
+/// (`deriveUnsetTransformOpsFromUpdateAlloc`), never delete the whole
+/// document out from under the other contributors. Once the caller
+/// configures `on_delete` to anything -- including `$delete_document`
+/// itself, or an explicit `[]` meaning "leave the document untouched" --
+/// that configuration is authoritative and neither default applies.
+fn deletesDocumentByDefault(value: std.json.Value, delete_field: []const u8, update_field: []const u8) bool {
+    const delete_child = value.object.get(delete_field) orelse return !fieldConfigured(value, update_field);
+    if (delete_child == .null) return !fieldConfigured(value, update_field);
+    return arrayContainsDeleteDocumentOp(value, delete_field);
+}
+
+fn fieldConfigured(value: std.json.Value, field: []const u8) bool {
+    const child = value.object.get(field) orelse return false;
+    return child != .null;
 }
 
 fn parseRequiredStringFieldAlloc(alloc: Allocator, value: std.json.Value, field: []const u8) ![]u8 {
@@ -2191,9 +2236,10 @@ fn applyReplicationChange(
     table_name: []const u8,
     change: foreign_mod.ReplicationChange,
     parsed: ParsedReplicationSourceConfig,
+    sync_level: db_mod.types.SyncLevel,
 ) !ReplicationApplySummary {
     if (parsed.routes.len > 0) {
-        return try applyReplicationChangeRouted(alloc, write_source, change, parsed);
+        return try applyReplicationChangeRouted(alloc, write_source, change, parsed, sync_level);
     }
 
     switch (change.op) {
@@ -2213,7 +2259,7 @@ fn applyReplicationChange(
             }};
             try applyReplicationBatchRequired(alloc, write_source, table_name, .{
                 .transforms = doc_transforms[0..],
-                .sync_level = cdc_apply_sync_level,
+                .sync_level = sync_level,
             });
             return .{ .writes_applied = 1 };
         },
@@ -2224,7 +2270,7 @@ fn applyReplicationChange(
                 const deletes = [_][]const u8{key};
                 try applyReplicationBatchRequired(alloc, write_source, table_name, .{
                     .deletes = deletes[0..],
-                    .sync_level = cdc_apply_sync_level,
+                    .sync_level = sync_level,
                 });
                 return .{ .deletes_applied = 1 };
             } else {
@@ -2242,7 +2288,7 @@ fn applyReplicationChange(
                 }};
                 try applyReplicationBatchRequired(alloc, write_source, table_name, .{
                     .transforms = doc_transforms[0..],
-                    .sync_level = cdc_apply_sync_level,
+                    .sync_level = sync_level,
                 });
                 return .{ .deletes_applied = 1 };
             }
@@ -2255,6 +2301,7 @@ fn applyReplicationChangeRouted(
     write_source: table_writes_api.TableWriteSource,
     change: foreign_mod.ReplicationChange,
     parsed: ParsedReplicationSourceConfig,
+    sync_level: db_mod.types.SyncLevel,
 ) !ReplicationApplySummary {
     const row = change.row orelse return error.InvalidReplicationSourceRow;
     var summary: ReplicationApplySummary = .{};
@@ -2278,7 +2325,7 @@ fn applyReplicationChangeRouted(
                 }};
                 try applyReplicationBatchRequired(alloc, write_source, route.target_table, .{
                     .transforms = doc_transforms[0..],
-                    .sync_level = cdc_apply_sync_level,
+                    .sync_level = sync_level,
                 });
                 summary.writes_applied += 1;
             },
@@ -2287,7 +2334,7 @@ fn applyReplicationChangeRouted(
                     const deletes = [_][]const u8{key};
                     try applyReplicationBatchRequired(alloc, write_source, route.target_table, .{
                         .deletes = deletes[0..],
-                        .sync_level = cdc_apply_sync_level,
+                        .sync_level = sync_level,
                     });
                     summary.deletes_applied += 1;
                 } else {
@@ -2305,7 +2352,7 @@ fn applyReplicationChangeRouted(
                     }};
                     try applyReplicationBatchRequired(alloc, write_source, route.target_table, .{
                         .transforms = doc_transforms[0..],
-                        .sync_level = cdc_apply_sync_level,
+                        .sync_level = sync_level,
                     });
                     summary.deletes_applied += 1;
                 }
@@ -4370,6 +4417,126 @@ test "metadata replication backfill applies configured update transforms" {
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"user_name\"") == null);
 }
 
+// Regression test for the snapshot/embedding deadlock: a table with both
+// Postgres CDC and an embeddings index used to hang forever on its first
+// snapshot. The snapshot backfill opens a bulk-ingest window around the
+// whole batch loop and applied each batch at `.full_index`, which waits for
+// the dense embedding worker; but the dense replay session that worker
+// needs is admission-gated against that very same open bulk-ingest window
+// (see `dense_publication_admission.zig`), so it could never become ready
+// while the window stayed open, and the window never closed because the
+// snapshot loop was still blocked waiting on it. `runTableSource` applying
+// at `cdc_snapshot_window_sync_level` (`.write`) instead means this test
+// returns promptly instead of hanging (or, before this fix, timing out
+// after `default_visibility_wait_timeout_ms`); embeddings then materialize
+// once `runUntilIdle` drains the now-unblocked worker after the window has
+// closed.
+test "metadata replication snapshot backfill completes for a table with an embeddings index" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-metadata-replication-backfill-embeddings";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var deterministic = db_embedder.DeterministicDenseEmbedder{};
+    var db = try db_mod.DB.open(alloc, path, .{
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"}}
+        ,
+    });
+
+    const FakeExecutor = struct {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery, _: ?u64, _: ?CancellationToken) !foreign_mod.QueryResult {
+            var owned = prepared;
+            defer owned.deinit(inner_alloc);
+            const rows = try inner_alloc.alloc(std.json.Value, 1);
+            errdefer inner_alloc.free(rows);
+            var parsed = try std.json.parseFromSlice(std.json.Value, inner_alloc, "{\"id\":\"doc:1\",\"body\":\"hello world\"}", .{});
+            defer parsed.deinit();
+            rows[0] = try cloneJsonValueAllocLocal(inner_alloc, parsed.value);
+            return .{ .rows = rows, .total = 1 };
+        }
+
+        fn statistics(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !foreign_mod.TableStatistics {
+            return .{ .row_count = 1, .size_bytes = 64 };
+        }
+
+        fn prepareReplication(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: foreign_mod.ReplicationPollParams) !foreign_mod.ReplicationPrepareResult {
+            return .{ .checkpoint = try inner_alloc.dupe(u8, "lsn:prepared") };
+        }
+
+        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_mod.Column {
+            const columns = try inner_alloc.alloc(foreign_mod.Column, 1);
+            columns[0] = .{
+                .name = try inner_alloc.dupe(u8, "id"),
+                .data_type = try inner_alloc.dupe(u8, "text"),
+                .nullable = false,
+            };
+            return columns;
+        }
+    };
+
+    var registry = foreign_mod.Registry{};
+    defer registry.deinit(alloc);
+    try foreign_mod.registerPostgresExecutor(alloc, &registry, .{
+        .ptr = undefined,
+        .vtable = &.{
+            .query = FakeExecutor.query,
+            .statistics = FakeExecutor.statistics,
+            .prepare_replication = FakeExecutor.prepareReplication,
+            .discover_columns = FakeExecutor.discoverColumns,
+        },
+    });
+
+    var write_source = table_writes_api.BoundTableWriteSource.init("docs", &db);
+    const StatusSink = struct {
+        fn upsertReplicationSourceStatus(_: *@This(), _: metadata_table_manager.ReplicationSourceStatusRecord) !void {}
+    };
+    var status_sink = StatusSink{};
+
+    var runner = SnapshotBackfillRunner{
+        .alloc = alloc,
+        .registry = &registry,
+        .write_source = write_source.source(),
+        .batch_size = 8,
+    };
+
+    // Before the fix this call hangs (or times out after
+    // `default_visibility_wait_timeout_ms`, five minutes) instead of
+    // returning.
+    const summary = try runner.runTableSource(&status_sink, .{
+        .table_id = 11,
+        .name = "docs",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\"}]",
+    }, 0);
+
+    try std.testing.expectEqual(@as(usize, 1), summary.rows_applied);
+    try std.testing.expect(summary.snapshot_complete);
+
+    // The document is written and visible immediately; the dense embedder
+    // catches up asynchronously once the bulk-ingest window has closed.
+    // `waitForCurrentSyncLevel(.full_index)` exercises exactly the wait that
+    // used to deadlock inside the window (admission-gated against it, see
+    // `dense_publication_admission.zig`); it now succeeds because the
+    // window is already closed by the time `runTableSource` returns above.
+    try db.runUntilIdle();
+    try db.waitForCurrentSyncLevel(.full_index);
+    var result = (try db.lookup(alloc, "doc:1", .{})).?;
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, result.json, "\"body\":\"hello world\"") != null);
+}
+
 test "metadata replication backfill routes matching snapshot rows to target tables" {
     const alloc = std.testing.allocator;
 
@@ -4573,7 +4740,9 @@ test "metadata replication source parser derives slot and publication names like
     try std.testing.expectEqualStrings("antfly_postgres_users_prod", parsed.slot_name);
     try std.testing.expectEqualStrings("antfly_pub_postgres_users_prod", parsed.publication_name);
     try std.testing.expect(!parsed.has_delete_transforms);
-    try std.testing.expect(!parsed.delete_document_on_delete);
+    // No `on_delete` configured: CDC mirrors the source table, so a deleted
+    // source row deletes the document by default.
+    try std.testing.expect(parsed.delete_document_on_delete);
 }
 
 test "metadata replication source parser preserves explicit slot and publication names" {
@@ -4591,6 +4760,31 @@ test "metadata replication source parser preserves explicit slot and publication
     try std.testing.expectEqualStrings("custom_slot", parsed.slot_name);
     try std.testing.expectEqualStrings("custom_pub", parsed.publication_name);
     try std.testing.expect(parsed.has_delete_transforms);
+    try std.testing.expect(!parsed.delete_document_on_delete);
+}
+
+test "metadata replication source parser keeps the scoped unset default when on_update is configured without on_delete" {
+    const alloc = std.testing.allocator;
+
+    // Several PostgreSQL tables commonly feed one Antfly table, each scoped
+    // to its own fields with `on_update`. Defaulting an unconfigured
+    // `on_delete` to `$delete_document` here would delete the whole
+    // document -- including fields owned by the other sources -- whenever
+    // just one contributing source's row is deleted. The default must stay
+    // scoped to this source's own fields (deriving `$unset` from
+    // `on_update`) exactly as before this source also configures
+    // `on_delete`.
+    var parsed = try parseReplicationSourceConfig(
+        alloc,
+        "docs",
+        "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"scores\",\"key_template\":\"user_id\",\"on_update\":[{\"op\":\"$set\",\"path\":\"score\",\"value\":\"{{score}}\"}]}]",
+        0,
+        null,
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(parsed.has_update_transforms);
+    try std.testing.expect(!parsed.has_delete_transforms);
     try std.testing.expect(!parsed.delete_document_on_delete);
 }
 
@@ -4639,7 +4833,9 @@ test "metadata replication source parser accepts null optional fields" {
     try std.testing.expectEqual(@as(usize, 0), parsed.routes.len);
     try std.testing.expect(!parsed.has_update_transforms);
     try std.testing.expect(!parsed.has_delete_transforms);
-    try std.testing.expect(!parsed.delete_document_on_delete);
+    // `on_delete` explicitly `null` is still unconfigured: default to
+    // deleting the document, same as when the field is absent.
+    try std.testing.expect(parsed.delete_document_on_delete);
 }
 
 test "metadata replication source parser detects delete document op" {
@@ -4655,6 +4851,56 @@ test "metadata replication source parser detects delete document op" {
     defer parsed.deinit(alloc);
 
     try std.testing.expect(parsed.delete_document_on_delete);
+}
+
+test "metadata replication source parser respects explicit empty on_delete as opting out of the default delete" {
+    const alloc = std.testing.allocator;
+
+    // An explicit `"on_delete":[]` is a configured (if empty) transform
+    // list, not an unconfigured field, so it overrides the default of
+    // deleting the document and leaves the field-stripped stub in place.
+    var parsed = try parseReplicationSourceConfig(
+        alloc,
+        "docs",
+        "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"on_delete\":[]}]",
+        0,
+        null,
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(!parsed.has_delete_transforms);
+    try std.testing.expect(!parsed.delete_document_on_delete);
+}
+
+test "metadata replication source parser defaults routes to deleting the document" {
+    const alloc = std.testing.allocator;
+
+    var parsed = try parseReplicationSourceConfig(
+        alloc,
+        "docs",
+        \\[{
+        \\  "type":"postgres",
+        \\  "dsn":"postgres://db",
+        \\  "postgres_table":"users",
+        \\  "_antfly_destination_authorization_v1":{"principal":"service:auth-disabled","signature":"auth-disabled","destinations":["premium_users","free_users"]},
+        \\  "routes":[
+        \\    {"target_table":"premium_users","where":{"term":"premium","field":"tier"}},
+        \\    {"target_table":"free_users","where":{"term":"free","field":"tier"},"on_delete":[{"op":"$unset","path":"name"}]}
+        \\  ]
+        \\}]
+    ,
+        0,
+        null,
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.routes.len);
+    // No `on_delete` configured on this route: defaults to deleting the
+    // document, same as the top-level source default.
+    try std.testing.expect(parsed.routes[0].delete_document_on_delete);
+    // This route explicitly configures `on_delete`, so its configuration
+    // wins and the default does not apply.
+    try std.testing.expect(!parsed.routes[1].delete_document_on_delete);
 }
 
 test "metadata replication backfill coordinator resumes and then skips completed sources" {
@@ -5955,10 +6201,10 @@ test "metadata replication stream applies insert update and delete through bound
     var result_one = (try db.lookup(alloc, "doc:1", .{})).?;
     defer result_one.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, result_one.json, "\"beta\"") != null);
-    var result_two = (try db.lookup(alloc, "doc:2", .{})).?;
-    defer result_two.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, result_two.json, "\"id\":\"doc:2\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result_two.json, "\"name\"") == null);
+    // No `on_update`/`on_delete` configured: this source is a full mirror,
+    // so the delete removes doc:2 entirely rather than leaving the
+    // field-stripped `{"id": ...}` stub an older release left behind.
+    try std.testing.expect((try db.lookup(alloc, "doc:2", .{})) == null);
 }
 
 test "metadata replication stream delete document op removes the full document" {
