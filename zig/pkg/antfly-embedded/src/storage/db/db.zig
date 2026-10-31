@@ -120298,6 +120298,16 @@ test "db manual text producers merge capacity without optional workers" {
         defer db.core.index_manager.cancelTextMergeTask(&held);
         try std.testing.expectError(error.TextMergeBackpressureTimeout, runtime.acquireProducerPermit("ft_v1", 6, 0));
     }
+    {
+        // A shared resource refusal signals admission but frees no capacity.
+        // It must back off rather than consume a core until the deadline.
+        text_merge_runtime_mod.test_task_failure_error = error.ResourceBudgetExceeded;
+        defer text_merge_runtime_mod.test_task_failure_error = error.PersistentDescriptorAdmissionExhausted;
+        text_merge_runtime_mod.test_execute_admission_failures_remaining.store(1000, .release);
+        defer text_merge_runtime_mod.test_execute_admission_failures_remaining.store(0, .release);
+        try std.testing.expectError(error.TextMergeBackpressureTimeout, runtime.acquireProducerPermit("ft_v1", 6, 0));
+        try std.testing.expect(text_merge_runtime_mod.test_execute_admission_failures_remaining.load(.acquire) >= 990);
+    }
     var result = try db.searchTextKernel(alloc, "ft_v1", .{
         .term = .{ .field = "body", .term = "manual" },
     }, .{ .limit = 40 });

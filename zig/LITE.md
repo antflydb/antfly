@@ -1210,7 +1210,12 @@ back off for 100 ms, including during an otherwise immediate namespace round.
 
 Full-text catch-up treats `CapacityUnavailable` and `CapacityObservationStale` as
 recoverable admission failures, with bounded backoff and persisted progress after
-successful retry. These changes require a rebuilt native library; they do not
+successful retry. Owners that drive replay without optional workers run synchronous
+merges when text-publication admission is blocked. A reduction in the blocked
+segment or heap-byte dimension renews their no-progress wait budget; unrelated or
+stale work does not. Total merge time remains visible in backpressure telemetry.
+Owners with background merge workers retain their existing wait budget.
+These changes require a rebuilt native library; they do not
 change SDK request schemas or the public C ABI.
 
 Small records in multi-key transactions share immutable record pages. A tagged

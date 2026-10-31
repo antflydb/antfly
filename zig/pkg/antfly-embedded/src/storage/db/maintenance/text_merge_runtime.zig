@@ -766,7 +766,18 @@ const PlatformTextMergeRuntime = struct {
                 recorded_wait = true;
             }
             self.mutex.unlock(io);
-            if (self.config.manual_producer_assistance and try self.runOnce()) {
+            if (self.config.manual_producer_assistance) {
+                if (!try self.runOnce()) {
+                    // Failed execution can signal admission without freeing
+                    // capacity. Waiting on the pre-attempt epoch would return
+                    // immediately and busy-spin on the same resource refusal.
+                    const max_wait_ns = std.math.mul(u64, self.config.backpressure_max_wait_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+                    const elapsed_ns = self.backpressureNowNs() -| wait_started_ns;
+                    if (elapsed_ns >= max_wait_ns) continue;
+                    const retry_ns = std.math.mul(u64, @max(1, self.config.idle_interval_ms), std.time.ns_per_ms) catch std.math.maxInt(u64);
+                    try io.sleep(.fromNanoseconds(@intCast(@min(retry_ns, max_wait_ns - elapsed_ns))), .awake);
+                    continue;
+                }
                 if (builtin.is_test) {
                     const delay_ms = test_manual_merge_delay_ms.load(.acquire);
                     if (delay_ms != 0) try io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake);
