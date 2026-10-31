@@ -25888,5 +25888,48 @@
       "skipped": 3
     }
   },
+  "review_followup_incremental_certificates": {
+    "complete": false,
+    "limitations": [
+      "The earlier flat-certificate optimized qualification was superseded after P1; its successful checks are not acceptance for AFACERT2.",
+      "The flat-certificate frozen import was stopped after more than 21 minutes on its large eighth thread; target append regression remains unqualified.",
+      "Debug large-ledger SQL timings still include background-driven index reopening; isolated SQL cache-retention regression passes.",
+      "Full aggregate unit gate and fresh AFACERT2 release-profile contention/frozen qualification remain outstanding."
+    ],
+    "p1": {
+      "allocator_and_merkle_component_tests_passed": 18,
+      "bounded_counter_update_test_pages": [
+        4096,
+        1048576
+      ],
+      "cold_tree_hash_work": "one hash per tree node",
+      "counter_chunk_items": 256,
+      "focused_capi_tests_passed": 4,
+      "implementation": "AFACERT2 chunked canonical Merkle digest; changed counter/pending chunks update at most 64 trie branches. Cold admission independently rebuilds the complete digest. Legacy clean-close AFACERT1 remains compatible.",
+      "maximum_branches_per_chunk": 64,
+      "maximum_measured_hash_operations_for_one_counter_change": 66,
+      "native_component_tests_passed": 46,
+      "optimized_cost_comparison": "pending",
+      "pending_chunk_ids": 64,
+      "warm_sql_cache_retention_regression": "passed with background worker stopped; repeated SQL inserts retain root and ledger and bounded digest work"
+    },
+    "p2": {
+      "backoff_ms": 100,
+      "commit": "aae20a43cc",
+      "regression": "peer holds turn, pending storage and nonzero namespace cursor; all three regression conditions preserve backoff",
+      "status": "fixed and pushed"
+    },
+    "runtime_source_sha256": {
+      "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "14b4c4eba1b2eb2129fc28d1f043602ab44ab047f7d0456d8b7f3bcdb06bf867",
+      "zig/pkg/antfly-embedded/src/storage/lite/allocator_v4.zig": "2d22d33b7bbb04f876404e137d859fd068f1fec85a83baf986fc4c4c75eb763a",
+      "zig/pkg/antfly-embedded/src/storage/lite/ledger_digest.zig": "b12b8af65d0ff07f168850aaaf3d618e2a41e08d2f507b28d965f14d8c5f8689",
+      "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "7af988cd6a882d3f5eec1d940f48006f94a541d0354316762ff2d6ed088652ed"
+    },
+    "test_log_sha256": {
+      ".tools/allocator-digest-bulk-final-tests.log": "34f039b3d08fde507e8c625a91490af14ef56671cdafdd6c826ace05d9057a08",
+      ".tools/merkle-final-capi-contracts.log": "34d378c5eaa9872219dcfbcf7daf8dd32cfd337278dbdda5c1b0f3a2a5245a11",
+      ".tools/native-merkle-bounded-stage.log": "34ff0d949a1c29b82da87af822b4385a2ad9968f9246d667ba6c45ee4f783d7e"
+    }
+  },
   "schema_version": 1
 }

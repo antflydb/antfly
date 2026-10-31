@@ -4695,6 +4695,7 @@ pub const NativeFile = struct {
 
     const allocator_certificate_key = "\x00AFCERT/allocator-v1";
     const allocator_certificate_magic = "AFACERT1";
+    const allocator_certificate_live_magic = "AFACERT2";
     const allocator_certificate_size = 72;
 
     fn fingerprintHeader(header: Header) [32]u8 {
@@ -4776,11 +4777,13 @@ pub const NativeFile = struct {
         else
             try self.getCatalogRecordAlloc(self.allocator, allocator_certificate_key)) orelse return false;
         defer self.allocator.free(certificate);
-        if (certificate.len != allocator_certificate_size or !std.mem.eql(u8, certificate[0..8], allocator_certificate_magic)) return false;
+        if (certificate.len != allocator_certificate_size) return false;
+        const live = std.mem.eql(u8, certificate[0..8], allocator_certificate_live_magic);
+        if (!live and !std.mem.eql(u8, certificate[0..8], allocator_certificate_magic)) return false;
         const header_hash = self.headerFingerprint();
         if (!std.mem.eql(u8, certificate[8..40], &header_hash)) return false;
-        const state = try self.loadLedger(self.activeCheckpoint());
-        const ownership_hash = try allocatorFingerprint(state);
+        const state = try self.loadLedgerForDigest(self.activeCheckpoint(), self.allocator_cancel_token, false);
+        const ownership_hash = if (live) try state.rebuildFingerprint() else try allocatorFingerprint(state);
         if (!std.mem.eql(u8, certificate[40..72], &ownership_hash)) return false;
         self.free_pages_verified = true;
         self.allocator_verification_base = null;
@@ -4834,9 +4837,10 @@ pub const NativeFile = struct {
         published.active_checkpoint = 1 - original.active_checkpoint;
         published.checkpoints[published.active_checkpoint] = next;
         var certificate: [allocator_certificate_size]u8 = undefined;
-        @memcpy(certificate[0..8], allocator_certificate_magic);
+        @memcpy(certificate[0..8], if (root == .index) allocator_certificate_live_magic else allocator_certificate_magic);
         @memcpy(certificate[8..40], &fingerprintHeader(published));
-        @memcpy(certificate[40..72], &try allocatorFingerprint(pages.ledger.?));
+        const ownership_hash = if (root == .index) try pages.ledger.?.incrementalFingerprint() else try allocatorFingerprint(pages.ledger.?);
+        @memcpy(certificate[40..72], &ownership_hash);
         var encoded = std.ArrayListUnmanaged(u8).empty;
         defer encoded.deinit(self.allocator);
         try encodeCatalogEntry(self.allocator, &encoded, .{ .previous_page = 0, .key = allocator_certificate_key, .value = &certificate });
@@ -4916,8 +4920,14 @@ pub const NativeFile = struct {
         return self.loadLedgerWithCancel(checkpoint, self.allocator_cancel_token);
     }
     fn loadLedgerWithCancel(self: *NativeFile, checkpoint: CheckpointSlot, cancel: ?*const maintenance.CancelToken) !*allocator_v4.State {
+        return self.loadLedgerForDigest(checkpoint, cancel, self.allocator_certificate_on_commit);
+    }
+    fn loadLedgerForDigest(self: *NativeFile, checkpoint: CheckpointSlot, cancel: ?*const maintenance.CancelToken, prepare_digest: bool) !*allocator_v4.State {
         if (cancel) |token| try token.check();
-        if (self.ledger) |state| if (state.root_page == checkpoint.free_map_root_page) return state;
+        if (self.ledger) |state| if (state.root_page == checkpoint.free_map_root_page) {
+            if (prepare_digest) try state.prepareDigestWithCancel(if (cancel) |token| &token.requested else null);
+            return state;
+        };
         self.invalidateLedger();
         if (checkpoint.free_map_root_page != 0) {
             const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
@@ -4934,6 +4944,8 @@ pub const NativeFile = struct {
             .payload_bytes = self.maxPagePayloadBytes(),
             .cancel_requested = if (cancel) |token| &token.requested else null,
         }, checkpoint.free_map_root_page);
+        errdefer state.deinit();
+        if (prepare_digest) try state.prepareDigestWithCancel(if (cancel) |token| &token.requested else null);
         self.ledger = state;
         return state;
     }
@@ -20098,5 +20110,41 @@ test "lite allocator fingerprint batches preserve canonical bytes across counter
         var expected: [32]u8 = undefined;
         reference.final(&expected);
         try std.testing.expectEqualSlices(u8, &expected, &try NativeFile.allocatorFingerprint(&state));
+    }
+}
+
+test "lite allocator v4 live Merkle certificates retain their cache across commits" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "live-merkle-cache.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    file.allocator_certificate_on_commit = true;
+    try file.beginTransaction();
+    try file.putDocument("doc", "initial");
+    try file.commitTransaction();
+    const ledger = file.ledger.?;
+    for (0..8) |iteration| {
+        const before = ledger.digestWork();
+        var value: [32]u8 = undefined;
+        try file.beginTransaction();
+        try file.putDocument("doc", try std.fmt.bufPrint(&value, "update-{d}", .{iteration}));
+        try file.commitTransaction();
+        try std.testing.expect(file.ledger.? == ledger);
+        try std.testing.expect(ledger.digestWork() - before < 400);
+        var peer = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+        defer peer.close();
+        const certificate = (try peer.getIndexCatalogRecordAlloc(a, NativeFile.allocator_certificate_key)).?;
+        defer a.free(certificate);
+        try std.testing.expectEqualStrings("AFACERT2", certificate[0..8]);
+        try std.testing.expect(try peer.inheritAllocatorCertificate());
+        const loaded = try peer.loadLedger(peer.activeCheckpoint());
+        loaded.counts.items[0] ^= 1;
+        try std.testing.expect(!try peer.inheritAllocatorCertificate());
+        loaded.counts.items[0] ^= 1;
+        try std.testing.expect(try peer.inheritAllocatorCertificate());
+        try std.testing.expect((try peer.check()).valid);
     }
 }

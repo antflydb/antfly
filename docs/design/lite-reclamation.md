@@ -336,9 +336,16 @@ primary catalog remain readable and are still published at clean close.
 Before opening a replacement runtime, native admission checks the current tip's
 certificate even when the previous runtime had a valid proof for an older tip.
 Missing or mismatched certificates retain the protected-graph fallback. Explicit
-integrity checks still traverse the graph. The handoff adds metadata records and
-fingerprinting proportional to the loaded ledger counters and pending entries;
-qualification must measure that cost alongside contending-writer progress.
+integrity checks still traverse the graph. Live `AFACERT2` seals bind a canonical
+Merkle digest of all ownership counters and pending entries, plus the complete
+allocator root and logical lengths. Counter chunks contain 256 counters; pending
+chunks cover 64 IDs. A compressed binary trie bounds each changed chunk's update
+to at most 64 branches, with memory proportional to live chunks rather than the
+largest historical retirement ID. Persistence cleanup retains digest dirtiness.
+Cold loads build the digest once, hashing each trie node once; warm commits hash
+only changed chunks and their paths. The older `AFACERT1` flat digest remains
+readable and is still emitted by the legacy clean-close path. Qualification must
+measure warm update cost separately from cold admission and contended progress.
 
 Storage-only maintenance can also replace a live certificate while deleting
 orphan artifact leases. The foreground may adopt that housekeeping only when
@@ -369,7 +376,8 @@ admission. Graph walks and provider computation still release the path-writer
 lease. Background publications join its queue for at most five seconds per
 acquisition, so a full round of foreground writers need not starve replay while
 close-time gate waits remain bounded. The coordination inode is never unlinked
-while an owner can still hold it.
+while an owner can still hold it. Refused or failed turn acquisition forces a
+100 ms backoff even with pending storage work or a nonzero namespace cursor.
 
 Opening an immutable artifact publishes an inode-local lease alias. These
 metadata-only commits have their own allocation policy. Mixed groups retain

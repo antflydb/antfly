@@ -1181,8 +1181,10 @@ metadata without repeating a graph walk after each peer publication. Both
 recovery slots and the canonical ledger must match; an uncertified writer or
 changed state retains the full-proof path. Allocator-only cleanup also retains
 that path so sealing does not perpetuate retirement work. Clean-close certificates
-remain compatible with older runtimes. This adds metadata hashing and catalog writes,
-without another checkpoint publication or durability barrier per transaction.
+remain compatible with older runtimes. Live seals use a cached chunked Merkle
+digest: warm updates hash changed chunks and bounded trie paths, while a cold
+ledger load constructs the cache once. This adds catalog writes without another
+checkpoint publication or durability barrier per transaction.
 Contended path leases join a cancelable kernel lock wait using a bounded,
 owner-scoped executor. Missing read-only sidecars and executor exhaustion retain
 short randomized retries, capped at four milliseconds. The configured busy
@@ -1196,7 +1198,8 @@ being proved. This coordination does not retain the path-writer lease during a
 graph walk or provider computation. Foreground publication still revalidates the
 inode, checkpoint and immutable index inputs. Background path-lease waits are
 capped at five seconds per acquisition. Like other coordination inodes, the sidecar
-must remain in place while any process may have the database open.
+must remain in place while any process may have the database open. Refused turns
+back off for 100 ms, including during an otherwise immediate namespace round.
 
 Full-text catch-up treats `CapacityUnavailable` and `CapacityObservationStale` as
 recoverable admission failures, with bounded backoff and persisted progress after

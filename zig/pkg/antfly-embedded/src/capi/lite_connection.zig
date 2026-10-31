@@ -3785,6 +3785,29 @@ test "issue1015 issue1431 unverified peer opens yield to a detached proof turn" 
     try std.testing.expectEqual(@as(usize, 0), peer_owner.maintenance_turn_references);
 }
 
+test "issue1015 issue1431 warm SQL retains the incremental allocator digest" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("warm-sql-digest", 1000, .sql);
+    defer fixture.deinit();
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&output);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(fixture.id, .fromSlice("{\"statement\":\"INSERT INTO numbers (n, _id) VALUES (1, 'warm')\"}"), &output));
+    api.antfly_buffer_free_zero(&output);
+    const owner = fixture.connection.owner;
+    const root = owner.current.?;
+    const ledger = root.owned_lite_backend.?.native_docstore.?.file.ledger.?;
+    for (0..8) |i| {
+        const before = ledger.digestWork();
+        var request: [160]u8 = undefined;
+        const bytes = try std.fmt.bufPrint(&request, "{{\"statement\":\"INSERT INTO numbers (n, _id) VALUES (1, 'warm-{d}')\"}}", .{i});
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(fixture.id, .fromSlice(bytes), &output));
+        api.antfly_buffer_free_zero(&output);
+        try std.testing.expect(owner.current == root);
+        try std.testing.expect(root.owned_lite_backend.?.native_docstore.?.file.ledger == ledger);
+        try std.testing.expect(ledger.digestWork() - before < 1000);
+    }
+}
+
 test "capi native allocator proof live commits carry a checked peer certificate" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("live-proof-certificate", 1000, .batch);
