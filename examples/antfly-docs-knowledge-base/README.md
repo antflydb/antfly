@@ -5,7 +5,8 @@ with [docsaf](../../go/pkg/docsaf/), writes one document per markdown section,
 and lets Antfly do the rest:
 
 - **Chunking and embedding.** Each section is split into ~400-token chunks with
-  40 tokens of overlap and embedded with `Qwen/Qwen3-Embedding-0.6B-GGUF`.
+  40 tokens of overlap and embedded with EmbeddingGemma 2
+  (`google/embeddinggemma-2:bf16-safetensors-bundle-v1`).
 - **Knowledge graph.** `fastino/gliner2.5-base-v1` extracts entities
   (`component`, `subsystem`, `file`, `decision`, `model`, `protocol`, and
   others) and relations (`depends_on`, `owns`, `implements`, `supersedes`,
@@ -38,8 +39,8 @@ Sections are tagged by path: `guide` (docs/guides and top-level docs pages),
 2. Pull the models:
 
    ```sh
-   antfly inference pull Qwen/Qwen3-Embedding-0.6B-GGUF
-   antfly inference pull fastino/gliner2.5-base-v1
+   antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
+   antfly inference pull fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d --tasks extract
    ```
 
 3. Lite runs inference in-process. Model execution happens in a sandboxed
@@ -127,7 +128,7 @@ Lite receives each index through `AddIndexJSON`; the server receives the same
 configs in its create-table request. See `index_config.go`.
 
 1. `chunk_vectors`, an `embeddings` index over the `doc_chunk_dense_v1`
-   artifact (1024 dimensions, cosine). Two enrichments travel with it:
+   artifact (768 dimensions, cosine). Two enrichments travel with it:
    `doc_chunks_v1` chunks each section body with the token-aware `fixed`
    chunker, and `doc_chunk_dense_v1` embeds those chunks. Semantic hits carry
    `hierarchy.parent_doc_key`, which `query` uses to map a chunk back to its

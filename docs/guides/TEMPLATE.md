@@ -194,12 +194,14 @@ break silently. The recurring traps:
   and `model`, which the `antfly` provider can omit when one reranker is installed.
   The providers that execute are `antfly`, `cohere`, and `vertex`. Pruning runs
   after fusion and reranking and before `offset` and `limit`.
-- The models the Quickstart installs, and so the ones every guide should use: text
-  embedding `Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1`, reranking
-  `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0`, images and audio
-  `antflydb/clipclap`, generation `ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0`. The
-  `hf:` prefix on pull refs is optional (the registry strips it if present).
-  `dimension` is probed, not passed.
+- The preferred models, and so the ones every guide should use: embedding
+  `google/embeddinggemma-2:bf16-safetensors-bundle-v1` (text and images, 768
+  dimensions), reranking `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0`,
+  extraction `fastino/gliner2.5-base-v1` (pull the pinned
+  `:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d` revision), OCR
+  `lightonai/LightOnOCR-3-0.8B`, and generation `ggml-org/gemma-4-E4B-it-GGUF`
+  (pull `:gguf:Q4_0`). The `hf:` prefix on pull refs is optional (the registry
+  strips it if present). `dimension` is probed, not passed.
 - Retrieval-agent generation runs via `steps.generation` and accepts providers
   `gemini`, `vertex`, `openai`, `ollama`, `antfly` only; `stream` defaults to
   `true`, so responses are SSE unless `stream: false`.

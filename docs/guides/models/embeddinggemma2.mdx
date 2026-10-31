@@ -3,7 +3,7 @@ title: EmbeddingGemma 2
 description: Embed text, images, audio, and video into one vector space with EmbeddingGemma 2
 ---
 
-EmbeddingGemma 2 (`google/embeddinggemma-2`) embeds text, images, audio, video,
+EmbeddingGemma 2 (`google/embeddinggemma-2:bf16-safetensors-bundle-v1`) is Antfly's default embedder. It embeds text, images, audio, video,
 and ordered combinations of them into one vector space. Use it when a single
 index should hold mixed media, or when you want one embedding per document
 rather than one per part. Antfly runs it on CPU, Metal, and CUDA (Ampere or
@@ -12,7 +12,7 @@ newer).
 ## Pull the model
 
 ```sh
-antfly inference pull hf:google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b --tasks embed
+antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
 ```
 
 The weights keep their upstream license.
@@ -24,7 +24,7 @@ for all of its ordered content. Post this to `/ai/v1/embed`:
 
 ```json
 {
-  "model": "embeddinggemma2",
+  "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1",
   "task_type": "RETRIEVAL_DOCUMENT",
   "dimensions": 256,
   "input": [
@@ -53,10 +53,11 @@ for all of its ordered content. Post this to `/ai/v1/embed`:
   1 FPS, up to 32 frames. CUDA video needs Linux NVDEC and an H.264 MP4 of at
   most 60 seconds.
 
-From the CLI:
+From the CLI, point `antfly inference embed` at the installed model directory:
 
 ```sh
-antfly inference embed models/embedders/embeddinggemma2 --group \
+MODEL_DIR=$(ls -d ~/.antfly/inference/models/google/embeddinggemma-2--antfly-*)
+antfly inference embed "$MODEL_DIR" --group \
   --title 'Account recovery' --dimensions 256 \
   --text 'Reset a forgotten password.' --image reset.png
 ```
