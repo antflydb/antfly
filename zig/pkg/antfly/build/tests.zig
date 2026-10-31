@@ -7433,9 +7433,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "unit-storage-compile",
         "Compile the three storage antfly-unit-test artifacts without running them",
     );
-    unit_storage_compile_step.dependOn(&unit_storage_support_tests.step);
-    unit_storage_compile_step.dependOn(&unit_storage_engine_tests.step);
-    unit_storage_compile_step.dependOn(&unit_storage_db_core_tests.step);
+    // Request the binaries so the compiles are cacheable: Zig cannot cache a
+    // compile that emits nothing, so a check-only step recompiled every time.
+    // Emitting also lets the run steps reuse these exact artifacts.
+    inline for (.{ unit_storage_support_tests, unit_storage_engine_tests, unit_storage_db_core_tests }) |artifact| {
+        _ = artifact.getEmittedBin();
+        unit_storage_compile_step.dependOn(&artifact.step);
+    }
 
     // Zig 0.17 schedules the native build graph concurrently. Test runs depend
     // on their own artifacts, allowing execution to overlap sibling compilation

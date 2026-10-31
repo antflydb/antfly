@@ -47,6 +47,17 @@ unit-test: unit-test-ownership-check ## Run the existing repository unit gate ac
 antfly-unit-test: ## Run hermetic Antfly unit tests with bounded scheduler memory.
 	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build antfly-unit-test $(ZIG_BUILD_FLAGS)
 
+# Incremental compilation keeps its state in the watching process, so it only
+# pays off with --watch: after the first build, an edit to a storage file
+# rebuilds and reruns in seconds instead of minutes.
+WATCH_STEP ?= antfly-storage-db-test
+WATCH_FILTER ?=
+
+.PHONY: watch
+
+watch: ## Rebuild and rerun WATCH_STEP on every save with incremental compilation (WATCH_FILTER selects tests).
+	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build $(WATCH_STEP) -fincremental --watch $(ZIG_BUILD_FLAGS) $(if $(WATCH_FILTER),-- "$(WATCH_FILTER)",)
+
 .PHONY: inference-e2e-models
 
 inference-e2e-models: ## Prefetch the curated inference E2E model set with `antfly inference pull`.
