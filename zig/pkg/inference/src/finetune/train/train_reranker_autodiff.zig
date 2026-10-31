@@ -361,6 +361,9 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         .intermediate_size = bert_config.intermediate_size,
         .max_position_embeddings = bert_config.max_position_embeddings,
         .type_vocab_size = bert_config.type_vocab_size,
+        .layer_norm_eps = bert_config.layer_norm_eps,
+        .hidden_act = bert_config.hidden_act,
+        .use_token_type = bert_config.model_type != .distilbert,
     };
 
     // ------------------------------------------------------------------

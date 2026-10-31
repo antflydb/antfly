@@ -1329,10 +1329,6 @@ fn policyAllowedComponentBackendsFromInspection(
     return error.NoBackendAvailable;
 }
 
-fn shouldUseMetalWholeModelExecutor(session: backends.Session) bool {
-    return session.backend() == .metal;
-}
-
 fn spinLock(m: *std.atomic.Mutex) void {
     platform.sync.lockYielding(m);
 }
@@ -2954,24 +2950,10 @@ pub const LoadedModel = struct {
     }
 
     pub fn wholeModelExecutor(self: *LoadedModel, allocator: std.mem.Allocator, kv_dtype: ?runtime.kv.pool.KvDType) !?graph_mod.model_runtime.ModelExecutor {
-        const gpt_config = session_factory.getGptConfig(self.session) orelse return null;
-        if (build_options.enable_metal and shouldUseMetalWholeModelExecutor(self.session) and graph_mod.metal_executor.supportsSession(self.session)) {
-            return try graph_mod.metal_executor.createModelExecutor(
-                allocator,
-                self.session,
-                gpt_config,
-                kv_dtype,
-                self.shared_moe_cache,
-            );
-        }
-        if (!graph_mod.live_model_executor.supportsSession(self.session)) return null;
-        return try graph_mod.live_model_executor.createModelExecutor(
-            allocator,
-            self.session,
-            gpt_config,
-            kv_dtype,
-            self.shared_moe_cache,
-        );
+        return @import("../execution/model_candidate.zig").createSessionExecutor(allocator, self.session, .{
+            .kv_dtype = kv_dtype,
+            .shared_moe_cache = self.shared_moe_cache,
+        });
     }
 
     fn ensureOptionalSessionWithControl(
@@ -3293,40 +3275,31 @@ pub const LoadedModel = struct {
 
     pub fn embeddingPipelineLocked(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
         const tok = self.getTokenizer();
-        const generic_encoder: ?session_factory.GenericEncoderArchConfig = session_factory.getGenericEncoderArchConfig(self.session) catch null;
-        const resident_text_encoder = (self.session.backend() == .native and self.manifest.embedding_style == .embedding_gemma2) or
-            ((self.session.backend() == .metal or self.session.backend() == .cuda) and session_factory.supportsResidentTextEncoder(self.session));
+        const contract = if (self.session.model_contract.resolved) self.session.model_contract else @import("../models/session_contract.zig").resolve(self.session.model_contract, &self.manifest, self.session.backend());
+        const semantics = contract.embedding.?;
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
-            .max_length = self.manifest.maxTextSequenceLength(),
-            .reject_truncation = self.manifest.embedding_style == .embedding_gemma2,
-            .normalize = self.manifest.normalize,
-            .pooling = switch (self.manifest.pooling) {
+            .max_length = semantics.max_length,
+            .reject_truncation = semantics.reject_truncation,
+            .normalize = semantics.normalize,
+            .pooling = switch (semantics.pooling) {
                 .mean => .mean,
                 .cls => .cls,
                 .max => .max,
                 .last => .last,
             },
-            .text_prefix = self.manifest.embedding_profile.document.prefix,
-            // Admission wrappers and imported ONNX sessions do not expose the
-            // native architecture vtable. Use declared encoder semantics too,
-            // otherwise a short BGE-M3 request is padded to its full 8K window.
-            // The pipeline still preserves explicitly fixed input dimensions.
-            .trim_padding_to_batch_max = self.manifest.embedding_style == .embedding_gemma2 or isJinaStyleEmbeddingManifest(&self.manifest) or
-                @import("../models/bert.zig").isBertModel(self.manifest.config_model_arch) or
-                self.manifest.bert_model_type == .roberta or
-                generic_encoder != null or
-                session_factory.supportsResidentTextEncoder(self.session),
-            .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
-            .resident_text_encoder = resident_text_encoder,
-            .resident_embedding_gemma2 = self.manifest.embedding_style == .embedding_gemma2 and self.session.backend() == .cuda,
-            .allow_image = self.manifest.inputs.len == 0 or model_caps.modelAcceptsInput(&self.manifest, "image"),
-            .allow_video = self.manifest.embedding_style == .embedding_gemma2 and model_caps.modelAcceptsInput(&self.manifest, "video"),
-            .allow_audio = self.manifest.inputs.len == 0 or model_caps.modelAcceptsInput(&self.manifest, "audio"),
-            .strict_max_length = self.manifest.embedding_style == .embedding_gemma2,
+            .text_prefix = semantics.document_prefix,
+            .trim_padding_to_batch_max = contract.padding == .batch_max,
+            .resident_qwen3_embedding = semantics.family == .last_token_decoder,
+            .resident_text_encoder = contract.resident_text_embeddings,
+            .resident_embedding_gemma2 = semantics.family == .gemma2 and self.session.backend() == .cuda,
+            .allow_image = semantics.image,
+            .allow_video = semantics.video,
+            .allow_audio = semantics.audio,
+            .strict_max_length = semantics.reject_truncation,
             .preprocess_io = self.executor_io,
             // Last-token pooling reads the EOS position; guarantee exactly
             // one trailing EOS regardless of tokenizer.json snapshot age.
-            .ensure_trailing_eos_id = if (isJinaStyleEmbeddingManifest(&self.manifest) and tok.specialTokens().sep_id >= 0)
+            .ensure_trailing_eos_id = if (semantics.family == .last_token_decoder and tok.specialTokens().sep_id >= 0)
                 tok.specialTokens().sep_id
             else
                 null,
@@ -3579,10 +3552,6 @@ pub const LoadedModel = struct {
         self.allocator.free(self.model_dir);
     }
 };
-
-fn isJinaStyleEmbeddingManifest(manifest: *const manifest_mod.ModelManifest) bool {
-    return manifest.isLastTokenDecoderEmbedder();
-}
 
 fn targetInferenceExecutionMutexForBackend(
     backend: backends.BackendType,
@@ -8799,6 +8768,8 @@ pub const ModelManager = struct {
         const chunk_planning = try chunkPlanningSnapshotWithControl(self.allocator, sm.io orelse std.Options.debug_io, man, resolution_revision, control orelse .{});
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
         if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
+        var resolved_session = session;
+        resolved_session.model_contract = @import("../models/session_contract.zig").resolve(session.model_contract, &man, session.backend());
         model.* = .{
             .chunk_planning = chunk_planning,
             .resolution_revision = resolution_revision,
@@ -8815,7 +8786,7 @@ pub const ModelManager = struct {
             .manifest = man,
             .hf_tok = hf_tok,
             .sp_tok = sp_tok,
-            .session = session,
+            .session = resolved_session,
             .session_manager = &self.session_manager,
             .model_manager = self,
             .model_dir = owned_model_dir,
@@ -8879,7 +8850,7 @@ pub const ModelManager = struct {
         // lazily after publication has reclaimed the victim.
         if (build_options.enable_metal and
             self.canPrewarmBeforeModelPublication() and
-            shouldUseMetalWholeModelExecutor(session))
+            @import("../execution/model_candidate.zig").prefersSpecializedSession(session))
         {
             if (session_factory.getGptConfig(session)) |gpt_config| {
                 if (graph_mod.metal_executor.supportsSession(session)) {

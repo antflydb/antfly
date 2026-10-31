@@ -187,8 +187,13 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     }
 
     pub fn createWithKernelJitOptions(options: metal_runtime.MetalJitOptions) !MetalNativeProvider {
+        return createWithKernelJitOptionsAndPipelineFormats(options, null);
+    }
+
+    /// A null census preserves complete preparation for open or custom stores.
+    pub fn createWithKernelJitOptionsAndPipelineFormats(options: metal_runtime.MetalJitOptions, formats: ?u16) !MetalNativeProvider {
         const raw_provider = metal_runtime.termite_metal_provider_create();
-        const raw_decode_runtime = metal_runtime.termite_metal_decode_runtime_create();
+        const raw_decode_runtime = metal_runtime.termite_metal_decode_runtime_create_for_quant_formats(formats orelse std.math.maxInt(u16));
         var result = MetalNativeProvider{
             .raw_provider = raw_provider,
             .raw_decode_runtime = raw_decode_runtime,

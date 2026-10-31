@@ -81,11 +81,11 @@ def compile_ptx(library, source):
 
 def source_bytes():
     source = (ARTIFACTS / "gliner25_training_math.cu").read_bytes()
-    marker = b'#include "../kernels/gliner25_softmax.cuh"'
+    marker = b'#include "../kernels/training_row_softmax.cuh"'
     if source.count(marker) != 1:
         raise RuntimeError("expected exactly one shared softmax include")
     return source.replace(
-        marker, (ARTIFACTS.parent / "kernels/gliner25_softmax.cuh").read_bytes()
+        marker, (ARTIFACTS.parent / "kernels/training_row_softmax.cuh").read_bytes()
     )
 
 

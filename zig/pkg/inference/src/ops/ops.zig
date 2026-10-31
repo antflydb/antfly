@@ -36,6 +36,9 @@ const ml = @import("ml");
 /// (native CPU uses f32 slices, device backends use opaque handles). Tensors are always
 /// freed via the ComputeBackend that created them.
 pub const CT = backend_contracts.CT;
+pub const kernel_descriptor = @import("kernel_descriptor.zig");
+pub const physical_storage = @import("physical_storage.zig");
+pub const KernelBackend = @import("kernel_backend.zig").VTable;
 
 /// Result of an optional backend lookup for immutable scalar model metadata.
 /// `unsupported` lets callers retain their existing weight-loading path;
@@ -613,6 +616,83 @@ pub const Gemma4MtpVerifyCommitRequest = struct {
     eos_token_ids: []const i32,
     accept_bonus: bool,
     allocator: std.mem.Allocator,
+    /// No allocation or backend state changes. Empty drafts retain optional
+    /// decline; overflowing row counts have the ordinary shape error.
+    pub fn verifyLength(self: *const @This()) error{InvalidTensorShape}!?usize {
+        if (self.draft_tokens.len == 0) return null;
+        const length = std.math.add(usize, self.draft_tokens.len, 1) catch return error.InvalidTensorShape;
+        if (self.rows < length) return error.InvalidTensorShape;
+        return length;
+    }
+
+    fn isEos(self: *const @This(), token: usize) bool {
+        for (self.eos_token_ids) |eos| {
+            if (eos >= 0 and token == @as(usize, @intCast(eos))) return true;
+        }
+        return false;
+    }
+
+    /// Borrow choices. The backend transfers its allocation only after this
+    /// succeeds; errors preserve its existing cleanup responsibility.
+    pub fn classifyTargetChoices(self: *const @This(), target_choices: []u32) error{ InvalidTensorShape, InvalidModelOutput }!Gemma4MtpVerifyCommitResult {
+        const length = (try self.verifyLength()) orelse return error.InvalidTensorShape;
+        if (target_choices.len < length) return error.InvalidTensorShape;
+        var matched_drafts: usize = 0;
+        var accepted: usize = 0;
+        var correction_added = false;
+        var hit_eos = false;
+
+        for (self.draft_tokens, 0..) |draft_token_raw, i| {
+            if (draft_token_raw < 0) return error.InvalidModelOutput;
+            const draft_token: usize = @intCast(draft_token_raw);
+            const target_choice: usize = @intCast(target_choices[i]);
+            if (target_choice == draft_token) {
+                matched_drafts += 1;
+                accepted += 1;
+                if (self.isEos(target_choice)) {
+                    hit_eos = true;
+                    break;
+                }
+            } else {
+                correction_added = true;
+                accepted = matched_drafts + 1;
+                if (self.isEos(target_choice)) {
+                    hit_eos = true;
+                }
+                break;
+            }
+        }
+
+        const can_bonus = matched_drafts == self.draft_tokens.len and !hit_eos;
+        const had_bonus = can_bonus and self.accept_bonus;
+        const bonus_skipped = can_bonus and !self.accept_bonus;
+        if (had_bonus) {
+            const bonus_token: usize = @intCast(target_choices[self.draft_tokens.len]);
+            accepted += 1;
+            if (self.isEos(bonus_token)) {
+                hit_eos = true;
+            }
+        }
+
+        const commit_forward_required = correction_added or had_bonus;
+        const accepted_hidden_row: ?usize = if (accepted != 0 and !commit_forward_required)
+            accepted - 1
+        else
+            null;
+
+        return .{
+            .target_choices = target_choices,
+            .target_choices_owned = false,
+            .matched_drafts = matched_drafts,
+            .accepted = accepted,
+            .correction_added = correction_added,
+            .had_bonus = had_bonus,
+            .bonus_skipped = bonus_skipped,
+            .hit_eos = hit_eos,
+            .commit_forward_required = commit_forward_required,
+            .accepted_hidden_row = accepted_hidden_row,
+        };
+    }
 };
 
 pub const TakeRowsRequest = struct {
@@ -1917,6 +1997,7 @@ pub const ComputeBackend = struct {
 
     pub const VTable = struct {
         backendKind: *const fn (ctx: *anyopaque) BackendKind,
+        kernels: ?*const KernelBackend = null,
         deinitBackend: *const fn (ctx: *anyopaque) void,
         freeTensor: *const fn (ctx: *anyopaque, tensor: CT) void,
         /// Optional backend-provided device-write hook installer. CUDA and
@@ -2671,7 +2752,7 @@ pub const ComputeBackend = struct {
 
         /// ModernBERT training attention over packed [Q;K;V] with an i32
         /// range/position control; linear storage, replayed backward
-        /// returning packed [dQ;dK;dV]. See ops/modernbert_training_attention.zig.
+        /// returning packed [dQ;dK;dV]. See ops/range_attention_reference.zig.
         modernBertTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
         modernBertTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
 
@@ -3961,6 +4042,30 @@ pub const ComputeBackend = struct {
         return false;
     }
 
+    /// Publish F32 rows independently of mutable decoder/arena storage. This
+    /// copies on the selected backend; it never stages activations through host.
+    pub fn snapshotRows2D(self: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, start_row: usize, rows: usize, cols: usize) !CT {
+        if (rows == 0 or cols == 0 or rows > std.math.maxInt(i32) or cols > std.math.maxInt(i32)) return error.InvalidShape;
+        if (try self.tensorDType(input) != .f32) return error.UnsupportedTensorType;
+        const count = try std.math.mul(usize, rows, cols);
+        if (count > std.math.maxInt(i32)) return error.InvalidShape;
+        const shape = [_]i32{ @intCast(rows), @intCast(cols) };
+        const output = stable_storage: {
+            // Stable target storage bypasses temporary arena slots. The owned
+            // reshape retains the flat allocation through the published value.
+            if (self.vtable.kernels) |functions| if (functions.allocatePhysicalStorage) |allocate| {
+                const storage = (try allocate(self.ptr, try std.math.mul(usize, count, @sizeOf(f32)))) orelse return error.UnsupportedBackendOp;
+                defer self.free(storage);
+                const dimensions = [_]i64{ @intCast(rows), @intCast(cols) };
+                break :stable_storage try self.primReshape(storage, &dimensions);
+            };
+            break :stable_storage (try self.allocUninitF32Shape(&shape)) orelse return error.UnsupportedBackendOp;
+        };
+        errdefer self.free(output);
+        if (!try self.copyRows2D(allocator, output, 0, input, start_row, rows, cols)) return error.UnsupportedBackendOp;
+        return output;
+    }
+
     /// Whether this backend exposes the device-to-device row-copy primitive.
     /// Callers may use this to choose an in-place layout-preserving algorithm
     /// without probing by partially mutating a destination tensor.
@@ -4516,6 +4621,10 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    /// Dense attention uses token-major [batch*seq, heads*dim] tensors.
+    /// Native, Metal and CUDA also honor explicit head-major 3D/4D storage;
+    /// output retains the input's physical layout. Model adapters can keep QKV
+    /// linear outputs token-major instead of inserting layout conversions.
     pub fn scaledDotProductAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
         return self.vtable.scaledDotProductAttention(self.ptr, Q, K, V, mask, attn_bias, batch, seq_len, num_heads, head_dim);
     }
@@ -5312,6 +5421,23 @@ pub const ComputeBackend = struct {
         if (self.vtable.cancelI32ScalarDownload) |cancel_i32_scalar_download| {
             cancel_i32_scalar_download(self.ptr, pending);
         }
+    }
+
+    pub fn readFloat32Into(self: *const ComputeBackend, tensor: CT, output: []f32) !bool {
+        try self.checkExecutionControl();
+        const functions = self.vtable.kernels orelse return false;
+        const read = functions.readFloat32Into orelse return false;
+        return read(self.ptr, tensor, output);
+    }
+
+    pub fn retainImmutableTensor(self: *const ComputeBackend, tensor: CT, allocator: std.mem.Allocator) !?CT {
+        if (self.vtable.kernels) |functions| if (functions.retainImmutableTensor) |retain| return retain(self.ptr, tensor);
+        const dims = try self.tensorShape(tensor, allocator);
+        defer allocator.free(dims);
+        if (dims.len > 8) return error.UnsupportedShape;
+        var shape: [8]i32 = undefined;
+        for (dims, 0..) |dim, axis| shape[axis] = std.math.cast(i32, dim) orelse return error.UnsupportedShape;
+        return self.cloneTensorShape(tensor, shape[0..dims.len]);
     }
 
     pub fn cloneTensorShape(self: *const ComputeBackend, tensor: CT, shape: []const i32) !?CT {
@@ -6752,5 +6878,47 @@ test "embeddinggemma2 streamed FFN restores controls and releases post-cancel ou
 }
 
 test {
+    _ = kernel_descriptor;
     _ = @import("embedding_vision_plan.zig");
+}
+
+test "MTP shared verify decision covers correction bonus EOS and checked geometry" {
+    var choices = [_]u32{ 3, 5, 7, 11 };
+    const drafts = [_]i64{ 3, 5, 7 };
+    var request = Gemma4MtpVerifyCommitRequest{ .input = @ptrFromInt(8), .weight = @ptrFromInt(16), .rows = 4, .in_dim = 1, .out_dim = 12, .suppress_token_ids = &.{}, .draft_tokens = &drafts, .eos_token_ids = &.{ -1, 11 }, .accept_bonus = true, .allocator = std.testing.allocator };
+    const all = try request.classifyTargetChoices(&choices);
+    try std.testing.expectEqual(@as(usize, 3), all.matched_drafts);
+    try std.testing.expectEqual(@as(usize, 4), all.accepted);
+    try std.testing.expect(all.had_bonus and all.hit_eos and all.commit_forward_required);
+    try std.testing.expect(!all.target_choices_owned and all.accepted_hidden_row == null);
+    request.accept_bonus = false;
+    const skipped = try request.classifyTargetChoices(&choices);
+    try std.testing.expect(skipped.bonus_skipped and !skipped.commit_forward_required and !skipped.hit_eos);
+    try std.testing.expectEqual(@as(?usize, 2), skipped.accepted_hidden_row);
+    for (0..drafts.len) |mismatch| {
+        choices = .{ 3, 5, 7, 11 };
+        choices[mismatch] = 11;
+        const result = try request.classifyTargetChoices(&choices);
+        try std.testing.expectEqual(mismatch, result.matched_drafts);
+        try std.testing.expectEqual(mismatch + 1, result.accepted);
+        try std.testing.expect(result.correction_added and result.hit_eos and result.commit_forward_required);
+    }
+    choices = .{ 3, 5, 7, 11 };
+    request.eos_token_ids = &.{ -1, 5 };
+    const eos = try request.classifyTargetChoices(&choices);
+    try std.testing.expectEqual(@as(usize, 2), eos.accepted);
+    try std.testing.expect(eos.hit_eos and !eos.correction_added and !eos.had_bonus);
+    request.rows = 3;
+    try std.testing.expectError(error.InvalidTensorShape, request.verifyLength());
+    request.rows = 4;
+    try std.testing.expectError(error.InvalidTensorShape, request.classifyTargetChoices(choices[0..3]));
+    request.draft_tokens = &.{ 3, -1, 7 };
+    try std.testing.expectError(error.InvalidModelOutput, request.classifyTargetChoices(&choices));
+    request.draft_tokens = &.{};
+    try std.testing.expectEqual(@as(?usize, null), try request.verifyLength());
+    try std.testing.expectError(error.InvalidTensorShape, request.classifyTargetChoices(&choices));
+    const fake: [*]const i64 = @ptrFromInt(8);
+    request.draft_tokens = fake[0..std.math.maxInt(usize)];
+    request.rows = std.math.maxInt(usize);
+    try std.testing.expectError(error.InvalidTensorShape, request.verifyLength());
 }

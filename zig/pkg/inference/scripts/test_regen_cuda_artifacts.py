@@ -31,9 +31,41 @@ FLASH_SYMBOLS = (
 
 
 class RegenCudaArtifactsTest(unittest.TestCase):
+    def test_deployment_driver_floors_match_the_artifact_compiler(self) -> None:
+        # A future toolkit bump must update PTX admission instead of accepting
+        # an older JIT driver merely because the fatbin compression is readable.
+        header = (ARTIFACTS / "inference_cuda_kernels.ptx").read_text()[:4096]
+        major, minor = map(int, re.search(r"release (\d+)\.(\d+),", header).groups())
+        contract = (ARTIFACTS.parent / "driver_contract.zig").read_text()
+        native = int(re.search(r"native_driver_version = (\d+);", contract)[1])
+        ptx = int(re.search(r"ptx_driver_version = (\d+);", contract)[1])
+        self.assertEqual(native, major * 1000)
+        self.assertEqual(ptx, major * 1000 + minor * 10)
+
+    def test_jit_identity_covers_transitive_local_headers_and_launch_contracts(self) -> None:
+        inference = SCRIPT.parent.parent
+        identity = (inference / "build" / "jit_identity.zig").read_text()
+        pending = [ARTIFACTS / "inference_cuda_kernels.cu"]
+        visited = set()
+        while pending:
+            source = pending.pop().resolve()
+            if source in visited:
+                continue
+            visited.add(source)
+            for include in re.findall(r'^\s*#include\s+"([^"\n]+)"', source.read_text(), re.MULTILINE):
+                header = (source.parent / include).resolve()
+                relative = header.relative_to(inference.resolve()).as_posix()
+                self.assertIn('"' + relative + '"', identity, f"untracked native include: {relative}")
+                pending.append(header)
+        for dependency in ("src/ops/cuda/launch_abi.zig", "src/ops/kernel_descriptor.zig", "src/ops/kernel_geometry.zig"):
+            self.assertIn('"' + dependency + '"', identity)
+
     def test_preference_training_ptx_matches_source_launch_abi(self) -> None:
         source = (ARTIFACTS / "inference_cuda_kernels.cu").read_text()
         ptx = (ARTIFACTS / "inference_cuda_kernels.ptx").read_text()
+        header = (ARTIFACTS.parent / "kernels" / "kernel_abi.cuh").read_text()
+        macros = dict(re.findall(r"^#define (ANTFLY_CUDA_\w+_PARAMS) (.*)$",
+                                 header.replace("\\\n", ""), re.MULTILINE))
         # These entrypoints changed with preference training. A stale artifact
         # can load successfully yet interpret launch arguments using the old
         # layout (batched dot silently ignored lhs_contract_last in CI).
@@ -54,11 +86,63 @@ class RegenCudaArtifactsTest(unittest.TestCase):
                 )
                 self.assertIsNotNone(declaration, f"missing CUDA source: {symbol}")
                 self.assertIsNotNone(entry, f"missing compiled PTX: {symbol}")
+                signature = declaration.group(1).strip()
+                if signature.startswith("ANTFLY_CUDA_"):
+                    self.assertIn(signature, macros, f"missing native signature: {symbol}")
+                    signature = macros[signature]
                 self.assertEqual(
-                    len(declaration.group(1).split(",")),
+                    len(signature.split(",")),
                     len(re.findall(r"\.param\b", entry.group(1))),
                     f"stale launch ABI for {symbol}; regenerate CUDA artifacts",
                 )
+
+    def test_native_scalar_parameter_macros_match_ptx_wire_layouts(self) -> None:
+        source = (ARTIFACTS / "inference_cuda_kernels.cu").read_text()
+        header = (ARTIFACTS.parent / "kernels" / "kernel_abi.cuh").read_text()
+        macros = dict(re.findall(r"^#define (ANTFLY_CUDA_\w+_PARAMS) (.*)$",
+                                 header.replace("\\\n", ""), re.MULTILINE))
+        ptx = (ARTIFACTS / "inference_cuda_kernels.ptx").read_text()
+        signatures = re.findall(r'extern "C" __global__ (?:__launch_bounds__\([^)]*\) )?void (\w+)\((ANTFLY_CUDA_\w+_PARAMS)\)', source)
+        self.assertGreater(len(signatures), 20)
+        checked = 0
+        for symbol, macro in signatures:
+            self.assertIn(macro, macros)
+            parameters = macros[macro].split(",")
+            # By-value native structs have their own size/offset contracts;
+            # these launch records admit only scalar wires and device addresses.
+            if any("*" not in parameter and not re.match(r"\s*(?:unsigned int|unsigned long long|int|float)\s+\w+\s*$", parameter)
+                   for parameter in parameters):
+                continue
+            checked += 1
+            with self.subTest(symbol=symbol):
+                entry = re.search(rf"\.visible \.entry {symbol}\((.*?)\)", ptx, re.DOTALL)
+                self.assertIsNotNone(entry, f"missing compiled PTX: {symbol}")
+                native = ["u64" if "*" in parameter or "unsigned long long" in parameter else "f32" if "float" in parameter else "u32"
+                          for parameter in parameters]
+                wires = re.findall(r"\.param\s+\.(\w+)", entry.group(1))
+                self.assertEqual(native, wires, f"stale native wire layout: {symbol}")
+        self.assertGreater(checked, 20)
+
+    def test_retired_unreachable_epilogues_have_no_source_slot_or_image(self) -> None:
+        source = (ARTIFACTS / "inference_cuda_kernels.cu").read_text()
+        slots = (ARTIFACTS.parent / "kernels.zig").read_text()
+        script = SCRIPT.read_text()
+        required = re.search(r"required_symbols=\(\n(.*?)\n\)", script, re.DOTALL).group(1).split()
+        for symbol in (
+            "termite_embedding_gemma2_gelu_ple_bf16",
+            "termite_linear_q4_0_bias_f32_tc_hmma",
+            "termite_linear_q4_0_bias_gelu_f32_tc_hmma",
+            "termite_linear_q4_0_bias_add_f32_tc_hmma",
+            "termite_linear_q4_0_bias_f32_tc_hmma_bf16",
+            "termite_linear_q4_0_bias_gelu_f32_tc_hmma_bf16",
+            "termite_linear_q4_0_bias_add_f32_tc_hmma_bf16",
+        ):
+            with self.subTest(symbol=symbol):
+                self.assertNotIn(symbol, source)
+                self.assertNotRegex(slots, rf"(?m)^    {symbol.removeprefix('termite_')}: driver_mod.CUfunction")
+                self.assertNotIn(symbol, required)
+                for filename in ("inference_cuda_kernels.ptx", "inference_cuda_kernels.fatbin", "inference_cuda_kernels_sm89.cubin"):
+                    self.assertFalse(symbol.encode() in (ARTIFACTS / filename).read_bytes(), f"{filename} retains {symbol}")
 
     def test_artifact_modes_require_fresh_codegen_before_nvcc(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -83,49 +167,78 @@ class RegenCudaArtifactsTest(unittest.TestCase):
 
         self.assertEqual(37, completed.returncode)
         self.assertIn(
-            "zig-args:build quant-kernel-codegen -- --check", completed.stdout
+            "zig-args:build quant-kernel-codegen tile-kernel-codegen -- --check", completed.stdout
         )
         self.assertNotIn("nvcc not found", completed.stderr)
 
-    def test_binary_symbols_are_decoded_and_checked_exactly(self) -> None:
-        source = SCRIPT.read_text()
-        function = re.search(
-            r"^check_required_symbols\(\) \{.*?^\}", source, re.MULTILINE | re.DOTALL
-        ).group(0)
+    def test_binary_export_checks_decode_compressed_symbol_tables(self) -> None:
+        checker = re.search(r"(?ms)^check_required_symbols\(\) \{\n.*?^\}", SCRIPT.read_text()).group()
         with tempfile.TemporaryDirectory() as temporary:
-            directory = pathlib.Path(temporary)
-            artifact = directory / "compressed.fatbin"
-            artifact.write_bytes(b"compressed payload without readable symbols")
-            tool = directory / "cuobjdump"
-            for output, status in (
-                ("required_kernel", 0),
-                ("required_kernel_suffix", 1),
+            root = pathlib.Path(temporary)
+            image = root / "compressed.fatbin"
+            image.write_bytes(b"opaque compressed payload, live name is not an export")
+            tool = root / "cuobjdump"
+            shell = root / "check.sh"
+            shell.write_text('set -eu\nrequired_symbols=(live)\nretired_symbols=(retired)\ncuobjdump="$1"\n' + checker + '\ncheck_required_symbols "$2"\n')
+            for table, succeeds in (
+                ("STT_FUNC STB_GLOBAL STO_ENTRY live", True),
+                ("STT_OBJECT STB_GLOBAL STV_DEFAULT live", False),
+                ("STT_FUNC STB_GLOBAL STV_DEFAULT live", False),
+                ("STT_FUNC STB_LOCAL STO_ENTRY live", False),
+                ("STT_FUNC STB_GLOBAL STO_ENTRY other", False),
+                ("STT_FUNC STB_GLOBAL STO_ENTRY live\nSTT_FUNC STB_GLOBAL STO_ENTRY retired", False),
             ):
-                with self.subTest(output=output):
-                    tool.write_text(
-                        '#!/bin/sh\n[ "$1" = --dump-elf-symbols ] || exit 2\nprintf "%s\\n" "'
-                        + output
-                        + '"\n'
-                    )
-                    tool.chmod(0o755)
-                    result = subprocess.run(
-                        [
-                            "bash",
-                            "-c",
-                            'set -euo pipefail\ncuobjdump="$1"\ntmp_symbols="$2"\nrequired_symbols=(required_kernel)\n'
-                            + function
-                            + '\ncheck_required_symbols "$3"',
-                            "test",
-                            str(tool),
-                            str(directory / "symbols"),
-                            str(artifact),
-                        ],
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertEqual(status, result.returncode, result.stderr)
-                    if status:
-                        self.assertIn("missing symbol required_kernel", result.stderr)
+                tool.write_text("#!/bin/sh\ncat <<'SYMBOLS'\n" + table + "\nSYMBOLS\n")
+                tool.chmod(0o755)
+                result = subprocess.run(["bash", str(shell), str(tool), str(image)], capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+            result = subprocess.run(["bash", str(shell), "", str(image)], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cuobjdump is required", result.stderr)
+            ptx = root / "portable.ptx"
+            ptx.write_text("// live\n.visible .entry other() {}\n")
+            result = subprocess.run(["bash", str(shell), "", str(ptx)], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            ptx.write_text(".visible .entry live() {}\n")
+            result = subprocess.run(["bash", str(shell), "", str(ptx)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fatbin_build_compresses_all_profiles_and_decodes_exports(self) -> None:
+        source = SCRIPT.read_text()
+        required = re.search(r"required_symbols=\(\n(.*?)\n\)", source, re.DOTALL).group(1).split()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            capture = root / "nvcc-args"
+            scratch = root / "nvcc-scratch"
+            zig = root / "zig"
+            zig.write_text("#!/bin/sh\nexit 0\n")
+            compiler = root / "nvcc"
+            compiler.write_text(
+                '#!/bin/sh\nif [ "$1" = --version ]; then echo "release 13.2"; exit 0; fi\n'
+                + 'printf "%s\\n" "$@" > "' + str(capture) + '"\n'
+                + 'printf "%s\\n" "$TMPDIR" > "' + str(scratch) + '"\n'
+                + 'while [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then shift; printf opaque > "$1"; exit 0; fi; shift; done\n'
+            )
+            dump = root / "cuobjdump"
+            table = "\n".join("STT_FUNC STB_GLOBAL STO_ENTRY " + symbol for symbol in required)
+            arches = "\n".join("ELF sm_" + arch for arch in ("75", "80", "89", "90", "100", "110", "120"))
+            dump.write_text('#!/bin/sh\ncase "$1" in\n--dump-elf-symbols) cat <<EOF\n' + table + '\nEOF\n;;\n--list-elf) cat <<EOF\n' + arches + '\nEOF\n;;\n--list-ptx) echo "PTX sm_75" ;;\n*) exit 42 ;;\nesac\n')
+            for tool in (zig, compiler, dump):
+                tool.chmod(0o755)
+            env = os.environ.copy()
+            env.update(ZIG_BIN=str(zig), NVCC=str(compiler), CUOBJDUMP=str(dump))
+            result = subprocess.run([str(SCRIPT), "--check", "--fatbin"], capture_output=True, text=True, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("fatbin artifact is stale", result.stderr)
+            args = capture.read_text().splitlines()
+            self.assertIn("--compress-mode=speed", args)
+            self.assertIn("-Xfatbin=-compress-all", args)
+            profiles = [arg for arg in args if arg.startswith("-gencode=")]
+            self.assertEqual(len(profiles), 8)
+            for arch in ("75", "80", "89", "90", "100", "110", "120"):
+                self.assertIn(f"-gencode=arch=compute_{arch},code=sm_{arch}", profiles)
+            self.assertIn("-gencode=arch=compute_75,code=compute_75", profiles)
+            pathlib.Path(scratch.read_text().strip()).relative_to(SCRIPT.parents[4] / ".zig-cache" / "cuda-artifacts")
 
     def test_default_zig_resolution_prefers_the_repo_pinned_toolchain(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")

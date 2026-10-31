@@ -26,7 +26,7 @@ const metal_runtime = @import("../backends/metal_runtime.zig");
 const cache_mod = @import("cache.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
-const generation = @import("../pipelines/generation.zig");
+const decode_state = @import("decode_state_runtime.zig");
 const debug_timing = @import("../debug_timing.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
@@ -976,7 +976,7 @@ fn executorUsesLazyDeviceKvReserve(config: gpt_mod.Config) bool {
     return mixed_width or config.num_kv_shared_layers > 0;
 }
 
-fn executorContractKvCacheView(kv_view: generation.KvView) contracts.KvCacheView {
+fn executorContractKvCacheView(kv_view: decode_state.KvView) contracts.KvCacheView {
     return .{
         .sequence_id = kv_view.sequence_id,
         .pool_id = kv_view.pool_id,
@@ -990,7 +990,7 @@ fn executorContractKvCacheView(kv_view: generation.KvView) contracts.KvCacheView
     };
 }
 
-fn executorDecodeKvCacheView(kv_view: generation.KvView) gpt_arch.DecodeContext.KvCacheView {
+fn executorDecodeKvCacheView(kv_view: decode_state.KvView) gpt_arch.DecodeContext.KvCacheView {
     return .{
         .sequence_id = kv_view.sequence_id,
         .pool_id = kv_view.pool_id,
@@ -1012,7 +1012,7 @@ const ExecutorKvMetadataLayer = struct {
     total_token_count: usize = 0,
     position_offset: usize = 0,
     tail_tokens: u16 = 0,
-    kv_view: ?generation.KvView = null,
+    kv_view: ?decode_state.KvView = null,
     compacted: bool = false,
     max_inflight_tokens: usize = 0,
     allow_swa_ring: bool = false,
@@ -1198,7 +1198,7 @@ const ExecutorKvMetadataLayer = struct {
         return droppable_blocks * page_size;
     }
 
-    fn notePrefill(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime, token_count: usize) !generation.KvMutationResult {
+    fn notePrefill(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime, token_count: usize) !decode_state.KvMutationResult {
         const before_view = self.kv_view;
         const before_sequence_id = self.sequence_id;
         self.total_token_count = token_count;
@@ -1220,7 +1220,7 @@ const ExecutorKvMetadataLayer = struct {
         };
     }
 
-    fn appendPrefillChunk(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime, token_count: usize) !generation.KvMutationResult {
+    fn appendPrefillChunk(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime, token_count: usize) !decode_state.KvMutationResult {
         const before_view = self.kv_view;
         const before_sequence_id = self.sequence_id;
         self.total_token_count += token_count;
@@ -1242,7 +1242,7 @@ const ExecutorKvMetadataLayer = struct {
         };
     }
 
-    fn appendGeneratedTokens(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime, count: usize) !generation.KvMutationResult {
+    fn appendGeneratedTokens(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime, count: usize) !decode_state.KvMutationResult {
         const before_view = self.kv_view;
         const before_sequence_id = self.sequence_id;
         self.total_token_count += count;
@@ -1267,7 +1267,7 @@ const ExecutorKvMetadataLayer = struct {
         };
     }
 
-    fn truncateTokens(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime, count: usize) !generation.KvMutationResult {
+    fn truncateTokens(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime, count: usize) !decode_state.KvMutationResult {
         const before_view = self.kv_view;
         const before_sequence_id = self.sequence_id;
         if (count > self.total_token_count) return error.TruncateBeyondStart;
@@ -1348,6 +1348,7 @@ fn submitSampledPipelineToken(cb: *const ops.ComputeBackend, token: i64, vocab_s
 }
 
 const RuntimeContext = struct {
+    references: std.atomic.Value(usize) = .init(1),
     allocator: std.mem.Allocator,
     cb: ops.ComputeBackend,
     gpt_config: gpt_mod.Config,
@@ -1358,7 +1359,7 @@ const RuntimeContext = struct {
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
     kv_metadata: ExecutorKvMetadataLayer,
     mirrored_token_count: usize,
-    mirrored_kv_view: ?generation.KvView,
+    mirrored_kv_view: ?decode_state.KvView,
     mirrored_kv_compacted: bool,
     pipelined_decode_armed: bool = false,
     pipelined_decode_mode: ?PipelinedDecodeMode = null,
@@ -1378,7 +1379,7 @@ const RuntimeContext = struct {
     ) !*RuntimeContext {
         // The runtime outlives the request that creates it and is cached on
         // the loaded model, so it must not hold the per-request Metal lease.
-        const cb = try session_factory.getComputeBackendBorrowingSharedProvider(session, allocator);
+        const cb = try session.acquireComputeBackend(allocator, .{ .borrow_shared_provider = true });
         errdefer {
             var cb_mut = cb;
             cb_mut.deinit();
@@ -1443,6 +1444,9 @@ const RuntimeContext = struct {
     }
 
     pub fn deinit(self: *RuntimeContext) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous != 0);
+        if (previous != 1) return;
         // Sampled and greedy pipelining intentionally leave the next frame
         // submitted after returning a token. The runtime borrows the shared
         // Metal provider, so its ComputeBackend teardown does not own or drain
@@ -1546,7 +1550,7 @@ const RuntimeContext = struct {
         return token_id;
     }
 
-    fn applyKvMutationResult(self: *RuntimeContext, result: generation.KvMutationResult) !void {
+    fn applyKvMutationResult(self: *RuntimeContext, result: decode_state.KvMutationResult) !void {
         _ = result;
         self.mirrored_token_count = self.kv_metadata.total_token_count;
         self.mirrored_kv_view = self.kv_metadata.kv_view;
@@ -1713,11 +1717,11 @@ const RuntimeContext = struct {
         return self.kv_metadata.total_token_count;
     }
 
-    fn kvView(self: *const RuntimeContext) ?generation.KvView {
+    fn kvView(self: *const RuntimeContext) ?decode_state.KvView {
         return self.kv_metadata.kv_view;
     }
 
-    fn kvCacheView(_: *const RuntimeContext, kv_view: generation.KvView) contracts.KvCacheView {
+    fn kvCacheView(_: *const RuntimeContext, kv_view: decode_state.KvView) contracts.KvCacheView {
         return executorContractKvCacheView(kv_view);
     }
 
@@ -1732,7 +1736,7 @@ const RuntimeContext = struct {
         if (self.currentTokenCount() != position) return error.InvalidDecodePosition;
     }
 
-    fn syncDecoderRuntimeStateForView(self: *RuntimeContext, kv_view: generation.KvView) !void {
+    fn syncDecoderRuntimeStateForView(self: *RuntimeContext, kv_view: decode_state.KvView) !void {
         const prior = self.raw_span_state orelse return;
         const prior_end = prior.kv_position_offset + prior.kv_tokens;
         const current_end = kv_view.position_offset + kv_view.token_count;
@@ -1742,7 +1746,7 @@ const RuntimeContext = struct {
         }
     }
 
-    fn noteDecoderRuntimeState(self: *RuntimeContext, kv_view: generation.KvView) void {
+    fn noteDecoderRuntimeState(self: *RuntimeContext, kv_view: decode_state.KvView) void {
         self.raw_span_state = .{
             .kv_tokens = kv_view.token_count,
             .kv_position_offset = kv_view.position_offset,
@@ -2165,6 +2169,7 @@ const runtime_vtable = model_runtime.ModelRuntime.VTable{
     .supports_sample_decode_request = runtimeSupportsSampleDecodeRequest,
     .decode_greedy = runtimeDecodeGreedy,
     .deinit = runtimeDeinit,
+    .retain_output_owner = runtimeRetainOutputOwner,
     .reset = runtimeReset,
     .debug_timing_stats = runtimeDebugTimingStats,
     .reset_debug_timing_stats = runtimeResetDebugTimingStats,
@@ -2473,8 +2478,23 @@ fn runtimePrintDebugTiming(ctx: *anyopaque) void {
     printRuntimeDebugTimingStats(runtimeDebugTimingStats(ctx), true);
 }
 
+fn runtimeRetainOutputOwner(ctx: *anyopaque) model_runtime.OutputOwner {
+    const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    const previous = runtime_ctx.references.fetchAdd(1, .monotonic);
+    std.debug.assert(previous != 0);
+    return .{ .ptr = ctx, .release = runtimeReleaseOutputOwner };
+}
+
+fn runtimeReleaseOutputOwner(ctx: *anyopaque) void {
+    const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    runtime_ctx.deinit();
+}
+
 fn runtimeDeinit(ctx: *anyopaque) void {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    // Stop speculative work when cache ownership retires, even if published
+    // outputs keep the backend and its prepared tail slots alive.
+    runtime_ctx.drainPipelinedDecode();
     runtime_ctx.deinit();
 }
 
@@ -3031,4 +3051,127 @@ test "sampled pipeline cancels invalid draws before submitting the next frame" {
     try std.testing.expectError(error.InjectedSubmitFailure, submitSampledPipelineToken(&cb, 7, vocab_size));
     try std.testing.expectEqual(@as(usize, 3), probe.submits);
     try std.testing.expectEqual(@as(usize, 5), probe.cancels);
+}
+
+test "resident Metal model output retains its actual backend across runtime eviction" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const path = @import("antfly_platform").env.getenv("ANTFLY_UNIFIED_DECODER_FIXTURE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var session = try session_factory.createMetalSession(a, path);
+    defer session.close();
+    session_factory.attachIo(session, std.testing.io);
+    var request_backend = try session_factory.getComputeBackend(session, a);
+    defer request_backend.deinit();
+    const config = session_factory.getGptConfig(session).?;
+    const Probe = struct {
+        fn prefill(ctx: *anyopaque, _: std.mem.Allocator, _: model_runtime.PrefillRequest) !model_runtime.ModelOutput {
+            const owner: *RuntimeContext = @ptrCast(@alignCast(ctx));
+            const tensor = try owner.cb.ensureDeviceResidentOwned(try owner.cb.fromFloat32Shape(&.{ 3, 5 }, &.{ 1, 2 }));
+            return .{ .device_logits = tensor, .device_logits_backend = owner.cb };
+        }
+        fn prepared(ctx: *anyopaque, _: std.mem.Allocator, _: model_runtime.PrefillRequest) !model_runtime.ModelOutput {
+            const owner: *RuntimeContext = @ptrCast(@alignCast(ctx));
+            const input = try owner.cb.ensureDeviceResidentOwned(try owner.cb.fromFloat32Shape(&.{ 3, 5 }, &.{ 1, 2 }));
+            defer owner.cb.free(input);
+            const metal = @import("../ops/metal_compute.zig").MetalCompute;
+            const pair = (try metal.reserveHiddenStatePair(&owner.cb, 1, 2)).?;
+            defer owner.cb.free(pair.front);
+            defer owner.cb.free(pair.back);
+            try std.testing.expect(try metal.copyTensorInto(&owner.cb, input, pair.front));
+            const published = try owner.cb.snapshotRows2D(std.testing.allocator, pair.front, 0, 1, 2);
+            return .{ .prepared_tail = .{ .final_hidden = published, .backend = owner.cb, .norm = .rms, .norm_slot = 0, .lm_head_slot = 0, .hidden_size = 2, .vocab_size = 2, .eps = 1e-6 } };
+        }
+    };
+    for ([_]bool{ false, true }) |prepared| {
+        const context = try RuntimeContext.init(a, session, config, null, null);
+        // Exercise output ownership with an actual device tensor independently of
+        // whether this deliberately small checkpoint qualifies for a fused decoder.
+        var callbacks = runtime_vtable;
+        callbacks.prefill = if (prepared) Probe.prepared else Probe.prefill;
+        var runtime_instance = model_runtime.ModelRuntime{ .ptr = context, .vtable = &callbacks };
+        var runtime_live = true;
+        defer if (runtime_live) runtime_instance.deinit();
+        if (prepared) {
+            const norm = try context.cb.fromFloat32Shape(&.{ 1, 1 }, &.{2});
+            defer context.cb.free(norm);
+            const weights = try context.cb.fromFloat32Shape(&.{ 1, 0, 0, 1 }, &.{ 2, 2 });
+            defer context.cb.free(weights);
+            const bias = try context.cb.fromFloat32Shape(&.{ 0, 0 }, &.{2});
+            defer context.cb.free(bias);
+            try std.testing.expect(try context.cb.decoderRuntimePrepareRmsNorm(&.{ .slot = 0, .weight = norm, .hidden_size = 2 }));
+            try std.testing.expect(try context.cb.decoderRuntimePrepareLinear(&.{ .slot = 0, .weight = weights, .bias = bias, .in_dim = 2, .out_dim = 2 }));
+        }
+        const transfer_audit = @import("../execution/transfer_audit.zig");
+        var audit = transfer_audit.Audit{ .forbid_device_host_access = true };
+        try transfer_audit.begin(&audit);
+        var auditing = true;
+        defer if (auditing) transfer_audit.end();
+        var output = try runtime_instance.prefill(a, .{ .input_ids = &.{1}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
+        defer output.deinit(a);
+        try std.testing.expect(output.owner != null);
+        try std.testing.expectEqual(@as(usize, 2), context.references.load(.acquire));
+        if (prepared) {
+            const metal = @import("../ops/metal_compute.zig").MetalCompute;
+            const pair = (try metal.reserveHiddenStatePair(&context.cb, 1, 2)).?;
+            defer context.cb.free(pair.front);
+            defer context.cb.free(pair.back);
+            const replacement = try context.cb.ensureDeviceResidentOwned(try context.cb.fromFloat32Shape(&.{ 99, 101 }, &.{ 1, 2 }));
+            defer context.cb.free(replacement);
+            try std.testing.expect(try metal.copyTensorInto(&context.cb, replacement, pair.front));
+        }
+        runtime_instance.deinit();
+        runtime_live = false;
+        try std.testing.expectEqual(@as(usize, 1), context.references.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+        transfer_audit.end();
+        auditing = false;
+        const actual = try output.hostLogits(a);
+        if (prepared) {
+            const inv = 1 / @sqrt(@as(f32, 17) + 1e-6);
+            try std.testing.expectApproxEqAbs(@as(f32, 3) * inv, actual[0], 1e-6);
+            try std.testing.expectApproxEqAbs(@as(f32, 5) * inv, actual[1], 1e-6);
+        } else try std.testing.expectEqualSlices(f32, &.{ 3, 5 }, actual);
+        try std.testing.expect(output.owner == null);
+    }
+}
+
+test "resident Metal decoder releases host mirrors across prompts and runtime eviction" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_UNIFIED_DECODER_FIXTURE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var session = try session_factory.createMetalSession(a, path);
+    defer session.close();
+    session_factory.attachIo(session, std.testing.io);
+    var request_backend = try session_factory.getComputeBackend(session, a);
+    defer request_backend.deinit();
+    const config = session_factory.getGptConfig(session).?;
+    var executor = try createModelExecutor(a, session, config, null, null);
+    defer executor.deinit();
+    var instance = try executor.createRuntime(a);
+    var live = true;
+    defer if (live) instance.deinit();
+    _ = try instance.prepare(a, .{ .kv_tokens_hint = 12 });
+    var baseline: ?u64 = null;
+    for (0..12) |iteration| {
+        if (iteration != 0 and iteration % 4 == 0) {
+            instance.deinit();
+            live = false;
+            instance = try executor.createRuntime(a);
+            live = true;
+            _ = try instance.prepare(a, .{ .kv_tokens_hint = 12 });
+        }
+        try instance.reset();
+        {
+            var output = try instance.prefill(a, .{ .input_ids = &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, .seq_len = 8, .query_seq_len = 8, .attention_mode = .paged_prefill });
+            defer output.deinit(a);
+            _ = try output.hostLogits(a);
+        }
+        for (0..4) |step| {
+            var output = try instance.decode(a, .{ .token_id = @intCast(11 + step), .position = 8 + step });
+            defer output.deinit(a);
+            _ = try output.hostLogits(a);
+        }
+        const mirrors = @import("../backends/metal_tensor.zig").memoryStatsSnapshot().host_mirror_live_bytes;
+        if (baseline) |expected| try std.testing.expectEqual(expected, mirrors) else baseline = mirrors;
+    }
 }

@@ -27,6 +27,7 @@ extern fn unsetenv(name: [*:0]const u8) c_int;
 
 pub const backends = @import("backends/backends.zig");
 pub const platform = @import("antfly_platform");
+pub const execution = @import("execution/root.zig");
 pub const execution_control = @import("execution_control.zig");
 pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
 pub const HardCancellationWatchdog = @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog;
@@ -125,6 +126,9 @@ pub const native_compute = struct {
 };
 
 test {
+    // Keep host-only ownership/descriptor tests reachable under narrow filters.
+    if (!build_options.enable_wasm) _ = @import("ops/cuda/embedded_module.zig");
+    _ = @import("ops/kernel_geometry.zig");
     _ = server;
     _ = @import("extractors/gliner_span_long_executor.zig");
     _ = @import("architectures/modern_bert.zig");
@@ -139,7 +143,7 @@ test {
     _ = @import("finetune/laya/training_test.zig");
     _ = @import("finetune/laya/training_packed_test.zig");
     _ = @import("finetune/laya/fused_attention_test.zig");
-    _ = @import("ops/segment_training_attention.zig");
+    _ = @import("ops/range_attention_reference.zig");
     _ = @import("finetune/laya/data.zig");
     _ = @import("finetune/laya/job.zig");
     _ = @import("finetune/laya/evaluate.zig");
@@ -172,6 +176,7 @@ test {
     _ = registry;
     _ = tabular;
     _ = models;
+    _ = @import("models/session_contract.zig");
     _ = gguf;
     _ = runtime;
     _ = util;
@@ -209,7 +214,7 @@ test {
     _ = @import("ops/deberta_training_attention_test.zig");
     _ = @import("ops/deberta_training_attention_source_test.zig");
     _ = @import("ops/deberta_training_attention_device_test.zig");
-    _ = @import("ops/modernbert_training_attention.zig");
+    _ = @import("ops/range_attention_reference.zig");
     _ = @import("ops/modernbert_training_attention_device_test.zig");
     _ = @import("ops/segment_training_attention_device_test.zig");
     _ = @import("graph/recomputed_training_test.zig");
@@ -364,27 +369,26 @@ test "non-device-scalar GQA attention never returns generated decode" {
     ctx.driver.fns.cuLaunchKernel = &Mocks.launchKernel;
 
     const buffer = buffer_mod.DeviceBuffer{ .ptr = 1, .len = 256 * @sizeOf(f32) };
-    const kind = try module.launchGqaAttentionF32(
-        &ctx,
-        buffer,
-        buffer,
-        buffer,
-        buffer,
-        .{},
-        .{},
-        1,
-        1,
-        1,
-        1,
-        1,
-        256,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-    );
+    const kind = try module.launchGqaAttentionF32(&ctx, &.{
+        .dst = buffer,
+        .q = buffer,
+        .k = buffer,
+        .v = buffer,
+        .attn_or_mask = .{},
+        .bias = .{},
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = 1,
+        .num_heads = 1,
+        .num_kv_heads = 1,
+        .head_dim = 256,
+        .query_position_offset = 0,
+        .kv_position_offset = 0,
+        .sliding_window = 0,
+        .total_sequence_len = 1,
+        .mask_len = 0,
+        .bias_mode = 0,
+    });
     try std.testing.expectEqual(kernels_mod.GqaAttentionLaunchKind.decode, kind);
     try std.testing.expect(kind != .decode_generated);
     try std.testing.expectEqual(@as(usize, 1), ctx.stats.kernel_launches);

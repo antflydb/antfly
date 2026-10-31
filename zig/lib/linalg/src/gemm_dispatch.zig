@@ -16,6 +16,7 @@
 //! Dispatch above the arithmetic kernels and below threading. Attention's
 //! sequential calls use the same selection without nested worker pools.
 const core = @import("gemm.zig");
+const builtin = @import("builtin");
 pub const x86 = @import("x86.zig");
 pub const SgemmTile = core.SgemmTile;
 pub const sgemm_tile = core.sgemm_tile;
@@ -58,7 +59,12 @@ pub fn sgemmTransBF16AddSlice(m_start: usize, m_end: usize, n: usize, k: usize, 
     core.sgemmTransBF16AddSlice(m_start, m_end, n, k, alpha, a, b, c);
 }
 
-pub fn sgemmSequential(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c: []f32) void {
+// Native hot entries keep their alignment as linked backend code changes.
+// WebAssembly rejects explicit function alignment and uses the same core math.
+pub const sgemmSequential = if (builtin.cpu.arch.isWasm()) core.sgemmSequential else sgemmSequentialAligned;
+pub const sgemmTransBSequential = if (builtin.cpu.arch.isWasm()) core.sgemmTransBSequential else sgemmTransBSequentialAligned;
+
+fn sgemmSequentialAligned(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c: []f32) align(64) void {
     if (comptime !x86.enabled) return core.sgemmSequential(m, n, k, alpha, a, b, beta, c);
     if (m == 0 or n == 0) return;
     applyBeta(c[0 .. m * n], beta);
@@ -66,7 +72,7 @@ pub fn sgemmSequential(m: usize, n: usize, k: usize, alpha: f32, a: []const f32,
     sgemmAddSlice(0, m, n, k, alpha, a, b, c);
 }
 
-pub fn sgemmTransBSequential(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c: []f32) void {
+fn sgemmTransBSequentialAligned(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c: []f32) align(64) void {
     if (comptime !x86.enabled) return core.sgemmTransBSequential(m, n, k, alpha, a, b, beta, c);
     if (m == 0 or n == 0) return;
     applyBeta(c[0 .. m * n], beta);

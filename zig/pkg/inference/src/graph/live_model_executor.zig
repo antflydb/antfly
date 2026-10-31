@@ -18,7 +18,6 @@ const backends = @import("../backends/backends.zig");
 const cache_mod = @import("cache.zig");
 const decode_state_runtime = @import("decode_state_runtime.zig");
 const session_factory = @import("../architectures/session_factory.zig");
-const generation = @import("../pipelines/generation.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
@@ -56,7 +55,7 @@ const RuntimeContext = struct {
         kv_dtype_override: ?runtime.kv.pool.KvDType,
         shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
     ) !*RuntimeContext {
-        const cb = try session_factory.getComputeBackend(session, allocator);
+        const cb = try session.acquireComputeBackend(allocator, .{});
         errdefer {
             var cb_mut = cb;
             cb_mut.deinit();
@@ -127,7 +126,7 @@ const RuntimeContext = struct {
         return self.decode_runtime.currentTokenCount();
     }
 
-    fn kvView(self: *const RuntimeContext) ?generation.KvView {
+    fn kvView(self: *const RuntimeContext) ?decode_state_runtime.KvView {
         return self.decode_runtime.kvView();
     }
 
@@ -165,18 +164,18 @@ const RuntimeContext = struct {
         query_seq_len: usize,
         attention_mode: cache_mod.AttentionMode,
     ) gpt_arch.DecodeContext {
-        return self.decode_runtime.makeDecodeContext(seq_len, query_seq_len, attention_mode);
+        return self.decode_runtime.makeDecodeContextForMode(seq_len, query_seq_len, attention_mode);
     }
 
     fn preparePrefill(self: *RuntimeContext, seq_len: usize, query_seq_len: usize, attention_mode: cache_mod.AttentionMode) !gpt_arch.DecodeContext {
-        return self.decode_runtime.preparePrefill(seq_len, query_seq_len, attention_mode);
+        return self.decode_runtime.preparePrefillForMode(seq_len, query_seq_len, attention_mode);
     }
 
     fn beginDecodeStep(self: *RuntimeContext, position: usize, attention_mode: cache_mod.AttentionMode) !struct {
         seq_len: usize,
         decode_context: gpt_arch.DecodeContext,
     } {
-        const step = try self.decode_runtime.beginDecodeStep(position, attention_mode);
+        const step = try self.decode_runtime.beginDecodeStepForMode(position, attention_mode);
         return .{
             .seq_len = step.seq_len,
             .decode_context = step.decode_context,

@@ -110,6 +110,8 @@ pub const CompiledModelExecutor = struct {
 pub const CacheEntry = struct {
     key: CacheKey,
     graph: Graph,
+    /// Allocator for cached resources when the graph itself is borrowed.
+    resource_allocator: ?std.mem.Allocator = null,
     /// Monotonic counter — higher = more recently used.
     last_used: u64,
     /// Cached weight tensors for parameter nodes. Populated on first
@@ -119,6 +121,8 @@ pub const CacheEntry = struct {
     /// Pre-computed reachable set + last-use arrays.  Populated on
     /// first execution so the interpreter skips per-decode analysis.
     cached_analysis: ?CachedAnalysis = null,
+    single_device_backend: ComputeBackend = undefined,
+    single_device_executable: ?*@import("../execution/executable.zig").Executable = null,
     /// Cached compiled partition executors. Populated on
     /// first multi-device execution. Pointers into this array are borrowed
     /// by partitions during execution (set owns_executors=false on the plan).
@@ -133,18 +137,30 @@ pub const CacheEntry = struct {
     compiled_model_executor: ?CompiledModelExecutor = null,
     compiled_model_runtime: ?model_runtime.ModelRuntime = null,
 
+    fn resourceAllocator(self: *const CacheEntry) std.mem.Allocator {
+        return self.resource_allocator orelse self.graph.allocator;
+    }
+
     fn freeWeights(self: *CacheEntry, cb: *const ComputeBackend) void {
         if (self.weight_inputs) |inputs| {
             for (inputs) |ri| cb.free(ri.value);
-            self.graph.allocator.free(inputs);
+            self.resourceAllocator().free(inputs);
             self.weight_inputs = null;
         }
+    }
+
+    pub fn resetSingleDeviceExecutable(self: *CacheEntry) void {
+        if (self.single_device_executable) |executable| {
+            executable.deinit();
+            self.resourceAllocator().destroy(executable);
+        }
+        self.single_device_executable = null;
     }
 
     fn freeAnalysis(self: *CacheEntry) void {
         if (self.cached_analysis) |*ca| {
             var analysis = ca.*;
-            analysis.deinit(self.graph.allocator);
+            analysis.deinit(self.resourceAllocator());
             self.cached_analysis = null;
         }
     }
@@ -153,9 +169,9 @@ pub const CacheEntry = struct {
         if (self.compiled_partitions) |cps| {
             for (cps) |*cp| {
                 cp.executor.deinitExecutor();
-                self.graph.allocator.free(cp.runtime_input_node_ids);
+                self.resourceAllocator().free(cp.runtime_input_node_ids);
             }
-            self.graph.allocator.free(cps);
+            self.resourceAllocator().free(cps);
         }
         self.compiled_partitions = null;
         self.compiled_partitions_backend = null;
@@ -221,7 +237,7 @@ pub const max_entries: usize = 32;
 
 /// LRU cache of traced computation graphs.
 pub const GraphCache = struct {
-    entries: std.ArrayListUnmanaged(CacheEntry),
+    entries: std.ArrayListUnmanaged(*CacheEntry),
     allocator: std.mem.Allocator,
     /// Monotonic use counter for LRU eviction.
     use_counter: u64,
@@ -242,11 +258,13 @@ pub const GraphCache = struct {
 
     pub fn deinit(self: *GraphCache) void {
         self.freeSessionCompiledModelRuntime();
-        for (self.entries.items) |*entry| {
+        for (self.entries.items) |entry| {
             entry.freeCompiledModelExecutor();
             entry.freeCompiledPartitions();
+            entry.resetSingleDeviceExecutable();
             entry.freeAnalysis();
             entry.graph.deinit();
+            self.allocator.destroy(entry);
             // Note: weight CTs require a ComputeBackend to free.
             // Use deinitWithBackend() to properly release weight caches.
         }
@@ -256,12 +274,14 @@ pub const GraphCache = struct {
     /// Deinit with proper weight cache cleanup.
     pub fn deinitWithBackend(self: *GraphCache, cb: *const ComputeBackend) void {
         self.freeSessionCompiledModelRuntime();
-        for (self.entries.items) |*entry| {
+        for (self.entries.items) |entry| {
             entry.freeCompiledModelExecutor();
             entry.freeCompiledPartitions();
+            entry.resetSingleDeviceExecutable();
             entry.freeWeights(cb);
             entry.freeAnalysis();
             entry.graph.deinit();
+            self.allocator.destroy(entry);
         }
         self.entries.deinit(self.allocator);
     }
@@ -317,7 +337,7 @@ pub const GraphCache = struct {
 
     /// Look up a cached graph by key. Returns null on cache miss.
     pub fn get(self: *GraphCache, key: CacheKey) ?*const Graph {
-        for (self.entries.items) |*entry| {
+        for (self.entries.items) |entry| {
             if (CacheKey.eql(entry.key, key)) {
                 self.use_counter += 1;
                 entry.last_used = self.use_counter;
@@ -330,7 +350,7 @@ pub const GraphCache = struct {
     /// Look up a cached entry by key. Returns the full mutable entry
     /// so callers can access/populate the weight cache.
     pub fn getEntry(self: *GraphCache, key: CacheKey) ?*CacheEntry {
-        for (self.entries.items) |*entry| {
+        for (self.entries.items) |entry| {
             if (CacheKey.eql(entry.key, key)) {
                 self.use_counter += 1;
                 entry.last_used = self.use_counter;
@@ -349,10 +369,11 @@ pub const GraphCache = struct {
     /// Insert with optional backend for proper weight cache eviction.
     pub fn putWithBackend(self: *GraphCache, key: CacheKey, graph: Graph, cb: ?*const ComputeBackend) !void {
         // Check for duplicate key (replace existing)
-        for (self.entries.items) |*entry| {
+        for (self.entries.items) |entry| {
             if (CacheKey.eql(entry.key, key)) {
                 entry.freeCompiledPartitions();
                 entry.freeCompiledModelExecutor();
+                entry.resetSingleDeviceExecutable();
                 if (cb) |backend| entry.freeWeights(backend);
                 entry.freeAnalysis();
                 entry.graph.deinit();
@@ -363,6 +384,10 @@ pub const GraphCache = struct {
             }
         }
 
+        // Prepare the new stable owner before replacing an existing entry.
+        const inserted = try self.allocator.create(CacheEntry);
+        errdefer self.allocator.destroy(inserted);
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
         // Evict LRU if at capacity
         if (self.entries.items.len >= max_entries) {
             var lru_idx: usize = 0;
@@ -375,18 +400,16 @@ pub const GraphCache = struct {
             }
             self.entries.items[lru_idx].freeCompiledPartitions();
             self.entries.items[lru_idx].freeCompiledModelExecutor();
+            self.entries.items[lru_idx].resetSingleDeviceExecutable();
             if (cb) |backend| self.entries.items[lru_idx].freeWeights(backend);
             self.entries.items[lru_idx].freeAnalysis();
             self.entries.items[lru_idx].graph.deinit();
-            _ = self.entries.swapRemove(lru_idx);
+            self.allocator.destroy(self.entries.swapRemove(lru_idx));
         }
 
         self.use_counter += 1;
-        try self.entries.append(self.allocator, .{
-            .key = key,
-            .graph = graph,
-            .last_used = self.use_counter,
-        });
+        inserted.* = .{ .key = key, .graph = graph, .last_used = self.use_counter };
+        self.entries.appendAssumeCapacity(inserted);
     }
 
     /// Number of cached entries.
@@ -397,11 +420,13 @@ pub const GraphCache = struct {
     /// Remove all cached entries and free their graphs.
     pub fn clear(self: *GraphCache) void {
         self.freeSessionCompiledModelRuntime();
-        for (self.entries.items) |*entry| {
+        for (self.entries.items) |entry| {
             entry.freeCompiledModelExecutor();
             entry.freeCompiledPartitions();
+            entry.resetSingleDeviceExecutable();
             entry.freeAnalysis();
             entry.graph.deinit();
+            self.allocator.destroy(entry);
         }
         self.entries.clearRetainingCapacity();
         self.use_counter = 0;
@@ -950,4 +975,49 @@ test "selectCompiledPartitionsBackend resets mismatched backend caches" {
     try std.testing.expectEqual(@as(?contracts.BackendKind, .metal), entry.compiled_partitions_backend);
     try std.testing.expectEqual(@as(?CompiledAttachmentTarget, .partitioned), entry.compiled_partitions_attachment_target);
     try std.testing.expectEqual(CompiledPartitionCacheStatus.uninitialized, entry.compiled_partitions_status);
+}
+
+test "GraphCache entry addresses survive growth and unrelated LRU eviction" {
+    const a = std.testing.allocator;
+    var cache = GraphCache.init(a);
+    defer cache.deinit();
+    var first: ?*CacheEntry = null;
+    const protected = CacheKey{ .config_hash = 0, .batch = 1, .seq_len = 1, .attention_mode = .full_recompute };
+    for (0..max_entries + 8) |index| {
+        if (first != null) try std.testing.expectEqual(first.?, cache.getEntry(protected).?);
+        var graph = Graph.init(a);
+        var owned = true;
+        defer if (owned) graph.deinit();
+        var b = Builder.init(&graph);
+        const x = try b.parameter("x", Shape.init(.f32, &.{4}));
+        const y = try b.neg(x);
+        try graph.markOutput(y);
+        var key = protected;
+        key.config_hash = index;
+        try cache.put(key, graph);
+        owned = false;
+        if (first == null) first = cache.getEntry(protected).?;
+        try std.testing.expectEqual(&first.?.graph, cache.get(protected).?);
+    }
+}
+
+test "GraphCache stable entry insertion and replacement clean up every allocation failure" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var cache = GraphCache.init(a);
+            defer cache.deinit();
+            for (0..3) |index| {
+                var graph = Graph.init(a);
+                var owned = true;
+                defer if (owned) graph.deinit();
+                var b = Builder.init(&graph);
+                const x = try b.parameter("x", Shape.init(.f32, &.{4}));
+                try graph.markOutput(try b.neg(x));
+                const key = CacheKey{ .config_hash = index % 2, .batch = 1, .seq_len = 1, .attention_mode = .full_recompute };
+                try cache.put(key, graph);
+                owned = false;
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

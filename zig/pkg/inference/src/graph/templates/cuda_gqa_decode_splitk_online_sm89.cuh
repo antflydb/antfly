@@ -42,11 +42,15 @@
 #error "ANTFLY_SPLITK_ONLINE_MAX_VISIBLE_TOKENS must match the qualified policy"
 #endif
 
-namespace ANTFLY_SPLITK_ONLINE_NAMESPACE {
+// antfly-splitk:begin common
+#include <cuda_fp16.h>
+#include <float.h>
+#include <stddef.h>
+#include <stdint.h>
+#ifndef ANTFLY_SPLITK_COMMON_DEFINED
+#define ANTFLY_SPLITK_COMMON_DEFINED
+namespace antfly_splitk_common {
 
-constexpr unsigned kHeadDim = ANTFLY_SPLITK_ONLINE_HEAD_DIM;
-constexpr unsigned kSlidingWindow = ANTFLY_SPLITK_ONLINE_SLIDING_WINDOW;
-constexpr unsigned kMaxVisibleTokens = ANTFLY_SPLITK_ONLINE_MAX_VISIBLE_TOKENS;
 constexpr unsigned kHeads = 8u;
 constexpr unsigned kKvHeads = 1u;
 constexpr unsigned kSplits = 64u;
@@ -54,7 +58,6 @@ constexpr unsigned kThreads = 128u;
 constexpr unsigned kPageTokens = 16u;
 constexpr unsigned kF16Format = 2u;
 constexpr unsigned kInvalidToken = 0xffffffffu;
-constexpr unsigned kMaxItems = kHeadDim / kThreads;
 
 __device__ __forceinline__ float warp_reduce_sum_f32(float value) {
     value += __shfl_down_sync(0xffffffffu, value, 16);
@@ -111,9 +114,9 @@ __device__ __forceinline__ float f16_value(
     return __half2float(reinterpret_cast<const __half*>(row)[index]);
 }
 
-}  // namespace ANTFLY_SPLITK_ONLINE_NAMESPACE
 
-extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
+template<unsigned kHeadDim, unsigned kSlidingWindow, unsigned kMaxVisibleTokens>
+__device__ __forceinline__ void splitk_online_body(
     float* dst,
     unsigned* completion_counters,
     // Volatile is part of the cross-CTA publication contract: after each
@@ -147,7 +150,7 @@ extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
     unsigned score_capacity,
     const unsigned* decode_scalars
 ) {
-    using namespace ANTFLY_SPLITK_ONLINE_NAMESPACE;
+    constexpr unsigned kMaxItems = kHeadDim / kThreads;
     if (decode_scalars != nullptr) {
         kv_position_offset = decode_scalars[4];
         query_position_offset = decode_scalars[1];
@@ -366,4 +369,64 @@ extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
     }
     if (tid == 0u) atomicExch(&completion_counters[head], 0u);
     asm volatile("" : : "r"(total_sequence_len));
+}
+
+} // namespace antfly_splitk_common
+#endif
+// antfly-splitk:end common
+
+namespace ANTFLY_SPLITK_ONLINE_NAMESPACE {
+using namespace antfly_splitk_common;
+constexpr unsigned kHeadDim = ANTFLY_SPLITK_ONLINE_HEAD_DIM;
+constexpr unsigned kSlidingWindow = ANTFLY_SPLITK_ONLINE_SLIDING_WINDOW;
+constexpr unsigned kMaxVisibleTokens = ANTFLY_SPLITK_ONLINE_MAX_VISIBLE_TOKENS;
+constexpr unsigned kMaxItems = kHeadDim / kThreads;
+}
+
+extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
+    float* dst,
+    unsigned* completion_counters,
+    // Volatile is part of the cross-CTA publication contract: after each
+    // producer's __threadfence and atomic counter increment, the last CTA must
+    // reload globally visible partials rather than satisfy reads from stale L1.
+    volatile float* partial_values,
+    volatile float* partial_max,
+    volatile float* partial_denom,
+    const float* q,
+    const unsigned char* k,
+    const unsigned char* v,
+    const unsigned* block_table,
+    unsigned batch,
+    unsigned q_seq_len,
+    unsigned kv_seq_len,
+    unsigned num_heads,
+    unsigned num_kv_heads,
+    unsigned head_dim,
+    unsigned query_position_offset,
+    unsigned kv_position_offset,
+    unsigned sliding_window,
+    unsigned total_sequence_len,
+    unsigned key_row_bytes,
+    unsigned base_key_row_bytes,
+    unsigned value_row_bytes,
+    unsigned block_count,
+    unsigned page_size_tokens,
+    unsigned key_format,
+    unsigned value_format,
+    unsigned physical_token_capacity,
+    unsigned score_capacity,
+    const unsigned* decode_scalars
+) {
+    antfly_splitk_common::splitk_online_body<
+        ANTFLY_SPLITK_ONLINE_HEAD_DIM,
+        ANTFLY_SPLITK_ONLINE_SLIDING_WINDOW,
+        ANTFLY_SPLITK_ONLINE_MAX_VISIBLE_TOKENS>(
+        dst, completion_counters, partial_values, partial_max,
+        partial_denom, q, k, v,
+        block_table, batch, q_seq_len, kv_seq_len,
+        num_heads, num_kv_heads, head_dim, query_position_offset,
+        kv_position_offset, sliding_window, total_sequence_len, key_row_bytes,
+        base_key_row_bytes, value_row_bytes, block_count, page_size_tokens,
+        key_format, value_format, physical_token_capacity, score_capacity,
+        decode_scalars);
 }

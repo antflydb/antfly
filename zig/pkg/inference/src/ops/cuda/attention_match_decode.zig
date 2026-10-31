@@ -55,17 +55,20 @@ pub const Request = struct {
     softcap: f32 = 0,
 };
 
+const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("artifacts/attention_match_decode.fatbin"), .{
+    .partial_f16 = "attention_match_partial_f16",
+    .partial_f32 = "attention_match_partial_f32",
+    .append_f16 = "attention_match_append_f16",
+    .append_f32 = "attention_match_append_f32",
+    .merge = "attention_match_merge",
+    .rotated_f16 = "attention_match_rotated_f16",
+    .rotated_f32 = "attention_match_rotated_f32",
+    .rotate_queries = "attention_match_rotate_queries",
+});
+
 pub const Runner = struct {
     context: *Context,
-    module: driver.CUmodule,
-    partial_f16: driver.CUfunction,
-    partial_f32: driver.CUfunction,
-    append_f16: driver.CUfunction,
-    append_f32: driver.CUfunction,
-    merge: driver.CUfunction,
-    rotated_f16: driver.CUfunction = null,
-    rotated_f32: driver.CUfunction = null,
-    rotate_queries: driver.CUfunction = null,
+    program: Program,
     rotated_queries: Buffer = .{},
     descriptors: Buffer = .{},
     partials: Buffer = .{},
@@ -76,19 +79,9 @@ pub const Runner = struct {
     pub fn init(context: *Context, max_device_bytes: usize) !Runner {
         try context.makeCurrent();
         if (try context.streamCaptureActive()) return error.CompactionDuringGraphCapture;
-        var module: driver.CUmodule = null;
-        try context.driver.check(context.driver.fns.cuModuleLoadDataEx(&module, @embedFile("artifacts/attention_match_decode.fatbin").ptr, 0, null, null));
-        errdefer _ = context.driver.fns.cuModuleUnload(module);
-        var result: Runner = .{ .context = context, .module = module, .partial_f16 = null, .partial_f32 = null, .append_f16 = null, .append_f32 = null, .merge = null, .max_device_bytes = max_device_bytes };
-        try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.partial_f16, module, "attention_match_partial_f16"));
-        try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.partial_f32, module, "attention_match_partial_f32"));
-        try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.append_f16, module, "attention_match_append_f16"));
-        try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.append_f32, module, "attention_match_append_f32"));
-        try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.merge, module, "attention_match_merge"));
-        try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.rotated_f16, module, "attention_match_rotated_f16"));
-        try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.rotated_f32, module, "attention_match_rotated_f32"));
-        try context.driver.check(context.driver.fns.cuModuleGetFunction(&result.rotate_queries, module, "attention_match_rotate_queries"));
-        return result;
+        var program: Program = .{};
+        try program.initCurrent(&context.driver);
+        return .{ .context = context, .program = program, .max_device_bytes = max_device_bytes };
     }
 
     pub fn deinit(self: *Runner) void {
@@ -98,7 +91,7 @@ pub const Runner = struct {
         self.partials.free(self.context);
         self.status.free(self.context);
         self.rotated_queries.free(self.context);
-        _ = self.context.driver.fns.cuModuleUnload(self.module);
+        self.program.deinitCurrent(&self.context.driver) catch return;
         self.* = undefined;
     }
 
@@ -156,7 +149,7 @@ pub const Runner = struct {
         errdefer self.context.synchronize() catch {};
         try self.descriptors.copyFromHost(self.context, std.mem.sliceAsBytes(descriptors[0..heads.len]));
         try self.status.copyFromHost(self.context, std.mem.asBytes(&status));
-        try self.launch(if (state.precision == .f16) self.append_f16 else self.append_f32, (count + 255) / 256, 1, .{ keys.ptr, values.ptr, self.descriptors.ptr, int(heads.len), int(dim), int(rows), first_position, self.status.ptr });
+        try self.launch(if (state.precision == .f16) self.program.function(.append_f16) else self.program.function(.append_f32), (count + 255) / 256, 1, .{ keys.ptr, values.ptr, self.descriptors.ptr, int(heads.len), int(dim), int(rows), first_position, self.status.ptr });
         try self.status.copyToHost(self.context, std.mem.asBytes(&status));
         try self.context.synchronize();
         if (status != 0) return error.NonFiniteAttention;
@@ -232,12 +225,12 @@ pub const Runner = struct {
             const mass = if (request.log_mass) |buffer| buffer.ptr + offset * request.query_heads * 4 else @as(usize, 0);
             const position = request.first_query_position + offset;
             if (compressed) {
-                try self.launch(self.rotate_queries, rows * request.query_heads, 1, .{ q, self.rotated_queries.ptr, int(dim) });
-                try self.launch(if (request.precision == .f16) self.rotated_f16 else self.rotated_f32, splits, rows * request.query_heads, .{ q, self.rotated_queries.ptr, self.descriptors.ptr, self.partials.ptr, int(request.query_heads), int(request.heads.len), int(dim), int(splits), position, request.scale, request.softcap, @as(u64, request.heads[0].window) });
+                try self.launch(self.program.function(.rotate_queries), rows * request.query_heads, 1, .{ q, self.rotated_queries.ptr, int(dim) });
+                try self.launch(if (request.precision == .f16) self.program.function(.rotated_f16) else self.program.function(.rotated_f32), splits, rows * request.query_heads, .{ q, self.rotated_queries.ptr, self.descriptors.ptr, self.partials.ptr, int(request.query_heads), int(request.heads.len), int(dim), int(splits), position, request.scale, request.softcap, @as(u64, request.heads[0].window) });
             } else {
-                try self.launch(if (request.precision == .f16) self.partial_f16 else self.partial_f32, splits, rows * request.query_heads, .{ q, self.descriptors.ptr, self.partials.ptr, int(request.query_heads), int(request.heads.len), int(dim), int(splits), position, request.scale, request.softcap, @as(u64, request.heads[0].window) });
+                try self.launch(if (request.precision == .f16) self.program.function(.partial_f16) else self.program.function(.partial_f32), splits, rows * request.query_heads, .{ q, self.descriptors.ptr, self.partials.ptr, int(request.query_heads), int(request.heads.len), int(dim), int(splits), position, request.scale, request.softcap, @as(u64, request.heads[0].window) });
             }
-            try self.launch(self.merge, rows * request.query_heads, 1, .{ self.partials.ptr, out, mass, int(dim), int(splits) });
+            try self.launch(self.program.function(.merge), rows * request.query_heads, 1, .{ self.partials.ptr, out, mass, int(dim), int(splits) });
             // Bound cancellation latency and retire scratch before reuse.
             try self.context.synchronize();
             offset += rows;

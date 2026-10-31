@@ -1402,6 +1402,7 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
         const owned = try MetalKvStorage.create(allocator, metal, dtype, kv_heads, head_dim, 4);
         defer owned.deviceWriteHook().deinit(allocator);
         const binding = try owned.acquireBinding(.{ .sequence_id = 91, .layer_index = 0 }, 0, false, true);
+        try std.testing.expect(binding.slot >= metal_runtime.paged_kv_slot_base);
         const layout = owned.rowLayout(kv_heads, head_dim);
         try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_update_attention_span_from_f32_key_device_slot(
             metal,
@@ -1420,6 +1421,9 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             0,
         ));
         binding.written_tokens = rows;
+        // This fixture writes the native slot directly, bypassing the storage
+        // writer that normally publishes contiguous physical-row metadata.
+        binding.logical_contiguous = true;
 
         // This fixture writes the physical prefix directly, bypassing the
         // normal writer that establishes its logical row mapping.

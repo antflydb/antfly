@@ -3361,6 +3361,7 @@ fn rebuild(
 
     // Build old->new ID mapping in topological order.
     const id_map = try allocator.alloc(NodeId, count);
+    errdefer allocator.free(id_map);
     @memset(id_map, null_node);
 
     var new_count: u32 = 0;
@@ -3415,6 +3416,10 @@ fn rebuild(
             try new_graph.parameters.append(allocator, id_map[redir]);
         }
     }
+
+    // External bindings follow redirects too. Representatives redirect to
+    // themselves, so their final IDs remain stable during this in-place fill.
+    for (0..count) |i| id_map[i] = id_map[resolve(redirect, @intCast(i))];
 
     return .{ .graph = new_graph, .id_map = id_map, .num_rewrites = num_rewrites };
 }

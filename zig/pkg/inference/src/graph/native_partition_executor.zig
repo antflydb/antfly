@@ -250,6 +250,9 @@ fn executeNativePlannedNode(
     exec_state: *interpreter.ExecState,
 ) !?CT {
     if (cb.kind() != .native) return null;
+    if (exec_state.options.physical_frame) |frame| {
+        if (try frame.execute(cb, values, node_id, if (graph.node(node_id).op == .fused_rope) (try interpreter.ropePositionOverride(exec_state.options.attention)) else null)) |output| return output;
+    }
     const n = graph.node(node_id);
     const inputs = n.getInputs();
     // Planned native kernels currently derive several operand layouts from

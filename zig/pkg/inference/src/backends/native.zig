@@ -30,9 +30,9 @@ pub const SegmentAttentionGemm = struct {
     pub const sgemmSync = @import("native.zig").sgemmSync;
 };
 
-/// Qualified wide tiles for EmbeddingGemma2's short sequences and global
-/// 512-dimensional heads. Long sliding layers retain SegmentAttentionGemm.
-pub fn EmbeddingGemma2SegmentAttentionGemm(comptime key_tile: usize) type {
+/// A 512-query BLAS tile amortizes dispatch for wide heads and short segments.
+/// Callers choose key reuse; long sliding segments retain SegmentAttentionGemm.
+pub fn WideSegmentAttentionGemm(comptime key_tile: usize) type {
     return struct {
         pub const query_block = 512;
         pub const key_block = key_tile;

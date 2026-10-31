@@ -40,11 +40,12 @@ pub fn create(ctx: Context) Suite {
     const native_cpu_debug = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
         ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and
         !ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
+    // CUDA serving reached 19.57 GB on Linux; dual-backend macOS reached
+    // 20.66 GB. Reserve 24 GiB for CUDA and 20 GiB for the measured 17.56 GB
+    // single-Metal suite. These are compiler scheduler reservations only.
     const tests = b.addTest(.{
-        // Zig 0.17's focused CUDA serving suite reached 19.57 GB on aarch64
-        // Linux. Reserve 24 GiB so the scheduler admits its measured compiler
-        // footprint and leaves room for the socket/reference coverage.
-        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
+        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else 9) * 1024 * 1024 * 1024,
+
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
@@ -70,21 +71,7 @@ pub fn create(ctx: Context) Suite {
     // Direct reader API tests share the runtime's request and result types.
     // Reuse the root owner so native reader options, imports, and framework
     // linkage stay consistent with the runtime under test.
-    const readers_mod = ctx.graph.inference_mod.import_table.get("antfly_readers") orelse blk: {
-        const standalone_readers_mod = b.createModule(.{
-            .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/readers/src/mod.zig" })),
-            .target = ctx.target,
-            .optimize = ctx.optimize,
-        });
-        standalone_readers_mod.addImport("antfly_document_runs", ctx.graph.document_runs_mod);
-        standalone_readers_mod.addImport("httpx", ctx.graph.httpx_mod);
-        standalone_readers_mod.addImport("inference_api", ctx.graph.inference_api_mod);
-        standalone_readers_mod.addImport("antfly_google", ctx.graph.google_mod);
-        standalone_readers_mod.addImport("antfly_reader_config", ctx.graph.reader_config_mod);
-        standalone_readers_mod.addImport("antfly_scraping", ctx.graph.scraping_mod);
-        standalone_readers_mod.addImport("antfly_image", ctx.graph.image_mod);
-        break :blk standalone_readers_mod;
-    };
+    const readers_mod = ctx.graph.inference_mod.import_table.get("antfly_readers").?;
     tests.root_module.addImport("antfly_readers", readers_mod);
     tests.root_module.addImport("antfly_document_runs", ctx.graph.document_runs_mod);
     tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);

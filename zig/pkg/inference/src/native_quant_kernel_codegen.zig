@@ -15,6 +15,22 @@
 
 const std = @import("std");
 const quant_kernel_compiler = @import("graph/quant_kernel_compiler.zig");
+const cuda_ffn_renderer = @import("graph/quant_kernel_cuda_ffn_renderer.zig");
+const cuda_renderer = @import("graph/quant_kernel_cuda_renderer.zig");
+const cpu_q8_renderer = @import("graph/quant_kernel_cpu_q8_renderer.zig");
+const cpu_k_projection_renderer = @import("graph/quant_kernel_cpu_k_projection_renderer.zig");
+const source_regions = @import("graph/quant_kernel_source_regions.zig");
+const gpu_training_renderer = @import("graph/quant_kernel_gpu_training_attention_renderer.zig");
+const gpu_operator_renderer = @import("graph/quant_kernel_gpu_operator_renderer.zig");
+const metal_attention_phases = @import("graph/quant_kernel_metal_attention_phases.zig");
+const metal_param_abi = @import("graph/quant_kernel_metal_param_abi.zig");
+const cpu_activation_renderer = @import("graph/quant_kernel_cpu_activation_pipeline_renderer.zig");
+const cpu_q8_dot_renderer = @import("graph/quant_kernel_cpu_q8_dot_renderer.zig");
+const cpu_panel_dot_renderer = @import("graph/quant_kernel_cpu_panel_dot_renderer.zig");
+const cpu_legacy_renderer = @import("graph/quant_kernel_cpu_legacy_renderer.zig");
+const cpu_grouped_renderer = @import("graph/quant_kernel_cpu_grouped_renderer.zig");
+const cpu_renderer = @import("graph/quant_kernel_cpu_renderer.zig");
+const cpu_schedule_renderer = @import("graph/quant_kernel_cpu_schedule_renderer.zig");
 const quant_kernel_compiler_renderer = @import("graph/quant_kernel_metal_renderer.zig");
 const quant_kernel_model_catalog = @import("graph/quant_kernel_model_catalog.zig");
 
@@ -79,23 +95,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             .inspect_model, .check_model => unreachable,
         }
     }
-    switch (mode) {
-        .check, .check_metal => {
-            try checkMetalRuntimeRegion(allocator, io);
-            try checkMetalLaunchShapeRegion(allocator, io);
-            try checkCudaRuntimeAttentionRegion(allocator, io);
-            try checkCudaRuntimeDevMatmulRegion(allocator, io);
-        },
-        .write => {
-            try writeMetalRuntimeRegion(allocator, io);
-            try writeMetalLaunchShapeRegion(allocator, io);
-            try writeCudaRuntimeAttentionRegion(allocator, io);
-            try writeCudaRuntimeDevMatmulRegion(allocator, io);
-        },
-        .inspect_model, .check_model => unreachable,
-    }
+    try processNativeOwnedSources(allocator, io, mode == .write);
     if (mode == .check_metal) try checkMetalArtifacts(allocator, io);
-    print("quant kernel generated sources {s}: {d} files + Metal/CUDA runtime regions\n", .{ @tagName(mode), files.len });
+    print("quant kernel generated sources {s}: {d} files + {d} native owned regions\n", .{ @tagName(mode), files.len, nativeOwnedRegionCount() });
 }
 
 // The runtime-embedded copy of the generated Metal quant kernels lives in
@@ -106,22 +108,12 @@ const metal_runtime_source_path = "src/backends/metal_kernels.m";
 const metal_runtime_region_begin_marker = "           // quant-kernel-codegen:begin generated quant kernels (do not edit; run: zig build quant-kernel-codegen -- --write)";
 const metal_runtime_region_end_marker = "           // quant-kernel-codegen:end generated quant kernels";
 
-const MetalRuntimeRegionSplit = struct {
-    prefix: []const u8,
-    region: []const u8,
-    suffix: []const u8,
-};
+const MetalRuntimeRegionSplit = SourceRegion;
 
-fn splitMetalRuntimeRegion(contents: []const u8) !MetalRuntimeRegionSplit {
-    const begin_line = metal_runtime_region_begin_marker ++ "\n";
-    const end_line = metal_runtime_region_end_marker ++ "\n";
-    const begin = std.mem.indexOf(u8, contents, begin_line) orelse return error.MetalRuntimeRegionMarkerMissing;
-    const region_start = begin + begin_line.len;
-    const end = std.mem.indexOfPos(u8, contents, region_start, end_line) orelse return error.MetalRuntimeRegionMarkerMissing;
-    return .{
-        .prefix = contents[0..region_start],
-        .region = contents[region_start..end],
-        .suffix = contents[end..],
+fn splitMetalRuntimeRegion(contents: []const u8) !SourceRegion {
+    return splitSourceRegion(contents, metal_runtime_region_begin_marker, metal_runtime_region_end_marker) catch |err| switch (err) {
+        error.SourceRegionMarkerDuplicate => error.MetalRuntimeRegionMarkerDuplicate,
+        else => error.MetalRuntimeRegionMarkerMissing,
     };
 }
 
@@ -129,25 +121,6 @@ fn readMetalRuntimeSource(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     const path = try existingSourcePath(allocator, io, metal_runtime_source_path);
     defer if (path.owned) allocator.free(path.value);
     return std.Io.Dir.cwd().readFileAlloc(io, path.value, allocator, .limited(8 * 1024 * 1024));
-}
-
-fn checkMetalRuntimeRegion(allocator: std.mem.Allocator, io: std.Io) !void {
-    const expected = try quant_kernel_compiler.renderMetalRuntimeQuantRegion(allocator);
-    defer allocator.free(expected);
-    const contents = try readMetalRuntimeSource(allocator, io);
-    defer allocator.free(contents);
-    const split = splitMetalRuntimeRegion(contents) catch |err| {
-        print("quant kernel Metal runtime region markers missing in {s}; run `zig build quant-kernel-codegen -- --write`\n", .{metal_runtime_source_path});
-        return err;
-    };
-    if (!std.mem.eql(u8, split.region, expected)) {
-        print(
-            "quant kernel Metal runtime region stale: path={s} expected_bytes={d} actual_bytes={d}; run `zig build quant-kernel-codegen -- --write`\n",
-            .{ metal_runtime_source_path, expected.len, split.region.len },
-        );
-        return error.GeneratedQuantKernelSourceStale;
-    }
-    try checkMetalRuntimeExternalHelpers(allocator, split);
 }
 
 // Helpers that live in metal_kernels.m outside the codegen-owned region but
@@ -160,6 +133,14 @@ fn checkMetalRuntimeExternalHelpers(allocator: std.mem.Allocator, split: MetalRu
         if (std.mem.indexOf(u8, split.prefix, fragment) == null and
             std.mem.indexOf(u8, split.suffix, fragment) == null)
         {
+            // A schema reference is valid only outside the generated region,
+            // with its native owner included. Standalone fields come from that
+            // same checked schema, preserving the reinterpret-cast ABI guard.
+            const include = "#include \"metal_param_abi.h\"";
+            const binding = "           TERMITE_METAL_ABI_MSL(paged_attention)\n";
+            if (std.mem.eql(u8, helper, metal_param_abi.declaration("paged_attention")) and
+                (std.mem.indexOf(u8, split.prefix, include) != null or std.mem.indexOf(u8, split.suffix, include) != null) and
+                (std.mem.indexOf(u8, split.prefix, binding) != null or std.mem.indexOf(u8, split.suffix, binding) != null)) continue;
             print(
                 "quant kernel Metal external helper drifted from compiler copy in {s}: {s}\n",
                 .{ metal_runtime_source_path, helper },
@@ -169,48 +150,141 @@ fn checkMetalRuntimeExternalHelpers(allocator: std.mem.Allocator, split: MetalRu
     }
 }
 
-fn writeMetalRuntimeRegion(allocator: std.mem.Allocator, io: std.Io) !void {
-    const expected = try quant_kernel_compiler.renderMetalRuntimeQuantRegion(allocator);
-    defer allocator.free(expected);
-    const contents = try readMetalRuntimeSource(allocator, io);
-    defer allocator.free(contents);
-    const split = try splitMetalRuntimeRegion(contents);
-    try checkMetalRuntimeExternalHelpers(allocator, split);
-    if (std.mem.eql(u8, split.region, expected)) return;
-    const updated = try std.mem.concat(allocator, u8, &.{ split.prefix, expected, split.suffix });
-    defer allocator.free(updated);
-    const path = try existingSourcePath(allocator, io, metal_runtime_source_path);
-    defer if (path.owned) allocator.free(path.value);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path.value, .data = updated });
-}
-
 // Generated CUDA attention kernels are linked into the runtime artifact from
 // this marker-delimited region. The standalone candidate sources and embedded
 // bundle are both rendered from the compiler registry.
 const cuda_runtime_source_path = "src/ops/cuda/artifacts/inference_cuda_kernels.cu";
+const cuda_shared_helpers_begin = "// quant-kernel-codegen:begin shared CUDA helpers (do not edit; run: zig build quant-kernel-codegen -- --write)";
+const cuda_shared_helpers_end = "// quant-kernel-codegen:end shared CUDA helpers";
+
+const cuda_production_matmul_begin = "// quant-kernel-codegen:begin generated CUDA promoted matmul kernels (do not edit; run: zig build quant-kernel-codegen -- --write)";
+const cuda_production_matmul_end = "// quant-kernel-codegen:end generated CUDA promoted matmul kernels";
+
+const cpu_source_owner_types = cpu_renderer.owners ++
+    .{ cpu_renderer.Q6ProjectionOwner, cpu_renderer.Q8KProjectionOwner } ++
+    cpu_renderer.q4_triple_owners ++ cpu_schedule_renderer.owners ++
+    cpu_grouped_renderer.owners ++ cpu_k_projection_renderer.owners ++ cpu_q8_renderer.owners ++ cpu_legacy_renderer.owners ++ cpu_panel_dot_renderer.owners ++ cpu_q8_dot_renderer.owners ++ cpu_activation_renderer.owners;
+const NativeSourceOwner = struct {
+    begin: []const u8,
+    render: *const fn (std.mem.Allocator) anyerror![]u8,
+    split: *const fn ([]const u8) anyerror!SourceRegion,
+    validate: ?*const fn (std.mem.Allocator, SourceRegion) anyerror!void = null,
+};
+fn nativeSourceOwner(comptime begin: []const u8, comptime end: []const u8, comptime render: anytype) NativeSourceOwner {
+    return .{ .begin = begin, .render = render, .split = struct {
+        fn split(contents: []const u8) !SourceRegion {
+            return splitSourceRegion(contents, begin, end);
+        }
+    }.split };
+}
+fn nativeSourceOwners(comptime owner_types: anytype) [owner_types.len]NativeSourceOwner {
+    var result: [owner_types.len]NativeSourceOwner = undefined;
+    for (owner_types, 0..) |Owner, index| result[index] = nativeSourceOwner(Owner.begin, Owner.end, Owner.render);
+    return result;
+}
+const cpu_source_owners = nativeSourceOwners(cpu_source_owner_types);
+const metal_source_owners = nativeSourceOwners(.{ gpu_operator_renderer.owners[0], metal_attention_phases.Owner } ++ gpu_training_renderer.metal_owners) ++ [_]NativeSourceOwner{
+    .{ .begin = metal_runtime_region_begin_marker, .render = quant_kernel_compiler.renderMetalRuntimeQuantRegion, .split = splitMetalRuntimeRegion, .validate = checkMetalRuntimeExternalHelpers },
+    nativeSourceOwner("           // quant-kernel-codegen:begin compatibility Metal attention (do not edit; run: zig build quant-kernel-codegen -- --write)", "           // quant-kernel-codegen:end compatibility Metal attention", quant_kernel_compiler.renderMetalRuntimeCompatibilityAttentionRegion),
+    .{ .begin = metal_launch_region_begin_marker, .render = quant_kernel_compiler.renderMetalLaunchShapeRegion, .split = splitMetalLaunchRegion },
+};
+const cuda_boundary_source_owners = nativeSourceOwners(.{gpu_operator_renderer.owners[1]});
+const cuda_training_source_owners = nativeSourceOwners(gpu_training_renderer.cuda_owners);
+fn validateCudaAttentionHelpers(_: std.mem.Allocator, split: SourceRegion) !void {
+    try quant_kernel_compiler.validateCudaRuntimeAttentionExternalHelpers(split.prefix);
+}
+fn validateCudaDevMatmulHelpers(_: std.mem.Allocator, split: SourceRegion) !void {
+    try quant_kernel_compiler.validateCudaRuntimeDevMatmulExternalHelpers(split.prefix);
+}
+const cuda_runtime_source_owners = nativeSourceOwners(cuda_ffn_renderer.owners) ++ [_]NativeSourceOwner{
+    nativeSourceOwner(cuda_shared_helpers_begin, cuda_shared_helpers_end, cuda_renderer.renderRuntimeSharedHelpers),
+    nativeSourceOwner(cuda_production_matmul_begin, cuda_production_matmul_end, quant_kernel_compiler.renderCudaRuntimeProductionMatmulRegion),
+    .{ .begin = cuda_runtime_attention_region_begin_marker, .render = quant_kernel_compiler.renderCudaRuntimeAttentionRegion, .split = splitCudaRuntimeAttentionRegion, .validate = validateCudaAttentionHelpers },
+    .{ .begin = cuda_runtime_dev_matmul_region_begin_marker, .render = quant_kernel_compiler.renderCudaRuntimeDevMatmulRegion, .split = splitCudaRuntimeDevMatmulRegion, .validate = validateCudaDevMatmulHelpers },
+};
+const native_source_files = [_]struct { path: []const u8, owners: []const NativeSourceOwner }{
+    .{ .path = "src/ops/cuda/artifacts/inference_cuda_kernels.cu", .owners = &cuda_runtime_source_owners },
+    .{ .path = "src/ops/native_compute.zig", .owners = &cpu_source_owners },
+    .{ .path = "src/backends/metal_kernels.m", .owners = &metal_source_owners },
+    .{ .path = "src/ops/cuda/kernels/ragged_boundary_programs.cuh", .owners = &cuda_boundary_source_owners },
+    .{ .path = "src/ops/cuda/kernels/relative_attention_training.cuh", .owners = &cuda_training_source_owners },
+};
+fn nativeOwnedRegionCount() usize {
+    var count: usize = 0;
+    for (native_source_files) |file| count += file.owners.len;
+    return count;
+}
+fn processNativeOwnedSources(allocator: std.mem.Allocator, io: std.Io, write: bool) !void {
+    for (native_source_files) |file| try processOwnedSourceRegions(allocator, io, write, file.path, file.owners);
+}
+fn processOwnedSourceRegions(allocator: std.mem.Allocator, io: std.Io, write: bool, source_path: []const u8, owners: []const NativeSourceOwner) !void {
+    const path = try existingSourcePath(allocator, io, source_path);
+    defer if (path.owned) allocator.free(path.value);
+    const contents = try std.Io.Dir.cwd().readFileAlloc(io, path.value, allocator, .limited(8 * 1024 * 1024));
+    defer allocator.free(contents);
+    var changes: std.ArrayList(source_regions.Change) = .empty;
+    defer {
+        for (changes.items) |change| allocator.free(change.expected);
+        changes.deinit(allocator);
+    }
+    for (owners) |owner| {
+        const split = owner.split(contents) catch |err| {
+            print("Generated source region markers invalid: {s} ({s}): {s}\n", .{ source_path, owner.begin, @errorName(err) });
+            return err;
+        };
+        const expected = try owner.render(allocator);
+        errdefer allocator.free(expected);
+        try changes.append(allocator, .{ .start = split.prefix.len, .end = contents.len - split.suffix.len, .expected = expected, .owner = owner.begin });
+    }
+    try source_regions.sortAndValidate(changes.items, contents.len);
+    var dirty = false;
+    for (changes.items) |change| {
+        if (std.mem.eql(u8, contents[change.start..change.end], change.expected)) continue;
+        dirty = true;
+        if (!write) print("Generated source region stale: {s} ({s}); run `zig build quant-kernel-codegen -- --write`\n", .{ source_path, change.owner });
+    }
+    if (!dirty or !write) {
+        try validateOwnedSourceRegions(allocator, contents, owners);
+        if (dirty) return error.GeneratedQuantKernelSourceStale;
+        return;
+    }
+    const updated = try source_regions.merge(allocator, contents, changes.items);
+    defer allocator.free(updated);
+    // Owned helper regions may be refreshed in the same batch. Check the
+    // staged complete file before publishing any of its replacements.
+    try validateOwnedSourceRegions(allocator, updated, owners);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path.value, .data = updated });
+}
+
+fn validateOwnedSourceRegions(allocator: std.mem.Allocator, contents: []const u8, owners: []const NativeSourceOwner) !void {
+    for (owners) |owner| {
+        if (owner.validate) |validate| try validate(allocator, try owner.split(contents));
+    }
+}
+
+const SourceRegion = struct { prefix: []const u8, region: []const u8, suffix: []const u8 };
+
+fn splitSourceRegion(contents: []const u8, comptime begin_marker: []const u8, comptime end_marker: []const u8) !SourceRegion {
+    const begin_line = begin_marker ++ "\n";
+    const end_line = end_marker ++ "\n";
+    const begin_count = std.mem.count(u8, contents, begin_line);
+    const end_count = std.mem.count(u8, contents, end_line);
+    if (begin_count == 0 or end_count == 0) return error.SourceRegionMarkerMissing;
+    if (begin_count != 1 or end_count != 1) return error.SourceRegionMarkerDuplicate;
+    const begin = std.mem.indexOf(u8, contents, begin_line).? + begin_line.len;
+    const end = std.mem.indexOfPos(u8, contents, begin, end_line) orelse return error.SourceRegionMarkerMissing;
+    return .{ .prefix = contents[0..begin], .region = contents[begin..end], .suffix = contents[end..] };
+}
+
 const cuda_runtime_attention_region_begin_marker = "// quant-kernel-codegen:begin generated CUDA attention kernels (do not edit; run: zig build quant-kernel-codegen -- --write)";
 const cuda_runtime_attention_region_end_marker = "// quant-kernel-codegen:end generated CUDA attention kernels";
 
-const CudaRuntimeAttentionRegionSplit = struct {
-    prefix: []const u8,
-    region: []const u8,
-    suffix: []const u8,
-};
+const CudaRuntimeAttentionRegionSplit = SourceRegion;
 
-fn splitCudaRuntimeAttentionRegion(contents: []const u8) !CudaRuntimeAttentionRegionSplit {
-    const begin_line = cuda_runtime_attention_region_begin_marker ++ "\n";
-    const end_line = cuda_runtime_attention_region_end_marker ++ "\n";
-    const begin_count = std.mem.count(u8, contents, begin_line);
-    const end_count = std.mem.count(u8, contents, end_line);
-    if (begin_count == 0 or end_count == 0) return error.CudaRuntimeAttentionRegionMarkerMissing;
-    if (begin_count != 1 or end_count != 1) return error.CudaRuntimeAttentionRegionMarkerDuplicate;
-    const begin = std.mem.indexOf(u8, contents, begin_line) orelse return error.CudaRuntimeAttentionRegionMarkerMissing;
-    const region_start = begin + begin_line.len;
-    const end = std.mem.indexOfPos(u8, contents, region_start, end_line) orelse return error.CudaRuntimeAttentionRegionMarkerMissing;
-    return .{
-        .prefix = contents[0..region_start],
-        .region = contents[region_start..end],
-        .suffix = contents[end..],
+fn splitCudaRuntimeAttentionRegion(contents: []const u8) !SourceRegion {
+    return splitSourceRegion(contents, cuda_runtime_attention_region_begin_marker, cuda_runtime_attention_region_end_marker) catch |err| switch (err) {
+        error.SourceRegionMarkerDuplicate => error.CudaRuntimeAttentionRegionMarkerDuplicate,
+        else => error.CudaRuntimeAttentionRegionMarkerMissing,
     };
 }
 
@@ -225,66 +299,15 @@ fn readCudaRuntimeSource(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path.value, allocator, .limited(8 * 1024 * 1024));
 }
 
-fn checkCudaRuntimeAttentionRegion(allocator: std.mem.Allocator, io: std.Io) !void {
-    const expected = try quant_kernel_compiler.renderCudaRuntimeAttentionRegion(allocator);
-    defer allocator.free(expected);
-    const contents = try readCudaRuntimeSource(allocator, io);
-    defer allocator.free(contents);
-    const split = splitCudaRuntimeAttentionRegion(contents) catch |err| {
-        print("quant kernel CUDA attention runtime region markers missing or duplicated in {s}; run `zig build quant-kernel-codegen -- --write`\n", .{cuda_runtime_source_path});
-        return err;
-    };
-    quant_kernel_compiler.validateCudaRuntimeAttentionExternalHelpers(split.prefix) catch |err| {
-        print("quant kernel CUDA attention runtime helper drift in {s}; keep the shared fast-attention reduction helpers before the generated region\n", .{cuda_runtime_source_path});
-        return err;
-    };
-    if (!std.mem.eql(u8, split.region, expected)) {
-        print(
-            "quant kernel CUDA attention runtime region stale: path={s} expected_bytes={d} actual_bytes={d}; run `zig build quant-kernel-codegen -- --write`\n",
-            .{ cuda_runtime_source_path, expected.len, split.region.len },
-        );
-        return error.GeneratedQuantKernelSourceStale;
-    }
-}
-
-fn writeCudaRuntimeAttentionRegion(allocator: std.mem.Allocator, io: std.Io) !void {
-    const expected = try quant_kernel_compiler.renderCudaRuntimeAttentionRegion(allocator);
-    defer allocator.free(expected);
-    const contents = try readCudaRuntimeSource(allocator, io);
-    defer allocator.free(contents);
-    const split = try splitCudaRuntimeAttentionRegion(contents);
-    try quant_kernel_compiler.validateCudaRuntimeAttentionExternalHelpers(split.prefix);
-    if (std.mem.eql(u8, split.region, expected)) return;
-    const updated = try std.mem.concat(allocator, u8, &.{ split.prefix, expected, split.suffix });
-    defer allocator.free(updated);
-    const path = try existingSourcePath(allocator, io, cuda_runtime_source_path);
-    defer if (path.owned) allocator.free(path.value);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path.value, .data = updated });
-}
-
 const cuda_runtime_dev_matmul_region_begin_marker = "// quant-kernel-codegen:begin generated CUDA runtime-wired dev matmul candidates (do not edit; run: zig build quant-kernel-codegen -- --write)";
 const cuda_runtime_dev_matmul_region_end_marker = "// quant-kernel-codegen:end generated CUDA runtime-wired dev matmul candidates";
 
-const CudaRuntimeDevMatmulRegionSplit = struct {
-    prefix: []const u8,
-    region: []const u8,
-    suffix: []const u8,
-};
+const CudaRuntimeDevMatmulRegionSplit = SourceRegion;
 
-fn splitCudaRuntimeDevMatmulRegion(contents: []const u8) !CudaRuntimeDevMatmulRegionSplit {
-    const begin_line = cuda_runtime_dev_matmul_region_begin_marker ++ "\n";
-    const end_line = cuda_runtime_dev_matmul_region_end_marker ++ "\n";
-    const begin_count = std.mem.count(u8, contents, begin_line);
-    const end_count = std.mem.count(u8, contents, end_line);
-    if (begin_count == 0 or end_count == 0) return error.CudaRuntimeDevMatmulRegionMarkerMissing;
-    if (begin_count != 1 or end_count != 1) return error.CudaRuntimeDevMatmulRegionMarkerDuplicate;
-    const begin = std.mem.indexOf(u8, contents, begin_line) orelse return error.CudaRuntimeDevMatmulRegionMarkerMissing;
-    const region_start = begin + begin_line.len;
-    const end = std.mem.indexOfPos(u8, contents, region_start, end_line) orelse return error.CudaRuntimeDevMatmulRegionMarkerMissing;
-    return .{
-        .prefix = contents[0..region_start],
-        .region = contents[region_start..end],
-        .suffix = contents[end..],
+fn splitCudaRuntimeDevMatmulRegion(contents: []const u8) !SourceRegion {
+    return splitSourceRegion(contents, cuda_runtime_dev_matmul_region_begin_marker, cuda_runtime_dev_matmul_region_end_marker) catch |err| switch (err) {
+        error.SourceRegionMarkerDuplicate => error.CudaRuntimeDevMatmulRegionMarkerDuplicate,
+        else => error.CudaRuntimeDevMatmulRegionMarkerMissing,
     };
 }
 
@@ -293,92 +316,17 @@ fn cudaRuntimeDevMatmulRegionIsCurrent(contents: []const u8, expected: []const u
     return std.mem.eql(u8, split.region, expected);
 }
 
-fn checkCudaRuntimeDevMatmulRegion(allocator: std.mem.Allocator, io: std.Io) !void {
-    const expected = try quant_kernel_compiler.renderCudaRuntimeDevMatmulRegion(allocator);
-    defer allocator.free(expected);
-    const contents = try readCudaRuntimeSource(allocator, io);
-    defer allocator.free(contents);
-    const split = splitCudaRuntimeDevMatmulRegion(contents) catch |err| {
-        print("quant kernel CUDA dev matmul runtime region markers missing or duplicated in {s}; run `zig build quant-kernel-codegen -- --write`\n", .{cuda_runtime_source_path});
-        return err;
-    };
-    quant_kernel_compiler.validateCudaRuntimeDevMatmulExternalHelpers(split.prefix) catch |err| {
-        print("quant kernel CUDA dev matmul external helpers drifted or moved after the owned region in {s}\n", .{cuda_runtime_source_path});
-        return err;
-    };
-    if (!std.mem.eql(u8, split.region, expected)) {
-        print(
-            "quant kernel CUDA dev matmul runtime region stale: path={s} expected_bytes={d} actual_bytes={d}; run `zig build quant-kernel-codegen -- --write`\n",
-            .{ cuda_runtime_source_path, expected.len, split.region.len },
-        );
-        return error.GeneratedQuantKernelSourceStale;
-    }
-}
-
-fn writeCudaRuntimeDevMatmulRegion(allocator: std.mem.Allocator, io: std.Io) !void {
-    const expected = try quant_kernel_compiler.renderCudaRuntimeDevMatmulRegion(allocator);
-    defer allocator.free(expected);
-    const contents = try readCudaRuntimeSource(allocator, io);
-    defer allocator.free(contents);
-    const split = try splitCudaRuntimeDevMatmulRegion(contents);
-    try quant_kernel_compiler.validateCudaRuntimeDevMatmulExternalHelpers(split.prefix);
-    if (std.mem.eql(u8, split.region, expected)) return;
-    const updated = try std.mem.concat(allocator, u8, &.{ split.prefix, expected, split.suffix });
-    defer allocator.free(updated);
-    const path = try existingSourcePath(allocator, io, cuda_runtime_source_path);
-    defer if (path.owned) allocator.free(path.value);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path.value, .data = updated });
-}
-
 // The generated launch-shape table + lookup in metal_kernels.m lives between
 // these markers (file scope, no indentation). Rendered from the compiler's
 // metal_production_schedules table.
 const metal_launch_region_begin_marker = "// quant-kernel-codegen:begin generated launch-shape table (do not edit; run: zig build quant-kernel-codegen -- --write)";
 const metal_launch_region_end_marker = "// quant-kernel-codegen:end generated launch-shape table";
 
-fn splitMetalLaunchRegion(contents: []const u8) !MetalRuntimeRegionSplit {
-    const begin_line = metal_launch_region_begin_marker ++ "\n";
-    const end_line = metal_launch_region_end_marker ++ "\n";
-    const begin = std.mem.indexOf(u8, contents, begin_line) orelse return error.MetalLaunchRegionMarkerMissing;
-    const region_start = begin + begin_line.len;
-    const end = std.mem.indexOfPos(u8, contents, region_start, end_line) orelse return error.MetalLaunchRegionMarkerMissing;
-    return .{
-        .prefix = contents[0..region_start],
-        .region = contents[region_start..end],
-        .suffix = contents[end..],
+fn splitMetalLaunchRegion(contents: []const u8) !SourceRegion {
+    return splitSourceRegion(contents, metal_launch_region_begin_marker, metal_launch_region_end_marker) catch |err| switch (err) {
+        error.SourceRegionMarkerDuplicate => error.MetalLaunchRegionMarkerDuplicate,
+        else => error.MetalLaunchRegionMarkerMissing,
     };
-}
-
-fn checkMetalLaunchShapeRegion(allocator: std.mem.Allocator, io: std.Io) !void {
-    const expected = try quant_kernel_compiler.renderMetalLaunchShapeRegion(allocator);
-    defer allocator.free(expected);
-    const contents = try readMetalRuntimeSource(allocator, io);
-    defer allocator.free(contents);
-    const split = splitMetalLaunchRegion(contents) catch |err| {
-        print("quant kernel Metal launch-shape region markers missing in {s}; run `zig build quant-kernel-codegen -- --write`\n", .{metal_runtime_source_path});
-        return err;
-    };
-    if (!std.mem.eql(u8, split.region, expected)) {
-        print(
-            "quant kernel Metal launch-shape region stale: path={s} expected_bytes={d} actual_bytes={d}; run `zig build quant-kernel-codegen -- --write`\n",
-            .{ metal_runtime_source_path, expected.len, split.region.len },
-        );
-        return error.GeneratedQuantKernelSourceStale;
-    }
-}
-
-fn writeMetalLaunchShapeRegion(allocator: std.mem.Allocator, io: std.Io) !void {
-    const expected = try quant_kernel_compiler.renderMetalLaunchShapeRegion(allocator);
-    defer allocator.free(expected);
-    const contents = try readMetalRuntimeSource(allocator, io);
-    defer allocator.free(contents);
-    const split = try splitMetalLaunchRegion(contents);
-    if (std.mem.eql(u8, split.region, expected)) return;
-    const updated = try std.mem.concat(allocator, u8, &.{ split.prefix, expected, split.suffix });
-    defer allocator.free(updated);
-    const path = try existingSourcePath(allocator, io, metal_runtime_source_path);
-    defer if (path.owned) allocator.free(path.value);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path.value, .data = updated });
 }
 
 fn parseMode(args: []const []const u8) !Mode {
@@ -414,7 +362,7 @@ fn printUsage() void {
 fn generatedFiles(allocator: std.mem.Allocator) ![]GeneratedFile {
     try quant_kernel_compiler.validateGeneratedArtifactRegistry();
     const source_count = generatedSourceFileCount();
-    const files = try allocator.alloc(GeneratedFile, source_count + 4);
+    const files = try allocator.alloc(GeneratedFile, source_count + 5);
     @memset(files, .{ .path = "", .data = "" });
     errdefer freeGeneratedFiles(allocator, files);
     var index: usize = 0;
@@ -428,7 +376,8 @@ fn generatedFiles(allocator: std.mem.Allocator) ![]GeneratedFile {
         index += 1;
     }
     if (index != source_count) return error.GeneratedQuantKernelSourceCountMismatch;
-    var manifest_index = index;
+    files[index] = .{ .path = metal_param_abi.header_path, .data = try metal_param_abi.renderHeader(allocator), .owned = true };
+    var manifest_index = index + 1;
     files[manifest_index] = .{
         .path = quant_kernel_compiler.first_spec_manifest_path,
         .data = try quant_kernel_compiler.specManifestJson(allocator),
@@ -469,6 +418,16 @@ fn compiledSourceForArtifact(
         .microkernel, .attention => {
             const source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse
                 return error.MissingGeneratedQuantKernelSource;
+            if (artifact.backend == .metal) {
+                if (try quant_kernel_compiler_renderer.compactNativeSourceFile(allocator, source)) |compact| {
+                    return .{ .data = compact, .owned = true };
+                }
+            }
+            if (artifact.backend == .cuda and artifact.opKind() == .attention) {
+                if (try cuda_renderer.compactAttentionSourceFile(allocator, source)) |compact| {
+                    return .{ .data = compact, .owned = true };
+                }
+            }
             return .{ .data = source, .owned = false };
         },
     }
@@ -484,6 +443,14 @@ fn compiledSourceForArtifact(
     errdefer emitted.deinit(allocator);
     if (!try quant_kernel_compiler.compiledSourceHeaderMatchesSource(allocator, compiled, emitted.data)) {
         return error.GeneratedQuantKernelSourceHeaderMismatch;
+    }
+    const compact = switch (artifact.backend) {
+        .metal => try quant_kernel_compiler_renderer.compactNativeSourceFile(allocator, emitted.data),
+        .cuda => try cuda_renderer.compactAttentionSourceFile(allocator, emitted.data),
+    };
+    if (compact) |data| {
+        emitted.deinit(allocator);
+        return .{ .data = data, .owned = true };
     }
     return .{ .data = emitted.data, .owned = emitted.owned };
 }
@@ -658,6 +625,10 @@ fn metalCheckOutputPath(command: []const u8) ?[]const u8 {
     return null;
 }
 
+test "quant kernel codegen native owner registry matches every checked-in region" {
+    try processNativeOwnedSources(std.testing.allocator, std.testing.io, false);
+}
+
 test "quant kernel codegen splits the Metal runtime region on marker lines" {
     const contents = "prefix\n" ++
         metal_runtime_region_begin_marker ++ "\n" ++
@@ -669,6 +640,8 @@ test "quant kernel codegen splits the Metal runtime region on marker lines" {
     try std.testing.expect(std.mem.startsWith(u8, split.prefix, "prefix\n"));
     try std.testing.expect(std.mem.startsWith(u8, split.suffix, metal_runtime_region_end_marker));
     try std.testing.expectError(error.MetalRuntimeRegionMarkerMissing, splitMetalRuntimeRegion("no markers"));
+    try std.testing.expectError(error.MetalRuntimeRegionMarkerDuplicate, splitMetalRuntimeRegion(contents ++ metal_runtime_region_begin_marker ++ "\n"));
+    try std.testing.expectError(error.MetalRuntimeRegionMarkerDuplicate, splitMetalRuntimeRegion(metal_runtime_region_end_marker ++ "\n" ++ contents));
 }
 
 test "quant kernel codegen Metal runtime region matches the checked-in runtime source" {
@@ -794,6 +767,8 @@ test "quant kernel codegen splits the Metal launch-shape region on marker lines"
     try std.testing.expectEqualStrings("static const int x = 1;\n", split.region);
     try std.testing.expect(std.mem.startsWith(u8, split.suffix, metal_launch_region_end_marker));
     try std.testing.expectError(error.MetalLaunchRegionMarkerMissing, splitMetalLaunchRegion("no markers"));
+    try std.testing.expectError(error.MetalLaunchRegionMarkerDuplicate, splitMetalLaunchRegion(contents ++ metal_launch_region_begin_marker ++ "\n"));
+    try std.testing.expectError(error.MetalLaunchRegionMarkerDuplicate, splitMetalLaunchRegion(metal_launch_region_end_marker ++ "\n" ++ contents));
 }
 
 test "quant kernel codegen Metal launch-shape region matches the checked-in runtime source" {
@@ -828,11 +803,11 @@ test "quant kernel codegen sources map to compiler artifacts" {
     const sources = try generatedFiles(std.testing.allocator);
     defer freeGeneratedFiles(std.testing.allocator, sources);
 
-    try std.testing.expectEqual(generatedSourceFileCount() + 4, sources.len);
+    try std.testing.expectEqual(generatedSourceFileCount() + 5, sources.len);
     for (quant_kernel_compiler.first_generated_artifacts, sources[0..quant_kernel_compiler.first_generated_artifacts.len]) |artifact, source| {
         try std.testing.expectEqualStrings(artifact.source_path, source.path);
         try std.testing.expect(source.data.len != 0);
-        if (artifact.backend == .cuda and artifact.opKind() == .small_batch_matmul) {
+        if ((artifact.backend == .cuda and artifact.opKind() == .small_batch_matmul) or std.mem.indexOf(u8, source.data, "#include \"../../../graph/templates/") != null) {
             try std.testing.expect(source.owned);
         } else {
             try std.testing.expect(!source.owned);
@@ -942,7 +917,7 @@ test "quant kernel codegen emits a self-contained microkernel source per microke
     const attn_count = quant_kernel_compiler.first_generated_attention_artifacts.len;
     try std.testing.expect(micro_count > 0);
     try std.testing.expect(attn_count > 0);
-    // Source layout: [matmul..][microkernel..][attention..][4 manifests].
+    // Source layout: [matmul..][microkernel..][attention..][scalar ABI][4 manifests].
     for (quant_kernel_compiler.first_generated_microkernel_artifacts, sources[matmul_count .. matmul_count + micro_count]) |artifact, source| {
         try std.testing.expectEqualStrings(artifact.source_path, source.path);
         try std.testing.expect(source.data.len != 0);
@@ -951,8 +926,8 @@ test "quant kernel codegen emits a self-contained microkernel source per microke
         try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, kernel_decl));
         try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "#include <metal_stdlib>"));
     }
-    // Attention sources follow the microkernels; each is self-contained for
-    // its backend and is emitted from the typed attention renderer plan.
+    // Attention sources follow the microkernels. CUDA template instantiations
+    // include their canonical owner; runtime/JIT source remains self-contained.
     for (quant_kernel_compiler.first_generated_attention_artifacts, sources[matmul_count + micro_count .. matmul_count + micro_count + attn_count]) |artifact, source| {
         try std.testing.expectEqualStrings(artifact.source_path, source.path);
         try std.testing.expect(source.data.len != 0);
@@ -977,14 +952,18 @@ test "quant kernel codegen emits a self-contained microkernel source per microke
                 // Self-contained: its own params struct + paging helper travel with it.
                 try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "struct antfly_paged_attention_1x_params {"));
             },
-            .cuda => if (artifact.cuda_flash_prefill_kernel != null or
-                artifact.cuda_splitk_online_decode_kernel != null)
-            {
-                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "#include <cuda_fp16.h>"));
-                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "const unsigned* decode_scalars"));
-            } else {
-                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "#include <math.h>"));
-                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "const unsigned int* decode_scalars"));
+            .cuda => {
+                const expanded = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedQuantKernelSource;
+                const compact = std.mem.indexOf(u8, source.data, "#include \"../../../graph/templates/cuda_gqa_") != null;
+                if (compact) {
+                    try std.testing.expect(source.owned);
+                    try std.testing.expect(source.data.len < expanded.len);
+                } else try std.testing.expectEqualStrings(expanded, source.data);
+                // Fingerprints and JIT use complete source, never a path-only
+                // wrapper whose include resolution depends on the working dir.
+                try std.testing.expect(std.mem.indexOf(u8, expanded, "../../../graph/templates/") == null);
+                const scalar_type = if (artifact.cuda_flash_prefill_kernel != null or artifact.cuda_splitk_online_decode_kernel != null) "const unsigned* decode_scalars" else "const unsigned int* decode_scalars";
+                try std.testing.expect(std.mem.containsAtLeast(u8, expanded, 1, scalar_type));
             },
         }
     }
@@ -1036,4 +1015,39 @@ test "quant kernel codegen write creates parent directories" {
     const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("generated", actual);
+}
+
+test "quant kernel codegen shared CUDA helper region fails closed and owns each definition once" {
+    const begin = cuda_shared_helpers_begin ++ "\n";
+    const end = cuda_shared_helpers_end ++ "\n";
+    const split = try splitSourceRegion("prefix\n" ++ begin ++ "body\n" ++ end ++ "suffix", cuda_shared_helpers_begin, cuda_shared_helpers_end);
+    try std.testing.expectEqualStrings("body\n", split.region);
+    try std.testing.expectError(error.SourceRegionMarkerMissing, splitSourceRegion(begin, cuda_shared_helpers_begin, cuda_shared_helpers_end));
+    try std.testing.expectError(error.SourceRegionMarkerDuplicate, splitSourceRegion(begin ++ begin ++ end, cuda_shared_helpers_begin, cuda_shared_helpers_end));
+    try std.testing.expectError(error.SourceRegionMarkerDuplicate, splitSourceRegion(begin ++ end ++ end, cuda_shared_helpers_begin, cuda_shared_helpers_end));
+    try std.testing.expectError(error.SourceRegionMarkerMissing, splitSourceRegion(end ++ begin, cuda_shared_helpers_begin, cuda_shared_helpers_end));
+    const contents = try readCudaRuntimeSource(std.testing.allocator, std.testing.io);
+    defer std.testing.allocator.free(contents);
+    const actual = try splitSourceRegion(contents, cuda_shared_helpers_begin, cuda_shared_helpers_end);
+    const expected = try cuda_renderer.renderRuntimeSharedHelpers(std.testing.allocator);
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, actual.region);
+    try std.testing.expect(std.mem.indexOf(u8, actual.prefix, "__global__") == null);
+    for (cuda_renderer.runtime_shared_helpers) |helper| {
+        const source = try helper.renderRuntimeAlloc(std.testing.allocator);
+        defer std.testing.allocator.free(source);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, contents, source));
+    }
+}
+
+test "quant kernel codegen owns the promoted CUDA matmul bodies without source drift" {
+    const contents = try readCudaRuntimeSource(std.testing.allocator, std.testing.io);
+    defer std.testing.allocator.free(contents);
+    const split = try splitSourceRegion(contents, cuda_production_matmul_begin, cuda_production_matmul_end);
+    const expected = try quant_kernel_compiler.renderCudaRuntimeProductionMatmulRegion(std.testing.allocator);
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, split.region);
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, split.region, "extern \"C\" __global__ void"));
+    try std.testing.expect(std.mem.indexOf(u8, split.region, "antfly_q4_0_mmv_f32_v1(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, split.region, "antfly_q4_0_down_q8_1_mmv_v1(") != null);
 }

@@ -30,6 +30,7 @@ const tensor_types = @import("../gguf/tensor_types.zig");
 const quant_kernel_op = @import("quant_kernel_op.zig");
 const kernel_jit = @import("kernel_jit.zig");
 const cuda_renderer = @import("quant_kernel_cuda_renderer.zig");
+const cuda_kernel_fold = @import("cuda_kernel_fold.zig");
 const metal_renderer = @import("quant_kernel_metal_renderer.zig");
 
 pub const metal_promotion_min_speedup: f64 = 1.02;
@@ -5168,7 +5169,11 @@ pub fn cudaSplitkOnlineDecodeArtifactRuntimeWired(artifact: GeneratedArtifact) b
 pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, cuda_renderer.attentionSplitCommonSource());
+    try out.appendSlice(allocator, cuda_renderer.attentionScorePreworkCommonSource());
     var emitted: usize = 0;
+    var flash_common_emitted = false;
+    var splitk_common_emitted = false;
     for (first_generated_attention_artifacts) |artifact| {
         if (!cudaAttentionArtifactRuntimeWired(artifact)) continue;
         if (emitted != 0) try out.append(allocator, '\n');
@@ -5179,14 +5184,22 @@ pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
         if (cudaFlashPrefillRenderPlanForArtifact(artifact)) |plan| {
             const plan_id = try cuda_renderer.flashPrefillPlanId(plan, allocator);
             defer allocator.free(plan_id);
-            const body = try cuda_renderer.renderFlashPrefillBodyAlloc(allocator, plan);
+            if (!flash_common_emitted) {
+                try out.appendSlice(allocator, cuda_renderer.flashPrefillCommonSource());
+                flash_common_emitted = true;
+            }
+            const body = try cuda_renderer.renderFlashPrefillInstantiationAlloc(allocator, plan);
             defer allocator.free(body);
             try appendFmt(allocator, &out, "// kernel_id={s} plan_id={s}\n", .{ plan.kernel_id, plan_id });
             try out.appendSlice(allocator, body);
         } else if (cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact)) |plan| {
             const plan_id = try cuda_renderer.splitkOnlineDecodePlanId(plan, allocator);
             defer allocator.free(plan_id);
-            const body = try cuda_renderer.renderSplitkOnlineDecodeBodyAlloc(allocator, plan);
+            if (!splitk_common_emitted) {
+                try out.appendSlice(allocator, cuda_renderer.splitkOnlineCommonSource());
+                splitk_common_emitted = true;
+            }
+            const body = try cuda_renderer.renderSplitkOnlineDecodeInstantiationAlloc(allocator, plan);
             defer allocator.free(body);
             try appendFmt(allocator, &out, "// kernel_id={s} plan_id={s}\n", .{ plan.kernel_id, plan_id });
             try out.appendSlice(allocator, body);
@@ -5194,7 +5207,7 @@ pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
             const plan = cudaAttentionRenderPlanForArtifact(artifact) orelse return error.MissingCudaAttentionRenderPlan;
             const plan_id = try cuda_renderer.attentionPlanId(plan, allocator);
             defer allocator.free(plan_id);
-            const body = try cuda_renderer.renderAttentionBodyAlloc(allocator, plan);
+            const body = try cuda_renderer.renderAttentionInstantiationAlloc(allocator, plan);
             defer allocator.free(body);
             try appendFmt(allocator, &out, "// kernel_id={s} plan_id={s}\n", .{ plan.kernel_id, plan_id });
             try out.appendSlice(allocator, body);
@@ -5202,7 +5215,10 @@ pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
         emitted += 1;
     }
     if (emitted == 0) return error.MissingCudaAttentionRenderPlan;
-    return out.toOwnedSlice(allocator);
+    // Plans bake their shape constants in; share each repeated body.
+    const raw = try out.toOwnedSlice(allocator);
+    defer allocator.free(raw);
+    return cuda_kernel_fold.fold(allocator, raw);
 }
 
 /// The attention runtime region emits bodies only. Keep the block-reduction
@@ -5221,6 +5237,36 @@ pub fn validateCudaRuntimeAttentionExternalHelpers(prefix: []const u8) !void {
     }
 }
 
+/// Promoted matmul bodies use the same renderer as their byte-qualified
+/// standalone artifacts. Only the runtime ABI's byte type aliases differ.
+pub fn renderCudaRuntimeProductionMatmulRegion(allocator: std.mem.Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    // Define shared precision policies and native schedules before every
+    // production/dev instantiation that borrows them.
+    for (cuda_renderer.q8_projection_runtime_owned_helpers) |helper| {
+        try out.appendSlice(allocator, helper.source);
+        if (helper.source.len == 0 or helper.source[helper.source.len - 1] != '\n') try out.append(allocator, '\n');
+    }
+    var emitted: usize = 0;
+    for (first_generated_matmul_artifacts) |artifact| {
+        if (artifact.backend != .cuda or !artifact.production_enabled) continue;
+        const plan = cudaRenderPlanForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
+        const plan_id = try cuda_renderer.planId(plan, allocator);
+        defer allocator.free(plan_id);
+        const body = try cuda_renderer.renderBodyAlloc(allocator, plan);
+        defer allocator.free(body);
+        const normalized = try normalizeCudaBundleTypes(allocator, body);
+        defer allocator.free(normalized);
+        try appendFmt(allocator, &out, "// Production generated CUDA matmul route from graph/quant_kernel_compiler.zig.\n// kernel_id={s} plan_id={s}\n", .{ plan.kernel_id, plan_id });
+        try out.appendSlice(allocator, normalized);
+        try out.append(allocator, '\n');
+        emitted += 1;
+    }
+    if (emitted == 0) return error.MissingCudaRenderPlan;
+    return out.toOwnedSlice(allocator);
+}
+
 /// Renders runtime-wired CUDA matmul candidates that remain dev-only. These
 /// bodies live in their own bundle region after the shared Antfly Q4/Q8 helper
 /// definitions, so renderer output can reference those helpers directly.
@@ -5228,10 +5274,6 @@ pub fn renderCudaRuntimeDevMatmulRegion(allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "// Runtime-owned llama.cpp CUDA block_q8_1 support; generated, never hand-edited.\n");
-    for (cuda_renderer.ggml_q8_1_runtime_owned_helpers) |helper| {
-        try out.appendSlice(allocator, helper.source);
-        if (helper.source.len == 0 or helper.source[helper.source.len - 1] != '\n') try out.append(allocator, '\n');
-    }
     const quantize_body = try cuda_renderer.renderGgmlQ8_1QuantizeRowsBodyAlloc(allocator);
     defer allocator.free(quantize_body);
     try out.append(allocator, '\n');
@@ -5254,7 +5296,10 @@ pub fn renderCudaRuntimeDevMatmulRegion(allocator: std.mem.Allocator) ![]u8 {
         emitted += 1;
     }
     if (emitted == 0) return error.MissingCudaRenderPlan;
-    return out.toOwnedSlice(allocator);
+    // Plans bake their shape constants in; share each repeated body.
+    const raw = try out.toOwnedSlice(allocator);
+    defer allocator.free(raw);
+    return cuda_kernel_fold.fold(allocator, raw);
 }
 
 /// Verifies that renderer helpers intentionally kept outside the owned dev
@@ -5266,8 +5311,10 @@ pub fn validateCudaRuntimeDevMatmulExternalHelpers(prefix: []const u8) !void {
         if (artifact.backend != .cuda or artifact.production_enabled or !artifactRuntimeWired(artifact)) continue;
         const plan = cudaRenderPlanForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
         for (cuda_renderer.supportFor(plan.lowering).helpers) |helper| {
-            if (std.mem.eql(u8, helper.name, cuda_renderer.helper_q4_0_ggml_q8_1_dot16.name)) continue;
-            if (std.mem.count(u8, prefix, helper.source) != 1) return error.CudaRuntimeDevMatmulExternalHelperDrift;
+            var storage: [32768]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&storage);
+            const rendered = try helper.renderRuntimeAlloc(fixed.allocator());
+            if (std.mem.count(u8, prefix, rendered) != 1) return error.CudaRuntimeDevMatmulExternalHelperDrift;
         }
         checked_candidates += 1;
     }
@@ -5330,17 +5377,22 @@ pub fn renderMetalRuntimeQuantRegion(allocator: std.mem.Allocator) ![]u8 {
         }
     }
     const body = try metal_renderer.renderRuntimeRegion(arena, kernels.items);
+    const florence = try metal_renderer.renderFlorenceNr4Compatibility(arena);
+    return encodeMetalRuntimeSource(allocator, try std.mem.concat(arena, u8, &.{ body, florence }));
+}
 
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    var lines = std.mem.splitScalar(u8, body, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        try out.appendSlice(allocator, "           \"");
-        try out.appendSlice(allocator, line);
-        try out.appendSlice(allocator, "\\n\"\n");
-    }
-    return out.toOwnedSlice(allocator);
+pub fn renderMetalRuntimeCompatibilityAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
+    const body = try metal_renderer.renderCompatibilityRuntimeAttention(allocator);
+    defer allocator.free(body);
+    return encodeMetalRuntimeSource(allocator, body);
+}
+
+fn encodeMetalRuntimeSource(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    const encoding = @import("../tile/source_boundary.zig");
+    const policy = encoding.MetalLines{ .skip_empty = true, .terminated_only = false };
+    const result = try allocator.alloc(u8, encoding.metalEncodedSize(body, "           ", policy));
+    encoding.encodeMetal(result, body, "           ", policy);
+    return result;
 }
 
 /// Renders the C launch-shape table + lookup for metal_kernels.m from
@@ -7997,7 +8049,9 @@ test "quant kernel compiler promoted CUDA renderer fragments stay in sync with t
 
         const support = cuda_renderer.supportFor(plan.lowering);
         for (support.helpers) |helper| {
-            const normalized = try normalizeCudaBundleTypes(std.testing.allocator, helper.source);
+            const rendered = try helper.renderAlloc(std.testing.allocator);
+            defer std.testing.allocator.free(rendered);
+            const normalized = try normalizeCudaBundleTypes(std.testing.allocator, rendered);
             defer std.testing.allocator.free(normalized);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, normalized));
         }
@@ -8018,6 +8072,10 @@ test "quant kernel compiler paged CUDA address helpers stay in sync with the pro
     }
 }
 
+test {
+    _ = cuda_kernel_fold;
+}
+
 test "quant kernel compiler renders the runtime-wired CUDA attention region deterministically" {
     const first = try renderCudaRuntimeAttentionRegion(std.testing.allocator);
     defer std.testing.allocator.free(first);
@@ -8025,7 +8083,11 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expectEqual(@as(usize, 17), first_generated_attention_artifacts.len);
+    const unfolded = try cuda_kernel_fold.unfold(std.testing.allocator, first);
+    defer std.testing.allocator.free(unfolded);
 
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, cuda_renderer.flashPrefillCommonSource()));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, cuda_renderer.splitkOnlineCommonSource()));
     var runtime_wired_count: usize = 0;
     for (first_generated_attention_artifacts) |artifact| {
         if (!cudaAttentionArtifactRuntimeWired(artifact)) continue;
@@ -8047,8 +8109,15 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             };
             try std.testing.expectEqual(promoted, artifact.production_enabled);
             try std.testing.expectEqual(promoted, artifact.runtime_default_enabled);
-            const body = try cuda_renderer.renderFlashPrefillBodyAlloc(std.testing.allocator, plan);
+            // Both geometries coexist in one translation unit. Each wrapper
+            // must bind its own KV-head count to the shared implementation.
+            const geometry = try std.fmt.allocPrint(std.testing.allocator, "#define ANTFLY_FLASH_KV_HEADS {d}\n", .{plan.lowering.kv_heads});
+            defer std.testing.allocator.free(geometry);
+            const body = try cuda_renderer.renderFlashPrefillInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
+            const geometry_at = std.mem.indexOf(u8, body, "#define ANTFLY_FLASH_KV_HEADS ") orelse return error.MissingFlashGeometry;
+            try std.testing.expect(std.mem.startsWith(u8, body[geometry_at..], geometry));
+            try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "antfly_flash_common::Geometry<ANTFLY_FLASH_KV_HEADS>"));
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
         } else if (cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact)) |plan| {
             const plan_id = try cuda_renderer.splitkOnlineDecodePlanId(plan, std.testing.allocator);
@@ -8061,7 +8130,7 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, exported_symbol));
             try std.testing.expect(!artifact.production_enabled);
             try std.testing.expect(!artifact.runtime_default_enabled);
-            const body = try cuda_renderer.renderSplitkOnlineDecodeBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderSplitkOnlineDecodeInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
         } else {
@@ -8071,9 +8140,9 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             const metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, plan_id });
             defer std.testing.allocator.free(metadata);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, metadata));
-            const body = try cuda_renderer.renderAttentionBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderAttentionInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
-            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, unfolded, body));
         }
     }
     try std.testing.expectEqual(@as(usize, 14), runtime_wired_count);
@@ -8089,6 +8158,8 @@ test "quant kernel compiler renders runtime-wired dev CUDA matmul candidates det
     const second = try renderCudaRuntimeDevMatmulRegion(std.testing.allocator);
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
+    const unfolded = try cuda_kernel_fold.unfold(std.testing.allocator, first);
+    defer std.testing.allocator.free(unfolded);
 
     var runtime_dev_count: usize = 0;
     for (first_generated_matmul_artifacts) |artifact| {
@@ -8103,7 +8174,7 @@ test "quant kernel compiler renders runtime-wired dev CUDA matmul candidates det
 
         const body = try cuda_renderer.renderBodyAlloc(std.testing.allocator, plan);
         defer std.testing.allocator.free(body);
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, unfolded, body));
         const declaration = try std.fmt.allocPrint(std.testing.allocator, "extern \"C\" __global__ void {s}(", .{plan.kernel_id});
         defer std.testing.allocator.free(declaration);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, declaration));
@@ -8118,6 +8189,8 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
     const attention_marker = "// quant-kernel-codegen:begin generated CUDA attention kernels";
     const attention_region_begin = std.mem.indexOf(u8, bundle, attention_marker) orelse return error.MissingCudaAttentionRuntimeMarker;
     try validateCudaRuntimeAttentionExternalHelpers(bundle[0..attention_region_begin]);
+    const unfolded_bundle = try cuda_kernel_fold.unfold(std.testing.allocator, bundle);
+    defer std.testing.allocator.free(unfolded_bundle);
     var runtime_cuda_attention_count: usize = 0;
     var standalone_cuda_attention_count: usize = 0;
     for (first_generated_attention_artifacts) |artifact| {
@@ -8142,7 +8215,7 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
             const bundle_metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, route_id });
             defer std.testing.allocator.free(bundle_metadata);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, bundle_metadata));
-            const body = try cuda_renderer.renderFlashPrefillBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderFlashPrefillInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, body));
         } else if (cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact)) |plan| {
@@ -8151,7 +8224,7 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
             const bundle_metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, route_id });
             defer std.testing.allocator.free(bundle_metadata);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, bundle_metadata));
-            const body = try cuda_renderer.renderSplitkOnlineDecodeBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderSplitkOnlineDecodeInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, body));
         } else {
@@ -8161,9 +8234,15 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
             const bundle_metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, route_id });
             defer std.testing.allocator.free(bundle_metadata);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, bundle_metadata));
-            const body = try cuda_renderer.renderAttentionBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderAttentionInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, body));
+            if (plan.lowering.reduction != .parallel_scores_then_serial) {
+                const standalone = try cuda_renderer.renderAttentionKernel(std.testing.allocator, plan);
+                defer std.testing.allocator.free(standalone);
+                try std.testing.expect(std.mem.containsAtLeast(u8, standalone, 1, cuda_renderer.attentionSplitCommonSource()));
+                try std.testing.expect(std.mem.containsAtLeast(u8, standalone, 1, body));
+            }
         }
     }
     try std.testing.expectEqual(@as(usize, 14), runtime_cuda_attention_count);
@@ -11368,7 +11447,7 @@ test "quant kernel compiler generated artifact manifest maps to route candidates
             try std.testing.expectEqual(expected_threads_per_block, candidate_schedule.threads_per_block);
         }
 
-        const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.source_path, std.testing.allocator, .limited(128 * 1024));
+        const contents = try readSemanticGeneratedSourceForTest(artifact.source_path);
         defer std.testing.allocator.free(contents);
         const emitted = try emitCompiledSource(std.testing.allocator, compiled);
         defer emitted.deinit(std.testing.allocator);
@@ -11604,9 +11683,6 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q5_bias.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q5_bias_kernel_id, metal_q5_bias.kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q5_bias_source_path, metal_q5_bias.candidate_source_path);
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q5_bias_source, 1, "threadgroup float partial[32];"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q5_bias_source, 1, "if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f;"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q5_bias_source, 1, "simdgroup_index_in_threadgroup"));
 
     const metal_q5_bias_gelu = registryLoweringFor(.metal, .q5_k, .rows_2_8, .bias_gelu, .small_batch);
     try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q5_bias_gelu.production_route);
@@ -11615,9 +11691,6 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q5_bias_gelu.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q5_bias_gelu_kernel_id, metal_q5_bias_gelu.kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q5_bias_gelu_source_path, metal_q5_bias_gelu.candidate_source_path);
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q5_bias_gelu_source, 1, "threadgroup float partial[32];"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q5_bias_gelu_source, 1, "if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f;"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q5_bias_gelu_source, 1, "simdgroup_index_in_threadgroup"));
 
     const metal_q6 = registryLoweringFor(.metal, .q6_k, .rows_2_8, .none, .small_batch);
     try std.testing.expectEqual(LoweringRoute.generated_production, metal_q6.production_route);
@@ -11634,9 +11707,6 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q6_bias.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q6_bias_kernel_id, metal_q6_bias.kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q6_bias_source_path, metal_q6_bias.candidate_source_path);
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_source, 1, "const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u;"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_source, 1, "float acc[4][2]"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_source, 1, "simd_sum(acc[c][rr])"));
 
     const metal_q6_bias_gelu = registryLoweringFor(.metal, .q6_k, .rows_2_8, .bias_gelu, .small_batch);
     try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q6_bias_gelu.production_route);
@@ -11645,9 +11715,6 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q6_bias_gelu.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q6_bias_gelu_kernel_id, metal_q6_bias_gelu.kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q6_bias_gelu_source_path, metal_q6_bias_gelu.candidate_source_path);
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_gelu_source, 1, "const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u;"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_gelu_source, 1, "float acc[4][2]"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_gelu_source, 1, "antfly_qk_gelu(total + bias[col])"));
 
     const miss = registryLoweringFor(.cuda, .unknown, .rows_2_8, .bias_gelu, .small_batch);
     try std.testing.expectEqual(LoweringRoute.unsupported, miss.production_route);
@@ -11676,7 +11743,7 @@ test "quant kernel compiler first CUDA candidate stays dev-only but checked in" 
     try std.testing.expect(!first_lazy_benchmark.production_enabled);
     try std.testing.expect(!std.mem.containsAtLeast(u8, first_lazy_benchmark.generated_source_path, 1, "/artifacts/"));
 
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, first_lazy_benchmark.generated_source_path, std.testing.allocator, .limited(128 * 1024));
+    const contents = try readSemanticGeneratedSourceForTest(first_lazy_benchmark.generated_source_path);
     defer std.testing.allocator.free(contents);
     const emitted = try emitFirstLazyCudaSource(std.testing.allocator);
     defer std.testing.allocator.free(emitted);
@@ -11721,16 +11788,16 @@ test "quant kernel compiler first Metal lazy target stays blocked by timing drif
     try std.testing.expectEqual(@as(usize, 0), counters.quant_kernel_generated_production);
     try std.testing.expectEqual(@as(usize, 1), counters.quant_kernel_generated_candidates);
 
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, first_lazy_metal_source_path, std.testing.allocator, .limited(128 * 1024));
+    const contents = try readSemanticGeneratedSourceForTest(first_lazy_metal_source_path);
     defer std.testing.allocator.free(contents);
     const compiled_lazy = compileMetalKernelSource(.q4_k, .rows_2_8, .bias_gelu).?;
     const emitted = try emitCompiledSource(std.testing.allocator, compiled_lazy);
     defer emitted.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings(emitted.data, contents);
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u;"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "float acc[4][2]"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly_qk_gelu(total + bias[col])"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly_projection_k_tile<antfly_projection_decode_q4_k, antfly_projection_bias_gelu, 4u, 4u, 2u>"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "float acc[NC][NR]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "return antfly_qk_gelu(value + bias[col])"));
 }
 
 test "quant kernel compiler compiles promoted Metal source from descriptor route" {
@@ -12467,8 +12534,8 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     // tile across every query head in the group. Keep the shader guard exact
     // for both the legacy E2B/E4B geometries and the separately admitted A4B
     // local/global geometries.
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_paged_attention_kv_decode_gqa_split_stage("));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_paged_attention_kv_decode_gqa_split_reduce("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_MSL_ABI_PAGED_GQA_SPLIT_STAGE(termite_paged_attention_kv_decode_gqa_split_stage)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_MSL_ABI_PAGED_GQA_SPLIT_REDUCE(termite_paged_attention_kv_decode_gqa_split_reduce)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const uint qi = tg.x; const uint kv_h = tg.y; const uint split = tg.z;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const uint query_pos = p.query_position_offset + qi;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const bool legacy_geometry = p.num_heads == 8u"));
@@ -12510,6 +12577,7 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "const bool use_decode_1x = !use_decode_gqa_split"));
     // Cached decode also excludes explicit-position requests from the 1x path.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "const bool use_decode_1x = !has_explicit_positions && !use_decode_gqa_split"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "use_decode_gqa_split ? split_launch.scratch_bytes"));
     // Both encoders retain scratch; coalesced attention also bounds and
     // advances its pooled scratch slice.
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, host_source, "split_launch.scratch_bytes"));
@@ -12618,11 +12686,13 @@ test "metal runtime source gates aligned and unrolled Q4 MM to measured shapes" 
     const host_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(host_source);
 
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_q4_0_linear_mm_sg_aligned("));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_q4_0_linear_mm_sg_aligned_tail("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_MSL_ABI_QUANT_MATRIX(termite_q4_0_linear_mm_sg_aligned)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_MSL_ABI_QUANT_MATRIX(termite_q4_0_linear_mm_sg_aligned_tail)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_ENABLE_Q4_0_MM_SG_ALIGNED"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DISABLE_Q4_0_MM_SG_ALIGNED"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "termite_dequantize_q4_0_4x4_half(x, il0, temp_a);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "termite_sg_dequantize_block(x, il, temp_a);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "termite_dequantize_q4_0_4x4_half(x, il, value);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "termite_dequantize_q4_0_4x4_half(x, il, temp_a);"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "*(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) = (half2x4)(*((device const float2x4 *)y));"));
 
     // Measured E4B FFN and projection matrices default to aligned full/tail
@@ -12699,7 +12769,7 @@ test "quant kernel compiler emits single-sourced backend source for every genera
         try std.testing.expect(emitted.owned);
         try std.testing.expectEqualStrings(compiled.source, emitted.data);
 
-        const checked_in = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.source_path, std.testing.allocator, .limited(1 << 20));
+        const checked_in = try readSemanticGeneratedSourceForTest(artifact.source_path);
         defer std.testing.allocator.free(checked_in);
         try std.testing.expectEqualStrings(checked_in, emitted.data);
     }
@@ -13011,8 +13081,8 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     // together after. Bound the q5_1 body by the next generated kernel.
     const q5_1_kernel_end = std.mem.indexOfPos(u8, contents, q5_1_kernel + 1, "kernel void antfly_") orelse return error.MissingMetalQ5_1KernelEnd;
     const q5_1_kernel_body = contents[q5_1_kernel..q5_1_kernel_end];
-    try std.testing.expect(std.mem.containsAtLeast(u8, q5_1_kernel_body, 1, "int col0 = int(group_pos.x << 1); int col1 = col0 + 1;"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, q5_1_kernel_body, 1, "device const uchar *col1_weight = has_col1 ? weight_q5_1 + col1 * block_count * 24 : col0_weight;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, q5_1_kernel_body, 1, "antfly_projection_two_columns<antfly_projection_decode_q5_1, antfly_projection_plain>"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "enum : int { values = 32, bytes = 24, shift = 5 };"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, q5_1_kernel_body, 1, "int col = int(group_pos.x); int row = int(group_pos.y);"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "uint32_t threads_per_threadgroup,\n    uint32_t cols_per_threadgroup,"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "const NSUInteger threads_per_threadgroup_size = (NSUInteger)threads_per_threadgroup;"));
@@ -13148,36 +13218,27 @@ test "quant kernel compiler embedded Metal source keeps generated q5 reduction a
     const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(contents);
 
-    // The hybrid-simd reduction structure, independent of the simdgroup count
-    // (`lane_id >= {threads/32}u`), which varies with the route's thread count.
-    const optimized_reduction_head = "threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= ";
-    const optimized_reduction_tail = "u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]);";
-    const old_reduction = "threadgroup float partial[32]; if (simdgroup_id == 0u) partial[lane_id] = 0.0f; acc = simd_sum(acc); threadgroup_barrier(mem_flags::mem_threadgroup); if (lane_id == 0u) partial[simdgroup_id] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]);";
-    const q5_kernels = [_][]const u8{
-        "antfly_q5_k_small_batch_bias_msl_v1",
-        "antfly_q5_k_small_batch_bias_gelu_msl_v1",
-    };
-
-    for (q5_kernels) |kernel| {
+    const native = @embedFile("templates/metal_projection_native.metal");
+    const maximum_write = std.mem.indexOf(u8, native, "partial[simdgroup_id] = acc;").?;
+    const zero_other_lanes = std.mem.indexOf(u8, native, "lane_id >= Threads / 32u").?;
+    const barrier = std.mem.indexOfPos(u8, native, zero_other_lanes, "threadgroup_barrier(mem_flags::mem_threadgroup)").?;
+    const total_read = std.mem.indexOfPos(u8, native, barrier, "simd_sum(partial[lane_id])").?;
+    try std.testing.expect(maximum_write < zero_other_lanes and zero_other_lanes < barrier and barrier < total_read);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, contents, "inline void antfly_projection_column("));
+    for ([_][]const u8{ "antfly_q5_k_small_batch_bias_msl_v1", "antfly_q5_k_small_batch_bias_gelu_msl_v1" }) |kernel| {
         const start = std.mem.indexOf(u8, contents, kernel) orelse return error.MissingEmbeddedQ5Q6BiasKernel;
         const end = std.mem.indexOfPos(u8, contents, start, "\"}\\n\"") orelse return error.MissingEmbeddedQ5Q6BiasKernelEnd;
         const body = contents[start..end];
-        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, optimized_reduction_head));
-        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, optimized_reduction_tail));
-        try std.testing.expect(!std.mem.containsAtLeast(u8, body, 1, old_reduction));
+        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "threadgroup float partial[32]"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "antfly_projection_column<antfly_projection_decode_q5_k,"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, ", 2u>(input"));
     }
-
-    const q6_kernels = [_][]const u8{
-        "antfly_q6_k_small_batch_bias_msl_v1",
-        "antfly_q6_k_small_batch_bias_gelu_msl_v1",
-    };
-    for (q6_kernels) |kernel| {
+    for ([_][]const u8{ "antfly_q6_k_small_batch_bias_msl_v1", "antfly_q6_k_small_batch_bias_gelu_msl_v1" }) |kernel| {
         const start = std.mem.indexOf(u8, contents, kernel) orelse return error.MissingEmbeddedQ5Q6BiasKernel;
         const end = std.mem.indexOfPos(u8, contents, start, "\"}\\n\"") orelse return error.MissingEmbeddedQ5Q6BiasKernelEnd;
         const body = contents[start..end];
-        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u;"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "float acc[4][2]"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "simd_sum(acc[c][rr])"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "antfly_projection_k_tile<antfly_projection_decode_q6_k,"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, ", 4u, 4u, 2u>"));
     }
 }
 
@@ -13227,7 +13288,7 @@ test "quant kernel compiler Metal build check covers generated and promoted arti
     defer std.testing.allocator.free(test_filter_contents);
 
     const macos_gate = std.mem.indexOf(u8, contents, "if (target.result.os.tag == .macos) {\n        const quant_kernel_metal_artifact_check = b.addRunArtifact(quant_kernel_codegen_exe);") orelse return error.MissingMetalBuildMacosGate;
-    const non_macos_fail_closed = std.mem.indexOf(u8, contents, "} else {\n        const quant_kernel_metal_unavailable = b.addFail(metal_unavailable_message);\n        quant_kernel_metal_unavailable_step = &quant_kernel_metal_unavailable.step;\n        quant_kernel_metal_check_step.dependOn(&quant_kernel_metal_unavailable.step);\n    }\n\n    const quant_kernel_metal_runtime_check_step") orelse return error.MissingMetalBuildNonMacosFailClosed;
+    const non_macos_fail_closed = std.mem.indexOf(u8, contents, "} else {\n        const quant_kernel_metal_unavailable = b.addFail(metal_unavailable_message);\n        quant_kernel_metal_unavailable_step = &quant_kernel_metal_unavailable.step;\n        quant_kernel_metal_check_step.dependOn(&quant_kernel_metal_unavailable.step);\n    }") orelse return error.MissingMetalBuildNonMacosFailClosed;
     try std.testing.expect(macos_gate < non_macos_fail_closed);
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "return build_test_filters.select("));
     try std.testing.expect(std.mem.containsAtLeast(u8, test_filter_contents, 1, "else if (std.mem.startsWith(u8, arg, \"-\")) {"));
@@ -13934,7 +13995,7 @@ test "quant kernel compiler rendered bodies carry their schedule cols marker" {
         defer std.testing.allocator.free(kernel_id);
         const body = try metal_renderer.renderKernel(std.testing.allocator, kernel_id, decoder, entry.schedule, entry.epilogue);
         defer std.testing.allocator.free(body);
-        const has_two_col = std.mem.containsAtLeast(u8, body, 1, "group_pos.x << 1");
+        const has_two_col = std.mem.containsAtLeast(u8, body, 1, "    antfly_projection_two_columns<");
         try std.testing.expectEqual(entry.schedule.cols_per_threadgroup == 2, has_two_col);
         // Reduction primitive must be present in the body.
         switch (entry.schedule.reduction) {
@@ -13945,10 +14006,105 @@ test "quant kernel compiler rendered bodies carry their schedule cols marker" {
                 try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "simdgroup_id"));
             },
             .simdgroup_tiled => {
-                try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "const uint NSG"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "antfly_projection_"));
                 try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "simd_sum"));
             },
             .simdgroup_matrix => try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "simdgroup_multiply_accumulate")),
         }
     }
+}
+
+test "quant kernel compiler serial schedules emit one owner and retain every export" {
+    const source = try renderCudaRuntimeAttentionRegion(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "__device__ __forceinline__ void antfly_gqa_serial("));
+    for (first_generated_attention_artifacts) |artifact| {
+        if (!cudaAttentionArtifactRuntimeWired(artifact)) continue;
+        const plan = cudaAttentionRenderPlanForArtifact(artifact) orelse continue;
+        const declaration = try std.fmt.allocPrint(std.testing.allocator, "extern \"C\" __global__ void {s}(", .{plan.serial_kernel_id});
+        defer std.testing.allocator.free(declaration);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, declaration));
+    }
+}
+
+const readSemanticGeneratedSourceForTest = @import("../ops/testing/native_source_files.zig").read;
+
+test "CUDA source refactor evidence binds qualified SM89 programs and semantic source" {
+    const allocator = std.testing.allocator;
+    const Proof = struct {
+        candidate_source_fingerprint: u64,
+        candidate_expanded_source_sha256: []const u8,
+        candidate_image_path: []const u8,
+        candidate_image_sha256: []const u8,
+        baseline_image_sha256: []const u8,
+        current_image_binding: ?struct {
+            image_sha256: []const u8,
+            receipt_path: []const u8,
+            receipt_sha256: []const u8,
+        } = null,
+        image_byte_identical: bool,
+        all_seven_targets_native_instructions_and_resources_identical: bool,
+    };
+    const Envelope = struct { kernel_id: []const u8, source_refactor_equivalence: ?Proof = null };
+    var validated: usize = 0;
+    for (first_cuda_q4_evidence_json) |raw| {
+        const parsed = try std.json.parseFromSlice(Envelope, allocator, raw, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const proof = parsed.value.source_refactor_equivalence orelse continue;
+        const artifact = generatedArtifactForKernel(.cuda, parsed.value.kernel_id).?;
+        try std.testing.expectEqual(artifactSourceFingerprint(artifact), proof.candidate_source_fingerprint);
+        try std.testing.expect(proof.image_byte_identical);
+        try std.testing.expect(proof.all_seven_targets_native_instructions_and_resources_identical);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, proof.candidate_image_path, allocator, .limited(16 * 1024 * 1024));
+        defer allocator.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        const hash = std.fmt.bytesToHex(digest, .lower);
+        // Preserve the historical whole-image proof. Later unrelated kernels
+        // may change the module without changing either qualified program.
+        try std.testing.expectEqualStrings(proof.candidate_image_sha256, proof.baseline_image_sha256);
+        if (proof.current_image_binding) |binding| {
+            try std.testing.expectEqualStrings(&hash, binding.image_sha256);
+            const receipt_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, binding.receipt_path, allocator, .limited(1024 * 1024));
+            defer allocator.free(receipt_bytes);
+            std.crypto.hash.sha2.Sha256.hash(receipt_bytes, &digest, .{});
+            const receipt_hash = std.fmt.bytesToHex(digest, .lower);
+            try std.testing.expectEqualStrings(&receipt_hash, binding.receipt_sha256);
+            const Receipt = struct {
+                original_image_sha256: []const u8,
+                candidate_image_sha256: []const u8,
+                programs: []const struct {
+                    arch: []const u8,
+                    function: []const u8,
+                    original_instructions_sha256: []const u8,
+                    candidate_instructions_sha256: []const u8,
+                    original_resources_sha256: []const u8,
+                    candidate_resources_sha256: []const u8,
+                },
+            };
+            const receipt = try std.json.parseFromSlice(Receipt, allocator, receipt_bytes, .{ .ignore_unknown_fields = true });
+            defer receipt.deinit();
+            try std.testing.expectEqualStrings(proof.candidate_image_sha256, receipt.value.original_image_sha256);
+            try std.testing.expectEqualStrings(&hash, receipt.value.candidate_image_sha256);
+            var matches: usize = 0;
+            for (receipt.value.programs) |program| {
+                if (!std.mem.eql(u8, program.function, parsed.value.kernel_id) or !std.mem.eql(u8, program.arch, "sm_89")) continue;
+                try std.testing.expectEqual(@as(usize, 64), program.original_instructions_sha256.len);
+                try std.testing.expectEqual(@as(usize, 64), program.original_resources_sha256.len);
+                try std.testing.expectEqualStrings(program.original_instructions_sha256, program.candidate_instructions_sha256);
+                try std.testing.expectEqualStrings(program.original_resources_sha256, program.candidate_resources_sha256);
+                matches += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 1), matches);
+        } else {
+            try std.testing.expectEqualStrings(&hash, proof.candidate_image_sha256);
+        }
+        const full = try readSemanticGeneratedSourceForTest(artifact.source_path);
+        defer allocator.free(full);
+        std.crypto.hash.sha2.Sha256.hash(full, &digest, .{});
+        const source_hash = std.fmt.bytesToHex(digest, .lower);
+        try std.testing.expectEqualStrings(&source_hash, proof.candidate_expanded_source_sha256);
+        validated += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), validated);
 }

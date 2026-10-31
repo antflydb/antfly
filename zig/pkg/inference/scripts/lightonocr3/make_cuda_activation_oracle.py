@@ -19,6 +19,7 @@ import argparse
 from pathlib import Path
 
 from make_cuda_vision_oracle import extract
+from native_source_closure import expand_native_source
 
 
 def main():
@@ -29,16 +30,20 @@ def main():
     args = parser.parse_args()
     reference = args.reference.read_text()
     headers = [
+        "__device__ __forceinline__ unsigned short termite_f32_to_bf16(",
+        "template<bool Weighted, bool Residual, bool Bf16, int ScaleStage>\n__device__ __forceinline__ void termite_rms_norm_impl(",
         'extern "C" __global__ void termite_rms_norm_f32(',
         'extern "C" __global__ void termite_add_scalar_f32(',
-        "__device__ __forceinline__ unsigned short termite_f32_to_bf16(",
         'extern "C" __global__ void termite_f32_to_bf16(',
         "__device__ __forceinline__ float termite_decoder_activation_f32(",
         'extern "C" __global__ void termite_silu_multiply_f32(',
         'extern "C" __global__ void termite_activation_multiply_fused_gate_up_f32(',
     ]
     functions = "\n\n".join(extract(reference, header) for header in headers)
-    args.output.write_text(args.prototype.read_text() + "\n\n" + functions + "\n")
+    abi = expand_native_source(args.reference.parent.parent / "kernels/kernel_abi.cuh")
+    args.output.write_text(
+        abi + "\n" + expand_native_source(args.prototype) + "\n\n" + functions + "\n"
+    )
 
 
 if __name__ == "__main__":

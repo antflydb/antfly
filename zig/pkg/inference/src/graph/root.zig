@@ -27,6 +27,8 @@ pub const seeded_training = @import("seeded_training.zig");
 pub const staged_training = @import("staged_training.zig");
 pub const multi_stage_training = @import("multi_stage_training.zig");
 pub const resident_training_program = @import("resident_training_program.zig");
+pub const program = @import("../execution/program.zig");
+pub const executable = @import("../execution/executable.zig");
 pub const runtime = @import("runtime.zig");
 pub const cache = @import("cache.zig");
 pub const executor_stats = @import("executor_stats.zig");
@@ -46,6 +48,7 @@ pub const quant_kernel_compiler = @import("quant_kernel_compiler.zig");
 pub const kernel_jit = @import("kernel_jit.zig");
 pub const quant_kernel_catalog = @import("quant_kernel_catalog.zig");
 pub const quant_kernel_model_catalog = @import("quant_kernel_model_catalog.zig");
+pub const quant_recipe = @import("quant_recipe.zig");
 pub const quant_kernel_metal_renderer = @import("quant_kernel_metal_renderer.zig");
 pub const model_runtime = @import("model_runtime.zig");
 pub const decode_state_runtime = @import("decode_state_runtime.zig");
@@ -128,6 +131,7 @@ pub const distributed_training = @import("distributed_training.zig");
 pub const passes = @import("ml").graph.passes;
 
 test {
+    _ = @import("../ops/physical_storage.zig");
     _ = resident_training_program;
     _ = @import("resident_training_program_test.zig");
     _ = @import("resident_training_session_test.zig");
@@ -135,6 +139,8 @@ test {
     _ = @import("resident_training_session_failure_test.zig");
     _ = tracing_compute;
     _ = interpreter;
+    _ = program;
+    _ = executable;
     _ = runtime;
     _ = cache;
     _ = executor_stats;
@@ -156,6 +162,7 @@ test {
     _ = quant_kernel_catalog;
     _ = quant_kernel_model_catalog;
     _ = quant_kernel_metal_renderer;
+    _ = quant_recipe;
     _ = model_runtime;
     _ = decode_state_runtime;
     _ = live_model_executor;

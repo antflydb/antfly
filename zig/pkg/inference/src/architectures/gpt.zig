@@ -39,7 +39,6 @@ const ComputeBackend = ops.ComputeBackend;
 const gpt_config = @import("../models/gpt.zig");
 const runtime = @import("../runtime/root.zig");
 const activations = @import("../backends/activations.zig");
-const native_blas = @import("../backends/native.zig");
 const native_compute_mod = @import("../ops/native_compute.zig");
 const metal_compute_mod = @import("../ops/metal_compute.zig");
 const deepseek_v4 = @import("deepseek_v4.zig");
@@ -59,7 +58,7 @@ fn debugPrint(comptime fmt: []const u8, args: anytype) void {
 
 pub const Qwen35LinearLayerState = struct {
     device: metal_compute_mod.Qwen35LinearState = .{},
-    cuda_device: if (build_options.enable_cuda) @import("../ops/cuda/lighton_recurrent.zig").State else struct {
+    cuda_device: if (build_options.enable_cuda) @import("../ops/cuda/gated_delta.zig").State else struct {
         pub fn deinit(_: *@This()) void {}
         pub fn reset(_: *@This()) void {}
     } = .{},
@@ -8699,7 +8698,7 @@ fn qwen35LinearAttentionWithResidual(
 
     if (comptime build_options.enable_cuda) {
         if (packed_lengths == null and seq_len > 1 and batch > 1 and batch <= 16 and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_PREFIX") and cb.kind() == .cuda and config.qwen35_device_only_state) {
-            var states: [16]*@import("../ops/cuda/lighton_recurrent.zig").State = undefined;
+            var states: [16]*@import("../ops/cuda/gated_delta.zig").State = undefined;
             var count: usize = 0;
             if (decode_context) |dc| if (dc.qwen35_linear_batch) |caches| {
                 if (caches.len != batch) return error.InvalidBatchDecodeState;
@@ -8738,7 +8737,7 @@ fn qwen35LinearAttentionWithResidual(
     }
     if (comptime build_options.enable_cuda) {
         if (packed_lengths == null and seq_len == 1 and batch > 1 and batch <= 64 and cb.kind() == .cuda and config.qwen35_device_only_state) {
-            var states: [64]*@import("../ops/cuda/lighton_recurrent.zig").State = undefined;
+            var states: [64]*@import("../ops/cuda/gated_delta.zig").State = undefined;
             var count: usize = 0;
             if (decode_context) |dc| if (dc.qwen35_linear_batch) |caches| {
                 if (caches.len != batch) return error.InvalidBatchDecodeState;
@@ -8917,7 +8916,7 @@ fn qwen35PackedProjectedCore(
         const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
         if (config.qwen35_device_only_state and CudaCompute.lightOnRaggedCoreEnabled(cb)) ragged: {
             if (caches.len != lengths.len) return error.InvalidPackedQueryShape;
-            var states: [max_packed_qwen_items]*@import("../ops/cuda/lighton_recurrent.zig").State = undefined;
+            var states: [max_packed_qwen_items]*@import("../ops/cuda/gated_delta.zig").State = undefined;
             for (caches, 0..) |cache, index| {
                 const state = (cache orelse return error.InvalidPackedQueryShape).layerState(layer) orelse return error.InvalidPackedQueryShape;
                 if (!state.device_only) break :ragged;
@@ -8993,7 +8992,7 @@ fn qwen35PackedProjectedCore(
                 var count: usize = 1;
                 while (count < 64 and index + count < lengths.len and lengths[index + count] == 1) : (count += 1) {}
                 if (count < 2) break :cuda_grouped;
-                var states: [64]*@import("../ops/cuda/lighton_recurrent.zig").State = undefined;
+                var states: [64]*@import("../ops/cuda/gated_delta.zig").State = undefined;
                 for (0..count) |row| {
                     const cache = caches[index + row] orelse break :cuda_grouped;
                     const state = cache.layerState(layer) orelse break :cuda_grouped;
@@ -9732,27 +9731,6 @@ test "qwen3.5 recurrent gated delta rule updates state" {
     try std.testing.expectApproxEqAbs(@as(f32, 2), output[0], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 3), output[1], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 3), state[0], 1e-4);
-}
-
-fn applyActivationHostInPlace(activation: ActivationType, data: []f32) void {
-    switch (activation) {
-        .gelu => activations.gelu(data),
-        .gelu_new => {
-            const k: f32 = 0.044715;
-            const s: f32 = 0.7978845608028654;
-            for (data) |*x| {
-                const v = x.*;
-                const inner = s * (v + k * v * v * v);
-                x.* = 0.5 * v * (1.0 + std.math.tanh(inner));
-            }
-        },
-        .silu => activations.silu(data),
-        .relu => activations.relu(data),
-        .relu_squared => {
-            activations.relu(data);
-            for (data) |*x| x.* *= x.*;
-        },
-    }
 }
 
 fn maybeDebugLayerTensor(
@@ -12906,11 +12884,6 @@ fn prefetchFormattedModelWeight(cb: *const ComputeBackend, config: Config, buf: 
     cb.prefetchWeightHint(name, hint);
 }
 
-fn prefetchFormattedWeight(cb: *const ComputeBackend, buf: *[256]u8, hint: u32, comptime fmt: []const u8, args: anytype) void {
-    const name = std.fmt.bufPrint(buf, fmt, args) catch return;
-    cb.prefetchWeightHint(name, hint);
-}
-
 fn prefetchMoeExpertWeight(cb: *const ComputeBackend, layer: usize, expert_index: u32, proj: []const u8, hint: u32, buf: *[256]u8) void {
     const name = std.fmt.bufPrint(buf, "model.layers.{d}.block_sparse_moe.experts.{d}.{s}.weight", .{ layer, expert_index, proj }) catch return;
     cb.prefetchWeightHint(name, hint);
@@ -14437,7 +14410,7 @@ test "LightOnOCR3 CUDA recurrent core preserves continuation reset and device re
         .limits = .{ .backend_limit_bytes = 1024 * 1024 * 1024 },
         .check_live_memory = false,
     };
-    var state: @import("../ops/cuda/lighton_recurrent.zig").State = .{};
+    var state: @import("../ops/cuda/gated_delta.zig").State = .{};
     defer {
         state.deinit();
         std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes) catch unreachable;
@@ -14523,7 +14496,7 @@ test "LightOnOCR3 CUDA recurrent core preserves continuation reset and device re
                 const original = compute.ctx.video_cache_budget.admission;
                 defer compute.ctx.video_cache_budget.admission = original;
                 compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = 16;
-                var denied: @import("../ops/cuda/lighton_recurrent.zig").State = .{};
+                var denied: @import("../ops/cuda/gated_delta.zig").State = .{};
                 defer denied.deinit();
                 try std.testing.expectError(error.ResourceLimitExceeded, cuda.CudaCompute.qwen35LinearCore(&cb, &denied, request));
                 try std.testing.expect(denied.ctx == null and !denied.initialized);
@@ -14537,7 +14510,7 @@ test "LightOnOCR3 CUDA recurrent core preserves continuation reset and device re
                 defer compute.ctx.video_cache_budget.admission = original;
                 const held = controller.snapshot().backend_scratch_bytes;
                 compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = held;
-                var denied: @import("../ops/cuda/lighton_recurrent.zig").State = .{};
+                var denied: @import("../ops/cuda/gated_delta.zig").State = .{};
                 defer denied.deinit();
                 try std.testing.expectError(error.ResourceTemporarilyUnavailable, cuda.CudaCompute.qwen35LinearCore(&cb, &denied, request));
                 try std.testing.expect(denied.ctx == null and !denied.initialized);

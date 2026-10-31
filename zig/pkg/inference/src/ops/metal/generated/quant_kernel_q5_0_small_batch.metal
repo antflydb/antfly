@@ -24,11 +24,41 @@
 #include <metal_stdlib>
 using namespace metal;
 
+inline float antfly_qk_gelu(float x) { if (!isfinite(x)) return 0.0f; float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); if (inner > 10.0f) return x; if (inner < -10.0f) return 0.0f; float y = 0.5f * x * (1.0f + tanh(inner)); return isfinite(y) ? y : 0.0f; }
 inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 inline uint antfly_qk_u32_le(device const uchar *p) { return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24); }
-inline float antfly_q5_0_dequant_lane_v2(device const uchar *block, int lane) { float d = antfly_qk_half_le_to_float(block); uint qh = antfly_qk_u32_le(block + 2); int packed_index = lane & 15; uchar packed = block[6 + packed_index]; int low4 = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); int high = int((qh >> uint(lane)) & 1u); return d * float((low4 | (high << 4)) - 16); }
+inline float antfly_q5_0_dequant_lane_v2(device const uchar *block, int lane) {
+    int v0 = lane;
+    int v1 = 6;
+    int v2 = 15;
+    int v3 = v0 & v2;
+    int v4 = v1 + v3;
+    int v5 = int(block[v4]);
+    int v6 = 16;
+    int v7 = v0 < v6;
+    int v8 = v5 & v2;
+    int v9 = 4;
+    int v10 = int(uint(v5) >> v9);
+    int v11 = v7 ? v8 : v10;
+    int v12 = 2;
+    int v13 = int(antfly_qk_u32_le(block + v12));
+    int v14 = int(uint(v13) >> v0);
+    int v15 = 1;
+    int v16 = v14 & v15;
+    int v17 = int(uint(v16) << v9);
+    int v18 = v11 | v17;
+    int v19 = v18 - v6;
+    int v20 = 0;
+    float v21 = antfly_qk_half_le_to_float(block + v20);
+    float v22 = float(v19);
+    float v23 = v21 * v22;
+    return v23;
+}
+struct antfly_projection_decode_q5_0 {
+    enum : int { values = 32, bytes = 22, shift = 5 };
+    __attribute__((always_inline)) static float decode(device const uchar* block, int lane) { return antfly_q5_0_dequant_lane_v2(block, lane); }
+};
+#include "../../../graph/templates/metal_projection_native.metal"
 kernel void antfly_q5_0_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_0 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
-    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_0 + ((col * block_count + block_idx) * 22); int base = block_idx << 5; for (int lane = int(tid); lane < 32; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q5_0_dequant_lane_v2(block, lane); }
-    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
+    antfly_projection_column<antfly_projection_decode_q5_0, antfly_projection_plain, 32u, 0u>(input, weight_q5_0, nullptr, output, rows, in_dim, out_dim, thread_pos, group_pos, 0, 0, nullptr);
 }

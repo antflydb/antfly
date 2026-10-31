@@ -29,34 +29,14 @@ const InferenceExecutionControl = @import("../execution_control.zig").InferenceE
 
 pub const Config = bert_config.Config;
 
-const BertLinearSlotKind = enum(usize) {
-    q,
-    k,
-    v,
-    attention_output,
-    intermediate,
-    output,
-};
+const BertLinearSlotKind = @import("bert_blocks.zig").Linear;
 
 const BertLayerNormSlotKind = enum(usize) {
     attention_output,
     output,
 };
 
-const bert_linear_specs = [_]struct {
-    kind: BertLinearSlotKind,
-    weight: []const u8,
-    bias: []const u8,
-    input_intermediate: bool = false,
-    output_intermediate: bool = false,
-}{
-    .{ .kind = .q, .weight = "attention.self.query.weight", .bias = "attention.self.query.bias" },
-    .{ .kind = .k, .weight = "attention.self.key.weight", .bias = "attention.self.key.bias" },
-    .{ .kind = .v, .weight = "attention.self.value.weight", .bias = "attention.self.value.bias" },
-    .{ .kind = .attention_output, .weight = "attention.output.dense.weight", .bias = "attention.output.dense.bias" },
-    .{ .kind = .intermediate, .weight = "intermediate.dense.weight", .bias = "intermediate.dense.bias", .output_intermediate = true },
-    .{ .kind = .output, .weight = "output.dense.weight", .bias = "output.dense.bias", .input_intermediate = true },
-};
+const bert_linear_specs = @import("bert_blocks.zig").linear_specs;
 
 const bert_layer_norm_specs = [_]struct {
     kind: BertLayerNormSlotKind,
@@ -482,59 +462,50 @@ fn embeddings(
     H: u32,
     layer_norm_slot: ?usize,
 ) !CT {
-    // Word embeddings
-    const word_emb = try cb.getWeight("embeddings.word_embeddings.weight");
-    defer cb.free(word_emb);
-    var result = try cb.embeddingLookup(word_emb, input_ids, total, H);
-
-    // Position embeddings
-    const pos_emb = try cb.getWeight("embeddings.position_embeddings.weight");
-    defer cb.free(pos_emb);
-    const pos_ids = try buildPositionIds(allocator, config, input_ids, total, seq_len);
-    defer allocator.free(pos_ids);
-    const pos_lookup = try cb.embeddingLookup(pos_emb, pos_ids, total, H);
-    defer cb.free(pos_lookup);
-
-    const with_pos = try cb.add(result, pos_lookup);
-    cb.free(result);
-    result = with_pos;
-
-    // Token type embeddings (optional, not present in distilbert)
-    if (config.model_type != .distilbert) {
-        if (cb.getWeight("embeddings.token_type_embeddings.weight")) |tt_emb| {
-            defer cb.free(tt_emb);
-            // Token type IDs: use provided or default to all zeros
-            const tt_ids = try allocator.alloc(i64, total);
-            defer allocator.free(tt_ids);
-            if (token_type_ids) |tids| {
-                @memcpy(tt_ids, tids[0..total]);
-            } else {
-                @memset(tt_ids, 0);
-            }
-            const tt_lookup = try cb.embeddingLookup(tt_emb, tt_ids, total, H);
-            defer cb.free(tt_lookup);
-            const with_tt = try cb.add(result, tt_lookup);
-            cb.free(result);
-            result = with_tt;
-        } else |_| {}
-    }
-
-    // Keep fallback weights completely off the resident Metal hot path:
-    // cached getWeight calls still allocate short-lived tensor wrappers.
-    const normed = embeddingLayerNormWithSlot(
-        cb,
-        result,
-        H,
-        config.layer_norm_eps,
-        layer_norm_slot,
-    ) catch |err| {
-        cb.free(result);
-        return err;
-    };
-    cb.free(result);
-
-    return normed;
+    var context = EmbeddingContext{ .cb = cb, .allocator = allocator, .config = config, .input_ids = input_ids, .token_type_ids = token_type_ids, .total = total, .seq_len = seq_len, .hidden = H, .norm_slot = layer_norm_slot };
+    return @import("bert_blocks.zig").embeddings(&context);
 }
+
+const EmbeddingContext = struct {
+    pub const Value = CT;
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    token_type_ids: ?[]const i64,
+    total: usize,
+    seq_len: usize,
+    hidden: u32,
+    norm_slot: ?usize,
+    pub fn lookup(self: *@This(), comptime role: @import("bert_blocks.zig").Embedding) !?CT {
+        if (role == .token_type and self.config.model_type == .distilbert) return null;
+        const weight = self.cb.getWeight(@import("bert_blocks.zig").embeddingName(role)) catch |err| {
+            if (role == .token_type) return null;
+            return err;
+        };
+        defer self.cb.free(weight);
+        const ids = switch (role) {
+            .word => self.input_ids,
+            .position => try buildPositionIds(self.allocator, self.config, self.input_ids, self.total, self.seq_len),
+            .token_type => if (self.token_type_ids) |ids| ids[0..self.total] else blk: {
+                const zeros = try self.allocator.alloc(i64, self.total);
+                @memset(zeros, 0);
+                break :blk zeros;
+            },
+        };
+        defer if (role == .position or (role == .token_type and self.token_type_ids == null)) self.allocator.free(ids);
+        return try self.cb.embeddingLookup(weight, ids, self.total, self.hidden);
+    }
+    pub fn add(self: *@This(), lhs: CT, rhs: CT) !CT {
+        return self.cb.add(lhs, rhs);
+    }
+    pub fn normalize(self: *@This(), input: CT) !CT {
+        return embeddingLayerNormWithSlot(self.cb, input, self.hidden, self.config.layer_norm_eps, self.norm_slot);
+    }
+    pub fn free(self: *@This(), value: CT) void {
+        self.cb.free(value);
+    }
+};
 
 fn embeddingLayerNormWithSlot(
     cb: *const ComputeBackend,
@@ -605,173 +576,146 @@ fn encoderLayer(
     layer: usize,
     resident_slots: bool,
 ) !CT {
-    const hidden_dim: usize = @intCast(config.hidden_size);
-    const num_heads: usize = @intCast(config.num_attention_heads);
-    const head_dim = hidden_dim / num_heads;
-    const intermediate_dim: usize = @intCast(config.intermediate_size);
-    const total = batch * seq_len;
-    const ffn_activation = runtimeActivationKind(config.hidden_act);
-
-    var name_buf: [256]u8 = undefined;
-
-    const tp_world_size = tensorParallelWorldSize(cb);
-    const use_tp = tp_world_size > 1;
-    if (use_tp and (hidden_dim % tp_world_size != 0 or num_heads % tp_world_size != 0 or intermediate_dim % tp_world_size != 0)) {
-        return error.InvalidTensorParallelShape;
-    }
-    const local_num_heads = if (use_tp) num_heads / tp_world_size else num_heads;
-
-    const qkv: ops.LinearTripleResult = if (resident_slots and !platform.env.getenvBool("TERMITE_METAL_DISABLE_BERT_QKV")) blk: {
-        if (try cb.decoderRuntimeApplyLinearQkv(&.{
-            .q_slot = bertLinearSlot(layer, .q),
-            .k_slot = bertLinearSlot(layer, .k),
-            .v_slot = bertLinearSlot(layer, .v),
-            .input = hidden,
-            .in_dim = hidden_dim,
-            .q_out_dim = hidden_dim,
-            .kv_out_dim = hidden_dim,
-        })) |projected| {
-            break :blk .{
-                .first = projected.first,
-                .second = projected.second,
-                .third = projected.third,
-            };
-        }
-        break :blk try layerLinearTriple(cb, allocator, layer, hidden, total, hidden_dim, &name_buf);
-    } else try layerLinearTriple(cb, allocator, layer, hidden, total, hidden_dim, &name_buf);
-    defer cb.free(qkv.first);
-    defer cb.free(qkv.second);
-    defer cb.free(qkv.third);
-    const attn_out = if (allAttentionMaskOnes(attention_mask, total))
-        (try cb.scaledDotProductAttentionFull(qkv.first, qkv.second, qkv.third, null, batch, seq_len, local_num_heads, head_dim)) orelse
-            try cb.scaledDotProductAttention(qkv.first, qkv.second, qkv.third, attention_mask, null, batch, seq_len, local_num_heads, head_dim)
-    else
-        try cb.scaledDotProductAttention(qkv.first, qkv.second, qkv.third, attention_mask, null, batch, seq_len, local_num_heads, head_dim);
-    defer {
-        cb.free(attn_out);
-    }
-
-    const attn_normed = blk: {
-        if (resident_slots) {
-            if (try cb.decoderRuntimeApplyLinearLayerNorm(&.{
-                .linear_slot = bertLinearSlot(layer, .attention_output),
-                .layer_norm_slot = bertLayerNormSlot(layer, .attention_output),
-                .input = attn_out,
-                .residual = hidden,
-                .in_dim = hidden_dim,
-                .hidden_size = hidden_dim,
-                .eps = config.layer_norm_eps,
-            })) |output| break :blk output;
-        }
-
-        const attn_proj = try layerLinearWithSlot(
-            cb,
-            allocator,
-            layer,
-            attn_out,
-            "attention.output.dense.weight",
-            "attention.output.dense.bias",
-            total,
-            hidden_dim,
-            hidden_dim,
-            if (resident_slots) bertLinearSlot(layer, .attention_output) else null,
-            &name_buf,
-        );
-        defer cb.free(attn_proj);
-        const attn_res = try cb.add(attn_proj, hidden);
-        defer cb.free(attn_res);
-        break :blk try layerNormForLayerWithSlot(
-            cb,
-            allocator,
-            layer,
-            attn_res,
-            "attention.output.LayerNorm.weight",
-            "attention.output.LayerNorm.bias",
-            hidden_dim,
-            config.layer_norm_eps,
-            if (resident_slots) bertLayerNormSlot(layer, .attention_output) else null,
-            &name_buf,
-        );
+    var context = EncoderOutputContext{
+        .cb = cb,
+        .allocator = allocator,
+        .config = config,
+        .layer = layer,
+        .total = batch * seq_len,
+        .resident_slots = resident_slots,
+        .batch = batch,
+        .seq_len = seq_len,
+        .attention_mask = attention_mask,
     };
-    defer cb.free(attn_normed);
-
-    if (resident_slots) {
-        if (try cb.decoderRuntimeApplyFfnLayerNorm(&.{
-            .first_linear_slot = bertLinearSlot(layer, .intermediate),
-            .second_linear_slot = bertLinearSlot(layer, .output),
-            .layer_norm_slot = bertLayerNormSlot(layer, .output),
-            .input = attn_normed,
-            .residual = attn_normed,
-            .hidden_size = hidden_dim,
-            .intermediate_size = intermediate_dim,
-            .eps = config.layer_norm_eps,
-            .activation = ffn_activation,
-        })) |layer_out| {
-            return layer_out;
-        }
-    }
-
-    const ffn_res = blk: {
-        if (resident_slots) {
-            if (try cb.runDenseFfnResidual(&.{
-                .first_linear_slot = bertLinearSlot(layer, .intermediate),
-                .second_linear_slot = bertLinearSlot(layer, .output),
-                .input = attn_normed,
-                .residual = attn_normed,
-                .hidden_size = hidden_dim,
-                .intermediate_size = intermediate_dim,
-                .activation = ffn_activation,
-            })) |output| break :blk output;
-        }
-
-        const ffn_inter = try layerLinearWithSlot(
-            cb,
-            allocator,
-            layer,
-            attn_normed,
-            "intermediate.dense.weight",
-            "intermediate.dense.bias",
-            total,
-            hidden_dim,
-            intermediate_dim,
-            if (resident_slots) bertLinearSlot(layer, .intermediate) else null,
-            &name_buf,
-        );
-        defer cb.free(ffn_inter);
-        const ffn_activated = try applyHiddenActivation(cb, ffn_inter, config.hidden_act);
-        defer cb.free(ffn_activated);
-        const ffn_out = try layerLinearWithSlot(
-            cb,
-            allocator,
-            layer,
-            ffn_activated,
-            "output.dense.weight",
-            "output.dense.bias",
-            total,
-            intermediate_dim,
-            hidden_dim,
-            if (resident_slots) bertLinearSlot(layer, .output) else null,
-            &name_buf,
-        );
-        defer cb.free(ffn_out);
-        break :blk try cb.add(ffn_out, attn_normed);
-    };
-    defer cb.free(ffn_res);
-
-    const layer_out = try layerNormForLayerWithSlot(
-        cb,
-        allocator,
-        layer,
-        ffn_res,
-        "output.LayerNorm.weight",
-        "output.LayerNorm.bias",
-        hidden_dim,
-        config.layer_norm_eps,
-        if (resident_slots) bertLayerNormSlot(layer, .output) else null,
-        &name_buf,
-    );
-    return layer_out;
+    return @import("bert_blocks.zig").encoderLayer(&context, hidden);
 }
+
+const EncoderOutputContext = struct {
+    pub const Value = CT;
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    layer: usize,
+    total: usize,
+    resident_slots: bool,
+    batch: usize,
+    seq_len: usize,
+    attention_mask: []const i64,
+
+    pub fn fusedQueryKeyValue(self: *@This(), hidden: CT) !?ops.LinearTripleResult {
+        const cb = self.cb;
+        const allocator = self.allocator;
+        const config = self.config;
+        const layer = self.layer;
+        const resident_slots = self.resident_slots;
+        const total = self.total;
+        const hidden_dim: usize = config.hidden_size;
+        const tp_world_size = tensorParallelWorldSize(cb);
+        if (hidden_dim % tp_world_size != 0 or config.num_attention_heads % tp_world_size != 0 or config.intermediate_size % tp_world_size != 0) return error.InvalidTensorParallelShape;
+        var name_buf: [256]u8 = undefined;
+        return if (resident_slots and !platform.env.getenvBool("TERMITE_METAL_DISABLE_BERT_QKV")) blk: {
+            if (try cb.decoderRuntimeApplyLinearQkv(&.{
+                .q_slot = bertLinearSlot(layer, .q),
+                .k_slot = bertLinearSlot(layer, .k),
+                .v_slot = bertLinearSlot(layer, .v),
+                .input = hidden,
+                .in_dim = hidden_dim,
+                .q_out_dim = hidden_dim,
+                .kv_out_dim = hidden_dim,
+            })) |projected| {
+                break :blk .{
+                    .first = projected.first,
+                    .second = projected.second,
+                    .third = projected.third,
+                };
+            }
+            break :blk try layerLinearTriple(cb, allocator, layer, hidden, total, hidden_dim, &name_buf);
+        } else try layerLinearTriple(cb, allocator, layer, hidden, total, hidden_dim, &name_buf);
+    }
+
+    pub fn attention(self: *@This(), q: CT, k: CT, v: CT) !CT {
+        const cb = self.cb;
+        const attention_mask = self.attention_mask;
+        const total = self.total;
+        const batch = self.batch;
+        const seq_len = self.seq_len;
+        const local_num_heads = self.config.num_attention_heads / tensorParallelWorldSize(cb);
+        const head_dim = self.config.hidden_size / self.config.num_attention_heads;
+        return if (allAttentionMaskOnes(attention_mask, total))
+            (try cb.scaledDotProductAttentionFull(q, k, v, null, batch, seq_len, local_num_heads, head_dim)) orelse
+                try cb.scaledDotProductAttention(q, k, v, attention_mask, null, batch, seq_len, local_num_heads, head_dim)
+        else
+            try cb.scaledDotProductAttention(q, k, v, attention_mask, null, batch, seq_len, local_num_heads, head_dim);
+    }
+
+    pub fn free(self: *@This(), value: CT) void {
+        self.cb.free(value);
+    }
+    pub fn add(self: *@This(), a: CT, b: CT) !CT {
+        return self.cb.add(a, b);
+    }
+    pub fn activate(self: *@This(), input: CT) !CT {
+        return applyHiddenActivation(self.cb, input, self.config.hidden_act);
+    }
+    pub fn linear(self: *@This(), comptime role: @import("bert_blocks.zig").Linear, input: CT) !CT {
+        const base = comptime @import("bert_blocks.zig").linearBase(role);
+        const slot: BertLinearSlotKind = role;
+        const H = self.config.hidden_size;
+        const I = self.config.intermediate_size;
+        var name_buf: [256]u8 = undefined;
+        return layerLinearWithSlot(self.cb, self.allocator, self.layer, input, base ++ ".weight", base ++ ".bias", self.total, if (role == .output) I else H, if (role == .intermediate) I else H, if (self.resident_slots) bertLinearSlot(self.layer, slot) else null, &name_buf);
+    }
+    pub fn norm(self: *@This(), comptime role: @import("bert_blocks.zig").Norm, input: CT) !CT {
+        const base = switch (role) {
+            .attention_output => "attention.output.LayerNorm",
+            .output => "output.LayerNorm",
+        };
+        const slot: BertLayerNormSlotKind = switch (role) {
+            .attention_output => .attention_output,
+            .output => .output,
+        };
+        var name_buf: [256]u8 = undefined;
+        return layerNormForLayerWithSlot(self.cb, self.allocator, self.layer, input, base ++ ".weight", base ++ ".bias", self.config.hidden_size, self.config.layer_norm_eps, if (self.resident_slots) bertLayerNormSlot(self.layer, slot) else null, &name_buf);
+    }
+    pub fn fusedAttentionOutput(self: *@This(), hidden: CT, attention_value: CT) !?CT {
+        if (!self.resident_slots) return null;
+        return self.cb.decoderRuntimeApplyLinearLayerNorm(&.{
+            .linear_slot = bertLinearSlot(self.layer, .attention_output),
+            .layer_norm_slot = bertLayerNormSlot(self.layer, .attention_output),
+            .input = attention_value,
+            .residual = hidden,
+            .in_dim = self.config.hidden_size,
+            .hidden_size = self.config.hidden_size,
+            .eps = self.config.layer_norm_eps,
+        });
+    }
+    pub fn fusedFeedForward(self: *@This(), input: CT) !?CT {
+        if (!self.resident_slots) return null;
+        return self.cb.decoderRuntimeApplyFfnLayerNorm(&.{
+            .first_linear_slot = bertLinearSlot(self.layer, .intermediate),
+            .second_linear_slot = bertLinearSlot(self.layer, .output),
+            .layer_norm_slot = bertLayerNormSlot(self.layer, .output),
+            .input = input,
+            .residual = input,
+            .hidden_size = self.config.hidden_size,
+            .intermediate_size = self.config.intermediate_size,
+            .eps = self.config.layer_norm_eps,
+            .activation = runtimeActivationKind(self.config.hidden_act),
+        });
+    }
+    pub fn fusedFeedForwardResidual(self: *@This(), input: CT) !?CT {
+        if (!self.resident_slots) return null;
+        return self.cb.runDenseFfnResidual(&.{
+            .first_linear_slot = bertLinearSlot(self.layer, .intermediate),
+            .second_linear_slot = bertLinearSlot(self.layer, .output),
+            .input = input,
+            .residual = input,
+            .hidden_size = self.config.hidden_size,
+            .intermediate_size = self.config.intermediate_size,
+            .activation = runtimeActivationKind(self.config.hidden_act),
+        });
+    }
+};
 
 fn runtimeActivationKind(activation: bert_config.HiddenActivation) ops.DecoderRuntimeActivationKind {
     return switch (activation) {

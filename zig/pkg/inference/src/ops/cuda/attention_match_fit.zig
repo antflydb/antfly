@@ -27,6 +27,7 @@ const check = algebra.check;
 const ptr = algebra.ptr;
 const int = algebra.int;
 const Kernel = enum { zero_values, normalize, pick_column, pack_basis, copy_scaled_column, finalize_column, delete_r_column, retriangularize, transpose_probabilities, select_column_cooperative };
+const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("artifacts/attention_match_fit.fatbin"), Kernel);
 
 pub const Fitter = struct {
     context: *Context,
@@ -41,8 +42,7 @@ pub const Fitter = struct {
     workspace_reuses: usize = 0,
     frame_active: bool = false,
     linalg: algebra.Linalg,
-    module: driver.CUmodule,
-    functions: [@typeInfo(Kernel).@"enum".field_names.len]driver.CUfunction,
+    program: Program,
     max_device_bytes: usize,
     /// Opt-in until real-model latency and reliability qualification completes.
     cooperative_enabled: bool = false,
@@ -74,13 +74,9 @@ pub const Fitter = struct {
         var linalg = try algebra.Linalg.initOnStream(context, stream);
         errdefer linalg.deinit();
         _ = allocator;
-        var module: driver.CUmodule = null;
-        try context.driver.check(context.driver.fns.cuModuleLoadDataEx(&module, @embedFile("artifacts/attention_match_fit.fatbin").ptr, 0, null, null));
-        errdefer _ = context.driver.fns.cuModuleUnload(module);
-        var functions: [@typeInfo(Kernel).@"enum".field_names.len]driver.CUfunction = undefined;
-        inline for (@typeInfo(Kernel).@"enum".field_names, 0..) |field, i| {
-            try context.driver.check(context.driver.fns.cuModuleGetFunction(&functions[i], module, field));
-        }
+        var program: Program = .{};
+        try program.initCurrent(&context.driver);
+        errdefer program.deinitCurrent(&context.driver) catch {};
         var blocks: usize = 0;
         const fns = context.driver.fns;
         if (fns.cuLaunchCooperativeKernel != null and fns.cuOccupancyMaxActiveBlocksPerMultiprocessor != null and fns.cuDeviceGetAttribute != null) {
@@ -90,17 +86,17 @@ pub const Fitter = struct {
                 var multiprocessors: c_int = 0;
                 var occupancy: c_int = 0;
                 try context.driver.check(fns.cuDeviceGetAttribute.?(&multiprocessors, 16, context.device));
-                try context.driver.check(fns.cuOccupancyMaxActiveBlocksPerMultiprocessor.?(&occupancy, functions[@backingInt(Kernel.select_column_cooperative)], 128, 0));
+                try context.driver.check(fns.cuOccupancyMaxActiveBlocksPerMultiprocessor.?(&occupancy, program.function(.select_column_cooperative), 128, 0));
                 if (multiprocessors > 0 and occupancy > 0) blocks = @min(64, @as(usize, @intCast(multiprocessors)) * @as(usize, @intCast(occupancy)));
             }
         }
-        return .{ .context = context, .stream = stream, .linalg = linalg, .module = module, .functions = functions, .max_device_bytes = max_device_bytes, .cooperative_blocks = blocks };
+        return .{ .context = context, .stream = stream, .linalg = linalg, .program = program, .max_device_bytes = max_device_bytes, .cooperative_blocks = blocks };
     }
     pub fn deinit(self: *Fitter) void {
         self.context.makeCurrent() catch {};
         self.synchronize() catch {};
         self.releaseWorkspace();
-        _ = self.context.driver.fns.cuModuleUnload(self.module);
+        self.program.deinitCurrent(&self.context.driver) catch return;
         self.linalg.deinit();
         if (self.owns_stream) _ = self.context.driver.fns.cuStreamDestroy(self.stream);
         self.* = undefined;
@@ -171,10 +167,10 @@ pub const Fitter = struct {
         if (cooperative) {
             if (blocks == 0 or blocks > self.cooperative_blocks) return error.UnsupportedCooperativeFit;
             const launch_fn = self.context.driver.fns.cuLaunchCooperativeKernel orelse return error.UnsupportedCooperativeFit;
-            try self.context.driver.check(launch_fn(self.functions[@backingInt(kernel)], @intCast(blocks), 1, 1, @intCast(threads), 1, 1, 0, self.stream, &params));
+            try self.context.driver.check(launch_fn(self.program.function(kernel), @intCast(blocks), 1, 1, @intCast(threads), 1, 1, 0, self.stream, &params));
             self.cooperative_launches += 1;
         } else {
-            try self.context.driver.check(self.context.driver.fns.cuLaunchKernel(self.functions[@backingInt(kernel)], @intCast(blocks), 1, 1, @intCast(threads), 1, 1, 0, self.stream, &params, null));
+            try self.context.driver.check(self.context.driver.fns.cuLaunchKernel(self.program.function(kernel), @intCast(blocks), 1, 1, @intCast(threads), 1, 1, 0, self.stream, &params, null));
         }
     }
     fn upload(self: *Fitter, device: usize, bytes: []const u8) !void {

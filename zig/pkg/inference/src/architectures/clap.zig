@@ -1389,24 +1389,6 @@ fn linearTripleNamedData(
     return .{ .first = first, .second = second, .third = third };
 }
 
-fn linearNamedNoBiasData(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    input: []const f32,
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-    weight_name: []const u8,
-) ![]f32 {
-    const input_ct = try cb.fromFloat32Shape(input, &[_]i32{ @intCast(rows), @intCast(in_dim) });
-    defer cb.free(input_ct);
-    const weight = try cb.getWeight(weight_name);
-    defer cb.free(weight);
-    const out_ct = try cb.linearNoBias(input_ct, weight, rows, in_dim, out_dim);
-    defer cb.free(out_ct);
-    return cb.toFloat32(out_ct, allocator);
-}
-
 fn layerNormData(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,

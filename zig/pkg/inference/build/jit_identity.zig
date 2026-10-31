@@ -55,7 +55,14 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
     const qualification: []const []const u8 = switch (backend) {
         .metal => &.{
             "src/backends/metal_runtime.zig",
+            "src/graph/quant_kernel_metal_renderer.zig",
+            "src/graph/quant_kernel_metal_attention_phases.zig",
+            "src/graph/quant_kernel_metal_param_abi.zig",
+            "src/graph/templates/metal_paged_prefill_compat.metal",
+            "src/graph/templates/metal_projection_native.metal",
+            "src/graph/templates/metal_paged_decode_native.metal",
             "src/backends/metal_compile_options.h",
+            "src/backends/metal_pipeline_catalog.h",
             "src/graph/kernel_jit.zig",
             "src/graph/quant_kernel_compiler.zig",
             "src/graph/quant_matmul.zig",
@@ -72,16 +79,144 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
             "src/gguf/tensor_types.zig",
         },
     };
-    run.addArg(b.fmt("{d}", .{qualification.len}));
+    const tile_inputs = @import("../src/tile/source_inputs.zig").paths;
+    const contracts = [_][]const u8{
+        "src/ops/kernel_descriptor.zig",
+        "src/graph/kernel_source_owner.zig",
+        "src/ops/kernel_geometry.zig",
+        "src/ops/kernel_math.zig",
+        "src/ops/kernel_reduction.zig",
+        "src/ops/gpu/depthwise_program.h",
+        "src/ops/gpu/masked_pool_program.h",
+        "src/graph/cuda_kernel_fold.zig",
+        "src/tile/source_inputs.zig",
+    };
+    // Native includes and host ABI consumers affect qualification even when
+    // the translation-unit text is unchanged. Declare the complete local
+    // include closure so Zig's watch/cache graph sees those edits as well.
+    const metal_dependencies = [_][]const u8{
+        "src/backends/metal_param_abi.h",
+        "src/backends/metal_gdn_source.h",
+        "src/backends/metal_buffer_observation.h",
+        "src/backends/metal_mtp_head.h",
+        "src/backends/metal_mtp_head_impl.h",
+        "src/ops/metal/generated/tile_whisper_logits_partials.msl.h",
+    };
+    const cuda_dependencies = [_][]const u8{
+        "src/ops/cuda/driver_contract.zig",
+        "src/ops/cuda/artifact.zig",
+        "src/ops/cuda/context.zig",
+        "src/ops/cuda/embedded_module.zig",
+        "src/ops/cuda/gated_delta.zig",
+        "src/ops/cuda/paged_attention_bf16.zig",
+        "src/ops/cuda/bf16_fusions.zig",
+        "src/ops/cuda/vision_fusions.zig",
+        "src/ops/cuda/buffer.zig",
+        "src/ops/cuda/buffer_cache.zig",
+        "src/ops/cuda/cublaslt.zig",
+        "src/ops/cuda/cudnn_sdpa.zig",
+        "src/ops/cuda/attention_inputs_f32.zig",
+        "src/ops/cuda/attention_inputs_partial_mrope_f32.ptx",
+        "src/ops/cuda/projection_top1_bf16.zig",
+        "src/ops/cuda/projection_top1_bf16_k1024_n248320_partial.ptx",
+        "src/ops/cuda/projection_top1_bf16_k1024_n248320_finish.ptx",
+        "src/ops/cuda/projection_epilogues_bf16.zig",
+        "src/ops/cuda/encoder_block_bf16.zig",
+        "src/ops/cuda/encoder_block_phases_bf16.ptx",
+        "src/ops/cuda/prototypes/attention_inputs_partial_mrope_f32.cu",
+        "src/ops/cuda/prototypes/encoder_block_phases_bf16.cu",
+        "src/ops/cuda/prototypes/projection_top1_bf16.py",
+        "src/ops/cuda/prototypes/projection_gelu_bf16.py",
+        "src/ops/cuda/prototypes/projection_dot_bias_bf16.py",
+        "src/ops/cuda/prototypes/producer_support.py",
+        "src/ops/cuda/generated/standalone_programs.json",
+        "src/ops/cuda/generated/standalone_images.zig",
+        "src/ops/cuda/prototypes/projection_residual_bf16.py",
+        "src/ops/cuda/projection_gelu_sm121_k768_n3072_bias_f32.ptx",
+        "src/ops/cuda/projection_residual_sm121_k3072_n768_io_f32.ptx",
+        "src/ops/cuda/projection_gelu_sm121_k768_n3072_bias_bf16.ptx",
+        "src/ops/cuda/projection_residual_sm121_k3072_n768_io_bf16.ptx",
+        "src/ops/cuda/projection_gelu_sm121_k1024_n4096_bias_f32.ptx",
+        "src/ops/cuda/projection_residual_sm121_k4096_n1024_io_f32.ptx",
+        "src/ops/cuda/projection_gelu_sm121_k1024_n4096_bias_bf16.ptx",
+        "src/ops/cuda/projection_residual_sm121_k4096_n1024_io_bf16.ptx",
+        "src/ops/cuda/encoder_decoder_fusions.zig",
+        "src/ops/cuda/embedding_gemma2.zig",
+        "src/ops/cuda/lighton_recurrent.ptx",
+        "src/ops/cuda/lighton_attention.ptx",
+        "src/ops/cuda/lighton_activation.ptx",
+        "src/ops/cuda/lighton_vision.ptx",
+        "src/ops/cuda/florence_fused.ptx",
+        "src/ops/cuda/prototypes/gated_delta_recurrent.cu",
+        "src/ops/cuda/prototypes/paged_attention_bf16_programs.cu",
+        "src/ops/cuda/prototypes/bf16_activation_programs.cu",
+        "src/ops/cuda/prototypes/vision_projection_programs.cu",
+        "src/ops/cuda/prototypes/vision_f16_programs.cu",
+        "src/graph/templates/cuda_gqa_flash_prefill_f16_sm89.cuh",
+        "src/graph/templates/cuda_gqa_decode_splitk_online_sm89.cuh",
+        "src/graph/templates/cuda_gqa_split_decode_f32.cuh",
+        "src/ops/cuda/launch_abi.zig",
+        "src/ops/cuda/driver.zig",
+        "src/graph/templates/cuda_q4_0_bf16_staged.cuh",
+        "src/graph/templates/cuda_q4_q8_projection.cuh",
+        "src/graph/templates/cuda_gqa_repeat_prefill_f16.cuh",
+        "src/graph/templates/cuda_gqa_repeat_split_f16.cuh",
+        "src/ops/cuda/kernels/kernel_abi.cuh",
+        "src/ops/cuda/kernels/row_program.cuh",
+        "src/ops/cuda/kernels/prefix_normalization_program.cuh",
+        "src/ops/cuda/kernels/wmma_tile_program.cuh",
+        "src/ops/cuda/kernels/rotary_program.cuh",
+        "src/ops/cuda/kernels/encoder_multimodal_programs.cuh",
+        "src/ops/cuda/kernels/rotary_frequency_training.cuh",
+        "src/ops/cuda/kernels/encoder_fused_programs.cuh",
+        "src/ops/cuda/kernels/ragged_boundary_programs.cuh",
+        "src/ops/cuda/kernels/relative_attention_tensor_rows64.cuh",
+        "src/ops/cuda/kernels/relative_attention_tensor_tiles.cuh",
+        "src/ops/cuda/kernels/q8_projection_tile4.cuh",
+        "src/ops/cuda/kernels/projection_rows_cols_init.cuh",
+        "src/ops/cuda/kernels/projection_rows_cols_tree.cuh",
+        "src/ops/cuda/kernels/quant_projection_epilogue.cuh",
+        "src/ops/cuda/kernels/q4_k_tiled_dot.cuh",
+        "src/ops/cuda/kernels/dense_qkv_tiled.cuh",
+        "src/ops/cuda/kernels/quant_tile4_publish.cuh",
+        "src/ops/cuda/kernels/quant_k_tile4_partials.cuh",
+        "src/ops/cuda/kernels/scalar_argmax_fold.cuh",
+        "src/ops/cuda/kernels/q8_1_zero_sum_store.cuh",
+        "src/ops/cuda/kernels/q4_a4b_q8_acquire.cuh",
+        "src/ops/cuda/kernels/tq_mma_visible_range.cuh",
+        "src/ops/cuda/kernels/tq_mma_stage_kv.cuh",
+        "src/ops/cuda/kernels/tq_mma_prefill.cuh",
+        "src/ops/cuda/kernels/tq_scalar_online.cuh",
+        "src/ops/cuda/kernels/vision_bf16_attention_m32n16.cuh",
+        "src/ops/cuda/kernels/q6_e4b_tile8_partials.cuh",
+        "src/ops/cuda/kernels/quant_argmax_publish.cuh",
+        "src/ops/cuda/kernels/block_local_attention.cuh",
+        "src/ops/cuda/kernels/primitive_gather.cuh",
+        "src/ops/cuda/kernels/primitive_scatter.cuh",
+        "src/ops/cuda/kernels/dense_fast_attention_online.cuh",
+        "src/ops/cuda/kernels/training_validation.cuh",
+        "src/ops/cuda/kernels/training_welford_layer_norm.cuh",
+        "src/ops/cuda/kernels/training_row_softmax.cuh",
+        "src/ops/cuda/kernels/relative_attention_training.cuh",
+    };
+    run.addArg(b.fmt("{d}", .{qualification.len + contracts.len + tile_inputs.len + if (backend == .cuda) cuda_dependencies.len else metal_dependencies.len}));
     for (qualification) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
+    for (contracts) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
+    for (if (backend == .cuda) &cuda_dependencies else &metal_dependencies) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
+    for (tile_inputs) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     if (backend == .cuda) {
-        run.addArgs(&.{ "dispatch", "4" });
-        for ([_][]const u8{
+        const dispatch_dependencies = [_][]const u8{
             "src/ops/cuda/cuda_compute.zig",
+            "src/ops/cuda/launch_abi.zig",
+            "src/ops/cuda/kernels/kernel_abi.cuh",
+            "src/ops/kernel_descriptor.zig",
+            "src/ops/kernel_geometry.zig",
             "src/graph/quant_kernel_compiler.zig",
             "src/graph/quant_matmul.zig",
             "src/gguf/tensor_types.zig",
-        }) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
+        };
+        run.addArgs(&.{ "dispatch", b.fmt("{d}", .{dispatch_dependencies.len}) });
+        for (dispatch_dependencies) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     }
     run.addArg("--output");
     return b.createModule(.{ .root_source_file = run.addOutputFileArg2(b.fmt("{s}_identity.zig", .{@tagName(backend)}), .{ .make_absolute = true }) });

@@ -1,0 +1,32 @@
+{
+  "original_entries": 2,
+  "compared_entries": 2,
+  "retired": [],
+  "candidate_entries": 2,
+  "architectures": [
+    "sm_89"
+  ],
+  "added": [],
+  "changed_instructions": [],
+  "changed_resources": [],
+  "original_image_sha256": "0cc41e211289f4415649458aa8fd5322221f8b567e98b682212f02eedd77850d",
+  "candidate_image_sha256": "6808bf313d8d24fbeed4666e971d19025c2ff40a79cfe052ca5d0ee4cf5f493c",
+  "programs": [
+    {
+      "arch": "sm_89",
+      "function": "antfly_q4_0_down_q8_1_mmv_v1",
+      "original_instructions_sha256": "a237b97963d19e53b2eb3441abf73cece145702ca473e13268d7de1c1497a1a2",
+      "candidate_instructions_sha256": "a237b97963d19e53b2eb3441abf73cece145702ca473e13268d7de1c1497a1a2",
+      "original_resources_sha256": "2a7990a324b2c8630d7076621fd5a23b2c18ec5521a78eb54ca79ae43782ebe9",
+      "candidate_resources_sha256": "2a7990a324b2c8630d7076621fd5a23b2c18ec5521a78eb54ca79ae43782ebe9"
+    },
+    {
+      "arch": "sm_89",
+      "function": "antfly_q4_0_pair_activation_q8_1_mmv_v1",
+      "original_instructions_sha256": "23001ba965acd97439911492c01ecdd25df574c227d7f5cbb91f650b58801cde",
+      "candidate_instructions_sha256": "23001ba965acd97439911492c01ecdd25df574c227d7f5cbb91f650b58801cde",
+      "original_resources_sha256": "2cf7cf1c4724767d941e15904f8ed2d7e1375367004513e34e2056c5d25d01f2",
+      "candidate_resources_sha256": "2cf7cf1c4724767d941e15904f8ed2d7e1375367004513e34e2056c5d25d01f2"
+    }
+  ]
+}

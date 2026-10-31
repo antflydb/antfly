@@ -1,0 +1,339 @@
+[
+  {
+    "family": "attention_inputs",
+    "file": "attention_inputs_partial_mrope_f32.ptx",
+    "entry": "lighton_qk_norm_partial_mrope_gate",
+    "producer": "attention_inputs_partial_mrope_f32.cu",
+    "exports": [],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 75,
+    "threads": 0,
+    "shared": 0,
+    "hidden": 0,
+    "wide": 0,
+    "bf16": false
+  },
+  {
+    "family": "encoder_block",
+    "file": "encoder_block_phases_bf16.ptx",
+    "entry": "lighton_bf16_vision_norm",
+    "producer": "encoder_block_phases_bf16.cu",
+    "exports": [
+      "lighton_bf16_vision_norm",
+      "lighton_bf16_vision_add",
+      "lighton_bf16_vision_gelu",
+      "lighton_bf16_vision_qkv_rope"
+    ],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 80,
+    "threads": 0,
+    "shared": 0,
+    "hidden": 0,
+    "wide": 0,
+    "bf16": false
+  },
+  {
+    "family": "projection_gelu",
+    "file": "projection_gelu_sm121_k768_n3072_bias_f32.ptx",
+    "entry": "lighton_vision_up",
+    "producer": "projection_gelu_bf16.py",
+    "exports": [],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 121,
+    "threads": 128,
+    "shared": 24576,
+    "hidden": 768,
+    "wide": 3072,
+    "bf16": false
+  },
+  {
+    "family": "projection_gelu",
+    "file": "projection_gelu_sm121_k768_n3072_bias_bf16.ptx",
+    "entry": "lighton_vision_up",
+    "producer": "projection_gelu_bf16.py",
+    "exports": [],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 121,
+    "threads": 128,
+    "shared": 24576,
+    "hidden": 768,
+    "wide": 3072,
+    "bf16": true
+  },
+  {
+    "family": "projection_gelu",
+    "file": "projection_gelu_sm121_k1024_n4096_bias_f32.ptx",
+    "entry": "lighton_vision_up",
+    "producer": "projection_gelu_bf16.py",
+    "exports": [],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 121,
+    "threads": 128,
+    "shared": 24576,
+    "hidden": 1024,
+    "wide": 4096,
+    "bf16": false
+  },
+  {
+    "family": "projection_gelu",
+    "file": "projection_gelu_sm121_k1024_n4096_bias_bf16.ptx",
+    "entry": "lighton_vision_up",
+    "producer": "projection_gelu_bf16.py",
+    "exports": [],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 121,
+    "threads": 128,
+    "shared": 24576,
+    "hidden": 1024,
+    "wide": 4096,
+    "bf16": true
+  },
+  {
+    "family": "projection_residual",
+    "file": "projection_residual_sm121_k3072_n768_io_f32.ptx",
+    "entry": "lighton_vision_down",
+    "producer": "projection_residual_bf16.py",
+    "exports": [],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 121,
+    "threads": 128,
+    "shared": 49152,
+    "hidden": 768,
+    "wide": 3072,
+    "bf16": false
+  },
+  {
+    "family": "projection_residual",
+    "file": "projection_residual_sm121_k3072_n768_io_bf16.ptx",
+    "entry": "lighton_vision_down",
+    "producer": "projection_residual_bf16.py",
+    "exports": [],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 121,
+    "threads": 128,
+    "shared": 49152,
+    "hidden": 768,
+    "wide": 3072,
+    "bf16": true
+  },
+  {
+    "family": "projection_residual",
+    "file": "projection_residual_sm121_k4096_n1024_io_f32.ptx",
+    "entry": "lighton_vision_down",
+    "producer": "projection_residual_bf16.py",
+    "exports": [],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 121,
+    "threads": 128,
+    "shared": 49152,
+    "hidden": 1024,
+    "wide": 4096,
+    "bf16": false
+  },
+  {
+    "family": "projection_residual",
+    "file": "projection_residual_sm121_k4096_n1024_io_bf16.ptx",
+    "entry": "lighton_vision_down",
+    "producer": "projection_residual_bf16.py",
+    "exports": [],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 121,
+    "threads": 128,
+    "shared": 49152,
+    "hidden": 1024,
+    "wide": 4096,
+    "bf16": true
+  },
+  {
+    "family": "projection_top1_partial",
+    "file": "projection_top1_bf16_k1024_n248320_partial.ptx",
+    "entry": "lighton_head_top1_partial",
+    "producer": "projection_top1_bf16.py",
+    "exports": [],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 121,
+    "threads": 256,
+    "shared": 32768,
+    "hidden": 1024,
+    "wide": 248320,
+    "bf16": false
+  },
+  {
+    "family": "projection_top1_finish",
+    "file": "projection_top1_bf16_k1024_n248320_finish.ptx",
+    "entry": "lighton_head_top1_finish",
+    "producer": "projection_top1_bf16.py",
+    "exports": [],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 121,
+    "threads": 128,
+    "shared": 16,
+    "hidden": 0,
+    "wide": 0,
+    "bf16": false
+  },
+  {
+    "family": "activation_bf16",
+    "file": "lighton_activation.ptx",
+    "entry": "lighton_silu_up_bf16",
+    "producer": "bf16_activation_programs.cu",
+    "exports": [
+      "lighton_silu_up_bf16",
+      "lighton_packed_silu_up_bf16",
+      "antfly_rms_tree_bf16",
+      "lighton_silu_up_bf16_inputs",
+      "lighton_bf16_residual_f32"
+    ],
+    "nvcc_flags": [],
+    "target": 80,
+    "threads": 0,
+    "shared": 0,
+    "hidden": 0,
+    "wide": 0,
+    "bf16": false
+  },
+  {
+    "family": "paged_attention_bf16",
+    "file": "lighton_attention.ptx",
+    "entry": "lighton_attention_chunks",
+    "producer": "paged_attention_bf16_programs.cu",
+    "exports": [
+      "lighton_attention_chunks",
+      "lighton_attention_combine",
+      "lighton_attention_write_suffix",
+      "lighton_attention_chunks128",
+      "lighton_graph_advance",
+      "lighton_attention_grouped_chunks32",
+      "lighton_attention_grouped_chunks128"
+    ],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 75,
+    "threads": 0,
+    "shared": 0,
+    "hidden": 0,
+    "wide": 0,
+    "bf16": false
+  },
+  {
+    "family": "gated_delta",
+    "file": "lighton_recurrent.ptx",
+    "entry": "antfly_gdn_causal_conv",
+    "producer": "gated_delta_recurrent.cu",
+    "exports": [
+      "antfly_gdn_causal_conv",
+      "lighton_normalize",
+      "lighton_recurrent",
+      "lighton_gated_norm",
+      "lighton_batch_conv",
+      "lighton_batch_recurrent",
+      "lighton_batch_conv_normalize",
+      "lighton_batch_recurrent_norm",
+      "lighton_batch_conv_normalize_cached_gates",
+      "lighton_batch_recurrent_norm_cached_gates",
+      "lighton_conv_cached_gates",
+      "lighton_recurrent_cached_gates",
+      "lighton_split_projections",
+      "lighton_prefix_conv_normalize_cached_gates",
+      "lighton_prefix_batch_conv_normalize",
+      "lighton_prefix_batch_recurrent",
+      "lighton_prefix_batch_recurrent_shared_qk",
+      "lighton_ragged_conv_normalize_cached_gates",
+      "lighton_ragged_recurrent_shared_qk",
+      "lighton_ragged_prefix_conv",
+      "lighton_ragged_recurrent_prefix_only",
+      "lighton_ragged_prefix_gated_norm",
+      "lighton_decode_fused_p2"
+    ],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 75,
+    "threads": 0,
+    "shared": 0,
+    "hidden": 0,
+    "wide": 0,
+    "bf16": false
+  },
+  {
+    "family": "vision_projection_bf16",
+    "file": "lighton_vision.ptx",
+    "entry": "lighton_vision_norm_bf16",
+    "producer": "vision_projection_programs.cu",
+    "exports": [
+      "lighton_vision_norm_bf16",
+      "lighton_vision_bias_gelu_bf16",
+      "lighton_vision_bias_residual_f32",
+      "antfly_qkv_rope_two_axis_bf16",
+      "lighton_vision_learned_positions_f32"
+    ],
+    "nvcc_flags": [],
+    "target": 80,
+    "threads": 0,
+    "shared": 0,
+    "hidden": 0,
+    "wide": 0,
+    "bf16": false
+  },
+  {
+    "family": "encoder_decoder_f16",
+    "file": "florence_fused.ptx",
+    "entry": "antfly_depthwise_3x3_residual_f32",
+    "producer": "vision_f16_programs.cu",
+    "exports": [
+      "antfly_depthwise_3x3_residual_f32",
+      "antfly_layer_norm_warp_finish_f16",
+      "florence_exact_gelu_f16",
+      "florence_cross_q1_f32",
+      "antfly_window_layer_norm_warp_finish_f16",
+      "florence_split_qkv_f16",
+      "florence_append_self_kv_f32"
+    ],
+    "nvcc_flags": [],
+    "target": 80,
+    "threads": 0,
+    "shared": 0,
+    "hidden": 0,
+    "wide": 0,
+    "bf16": false
+  }
+]

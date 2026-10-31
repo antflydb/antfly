@@ -115,7 +115,7 @@ pub const Module = struct {
     local_flash_attention: driver.CUfunction,
     attention_softmax: driver.CUfunction,
     matmul: driver.CUfunction,
-    gelu_mul: driver.CUfunction,
+    gelu_product: driver.CUfunction,
     gelu_mul_vjp: driver.CUfunction,
     bf16_to_f32: driver.CUfunction,
     f32_to_bf16: driver.CUfunction,
@@ -130,7 +130,6 @@ pub const Module = struct {
     scale_device_f32_bf16: driver.CUfunction,
     accumulate_f32: driver.CUfunction,
     accumulate_bf16_boundary_f32: driver.CUfunction,
-    gelu_ple: driver.CUfunction,
     residual: driver.CUfunction,
     residual_vjp: driver.CUfunction,
     contrastive_prob: driver.CUfunction,
@@ -142,8 +141,7 @@ pub const Module = struct {
     mean_l2: driver.CUfunction,
     training_mean_l2: driver.CUfunction,
     mean_l2_vjp: driver.CUfunction,
-    mrl_normalize: driver.CUfunction,
-    mrl_normalize_vjp: driver.CUfunction,
+    prefix_normalization: @import("prefix_normalization.zig").Program,
     stats_: Stats = .{},
 
     pub fn init(ctx: *Context) !Module {
@@ -165,7 +163,7 @@ pub const Module = struct {
             .audio_fft512 = try function(ctx, m, "antfly_audio_fft512_f32"),
             .audio_conv_tiled = try function(ctx, m, "antfly_audio_conv_tiled_f32"),
             .audio_conv_bf16 = try function(ctx, m, "antfly_audio_conv_bf16_wmma"),
-            .audio_depthwise_conv = try function(ctx, m, "termite_gemma4_audio_depthwise_causal_conv1d_f32"),
+            .audio_depthwise_conv = try function(ctx, m, "termite_causal_depthwise_f32"),
             .pillow_horizontal = try function(ctx, m, "termite_embedding_gemma2_pillow_horizontal_rgb8"),
             .pillow_vertical_patches = try function(ctx, m, "termite_embedding_gemma2_pillow_vertical_patches_f32"),
             .rms_norm = try function(ctx, m, "termite_embedding_gemma2_rms_norm_bf16"),
@@ -189,7 +187,7 @@ pub const Module = struct {
             .local_flash_attention = try function(ctx, m, "termite_embedding_gemma2_attention_local_flash_bf16"),
             .attention_softmax = try function(ctx, m, "termite_embedding_gemma2_attention_softmax_bf16"),
             .matmul = try function(ctx, m, "termite_embedding_gemma2_matmul_bf16"),
-            .gelu_mul = try function(ctx, m, "termite_embedding_gemma2_gelu_mul_bf16"),
+            .gelu_product = try function(ctx, m, "termite_embedding_gemma2_gelu_mul_bf16"),
             .gelu_mul_vjp = try function(ctx, m, "termite_embedding_gemma2_gelu_mul_vjp_f32"),
             .bf16_to_f32 = try function(ctx, m, "termite_embedding_gemma2_bf16_to_f32"),
             .f32_to_bf16 = try function(ctx, m, "termite_embedding_gemma2_f32_to_bf16"),
@@ -204,7 +202,6 @@ pub const Module = struct {
             .scale_device_f32_bf16 = try function(ctx, m, "termite_embedding_gemma2_scale_device_f32_bf16"),
             .accumulate_f32 = try function(ctx, m, "termite_embedding_gemma2_accumulate_f32"),
             .accumulate_bf16_boundary_f32 = try function(ctx, m, "termite_embedding_gemma2_accumulate_bf16_boundary_f32"),
-            .gelu_ple = try function(ctx, m, "termite_embedding_gemma2_gelu_ple_bf16"),
             .residual = try function(ctx, m, "termite_embedding_gemma2_residual_bf16"),
             .residual_vjp = try function(ctx, m, "termite_embedding_gemma2_residual_vjp_f32"),
             .contrastive_prob = try function(ctx, m, "termite_embedding_gemma2_contrastive_prob_f32"),
@@ -216,8 +213,7 @@ pub const Module = struct {
             .mean_l2 = try function(ctx, m, "termite_embedding_gemma2_mean_l2_f32"),
             .training_mean_l2 = try function(ctx, m, "termite_embedding_gemma2_training_mean_l2_f32"),
             .mean_l2_vjp = try function(ctx, m, "termite_embedding_gemma2_mean_l2_vjp_f32"),
-            .mrl_normalize = try function(ctx, m, "termite_embedding_gemma2_mrl_normalize_f32"),
-            .mrl_normalize_vjp = try function(ctx, m, "termite_embedding_gemma2_mrl_normalize_vjp_f32"),
+            .prefix_normalization = try @import("prefix_normalization.zig").Program.init(ctx, m),
         };
     }
 
@@ -991,17 +987,8 @@ pub const Module = struct {
         self.stats_.scalar_matmul_fallbacks += 1;
     }
 
-    pub fn launchGeluPle(self: *Module, ctx: *Context, out: Buffer, gate: Buffer, ple: Buffer, count: u32) !void {
-        const bytes = @as(usize, count) * 2;
-        try require(out, bytes);
-        try require(gate, bytes);
-        try require(ple, bytes);
-        var op = out.ptr;
-        var gp = gate.ptr;
-        var pp = ple.ptr;
-        var n = count;
-        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&gp), @ptrCast(&pp), @ptrCast(&n) };
-        try self.launch1d(ctx, self.gelu_ple, &args, count);
+    pub inline fn launchGeluPle(self: *Module, ctx: *Context, out: Buffer, gate: Buffer, ple: Buffer, count: u32) !void {
+        return self.launchGeluMul(ctx, out, gate, ple, count);
     }
 
     pub fn launchGeluMul(self: *Module, ctx: *Context, out: Buffer, gate: Buffer, up: Buffer, count: u32) !void {
@@ -1014,7 +1001,7 @@ pub const Module = struct {
         var uptr = up.ptr;
         var n = count;
         var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&gp), @ptrCast(&uptr), @ptrCast(&n) };
-        try self.launch1d(ctx, self.gelu_mul, &args, count);
+        try self.launch1d(ctx, self.gelu_product, &args, count);
     }
 
     pub fn launchGeluMulVjp(self: *Module, ctx: *Context, dgate: Buffer, dup: Buffer, dy: Buffer, gate: Buffer, up: Buffer, count: u32) !void {
@@ -1359,29 +1346,18 @@ pub const Module = struct {
     }
     pub fn launchMrlNormalize(self: *Module, ctx: *Context, out: Buffer, input: Buffer, rows: u32, width: u32) !void {
         if (rows == 0 or rows > 384 or width == 0 or width > 768) return error.InvalidEmbeddingGemma2TrainingShape;
-        try require(input, try std.math.mul(usize, try std.math.mul(usize, rows, 768), @sizeOf(f32)));
-        try require(out, try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32)));
-        var op = out.ptr;
-        var ip = input.ptr;
-        var r = rows;
-        var w = width;
-        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&r), @ptrCast(&w) };
-        try launchShared(ctx, self.mrl_normalize, &args, .{ rows, 1, 1 }, .{ 256, 1, 1 }, 8 * @sizeOf(f32));
-        self.stats_.launches += 1;
+        try self.launchPrefixNormalize(ctx, out, input, .{ .rows = rows, .width = width, .input_stride = 768 });
     }
     pub fn launchMrlNormalizeVjp(self: *Module, ctx: *Context, dinput: Buffer, dout: Buffer, input: Buffer, rows: u32, width: u32, objective_weight: f32) !void {
         if (rows == 0 or rows > 384 or width == 0 or width > 768 or !std.math.isFinite(objective_weight)) return error.InvalidEmbeddingGemma2TrainingShape;
-        try require(dinput, try std.math.mul(usize, try std.math.mul(usize, rows, 768), @sizeOf(f32)));
-        try require(input, try std.math.mul(usize, try std.math.mul(usize, rows, 768), @sizeOf(f32)));
-        try require(dout, try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32)));
-        var dip = dinput.ptr;
-        var dop = dout.ptr;
-        var ip = input.ptr;
-        var r = rows;
-        var w = width;
-        var weight = objective_weight;
-        var args = [_]?*anyopaque{ @ptrCast(&dip), @ptrCast(&dop), @ptrCast(&ip), @ptrCast(&r), @ptrCast(&w), @ptrCast(&weight) };
-        try launchShared(ctx, self.mrl_normalize_vjp, &args, .{ rows, 1, 1 }, .{ 256, 1, 1 }, 16 * @sizeOf(f32));
+        try self.launchPrefixNormalizeVjp(ctx, dinput, dout, input, .{ .rows = rows, .width = width, .input_stride = 768 }, objective_weight);
+    }
+    pub fn launchPrefixNormalize(self: *Module, ctx: *Context, out: Buffer, input: Buffer, shape: @import("prefix_normalization.zig").Geometry) !void {
+        try self.prefix_normalization.normalize(ctx, out, input, shape);
+        self.stats_.launches += 1;
+    }
+    pub fn launchPrefixNormalizeVjp(self: *Module, ctx: *Context, dinput: Buffer, dout: Buffer, input: Buffer, shape: @import("prefix_normalization.zig").Geometry, objective_weight: f32) !void {
+        try self.prefix_normalization.accumulateVjp(ctx, dinput, dout, input, shape, objective_weight);
         self.stats_.launches += 1;
     }
     fn launch1d(self: *Module, ctx: *Context, f: driver.CUfunction, args: []?*anyopaque, n: usize) !void {
@@ -1532,6 +1508,62 @@ test "embeddinggemma2 CUDA extended flash matches scalar attention with mask hol
                     }
                 }
             }
+        }
+    }
+}
+
+test "CUDA BF16 GELU product preserves PLE and FFN adapter outputs and tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = try Context.initDefault();
+    defer ctx.deinit();
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    const Round = struct {
+        fn bf16(value: f32) u16 {
+            const bits: u32 = @bitCast(value);
+            return @intCast((bits +% (0x7fff + ((bits >> 16) & 1))) >> 16);
+        }
+        fn f32Value(bits: u16) f32 {
+            return @bitCast(@as(u32, bits) << 16);
+        }
+    };
+    var gates: [1033]u16 = undefined;
+    var right: [1033]u16 = undefined;
+    const guards: [1033]u16 = @splat(0x4bad);
+    for (&gates, &right, 0..) |*gate, *value, i| {
+        gate.* = Round.bf16(@as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18)) / 8);
+        value.* = Round.bf16(@as(f32, @floatFromInt(@as(i32, @intCast(i % 29)) - 14)) / 16);
+    }
+    var gate_buffer = try Buffer.alloc(&ctx, @sizeOf(@TypeOf(gates)));
+    defer gate_buffer.free(&ctx);
+    var right_buffer = try Buffer.alloc(&ctx, @sizeOf(@TypeOf(right)));
+    defer right_buffer.free(&ctx);
+    var ple = try Buffer.alloc(&ctx, @sizeOf(@TypeOf(guards)));
+    defer ple.free(&ctx);
+    var ffn = try Buffer.alloc(&ctx, @sizeOf(@TypeOf(guards)));
+    defer ffn.free(&ctx);
+    try gate_buffer.copyFromHost(&ctx, std.mem.sliceAsBytes(&gates));
+    try right_buffer.copyFromHost(&ctx, std.mem.sliceAsBytes(&right));
+    for ([_]u32{ 0, 1, 7, 255, 256, 257, 1025 }) |count| {
+        try ple.copyFromHost(&ctx, std.mem.sliceAsBytes(&guards));
+        try ffn.copyFromHost(&ctx, std.mem.sliceAsBytes(&guards));
+        const before = module.stats_.launches;
+        try module.launchGeluPle(&ctx, ple, gate_buffer, right_buffer, count);
+        try module.launchGeluMul(&ctx, ffn, gate_buffer, right_buffer, count);
+        try std.testing.expectEqual(before + (if (count == 0) @as(u64, 0) else 2), module.stats_.launches);
+        var first: [1033]u16 = undefined;
+        var second: [1033]u16 = undefined;
+        try ple.copyToHost(&ctx, std.mem.sliceAsBytes(&first));
+        try ffn.copyToHost(&ctx, std.mem.sliceAsBytes(&second));
+        try ctx.synchronize();
+        try std.testing.expectEqualSlices(u16, &first, &second);
+        try std.testing.expectEqualSlices(u16, guards[count..], first[count..]);
+        for (first[0..count], 0..) |actual, i| {
+            const x: f64 = Round.f32Value(gates[i]);
+            const gelu = 0.5 * x * (1.0 + std.math.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
+            const rounded = Round.f32Value(Round.bf16(@floatCast(gelu)));
+            const expected = Round.f32Value(Round.bf16(rounded * Round.f32Value(right[i])));
+            try std.testing.expectApproxEqAbs(expected, Round.f32Value(actual), 0.008 * (1 + @abs(expected)));
         }
     }
 }
