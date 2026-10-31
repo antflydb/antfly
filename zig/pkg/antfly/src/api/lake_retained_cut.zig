@@ -829,14 +829,15 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
         legacy_envelope.state = try upload(wa, &artifacts, scope, legacy_state, .none);
         const legacy_ref = try upload(wa, &artifacts, try stores.UploadScope.forPublication(scope.domain, descriptor.expires_ms, std.testing.io), legacy_envelope, .none);
         const legacy_token = try generations.encode(wa, prefix, .{ .artifact_id = @constCast(legacy_ref.id), .checksum = @constCast(try stores.sha256ChecksumFromArtifactId(legacy_ref.id)), .byte_len = legacy_ref.bytes, .provider_version = legacy_ref.generation });
+        // Allocator remapping changes the legacy parser's peak across owners,
+        // Zig versions and build modes. Explicit active-load pressure proves
+        // the private replay path deterministically, without depending on
+        // that incidental allocation layout to exceed the default residency.
+        decoded.max_loading_bytes = 32 * 1024 * 1024;
         const legacy_pin = try loadCached(wa, &artifacts, identity, legacy_token, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
         defer legacy_pin.deinit();
         try std.testing.expectEqual(@as(usize, 1), legacy_pin.descriptor.pending.count());
         try std.testing.expect(!legacy_pin.lease.?.item.cached);
-        // Allocator remapping changes the legacy parser's peak across owners
-        // and build modes. Explicit active-load pressure proves the private
-        // replay path without depending on that incidental allocation layout.
-        decoded.max_loading_bytes = 32 * 1024 * 1024;
         const constrained = try loadCached(wa, &artifacts, identity, legacy_token, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
         defer constrained.deinit();
         try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), constrained.lease.?.item.budget.limit);
