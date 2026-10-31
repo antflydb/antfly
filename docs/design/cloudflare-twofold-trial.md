@@ -169,3 +169,20 @@ separates throughput, startup evidence and allocator qualification. No additiona
 Cloudflare resources were created for this follow-up. The hosted read target,
 complete live coverage, three hour-long trials and physical cold samples remain
 unqualified; another deployment should follow a justified candidate selection.
+
+### Hosted seal correction
+
+A subsequent full audit found that the original 516-artifact hosted manifest
+included `dist/twofold-hosted-evidence-result.json` while that summary file was
+still empty; writing the summary after sealing changed that one artifact. All
+other 515 artifacts match, with zero missing files. The original manifest above
+and original rehearsal report remain unchanged. Its earlier assertion of a fully
+verifiable 516-artifact closure is superseded rather than silently repaired.
+
+Corrected closure:
+`examples/cloudflare-serverless/dist/qualification/twofold-hosted-1793408257498/evidence.json`,
+**517 verified artifacts / 309,473,367 bytes**, including the invalid original
+manifest and all 224 window references. SHA-256
+`f45e851f196919f6ccb4ee562b151bae6baf98e790780b34ec66c661801177fa`.
+Its summary is written to a separate excluded output path. No hosted result,
+qualification outcome or captured diagnostic data changed.
