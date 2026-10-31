@@ -117,7 +117,11 @@ fn listModels(handle: *anyopaque, io: io_abi.Borrow) !void {
     var receiver = try io.receive();
     const models = try owner.registry.discover(receiver.io());
     defer owner.memory.asStd().free(models);
-    for (models) |model| std.debug.print("{s:<12} {s}\n", .{ @tagName(model.kind), model.name });
+    for (models) |model| {
+        if (model.load_error) |err| {
+            std.debug.print("{s:<12} {s}  unusable: {s}\n", .{ @tagName(model.kind), model.name, @errorName(err) });
+        } else std.debug.print("{s:<12} {s}\n", .{ @tagName(model.kind), model.name });
+    }
 }
 fn pull(handle: *anyopaque, io: io_abi.Borrow, ref: []const u8, config: engine.HubConfig, tasks: ?[]const u8, capabilities: ?[]const u8, projector: engine.ProjectorSelection) !void {
     var receiver = try io.receive();

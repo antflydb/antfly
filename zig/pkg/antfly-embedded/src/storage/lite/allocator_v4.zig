@@ -19,6 +19,7 @@
 //! A hierarchical bitmap locates free runs without scanning the page table.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ledger_digest = @import("ledger_digest.zig");
 pub const free: u32 = 0x80000000;
 pub const max_references: u32 = free - 1;
 pub const max_pending_objects = 1024 * 1024;
@@ -134,11 +135,182 @@ pub const State = struct {
     retired_inline_bytes: u64 = 0,
     checkpointing: bool = false,
     force_checkpoint: bool = false,
+    digest_cache: ?DigestCache = null,
+
+    const counter_chunk_items = 256;
+    const pending_chunk_items = 64;
+    const DigestCache = struct {
+        counters: ledger_digest.Tree = .{},
+        pending: ledger_digest.Tree = .{},
+        dirty_counters: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        dirty_pending: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        chunk_hashes: u64 = 0,
+        fn deinit(self: *@This(), a: Allocator) void {
+            self.counters.deinit(a);
+            self.pending.deinit(a);
+            self.dirty_counters.deinit(a);
+            self.dirty_pending.deinit(a);
+        }
+    };
+
+    /// Initialize once for a loaded ledger. Steady commits retain these trees;
+    /// clean() only clears persistence deltas, never fingerprint dirtiness.
+    pub fn prepareDigest(self: *State) !void {
+        return self.prepareDigestWithCancel(null);
+    }
+
+    pub fn prepareDigestWithCancel(self: *State, cancel: ?*const std.atomic.Value(bool)) !void {
+        if (self.digest_cache != null) return;
+        if (cancel) |flag| if (flag.load(.acquire)) return error.MaintenanceCanceled;
+        self.digest_cache = .{};
+        errdefer {
+            self.digest_cache.?.deinit(self.allocator);
+            self.digest_cache = null;
+        }
+        var entries: std.ArrayList(ledger_digest.Tree.Entry) = .empty;
+        defer entries.deinit(self.allocator);
+        const chunks = (self.counts.items.len + counter_chunk_items - 1) / counter_chunk_items;
+        for (0..chunks) |chunk| {
+            if (cancel) |flag| if (flag.load(.acquire)) return error.MaintenanceCanceled;
+            try entries.append(self.allocator, .{ .key = @intCast(chunk), .value = self.counterValueDigest(@intCast(chunk)) });
+        }
+        self.digest_cache.?.counters = try ledger_digest.Tree.fromSortedWithCancel(self.allocator, entries.items, cancel);
+        entries.clearRetainingCapacity();
+        var ids = self.pending.keyIterator();
+        while (ids.next()) |id| {
+            if (cancel) |flag| if (flag.load(.acquire)) return error.MaintenanceCanceled;
+            try self.digest_cache.?.dirty_pending.put(self.allocator, id.* / pending_chunk_items, {});
+        }
+        const keys = try self.allocator.alloc(u64, self.digest_cache.?.dirty_pending.count());
+        defer self.allocator.free(keys);
+        var pending_chunks = self.digest_cache.?.dirty_pending.keyIterator();
+        for (keys) |*key| key.* = pending_chunks.next().?.*;
+        std.mem.sort(u64, keys, {}, std.sort.asc(u64));
+        for (keys) |chunk| {
+            if (cancel) |flag| if (flag.load(.acquire)) return error.MaintenanceCanceled;
+            try entries.append(self.allocator, .{ .key = chunk, .value = (try self.pendingValueDigest(chunk)).? });
+        }
+        self.digest_cache.?.pending = try ledger_digest.Tree.fromSortedWithCancel(self.allocator, entries.items, cancel);
+        self.digest_cache.?.dirty_pending.clearRetainingCapacity();
+    }
+
+    fn counterValueDigest(self: *State, chunk: u64) ledger_digest.Digest {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("Antfly allocator counter chunk v2");
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, chunk, .little);
+        hash.update(&key);
+        var bytes: [counter_chunk_items * 4]u8 = @splat(0);
+        const start: usize = @intCast(chunk * counter_chunk_items);
+        const end = @min(start + counter_chunk_items, self.counts.items.len);
+        for (self.counts.items[start..end], 0..) |value, i| std.mem.writeInt(u32, bytes[i * 4 ..][0..4], value, .little);
+        hash.update(&bytes);
+        var digest: ledger_digest.Digest = undefined;
+        hash.final(&digest);
+        self.digest_cache.?.chunk_hashes +|= 1;
+        return digest;
+    }
+
+    fn refreshCounterDigest(self: *State, chunk: u64) !void {
+        try self.digest_cache.?.counters.put(self.allocator, chunk, self.counterValueDigest(chunk));
+    }
+
+    fn pendingValueDigest(self: *State, chunk: u64) !?ledger_digest.Digest {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("Antfly allocator pending chunk v2");
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, chunk, .little);
+        hash.update(&key);
+        var present = false;
+        for (0..pending_chunk_items) |offset| {
+            const id = chunk * pending_chunk_items + offset;
+            if (self.pending.get(id)) |item| {
+                if (item.id != id) return error.InvalidNativeAllocator;
+                hash.update(&.{1});
+                var encoded: [40]u8 = @splat(0);
+                std.mem.writeInt(u64, encoded[0..8], id, .little);
+                std.mem.writeInt(u64, encoded[8..16], item.epoch, .little);
+                std.mem.writeInt(u64, encoded[16..24], item.page, .little);
+                std.mem.writeInt(u64, encoded[24..32], item.length, .little);
+                encoded[32] = @backingInt(item.kind);
+                hash.update(&encoded);
+                present = true;
+            } else hash.update(&.{0});
+        }
+        self.digest_cache.?.chunk_hashes +|= 1;
+        if (!present) return null;
+        var digest: ledger_digest.Digest = undefined;
+        hash.final(&digest);
+        return digest;
+    }
+
+    fn refreshPendingDigest(self: *State, chunk: u64) !void {
+        if (try self.pendingValueDigest(chunk)) |digest| {
+            try self.digest_cache.?.pending.put(self.allocator, chunk, digest);
+        } else _ = self.digest_cache.?.pending.remove(self.allocator, chunk);
+    }
+
+    fn flushDigest(self: *State) !void {
+        var counters = self.digest_cache.?.dirty_counters.keyIterator();
+        while (counters.next()) |chunk| try self.refreshCounterDigest(chunk.*);
+        self.digest_cache.?.dirty_counters.clearRetainingCapacity();
+        var pending = self.digest_cache.?.dirty_pending.keyIterator();
+        while (pending.next()) |chunk| try self.refreshPendingDigest(chunk.*);
+        self.digest_cache.?.dirty_pending.clearRetainingCapacity();
+    }
+
+    pub fn fingerprint(self: *State) !ledger_digest.Digest {
+        try self.prepareDigest();
+        return self.incrementalFingerprint();
+    }
+
+    pub fn incrementalFingerprint(self: *State) !ledger_digest.Digest {
+        std.debug.assert(self.digest_cache != null);
+        try self.flushDigest();
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("Antfly checked allocator Merkle v2");
+        var root: [128]u8 = undefined;
+        encodeRoot(self.root, &root);
+        hash.update(&root);
+        var sizes: [32]u8 = undefined;
+        std.mem.writeInt(u64, sizes[0..8], self.counts.items.len, .little);
+        std.mem.writeInt(u64, sizes[8..16], self.pending.count(), .little);
+        std.mem.writeInt(u64, sizes[16..24], self.first_pending, .little);
+        std.mem.writeInt(u64, sizes[24..32], self.last_pending, .little);
+        hash.update(&sizes);
+        hash.update(&self.digest_cache.?.counters.digest());
+        hash.update(&self.digest_cache.?.pending.digest());
+        var result: ledger_digest.Digest = undefined;
+        hash.final(&result);
+        return result;
+    }
+
+    /// Admission checks the complete loaded state independently of any cache
+    /// left by earlier use. Only trusted mutations use the incremental path.
+    pub fn rebuildFingerprint(self: *State) !ledger_digest.Digest {
+        if (self.digest_cache) |*cache| cache.deinit(self.allocator);
+        self.digest_cache = null;
+        return self.fingerprint();
+    }
+
+    pub fn digestWork(self: *const State) u64 {
+        const cache = self.digest_cache orelse return 0;
+        return cache.chunk_hashes + cache.counters.hashes + cache.pending.hashes;
+    }
+
+    fn dirtyCounter(self: *State, page: u64) !void {
+        if (self.digest_cache) |*cache| try cache.dirty_counters.put(self.allocator, page / counter_chunk_items, {});
+    }
+
+    fn dirtyPending(self: *State, id: u64) !void {
+        if (self.digest_cache) |*cache| try cache.dirty_pending.put(self.allocator, id / pending_chunk_items, {});
+    }
 
     pub fn init(a: Allocator) State {
         return .{ .allocator = a, .heap = Heap.initContext({}), .metadata_heap = Heap.initContext({}), .chains_heap = Heap.initContext({}) };
     }
     pub fn deinit(self: *State) void {
+        if (self.digest_cache) |*cache| cache.deinit(self.allocator);
         self.counts.deinit(self.allocator);
         for (&self.bitmap) |*level| level.deinit(self.allocator);
         self.pending.deinit(self.allocator);
@@ -158,6 +330,11 @@ pub const State = struct {
         const old = self.counts.items.len;
         try self.counts.resize(self.allocator, needed);
         @memset(self.counts.items[old..], 0);
+        if (self.digest_cache != null) {
+            const first = old / counter_chunk_items;
+            const end = (needed + counter_chunk_items - 1) / counter_chunk_items;
+            for (first..end) |chunk| try self.digest_cache.?.dirty_counters.put(self.allocator, @intCast(chunk), {});
+        }
         var words = (needed + 63) / 64;
         for (&self.bitmap) |*level| {
             const before = level.items.len;
@@ -190,6 +367,7 @@ pub const State = struct {
         try self.ensure(page);
         const previous = self.counts.items[@intCast(page)];
         if (journal) try self.changes.put(self.allocator, page, references);
+        if (previous != references) try self.dirtyCounter(page);
         if (previous == free) self.free_pages -= 1;
         if (references == free) self.free_pages += 1;
         self.counts.items[@intCast(page)] = references;
@@ -256,6 +434,7 @@ pub const State = struct {
         if (self.pending.count() >= self.pending_limit + collector_reserve) return error.LiteRetirementBacklogExceeded;
         var owned = item;
         owned.id = self.root.next_id;
+        try self.dirtyPending(owned.id);
         self.root.next_id = try std.math.add(u64, owned.id, 1);
         try self.added.append(self.allocator, owned);
         owned.previous = self.last_pending;
@@ -284,6 +463,7 @@ pub const State = struct {
         const first = self.queue(item.kind).pop() orelse return error.InvalidNativeAllocator;
         if (first.id != item.id) return error.InvalidNativeAllocator;
         const linked = self.pending.get(item.id) orelse return error.InvalidNativeAllocator;
+        try self.dirtyPending(item.id);
         if (linked.previous != 0) self.pending.getPtr(linked.previous).?.next = linked.next else self.first_pending = linked.next;
         if (linked.next != 0) self.pending.getPtr(linked.next).?.previous = linked.previous else self.last_pending = linked.previous;
         if (self.root.build_cursor == item.id) self.root.build_cursor = linked.next;
@@ -300,6 +480,7 @@ pub const State = struct {
         var items = self.pending.valueIterator();
         while (items.next()) |item| {
             if (cancel_requested) |flag| if (flag.load(.acquire)) return error.MaintenanceCanceled;
+            if (item.epoch > epoch) try self.dirtyPending(item.id);
             item.epoch = @min(item.epoch, epoch);
             try self.queue(item.kind).push(self.allocator, item.*);
         }
@@ -959,4 +1140,74 @@ test "lite allocator v4 capacity reserve scales with snapshots and queue width" 
     // The reserve covers a checkpoint even after the entire DFS reserve is
     // occupied and allocating its own pages grows the counter table.
     try std.testing.expect(wide >= snapshotPages(payload, 1_000_000 + wide, max_pending_objects + collector_reserve) + 2 * serviceJournalPages(payload, 1));
+}
+
+fn expectDigestMatchesRebuild(state: *State) !void {
+    var rebuilt = State.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    rebuilt.root = state.root;
+    rebuilt.first_pending = state.first_pending;
+    rebuilt.last_pending = state.last_pending;
+    try rebuilt.counts.appendSlice(std.testing.allocator, state.counts.items);
+    var pending = state.pending.iterator();
+    while (pending.next()) |item| try rebuilt.pending.put(std.testing.allocator, item.key_ptr.*, item.value_ptr.*);
+    try std.testing.expectEqualSlices(u8, &try rebuilt.fingerprint(), &try state.fingerprint());
+}
+
+test "lite allocator v4 Merkle fingerprints retain changes across persistence cleanup" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.ensure(257);
+    _ = try state.fingerprint();
+    try state.retain(255);
+    try state.retain(256);
+    try state.retain(600);
+    for (0..130) |i| try state.retire(.{ .epoch = 7, .page = i + 1, .kind = .page });
+    state.clean();
+    try expectDigestMatchesRebuild(&state);
+    for (0..65) |_| try state.complete(state.eligible(7, 7).?);
+    state.clean();
+    try expectDigestMatchesRebuild(&state);
+    try state.rebaseEpochs(3, null);
+    try expectDigestMatchesRebuild(&state);
+    while (state.first_pending != 0) try state.complete(state.eligible(3, 3).?);
+    try expectDigestMatchesRebuild(&state);
+}
+
+test "lite allocator v4 tiny certificate update work does not scan retained counters" {
+    for ([_]usize{ 4096, 1024 * 1024 }) |pages| {
+        var state = State.init(std.testing.allocator);
+        defer state.deinit();
+        try state.ensure(pages - 1);
+        _ = try state.fingerprint();
+        const before = state.digestWork();
+        try state.retain(3);
+        state.clean();
+        _ = try state.fingerprint();
+        try std.testing.expect(state.digestWork() - before <= 66);
+        try expectDigestMatchesRebuild(&state);
+    }
+}
+
+test "lite allocator v4 pending digest memory follows live chunks rather than historical IDs" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    state.root.next_id = (@as(u64, 1) << 63) - 2;
+    for (0..4) |i| try state.retire(.{ .epoch = 7, .page = i + 1, .kind = .page });
+    _ = try state.fingerprint();
+    try std.testing.expectEqual(@as(usize, 3), state.digest_cache.?.pending.nodes);
+    try state.complete(state.eligible(7, 7).?);
+    try expectDigestMatchesRebuild(&state);
+}
+
+test "lite allocator v4 canceled digest initialization retains no partial cache" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.ensure(1024);
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.MaintenanceCanceled, state.prepareDigestWithCancel(&canceled));
+    try std.testing.expect(state.digest_cache == null);
+    canceled.store(false, .release);
+    try state.prepareDigestWithCancel(&canceled);
+    try expectDigestMatchesRebuild(&state);
 }

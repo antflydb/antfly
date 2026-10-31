@@ -1072,11 +1072,21 @@ jobs:
         run: |
           python -m pip install --require-hashes -r scripts/release/requirements.lock
           python -m pip check
+      - name: Create Homebrew publishing token
+        id: homebrew-token
+        if: ${{ needs.prepare-release-promotion.outputs.publish_homebrew == 'true' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: antflydb
+          repositories: homebrew-taps
+          permission-contents: write
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ needs.prepare-release-promotion.outputs.publish_homebrew == 'true' }}
         with:
           repository: antflydb/homebrew-taps
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          token: ${{ steps.homebrew-token.outputs.token }}
           path: homebrew-taps
           fetch-depth: 1
       - name: Commit the stable Homebrew formula

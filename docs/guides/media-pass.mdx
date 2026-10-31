@@ -22,11 +22,11 @@ Model-aware `/chunk` requests name their boundary model explicitly. Only that mo
   "outputs": {
     "boundary_model": "embedding",
     "targets": [
-      {"name": "embedding", "kind": "embedding", "model": "google/embeddinggemma-2", "dimensions": 768},
+      {"name": "embedding", "kind": "embedding", "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1", "dimensions": 768},
       {"name": "speech", "kind": "transcribe", "model": "openai/whisper-small", "diarize": true, "required": false}
     ]
   },
-  "embedding": {"model": "google/embeddinggemma-2", "dimensions": 768, "allow_partial": true},
+  "embedding": {"model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1", "dimensions": 768, "allow_partial": true},
   "config": {"max_chunks": 64},
   "allow_partial": true,
   "stream": true
@@ -55,11 +55,11 @@ Declare the shared chunk producer once. A dense enrichment consumes its primary 
     "field": "recording",
     "chunker": {
       "provider": "antfly",
-      "embedding": {"model": "google/embeddinggemma-2", "dimensions": 768},
+      "embedding": {"model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1", "dimensions": 768},
       "outputs": {
         "boundary_model": "embedding",
         "targets": [
-          {"name": "embedding", "kind": "embedding", "model": "google/embeddinggemma-2", "dimensions": 768},
+          {"name": "embedding", "kind": "embedding", "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1", "dimensions": 768},
           {"name": "speech", "kind": "transcribe", "model": "openai/whisper-small", "required": false}
         ]
       }

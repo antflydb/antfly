@@ -6475,8 +6475,19 @@ fn inferenceAuth(route_context: *StandaloneHttpContext, ctx: *httpx.Context, nex
         .allowed => next.call(ctx),
         .unauthorized => inferenceUnauthorizedResponse(ctx),
         .forbidden => inferenceForbiddenResponse(ctx, permission),
+        .public_inference_disabled => publicInferenceDisabledResponse(ctx),
         .not_ready => inferenceNotReadyResponse(ctx),
     };
+}
+
+/// Matches the gateway's deployment-policy rejection so clients can tell it
+/// apart from a missing inference permission.
+fn publicInferenceDisabledResponse(ctx: *httpx.Context) !httpx.Response {
+    return ctx.status(403).json(.{ .@"error" = .{
+        .code = "PublicInferenceDisabled",
+        .type = "permission_error",
+        .message = "Public inference is disabled on this deployment; set public_inference.enabled in the server config",
+    } });
 }
 
 fn interactiveGenerateMiddleware() httpx.Middleware {

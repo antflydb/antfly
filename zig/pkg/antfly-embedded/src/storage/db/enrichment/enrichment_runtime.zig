@@ -8053,7 +8053,7 @@ fn noteTerminalRequestFailure(
     indexes: []const []const u8,
     artifact_name: []const u8,
     completed_failure_fingerprint: u64,
-    failure: anyerror,
+    failure_name: []const u8,
 ) !void {
     const maybe_io = lockRuntime(runtime);
     const interval = mergedTerminalFailureInterval(
@@ -8075,7 +8075,7 @@ fn noteTerminalRequestFailure(
         runtime.retry_failure_fingerprint = 0;
         runtime.retry_failure_count = 0;
     }
-    runtime.last_error_code = types.RuntimeErrorName.init(@errorName(failure));
+    runtime.last_error_code = types.RuntimeErrorName.init(failure_name);
     runtime.error_count += 1;
     runtime.fatal_error_count += 1;
     runtime.retrying = false;
@@ -8161,7 +8161,13 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
 }
 
 fn recordIsolatedRequestErrorFor(runtime: *EnrichmentRuntime, window: ?*GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, err: anyerror, attempt_number: u64) !void {
-    std.log.warn("enrichment request failed index={s} artifact={s} doc_key={s}: {s}", .{ request.index_name, requestEmbeddingName(request), request.doc_key, @errorName(err) });
+    try recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), attempt_number);
+}
+
+/// `error_name` is the durable, operator-visible cause. Callers that wrap a
+/// lower-level failure pass that failure's name rather than the wrapper.
+fn recordIsolatedRequestErrorNamed(runtime: *EnrichmentRuntime, window: ?*GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, error_name: []const u8, attempt_number: u64) !void {
+    std.log.warn("enrichment request failed index={s} artifact={s} doc_key={s}: {s}", .{ request.index_name, requestEmbeddingName(request), request.doc_key, error_name });
     const owned_indexes = if (runtime.coverage_apply_mutex != null)
         try affectedIndexesForRequestAlloc(runtime, request)
     else
@@ -8187,7 +8193,7 @@ fn recordIsolatedRequestErrorFor(runtime: *EnrichmentRuntime, window: ?*Generate
                     .asset, .chunk_text => "",
                 },
                 .doc_key = request.doc_key,
-                .error_name = @errorName(err),
+                .error_name = error_name,
                 .attempts = attempt_number,
                 .sequence = request.sequence,
             });
@@ -8209,7 +8215,7 @@ fn recordIsolatedRequestErrorFor(runtime: *EnrichmentRuntime, window: ?*Generate
             .asset, .chunk_text => requestArtifactName(request),
         },
         requestFailureFingerprint(request),
-        err,
+        error_name,
     );
     runtime.notifyStatusHook();
 }
@@ -31824,6 +31830,34 @@ pub fn documentExtractionEmptyCoverageIsTerminalFailure(alloc: Allocator, manife
     return chunk_count == 0 and (ocr_failed_count > 0 or failed_pages > 0);
 }
 
+/// The first OCR unit failure recorded in an extraction manifest, if any.
+pub fn documentExtractionFailureCauseAlloc(alloc: Allocator, manifest_json: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const details = parsed.value.object.get("ocr_failure_details") orelse return null;
+    if (details != .array) return null;
+    for (details.array.items) |detail| {
+        if (detail != .object) continue;
+        const message = detail.object.get("error_message") orelse continue;
+        if (message != .string or message.string.len == 0) continue;
+        // Unit warnings read "<method> failed: <ErrorName>".
+        const name = if (std.mem.lastIndexOf(u8, message.string, ": ")) |at| message.string[at + 2 ..] else message.string;
+        if (name.len > 0) return try alloc.dupe(u8, name);
+    }
+    return null;
+}
+
+test "empty document extraction reports the OCR unit failure cause" {
+    const a = std.testing.allocator;
+    const cause = (try documentExtractionFailureCauseAlloc(a,
+        \\{"chunk_count":0,"ocr_failed_count":1,"ocr_failure_details":[{"unit_id":"image:000001","retained_method":"ocr_pending","error_message":"ocr_text failed: ResourceLimitExceeded","retryable":false}]}
+    )).?;
+    defer a.free(cause);
+    try std.testing.expectEqualStrings("ResourceLimitExceeded", cause);
+    try std.testing.expect((try documentExtractionFailureCauseAlloc(a, "{\"chunk_count\":0,\"ocr_failure_details\":[]}")) == null);
+}
+
 fn documentExtractionEmptyCoverageOutcome(alloc: Allocator, manifest_json: []const u8) !CoverageOutcome {
     return if (try documentExtractionEmptyCoverageIsTerminalFailure(alloc, manifest_json))
         .terminal_failed
@@ -31896,7 +31930,11 @@ fn finalizeEmptyDocumentExtractionCoverage(
         // Mainline coverage transitions revalidate terminal outcomes against
         // durable repair debt. Publish that debt before queueing the guarded
         // transition so an empty OCR failure cannot look like a healthy skip.
-        try recordIsolatedRequestError(runtime, window, request, error.DocumentExtractionProducedNoUsableText);
+        // Report the OCR units' own failure (for example an admission
+        // refusal) when there is one, not the generic empty-result wrapper.
+        const cause = try documentExtractionFailureCauseAlloc(runtime.alloc, manifest_json);
+        defer if (cause) |value| runtime.alloc.free(value);
+        try recordIsolatedRequestErrorNamed(runtime, window, request, cause orelse @errorName(error.DocumentExtractionProducedNoUsableText), requestAttemptNumber(runtime));
         return;
     }
     try queueCoverageOutcomeForRequest(runtime, window, request, outcome);
@@ -34327,14 +34365,14 @@ test "durable enrichment retry progress preserves unrelated request debt across 
     runtime.consecutive_retry_count = 6;
     runtime.retry_failure_fingerprint = 91;
     runtime.retry_failure_count = 4;
-    try noteTerminalRequestFailure(&runtime, 7, &.{}, "", 92, error.TestFailure);
+    try noteTerminalRequestFailure(&runtime, 7, &.{}, "", 92, "TestFailure");
     persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u32, 0), persisted.consecutive_retry_count);
     try std.testing.expectEqual(@as(u64, 91), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 4), persisted.retry_failure_count);
 
     // Parking the request which owns the budget retires that debt.
-    try noteTerminalRequestFailure(&runtime, 8, &.{}, "", 91, error.TestFailure);
+    try noteTerminalRequestFailure(&runtime, 8, &.{}, "", 91, "TestFailure");
     persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 0), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 0), persisted.retry_failure_count);

@@ -1290,6 +1290,16 @@ pub fn artifactRepairIssueIndexPrefixAlloc(alloc: Allocator, index_name: []const
     return try list.toOwnedSlice(alloc);
 }
 
+/// Reserved selector in the secondary issue namespace; it cannot alias an
+/// ArtifactRepairKind. The primary key keeps different kinds disjoint.
+pub fn artifactRepairEnrichmentFailurePrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    return artifactRepairIssueKindIndexPrefixAlloc(alloc, "enrichment_failed", index_name);
+}
+
+pub fn artifactRepairEnrichmentFailureKeyAlloc(alloc: Allocator, index_name: []const u8, primary_key: []const u8) ![]u8 {
+    return artifactRepairIssueKindKeyAlloc(alloc, "enrichment_failed", index_name, primary_key);
+}
+
 pub fn artifactRepairIssueKeyAlloc(
     alloc: Allocator,
     index_name: []const u8,

@@ -31,8 +31,9 @@ requires an explicit opt-in before calling `/ai/v1`. Save `antfly.json`:
 antfly standalone --config antfly.json
 ```
 
-There is no enablement CLI flag. Without this setting, public execution returns
-HTTP 403 even when models are installed. See the
+There is no enablement CLI flag. Without this setting, `/ai/v1/models` still
+lists the installed models, marked `invocable: false`, but public execution
+returns HTTP 403. See the
 [public execution policy](/docs/reference/inference-gateway#public-execution-policy).
 This prerequisite applies to database API nodes on this source version; the
 independent `antfly inference run` listener and older stable releases have their
@@ -106,13 +107,13 @@ Verified starting points, one per job:
 
 | Job | Model |
 |-----|-------|
-| Text embedding | `BAAI/bge-small-en-v1.5` |
+| Text and image embedding | [`google/embeddinggemma-2:bf16-safetensors-bundle-v1`](/docs/guides/models/embeddinggemma2) |
 | Multimodal embedding (text, image, audio) | `antflydb/clipclap` |
 | Reranking | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0` |
 | Generation | `ggml-org/gemma-4-E4B-it-GGUF` |
 | Transcription | `openai/whisper-tiny` |
 | Reading and OCR | [`lightonai/LightOnOCR-3-0.8B`](/docs/guides/models/lightonocr3) |
-| Extraction | `antflydb/gliner2-base-v1` |
+| Extraction | `fastino/gliner2.5-base-v1` |
 
 See what is installed:
 
