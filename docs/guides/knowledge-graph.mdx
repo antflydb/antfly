@@ -29,7 +29,7 @@ Each document you write is chunked and embedded for search, and GLiNER extracts 
 The embedding and extraction models pulled:
 
 ```bash
-antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1
+antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
 antfly inference pull fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d --tasks extract
 antfly inference list
 ```
@@ -63,13 +63,13 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/docs \
     "chunk_vectors": {
       "type": "embeddings",
       "sources": [{"artifact": "chunk_dense"}],
-      "embedder": {"provider": "antfly", "model": "Qwen/Qwen3-Embedding-0.6B-GGUF"},
+      "embedder": {"provider": "antfly", "model": "google/embeddinggemma-2"},
       "distance_metric": "cosine",
       "enrichments": [
         {"name": "chunks", "kind": "chunk", "field": "body",
          "chunker_json": "{\"provider\":\"antfly\",\"model\":\"fixed\",\"text\":{\"target_tokens\":400,\"overlap_tokens\":40}}"},
         {"name": "chunk_dense", "kind": "embedding", "field": "body",
-         "source_artifact_name": "chunks", "expected_dims": 1024}
+         "source_artifact_name": "chunks", "expected_dims": 768}
       ]
     },
     "knowledge": {
