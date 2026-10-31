@@ -61,7 +61,7 @@ test "external lake portable native cursor recovers document and vector generati
             request.create = false;
             request.origin = namespace;
             {
-                var retained = try receiver.openQueryCut(request, .none);
+                var retained = try receiver.query.openCut(request, .none);
                 defer retained.close();
                 const value = (try retained.get(a, "doc")).?;
                 defer a.free(value);
@@ -81,9 +81,9 @@ test "external lake portable native cursor recovers document and vector generati
             repository_open = true;
             receiver.backend_runtime.query_cut_repository = repository.capability();
             request.timeout_ms = 1000;
-            try std.testing.expectError(error.CatalogGenerationChanged, receiver.openQueryCut(request, .none));
+            try std.testing.expectError(error.CatalogGenerationChanged, receiver.query.openCut(request, .none));
             // Recovery errors must release the parent lock for the next request.
-            try std.testing.expectError(error.CatalogGenerationChanged, receiver.openQueryCut(request, .none));
+            try std.testing.expectError(error.CatalogGenerationChanged, receiver.query.openCut(request, .none));
         }
     }
 }

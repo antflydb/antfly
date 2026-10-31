@@ -243,10 +243,10 @@ fn loadDocs(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) ![][]u8 {
     var batches: usize = 0;
     var bulk_active = false;
     if (cfg.bulk_load) {
-        try db.beginPrimaryStoreAutoBulkIngestSession();
+        try db.documents.beginPrimaryStoreAutoBulkIngest();
         bulk_active = true;
     }
-    errdefer if (bulk_active) db.abortPrimaryStoreAutoBulkIngestSession();
+    errdefer if (bulk_active) db.documents.abortPrimaryStoreAutoBulkIngest();
 
     for (0..cfg.docs) |i| {
         const doc_id = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{i});
@@ -282,7 +282,7 @@ fn loadDocs(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) ![][]u8 {
         printLoadProgress(cfg, cfg.docs, load_start);
     }
     if (bulk_active) {
-        try db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{ .compact = false });
+        try db.documents.finishPrimaryStoreAutoBulkIngest(.{ .compact = false });
         bulk_active = false;
     }
     printLoadSummary(cfg, batches, nanotime() - load_start, total_profile);

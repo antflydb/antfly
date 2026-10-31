@@ -729,6 +729,7 @@ pub const storage_db_indexes_relational = @import("storage/db/indexes/relational
 pub const storage_db_indexes_repair = @import("storage/db/indexes/repair.zig");
 pub const storage_db_indexes_sparse = @import("storage/db/indexes/sparse.zig");
 pub const storage_db_indexes_text = @import("storage/db/indexes/text.zig");
+pub const storage_db_query_state = @import("storage/db/query/state.zig");
 pub const storage_db_native_projection_owner = @import("storage/db/native_projection_owner.zig");
 pub const storage_db_runtime_restart_owner = @import("storage/db/runtime_restart_owner.zig");
 pub const storage_db_cleanup_job_owner = @import("storage/db/cleanup_job_owner.zig");

@@ -159,7 +159,7 @@ fn runUntilIdleWithGroupSourceState(self: *DB, state: *DB.GroupSourceMaintenance
 }
 
 fn runGroupSourceMaintenanceSlice(self: *DB, state: *DB.GroupSourceMaintenanceState) engine.Outcome(bool) {
-    return .{ .value = self.runGroupSourceMaintenanceSlice(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.documents.runGroupSourceMaintenanceSlice(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, shadow: bool) engine.Outcome(bool) {
@@ -376,7 +376,7 @@ fn applyReplicatedSchema(self: *DB, mutation: @import("db/replication_effects.zi
 }
 
 fn applyReplicatedRowPolicy(self: *DB, mutation: @import("db/replication_effects.zig").RowPolicyMutation, sequence: u64) engine.Outcome(void) {
-    return .{ .value = self.applyReplicatedRowPolicy(mutation, sequence) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.query.applyReplicatedRowPolicy(mutation, sequence) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn applyReplicatedDerivedEffect(self: *DB, change: @import("db/derived/change_journal.zig").Record, primary: ?@import("db/replication_effects.zig").primary_effect.View, sequence: u64) engine.Outcome(u64) {
@@ -396,7 +396,7 @@ fn captureQueryCut(self: *DB, request: @import("db/native_query_cut.zig").Reques
 }
 
 fn openQueryCut(self: *DB, request: @import("db/native_query_cut.zig").Request, cancellation: types.CancellationToken) engine.Outcome(DB) {
-    return .{ .value = self.openQueryCut(request, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.query.openCut(request, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runSourcePinCleanupStep(self: *DB) engine.Outcome(bool) {
@@ -714,27 +714,27 @@ fn finishBulkIngestSessionWithOptions(self: *DB, options: @import("backend_types
 }
 
 fn beginDenseAutoBulkIngestSession(self: *DB) engine.Outcome(void) {
-    return .{ .value = self.beginDenseAutoBulkIngestSession() catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.documents.beginDenseAutoBulkIngest() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) engine.Outcome(void) {
-    return .{ .value = self.beginPrimaryStoreAutoBulkIngestSession() catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.documents.beginPrimaryStoreAutoBulkIngest() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: @import("backend_types.zig").BulkIngestFinishOptions) engine.Outcome(void) {
-    return .{ .value = self.finishPrimaryStoreAutoBulkIngestSessionWithOptions(options) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.documents.finishPrimaryStoreAutoBulkIngest(options) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn rollPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: @import("backend_types.zig").BulkIngestFinishOptions) engine.Outcome(void) {
-    return .{ .value = self.rollPrimaryStoreAutoBulkIngestSessionWithOptions(options) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.documents.rollPrimaryStoreAutoBulkIngest(options) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn finishDenseAutoBulkIngestSessionWithOptions(self: *DB, options: @import("backend_types.zig").BulkIngestFinishOptions) engine.Outcome(void) {
-    return .{ .value = self.finishDenseAutoBulkIngestSessionWithOptions(options) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.documents.finishDenseAutoBulkIngest(options) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn rollDenseAutoBulkIngestSessionWithOptions(self: *DB, options: @import("backend_types.zig").BulkIngestFinishOptions) engine.Outcome(void) {
-    return .{ .value = self.rollDenseAutoBulkIngestSessionWithOptions(options) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.documents.rollDenseAutoBulkIngest(options) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn relationalReaderDeinit(self: *@import("db/relational_rows.zig").Reader) engine.Outcome(void) {
@@ -892,7 +892,7 @@ fn orderedMutationAlreadyApplied(self: *DB, identity: db.OrderedApplyReceipt) en
 }
 
 fn loadRowPolicyReceipt(self: *DB, generation: u64, phase: @import("../system_catalog/policies.zig").Publication.Phase) engine.Outcome(@import("db/row_policy_bundle.zig").Receipt) {
-    return .{ .value = self.loadRowPolicyReceipt(generation, phase) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.query.loadRowPolicyReceipt(generation, phase) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn listArtifactRepairIssues(self: *DB, alloc: std.mem.Allocator, artifact_kind: ?types.ArtifactRepairKind, index_name: ?[]const u8, limit: usize) engine.Outcome([]types.ArtifactRepairIssue) {
@@ -1283,7 +1283,7 @@ fn recoverLocalTransactionRecords(self: *DB, cutoff_ns: u64, now_ns: u64) engine
 }
 
 fn abortPrimaryStoreAutoBulkIngestSession(self: *DB) engine.Outcome(void) {
-    return .{ .value = self.abortPrimaryStoreAutoBulkIngestSession() };
+    return .{ .value = self.documents.abortPrimaryStoreAutoBulkIngest() };
 }
 
 fn abortBulkIngestSession(self: *DB) engine.Outcome(void) {
@@ -1581,7 +1581,7 @@ fn batchReplicatedApply(self: *DB, req: types.BatchRequest) engine.Outcome(void)
 }
 
 fn applyReplicatedRowPolicyPublication(self: *DB, bundle_bytes: []const u8, request: @import("../system_catalog/policies.zig").InstallRequest, identity: db.OrderedApplyReceipt) engine.Outcome(?@import("db/row_policy_bundle.zig").Receipt) {
-    return .{ .value = self.applyReplicatedRowPolicyPublication(bundle_bytes, request, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.query.applyReplicatedRowPolicyPublication(bundle_bytes, request, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn recoverReplicatedRestoreFinish(self: *DB, finish: @FieldType(@import("db/restore_staging_contract.zig").Control, "finish")) engine.Outcome(void) {

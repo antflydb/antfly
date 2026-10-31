@@ -10819,7 +10819,7 @@ test "capi native memory grouped episodes advance without a waiting write in roo
             defer guard.leave();
             const owner = (guard.handle.parent_handle orelse guard.handle).lite_scheduling_owner.?;
             const state = try owner.groupSourceState(guard.handle.database());
-            std.debug.print("group background cursor={d} reader={d} mode={s} stopping={} submitted={d} next_definition={d}\n", .{ owner.maintenance_table_cursor, guard.handle.database().core.index_manager.minimum_reader_version.load(.acquire), @tagName(guard.handle.database().open_mode), guard.handle.database().group_source_owner.stopping.load(.acquire), state.submitted, state.next_definition });
+            std.debug.print("group background cursor={d} reader={d} mode={s} stopping={} submitted={d} next_definition={d}\n", .{ owner.maintenance_table_cursor, guard.handle.database().core.index_manager.minimum_reader_version.load(.acquire), @tagName(guard.handle.database().open_mode), guard.handle.database().documents.group_sources.owner.stopping.load(.acquire), state.submitted, state.next_definition });
             const stats = try pendingWorkStatsJson(guard.handle);
             defer std.heap.c_allocator.free(stats.ptr.?[0..stats.len]);
             std.debug.print("group background namespace={d} stats={s}\n", .{ namespace_index, stats.ptr.?[0..stats.len] });

@@ -1049,7 +1049,7 @@ test "external lake native reuse avoids capture and invalidates writes metadata 
         // drain maintenance, pause workers or build a filesystem generation.
         try std.testing.expect(db.snapshot_publication_mutex.tryLock());
         defer db.snapshot_publication_mutex.unlock();
-        var frozen = try db.openQueryCut(second, .none);
+        var frozen = try db.query.openCut(second, .none);
         defer frozen.close();
         const bytes = (try frozen.get(a, "doc")).?;
         defer a.free(bytes);
@@ -1078,7 +1078,7 @@ test "external lake native reuse avoids capture and invalidates writes metadata 
     const third_id: [64]u8 = @splat('c');
     const third: cut.Request = .{ .id = &third_id, .table_id = 7, .expires_ms = first.expires_ms + 2000, .create = true };
     {
-        var fresh = try db.openQueryCut(third, .none);
+        var fresh = try db.query.openCut(third, .none);
         defer fresh.close();
         const bytes = (try fresh.get(a, "doc")).?;
         defer a.free(bytes);
@@ -1116,7 +1116,7 @@ test "external lake native reuse avoids capture and invalidates writes metadata 
     try std.Io.Dir.accessAbsolute(io, sixth_root, .{});
     var old = first;
     old.create = false;
-    var prior = try db.openQueryCut(old, .none);
+    var prior = try db.query.openCut(old, .none);
     defer prior.close();
     const old_bytes = (try prior.get(a, "doc")).?;
     defer a.free(old_bytes);
@@ -1204,7 +1204,7 @@ test "external lake native repository opens retained vector storage after local 
     const id: [64]u8 = @splat('f');
     var request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
     {
-        var retained = try db.openQueryCut(request, .none);
+        var retained = try db.query.openCut(request, .none);
         defer retained.close();
         const prior = (try retained.get(a, "doc")).?;
         defer a.free(prior);
@@ -1219,7 +1219,7 @@ test "external lake native repository opens retained vector storage after local 
     db_open = true;
     request.create = false;
     {
-        var restarted = try db.openQueryCut(request, .none);
+        var restarted = try db.query.openCut(request, .none);
         defer restarted.close();
         const before_loss = (try restarted.get(a, "doc")).?;
         defer a.free(before_loss);
@@ -1246,7 +1246,7 @@ test "external lake native repository opens retained vector storage after local 
             },
             else => unreachable,
         }
-        var remote = try db.openQueryCut(request, .none);
+        var remote = try db.query.openCut(request, .none);
         defer remote.close();
         const original = (try remote.get(a, "doc")).?;
         defer a.free(original);
@@ -1261,7 +1261,7 @@ test "external lake native repository opens retained vector storage after local 
     const remote_key = try repository.key(a, request, namespace);
     defer a.free(remote_key);
     try repository.store.opened.client.deleteObject(repository.store.opened.bucket, remote_key, .{});
-    try std.testing.expectError(error.CatalogGenerationChanged, db.openQueryCut(request, .none));
+    try std.testing.expectError(error.CatalogGenerationChanged, db.query.openCut(request, .none));
     const latest = (try db.get(a, "doc")).?;
     defer a.free(latest);
     try std.testing.expect(std.mem.indexOf(u8, latest, "\"amount\":2") != null);
@@ -1545,16 +1545,16 @@ fn testNativeCacheEviction(linked: bool) !void {
     const expires = cut.nowMs() + 300_000;
     var old: cut.Request = .{ .id = &old_id, .table_id = 7, .expires_ms = expires, .create = true };
     const next: cut.Request = .{ .id = &new_id, .table_id = 7, .expires_ms = expires, .create = true };
-    var original = try db.openQueryCut(old, .none);
+    var original = try db.query.openCut(old, .none);
     var original_open = true;
     defer if (original_open) original.close();
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":2}" }} });
     // An active local reader must retain its files even with durable authority.
-    try std.testing.expectError(error.QueryCandidateBudgetExceeded, db.openQueryCut(next, .none));
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, db.query.openCut(next, .none));
     original.close();
     original_open = false;
     {
-        var current = try db.openQueryCut(next, .none);
+        var current = try db.query.openCut(next, .none);
         defer current.close();
         const old_root = try cut.pathAlloc(a, root, &old_id);
         defer a.free(old_root);
@@ -1563,7 +1563,7 @@ fn testNativeCacheEviction(linked: bool) !void {
     // The original cursor reads the exact old generation through the repository.
     old.create = false;
     {
-        var recovered = try db.openQueryCut(old, .none);
+        var recovered = try db.query.openCut(old, .none);
         defer recovered.close();
         const value = (try recovered.get(a, "doc")).?;
         defer a.free(value);
@@ -1579,7 +1579,7 @@ fn testNativeCacheEviction(linked: bool) !void {
         defer a.free(key);
         try repository.store.opened.client.deleteObject(repository.store.opened.bucket, key, .{});
     }
-    try std.testing.expectError(error.QueryCandidateBudgetExceeded, db.openQueryCut(.{ .id = &last_id, .table_id = 7, .expires_ms = expires, .create = true }, .none));
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, db.query.openCut(.{ .id = &last_id, .table_id = 7, .expires_ms = expires, .create = true }, .none));
     const current_root = try cut.pathAlloc(a, root, &new_id);
     defer a.free(current_root);
     try std.Io.Dir.accessAbsolute(io, current_root, .{});
@@ -1787,7 +1787,7 @@ test "external lake native linked recovery bypasses partial caches without repla
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":1}" }}, .sync_level = .write });
     const id: [64]u8 = @splat('a');
     var request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300000, .create = true };
-    var reader = try db.openQueryCut(request, .none);
+    var reader = try db.query.openCut(request, .none);
     var reader_open = true;
     defer if (reader_open) reader.close();
     request.create = false;
@@ -1800,7 +1800,7 @@ test "external lake native linked recovery bypasses partial caches without repla
     defer a.free(manifest_bytes);
     try std.Io.Dir.cwd().deleteFile(io, manifest_path);
     {
-        var parallel = try db.openQueryCut(request, .none);
+        var parallel = try db.query.openCut(request, .none);
         defer parallel.close();
         const value = (try parallel.get(a, "doc")).?;
         defer a.free(value);
@@ -1821,7 +1821,7 @@ test "external lake native linked recovery bypasses partial caches without repla
             defer a.free(file);
             try std.Io.Dir.cwd().deleteFile(io, file);
         }
-        var recovered = try db.openQueryCut(request, .none);
+        var recovered = try db.query.openCut(request, .none);
         defer recovered.close();
         const original = (try recovered.get(a, "doc")).?;
         defer a.free(original);
@@ -1832,7 +1832,7 @@ test "external lake native linked recovery bypasses partial caches without repla
     defer a.free(retained);
     try std.Io.Dir.cwd().deleteTree(io, retained);
     try std.Io.Dir.cwd().deleteFile(io, manifest_path);
-    try std.testing.expectError(error.CatalogGenerationChanged, db.openQueryCut(request, .none));
+    try std.testing.expectError(error.CatalogGenerationChanged, db.query.openCut(request, .none));
     try std.Io.Dir.accessAbsolute(io, pinned, .{});
 }
 

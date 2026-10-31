@@ -988,7 +988,7 @@ pub const QuerySession = struct {
             const generation = database.core.schemaNamespaceGeneration();
             var view = database.core.acquireSchemaView();
             defer if (view) |*pinned| pinned.release();
-            return .{ .instance = database.querySchemaIdentity(), .core = @intFromPtr(database.core), .namespace = database.core.identity_namespace, .catalog = database.core.index_manager.writePlanGeneration(), .schema_generation = generation, .schema_version = if (view) |pinned| pinned.tableSchema().version else null, .digest = undefined };
+            return .{ .instance = database.query.schemaIdentity(), .core = @intFromPtr(database.core), .namespace = database.core.identity_namespace, .catalog = database.core.index_manager.writePlanGeneration(), .schema_generation = generation, .schema_version = if (view) |pinned| pinned.tableSchema().version else null, .digest = undefined };
         }
         fn epoch(self: SchemaStamp) h.db_mod.DB.ResolverQuerySchemaEpoch {
             return .{ .instance = self.instance, .core = self.core, .namespace = self.namespace, .catalog = self.catalog, .schema_generation = self.schema_generation, .schema_version = self.schema_version };
@@ -1005,11 +1005,11 @@ pub const QuerySession = struct {
         }
     };
     fn schema(database: *h.db_mod.DB, owner: A) !SchemaStamp {
-        @import("antfly_platform").sync.lockYielding(&database.resolver_query_schema_mutex);
-        defer database.resolver_query_schema_mutex.unlock();
+        @import("antfly_platform").sync.lockYielding(&database.query.schema.resolver_mutex);
+        defer database.query.schema.resolver_mutex.unlock();
         var result = SchemaStamp.current(database);
-        if (database.resolver_query_schema_epoch) |epoch| if (std.meta.eql(epoch, result.epoch())) {
-            result.digest = database.resolver_query_schema_digest;
+        if (database.query.schema.resolver_epoch) |epoch| if (std.meta.eql(epoch, result.epoch())) {
+            result.digest = database.query.schema.resolver_digest;
             if (!result.matchesEpoch(database)) return error.Busy;
             return result;
         };
@@ -1022,8 +1022,8 @@ pub const QuerySession = struct {
         defer h.db_mod.types.freeEnrichmentConfigs(a, enrichments);
         result.digest = try resolver.fingerprint(a, .{ database.core.identity_namespace, try database.getSchemaJson(a), indexes, enrichments });
         if (!result.matchesEpoch(database)) return error.Busy;
-        database.resolver_query_schema_digest = result.digest;
-        database.resolver_query_schema_epoch = result.epoch();
+        database.query.schema.resolver_digest = result.digest;
+        database.query.schema.resolver_epoch = result.epoch();
         return result;
     }
     const Admission = @import("../storage/db/catalog/index_manager.zig").IndexManager.QueryAdmission;
@@ -1497,7 +1497,7 @@ test "capi resolver curation schema digests qualify snapshots and reuse unchange
     // A new immutable snapshot may reuse identical scalar generation values.
     // Its process incarnation must still force content requalification.
     const prior_instance = stamp.instance;
-    root.db.query_schema_identity.store(0, .release);
+    root.db.query.schema.identity.store(0, .release);
     try std.testing.expect(!stamp.matchesEpoch(&root.db));
     try stamp.verify(&root.db, bounded.allocator());
     try std.testing.expect(stamp.matchesEpoch(&root.db));
@@ -1894,7 +1894,7 @@ test "capi resolver curation schema captures reuse owner proofs across large unr
     try std.testing.expectError(error.Busy, captured.verify(&root.db, a));
     const updated = try QuerySession.schema(&root.db, bounded.allocator());
     try std.testing.expect(!std.mem.eql(u8, &captured.digest, &updated.digest));
-    root.db.query_schema_identity.store(0, .release);
+    root.db.query.schema.identity.store(0, .release);
     try std.testing.expect(!updated.matchesEpoch(&root.db));
     try std.testing.expectError(error.OutOfMemory, QuerySession.schema(&root.db, bounded.allocator()));
     const reopened = try QuerySession.schema(&root.db, a);

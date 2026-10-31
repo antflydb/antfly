@@ -121,7 +121,7 @@ pub const AtomicU64 = execution_resources.AtomicU64;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const common_secrets = @import("../../common/secrets.zig");
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
-const backend_types = @import("../backend_types.zig");
+pub const backend_types = @import("../backend_types.zig");
 const backup_codec = @import("../backup_codec.zig");
 pub const docstore_mod = @import("../docstore.zig");
 const table_storage_mod = @import("../../common/table_storage.zig");
@@ -142,7 +142,7 @@ const snapshot_admission_mod = @import("snapshot_admission.zig");
 const db_core = @import("core.zig");
 pub const internal_keys = @import("../internal_keys.zig");
 const hierarchy_navigation = @import("../hierarchy_navigation.zig");
-const doc_identity = @import("doc_identity.zig");
+pub const doc_identity = @import("doc_identity.zig");
 const document_content_hash = @import("document_content_hash.zig");
 const range_cardinality = @import("range_cardinality.zig");
 const replay_batcher_mod = @import("batcher.zig");
@@ -185,7 +185,7 @@ test {
 }
 
 pub const change_journal_mod = @import("derived/change_journal.zig");
-const replication_effects_mod = @import("replication_effects.zig");
+pub const replication_effects_mod = @import("replication_effects.zig");
 
 const replication_mutation_barrier_mod = @import("antfly_runtime_abi").mutation_barrier;
 
@@ -194,7 +194,7 @@ const replication_record_mod = @import("replication_record.zig");
 const replay_stream_mod = @import("derived/replay_stream.zig");
 const derived_types = @import("derived/derived_types.zig");
 pub const derived_worker = @import("derived/derived_worker.zig");
-const derived_executor_mod = @import("derived/derived_executor.zig");
+pub const derived_executor_mod = @import("derived/derived_executor.zig");
 pub const background_runtime_mod = @import("../background_runtime.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
 const persistent_mod = @import("../persistent.zig");
@@ -223,7 +223,7 @@ const enrichment_lease_mod = @import("enrichment/enrichment_lease.zig");
 const enrichment_worker = @import("enrichment/enrichment_worker.zig");
 const enrichment_lease = @import("enrichment/enrichment_lease.zig");
 const enrichment_state = @import("enrichment/enrichment_state.zig");
-const enrichment_types = @import("enrichment/enrichment_types.zig");
+pub const enrichment_types = @import("enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
@@ -321,10 +321,10 @@ test "standalone resource manager derives elastic storage cache envelopes" {
     try std.testing.expectEqual(hbc.hard_limit_bytes * 7 / 8, hbc.soft_limit_bytes);
 }
 const schema_mod = @import("../schema.zig");
-const table_catalog_mod = @import("table_catalog.zig");
+pub const table_catalog_mod = @import("table_catalog.zig");
 const row_policy_gate_mod = @import("row_policy_gate.zig");
-const row_policy_bundle_mod = @import("row_policy_bundle.zig");
-const row_policy_authority_mod = @import("../../usermgr/row_policy_authority.zig");
+pub const row_policy_bundle_mod = @import("row_policy_bundle.zig");
+pub const row_policy_authority_mod = @import("../../usermgr/row_policy_authority.zig");
 pub const schema_registry_mod = @import("schema_registry.zig");
 const relational_index_plans = @import("relational_index_plan.zig");
 const relational_index_records = @import("relational_index_records.zig");
@@ -360,11 +360,11 @@ const graph_query_mod = @import("../../graph/query.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
 const graph_node_identity = @import("../../graph/node_identity.zig");
 pub const mapper = @import("document_mapper.zig");
-const relational_store = @import("relational_store.zig");
+pub const relational_store = @import("relational_store.zig");
 const lookup_key_scratch = @import("lookup_key_scratch.zig");
 const document_read_scratch = @import("document_read_scratch.zig");
 pub const relational_columns = @import("relational_columns.zig");
-const relational_row_codec = @import("algebraic/relational_row_codec.zig");
+pub const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
 const planning_stats_mod = @import("planning_stats.zig");
@@ -441,11 +441,11 @@ const replication_outbox_checksum_len = durable_outbox.replication_outbox_checks
 
 const DurableReplicationOutbox = execution_resources.DurableReplicationOutbox;
 
-const durableReplicationOutboxKeyAlloc = durable_outbox.durableReplicationOutboxKeyAlloc;
+pub const durableReplicationOutboxKeyAlloc = durable_outbox.durableReplicationOutboxKeyAlloc;
 
 const durableReplicationOutboxKindFromKey = durable_outbox.durableReplicationOutboxKindFromKey;
 
-const encodeDurableReplicationOutboxAlloc = durable_outbox.encodeDurableReplicationOutboxAlloc;
+pub const encodeDurableReplicationOutboxAlloc = durable_outbox.encodeDurableReplicationOutboxAlloc;
 
 const decodeDurableReplicationOutbox = durable_outbox.decodeDurableReplicationOutbox;
 
@@ -799,7 +799,7 @@ pub const ReplicationAsyncEffectMirror = execution_resources.ReplicationAsyncEff
 
 const ReplicationDeferredCommitGate = execution_resources.ReplicationDeferredCommitGate;
 
-const ReplicationDeferredCommitGates = execution_resources.ReplicationDeferredCommitGates;
+pub const ReplicationDeferredCommitGates = execution_resources.ReplicationDeferredCommitGates;
 
 pub const ReplicationAsyncBatchMirror = execution_resources.ReplicationAsyncBatchMirror;
 pub const ReplicationAsyncMetadataMirror = execution_resources.ReplicationAsyncMetadataMirror;
@@ -1206,21 +1206,21 @@ pub const BatchExecutionOptions = execution_resources.BatchExecutionOptions;
 
 pub const OrderedApplyReceipt = execution_resources.OrderedApplyReceipt;
 
-const ordered_apply_receipt_value_len = apply_receipts.ordered_apply_receipt_value_len;
+pub const ordered_apply_receipt_value_len = apply_receipts.ordered_apply_receipt_value_len;
 
-const orderedApplyReceiptWrite = apply_receipts.orderedApplyReceiptWrite;
+pub const orderedApplyReceiptWrite = apply_receipts.orderedApplyReceiptWrite;
 
-const readOrderedApplyReceipt = apply_receipts.readOrderedApplyReceipt;
+pub const readOrderedApplyReceipt = apply_receipts.readOrderedApplyReceipt;
 
 const OrderedApplyDisposition = apply_receipts.OrderedApplyDisposition;
 
-const orderedApplyDisposition = apply_receipts.orderedApplyDisposition;
+pub const orderedApplyDisposition = apply_receipts.orderedApplyDisposition;
 
 const TransactionResolution = execution_resources.TransactionResolution;
 
-const replication_applied_lsn_value_len = apply_receipts.replication_applied_lsn_value_len;
+pub const replication_applied_lsn_value_len = apply_receipts.replication_applied_lsn_value_len;
 
-const replicationAppliedSequenceWrite = apply_receipts.replicationAppliedSequenceWrite;
+pub const replicationAppliedSequenceWrite = apply_receipts.replicationAppliedSequenceWrite;
 
 const readReplicationAppliedSequence = apply_receipts.readReplicationAppliedSequence;
 
@@ -3105,12 +3105,12 @@ pub const DocumentPrimaryReadWindow = struct {
 };
 pub const GraphReplacementProgress = struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 };
 
-var next_query_schema_identity: std.atomic.Value(u64) = .init(1);
+pub var next_query_schema_identity: std.atomic.Value(u64) = .init(1);
 
 pub const Indexes = @import("indexes/mod.zig").Indexes;
 pub const GraphIndexes = @import("indexes/graph.zig").GraphIndexes;
 
-const Documents = @import("documents.zig").Documents;
+pub const Documents = @import("documents.zig").Documents;
 
 pub const SparseIndexes = @import("indexes/sparse.zig").SparseIndexes;
 
@@ -3118,6 +3118,7 @@ pub const TextIndexes = @import("indexes/text.zig").TextIndexes;
 pub const RelationalIndexes = @import("indexes/relational.zig").RelationalIndexes;
 pub const AlgebraicIndexes = @import("indexes/algebraic.zig").AlgebraicIndexes;
 pub const RepairIndexes = @import("indexes/repair.zig").RepairIndexes;
+pub const Query = @import("query/state.zig").Query;
 pub const DB = struct {
     /// Content-only proof for this physical owner and immutable catalog cut.
     /// Native heads, grants and live logical bindings are validated separately.
@@ -3129,29 +3130,12 @@ pub const DB = struct {
         schema_generation: u64,
         schema_version: ?u32,
     };
-    query_schema_identity: std.atomic.Value(u64) = .init(0),
-    resolver_query_schema_mutex: std.atomic.Mutex = .unlocked,
-    resolver_query_schema_epoch: ?ResolverQuerySchemaEpoch = null,
-    resolver_query_schema_digest: [32]u8 = undefined,
-    /// Installed only after immutable query-cut admission. Never persisted.
-    retained_value_scope: ?@import("../../search/value_membership.zig").Scope = null,
-    retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
-    retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
-    native_query_warming: @import("native_query_warming.zig").Owner = .{},
     /// Shared local mutation state outlives foreground and recovery execution.
     local_execution: *LocalExecutionState,
-    /// Monolithic managed opens retain the process verifier until workers drain.
-    owned_row_policy_authority_secret: ?[]u8 = null,
-    owned_row_policy_authority_issuer: ?[]u8 = null,
-    owned_row_policy_table_name: ?[]u8 = null,
     restore_decoder_cache: @import("../restore_decoder_cache.zig").Cache = .{},
     source_vector_storage: ?*lsm_backend_mod.NativeStorage = null,
     closed: bool = false,
     stable_address: bool = false,
-    group_source_owner: @import("group_source_owner.zig").Owner = .{},
-    /// Borrowed from the native connection owner; stable across DB refreshes.
-    /// The owner serializes every producer slice and outlives this wrapper.
-    borrowed_group_source_state: ?*GroupSourceMaintenanceState = null,
     alloc: Allocator,
     runtime_alloc: Allocator,
     generation_read_lease: ?generation_lifecycle.ReadLease,
@@ -3221,6 +3205,7 @@ pub const DB = struct {
     quarantine_recovery: quarantine_recovery.Owner = .{},
     independent_maintenance: independent_maintenance.Owner = .{},
     documents: Documents = .{},
+    query: Query = .{},
     artifact_repair_metadata_due_ns: u64 = 0,
     artifact_repair_metadata_pending: bool = true,
     artifact_footprint_pending: std.atomic.Value(bool) = .init(true),
@@ -3239,8 +3224,6 @@ pub const DB = struct {
     /// stuck index and its indexed/expected counters without re-parsing a log
     /// line. Overwritten on each new occurrence; freed at `deinitWrapperState`.
     last_run_until_idle_no_progress: ?NoProgressDiagnostic = null,
-    bulk_ingest_session: @import("bulk_ingest_session.zig").State = .{},
-    bulk_identity: @import("bulk_ingest_session.zig").IdentityScratch = .{},
     // Status snapshots are reconstructed from durable state on every poll, so
     // volatile worker observations need an independently owned cache. Keeping
     // it on the resident DB (rather than inside a returned DBStats value) lets
@@ -3358,15 +3341,6 @@ pub const DB = struct {
         failed_check: ?u16,
     };
 
-    /// A process-local incarnation prevents epoch ABA across reopened or
-    /// refreshed immutable DB snapshots, including allocator address reuse.
-    pub fn querySchemaIdentity(self: *DB) u64 {
-        const existing = self.query_schema_identity.load(.acquire);
-        if (existing != 0) return existing;
-        const fresh = next_query_schema_identity.fetchAdd(1, .monotonic);
-        std.debug.assert(fresh != 0);
-        return self.query_schema_identity.cmpxchgStrong(0, fresh, .acq_rel, .acquire) orelse fresh;
-    }
     pub fn constraintValidationStatus(self: *DB) !ConstraintValidationStatus {
         if (comptime storage_engine.enabled) return storage_engine.call("constraintValidationStatus", .{self});
         try self.lockApplySharedForPortableRuntime();
@@ -3686,7 +3660,7 @@ pub const DB = struct {
 
     pub const preflightReplicationBatchSyncCommit = local_mutation.preflightReplicationBatchSyncCommit;
 
-    fn preflightReplicationMetadataSyncCommit(self: *DB) !void {
+    pub fn preflightReplicationMetadataSyncCommit(self: *DB) !void {
         var ctx = self.batchContext();
         try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_metadata_mirror);
     }
@@ -4063,8 +4037,10 @@ pub const DB = struct {
             };
             var db = DB{
                 .local_execution = local_execution,
-                .owned_row_policy_authority_secret = policy_secret,
-                .owned_row_policy_authority_issuer = policy_issuer,
+                .query = .{ .row_policy = .{
+                    .authority_secret = policy_secret,
+                    .authority_issuer = policy_issuer,
+                } },
                 .alloc = alloc,
                 .runtime_alloc = runtime_alloc,
                 .generation_read_lease = generation_read_lease,
@@ -5236,7 +5212,7 @@ pub const DB = struct {
         self.startQuarantineRetryWorkerIfNeeded();
         self.indexes.graph.startEndpointCleanupWorker();
         if (self.local_execution.optional_runtime_workers_enabled)
-            self.group_source_owner.start(.{ .ptr = self, .runtime = self.backend_runtime, .run = runLocalGroupSourceSlice });
+            self.documents.group_sources.owner.start(.{ .ptr = self, .runtime = self.backend_runtime, .run = Documents.runLocalGroupSourceSlice });
     }
 
     pub fn closeOwned(self: *DB) void {
@@ -5425,7 +5401,7 @@ pub const DB = struct {
         return ctx.visibility_observer.attached();
     }
 
-    fn notifyQueryVisibilityHook(ctx: *AsyncContext, change: QueryVisibilityChange) void {
+    pub fn notifyQueryVisibilityHook(ctx: *AsyncContext, change: QueryVisibilityChange) void {
         notifyQueryVisibilityEvent(ctx, .{ .change = change });
     }
 
@@ -5959,14 +5935,14 @@ pub const DB = struct {
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
-        self.native_query_warming.stop(self.backend_runtime);
+        self.query.warming.stop(self.backend_runtime);
         self.local_execution.schema_reconcile.stop();
         self.stopArtifactRepairMetadataWorker();
         self.indexes.graph.clearReplacementManager();
         self.artifact_producer_scheduler.deinit(self.alloc);
         self.stopPortableActivationRetryWorker();
         self.stopQuarantineRetryWorker();
-        self.group_source_owner.stop(self.backend_runtime.io());
+        self.documents.group_sources.owner.stop(self.backend_runtime.io());
         self.indexes.graph.stopEndpointCleanupWorker();
         self.transaction_owner.deinitRuntime(self.runtime_alloc);
         self.transaction_runtime = null;
@@ -5997,7 +5973,7 @@ pub const DB = struct {
         self.embedding_activity.deinit(self.alloc);
         if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
         self.graph_restore_parse_cache = null;
-        self.bulk_identity.deinit(self.alloc);
+        self.documents.bulk_ingest.identity.deinit(self.alloc);
         self.clearActiveIndexRepairsLocked();
         self.indexes.repair.active.deinit(self.alloc);
         self.indexes.closeSplitShadowLocked() catch {};
@@ -6075,10 +6051,10 @@ pub const DB = struct {
         // state has closed.
         if (self.generation_read_lease) |*lease| lease.deinit();
         self.generation_read_lease = null;
-        if (self.retained_query_lease) |*lease| lease.deinit();
-        self.retained_query_lease = null;
-        if (self.retained_remote_query_lease) |*lease| lease.deinit();
-        self.retained_remote_query_lease = null;
+        if (self.query.cut.lease) |*lease| lease.deinit();
+        self.query.cut.lease = null;
+        if (self.query.cut.remote_lease) |*lease| lease.deinit();
+        self.query.cut.remote_lease = null;
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.owned_resource_manager) |manager| {
             manager.deinit(self.alloc);
@@ -6086,12 +6062,12 @@ pub const DB = struct {
         }
         if (self.local_execution.row_policy_bundle) |*bundle| bundle.deinit();
         self.local_execution.row_policy_bundle = null;
-        if (self.owned_row_policy_authority_secret) |value| {
+        if (self.query.row_policy.authority_secret) |value| {
             @memset(value, 0);
             self.alloc.free(value);
         }
-        if (self.owned_row_policy_authority_issuer) |value| self.alloc.free(value);
-        if (self.owned_row_policy_table_name) |value| self.alloc.free(value);
+        if (self.query.row_policy.authority_issuer) |value| self.alloc.free(value);
+        if (self.query.row_policy.table_name) |value| self.alloc.free(value);
         self.runtime_alloc.destroy(self.local_execution);
         self.* = undefined;
         self.closed = true;
@@ -6140,12 +6116,12 @@ pub const DB = struct {
         try resources.index_manager.beginSparseBulkIngestSessions();
         errdefer resources.index_manager.abortSparseBulkIngestSessions();
         try resources.index_manager.beginAlgebraicBulkIngestSessions();
-        self.configureBulkIngestIdentityAllNewLocked() catch |err| {
+        self.documents.configureBulkIngestIdentityAllNewLocked() catch |err| {
             resources.index_manager.abortAlgebraicBulkIngestSessions();
             return err;
         };
         errdefer self.clearBulkIngestIdentityAllNewLocked();
-        self.bulk_ingest_session.begin();
+        self.documents.bulk_ingest.session.begin();
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
@@ -6169,7 +6145,7 @@ pub const DB = struct {
             resources.index_manager.finishSparseBulkIngestSessionsWithOptions(options) catch |err| {
                 if (first_err == null) first_err = err;
             };
-            self.bulk_ingest_session.finish();
+            self.documents.bulk_ingest.session.finish();
             self.clearBulkIngestIdentityAllNewLocked();
             if (first_err) |err| return err;
         }
@@ -6189,139 +6165,7 @@ pub const DB = struct {
     }
 
     pub fn bulkSessionActive(self: *const DB) bool {
-        return self.bulk_ingest_session.active;
-    }
-
-    pub fn beginDenseAutoBulkIngestSession(self: *DB) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("beginDenseAutoBulkIngestSession", .{self});
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
-        try self.enforcePortableRuntimeGate();
-        try beginExternalDenseBulkSessionTrackedWait(self.async_context, self.backend_runtime.io());
-        errdefer finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        const resources = self.core.batchExecutionResources();
-        try resources.index_manager.beginDenseBulkIngestSessions();
-        self.bulk_ingest_session.begin();
-    }
-
-    pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("beginPrimaryStoreAutoBulkIngestSession", .{self});
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        const resources = self.core.batchExecutionResources();
-        try resources.store.beginBulkIngestSession();
-        errdefer resources.store.abortBulkIngestSession();
-        try self.configureBulkIngestIdentityAllNewLocked();
-        errdefer self.clearBulkIngestIdentityAllNewLocked();
-        self.bulk_ingest_session.begin();
-    }
-
-    pub fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("finishPrimaryStoreAutoBulkIngestSessionWithOptions", .{ self, options });
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
-        {
-            try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
-            const resources = self.core.batchExecutionResources();
-            resources.store.finishBulkIngestSessionWithOptions(options) catch |err| {
-                self.bulk_ingest_session.finish();
-                self.clearBulkIngestIdentityAllNewLocked();
-                return err;
-            };
-            self.bulk_ingest_session.finish();
-            self.clearBulkIngestIdentityAllNewLocked();
-        }
-        flushDeferredExternalBulkExecutorNotificationOrTarget(
-            self.async_context,
-            self.executor,
-            self.core.nextDerivedSequence(),
-        );
-        notifyQueryVisibilityHook(self.async_context, .publish);
-    }
-
-    pub fn rollPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("rollPrimaryStoreAutoBulkIngestSessionWithOptions", .{ self, options });
-        try self.finishPrimaryStoreAutoBulkIngestSessionWithOptions(options);
-        try self.beginPrimaryStoreAutoBulkIngestSession();
-    }
-
-    pub fn finishDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("finishDenseAutoBulkIngestSessionWithOptions", .{ self, options });
-        try self.finishDenseAutoBulkIngestSessionWithOptionsInternal(options, true);
-    }
-
-    pub fn rollDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("rollDenseAutoBulkIngestSessionWithOptions", .{ self, options });
-        try self.finishDenseAutoBulkIngestSessionWithOptionsInternal(options, true);
-        try self.beginDenseAutoBulkIngestSession();
-    }
-
-    fn finishDenseAutoBulkIngestSessionWithOptionsInternal(self: *DB, options: backend_types.BulkIngestFinishOptions, notify_executor: bool) !void {
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
-        var external_session_tracked = true;
-        defer if (external_session_tracked) finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
-        {
-            try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
-            const resources = self.core.batchExecutionResources();
-            resources.store.flushBufferedWritesWithOptions(options) catch |err| {
-                self.bulk_ingest_session.finish();
-                return err;
-            };
-            resources.index_manager.finishDenseBulkIngestSessionsWithOptions(options) catch |err| {
-                self.bulk_ingest_session.finish();
-                self.clearBulkIngestIdentityAllNewLocked();
-                return err;
-            };
-            self.bulk_ingest_session.finish();
-            self.clearBulkIngestIdentityAllNewLocked();
-        }
-        external_session_tracked = false;
-        _ = try finishExternalDenseBulkSessionTrackedAndFinalize(self.async_context);
-        if (notify_executor) {
-            flushDeferredExternalBulkExecutorNotificationOrTarget(
-                self.async_context,
-                self.executor,
-                self.core.nextDerivedSequence(),
-            );
-        }
-        notifyQueryVisibilityHook(self.async_context, .publish);
-    }
-
-    pub fn abortDenseAutoBulkIngestSession(self: *DB) void {
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        lockApply(self);
-        {
-            defer self.core.unlockApply();
-            const resources = self.core.batchExecutionResources();
-            self.bulk_ingest_session.finish();
-            resources.index_manager.abortDenseBulkIngestSessions();
-        }
-        finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
-        flushDeferredExternalBulkExecutorNotification(self.async_context, self.executor);
-    }
-
-    pub fn abortPrimaryStoreAutoBulkIngestSession(self: *DB) void {
-        if (comptime storage_engine.enabled) return storage_engine.call("abortPrimaryStoreAutoBulkIngestSession", .{self}) catch @panic("incompatible storage owner");
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        lockApply(self);
-        defer self.core.unlockApply();
-        const resources = self.core.batchExecutionResources();
-        self.bulk_ingest_session.finish();
-        self.clearBulkIngestIdentityAllNewLocked();
-        resources.store.abortBulkIngestSession();
+        return self.documents.bulk_ingest.session.active;
     }
 
     pub fn abortBulkIngestSession(self: *DB) void {
@@ -6332,7 +6176,7 @@ pub const DB = struct {
         {
             defer self.core.unlockApply();
             const resources = self.core.batchExecutionResources();
-            self.bulk_ingest_session.finish();
+            self.documents.bulk_ingest.session.finish();
             self.clearBulkIngestIdentityAllNewLocked();
             resources.index_manager.abortAlgebraicBulkIngestSessions();
             resources.index_manager.abortSparseBulkIngestSessions();
@@ -6395,7 +6239,7 @@ pub const DB = struct {
         async_stats.dense_projection_finalizing =
             self.async_context.dense_admission.finalizing.load(.acquire) or
             self.core.index_manager.vectorBlockProjectionPending();
-        async_stats.bulk_coalescing = self.bulk_ingest_session.snapshot();
+        async_stats.bulk_coalescing = self.documents.bulk_ingest.session.snapshot();
         async_stats.derived_workers = self.executor.snapshotStats();
         return async_stats;
     }
@@ -6985,159 +6829,9 @@ pub const DB = struct {
 
     pub const maintenanceRequiresOrderedApply = local_mutation.maintenanceRequiresOrderedApply;
 
-    fn runLocalGroupSourceSlice(ptr: *anyopaque) !bool {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        if (!self.stable_address or self.closed or self.open_mode != .writer or !self.local_execution.optional_runtime_workers_enabled or self.core.index_manager.minimum_reader_version.load(.acquire) < 8) return false;
-        return self.runGroupSourceSlice();
-    }
     pub const GroupSourceMaintenanceState = @import("group_source_owner.zig").State;
 
-    /// One bounded producer/control slice, without inference. Native Lite calls
-    /// this on the live coordinator under its short path lease, then replays
-    /// downstream providers in its separate detached turn.
-    pub fn runGroupSourceMaintenanceSlice(self: *DB, state: *GroupSourceMaintenanceState) !bool {
-        if (comptime storage_engine.enabled) return storage_engine.call("runGroupSourceMaintenanceSlice", .{ self, state });
-        const before = state.submitted;
-        _ = try self.runGroupSourceSliceWithState(state);
-        // Only a committed control mutation makes detached provider replay
-        // eligible. Visiting an idle sibling must not reopen provider state.
-        return state.submitted != before;
-    }
-
-    fn runGroupSourceSlice(self: *DB) !bool {
-        return self.runGroupSourceSliceWithState(self.borrowed_group_source_state orelse &self.group_source_owner.state);
-    }
-    const LocalGroupSourceContext = struct { db: *DB, state: *GroupSourceMaintenanceState };
-    fn runGroupSourceSliceWithState(self: *DB, state: *GroupSourceMaintenanceState) !bool {
-        if (!state.slice_mutex.tryLock()) return false;
-        defer state.slice_mutex.unlock();
-        // The resident scheduler runs independently of foreground index DDL.
-        // A slice borrows the current producer through batchContext as well
-        // as the final wake. Keep that entire bounded, inference-free turn
-        // inside the replacement fence so no borrowed runtime can be freed.
-        // Yield during reconfiguration rather than blocking the scheduler;
-        // durable group queues retain every pending command for the next turn.
-        if (!self.enrichment_owner.replacement_mutex.tryLock()) return false;
-        defer self.enrichment_owner.replacement_mutex.unlock();
-        return self.runGroupSourceSliceLocked(state);
-    }
-    fn runGroupSourceSliceLocked(self: *DB, state: *GroupSourceMaintenanceState) !bool {
-        // A table-wide coordinator must drive partial owners. The native
-        // worker can certify membership only for an unpartitioned Lite DB.
-        if (self.core.byteRange().start.len != 0 or self.core.byteRange().end.len != 0) return false;
-        if (self.open_mode != .writer or self.core.index_manager.minimum_reader_version.load(.acquire) < 8 or self.group_source_owner.stopping.load(.acquire)) return false;
-        if (try self.maintenanceRequiresOrderedApply()) return false;
-        try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
-        var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.init(manager, .shard_transition_working_set, self.runtime_alloc, 1) else null;
-        defer if (budget) |*value| value.deinit();
-        var arena = std.heap.ArenaAllocator.init(if (budget) |*value| value.allocator() else self.runtime_alloc);
-        defer arena.deinit();
-        const a = arena.allocator();
-        const work = @import("group_source_worker.zig");
-        const raw = (try self.lookupGroupSource(a, "{\"action\":\"definitions\"}")) orelse return false;
-        const definitions = try std.json.parseFromSliceLeaky([]work.Definition, a, raw.json, .{});
-        if (definitions.len == 0) return false;
-        const definition = definitions[state.next_definition % definitions.len];
-        state.next_definition +%= 1;
-        const namespace = definition.namespace;
-        if (state.worker == null) {
-            const identity = try std.json.Stringify.valueAlloc(a, .{ self.root_incarnation, platform_time.realtimeNs(), namespace }, .{});
-            state.worker = .{ .allocator = state.allocator orelse self.runtime_alloc, .identity = @import("group_sources.zig").digest(identity) };
-        }
-        var context = LocalGroupSourceContext{ .db = self, .state = state };
-        const ports = work.Ports{ .ptr = &context, .query_fn = localGroupSourceQuery, .submit_fn = localGroupSourceSubmit, .fan_in_fn = localGroupSourceFanIn, .settled_fn = localGroupSourceSettled };
-        const before = state.submitted;
-        try state.worker.?.sourceStep(a, ports, definition);
-        try state.worker.?.groupStep(a, ports, definition, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_ms)));
-        const changed = state.submitted != before;
-        state.idle_definitions = if (changed) 0 else state.idle_definitions +| 1;
-        // A no-op GC/idle definition is not proof that its siblings are idle.
-        // Complete a fair round before allowing a manual or connection owner
-        // to sleep. Progress resets the round so downstream receipts can settle.
-        return changed or state.idle_definitions < definitions.len;
-    }
-    fn localGroupSourceQuery(ptr: *anyopaque, a: Allocator, route: []const u8, request: []const u8) ![]const u8 {
-        const context: *LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
-        const self = context.db;
-        if (!self.core.byteRange().contains(route)) return error.KeyOutOfRange;
-        const result = (try self.lookupGroupSource(a, request)) orelse return error.NotFound;
-        return result.json;
-    }
-    fn localGroupSourceSubmit(ptr: *anyopaque, command: @import("group_source_contract.zig").Command) !void {
-        const context: *LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
-        const self = context.db;
-        if (try self.maintenanceRequiresOrderedApply()) return error.ArtifactCatalogDrift;
-        try self.batchInternal(.{ .group_source = command, .sync_level = .write }, null, .{});
-        context.state.submitted +%= 1;
-        // Group publication appends private producer rows. Independent resident
-        // owners need the same downstream wake as an enrichments-level wait;
-        // connection-owned Lite observes the durable sequence on its next turn.
-        if (self.enrichment_runtime) |runtime| runtime.notifySequence(self.core.nextDerivedSequence());
-    }
-    fn localGroupSourceFanIn(ptr: *anyopaque, a: Allocator, definition: @import("group_source_worker.zig").Definition, partition: @import("group_source_index.zig").Partition, ordinal: i64) !@import("group_source_worker.zig").FanIn {
-        const context: *LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
-        const self = context.db;
-        // A partial local range cannot certify a table-wide fan-in. The
-        // cluster adapter must enumerate all authoritative table owners.
-        if (self.core.byteRange().start.len != 0 or self.core.byteRange().end.len != 0) return error.GroupedSourceTopologyUnavailable;
-        const contract = @import("group_source_contract.zig");
-        const reads = @import("group_source_reads.zig");
-        var query = contract.Query{ .action = .partition, .artifact = definition.artifact, .definition = definition.definition, .group = partition.group, .segment = partition.segment, .cell = partition.cell, .ordinal = ordinal, .max_bytes = contract.max_partition_bytes };
-        var members: std.ArrayList(@import("group_sources.zig").Member) = .empty;
-        var revision: ?u64 = null;
-        var bytes: usize = 0;
-        var earlier_pending = false;
-        while (true) {
-            const request = try std.json.Stringify.valueAlloc(a, query, .{});
-            const response = try localGroupSourceQuery(ptr, a, definition.route.value, request);
-            const page = try std.json.parseFromSliceLeaky(reads.SourcePage, a, response, .{ .allocate = .alloc_always });
-            earlier_pending = earlier_pending or page.earlier_pending;
-            if (revision) |expected| {
-                if (expected != page.revision) return error.EnrichmentSourceChanged;
-            } else revision = page.revision;
-            for (page.members) |member| {
-                bytes += member.text.len + member.document.len;
-                if (members.items.len == 65536 or bytes > contract.max_partition_bytes) return error.GroupedSourcePartitionTooLarge;
-                try members.append(a, member);
-            }
-            if (page.done) break;
-            if (page.cursor.len == 0 or std.mem.eql(u8, query.cursor, page.cursor)) return error.GroupedSourceCorrupt;
-            query.cursor = page.cursor;
-        }
-        const sources = try a.alloc(contract.SourceCut, 1);
-        sources[0] = .{ .owner = definition.source_owner, .revision = revision orelse 0 };
-        return .{ .earlier_pending = earlier_pending, .members = try members.toOwnedSlice(a), .sources = sources, .topology_epoch = 0 };
-    }
-    fn localGroupSourceSettled(ptr: *anyopaque, sequence: u64, units: []const []const u8) !bool {
-        const context: *LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
-        return context.db.groupSourceSettled(sequence, units);
-    }
-    fn groupSourceSettled(self: *DB, sequence: u64, units: []const []const u8) !bool {
-        var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
-        defer arena.deinit();
-        var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = arena.allocator(), .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
-        if (try @import("artifact_publication.zig").authority(&overlay) != null) {
-            for (units) |unit| if (!try overlay.sourceSettled(unit)) return false;
-            return true;
-        }
-        // A native standalone owner has no Raft publication authority. Its
-        // ordinary committed replay cursor and per-producer repair receipts
-        // provide completion; replicated owners always require durable proofs.
-        if (try self.maintenanceRequiresOrderedApply()) return false;
-        if (sequence == 0) return true;
-        const runtime = self.enrichment_runtime orelse return false;
-        const status = runtime.stats();
-        if (status.applied_sequence < sequence or status.worker_failed) return false;
-        const check = runtime.failure_pending_fn orelse return status.fatal_error_count == 0;
-        var plan = try self.core.index_manager.acquireWritePlanSnapshot();
-        defer plan.release();
-        for (units) |unit| for (plan.plan().generated_templates) |template| {
-            if (!enrichment_types.appliesToDocument(template, unit)) continue;
-            const failure = enrichment_runtime_mod.FailureIdentity{ .kind = template.kind, .artifact_name = template.artifact_name, .source_artifact_name = template.upstream_artifact_name, .doc_key = unit, .sequence = sequence };
-            if (try check(runtime.failure_ctx orelse return false, failure, template.index_name)) return false;
-        };
-        return true;
-    }
+    pub const LocalGroupSourceContext = struct { db: *DB, state: *GroupSourceMaintenanceState };
 
     pub const GraphEndpointCleanupBatch = struct {
         page: docstore_mod.DocStore.GraphEndpointCleanupPage,
@@ -7577,34 +7271,6 @@ pub const DB = struct {
         try self.core.store.putBatch(&.{marker}, &.{});
     }
 
-    /// Apply an exact metadata-read-index policy publication through the data
-    /// Raft log. The ingress must obtain `bundle_bytes` from the provisioned
-    /// metadata leader callback, never from a user request. The bundle,
-    /// fail-closed preparing catalog, pending receipt intent, and applied
-    /// marker commit atomically on every replica. Receipt publication is a
-    /// separate owner-local completion after old leases drain; no metadata ACK
-    /// is available until that completion is durable.
-    fn readRowPolicyReceiptLocked(self: *DB, expected: row_policy_bundle_mod.Receipt) !row_policy_bundle_mod.Receipt {
-        var key_buf: [128]u8 = undefined;
-        const key = try expected.key(&key_buf);
-        const bytes = self.core.store.get(self.alloc, key) catch return error.InvalidRowPolicyReceipt;
-        defer self.alloc.free(bytes);
-        const stored = try row_policy_bundle_mod.Receipt.decode(bytes);
-        if (!std.meta.eql(expected, stored)) return error.InvalidRowPolicyReceipt;
-        return stored;
-    }
-
-    fn readRowPolicyApplyResultLocked(self: *DB, expected: row_policy_bundle_mod.Receipt) !?row_policy_bundle_mod.Receipt {
-        const receipt = self.readRowPolicyReceiptLocked(expected) catch |err| switch (err) {
-            error.InvalidRowPolicyReceipt => null,
-            else => return err,
-        };
-        if (receipt) |stored| return stored;
-        const pending = (try self.pendingRowPolicyReceipt()) orelse return error.InvalidRowPolicyReceipt;
-        if (!std.meta.eql(pending, expected)) return error.RowPolicyCatalogChanged;
-        return null;
-    }
-
     pub const pendingRowPolicyReceipt = local_mutation.pendingRowPolicyReceipt;
 
     /// A data-Raft entry first commits a fail-closed preparing marker without
@@ -7620,310 +7286,6 @@ pub const DB = struct {
     /// load and never touches the store. Busy old leases simply leave the
     /// owner preparing and the operation continues to fail closed.
     pub const maybeFinalizePendingRowPolicyPublication = local_mutation.maybeFinalizePendingRowPolicyPublication;
-
-    /// Private owner status query. A coordinator reads this only after the
-    /// data-Raft proposal has committed; it is never a substitute for the
-    /// metadata read-index bundle or an owner ACK. It exposes no user rows.
-    pub fn loadRowPolicyReceipt(self: *DB, generation: u64, phase: @import("../../system_catalog/policies.zig").Publication.Phase) !row_policy_bundle_mod.Receipt {
-        if (comptime storage_engine.enabled) return storage_engine.call("loadRowPolicyReceipt", .{ self, generation, phase });
-        if (generation == 0) return error.InvalidRowPolicyReceipt;
-        var key_buf: [128]u8 = undefined;
-        const identity: row_policy_bundle_mod.Receipt = .{
-            .table_id = self.core.identity_namespace.table_id,
-            .generation = generation,
-            .catalog_epoch = 0,
-            .phase = phase,
-            .applied_term = 0,
-            .applied_index = 0,
-            .bundle_digest = @splat(0),
-            .descriptor_digest = @splat(0),
-        };
-        const key = try identity.key(&key_buf);
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        const bytes = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
-        if (bytes) |encoded| {
-            defer self.alloc.free(encoded);
-            const stored = try row_policy_bundle_mod.Receipt.decode(encoded);
-            if (stored.table_id != identity.table_id or stored.generation != generation or stored.phase != phase)
-                return error.InvalidRowPolicyReceipt;
-            return stored;
-        }
-        const pending = (try self.pendingRowPolicyReceipt()) orelse return error.NotFound;
-        if (pending.table_id != identity.table_id or pending.generation != generation or pending.phase != phase)
-            return error.NotFound;
-        return self.finalizePendingRowPolicyReceiptLocked(pending);
-    }
-
-    pub fn applyReplicatedRowPolicyPublication(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: OrderedApplyReceipt) !?row_policy_bundle_mod.Receipt {
-        if (comptime storage_engine.enabled) return storage_engine.call("applyReplicatedRowPolicyPublication", .{ self, bundle_bytes, request, identity });
-        return self.applyRowPolicyPublicationInternal(bundle_bytes, request, identity, null);
-    }
-
-    fn finishRowPolicyReplicationCommitLocked(self: *DB, payload: ?[]const u8, outbox_key: ?[]const u8, apply_held: *bool, replication_mutation: *?MutationBarrier.ExclusiveLease) !void {
-        const encoded = payload orelse return;
-        var ctx = self.batchContext();
-        var deferred = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&ctx));
-        defer deferred.releaseTransition();
-        deferred.append(appendReplicationEncodedSchemaMetadataCommitLockedContext(&ctx, encoded) catch {
-            self.core.unlockApply();
-            apply_held.* = false;
-            if (replication_mutation.*) |*lease| lease.release();
-            replication_mutation.* = null;
-            return error.DurabilityOutcomeUnknown;
-        });
-        self.core.unlockApply();
-        apply_held.* = false;
-        if (replication_mutation.*) |*lease| lease.release();
-        replication_mutation.* = null;
-        deferred.waitForDurabilityAndAuthority(ctx.replication_write_gate) catch return error.DurabilityOutcomeUnknown;
-        self.clearDurableReplicationOutbox(outbox_key.?) catch |err| std.log.warn(
-            "row policy HA durability acknowledged but outbox cleanup is pending path={s} err={s}",
-            .{ self.core.path, @errorName(err) },
-        );
-    }
-
-    fn applyRowPolicyPublicationInternal(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: OrderedApplyReceipt, replication_lsn: ?u64) !?row_policy_bundle_mod.Receipt {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (identity.term == 0 or identity.index == 0 or (replication_lsn != null and replication_lsn.? == 0)) return error.InvalidRowPolicyPublication;
-        if (replication_lsn == null and self.local_execution.replication_async_metadata_mirror == null and
-            (self.local_execution.replication_async_batch_mirror != null or self.local_execution.replication_write_gate != null)) return error.ReplicationPublisherUnavailable;
-        // The policy cut must be serialized with all in-flight primary writes,
-        // including writers that passed their fast outbox preflight already.
-        // Production hot-standby mirrors share this capture barrier with every mutation.
-        if (replication_lsn == null) if (self.local_execution.replication_async_metadata_mirror) |mirror|
-            if (mirror.mutation_barrier == null) return error.ReplicationPublisherUnavailable;
-        var replication_mutation: ?MutationBarrier.ExclusiveLease = null;
-        defer if (replication_mutation) |*lease| lease.release();
-        if (replication_lsn == null) {
-            try self.enforceReplicationWriteGate();
-            try self.ensureDurableReplicationStartupBarrier();
-            try self.preflightReplicationMetadataSyncCommit();
-            if (self.local_execution.replication_async_metadata_mirror) |mirror|
-                replication_mutation = mirror.mutation_barrier.?.acquireExclusive();
-        }
-        var schedule_replication_recovery_on_exit = false;
-        defer if (schedule_replication_recovery_on_exit) self.scheduleDurableReplicationOutboxRecovery();
-        const replication_payload = if (replication_lsn == null and self.local_execution.replication_async_metadata_mirror != null)
-            try replication_effects_mod.encodeRowPolicyMetadataMutationAlloc(self.alloc, bundle_bytes, request, identity)
-        else
-            null;
-        defer if (replication_payload) |payload| self.alloc.free(payload);
-        const replication_outbox = if (replication_payload) |payload| blk: {
-            // This is a WAL search lower bound, not an LSN reservation.
-            // Recovery matches the exact payload and owner identity under the
-            // transition/log locks even if another publisher appended first.
-            const from_lsn = self.local_execution.replication_async_metadata_mirror.?.publisher.nextLsn();
-            const encoded = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
-            errdefer self.alloc.free(encoded);
-            const key = try durableReplicationOutboxKeyAlloc(self.alloc, .row_policy, from_lsn, self.core.root_generation, payload);
-            break :blk .{ .key = key, .value = encoded };
-        } else null;
-        defer if (replication_outbox) |outbox| {
-            self.alloc.free(outbox.key);
-            self.alloc.free(outbox.value);
-        };
-        const schema = self.core.schema orelse return error.RowPolicyCatalogChanged;
-        var installed = try row_policy_bundle_mod.Installed.init(self.alloc, bundle_bytes, self.core.identity_namespace.table_id, schema);
-        defer installed.deinit();
-        if (installed.parsed.value.table_id != request.table_id or
-            installed.parsed.value.policy_generation != request.expected_generation or
-            installed.parsed.value.catalog_epoch != request.expected_catalog_epoch or
-            installed.parsed.value.phase != request.expected_phase)
-            return error.RowPolicyCatalogChanged;
-        var bundle_digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bundle_bytes, &bundle_digest, .{});
-        const expected_receipt: row_policy_bundle_mod.Receipt = .{
-            .table_id = request.table_id,
-            .generation = request.expected_generation,
-            .catalog_epoch = request.expected_catalog_epoch,
-            .phase = request.expected_phase,
-            .applied_term = identity.term,
-            .applied_index = identity.index,
-            .bundle_digest = bundle_digest,
-            .descriptor_digest = request.expected_descriptor_digest,
-        };
-        if (try self.orderedMutationAlreadyApplied(identity)) {
-            lockApply(self);
-            const already = self.readRowPolicyApplyResultLocked(expected_receipt) catch |err| {
-                self.core.unlockApply();
-                return err;
-            };
-            self.core.unlockApply();
-            if (replication_lsn) |lsn| try self.recordReplicationApplied(lsn);
-            return already;
-        }
-        const phase = installed.parsed.value.phase;
-        const pending_phase = phase == .pending_install or phase == .pending_disable;
-        try self.lockApplyForPortableRuntime();
-        var apply_held = true;
-        defer if (apply_held) self.core.unlockApply();
-        if (switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
-            .already_applied => true,
-            .apply => false,
-        }) {
-            const already = try self.readRowPolicyApplyResultLocked(expected_receipt);
-            self.core.unlockApply();
-            apply_held = false;
-            if (replication_lsn) |lsn| try self.recordReplicationApplied(lsn);
-            return already;
-        }
-        {
-            var read = try self.core.store.beginReadTxn();
-            defer read.abort();
-            try self.requireOnlineArtifactCatalogMutableLocked(&read);
-            try @import("relational_integrity_topology.zig").requireUnfenced(&read);
-        }
-        const stage_with_serving = pending_phase and self.local_execution.row_policy_gate.currentPhase() == .active;
-        if (!stage_with_serving and pending_phase) {
-            if (self.local_execution.row_policy_gate.currentPhase() != .preparing)
-                try self.local_execution.row_policy_gate.beginPreparing(self.local_execution.row_policy_gate.currentPhase());
-        } else if (!pending_phase and self.local_execution.row_policy_gate.currentPhase() == .active and
-            (phase == .serving_install or phase == .serving_disable))
-        {
-            try self.local_execution.row_policy_gate.beginPreparing(.active);
-        } else if (!stage_with_serving and self.local_execution.row_policy_gate.currentPhase() != .preparing) {
-            return error.RowPolicyCatalogChanged;
-        }
-        if (try self.pendingRowPolicyReceipt()) |prior| {
-            // A lagging follower need not have received a coordinator receipt
-            // probe for the earlier phase. A later metadata-authorized Raft
-            // phase may supersede that fail-closed intent without admitting
-            // readers or claiming the earlier local ACK. The latest phase
-            // still waits for all old leases before it can serve.
-            const next_phase = installed.parsed.value.phase;
-            const follows = if (request.expected_generation > prior.generation)
-                next_phase == .pending_install or next_phase == .pending_disable
-            else if (request.expected_generation == prior.generation)
-                switch (prior.phase) {
-                    .pending_install => next_phase == .serving_install,
-                    .serving_install => next_phase == .active or next_phase == .pending_disable,
-                    .pending_disable => next_phase == .serving_disable,
-                    .serving_disable => next_phase == .disabled,
-                    .active, .disabled => false,
-                }
-            else
-                false;
-            if (!follows or prior.table_id != request.table_id or
-                !std.mem.eql(u8, &prior.descriptor_digest, &request.expected_descriptor_digest) or
-                identity.index <= prior.applied_index) return error.RowPolicyCatalogChanged;
-        }
-        const previous = self.core.table_catalog;
-        const publication = installed.parsed.value;
-        const current_range = self.core.byteRange();
-        const actual_descriptor_digest = try (@import("../../system_catalog/policies.zig").OwnerDescriptor{
-            .table_id = self.core.identity_namespace.table_id,
-            .group_id = request.owner_group_id,
-            .shard_id = self.core.identity_namespace.shard_id,
-            .range_id = self.core.identity_namespace.range_id,
-            .schema_version = publication.schema_version,
-            .schema_digest = publication.schema_digest,
-            .range_start = current_range.start,
-            .range_end = current_range.end,
-        }).digest();
-        if (!std.mem.eql(u8, &actual_descriptor_digest, &request.expected_descriptor_digest))
-            return error.RowPolicyCatalogChanged;
-        if (previous.storage_mode != .relational or previous.active_schema_version != publication.schema_version or
-            publication.policy_generation < previous.row_policy_generation or
-            (publication.policy_generation == previous.row_policy_generation and !stage_with_serving and
-                previous.row_policy_phase != .preparing)) return error.RowPolicyCatalogChanged;
-        var receipt_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
-        const receipt = orderedApplyReceiptWrite(identity, &receipt_bytes);
-        if (stage_with_serving) {
-            if (self.local_execution.row_policy_gate.currentPhase() != .active or previous.row_policy_phase != .active or
-                publication.policy_generation <= previous.row_policy_generation or
-                (try self.pendingRowPolicyReceipt()) != null) return error.RowPolicyCatalogChanged;
-            const existing_candidate = self.core.store.get(self.alloc, row_policy_bundle_mod.candidate_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
-            defer if (existing_candidate) |value| self.alloc.free(value);
-            if (existing_candidate != null) return error.RowPolicyCatalogChanged;
-            const encoded_receipt = expected_receipt.encode();
-            var receipt_key_buf: [128]u8 = undefined;
-            const receipt_key = try expected_receipt.key(&receipt_key_buf);
-            var stage_txn = try self.core.store.beginWriteTxn();
-            errdefer stage_txn.abort();
-            try stage_txn.put(row_policy_bundle_mod.candidate_key, bundle_bytes);
-            try stage_txn.put(receipt_key, &encoded_receipt);
-            try stage_txn.put(receipt.key, receipt.value);
-            var replication_lsn_buf: [replication_applied_lsn_value_len]u8 = undefined;
-            if (replication_lsn) |lsn| {
-                const marker = replicationAppliedSequenceWrite(lsn, &replication_lsn_buf);
-                try stage_txn.put(marker.key, marker.value);
-            }
-            if (replication_outbox) |outbox| try stage_txn.put(outbox.key, outbox.value);
-            if (replication_outbox != null) {
-                // Conservative on abort: the next admission performs an
-                // apply-fenced empty scan and clears both fast-negative flags.
-                self.local_execution.durable_replication_outbox_maybe.store(true, .release);
-                self.local_execution.row_policy_replication_outbox_pending.store(true, .release);
-            }
-            try stage_txn.commit();
-            if (replication_outbox != null) {
-                schedule_replication_recovery_on_exit = true;
-            }
-            try self.finishRowPolicyReplicationCommitLocked(replication_payload, if (replication_outbox) |outbox| outbox.key else null, &apply_held, &replication_mutation);
-            return expected_receipt;
-        }
-        if (phase == .serving_install or phase == .serving_disable) {
-            const candidate = try self.core.store.get(self.alloc, row_policy_bundle_mod.candidate_key);
-            defer self.alloc.free(candidate);
-            var parsed_candidate = try row_policy_bundle_mod.Installed.init(self.alloc, candidate, self.core.identity_namespace.table_id, schema);
-            defer parsed_candidate.deinit();
-            if (parsed_candidate.parsed.value.table_id != publication.table_id or
-                parsed_candidate.parsed.value.policy_generation != publication.policy_generation or
-                parsed_candidate.parsed.value.catalog_epoch != publication.catalog_epoch or
-                !std.mem.eql(u8, &parsed_candidate.parsed.value.schema_digest, &publication.schema_digest) or
-                parsed_candidate.parsed.value.phase != (if (phase == .serving_install)
-                    @as(@import("../../system_catalog/policies.zig").Publication.Phase, .pending_install)
-                else
-                    .pending_disable))
-                return error.RowPolicyCatalogChanged;
-            const candidate_definitions = try std.json.Stringify.valueAlloc(self.alloc, .{ .records = parsed_candidate.parsed.value.records, .settings = parsed_candidate.parsed.value.settings }, .{});
-            defer self.alloc.free(candidate_definitions);
-            const serving_definitions = try std.json.Stringify.valueAlloc(self.alloc, .{ .records = publication.records, .settings = publication.settings }, .{});
-            defer self.alloc.free(serving_definitions);
-            if (!std.mem.eql(u8, candidate_definitions, serving_definitions)) return error.RowPolicyCatalogChanged;
-        }
-        var next = previous;
-        next.row_policy_generation = publication.policy_generation;
-        next.row_policy_catalog_epoch = publication.catalog_epoch;
-        next.row_policy_phase = .preparing;
-        next.generation +|= 1;
-        const catalog_bytes = next.encode();
-        const encoded_pending = expected_receipt.encode();
-        var txn = try self.core.store.beginWriteTxn();
-        errdefer txn.abort();
-        try txn.put(row_policy_bundle_mod.key, bundle_bytes);
-        if (pending_phase) try txn.put(row_policy_bundle_mod.candidate_key, bundle_bytes);
-        if (phase == .serving_install or phase == .serving_disable) try txn.delete(row_policy_bundle_mod.candidate_key);
-        try txn.put(row_policy_bundle_mod.pending_key, &encoded_pending);
-        try txn.put(table_catalog_mod.key, &catalog_bytes);
-        try txn.put(receipt.key, receipt.value);
-        var replication_lsn_buf: [replication_applied_lsn_value_len]u8 = undefined;
-        if (replication_lsn) |lsn| {
-            const marker = replicationAppliedSequenceWrite(lsn, &replication_lsn_buf);
-            try txn.put(marker.key, marker.value);
-        }
-        if (replication_outbox) |outbox| try txn.put(outbox.key, outbox.value);
-        if (replication_outbox != null) {
-            self.local_execution.durable_replication_outbox_maybe.store(true, .release);
-            self.local_execution.row_policy_replication_outbox_pending.store(true, .release);
-        }
-        try txn.commit();
-        if (replication_outbox != null) {
-            schedule_replication_recovery_on_exit = true;
-        }
-        self.core.table_catalog = next;
-        // Keep the old immutable bundle alive for previously admitted bound
-        // readers. The receipt probe swaps it only after those leases drain.
-        try self.finishRowPolicyReplicationCommitLocked(replication_payload, if (replication_outbox) |outbox| outbox.key else null, &apply_held, &replication_mutation);
-        return null;
-    }
 
     /// Removes group-local apply history when this document generation is
     /// materialized for a different Raft history (for example restore or the
@@ -8082,16 +7444,6 @@ pub const DB = struct {
             try self.setPublishedChildSchemaReplicatedApplyWithMarker(mutation.schema, mutation.public_schema_json orelse return error.InvalidGenerationPublication, published, sequence)
         else
             try self.setSchemaReplicatedApplyWithMarker(mutation.schema, mutation.public_schema_json, sequence);
-    }
-
-    pub fn applyReplicatedRowPolicy(self: *DB, mutation: replication_effects_mod.RowPolicyMutation, sequence: u64) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("applyReplicatedRowPolicy", .{ self, mutation, sequence });
-        _ = try self.applyRowPolicyPublicationInternal(
-            mutation.bundle,
-            mutation.request,
-            mutation.entry,
-            sequence,
-        );
     }
 
     /// Only the latest replay receipt may need local source-pin repair.
@@ -8368,7 +7720,7 @@ pub const DB = struct {
                 req.online_source != null or req.restore_staging != null)
                 return error.RowPolicyAuthenticationRequired;
             const now_seconds: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
-            verified_principal = try self.verifyRowPolicyPrincipal(self.alloc, req.row_policy_principal_proof, req.row_policy_database, .write, if (trusted_replay) req.row_policy_admitted_at_seconds else now_seconds);
+            verified_principal = try self.query.verifyRowPolicyPrincipal(self.alloc, req.row_policy_principal_proof, req.row_policy_database, .write, if (trusted_replay) req.row_policy_admitted_at_seconds else now_seconds);
             row_policy_lease = if (trusted_replay)
                 try self.local_execution.row_policy_gate.enterReplicatedPrincipal(&verified_principal.?.value)
             else
@@ -8430,7 +7782,7 @@ pub const DB = struct {
                 const observed = try @import("group_source_state.zig").readSnapshot(owned, &read, finish.held.group, finish.held.partition);
                 if (observed) |observed_snapshot| {
                     const generation = self.core.index_manager.writePlanGeneration();
-                    if (try groupSourceSettled(self, observed_snapshot.sequence, try std.mem.concat(owned, []const u8, &.{ observed_snapshot.units, observed_snapshot.retired }))) {
+                    if (try self.documents.groupSourceSettled(observed_snapshot.sequence, try std.mem.concat(owned, []const u8, &.{ observed_snapshot.units, observed_snapshot.retired }))) {
                         control_opts.legacy_group_completed_through = observed_snapshot.sequence;
                         control_opts.legacy_group_plan_generation = generation;
                     }
@@ -8681,18 +8033,6 @@ pub const DB = struct {
     }
 
     pub const failIfIdentityOrdinalExhaustedForNewUpserts = local_mutation.failIfIdentityOrdinalExhaustedForNewUpserts;
-
-    fn configureBulkIngestIdentityAllNewLocked(self: *DB) !void {
-        self.clearBulkIngestIdentityAllNewLocked();
-        if (!try self.primaryUserNamespaceIsEmptyLocked()) return;
-        if (try doc_identity.loadAllNewTrustedStateForNamespace(self.core.store, self.core.identity_namespace)) |state| {
-            self.bulk_identity.trusted = state;
-            self.core.identity_visibility.summary = state.visibility_summary;
-            self.clearLiveDocSetCache();
-            self.clearNonVisibleDocSetCache();
-            self.bulk_identity.enabled = true;
-        }
-    }
 
     pub const clearBulkIngestIdentityAllNewLocked = local_mutation.clearBulkIngestIdentityAllNewLocked;
 
@@ -9321,7 +8661,7 @@ pub const DB = struct {
         return error.IndexArtifactCleanupPending;
     }
 
-    fn primaryUserNamespaceIsEmptyLocked(self: *DB) !bool {
+    pub fn primaryUserNamespaceIsEmptyLocked(self: *DB) !bool {
         var txn = try self.core.store.beginCurrentScanTxn();
         defer txn.abort();
         var cur = try txn.openCursor();
@@ -14578,187 +13918,12 @@ pub const DB = struct {
         return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .address = address, .claim = claim, .references = references.items, .next = next }, .{}) };
     }
 
-    fn verifyRowPolicyPrincipal(self: *DB, alloc: Allocator, token: []const u8, database: []const u8, access: row_policy_authority_mod.Access, now_seconds: i64) !std.json.Parsed(row_policy_authority_mod.Payload) {
-        if (token.len == 0 or token.len > row_policy_authority_mod.maximum_token_bytes or database.len == 0)
-            return error.RowPolicyAuthenticationRequired;
-        return row_policy_authority_mod.verify(alloc, self.local_execution.row_policy_authority_secret orelse return error.RowPolicyAuthorityUnavailable, self.local_execution.row_policy_authority_issuer orelse return error.RowPolicyAuthorityUnavailable, .{
-            .table_id = self.core.identity_namespace.table_id,
-            .table = self.local_execution.row_policy_table_name orelse return error.RowPolicyAuthorityUnavailable,
-            .database = database,
-            .policy_generation = self.local_execution.row_policy_gate.generation.load(.acquire),
-            .catalog_epoch = self.local_execution.row_policy_gate.catalog_epoch.load(.acquire),
-            .access = access,
-        }, now_seconds, token);
-    }
-
     /// Called under the serialized apply lock, after transform coalescing and
     /// optimistic schema validation but before any primary/index side effect.
     /// A single read snapshot observes the old image for each affected key;
     /// new images reuse the already prepared AROW bytes. Both sides are
     /// evaluated on typed ordinals, not reconstructed JSON projections.
     pub const enforceRowPolicyMutationLocked = local_mutation.enforceRowPolicyMutationLocked;
-
-    fn enforceRowPolicyIntentsLocked(self: *DB, schema_view: schema_registry_mod.SchemaView, intents: []const transactions_mod.WriteIntent, principal: *const row_policy_authority_mod.Payload) !void {
-        if (principal.access != .write) return error.RowPolicyAuthenticationRequired;
-        const bundle = if (self.local_execution.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
-        const schema = schema_view.tableSchema().*;
-        var insert_check = try bundle.captureEvaluation(self.alloc, schema, principal, .insert);
-        defer insert_check.deinit();
-        var update_old = try bundle.captureEvaluation(self.alloc, schema, principal, .update_old);
-        defer update_old.deinit();
-        var update_new = try bundle.captureEvaluation(self.alloc, schema, principal, .update_new);
-        defer update_new.deinit();
-        var delete_old = try bundle.captureEvaluation(self.alloc, schema, principal, .delete);
-        defer delete_old.deinit();
-        var probe = try self.core.store.beginProbeTxn();
-        defer probe.abort();
-        for (intents) |intent| {
-            if (isMetadataKey(intent.key)) return error.RowPolicyMutationUnsupported;
-            const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, intent.key);
-            defer self.alloc.free(store_key);
-            const old_bytes: ?[]const u8 = probe.getLeased(store_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
-            if (old_bytes) |bytes| {
-                if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
-                const old = if (self.core.store.valuesAreAuthenticated())
-                    try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
-                else
-                    try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
-                if (!try (if (intent.value == null) delete_old else update_old).permits(old)) return error.RowPolicyDenied;
-            }
-            if (intent.value != null) {
-                const encoded = intent.prepared_row orelse return error.RowPolicyMutationUnsupported;
-                const new = try relational_row_codec.ordinalRowViewTrusted(encoded, schema, schema_view.physicalLayout());
-                if (!try (if (old_bytes == null) insert_check else update_new).permits(new)) return error.RowPolicyDenied;
-            }
-        }
-    }
-
-    fn lookupGroupSource(self: *DB, a: Allocator, raw: []const u8) !?types.LookupResult {
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        const owned = arena.allocator();
-        const contract = @import("group_source_contract.zig");
-        const query = try std.json.parseFromSliceLeaky(contract.Query, owned, raw, .{ .allocate = .alloc_always });
-        try query.validate();
-        var plan = try self.core.index_manager.acquireWritePlanSnapshot();
-        defer plan.release();
-        const empty_groups = @import("group_source_mutations.zig").Plan{ .arena = undefined, .entries = &.{} };
-        const group_plan = plan.plan().group_sources orelse empty_groups;
-        if (query.action == .definitions) {
-            if (self.core.index_manager.minimum_reader_version.load(.acquire) < 8) return .{ .json = try a.dupe(u8, "[]") };
-            var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = owned, .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
-            const table = try @import("group_source_mutations.zig").tableIdentity(&overlay, self.core.identity_namespace.table_id, self.root_incarnation);
-            var namespace: [24]u8 = undefined;
-            doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
-            var source_namespace = namespace;
-            if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], self.root_incarnation, .big);
-            const definitions = try owned.alloc(@import("group_source_worker.zig").Definition, group_plan.entries.len + 1);
-            definitions[group_plan.entries.len] = .{ .artifact = "__group_source_gc", .definition = .{ .table_incarnation = table, .configuration = @splat(1) }, .source = .{ .group_by = "_", .order_by = "_", .field = "_" }, .namespace = namespace, .source_owner = .{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) }, .route = .{ .value = self.core.byteRange().start }, .retirement = true };
-            for (group_plan.entries, definitions[0..group_plan.entries.len]) |entry, *definition| definition.* = .{ .artifact = entry.name, .definition = .{ .table_incarnation = table, .configuration = entry.configuration }, .source = entry.source, .namespace = namespace, .source_owner = .{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) }, .route = .{ .value = self.core.byteRange().start }, .horizon = entry.horizon };
-            return .{ .json = try std.json.Stringify.valueAlloc(a, definitions, .{}) };
-        }
-        var matched = false;
-        for (group_plan.entries) |entry| if (std.mem.eql(u8, entry.name, query.artifact) and std.mem.eql(u8, &entry.configuration, &query.definition.configuration)) {
-            matched = true;
-            break;
-        };
-        if (!matched and query.action != .retirement and query.action != .retirement_page and query.action != .activation) return error.InvalidGroupedSourceQuery;
-        var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = owned, .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
-        if (query.definition.table_incarnation != try @import("group_source_mutations.zig").tableIdentity(&overlay, self.core.identity_namespace.table_id, self.root_incarnation)) return error.InvalidGroupedSourceQuery;
-        var read = try self.core.store.beginReadTxn();
-        defer read.abort();
-        const baseline = @import("group_source_baseline.zig");
-        const reads = @import("group_source_reads.zig");
-        const state = @import("group_source_state.zig");
-        const group = state.Group{ .definition = query.definition, .key = query.group };
-        var namespace: [24]u8 = undefined;
-        doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
-        if (std.mem.allEqual(u8, &namespace, 0)) std.mem.writeInt(u128, namespace[8..24], self.root_incarnation, .big);
-        const owner = state.Owner{ .namespace = namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) };
-        var command_namespace: [24]u8 = undefined;
-        doc_identity.encodeNamespace(&command_namespace, self.core.identity_namespace);
-        const output = switch (query.action) {
-            .definitions => unreachable,
-            .activation => blk: {
-                if (!try self.maintenanceRequiresOrderedApply()) break :blk try a.dupe(u8, "true");
-                const active = try @import("artifact_publication.zig").authority(&read);
-                const catalogs = try @import("artifact_inventory.zig").catalogs(&read);
-                const inventory = @import("artifact_inventory.zig");
-                const status = try inventory.status(owned, &read, command_namespace);
-                const ready = if (active) |value| status.ready and status.ordered != null and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
-                break :blk try std.json.Stringify.valueAlloc(a, ready, .{});
-            },
-            .retirement => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").load(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation), try self.core.index_manager.artifact_semantic_cache.get(owned, try @import("artifact_inventory.zig").catalogs(&read)))), .{}),
-            .retirement_page => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").preparePage(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation), try self.core.index_manager.artifact_semantic_cache.get(owned, try @import("artifact_inventory.zig").catalogs(&read)))), .{}),
-            .backfill_page => try std.json.Stringify.valueAlloc(a, try baseline.preparePage(owned, &read, query.definition, baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation)), .{}),
-            .readiness => blk: {
-                const completion = @import("artifact_completion_progress.zig");
-                const statuses = try owned.alloc(completion.GroupReadiness, query.documents.len);
-                for (query.documents, statuses) |document, *status| {
-                    if (!self.core.byteRange().contains(document)) return error.KeyOutOfRange;
-                    status.* = try completion.diagnoseGroup(owned, &read, self.root_incarnation, document, plan.plan());
-                }
-                const Replay = struct {
-                    target: u64,
-                    applied: u64,
-                    worker_started: bool,
-                    worker_failed: bool,
-                    lease_owned: bool,
-                    retrying: bool,
-                    consecutive_retries: u32,
-                    fatal_errors: u64,
-                    last_error: []const u8,
-                    asset_backend: bool,
-                };
-                const replay: ?Replay = if (self.enrichment_runtime) |runtime| status: {
-                    const replay_stats = runtime.stats();
-                    break :status .{ .target = replay_stats.target_sequence, .applied = replay_stats.applied_sequence, .worker_started = replay_stats.worker_started, .worker_failed = replay_stats.worker_failed, .lease_owned = replay_stats.lease_owned, .retrying = replay_stats.retrying, .consecutive_retries = replay_stats.consecutive_retry_count, .fatal_errors = replay_stats.fatal_error_count, .last_error = try owned.dupe(u8, replay_stats.last_error_code.slice()), .asset_backend = runtime.config.asset_producer != null };
-                } else null;
-                break :blk try std.json.Stringify.valueAlloc(a, .{ .units = statuses, .replay = replay }, .{});
-            },
-            .settled => blk: {
-                const authority = try @import("artifact_publication.zig").authority(&read);
-                var complete = query.documents.len == 0 or authority != null;
-                if (authority) |active| {
-                    const progress = try @import("artifact_producer_obligations.zig").load(&read);
-                    if (progress) |value| try value.requireAuthority(active);
-                    complete = progress != null and progress.?.baseline_complete;
-                }
-                if (authority == null and !try self.maintenanceRequiresOrderedApply()) complete = try groupSourceSettled(self, query.through_sequence, query.documents);
-                for (query.documents) |document| {
-                    if (!self.core.byteRange().contains(document)) return error.KeyOutOfRange;
-                    if (authority != null and !try @import("artifact_completion_progress.zig").groupReady(owned, &read, self.root_incarnation, document)) {
-                        complete = false;
-                        break;
-                    }
-                }
-                break :blk try std.json.Stringify.valueAlloc(a, complete, .{});
-            },
-            .backfill => try std.json.Stringify.valueAlloc(a, try baseline.load(owned, &read, query.definition, baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation)), .{}),
-            .partition => blk: {
-                try baseline.requireReady(owned, &read, query.definition, baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation));
-                break :blk try std.json.Stringify.valueAlloc(a, try reads.partition(owned, &read, query, owner, .{ .start = self.core.byteRange().start, .end = self.core.byteRange().end }), .{});
-            },
-            .outbox => try std.json.Stringify.valueAlloc(a, try reads.directory(owned, &read, @import("group_source_queue.zig").source_prefix, query.cursor, query.limit, .{ .start = self.core.byteRange().start, .end = self.core.byteRange().end }), .{}),
-            .pending => if (query.group.len == 0)
-                try std.json.Stringify.valueAlloc(a, try reads.directory(owned, &read, @import("group_source_queue.zig").group_prefix, query.cursor, query.limit, .{ .start = self.core.byteRange().start, .end = self.core.byteRange().end }), .{})
-            else
-                try std.json.Stringify.valueAlloc(a, try state.nextPending(owned, &read, group), .{}),
-            .status => try std.json.Stringify.valueAlloc(a, .{
-                .owner = owner,
-                .namespace = command_namespace,
-                .event_status = if (query.event) |event| try @import("group_source_propagation.zig").status(owned, &read, query.source_owner.?, event) else null,
-                .lease = if (query.group.len > 0) try state.currentLease(owned, &read, group) else null,
-                .pending = if (query.segment.len > 0) try state.pendingFor(owned, &read, group, .{ .group = query.group, .segment = query.segment, .cell = query.cell }) else null,
-                .snapshot = if (query.segment.len > 0) try state.readSnapshot(owned, &read, group, .{ .group = query.group, .segment = query.segment, .cell = query.cell }) else null,
-            }, .{}),
-            .prior => return error.InvalidGroupedSourceQuery,
-        };
-        return .{ .json = output };
-    }
 
     pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         if (comptime storage_engine.enabled) return storage_engine.call("lookup", .{ self, alloc, key, opts });
@@ -14774,7 +13939,7 @@ pub const DB = struct {
             if (self.local_execution.row_policy_authority_secret == null or key.len != 0 or
                 opts.row_policy_principal_proof.len != 0 or opts.row_policy_database.len != 0)
                 return error.RowPolicyAuthenticationRequired;
-            const receipt = try self.loadRowPolicyReceipt(request.generation, request.phase);
+            const receipt = try self.query.loadRowPolicyReceipt(request.generation, request.phase);
             return .{ .json = try std.json.Stringify.valueAlloc(alloc, receipt, .{}) };
         }
         try self.maybeFinalizePendingRowPolicyPublication();
@@ -14787,7 +13952,7 @@ pub const DB = struct {
             defer staging_read.abort();
             try @import("restore_staging.zig").requireScope(alloc, &staging_read, opts.restore_staging_scope, false);
         }
-        if (opts.group_source_query_json.len != 0) return self.lookupGroupSource(alloc, opts.group_source_query_json);
+        if (opts.group_source_query_json.len != 0) return self.documents.lookupGroupSource(alloc, opts.group_source_query_json);
         if (opts.relational_topology_json.len != 0) return self.lookupRelationalTopology(alloc, opts.relational_topology_json, opts);
         if (opts.relational_index_status_json.len != 0) return self.lookupRelationalIndexStatus(alloc, opts.relational_index_status_json, opts);
         if (opts.relational_activation_json.len != 0) return self.lookupRelationalActivation(alloc, opts.relational_activation_json);
@@ -14822,7 +13987,7 @@ pub const DB = struct {
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease = if (opts.row_policy_principal_proof.len != 0) bound: {
-            verified_principal = try self.verifyRowPolicyPrincipal(alloc, opts.row_policy_principal_proof, opts.row_policy_database, .read, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            verified_principal = try self.query.verifyRowPolicyPrincipal(alloc, opts.row_policy_principal_proof, opts.row_policy_database, .read, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             break :bound try self.local_execution.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         } else try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
@@ -15964,7 +15129,7 @@ pub const DB = struct {
 
     /// A durable generation for cursor pages: no apply/read lease escapes
     /// capture, and resume never falls back to a fresh live generation.
-    fn admitQueryCut(self: *DB, io: std.Io, id: []const u8, cancellation: types.CancellationToken) !void {
+    pub fn admitQueryCut(self: *DB, io: std.Io, id: []const u8, cancellation: types.CancellationToken) !void {
         const cut = @import("native_query_cut.zig");
         var repository = self.backend_runtime.query_cut_repository;
         const Confirm = struct {
@@ -16141,85 +15306,6 @@ pub const DB = struct {
             try std.Io.Dir.cwd().deleteTree(io, root);
         }
         return completed;
-    }
-
-    pub fn openQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !DB {
-        if (comptime storage_engine.enabled) return storage_engine.call("openQueryCut", .{ self, request, cancellation });
-        const cut = @import("native_query_cut.zig");
-        try request.validate(cut.nowMs());
-        const origin = try request.namespace(self.core.identity_namespace);
-        const cache_id = try request.cacheId(self.alloc, self.core.identity_namespace);
-        defer self.alloc.free(cache_id);
-        if (request.create) try self.captureQueryCut(request, cancellation);
-        const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
-        const path = try cut.pathAlloc(self.alloc, self.core.path, cache_id);
-        defer self.alloc.free(path);
-        const expiry_deadline = monotonicTimeNs() +| (request.expires_ms -| cut.nowMs()) * std.time.ns_per_ms;
-        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = if (request.timeout_ms) |value| @min(monotonicTimeNs() +| value *| std.time.ns_per_ms, expiry_deadline) else expiry_deadline };
-        var guard = try cut.lock(self.alloc, io, self.core.path, control.token());
-        var guarded = true;
-        defer if (guarded) guard.deinit();
-        var source_proof: ?[32]u8 = null;
-        const local_exists = try snapshotPathExists(io, path);
-        const local_usable = if (local_exists) validated: {
-            // Local files are a cache of the retained generation. Validate
-            // under the parent guard before trusting directory existence.
-            source_proof = cut.validateWithSourceProof(self.alloc, io, path, request, origin, control.token()) catch |err| switch (err) {
-                error.CatalogGenerationChanged => break :validated false,
-                else => return err,
-            };
-            break :validated true;
-        } else false;
-        if (!local_usable) if (self.backend_runtime.query_cut_repository) |repository| {
-            // The read lease retains the caller's token beyond this stack frame.
-            if (try repository.openRead(io, path, request, origin, cancellation)) |opened| {
-                var lease = opened;
-                errdefer lease.deinit();
-                // The remote manifest is immutable. No local capture or
-                // collection can change it, so opening pages must not hold
-                // the filesystem publication guard across provider I/O.
-                guard.deinit();
-                guarded = false;
-                var readonly = try DB.open(self.alloc, path, .{
-                    .open_mode = .query_readonly,
-                    .physical_root_mode = .external_backend,
-                    .storage = lease.view,
-                    .backend_runtime = self.backend_runtime,
-                    .identity_namespace = origin,
-                });
-                errdefer readonly.close();
-                try control.token().check();
-                readonly.retained_value_scope = @import("../../search/value_membership.zig").Scope.init(self.core.path, request.id, origin, request.expires_ms);
-                readonly.retained_remote_query_lease = lease;
-                return readonly;
-            }
-            // Retained files are authority; local files are a disposable cache.
-            // Admission alone cannot detect a missing sealed file behind a valid
-            // manifest. Protect active readers before replacing any invalid root.
-            if (local_exists) try cut.discardInvalidCache(self.alloc, io, std.fs.path.dirname(path).?, cache_id, path);
-            try self.admitQueryCut(io, cache_id, control.token());
-            try repository.recover(io, path, request, origin, control.token());
-            errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
-            try self.admitQueryCut(io, cache_id, control.token());
-            source_proof = try cut.validateWithSourceProof(self.alloc, io, path, request, origin, control.token());
-        } else return error.CatalogGenerationChanged;
-        var reader = try cut.readLease(self.alloc, io, self.core.path, cache_id, control.token());
-        guard.deinit();
-        guarded = false;
-        var transferred = false;
-        defer if (!transferred) reader.deinit();
-        var readonly = try DB.open(self.alloc, path, .{
-            .open_mode = .query_readonly,
-            .backend_runtime = self.backend_runtime,
-            .identity_namespace = origin,
-            .prefer_existing_identity_namespace = true,
-        });
-        errdefer readonly.close();
-        try control.token().check();
-        readonly.retained_value_scope = @import("../../search/value_membership.zig").Scope.init(self.core.path, request.id, origin, request.expires_ms).withSourceProof(source_proof);
-        readonly.retained_query_lease = reader;
-        transferred = true;
-        return readonly;
     }
 
     const SnapshotFenceTestHook = struct {
@@ -20082,7 +19168,7 @@ pub const DB = struct {
             if (req.row_policy_database.len == 0 or req.row_policy_admitted_at_seconds <= 0 or
                 req.restore_staging_scope != null) return error.RowPolicyAuthenticationRequired;
             const now_seconds: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
-            verified_principal = try self.verifyRowPolicyPrincipal(self.alloc, req.row_policy_principal_proof, req.row_policy_database, .write, if (ordered_receipt != null) req.row_policy_admitted_at_seconds else now_seconds);
+            verified_principal = try self.query.verifyRowPolicyPrincipal(self.alloc, req.row_policy_principal_proof, req.row_policy_database, .write, if (ordered_receipt != null) req.row_policy_admitted_at_seconds else now_seconds);
             row_policy_lease = if (ordered_receipt != null)
                 try self.local_execution.row_policy_gate.enterReplicatedPrincipal(&verified_principal.?.value)
             else
@@ -20327,7 +19413,7 @@ pub const DB = struct {
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
         if (row_policy_principal) |principal| {
             const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
-            try self.enforceRowPolicyIntentsLocked(view, intents.items, principal);
+            try self.query.enforceRowPolicyIntentsLocked(view, intents.items, principal);
         }
         const integrity_mod = @import("relational_integrity.zig");
         const activation_mod = @import("relational_integrity_activation.zig");
@@ -23868,7 +22954,7 @@ pub const DB = struct {
     /// effects, not independently produced graph/vector/enrichment effects.
     /// Check after taking the apply lock, which serializes this observation
     /// with source admission and terminal release.
-    fn requireOnlineArtifactCatalogMutableLocked(self: *DB, txn: anytype) !void {
+    pub fn requireOnlineArtifactCatalogMutableLocked(self: *DB, txn: anytype) !void {
         return self.requireOnlineArtifactCatalogMutableWithContextLocked(txn, null);
     }
 
@@ -26589,7 +25675,7 @@ pub const DB = struct {
         try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, null);
     }
 
-    fn runEnrichmentUntilWithVisibilityDeadline(
+    pub fn runEnrichmentUntilWithVisibilityDeadline(
         self: *DB,
         sequence: u64,
         cancellation: types.CancellationToken,
@@ -27924,7 +27010,7 @@ pub const DB = struct {
         if (self.open_mode == .writer and self.physical_root_mode == .filesystem_managed and self.primary_backend == .lsm and
             self.core.identity_namespace.table_id != 0 and self.backend_runtime.query_cut_repository != null and
             self.backend_runtime.query_cut_repository.?.vtable.warm != null and self.backend_runtime.query_cut_repository.?.limits.max_cuts > 1)
-            self.native_query_warming.start(.{ .ptr = self, .runtime = self.backend_runtime, .turn = warmNativeCheckpoint });
+            self.query.warming.start(.{ .ptr = self, .runtime = self.backend_runtime, .turn = warmNativeCheckpoint });
         self.quarantine_recovery.start(.{
             .ptr = self,
             .runtime = self.backend_runtime,
@@ -27999,7 +27085,7 @@ pub const DB = struct {
             if (self.promotion_runtime == null) try self.initPromotionRuntime();
         }
         {
-            const group_state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
+            const group_state = options.group_source_state orelse self.documents.group_sources.borrowed_state orelse &self.documents.group_sources.owner.state;
             const drive_groups = self.async_context.replay_publication == null;
             if (drive_groups) {
                 // A manual drain owns this producer lane until its fair round
@@ -28017,7 +27103,7 @@ pub const DB = struct {
                 if (options.deadline_ns) |deadline| if (monotonicTimeNs() >= deadline) return error.RunUntilIdleDidNotConverge;
                 // Detached snapshots compute providers; their connection owner
                 // issues group commands on the current coordinator instead.
-                const group_pending = if (drive_groups) try self.runGroupSourceSliceLocked(group_state) else false;
+                const group_pending = if (drive_groups) try self.documents.runGroupSourceSliceLocked(group_state) else false;
                 try self.drainReplayStagesUntilStableWithOptions(options);
                 if (!group_pending or options.bounded_replay) break;
             }
@@ -28091,7 +27177,7 @@ pub const DB = struct {
 
     pub fn runUntilIdle(self: *DB) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdle", .{self});
-        return self.runUntilIdleWithGroupSourceState(self.borrowed_group_source_state orelse &self.group_source_owner.state);
+        return self.runUntilIdleWithGroupSourceState(self.documents.group_sources.borrowed_state orelse &self.documents.group_sources.owner.state);
     }
 
     /// A connection's explicit drain borrows the same cursor/lease identity as
@@ -30477,7 +29563,7 @@ pub const DB = struct {
             break :primary false;
         });
         const effective_sequence = captured_cut orelse if (has_groups)
-            try self.waitForGroupSourcesThrough(sequence, wait)
+            try self.documents.waitForGroupSourcesThrough(sequence, wait)
         else
             sequence;
         switch (sync_level) {
@@ -30506,54 +29592,6 @@ pub const DB = struct {
                     try wait.check();
                 }
             },
-        }
-    }
-
-    fn waitForGroupSourcesThrough(self: *DB, through: u64, wait: derived_executor_mod.VisibilityWait) !u64 {
-        const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
-        var producer_sequence = through;
-        while (true) {
-            try wait.check();
-            if (self.async_context.background_closing.load(.acquire)) return error.Canceled;
-            const ready = blk: {
-                var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
-                defer arena.deinit();
-                const a = arena.allocator();
-                var pinned = try self.core.index_manager.acquireWritePlanSnapshot();
-                defer pinned.release();
-                const plan = pinned.plan().group_sources orelse break :blk true;
-                var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = a, .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
-                const table = try @import("group_source_mutations.zig").tableIdentity(&overlay, self.core.identity_namespace.table_id, self.root_incarnation);
-                var read = try self.core.store.beginReadTxn();
-                defer read.abort();
-                const baseline = @import("group_source_baseline.zig");
-                var namespace: [24]u8 = undefined;
-                doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
-                const generation = baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation);
-                var settled = true;
-                for (plan.entries) |entry| {
-                    const definition = @import("group_source_index.zig").Definition{ .table_incarnation = table, .configuration = entry.configuration };
-                    if ((try baseline.load(a, &read, definition, generation)).phase != .ready) settled = false;
-                    if (try @import("group_source_debt.zig").earliest(a, &read, definition, through)) |event| {
-                        settled = false;
-                        var source_namespace = namespace;
-                        if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], self.root_incarnation, .big);
-                        const owner = @import("group_source_state.zig").Owner{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) };
-                        producer_sequence = @max(producer_sequence, try @import("group_source_visibility.zig").producerSequence(a, &read, owner, event));
-                    }
-                }
-                break :blk settled;
-            };
-            if (ready) return producer_sequence;
-            _ = try self.runGroupSourceSlice();
-            if (self.local_execution.optional_runtime_workers_enabled) {
-                // Wake the owner without waiting for a global cursor that
-                // may be blocked on an independent, later request. The
-                // durable source debt above is the completion authority.
-                if (self.enrichment_runtime) |runtime| runtime.notifySequence(producer_sequence);
-            } else try self.runEnrichmentUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?);
-            try wait.check();
-            try io.sleep(.fromMilliseconds(5), .awake);
         }
     }
 
@@ -35819,7 +34857,7 @@ pub const DB = struct {
         if (req.document_authority_mode == .lookup) return error.InvalidQueryRequest;
         var request = req;
         // A caller cannot promote a mutable DB into an immutable cache scope.
-        request.value_search_scope = self.retained_value_scope;
+        request.value_search_scope = self.query.cut.value_scope;
         if (requestHasLogicalValues(req)) if (self.core.textIndexEntry(req.index_name)) |entry| {
             // A declared mapping is not a completeness proof. Do not let a
             // lagging or partial projection exclude a newer primary value.
@@ -35828,7 +34866,7 @@ pub const DB = struct {
             // than a newly attached worker's in-memory observation.
             var applied = try self.core.loadAppliedSequence(alloc, entry.config.name);
             if (self.executor.appliedSequence(entry.config.name)) |live| applied = @max(applied, live);
-            if (applied < self.core.nextDerivedSequence() and self.retained_remote_query_lease != null) {
+            if (applied < self.core.nextDerivedSequence() and self.query.cut.remote_lease != null) {
                 if (self.primary_lsm_storage) |storage| {
                     const checkpoint_path = try apply_state.checkpointPathAlloc(alloc, self.core.path);
                     defer alloc.free(checkpoint_path);
@@ -41600,7 +40638,7 @@ fn skipNonPrimaryMedianKey(key: []const u8) bool {
 
 pub const relationalColumns = local_mutation.relationalColumns;
 
-const encodeStoreLookupKeyAlloc = local_mutation.encodeStoreLookupKeyAlloc;
+pub const encodeStoreLookupKeyAlloc = local_mutation.encodeStoreLookupKeyAlloc;
 
 pub const encodeStoreLookupKeyWithPinnedSchemaAlloc = local_mutation.encodeStoreLookupKeyWithPinnedSchemaAlloc;
 
@@ -46443,7 +45481,7 @@ pub fn acquireSnapshotReplayContext(ctx: *const BatchExecutionContext) !?snapsho
 
 const acquireSnapshotReplayAsyncContext = local_mutation.acquireSnapshotReplayAsyncContext;
 
-const replicationTransitionMutexFromContext = local_mutation.replicationTransitionMutexFromContext;
+pub const replicationTransitionMutexFromContext = local_mutation.replicationTransitionMutexFromContext;
 
 const DurableReplicationOutboxKind = @import("durable_outbox.zig").Kind;
 
@@ -46499,7 +45537,7 @@ fn appendReplicationSchemaMetadataCommitLockedContext(
     return try replication_commit.appendReplicationSchemaMetadataCommitLockedContext(&projected, table_schema, public_schema_json);
 }
 
-fn appendReplicationEncodedSchemaMetadataCommitLockedContext(
+pub fn appendReplicationEncodedSchemaMetadataCommitLockedContext(
     ctx: *const BatchExecutionContext,
     payload: []const u8,
 ) !?ReplicationDeferredCommitGate {
@@ -46781,7 +45819,7 @@ fn beginExternalDenseBulkSessionTracked(ctx: *AsyncContext) !void {
     ctx.text_merge_deferred.store(true, .release);
 }
 
-fn beginExternalDenseBulkSessionTrackedWait(ctx: *AsyncContext, io: ?std.Io) !void {
+pub fn beginExternalDenseBulkSessionTrackedWait(ctx: *AsyncContext, io: ?std.Io) !void {
     const wait_start_ns = monotonicTimeNs();
     const wait_timeout_ns = 30 * std.time.ns_per_s;
     {
@@ -46870,7 +45908,7 @@ fn finishDenseCatchUpSessionTrackedAndFinalize(ctx: *AsyncContext, index_name: [
     return completed;
 }
 
-fn finishExternalDenseBulkSessionTrackedAndFinalize(ctx: *AsyncContext) !bool {
+pub fn finishExternalDenseBulkSessionTrackedAndFinalize(ctx: *AsyncContext) !bool {
     var finished = false;
     errdefer if (finished) resumeDeferredBackgroundMaintenanceIfIdle(ctx);
     const completed = blk: {
@@ -46904,7 +45942,7 @@ fn finishDenseCatchUpSessionTrackedBestEffort(ctx: *AsyncContext, index_name: []
     if (completed) DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
 }
 
-fn finishExternalDenseBulkSessionTrackedBestEffort(ctx: *AsyncContext) void {
+pub fn finishExternalDenseBulkSessionTrackedBestEffort(ctx: *AsyncContext) void {
     const completed = finishExternalDenseBulkSessionTrackedAndFinalize(ctx) catch |err| {
         if (err == error.PortableRuntimeActivationPending) return;
         std.log.err("dense external bulk idle finalization failed error={s}", .{@errorName(err)});
@@ -46990,14 +46028,14 @@ const notifyExecutorForSyncLevelWithDenseBulkDeferral = local_mutation.notifyExe
 
 const notifyExecutorForSyncLevel = local_mutation.notifyExecutorForSyncLevel;
 
-fn flushDeferredExternalBulkExecutorNotification(ctx: *AsyncContext, executor: *derived_executor_mod.Executor) void {
+pub fn flushDeferredExternalBulkExecutorNotification(ctx: *AsyncContext, executor: *derived_executor_mod.Executor) void {
     const sequence = ctx.dense_admission.takeDeferredSequence();
     if (sequence == 0) return;
     if (!executor.hasWorkers()) return;
     executor.notifySequence(sequence);
 }
 
-fn flushDeferredExternalBulkExecutorNotificationOrTarget(
+pub fn flushDeferredExternalBulkExecutorNotificationOrTarget(
     ctx: *AsyncContext,
     executor: *derived_executor_mod.Executor,
     target_sequence: u64,
@@ -52737,7 +51775,7 @@ fn validateSnapshotId(id: []const u8) !void {
     }
 }
 
-fn snapshotPathExists(io: Io, path: []const u8) !bool {
+pub fn snapshotPathExists(io: Io, path: []const u8) !bool {
     if (std.fs.path.isAbsolute(path)) {
         std.Io.Dir.accessAbsolute(io, path, .{}) catch |err| switch (err) {
             error.FileNotFound => return false,
@@ -63519,15 +62557,15 @@ test "db portable import target rejects active in-memory bulk leases" {
     defer db.close();
     try std.testing.expect(try db.isPortableImportTargetEmpty(alloc));
 
-    try db.beginPrimaryStoreAutoBulkIngestSession();
+    try db.documents.beginPrimaryStoreAutoBulkIngest();
     try std.testing.expectError(error.WriterLocked, db.isPortableImportTargetEmpty(alloc));
-    db.abortPrimaryStoreAutoBulkIngestSession();
+    db.documents.abortPrimaryStoreAutoBulkIngest();
     try std.testing.expect(try db.isPortableImportTargetEmpty(alloc));
 
     db.async_context.portable_runtime_activation_pending.store(true, .release);
     try std.testing.expectError(error.PortableRuntimeActivationPending, db.beginBulkIngestSession());
     try std.testing.expectEqual(@as(u32, 0), db.async_context.dense_admission.external_sessions.load(.acquire));
-    try std.testing.expect(!db.bulk_ingest_session.active);
+    try std.testing.expect(!db.documents.bulk_ingest.session.active);
     db.async_context.portable_runtime_activation_pending.store(false, .release);
 
     try db.beginBulkIngestSession();
@@ -63539,8 +62577,8 @@ test "db portable import target rejects active in-memory bulk leases" {
         .key = "doc:durable-target-state",
         .value = "{\"title\":\"permanently nonempty\"}",
     }} });
-    try db.beginPrimaryStoreAutoBulkIngestSession();
-    defer db.abortPrimaryStoreAutoBulkIngestSession();
+    try db.documents.beginPrimaryStoreAutoBulkIngest();
+    defer db.documents.abortPrimaryStoreAutoBulkIngest();
     // Permanent target state takes precedence over transient activity so API
     // clients receive invalid_argument rather than entering a futile retry loop.
     try std.testing.expect(!(try db.isPortableImportTargetEmpty(alloc)));
@@ -66558,7 +65596,7 @@ test "db query capture seals outside mutation fences and retains the selected ge
         db.endPublishedDenseSearch();
         empty_request.create = false;
         {
-            var empty = try db.openQueryCut(empty_request, .none);
+            var empty = try db.query.openCut(empty_request, .none);
             defer empty.close();
             var empty_hits = try empty.search(alloc, .{ .full_text = .{ .match = .{ .field = "body", .text = "original" } }, .include_stored = false });
             defer empty_hits.deinit();
@@ -66639,7 +65677,7 @@ test "db query capture seals outside mutation fences and retains the selected ge
         if (probe.failure) |err| return err;
         try std.testing.expect(probe.released);
         request.create = false;
-        var retained = try db.openQueryCut(request, .none);
+        var retained = try db.query.openCut(request, .none);
         defer retained.close();
         if (missing_summary) try std.testing.expect(try doc_identity.visibilitySummaryFromStore(retained.core.store) == null);
         const old = (try retained.get(alloc, "doc")).?;
@@ -66764,7 +65802,7 @@ test "db query capture retains settled terminal repair debt without acknowledgin
     runtime.retrying = false;
     runtime.next_retry_at_ms = 0;
 
-    var retained = try db.openQueryCut(request, .none);
+    var retained = try db.query.openCut(request, .none);
     defer retained.close();
     var sorted = try retained.search(alloc, .{ .index_name = "text", .full_text = .{ .match_all = {} }, .order_by = &.{.{ .field = "_id" }}, .limit = 10 });
     defer sorted.deinit();
@@ -118972,8 +118010,8 @@ test "db primary auto bulk leaves dense replay active while session is open" {
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
     });
 
-    try db.beginPrimaryStoreAutoBulkIngestSession();
-    errdefer db.abortPrimaryStoreAutoBulkIngestSession();
+    try db.documents.beginPrimaryStoreAutoBulkIngest();
+    errdefer db.documents.abortPrimaryStoreAutoBulkIngest();
     try std.testing.expectEqual(@as(u32, 0), db.async_context.dense_admission.external_sessions.load(.acquire));
 
     try db.batch(.{
@@ -118989,7 +118027,7 @@ test "db primary auto bulk leaves dense replay active while session is open" {
     try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].doc_count);
     try std.testing.expectEqual(target_sequence, stats.indexes[0].replay_applied_sequence);
 
-    try db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{ .compact = false });
+    try db.documents.finishPrimaryStoreAutoBulkIngest(.{ .compact = false });
 }
 
 test "db dense auto bulk finish wakes weak-sync replay and publishes visibility after catch-up" {
@@ -119076,8 +118114,8 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
         .on_change = HookCtx.onChange,
     });
 
-    try db.beginDenseAutoBulkIngestSession();
-    errdefer db.abortDenseAutoBulkIngestSession();
+    try db.documents.beginDenseAutoBulkIngest();
+    errdefer db.documents.abortDenseAutoBulkIngest();
 
     inline for (.{ "write", "propose", "write", "propose" }, 0..) |level, i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
@@ -119096,7 +118134,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 
     // Finish the implicit bulk publish, but hold the deferred executor wake so
     // the test can prove the replay catch-up itself publishes fresh visibility.
-    try db.finishDenseAutoBulkIngestSessionWithOptionsInternal(.{ .compact = false }, false);
+    try db.documents.finishDenseAutoBulkIngestInternal(.{ .compact = false }, false);
     hook_mutex.lockUncancelable(std.testing.io);
     hook_ctx = .{ .mutex = &hook_mutex, .changed_db = &db };
     hook_mutex.unlock(std.testing.io);
@@ -119151,8 +118189,8 @@ test "db dense auto bulk finish wakes current replay target if deferred wake is 
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
     });
 
-    try db.beginDenseAutoBulkIngestSession();
-    errdefer db.abortDenseAutoBulkIngestSession();
+    try db.documents.beginDenseAutoBulkIngest();
+    errdefer db.documents.abortDenseAutoBulkIngest();
 
     try db.batch(.{
         .writes = &.{
@@ -119165,7 +118203,7 @@ test "db dense auto bulk finish wakes current replay target if deferred wake is 
     try std.testing.expect(target_sequence > 0);
     db.async_context.dense_admission.deferred_sequence.store(0, .release);
 
-    try db.finishDenseAutoBulkIngestSessionWithOptions(.{ .compact = false });
+    try db.documents.finishDenseAutoBulkIngest(.{ .compact = false });
     try db.executor.waitForAll(target_sequence);
 
     const stats = try db.stats(alloc);
@@ -119191,8 +118229,8 @@ test "db dense auto bulk replays packed external embedding strings" {
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
     });
 
-    try db.beginDenseAutoBulkIngestSession();
-    errdefer db.abortDenseAutoBulkIngestSession();
+    try db.documents.beginDenseAutoBulkIngest();
+    errdefer db.documents.abortDenseAutoBulkIngest();
 
     try db.batch(.{
         .writes = &.{
@@ -119203,7 +118241,7 @@ test "db dense auto bulk replays packed external embedding strings" {
     });
 
     const target_sequence = db.core.nextDerivedSequence();
-    try db.finishDenseAutoBulkIngestSessionWithOptions(.{ .compact = false });
+    try db.documents.finishDenseAutoBulkIngest(.{ .compact = false });
     try db.executor.waitForAll(target_sequence);
 
     const stats = try db.stats(alloc);
@@ -136736,10 +135774,10 @@ test "grouped sources production yields across producer replacement and resumes 
         var called: bool = false;
         fn run(live: *DB) !void {
             called = true;
-            const before = live.group_source_owner.state.submitted;
-            try std.testing.expect(!try live.runGroupSourceSlice());
-            try std.testing.expectEqual(before, live.group_source_owner.state.submitted);
-            try std.testing.expect(live.group_source_owner.state.worker == null);
+            const before = live.documents.group_sources.owner.state.submitted;
+            try std.testing.expect(!try live.documents.runGroupSourceSlice());
+            try std.testing.expectEqual(before, live.documents.group_sources.owner.state.submitted);
+            try std.testing.expect(live.documents.group_sources.owner.state.worker == null);
         }
     };
     // The replacement hook runs after constructing the new producer while
@@ -136750,8 +135788,8 @@ test "grouped sources production yields across producer replacement and resumes 
     defer DB.test_enrichment_reconfigure_after_detached_hook = null;
     try db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true });
     try std.testing.expect(Probe.called);
-    try std.testing.expect(try db.runGroupSourceSlice());
-    try std.testing.expect(db.group_source_owner.state.submitted > 0);
+    try std.testing.expect(try db.documents.runGroupSourceSlice());
+    try std.testing.expect(db.documents.group_sources.owner.state.submitted > 0);
 }
 
 test "grouped sources production publishes private units incrementally across delete and reopen" {

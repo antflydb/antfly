@@ -23,7 +23,7 @@ DB              core: identity, backends, runtime wiring, status
 │  └─ repair    repair intents and scheduler, leases, shadow rebuilds, activation
 ├─ enrichment   enrichment, resolution and promotion runtimes, artifact scheduling
 ├─ documents    authority backfill and repair, group sources, bulk ingest
-├─ query        schema identity, leases, warming, row policy
+├─ query        schema identity, retained query cut, warming, row policy
 ├─ recovery     transactions, publication, portable activation, restore, source pins
 ├─ ttl          TTL cleanup runtime
 └─ maintenance  quarantine, independent maintenance, run-until-idle tracking
@@ -36,6 +36,7 @@ _ = try db.indexes.graph.advanceReplacement();
 db.indexes.sparse.restartCompaction("drop", name);
 _ = try db.indexes.repair.advanceIntent(alloc, repair_id, .{});
 _ = try db.documents.advanceAuthorityBackfillPage();
+var cut = try db.query.openCut(request, cancellation);
 ```
 
 ## Pattern
@@ -130,8 +131,8 @@ Moved fields show their new path. The rest show where they will go.
 | `enrichment` | `enrichment_owner`, `enrichment_append_context`, `enrichment_runtime`, `artifact_repair_metadata_due_ns`, `artifact_repair_metadata_pending`, `artifact_footprint_pending`, `artifact_producer_baseline_pending`, `artifact_producer_scheduler`, `embedding_activity`, `managed_admission` |
 | `enrichment.resolution` | `resolution_append_context`, `resolution_owner`, `resolution_runtime`, `resolution_candidate_source`, `resolution_embedder` |
 | `enrichment.promotion` | `promotion_owner_bundle`, `promotion_runtime`, `entity_sink`, `promotion_owner`, `entity_sink_missing_policy` |
-| `documents` (authority moved) | `authority.backfill_active`, `authority.backfill_requested`, `authority.backfill_mutex`, `authority.backfill_restart`, `authority.repairs`, `authority.repairs_yield_sweep`; to move: `group_source_owner`, `borrowed_group_source_state`, `bulk_ingest_session`, `bulk_identity` |
-| `query` | `query_schema_identity`, `resolver_query_schema_mutex`, `resolver_query_schema_epoch`, `resolver_query_schema_digest`, `retained_value_scope`, `retained_query_lease`, `retained_remote_query_lease`, `native_query_warming`, `owned_row_policy_authority_secret`, `owned_row_policy_authority_issuer`, `owned_row_policy_table_name` |
+| `documents` (moved) | `authority.backfill_active`, `authority.backfill_requested`, `authority.backfill_mutex`, `authority.backfill_restart`, `authority.repairs`, `authority.repairs_yield_sweep`, `group_sources.owner`, `group_sources.borrowed_state`, `bulk_ingest.session`, `bulk_ingest.identity` |
+| `query` (moved) | `schema.identity`, `schema.resolver_mutex`, `schema.resolver_epoch`, `schema.resolver_digest`, `cut.value_scope`, `cut.lease`, `cut.remote_lease`, `warming`, `row_policy.authority_secret`, `row_policy.authority_issuer`, `row_policy.table_name` |
 | `recovery` | `transaction_recovery_identity_context`, `transaction_recovery_local_context`, `transaction_owner`, `transaction_runtime`, `publication_recovery`, `snapshot_publication_mutex`, `portable_runtime_activation_attempts`, `portable_runtime_activation_mutex`, `portable_activation_recovery`, `restore_decoder_cache`, `graph_restore_parse_cache`, `graph_restore_parse_count_for_test`, `source_pin_cleanup` |
 | `ttl` | `ttl_owner`, `ttl_cleanup_context`, `ttl_runtime` |
 | `maintenance` | `quarantine_recovery`, `independent_maintenance`, `local_source_completion_audit_pending`, `local_source_recovery_pending`, `run_until_idle_no_progress_timeout_ns`, `last_run_until_idle_no_progress` |
@@ -141,14 +142,23 @@ Moved fields show their new path. The rest show where they will go.
 Move self-contained areas first; they need no changes to `DB.open` beyond
 dropping fields that now have defaults.
 
-1. `indexes` with every index kind, and `documents.authority` (done).
-2. `ttl`, `maintenance` and the rest of `documents`.
+1. `indexes` with every index kind, `documents` and `query` (done).
+2. `ttl` and `maintenance`.
 3. `enrichment` with `resolution` and `promotion`, which share append contexts
    and must move together.
-4. `recovery` and `query`.
+4. `recovery`.
 
-Query-time graph metric methods (`executeGraphMetricQueries`,
-`applyGraphMetricRerank`) stay on `DB` and move with `query`.
+Some methods stay on `DB` even though their state moved:
+
+- The public bulk ingest entry points (`beginBulkIngestSession`,
+  `finishBulkIngestSessionWithOptions`, `abortBulkIngestSession`,
+  `bulkSessionActive`) share their names with index backends and the local
+  mutation execution view, which callers use interchangeably. Their state is in
+  `documents.bulk_ingest`; the dense and primary-store auto sessions moved.
+- Search and query-time graph metric methods (`searchLockedWithExecutionContextImpl`,
+  `executeGraphMetricQueries`, `applyGraphMetricRerank`) stay on `DB` until the
+  search path moves into `query`.
+- `runUntilIdle` and its variants drive every subsystem, including group sources.
 
 `AsyncContext` mirrors several runtime pointers (for example
 `async_context.sparse_compaction_runtime`) for background workers that only
@@ -160,4 +170,5 @@ code can read either owner through `ownerField`. When a moved field is read
 that way, the view carries the same subsystem path (it now has an `indexes`
 field that carries the text and sparse runtimes from the async context, the
 repair cleanup owner, the relational rewrite caches, the split shadow and the
-active repair set).
+active repair set, and a `documents` field that carries the bulk ingest identity
+scratch).

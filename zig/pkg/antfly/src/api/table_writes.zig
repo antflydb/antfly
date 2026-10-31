@@ -2392,12 +2392,12 @@ pub const ProvisionedTableWriteCache = struct {
             self.detachRuntimeHooks();
             if (self.bulk_ingest_session_open) {
                 if (self.auto_bulk_ingest_session_open) {
-                    self.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
+                    self.db.documents.finishPrimaryStoreAutoBulkIngest(auto_bulk_ingest_finish_options) catch |err| {
                         std.log.warn("auto bulk ingest finish failed before cached db close table={s} err={s}", .{
                             self.table_name,
                             @errorName(err),
                         });
-                        self.db.abortPrimaryStoreAutoBulkIngestSession();
+                        self.db.documents.abortPrimaryStoreAutoBulkIngest();
                     };
                 } else {
                     self.db.abortBulkIngestSession();
@@ -3142,7 +3142,7 @@ pub const ProvisionedTableWriteCache = struct {
                 errdefer db.close();
                 try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
                 const owned_policy_table_name = try allocator.dupe(u8, policy_table_name);
-                db.owned_row_policy_table_name = owned_policy_table_name;
+                db.query.row_policy.table_name = owned_policy_table_name;
                 db.local_execution.row_policy_table_name = owned_policy_table_name;
                 return .{
                     .db = db,
@@ -3989,7 +3989,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name) or !entry.bulk_ingest_session_open) continue;
             if (entry.auto_bulk_ingest_session_open) {
-                try entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(options);
+                try entry.db.documents.finishPrimaryStoreAutoBulkIngest(options);
             } else {
                 try entry.db.finishBulkIngestSessionWithOptions(options);
             }
@@ -4008,7 +4008,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name) or !entry.bulk_ingest_session_open) continue;
             if (entry.auto_bulk_ingest_session_open) {
-                entry.db.abortPrimaryStoreAutoBulkIngestSession();
+                entry.db.documents.abortPrimaryStoreAutoBulkIngest();
             } else {
                 entry.db.abortBulkIngestSession();
             }
@@ -4024,7 +4024,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.auto_bulk_ingest_finishing) return error.LsmRootWriterAlreadyOpen;
             if (!entry.bulk_ingest_session_open) {
-                try entry.db.beginPrimaryStoreAutoBulkIngestSession();
+                try entry.db.documents.beginPrimaryStoreAutoBulkIngest();
                 entry.bulk_ingest_session_open = true;
             }
             entry.auto_bulk_ingest_session_open = true;
@@ -4053,7 +4053,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.auto_bulk_ingest_finishing) return false;
             if (!entry.auto_bulk_ingest_session_open or !entry.auto_bulk_ingest_finish_requested) return false;
             if (self.entryActiveLeasesLocked(entry) > 1) return false;
-            try entry.db.rollPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_roll_options);
+            try entry.db.documents.rollPrimaryStoreAutoBulkIngest(auto_bulk_ingest_roll_options);
             entry.auto_bulk_ingest_session_open = true;
             entry.auto_bulk_ingest_ops = 0;
             entry.auto_bulk_ingest_started_ns = now_ns;
@@ -4067,7 +4067,7 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn finishAutoBulkIngestLocked(self: *ProvisionedTableWriteCache, group_id: u64, table_name: []const u8) !void {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name) or !entry.auto_bulk_ingest_session_open) continue;
-            try entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
+            try entry.db.documents.finishPrimaryStoreAutoBulkIngest(auto_bulk_ingest_finish_options);
             entry.bulk_ingest_session_open = false;
             entry.auto_bulk_ingest_session_open = false;
             entry.auto_bulk_ingest_ops = 0;
@@ -4106,7 +4106,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (!idle_expired and entry.auto_bulk_ingest_finish_requested) {
                 continue;
             } else {
-                entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_idle_finish_options) catch |err| {
+                entry.db.documents.finishPrimaryStoreAutoBulkIngest(auto_bulk_ingest_idle_finish_options) catch |err| {
                     if (first_err == null) first_err = err;
                     continue;
                 };
@@ -13297,7 +13297,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         if (!entry.auto_bulk_ingest_session_open) return;
         if (entry.auto_bulk_ingest_finishing) return error.AutoBulkIngestBusy;
-        try entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
+        try entry.db.documents.finishPrimaryStoreAutoBulkIngest(auto_bulk_ingest_finish_options);
         entry.bulk_ingest_session_open = false;
         entry.auto_bulk_ingest_session_open = false;
         entry.auto_bulk_ingest_ops = 0;
@@ -15212,7 +15212,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         var first_err: ?anyerror = null;
         for (leases.items) |*item| {
-            item.cached.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(
+            item.cached.db.documents.finishPrimaryStoreAutoBulkIngest(
                 auto_bulk_ingest_finish_options,
             ) catch |err| {
                 if (first_err == null) first_err = err;
@@ -19895,7 +19895,7 @@ pub const ProvisionedTableWriteSource = struct {
         for (leases.items) |*item| {
             if (!item.started and !(abort_requested and item.already_open)) continue;
             if (item.already_auto) {
-                item.cached.db.abortPrimaryStoreAutoBulkIngestSession();
+                item.cached.db.documents.abortPrimaryStoreAutoBulkIngest();
             } else {
                 item.cached.db.abortBulkIngestSession();
             }
@@ -19967,7 +19967,7 @@ pub const ProvisionedTableWriteSource = struct {
         var first_err: ?anyerror = null;
         for (leases.items) |*item| {
             if (item.auto) {
-                item.cached.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(options) catch |err| {
+                item.cached.db.documents.finishPrimaryStoreAutoBulkIngest(options) catch |err| {
                     if (first_err == null) first_err = err;
                     continue;
                 };
@@ -20060,7 +20060,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         for (leases.items) |*item| {
             if (item.auto) {
-                item.cached.db.abortPrimaryStoreAutoBulkIngestSession();
+                item.cached.db.documents.abortPrimaryStoreAutoBulkIngest();
             } else {
                 item.cached.db.abortBulkIngestSession();
             }
@@ -22506,7 +22506,7 @@ pub const ProvisionedTableWriteSource = struct {
             defer self.endGroupOperation(table_name, group_id);
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
-            _ = try cached.db.applyReplicatedRowPolicyPublication(req.row_policy_install_bundle, req.row_policy_publication.?, applied);
+            _ = try cached.db.query.applyReplicatedRowPolicyPublication(req.row_policy_install_bundle, req.row_policy_publication.?, applied);
             return {};
         }
     }

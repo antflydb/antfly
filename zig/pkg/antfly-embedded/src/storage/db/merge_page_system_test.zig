@@ -691,11 +691,11 @@ test "relational index system merge pages commit effects and cursors with reopen
         // Bulk writes commit directly. Preserve the receiver's base row and
         // atomically commit the copied row with its merge cursor while bulk
         // admission is active; reopen must retain both effects.
-        try db.beginPrimaryStoreAutoBulkIngestSession();
+        try db.documents.beginPrimaryStoreAutoBulkIngest();
         try apply(&db, &index, .{ .writes = &.{.{ .key = "m", .value = "{\"id\":9,\"doubled\":18}" }} });
         try apply(&db, &index, row);
-        try db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{});
-        try std.testing.expect(!db.bulk_ingest_session.snapshot().active_session);
+        try db.documents.finishPrimaryStoreAutoBulkIngest(.{});
+        try std.testing.expect(!db.documents.bulk_ingest.session.snapshot().active_session);
         db.close();
         db = try db_mod.DB.open(alloc, directory.path(), options);
         const base_row_after_reopen = (try db.get(alloc, "m")).?;

@@ -102,7 +102,7 @@ test "external lake portable native cursor recovers document and vector generati
         try receiver.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"live replacement\"}" }}, .sync_level = .full_index });
         request.create = false;
         {
-            var retained = try receiver.openQueryCut(request, .none);
+            var retained = try receiver.query.openCut(request, .none);
             defer retained.close();
             const value = (try retained.get(a, "doc")).?;
             defer a.free(value);
@@ -122,9 +122,9 @@ test "external lake portable native cursor recovers document and vector generati
         repository_open = true;
         receiver.backend_runtime.query_cut_repository = repository.capability();
         request.timeout_ms = 1000;
-        try std.testing.expectError(error.CatalogGenerationChanged, receiver.openQueryCut(request, .none));
+        try std.testing.expectError(error.CatalogGenerationChanged, receiver.query.openCut(request, .none));
         // Recovery errors must release the parent lock for the next request.
-        try std.testing.expectError(error.CatalogGenerationChanged, receiver.openQueryCut(request, .none));
+        try std.testing.expectError(error.CatalogGenerationChanged, receiver.query.openCut(request, .none));
     }
 }
 fn verifyNativeCut(vector_store: bool) !void {
@@ -151,7 +151,7 @@ fn verifyNativeCut(vector_store: bool) !void {
     cut.create = false;
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"after\",\"v\":[0,1]}" }}, .sync_level = .full_index });
     {
-        var snapshot = try db.openQueryCut(cut, .none);
+        var snapshot = try db.query.openCut(cut, .none);
         defer snapshot.close();
         if (vector_store) try std.testing.expectEqual(@as(u64, 0), snapshot.local_execution.source_vectors.load(.acquire).?.stats.inventory_updates);
         const stored = (try snapshot.get(a, "doc")).?;
@@ -167,7 +167,7 @@ fn verifyNativeCut(vector_store: bool) !void {
     opened = false;
     var restarted = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 } });
     defer restarted.close();
-    var snapshot = try restarted.openQueryCut(cut, .none);
+    var snapshot = try restarted.query.openCut(cut, .none);
     defer snapshot.close();
     const stored = (try snapshot.get(a, "doc")).?;
     defer a.free(stored);
@@ -175,13 +175,13 @@ fn verifyNativeCut(vector_store: bool) !void {
     var missing = cut;
     const other: [64]u8 = @splat('b');
     missing.id = &other;
-    try std.testing.expectError(error.CatalogGenerationChanged, restarted.openQueryCut(missing, .none));
+    try std.testing.expectError(error.CatalogGenerationChanged, restarted.query.openCut(missing, .none));
     var wrong = cut;
     wrong.table_id = 8;
-    try std.testing.expectError(error.CatalogGenerationChanged, restarted.openQueryCut(wrong, .none));
+    try std.testing.expectError(error.CatalogGenerationChanged, restarted.query.openCut(wrong, .none));
     var expired = cut;
     expired.expires_ms = 0;
-    try std.testing.expectError(error.CatalogGenerationChanged, restarted.openQueryCut(expired, .none));
+    try std.testing.expectError(error.CatalogGenerationChanged, restarted.query.openCut(expired, .none));
 }
 
 test "external lake native cursor capability fences recipe incarnation scope and expiration" {

@@ -1748,13 +1748,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 active_profile.identity_delete_keys += @intCast(effective_req.deletes.len);
             }
             const identity_capacity_start_ns = monotonicTimeNs();
-            if (!S.ownerField(self, "bulk_identity").*.enabled or effective_req.deletes.len != 0) {
+            if (!S.ownerField(self, "documents").bulk_ingest.identity.enabled or effective_req.deletes.len != 0) {
                 try self.failIfIdentityOrdinalExhaustedForNewUpserts(write_buffers.identity_upsert_keys.items);
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.identity_capacity_check_ns, identity_capacity_start_ns);
 
             var assume_all_new_identity_upserts = false;
-            if (S.ownerField(self, "bulk_identity").*.enabled and effective_req.deletes.len == 0 and write_buffers.identity_upsert_keys.items.len > 0) {
+            if (S.ownerField(self, "documents").bulk_ingest.identity.enabled and effective_req.deletes.len == 0 and write_buffers.identity_upsert_keys.items.len > 0) {
                 assume_all_new_identity_upserts = try self.rememberBulkIngestAllNewIdentityUpserts(write_buffers.identity_upsert_keys.items);
                 if (!assume_all_new_identity_upserts) self.clearBulkIngestIdentityAllNewLocked();
             }
@@ -2435,7 +2435,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (effective_req.deletes.len != 0) {
                 self.clearBulkIngestIdentityAllNewLocked();
             }
-            if (S.ownerField(self, "bulk_identity").*.enabled and
+            if (S.ownerField(self, "documents").bulk_ingest.identity.enabled and
                 effective_req.deletes.len == 0 and
                 write_buffers.identity_upsert_keys.items.len > 0 and
                 (assume_all_new_identity_upserts or identityUpsertStoreWritesAreNew(write_buffers.identity_upsert_write_indexes.items, overwritten_flags)))
@@ -2447,7 +2447,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     &write_buffers.identity_writes,
                     &write_buffers.identity_visibility_deletes,
                     write_buffers.identity_upsert_keys.items,
-                    &S.ownerField(self, "bulk_identity").*.trusted,
+                    &S.ownerField(self, "documents").bulk_ingest.identity.trusted,
                 );
                 if (!used_trusted_identity_path) self.clearBulkIngestIdentityAllNewLocked();
             }
@@ -3302,7 +3302,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn clearBulkIngestIdentityAllNewLocked(self: anytype) void {
-            S.ownerField(self, "bulk_identity").*.reset(S.ownerField(self, "alloc").*);
+            S.ownerField(self, "documents").bulk_ingest.identity.reset(S.ownerField(self, "alloc").*);
         }
 
         pub fn clearDurableReplicationOutbox(self: anytype, key: []const u8) !void {
@@ -3790,7 +3790,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn rememberBulkIngestAllNewIdentityUpserts(self: anytype, doc_ids: []const []const u8) !bool {
-            return S.ownerField(self, "bulk_identity").*.remember(S.ownerField(self, "alloc").*, doc_ids);
+            return S.ownerField(self, "documents").bulk_ingest.identity.remember(S.ownerField(self, "alloc").*, doc_ids);
         }
 
         pub fn replicationMutationBarrier(self: anytype) ?*MutationBarrier {

@@ -789,7 +789,7 @@ pub fn ImplementationFor(comptime D: type) type {
             transaction_recovery_local_context: *@FieldType(Execution, "transaction_recovery_local_context"),
             indexes: *@FieldType(Execution, "indexes"),
             last_run_until_idle_no_progress: *@FieldType(Execution, "last_run_until_idle_no_progress"),
-            bulk_identity: *@FieldType(Execution, "bulk_identity"),
+            documents: *@FieldType(Execution, "documents"),
             embedding_activity: *@FieldType(Execution, "embedding_activity"),
             graph_restore_parse_cache: *@FieldType(Execution, "graph_restore_parse_cache"),
             pub const derivedCoverageAppliesToIndex = Implementation.derivedCoverageAppliesToIndex;
@@ -935,7 +935,7 @@ pub fn ImplementationFor(comptime D: type) type {
             transaction_recovery_local_context: ?*TransactionRecoveryLocalContext,
             indexes: @import("indexes/mod.zig").Indexes = .{},
             last_run_until_idle_no_progress: ?execution_resources.NoProgressDiagnostic = null,
-            bulk_identity: @import("bulk_ingest_session.zig").IdentityScratch = .{},
+            documents: @import("documents.zig").Documents = .{},
             embedding_activity: @import("embedding_activity_cache.zig").Owner = .{},
             graph_restore_parse_cache: ?GraphRestoreParseCache = null,
 
@@ -1030,7 +1030,7 @@ pub fn ImplementationFor(comptime D: type) type {
                 S.ownerField(self, "embedding_activity").*.deinit(S.ownerField(self, "alloc").*);
                 self.clearActiveIndexRepairsLocked();
                 S.ownerField(self, "indexes").repair.active.deinit(S.ownerField(self, "alloc").*);
-                S.ownerField(self, "bulk_identity").*.deinit(S.ownerField(self, "alloc").*);
+                S.ownerField(self, "documents").bulk_ingest.identity.deinit(S.ownerField(self, "alloc").*);
             }
 
             comptime {

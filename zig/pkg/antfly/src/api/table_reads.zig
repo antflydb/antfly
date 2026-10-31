@@ -12206,7 +12206,7 @@ fn queryDbDetailed(
     var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
     try reads.reads.prepareSearchWithConsistency(group_id, req, consistency);
     if (req.native_query_cut) |cut| {
-        const retained = try db.openQueryCut(cut, req.cancellation orelse .none);
+        const retained = try db.query.openCut(cut, req.cancellation orelse .none);
         owner.deinit();
         owner = .{ .owned = retained };
         db = owner.db();

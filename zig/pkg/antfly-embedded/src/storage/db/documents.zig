@@ -19,9 +19,12 @@ const Allocator = std.mem.Allocator;
 const db_mod = @import("db.zig");
 const DB = db_mod.DB;
 
-/// Document state owned by `DB.documents`.
+/// Document state owned by `DB`: authority backfill and repair, group source
+/// maintenance, and the bulk ingest session.
 pub const Documents = struct {
     authority: Authority = .{},
+    group_sources: GroupSources = .{},
+    bulk_ingest: BulkIngest = .{},
 
     /// Document authority backfill and repair: pages legacy documents into the authority index and attaches distributed authority snapshots.
     pub const Authority = struct {
@@ -31,6 +34,20 @@ pub const Documents = struct {
         backfill_restart: bool = false,
         repairs: @import("../document_mutation_revision.zig").RepairQueue = .{},
         repairs_yield_sweep: bool = false,
+    };
+
+    /// Group source maintenance: the local worker owner, or state borrowed from the native connection owner.
+    pub const GroupSources = struct {
+        owner: @import("group_source_owner.zig").Owner = .{},
+        /// Borrowed from the native connection owner; stable across DB refreshes.
+        /// The owner serializes every producer slice and outlives this wrapper.
+        borrowed_state: ?*DB.GroupSourceMaintenanceState = null,
+    };
+
+    /// The active bulk ingest session and its document identity scratch.
+    pub const BulkIngest = struct {
+        session: @import("bulk_ingest_session.zig").State = .{},
+        identity: @import("bulk_ingest_session.zig").IdentityScratch = .{},
     };
 
     fn dbPtr(self: *Documents) *DB {
@@ -285,5 +302,496 @@ pub const Documents = struct {
         }
         result.document_authority_version = 1;
         if (scalar_plan != null and db_mod.benchQueryProfileEnabled()) std.log.info("antfly_bench_projection metadata_rows={d} fallback_rows={d} certificate_rows={d}", .{ scalar_metadata_rows, scalar_fallback_rows, scalar_certificate_rows });
+    }
+
+    pub fn beginDenseAutoBulkIngest(self: *Documents) !void {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("beginDenseAutoBulkIngestSession", .{db});
+        var replication_mutation = db.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try db.enforceReplicationWriteGate();
+        try db.enforcePortableRuntimeGate();
+        try db_mod.beginExternalDenseBulkSessionTrackedWait(db.async_context, db.backend_runtime.io());
+        errdefer db_mod.finishExternalDenseBulkSessionTrackedBestEffort(db.async_context);
+        try db.lockApplyForPortableRuntime();
+        defer db.core.unlockApply();
+        const resources = db.core.batchExecutionResources();
+        try resources.index_manager.beginDenseBulkIngestSessions();
+        self.bulk_ingest.session.begin();
+    }
+
+    pub fn beginPrimaryStoreAutoBulkIngest(self: *Documents) !void {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("beginPrimaryStoreAutoBulkIngestSession", .{db});
+        var replication_mutation = db.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try db.enforceReplicationWriteGate();
+        try db.lockApplyForPortableRuntime();
+        defer db.core.unlockApply();
+        const resources = db.core.batchExecutionResources();
+        try resources.store.beginBulkIngestSession();
+        errdefer resources.store.abortBulkIngestSession();
+        try self.configureBulkIngestIdentityAllNewLocked();
+        errdefer db.clearBulkIngestIdentityAllNewLocked();
+        self.bulk_ingest.session.begin();
+    }
+
+    pub fn finishPrimaryStoreAutoBulkIngest(self: *Documents, options: db_mod.backend_types.BulkIngestFinishOptions) !void {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("finishPrimaryStoreAutoBulkIngestSessionWithOptions", .{ db, options });
+        var replication_mutation = db.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try db.enforceReplicationWriteGate();
+        {
+            try db.lockApplyForPortableRuntime();
+            defer db.core.unlockApply();
+            const resources = db.core.batchExecutionResources();
+            resources.store.finishBulkIngestSessionWithOptions(options) catch |err| {
+                self.bulk_ingest.session.finish();
+                db.clearBulkIngestIdentityAllNewLocked();
+                return err;
+            };
+            self.bulk_ingest.session.finish();
+            db.clearBulkIngestIdentityAllNewLocked();
+        }
+        db_mod.flushDeferredExternalBulkExecutorNotificationOrTarget(
+            db.async_context,
+            db.executor,
+            db.core.nextDerivedSequence(),
+        );
+        DB.notifyQueryVisibilityHook(db.async_context, .publish);
+    }
+
+    pub fn rollPrimaryStoreAutoBulkIngest(self: *Documents, options: db_mod.backend_types.BulkIngestFinishOptions) !void {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("rollPrimaryStoreAutoBulkIngestSessionWithOptions", .{ db, options });
+        try self.finishPrimaryStoreAutoBulkIngest(options);
+        try self.beginPrimaryStoreAutoBulkIngest();
+    }
+
+    pub fn finishDenseAutoBulkIngest(self: *Documents, options: db_mod.backend_types.BulkIngestFinishOptions) !void {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("finishDenseAutoBulkIngestSessionWithOptions", .{ db, options });
+        try self.finishDenseAutoBulkIngestInternal(options, true);
+    }
+
+    pub fn rollDenseAutoBulkIngest(self: *Documents, options: db_mod.backend_types.BulkIngestFinishOptions) !void {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("rollDenseAutoBulkIngestSessionWithOptions", .{ db, options });
+        try self.finishDenseAutoBulkIngestInternal(options, true);
+        try self.beginDenseAutoBulkIngest();
+    }
+
+    pub fn finishDenseAutoBulkIngestInternal(self: *Documents, options: db_mod.backend_types.BulkIngestFinishOptions, notify_executor: bool) !void {
+        const db = self.dbPtr();
+        var replication_mutation = db.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try db.enforceReplicationWriteGate();
+        var external_session_tracked = true;
+        defer if (external_session_tracked) db_mod.finishExternalDenseBulkSessionTrackedBestEffort(db.async_context);
+        {
+            try db.lockApplyForPortableRuntime();
+            defer db.core.unlockApply();
+            const resources = db.core.batchExecutionResources();
+            resources.store.flushBufferedWritesWithOptions(options) catch |err| {
+                self.bulk_ingest.session.finish();
+                return err;
+            };
+            resources.index_manager.finishDenseBulkIngestSessionsWithOptions(options) catch |err| {
+                self.bulk_ingest.session.finish();
+                db.clearBulkIngestIdentityAllNewLocked();
+                return err;
+            };
+            self.bulk_ingest.session.finish();
+            db.clearBulkIngestIdentityAllNewLocked();
+        }
+        external_session_tracked = false;
+        _ = try db_mod.finishExternalDenseBulkSessionTrackedAndFinalize(db.async_context);
+        if (notify_executor) {
+            db_mod.flushDeferredExternalBulkExecutorNotificationOrTarget(
+                db.async_context,
+                db.executor,
+                db.core.nextDerivedSequence(),
+            );
+        }
+        DB.notifyQueryVisibilityHook(db.async_context, .publish);
+    }
+
+    pub fn abortDenseAutoBulkIngest(self: *Documents) void {
+        const db = self.dbPtr();
+        var replication_mutation = db.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        db_mod.lockApply(db);
+        {
+            defer db.core.unlockApply();
+            const resources = db.core.batchExecutionResources();
+            self.bulk_ingest.session.finish();
+            resources.index_manager.abortDenseBulkIngestSessions();
+        }
+        db_mod.finishExternalDenseBulkSessionTrackedBestEffort(db.async_context);
+        db_mod.flushDeferredExternalBulkExecutorNotification(db.async_context, db.executor);
+    }
+
+    pub fn abortPrimaryStoreAutoBulkIngest(self: *Documents) void {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("abortPrimaryStoreAutoBulkIngestSession", .{db}) catch @panic("incompatible storage owner");
+        var replication_mutation = db.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        db_mod.lockApply(db);
+        defer db.core.unlockApply();
+        const resources = db.core.batchExecutionResources();
+        self.bulk_ingest.session.finish();
+        db.clearBulkIngestIdentityAllNewLocked();
+        resources.store.abortBulkIngestSession();
+    }
+
+    pub fn configureBulkIngestIdentityAllNewLocked(self: *Documents) !void {
+        const db = self.dbPtr();
+        db.clearBulkIngestIdentityAllNewLocked();
+        if (!try db.primaryUserNamespaceIsEmptyLocked()) return;
+        if (try db_mod.doc_identity.loadAllNewTrustedStateForNamespace(db.core.store, db.core.identity_namespace)) |state| {
+            self.bulk_ingest.identity.trusted = state;
+            db.core.identity_visibility.summary = state.visibility_summary;
+            db.clearLiveDocSetCache();
+            db.clearNonVisibleDocSetCache();
+            self.bulk_ingest.identity.enabled = true;
+        }
+    }
+
+    pub fn runLocalGroupSourceSlice(ptr: *anyopaque) !bool {
+        const db: *DB = @ptrCast(@alignCast(ptr));
+        if (!db.stable_address or db.closed or db.open_mode != .writer or !db.local_execution.optional_runtime_workers_enabled or db.core.index_manager.minimum_reader_version.load(.acquire) < 8) return false;
+        return db.documents.runGroupSourceSlice();
+    }
+
+    /// One bounded producer/control slice, without inference. Native Lite calls
+    /// this on the live coordinator under its short path lease, then replays
+    /// downstream providers in its separate detached turn.
+    pub fn runGroupSourceMaintenanceSlice(self: *Documents, state: *DB.GroupSourceMaintenanceState) !bool {
+        const db = self.dbPtr();
+        if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("runGroupSourceMaintenanceSlice", .{ db, state });
+        const before = state.submitted;
+        _ = try self.runGroupSourceSliceWithState(state);
+        // Only a committed control mutation makes detached provider replay
+        // eligible. Visiting an idle sibling must not reopen provider state.
+        return state.submitted != before;
+    }
+
+    pub fn runGroupSourceSlice(self: *Documents) !bool {
+        return self.runGroupSourceSliceWithState(self.group_sources.borrowed_state orelse &self.group_sources.owner.state);
+    }
+
+    fn runGroupSourceSliceWithState(self: *Documents, state: *DB.GroupSourceMaintenanceState) !bool {
+        const db = self.dbPtr();
+        if (!state.slice_mutex.tryLock()) return false;
+        defer state.slice_mutex.unlock();
+        // The resident scheduler runs independently of foreground index DDL.
+        // A slice borrows the current producer through batchContext as well
+        // as the final wake. Keep that entire bounded, inference-free turn
+        // inside the replacement fence so no borrowed runtime can be freed.
+        // Yield during reconfiguration rather than blocking the scheduler;
+        // durable group queues retain every pending command for the next turn.
+        if (!db.enrichment_owner.replacement_mutex.tryLock()) return false;
+        defer db.enrichment_owner.replacement_mutex.unlock();
+        return self.runGroupSourceSliceLocked(state);
+    }
+
+    pub fn runGroupSourceSliceLocked(self: *Documents, state: *DB.GroupSourceMaintenanceState) !bool {
+        const db = self.dbPtr();
+        // A table-wide coordinator must drive partial owners. The native
+        // worker can certify membership only for an unpartitioned Lite DB.
+        if (db.core.byteRange().start.len != 0 or db.core.byteRange().end.len != 0) return false;
+        if (db.open_mode != .writer or db.core.index_manager.minimum_reader_version.load(.acquire) < 8 or self.group_sources.owner.stopping.load(.acquire)) return false;
+        if (try db.maintenanceRequiresOrderedApply()) return false;
+        try db_mod.enforceReplicationWriteGateOptional(db.local_execution.replication_write_gate);
+        var budget = if (db.core.index_manager.resource_manager) |manager| db_mod.resource_manager_mod.BudgetedAllocator.init(manager, .shard_transition_working_set, db.runtime_alloc, 1) else null;
+        defer if (budget) |*value| value.deinit();
+        var arena = std.heap.ArenaAllocator.init(if (budget) |*value| value.allocator() else db.runtime_alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const work = @import("group_source_worker.zig");
+        const raw = (try self.lookupGroupSource(a, "{\"action\":\"definitions\"}")) orelse return false;
+        const definitions = try std.json.parseFromSliceLeaky([]work.Definition, a, raw.json, .{});
+        if (definitions.len == 0) return false;
+        const definition = definitions[state.next_definition % definitions.len];
+        state.next_definition +%= 1;
+        const namespace = definition.namespace;
+        if (state.worker == null) {
+            const identity = try std.json.Stringify.valueAlloc(a, .{ db.root_incarnation, db_mod.platform_time.realtimeNs(), namespace }, .{});
+            state.worker = .{ .allocator = state.allocator orelse db.runtime_alloc, .identity = @import("group_sources.zig").digest(identity) };
+        }
+        var context = DB.LocalGroupSourceContext{ .db = db, .state = state };
+        const ports = work.Ports{ .ptr = &context, .query_fn = localGroupSourceQuery, .submit_fn = localGroupSourceSubmit, .fan_in_fn = localGroupSourceFanIn, .settled_fn = localGroupSourceSettled };
+        const before = state.submitted;
+        try state.worker.?.sourceStep(a, ports, definition);
+        try state.worker.?.groupStep(a, ports, definition, @intCast(@divFloor(db_mod.platform_time.realtimeNs(), std.time.ns_per_ms)));
+        const changed = state.submitted != before;
+        state.idle_definitions = if (changed) 0 else state.idle_definitions +| 1;
+        // A no-op GC/idle definition is not proof that its siblings are idle.
+        // Complete a fair round before allowing a manual or connection owner
+        // to sleep. Progress resets the round so downstream receipts can settle.
+        return changed or state.idle_definitions < definitions.len;
+    }
+
+    fn localGroupSourceQuery(ptr: *anyopaque, a: Allocator, route: []const u8, request: []const u8) ![]const u8 {
+        const context: *DB.LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
+        const db = context.db;
+        if (!db.core.byteRange().contains(route)) return error.KeyOutOfRange;
+        const result = (try db.documents.lookupGroupSource(a, request)) orelse return error.NotFound;
+        return result.json;
+    }
+
+    fn localGroupSourceSubmit(ptr: *anyopaque, command: @import("group_source_contract.zig").Command) !void {
+        const context: *DB.LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
+        const db = context.db;
+        if (try db.maintenanceRequiresOrderedApply()) return error.ArtifactCatalogDrift;
+        try db.batchInternal(.{ .group_source = command, .sync_level = .write }, null, .{});
+        context.state.submitted +%= 1;
+        // Group publication appends private producer rows. Independent resident
+        // owners need the same downstream wake as an enrichments-level wait;
+        // connection-owned Lite observes the durable sequence on its next turn.
+        if (db.enrichment_runtime) |runtime| runtime.notifySequence(db.core.nextDerivedSequence());
+    }
+
+    fn localGroupSourceFanIn(ptr: *anyopaque, a: Allocator, definition: @import("group_source_worker.zig").Definition, partition: @import("group_source_index.zig").Partition, ordinal: i64) !@import("group_source_worker.zig").FanIn {
+        const context: *DB.LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
+        const db = context.db;
+        // A partial local range cannot certify a table-wide fan-in. The
+        // cluster adapter must enumerate all authoritative table owners.
+        if (db.core.byteRange().start.len != 0 or db.core.byteRange().end.len != 0) return error.GroupedSourceTopologyUnavailable;
+        const contract = @import("group_source_contract.zig");
+        const reads = @import("group_source_reads.zig");
+        var query = contract.Query{ .action = .partition, .artifact = definition.artifact, .definition = definition.definition, .group = partition.group, .segment = partition.segment, .cell = partition.cell, .ordinal = ordinal, .max_bytes = contract.max_partition_bytes };
+        var members: std.ArrayList(@import("group_sources.zig").Member) = .empty;
+        var revision: ?u64 = null;
+        var bytes: usize = 0;
+        var earlier_pending = false;
+        while (true) {
+            const request = try std.json.Stringify.valueAlloc(a, query, .{});
+            const response = try localGroupSourceQuery(ptr, a, definition.route.value, request);
+            const page = try std.json.parseFromSliceLeaky(reads.SourcePage, a, response, .{ .allocate = .alloc_always });
+            earlier_pending = earlier_pending or page.earlier_pending;
+            if (revision) |expected| {
+                if (expected != page.revision) return error.EnrichmentSourceChanged;
+            } else revision = page.revision;
+            for (page.members) |member| {
+                bytes += member.text.len + member.document.len;
+                if (members.items.len == 65536 or bytes > contract.max_partition_bytes) return error.GroupedSourcePartitionTooLarge;
+                try members.append(a, member);
+            }
+            if (page.done) break;
+            if (page.cursor.len == 0 or std.mem.eql(u8, query.cursor, page.cursor)) return error.GroupedSourceCorrupt;
+            query.cursor = page.cursor;
+        }
+        const sources = try a.alloc(contract.SourceCut, 1);
+        sources[0] = .{ .owner = definition.source_owner, .revision = revision orelse 0 };
+        return .{ .earlier_pending = earlier_pending, .members = try members.toOwnedSlice(a), .sources = sources, .topology_epoch = 0 };
+    }
+
+    fn localGroupSourceSettled(ptr: *anyopaque, sequence: u64, units: []const []const u8) !bool {
+        const context: *DB.LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
+        return context.db.documents.groupSourceSettled(sequence, units);
+    }
+
+    pub fn groupSourceSettled(self: *Documents, sequence: u64, units: []const []const u8) !bool {
+        const db = self.dbPtr();
+        var arena = std.heap.ArenaAllocator.init(db.runtime_alloc);
+        defer arena.deinit();
+        var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = db.root_incarnation, .allocator = arena.allocator(), .reader = @import("group_source_mutations.zig").Reader.fromStore(db.core.store) };
+        if (try @import("artifact_publication.zig").authority(&overlay) != null) {
+            for (units) |unit| if (!try overlay.sourceSettled(unit)) return false;
+            return true;
+        }
+        // A native standalone owner has no Raft publication authority. Its
+        // ordinary committed replay cursor and per-producer repair receipts
+        // provide completion; replicated owners always require durable proofs.
+        if (try db.maintenanceRequiresOrderedApply()) return false;
+        if (sequence == 0) return true;
+        const runtime = db.enrichment_runtime orelse return false;
+        const status = runtime.stats();
+        if (status.applied_sequence < sequence or status.worker_failed) return false;
+        const check = runtime.failure_pending_fn orelse return status.fatal_error_count == 0;
+        var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        for (units) |unit| for (plan.plan().generated_templates) |template| {
+            if (!db_mod.enrichment_types.appliesToDocument(template, unit)) continue;
+            const failure = db_mod.enrichment_runtime_mod.FailureIdentity{ .kind = template.kind, .artifact_name = template.artifact_name, .source_artifact_name = template.upstream_artifact_name, .doc_key = unit, .sequence = sequence };
+            if (try check(runtime.failure_ctx orelse return false, failure, template.index_name)) return false;
+        };
+        return true;
+    }
+
+    pub fn lookupGroupSource(self: *Documents, a: Allocator, raw: []const u8) !?db_mod.types.LookupResult {
+        const db = self.dbPtr();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const contract = @import("group_source_contract.zig");
+        const query = try std.json.parseFromSliceLeaky(contract.Query, owned, raw, .{ .allocate = .alloc_always });
+        try query.validate();
+        var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        const empty_groups = @import("group_source_mutations.zig").Plan{ .arena = undefined, .entries = &.{} };
+        const group_plan = plan.plan().group_sources orelse empty_groups;
+        if (query.action == .definitions) {
+            if (db.core.index_manager.minimum_reader_version.load(.acquire) < 8) return .{ .json = try a.dupe(u8, "[]") };
+            var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = db.root_incarnation, .allocator = owned, .reader = @import("group_source_mutations.zig").Reader.fromStore(db.core.store) };
+            const table = try @import("group_source_mutations.zig").tableIdentity(&overlay, db.core.identity_namespace.table_id, db.root_incarnation);
+            var namespace: [24]u8 = undefined;
+            db_mod.doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
+            var source_namespace = namespace;
+            if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], db.root_incarnation, .big);
+            const definitions = try owned.alloc(@import("group_source_worker.zig").Definition, group_plan.entries.len + 1);
+            definitions[group_plan.entries.len] = .{ .artifact = "__group_source_gc", .definition = .{ .table_incarnation = table, .configuration = @splat(1) }, .source = .{ .group_by = "_", .order_by = "_", .field = "_" }, .namespace = namespace, .source_owner = .{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(db.core.identity_namespace, db.root_incarnation) }, .route = .{ .value = db.core.byteRange().start }, .retirement = true };
+            for (group_plan.entries, definitions[0..group_plan.entries.len]) |entry, *definition| definition.* = .{ .artifact = entry.name, .definition = .{ .table_incarnation = table, .configuration = entry.configuration }, .source = entry.source, .namespace = namespace, .source_owner = .{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(db.core.identity_namespace, db.root_incarnation) }, .route = .{ .value = db.core.byteRange().start }, .horizon = entry.horizon };
+            return .{ .json = try std.json.Stringify.valueAlloc(a, definitions, .{}) };
+        }
+        var matched = false;
+        for (group_plan.entries) |entry| if (std.mem.eql(u8, entry.name, query.artifact) and std.mem.eql(u8, &entry.configuration, &query.definition.configuration)) {
+            matched = true;
+            break;
+        };
+        if (!matched and query.action != .retirement and query.action != .retirement_page and query.action != .activation) return error.InvalidGroupedSourceQuery;
+        var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = db.root_incarnation, .allocator = owned, .reader = @import("group_source_mutations.zig").Reader.fromStore(db.core.store) };
+        if (query.definition.table_incarnation != try @import("group_source_mutations.zig").tableIdentity(&overlay, db.core.identity_namespace.table_id, db.root_incarnation)) return error.InvalidGroupedSourceQuery;
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const baseline = @import("group_source_baseline.zig");
+        const reads = @import("group_source_reads.zig");
+        const state = @import("group_source_state.zig");
+        const group = state.Group{ .definition = query.definition, .key = query.group };
+        var namespace: [24]u8 = undefined;
+        db_mod.doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
+        if (std.mem.allEqual(u8, &namespace, 0)) std.mem.writeInt(u128, namespace[8..24], db.root_incarnation, .big);
+        const owner = state.Owner{ .namespace = namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(db.core.identity_namespace, db.root_incarnation) };
+        var command_namespace: [24]u8 = undefined;
+        db_mod.doc_identity.encodeNamespace(&command_namespace, db.core.identity_namespace);
+        const output = switch (query.action) {
+            .definitions => unreachable,
+            .activation => blk: {
+                if (!try db.maintenanceRequiresOrderedApply()) break :blk try a.dupe(u8, "true");
+                const active = try @import("artifact_publication.zig").authority(&read);
+                const catalogs = try @import("artifact_inventory.zig").catalogs(&read);
+                const inventory = @import("artifact_inventory.zig");
+                const status = try inventory.status(owned, &read, command_namespace);
+                const ready = if (active) |value| status.ready and status.ordered != null and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
+                break :blk try std.json.Stringify.valueAlloc(a, ready, .{});
+            },
+            .retirement => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").load(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(db.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, db.core.byteRange().start, db.core.byteRange().end, db.root_incarnation), try db.core.index_manager.artifact_semantic_cache.get(owned, try @import("artifact_inventory.zig").catalogs(&read)))), .{}),
+            .retirement_page => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").preparePage(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(db.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, db.core.byteRange().start, db.core.byteRange().end, db.root_incarnation), try db.core.index_manager.artifact_semantic_cache.get(owned, try @import("artifact_inventory.zig").catalogs(&read)))), .{}),
+            .backfill_page => try std.json.Stringify.valueAlloc(a, try baseline.preparePage(owned, &read, query.definition, baseline.sourceGeneration(db.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, db.core.byteRange().start, db.core.byteRange().end, db.root_incarnation)), .{}),
+            .readiness => blk: {
+                const completion = @import("artifact_completion_progress.zig");
+                const statuses = try owned.alloc(completion.GroupReadiness, query.documents.len);
+                for (query.documents, statuses) |document, *status| {
+                    if (!db.core.byteRange().contains(document)) return error.KeyOutOfRange;
+                    status.* = try completion.diagnoseGroup(owned, &read, db.root_incarnation, document, plan.plan());
+                }
+                const Replay = struct {
+                    target: u64,
+                    applied: u64,
+                    worker_started: bool,
+                    worker_failed: bool,
+                    lease_owned: bool,
+                    retrying: bool,
+                    consecutive_retries: u32,
+                    fatal_errors: u64,
+                    last_error: []const u8,
+                    asset_backend: bool,
+                };
+                const replay: ?Replay = if (db.enrichment_runtime) |runtime| status: {
+                    const replay_stats = runtime.stats();
+                    break :status .{ .target = replay_stats.target_sequence, .applied = replay_stats.applied_sequence, .worker_started = replay_stats.worker_started, .worker_failed = replay_stats.worker_failed, .lease_owned = replay_stats.lease_owned, .retrying = replay_stats.retrying, .consecutive_retries = replay_stats.consecutive_retry_count, .fatal_errors = replay_stats.fatal_error_count, .last_error = try owned.dupe(u8, replay_stats.last_error_code.slice()), .asset_backend = runtime.config.asset_producer != null };
+                } else null;
+                break :blk try std.json.Stringify.valueAlloc(a, .{ .units = statuses, .replay = replay }, .{});
+            },
+            .settled => blk: {
+                const authority = try @import("artifact_publication.zig").authority(&read);
+                var complete = query.documents.len == 0 or authority != null;
+                if (authority) |active| {
+                    const progress = try @import("artifact_producer_obligations.zig").load(&read);
+                    if (progress) |value| try value.requireAuthority(active);
+                    complete = progress != null and progress.?.baseline_complete;
+                }
+                if (authority == null and !try db.maintenanceRequiresOrderedApply()) complete = try self.groupSourceSettled(query.through_sequence, query.documents);
+                for (query.documents) |document| {
+                    if (!db.core.byteRange().contains(document)) return error.KeyOutOfRange;
+                    if (authority != null and !try @import("artifact_completion_progress.zig").groupReady(owned, &read, db.root_incarnation, document)) {
+                        complete = false;
+                        break;
+                    }
+                }
+                break :blk try std.json.Stringify.valueAlloc(a, complete, .{});
+            },
+            .backfill => try std.json.Stringify.valueAlloc(a, try baseline.load(owned, &read, query.definition, baseline.sourceGeneration(db.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, db.core.byteRange().start, db.core.byteRange().end, db.root_incarnation)), .{}),
+            .partition => blk: {
+                try baseline.requireReady(owned, &read, query.definition, baseline.sourceGeneration(db.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, db.core.byteRange().start, db.core.byteRange().end, db.root_incarnation));
+                break :blk try std.json.Stringify.valueAlloc(a, try reads.partition(owned, &read, query, owner, .{ .start = db.core.byteRange().start, .end = db.core.byteRange().end }), .{});
+            },
+            .outbox => try std.json.Stringify.valueAlloc(a, try reads.directory(owned, &read, @import("group_source_queue.zig").source_prefix, query.cursor, query.limit, .{ .start = db.core.byteRange().start, .end = db.core.byteRange().end }), .{}),
+            .pending => if (query.group.len == 0)
+                try std.json.Stringify.valueAlloc(a, try reads.directory(owned, &read, @import("group_source_queue.zig").group_prefix, query.cursor, query.limit, .{ .start = db.core.byteRange().start, .end = db.core.byteRange().end }), .{})
+            else
+                try std.json.Stringify.valueAlloc(a, try state.nextPending(owned, &read, group), .{}),
+            .status => try std.json.Stringify.valueAlloc(a, .{
+                .owner = owner,
+                .namespace = command_namespace,
+                .event_status = if (query.event) |event| try @import("group_source_propagation.zig").status(owned, &read, query.source_owner.?, event) else null,
+                .lease = if (query.group.len > 0) try state.currentLease(owned, &read, group) else null,
+                .pending = if (query.segment.len > 0) try state.pendingFor(owned, &read, group, .{ .group = query.group, .segment = query.segment, .cell = query.cell }) else null,
+                .snapshot = if (query.segment.len > 0) try state.readSnapshot(owned, &read, group, .{ .group = query.group, .segment = query.segment, .cell = query.cell }) else null,
+            }, .{}),
+            .prior => return error.InvalidGroupedSourceQuery,
+        };
+        return .{ .json = output };
+    }
+
+    pub fn waitForGroupSourcesThrough(self: *Documents, through: u64, wait: db_mod.derived_executor_mod.VisibilityWait) !u64 {
+        const db = self.dbPtr();
+        const io = db.backend_runtime.controlIo() orelse db.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
+        var producer_sequence = through;
+        while (true) {
+            try wait.check();
+            if (db.async_context.background_closing.load(.acquire)) return error.Canceled;
+            const ready = blk: {
+                var arena = std.heap.ArenaAllocator.init(db.runtime_alloc);
+                defer arena.deinit();
+                const a = arena.allocator();
+                var pinned = try db.core.index_manager.acquireWritePlanSnapshot();
+                defer pinned.release();
+                const plan = pinned.plan().group_sources orelse break :blk true;
+                var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = db.root_incarnation, .allocator = a, .reader = @import("group_source_mutations.zig").Reader.fromStore(db.core.store) };
+                const table = try @import("group_source_mutations.zig").tableIdentity(&overlay, db.core.identity_namespace.table_id, db.root_incarnation);
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                const baseline = @import("group_source_baseline.zig");
+                var namespace: [24]u8 = undefined;
+                db_mod.doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
+                const generation = baseline.sourceGeneration(db.core.index_manager.activeSchemaVersion() orelse 0, namespace, db.core.byteRange().start, db.core.byteRange().end, db.root_incarnation);
+                var settled = true;
+                for (plan.entries) |entry| {
+                    const definition = @import("group_source_index.zig").Definition{ .table_incarnation = table, .configuration = entry.configuration };
+                    if ((try baseline.load(a, &read, definition, generation)).phase != .ready) settled = false;
+                    if (try @import("group_source_debt.zig").earliest(a, &read, definition, through)) |event| {
+                        settled = false;
+                        var source_namespace = namespace;
+                        if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], db.root_incarnation, .big);
+                        const owner = @import("group_source_state.zig").Owner{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(db.core.identity_namespace, db.root_incarnation) };
+                        producer_sequence = @max(producer_sequence, try @import("group_source_visibility.zig").producerSequence(a, &read, owner, event));
+                    }
+                }
+                break :blk settled;
+            };
+            if (ready) return producer_sequence;
+            _ = try self.runGroupSourceSlice();
+            if (db.local_execution.optional_runtime_workers_enabled) {
+                // Wake the owner without waiting for a global cursor that
+                // may be blocked on an independent, later request. The
+                // durable source debt above is the completion authority.
+                if (db.enrichment_runtime) |runtime| runtime.notifySequence(producer_sequence);
+            } else try db.runEnrichmentUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?);
+            try wait.check();
+            try io.sleep(.fromMilliseconds(5), .awake);
+        }
     }
 };

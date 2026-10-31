@@ -826,10 +826,10 @@ pub const Owner = struct {
             self.maintenance_schedules = .empty;
             self.maintenance_root_incarnation = root.db.root_incarnation;
         }
-        root.db.borrowed_group_source_state = try self.groupSourceState(&root.db);
+        root.db.documents.group_sources.borrowed_state = try self.groupSourceState(&root.db);
         var tables = root.embedded_tables.valueIterator();
         while (tables.next()) |table|
-            table.*.db.borrowed_group_source_state = try self.groupSourceState(&table.*.db);
+            table.*.db.documents.group_sources.borrowed_state = try self.groupSourceState(&table.*.db);
         root.lite_scheduling_owner = self;
     }
 
@@ -1225,7 +1225,7 @@ pub const Owner = struct {
         // Alternate it with detached provider replay per namespace so a busy
         // root or a long backfill cannot starve a child or its consumers.
         if (self.options.open_mode == .writer and schedule.group_source_next) {
-            if (try database.runGroupSourceMaintenanceSlice(group_state)) {
+            if (try database.documents.runGroupSourceMaintenanceSlice(group_state)) {
                 schedule.group_source_next = false;
                 self.notifyMutation();
                 return true;

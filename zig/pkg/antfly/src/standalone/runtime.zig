@@ -14733,7 +14733,7 @@ fn exerciseStandalonePolicyPublication(use_hot_standby: bool) !void {
         var replayed_status = try std.json.parseFromSlice(policies.PublicationStamp, alloc, replayed, .{});
         defer replayed_status.deinit();
         try std.testing.expectEqual(policies.Publication.Phase.active, replayed_status.value.phase);
-        _ = try standby_owner.loadRowPolicyReceipt(status.value.generation, .serving_install);
+        _ = try standby_owner.query.loadRowPolicyReceipt(status.value.generation, .serving_install);
         try std.testing.expectError(error.RowPolicyAuthenticationRequired, standby_owner.get(alloc, "absent"));
         try std.testing.expect((try standby_owner.lookup(alloc, "absent", .{ .row_policy_principal_proof = proof, .row_policy_database = "main" })) == null);
         standby_owner.close();
@@ -14746,7 +14746,7 @@ fn exerciseStandalonePolicyPublication(use_hot_standby: bool) !void {
         });
         promoted_owner.local_execution.row_policy_table_name = table_name;
         defer promoted_owner.close();
-        _ = try promoted_owner.loadRowPolicyReceipt(status.value.generation, .serving_install);
+        _ = try promoted_owner.query.loadRowPolicyReceipt(status.value.generation, .serving_install);
         try std.testing.expectError(error.RowPolicyAuthenticationRequired, promoted_owner.get(alloc, "absent"));
         try std.testing.expect((try promoted_owner.lookup(alloc, "absent", .{ .row_policy_principal_proof = proof, .row_policy_database = "main" })) == null);
         server.hot_standby_public_gate_state.publishPrimaryFence(true);

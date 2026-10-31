@@ -5039,7 +5039,7 @@ pub fn replicatedBatchStorageKernelJsonAtRaftEntry(
         // Bound the private ABI payload before crossing into the storage owner;
         // the owner independently checks the canonical bundle limit and shape.
         if (bundle.len == 0 or bundle.len > 4 * 1024 * 1024) return .invalid_argument;
-        const receipt = handle.db.applyReplicatedRowPolicyPublication(bundle, publication, raft_entry) catch |err|
+        const receipt = handle.db.query.applyReplicatedRowPolicyPublication(bundle, publication, raft_entry) catch |err|
             return storageOwnerStatusFromError(err);
         var result = owned.result();
         result.row_policy_receipt = receipt;
