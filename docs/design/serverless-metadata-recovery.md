@@ -484,3 +484,25 @@ mail auth/isolation/search/attachments/restart. Both preparation steps pass.
 The native R2 run includes its full collector grace period. These checks apply
 to the final compatibility code; the frozen performance runs retain their own
 recorded earlier source revisions.
+
+
+### Continuation evidence closure
+
+Final compatibility source `476723404c` and all measured source revisions are
+archived at
+`examples/cloudflare-serverless/dist/qualification/continuation-sealed-1793414930483/evidence.json`:
+**293 verified artifacts / 1,181,327,714 bytes**, SHA-256
+`d6c89efe7f180b704ee1bd3b9a50fa11c048b2d930fe1c9f35c8538fdbc37290`.
+The closure includes all twenty correct app cases, failed attempts, frozen
+modules/bundles, final native test binary, test logs, diagnostic scripts and
+four source archives. Its summary output is excluded before sealing.
+
+The prior 2,196-artifact local, corrected 517-artifact hosted and preceding
+568/1,069-artifact closures independently reverify with zero missing or changed
+files. Their 1,344 / 224 / 0 / 27 recorded window references also match.
+The invalid original 516-artifact seal and older availability gaps remain
+historical; no report has been repaired by changing its captured bytes.
+Credentials are excluded. Guarded `make gc` was attempted after native artifacts
+were copied; it skipped cleanup because a native build was active or process
+inspection unavailable. Its guard was not bypassed. No new cloud resources,
+hosted gate pass or resolution of the live memory error is claimed.
