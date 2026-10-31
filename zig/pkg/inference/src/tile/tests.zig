@@ -339,4 +339,5 @@ test "tile im2col and embed lay data out as conv and lookup expect" {
 
 test {
     _ = @import("region.zig");
+    _ = @import("native_sources.zig");
 }

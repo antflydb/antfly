@@ -15,6 +15,46 @@
 
 const std = @import("std");
 
+/// Physical dense-attention storage shared by CPU, Metal and CUDA adapters.
+/// The values preserve the native Metal ABI. Unrecognized shapes remain an
+/// explicit compatibility decision of the caller, rather than a model hint.
+pub const DenseAttentionLayout = enum(u32) {
+    head_major = 0,
+    token_major = 1,
+
+    pub fn fromShape(comptime Int: type, shape: []const Int, batch: usize, sequence: usize, heads: usize, dim: usize) ?DenseAttentionLayout {
+        if (batch == 0 or sequence == 0 or heads == 0 or dim == 0) return null;
+        const tokens = std.math.mul(usize, batch, sequence) catch return null;
+        const hidden = std.math.mul(usize, heads, dim) catch return null;
+        const batch_heads = std.math.mul(usize, batch, heads) catch return null;
+        const b = std.math.cast(Int, batch) orelse return null;
+        const n = std.math.cast(Int, sequence) orelse return null;
+        const h = std.math.cast(Int, heads) orelse return null;
+        const d = std.math.cast(Int, dim) orelse return null;
+        if (shape.len == 2) {
+            const rows = std.math.cast(Int, tokens) orelse return null;
+            const width = std.math.cast(Int, hidden) orelse return null;
+            if (shape[0] == rows and shape[1] == width) return .token_major;
+        } else if (shape.len == 3) {
+            const bh = std.math.cast(Int, batch_heads) orelse return null;
+            if (shape[0] == bh and shape[1] == n and shape[2] == d) return .head_major;
+        } else if (shape.len == 4) {
+            if (shape[0] == b and shape[1] == h and shape[2] == n and shape[3] == d) return .head_major;
+        }
+        return null;
+    }
+};
+
+test "dense attention physical layouts preserve integer widths and reject overflow" {
+    const L = DenseAttentionLayout;
+    try std.testing.expectEqual(L.token_major, L.fromShape(i64, &.{ 6, 14 }, 2, 3, 2, 7).?);
+    try std.testing.expectEqual(L.head_major, L.fromShape(i32, &.{ 4, 3, 7 }, 2, 3, 2, 7).?);
+    try std.testing.expectEqual(L.head_major, L.fromShape(i64, &.{ 2, 2, 3, 7 }, 2, 3, 2, 7).?);
+    try std.testing.expect(L.fromShape(i32, &.{ 6, 15 }, 2, 3, 2, 7) == null);
+    try std.testing.expect(L.fromShape(i32, &.{ 6, 14 }, 0, 3, 2, 7) == null);
+    try std.testing.expect(L.fromShape(i32, &.{ 6, 14 }, std.math.maxInt(usize), 3, 2, 7) == null);
+}
+
 pub const BatchedDotGeneralPlan = struct {
     batch_count: usize,
     m: usize,

@@ -537,19 +537,6 @@ pub fn logSoftmaxInPlace(data: []f32, dim: usize) void {
 
 // --- Vectorized helpers ---
 
-fn vectorSum(data: []const f32) f32 {
-    var acc: F32xN = @splat(0.0);
-    var i: usize = 0;
-    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
-        const v: F32xN = data[i..][0..VEC_LEN].*;
-        acc += v;
-    }
-    var sum = @reduce(.Add, acc);
-    while (i < data.len) : (i += 1) {
-        sum += data[i];
-    }
-    return sum;
-}
 
 fn vectorDotSelf(data: []const f32) f32 {
     var acc: F32xN = @splat(0.0);

@@ -1159,18 +1159,6 @@ fn nodeHasPackedQuantInput(query: CapabilityQuery) bool {
     return false;
 }
 
-fn nodeInputsAreHostOrUnknown(query: CapabilityQuery) bool {
-    const descs = query.tensor_descs orelse return true;
-    const n = query.graph.node(query.node_id);
-    for (n.getInputs()) |input_id| {
-        if (inputDesc(descs, input_id)) |desc| {
-            if (desc.storage == .unknown or desc.storage == .metadata_view) continue;
-            if (!desc.isHostResident()) return false;
-        }
-    }
-    return true;
-}
-
 fn nodeInputsAreDenseF32HostOrUnknown(query: CapabilityQuery) bool {
     const descs = query.tensor_descs orelse return true;
     const n = query.graph.node(query.node_id);

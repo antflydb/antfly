@@ -12850,18 +12850,6 @@ fn noteLearnedTempArenaBoundary(self: *CudaCompute) !void {
     }
 }
 
-fn retainPinnedTempSlot(self: *CudaCompute, buffer: buffer_mod.DeviceBuffer) bool {
-    if (buffer.ptr == 0 or self.temp_pinned_slots.items.len == 0) return false;
-    for (self.temp_pinned_slots.items) |*slot| {
-        if (slot.buffer.ptr == buffer.ptr) {
-            if (slot.in_use) return false;
-            slot.in_use = true;
-            return true;
-        }
-    }
-    return false;
-}
-
 fn drainDeferredDeviceFreesAfterSyncUnlocked(self: *CudaCompute) void {
     if (self.deferred_device_frees.items.len == 0) return;
     var reclaimed: usize = 0;
@@ -12890,12 +12878,6 @@ fn synchronizeAndDrainDeferredDeviceFreesUnlocked(self: *CudaCompute) !void {
     // stream makes every previously submitted source slice reusable.
     self.pinned_scalar_upload_ring.next_slot = 0;
     self.pinned_upload_arena.next_offset = 0;
-}
-
-fn forceDrainDeferredDeviceFrees(self: *CudaCompute) !void {
-    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
-    defer self.temp_buffer_mutex.unlock();
-    try forceDrainDeferredDeviceFreesUnlocked(self);
 }
 
 fn forceDrainDeferredDeviceFreesUnlocked(self: *CudaCompute) !void {
@@ -17744,11 +17726,6 @@ test "CUDA biased dense linear dtype gate accepts resident BF16 weights" {
     try std.testing.expect(isBf16Weight(&weight));
 }
 
-fn ensureF32F16OrQuantized(tensor: *const CudaTensor) !void {
-    if (tensor.quant_type != null) return;
-    if (tensor.dtype != .f32 and tensor.dtype != .f16) return error.UnsupportedTensorType;
-}
-
 fn isBf16Weight(tensor: *const CudaTensor) bool {
     return tensor.dtype == .bf16 and tensor.quant_type == null;
 }
@@ -17964,16 +17941,6 @@ fn ensureLogicalWeightCount(tensor: *const CudaTensor, expected: usize) !void {
 
 fn checkedMul(a: usize, b: usize) !usize {
     return std.math.mul(usize, a, b) catch error.InvalidShape;
-}
-
-fn computeStridesUsize(shape: []const usize, out: []usize) void {
-    var stride: usize = 1;
-    var i = shape.len;
-    while (i > 0) {
-        i -= 1;
-        out[i] = stride;
-        stride *= shape[i];
-    }
 }
 
 fn checkedAdd(a: usize, b: usize) !usize {
@@ -23667,6 +23634,14 @@ fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64,
     try ensureCount(k_tensor, count);
     try ensureCount(v_tensor, count);
     const token_count = try checkedMul(batch, seq_len);
+    const Layout = kernel_geometry.DenseAttentionLayout;
+    const q_layout = Layout.fromShape(i64, q_tensor.shape, batch, seq_len, num_heads, head_dim);
+    const k_layout = Layout.fromShape(i64, k_tensor.shape, batch, seq_len, num_heads, head_dim);
+    const v_layout = Layout.fromShape(i64, v_tensor.shape, batch, seq_len, num_heads, head_dim);
+    if (num_heads > 1 and (q_layout != k_layout or q_layout != v_layout)) return error.InvalidShape;
+    // Preserve legacy unclassified token-major inputs and single-head schedules.
+    const head_major = num_heads > 1 and q_layout != null and q_layout.? == .head_major;
+
     const has_mask = mask != null;
     if (mask) |mask_values| {
         if (mask_values.len < token_count) return error.InvalidShape;
@@ -23681,7 +23656,7 @@ fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64,
         break :blk if (bt.elem_count == batched) 2 else if (bt.elem_count == shared) 1 else return error.InvalidShape;
     } else 0;
 
-    if (self.capability_profile == .florence2 and self.florence_f16_weights_enabled and
+    if (!head_major and self.capability_profile == .florence2 and self.florence_f16_weights_enabled and
         platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_CUDNN") and
         batch <= 64 and (num_heads == 8 or num_heads == 12 or num_heads == 16) and head_dim == 64 and seq_len <= 1024 and bias_mode == 0 and
         !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
@@ -23701,7 +23676,7 @@ fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64,
     defer if (prefill_profile_scope) |*scope| scope.end();
     // Mixed candidates retain F32 softmax/output accumulation and use F16
     // attention operands even when encoder matrix weights are BF16.
-    if (has_mask and bias_mode == 0 and ((self.gliner_mixed_attention and head_dim == 64) or glinerQ8F16AttentionEligible(self, batch, seq_len, num_heads, head_dim))) {
+    if (!head_major and has_mask and bias_mode == 0 and ((self.gliner_mixed_attention and head_dim == 64) or glinerQ8F16AttentionEligible(self, batch, seq_len, num_heads, head_dim))) {
         try self.kernels.launchGlinerEncoderAttentionTcF16(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim, seq_len);
         self.stats.gliner_encoder_f16_attention_launches += 1;
         if (seq_len >= 2048 and self.kernels.gliner_encoder_attention_tc_f16_m64 != null)
@@ -23709,12 +23684,14 @@ fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64,
         self.stats.launch_attention += 1;
         return createTensor(self, device, shape, count);
     }
-    if (self.gliner_encoder_attention and has_mask and bias_mode == 0) {
+    if (!head_major and self.gliner_encoder_attention and has_mask and bias_mode == 0) {
         try self.kernels.launchGlinerEncoderAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim, seq_len);
         self.stats.gliner_encoder_f32_attention_launches += 1;
-    } else if (has_mask and bias_mode == 0 and layaWarpEligible(self, batch, seq_len, head_dim)) {
+    } else if (!head_major and has_mask and bias_mode == 0 and layaWarpEligible(self, batch, seq_len, head_dim)) {
         try self.kernels.launchLayaAttentionWarpF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim, seq_len);
         self.stats.laya_warp_attention += 1;
+    } else if (head_major) {
+        try self.kernels.launchAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, bias_buffer, batch, seq_len, num_heads, head_dim, false, has_mask, bias_mode, true);
     } else {
         try self.kernels.launchTokenMajorAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, bias_buffer, batch, seq_len, num_heads, head_dim, false, has_mask, bias_mode);
     }
@@ -27832,14 +27809,6 @@ fn generatedE2BPairQ8ZpKernelId(intermediate_size: usize) []const u8 {
     };
 }
 
-fn generatedE2BDownQ8ZpKernelId(intermediate_size: usize) []const u8 {
-    return switch (intermediate_size) {
-        6144 => "antfly_q4_0_down_q8_1_e2b_6144_mmv_v1",
-        12288 => "antfly_q4_0_down_q8_1_e2b_12288_mmv_v1",
-        else => "antfly_q4_0_down_q8_1_mmv_v1",
-    };
-}
-
 fn generatedE2BDownQ8BlockSize(intermediate_size: usize) usize {
     return if (intermediate_size == 6144) 128 else 256;
 }
@@ -31908,9 +31877,11 @@ test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclam
     var scope = @import("execution_arena.zig").Scope{ .plan = &plan, .base = 1 };
     compute.execution_scope = &scope;
     var bytes = [_]u8{0};
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyFromHostTracked(&compute, undefined, &bytes));
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyToHostTracked(&compute, undefined, &bytes));
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyToHostTrackedAndSync(&compute, undefined, &bytes));
+    const device = buffer_mod.DeviceBuffer{ .ptr = 1, .len = bytes.len };
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyFromHostTracked(&compute, device, &bytes));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyToHostTracked(&compute, device, &bytes));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyToHostTrackedAndSync(&compute, device, &bytes));
+    try std.testing.expectError(error.InvalidCudaState, copyToHostTrackedAndSync(&compute, .{}, &bytes));
 }
 
 fn physicalExecutionScopeOp(ctx: *anyopaque, leases: ?[]const ?*ops.physical_storage.Lease) anyerror!void {
@@ -37428,4 +37399,99 @@ test "CUDA encoder precision profile preserves model-facing compatibility labels
     try std.testing.expectEqual(EncoderPrecisionProfile.f32, try EncoderPrecisionProfile.resolveWithAttention("bf16_vision", false));
     try std.testing.expectEqual(EncoderPrecisionProfile.bf16_vision, try EncoderPrecisionProfile.resolveWithAttention("bf16_vision", true));
     try std.testing.expectError(error.InvalidLightOnPrecisionProfile, EncoderPrecisionProfile.resolveWithAttention("typo", false));
+}
+
+test "CUDA dense attention preserves physical layouts against independent F64" {
+    const a = std.testing.allocator;
+    var compute = CudaCompute.init(a) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const B = 2;
+    const S = 3;
+    const H = 2;
+    const D = 7;
+    const N = B * S * H * D;
+    var q: [N]f32 = undefined;
+    var k: [N]f32 = undefined;
+    var v: [N]f32 = undefined;
+    var qt: [N]f32 = undefined;
+    var kt: [N]f32 = undefined;
+    var vt: [N]f32 = undefined;
+    for (0..N) |i| {
+        q[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i * 13 % 41)) - 20)) / 17;
+        k[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i * 19 % 43)) - 21)) / 19;
+        v[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i * 23 % 47)) - 23)) / 23;
+    }
+    const mask = [_]i64{ 1, 0, 1, 1, 1, 0 };
+    var bias: [H * S * S]f32 = undefined;
+    for (&bias, 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 9)) * 0.01;
+    var expected: [N]f32 = undefined;
+    for (0..B) |b| {
+        for (0..H) |h| {
+            for (0..S) |row| {
+                var scores: [S]f64 = @splat(-std.math.inf(f64));
+                for (0..S) |col| {
+                    if (mask[b * S + col] == 0) continue;
+                    var dot: f64 = 0;
+                    for (0..D) |d| dot += @as(f64, q[((b * H + h) * S + row) * D + d]) * @as(f64, k[((b * H + h) * S + col) * D + d]);
+                    scores[col] = dot / @sqrt(@as(f64, D)) + bias[(h * S + row) * S + col];
+                }
+                const max_score = @max(scores[0], @max(scores[1], scores[2]));
+                var probabilities: [S]f64 = undefined;
+                var total: f64 = 0;
+                for (scores, 0..) |score, i| {
+                    probabilities[i] = @exp(score - max_score);
+                    total += probabilities[i];
+                }
+                for (0..D) |d| {
+                    var value: f64 = 0;
+                    for (0..S) |col| value += probabilities[col] / total * @as(f64, v[((b * H + h) * S + col) * D + d]);
+                    const head = ((b * H + h) * S + row) * D + d;
+                    const token = ((b * S + row) * H + h) * D + d;
+                    expected[head] = @floatCast(value);
+                    qt[token] = q[head];
+                    kt[token] = k[head];
+                    vt[token] = v[head];
+                }
+            }
+        }
+    }
+    const bias_ct = try cb.fromFloat32Shape(&bias, &.{ H, S, S });
+    defer cb.free(bias_ct);
+    for ([_]u8{ 2, 3, 4 }) |rank| {
+        const shape: []const i32 = switch (rank) {
+            2 => &.{ B * S, H * D },
+            3 => &.{ B * H, S, D },
+            else => &.{ B, H, S, D },
+        };
+        const qct = try cb.fromFloat32Shape(if (rank == 2) &qt else &q, shape);
+        defer cb.free(qct);
+        const kct = try cb.fromFloat32Shape(if (rank == 2) &kt else &k, shape);
+        defer cb.free(kct);
+        const vct = try cb.fromFloat32Shape(if (rank == 2) &vt else &v, shape);
+        defer cb.free(vct);
+        const output = try cb.scaledDotProductAttention(qct, kct, vct, &mask, bias_ct, B, S, H, D);
+        defer cb.free(output);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        for (0..B) |b| {
+            for (0..H) |h| {
+                for (0..S) |row| {
+                    for (0..D) |d| {
+                        const head = ((b * H + h) * S + row) * D + d;
+                        const token = ((b * S + row) * H + h) * D + d;
+                        try std.testing.expectApproxEqAbs(expected[head], actual[if (rank == 2) token else head], 2e-5);
+                    }
+                }
+            }
+        }
+        if (rank != 2) {
+            const token = try cb.fromFloat32Shape(&kt, &.{ B * S, H * D });
+            defer cb.free(token);
+            try std.testing.expectError(error.InvalidShape, cb.scaledDotProductAttention(qct, token, vct, &mask, bias_ct, B, S, H, D));
+        }
+    }
 }

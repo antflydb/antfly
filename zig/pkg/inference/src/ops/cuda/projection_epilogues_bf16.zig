@@ -43,18 +43,20 @@ pub fn validate(r: Request) !void {
     try buffer.validateRegions(4, regions, lengths, @splat(16), 3);
 }
 
+const catalog = @import("../../tile/cuda_standalone.zig");
+const image = @import("embedded_module.zig").profile;
 const EmbeddedPrograms = @import("embedded_module.zig").EmbeddedPrograms;
 const UpPrograms = EmbeddedPrograms(.{
-    .k768_f32 = .{ .image = @embedFile("projection_gelu_sm121_k768_n3072_bias_f32.ptx") ++ "\x00", .entry = "lighton_vision_up" },
-    .k768_bf16 = .{ .image = @embedFile("projection_gelu_sm121_k768_n3072_bias_bf16.ptx") ++ "\x00", .entry = "lighton_vision_up" },
-    .k1024_f32 = .{ .image = @embedFile("projection_gelu_sm121_k1024_n4096_bias_f32.ptx") ++ "\x00", .entry = "lighton_vision_up" },
-    .k1024_bf16 = .{ .image = @embedFile("projection_gelu_sm121_k1024_n4096_bias_bf16.ptx") ++ "\x00", .entry = "lighton_vision_up" },
+    .k768_f32 = image(catalog.gelu[0]),
+    .k768_bf16 = image(catalog.gelu[1]),
+    .k1024_f32 = image(catalog.gelu[2]),
+    .k1024_bf16 = image(catalog.gelu[3]),
 });
 const DownPrograms = EmbeddedPrograms(.{
-    .k768_f32 = .{ .image = @embedFile("projection_residual_sm121_k3072_n768_io_f32.ptx") ++ "\x00", .entry = "lighton_vision_down" },
-    .k768_bf16 = .{ .image = @embedFile("projection_residual_sm121_k3072_n768_io_bf16.ptx") ++ "\x00", .entry = "lighton_vision_down" },
-    .k1024_f32 = .{ .image = @embedFile("projection_residual_sm121_k4096_n1024_io_f32.ptx") ++ "\x00", .entry = "lighton_vision_down" },
-    .k1024_bf16 = .{ .image = @embedFile("projection_residual_sm121_k4096_n1024_io_bf16.ptx") ++ "\x00", .entry = "lighton_vision_down" },
+    .k768_f32 = image(catalog.residual[0]),
+    .k768_bf16 = image(catalog.residual[1]),
+    .k1024_f32 = image(catalog.residual[2]),
+    .k1024_bf16 = image(catalog.residual[3]),
 });
 
 pub const Module = struct {
@@ -81,7 +83,7 @@ pub const Module = struct {
         // are asserted zero by the generator; neither is allocated or read.
         var scratch: u64 = 0;
         var args = [_]?*anyopaque{ &p[0], &p[1], &p[2], &p[3], &rows, &scratch, &scratch };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(@fromBackingInt(@intCast(index))), @intCast((r.wide + 127) / 128), @intCast((r.rows + 63) / 64), 1, 128, 1, 1, 24576, ctx.stream, &args, null));
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(@fromBackingInt(@intCast(index))), @intCast((r.wide + 127) / 128), @intCast((r.rows + 63) / 64), 1, catalog.gelu[0].threads, 1, 1, catalog.gelu[0].shared, ctx.stream, &args, null));
         ctx.noteKernelLaunch();
         self.calls += 1;
     }
@@ -160,7 +162,7 @@ pub const DownModule = struct {
         var rows: u32 = @intCast(r.rows);
         var scratch: u64 = 0;
         var args = [_]?*anyopaque{ &p[0], &p[1], &p[2], &p[3], &p[4], &rows, &scratch, &scratch };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(@fromBackingInt(@intCast(index))), @intCast((r.hidden + 127) / 128), @intCast((r.rows + 63) / 64), 1, 128, 1, 1, 49152, ctx.stream, &args, null));
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(@fromBackingInt(@intCast(index))), @intCast((r.hidden + 127) / 128), @intCast((r.rows + 63) / 64), 1, catalog.residual[0].threads, 1, 1, catalog.residual[0].shared, ctx.stream, &args, null));
         ctx.noteKernelLaunch();
         self.calls += 1;
     }

@@ -447,21 +447,28 @@ __device__ __forceinline__ unsigned int termite_tq_physical_token(
 );
 __device__ __forceinline__ float termite_tq_f16_value(const unsigned char* row, unsigned int value_index);
 
+// tile-codegen:begin elementwise.direct.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_fill_f32(float* dst, unsigned int n, float value) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = value;
 }
+// tile-codegen:end elementwise.direct.0 family
 
+// tile-codegen:begin tensor.layout.direct.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_copy_f32(float* dst, const float* src, unsigned int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = src[i];
 }
+// tile-codegen:end tensor.layout.direct.0 family
 
+// tile-codegen:begin tensor.layout.direct.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_copy_u8(unsigned char* dst, const unsigned char* src, unsigned int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = src[i];
 }
+// tile-codegen:end tensor.layout.direct.1 family
 
+// tile-codegen:begin elementwise.direct.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_scale_f32(
     float* dst,
     const float* input,
@@ -471,7 +478,9 @@ extern "C" __global__ void termite_scale_f32(
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = input[i] * scale;
 }
+// tile-codegen:end elementwise.direct.1 family
 
+// tile-codegen:begin elementwise.direct.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_add_scalar_f32(
     float* dst,
     const float* input,
@@ -481,7 +490,9 @@ extern "C" __global__ void termite_add_scalar_f32(
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = input[i] + value;
 }
+// tile-codegen:end elementwise.direct.2 family
 
+// tile-codegen:begin elementwise.direct.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_binary_scalar_f32(
     float* dst,
     const float* input,
@@ -502,7 +513,9 @@ extern "C" __global__ void termite_binary_scalar_f32(
     else if (op == 9u) dst[i] = x / y;
     else dst[i] = x < y ? 1.0f : 0.0f;
 }
+// tile-codegen:end elementwise.direct.3 family
 
+// tile-codegen:begin elementwise.direct.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_add_mul_scalar_f32(
     float* dst,
     const float* a,
@@ -513,7 +526,9 @@ extern "C" __global__ void termite_add_mul_scalar_f32(
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = a[i] * scalar[0] + b[i];
 }
+// tile-codegen:end elementwise.direct.4 family
 
+// tile-codegen:begin elementwise.direct.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_add_weighted_scalars_f32(
     float* dst,
     const float* a,
@@ -525,6 +540,7 @@ extern "C" __global__ void termite_add_weighted_scalars_f32(
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = a[i] * scale_a + b[i] * scale_b;
 }
+// tile-codegen:end elementwise.direct.5 family
 
 // tile-codegen:begin quant_cuda.dense_f32.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_f32(ANTFLY_CUDA_LINEAR_F32_PARAMS) {
@@ -573,6 +589,7 @@ __device__ __forceinline__ unsigned short termite_f32_to_bf16(float value) {
     return (unsigned short)((bits + rounding_bias) >> 16);
 }
 
+// tile-codegen:begin tensor.layout.direct.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_f32_to_bf16(
     unsigned short* dst,
     const float* input,
@@ -582,10 +599,12 @@ extern "C" __global__ void termite_f32_to_bf16(
     if (idx >= count) return;
     dst[idx] = termite_f32_to_bf16(input[idx]);
 }
+// tile-codegen:end tensor.layout.direct.2 family
 
 // Keep dense encoder activations in F32 through the graph, then stage only
 // the operand consumed by the FP16 tensor-core GEMM. This gives FP16 GGUF
 // models tensor-core throughput without changing residual/norm accumulation.
+// tile-codegen:begin tensor.layout.direct.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_f32_to_f16(
     unsigned short* dst,
     const float* input,
@@ -596,7 +615,9 @@ extern "C" __global__ void termite_f32_to_f16(
     __half value = __float2half_rn(input[idx]);
     dst[idx] = __half_as_ushort(value);
 }
+// tile-codegen:end tensor.layout.direct.3 family
 
+// tile-codegen:begin tensor.layout.direct.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_f32_to_i32(
     int* dst,
     const float* input,
@@ -606,10 +627,12 @@ extern "C" __global__ void termite_f32_to_i32(
     if (idx >= count) return;
     dst[idx] = __float2int_rn(input[idx]);
 }
+// tile-codegen:end tensor.layout.direct.4 family
 
 // The graph interpreter historically represents i64/u8/bool tensors as f32
 // buffers after rounding. Preserve that contract on-device so integer casts
 // used by imported training graphs do not force a host round-trip.
+// tile-codegen:begin elementwise.direct.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_round_f32(
     float* dst,
     const float* input,
@@ -619,6 +642,7 @@ extern "C" __global__ void termite_round_f32(
     if (idx >= count) return;
     dst[idx] = nearbyintf(input[idx]);
 }
+// tile-codegen:end elementwise.direct.6 family
 
 template<bool Bf16>
 __device__ __forceinline__ void termite_linear_u16_weight_f32_tiled_impl(
@@ -749,6 +773,7 @@ __device__ __forceinline__ float termite_mtp_load_preproject_weight(
     return 0.0f;
 }
 
+// tile-codegen:begin selection.direct.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_mtp_preproject_f32(ANTFLY_CUDA_GEMMA4_MTP_PREPROJECT_F32_PARAMS) {
     __shared__ float partial[256];
     unsigned int row = blockIdx.x;
@@ -776,6 +801,7 @@ extern "C" __global__ void termite_gemma4_mtp_preproject_f32(ANTFLY_CUDA_GEMMA4_
     }
     if (tid == 0u) dst[row] = partial[0];
 }
+// tile-codegen:end selection.direct.0 family
 
 struct termite_mtp_logits_score {
     const float* logits;
@@ -915,10 +941,13 @@ __device__ __forceinline__ void termite_mtp_masked_select_impl(
     termite_mtp_rank_and_select(dst, score_at, centroid_scores, token_ordering, vocab_size, num_centroids, top_k, use_inverse_ordering, cluster_size);
 }
 
+// tile-codegen:begin selection.direct.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_mtp_masked_select_f32(ANTFLY_CUDA_GEMMA4_MTP_MASKED_SELECT_F32_PARAMS) {
     termite_mtp_masked_select_impl(dst, assistant_hidden, termite_mtp_logits_score{logits}, centroid_weight, token_ordering, hidden_size, vocab_size, num_centroids, top_k, use_inverse_ordering, centroid_weight_dtype);
 }
+// tile-codegen:end selection.direct.1 family
 
+// tile-codegen:begin selection.direct.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_mtp_centroid_scores_hidden_f32(
     float* centroid_scores,
     const float* assistant_hidden,
@@ -945,7 +974,9 @@ extern "C" __global__ void termite_gemma4_mtp_centroid_scores_hidden_f32(
     }
     if (tid == 0u) centroid_scores[centroid] = partial[0];
 }
+// tile-codegen:end selection.direct.2 family
 
+// tile-codegen:begin selection.direct.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_mtp_centroid_topk_u32(
     unsigned int* top_centroids,
     const float* centroid_scores,
@@ -980,7 +1011,9 @@ extern "C" __global__ void termite_gemma4_mtp_centroid_topk_u32(
     }
     for (unsigned int i = 0u; i < top_k; ++i) top_centroids[i] = top_ids[i];
 }
+// tile-codegen:end selection.direct.3 family
 
+// tile-codegen:begin selection.direct.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_mtp_restricted_lm_head_scores_f32(
     float* partial_values,
     unsigned int* partial_tokens,
@@ -1026,7 +1059,9 @@ extern "C" __global__ void termite_gemma4_mtp_restricted_lm_head_scores_f32(
         partial_tokens[candidate] = token;
     }
 }
+// tile-codegen:end selection.direct.4 family
 
+// tile-codegen:begin selection.direct.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_mtp_reduce_token_scores_f32(
     unsigned int* dst,
     const float* partial_values,
@@ -1064,6 +1099,7 @@ extern "C" __global__ void termite_gemma4_mtp_reduce_token_scores_f32(
     }
     if (tid == 0u) dst[0] = block_indices[0];
 }
+// tile-codegen:end selection.direct.5 family
 
 struct termite_mtp_hidden_score {
     const float* assistant_hidden;
@@ -1078,10 +1114,13 @@ struct termite_mtp_hidden_score {
         return score;
     }
 };
+// tile-codegen:begin selection.direct.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_mtp_masked_select_hidden_f32(ANTFLY_CUDA_GEMMA4_MTP_MASKED_SELECT_HIDDEN_F32_PARAMS) {
     termite_mtp_masked_select_impl(dst, assistant_hidden, termite_mtp_hidden_score{assistant_hidden, lm_head_weight, hidden_size, lm_head_dtype}, centroid_weight, token_ordering, hidden_size, vocab_size, num_centroids, top_k, use_inverse_ordering, centroid_weight_dtype);
 }
+// tile-codegen:end selection.direct.6 family
 
+// tile-codegen:begin selection.direct.7 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_mtp_masked_argmax_f32(
     unsigned int* dst,
     const float* logits,
@@ -1106,6 +1145,7 @@ extern "C" __global__ void termite_gemma4_mtp_masked_argmax_f32(
 
     termite_mtp_rank_and_select(dst, termite_mtp_logits_score{logits}, centroid_logits, token_ordering, vocab_size, num_centroids, top_k, use_inverse_ordering, cluster_size);
 }
+// tile-codegen:end selection.direct.7 family
 
 __device__ bool termite_gemma4_mtp_token_is_eos_u32(unsigned int token, const int* eos_token_ids, unsigned int eos_count) {
     for (unsigned int i = 0u; i < eos_count; ++i) {
@@ -1115,6 +1155,7 @@ __device__ bool termite_gemma4_mtp_token_is_eos_u32(unsigned int token, const in
     return false;
 }
 
+// tile-codegen:begin selection.direct.8 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_mtp_verify_commit_u32(
     unsigned int* result,
     const unsigned int* target_choices,
@@ -1191,6 +1232,7 @@ extern "C" __global__ void termite_gemma4_mtp_verify_commit_u32(
     result[10] = bonus_token;
     result[11] = invalid_model_output;
 }
+// tile-codegen:end selection.direct.8 family
 
 // tile-codegen:begin quant_cuda.dense_f32.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_bias_f32(
@@ -1215,6 +1257,7 @@ extern "C" __global__ void termite_linear_bias_f32(
 }
 // tile-codegen:end quant_cuda.dense_f32.3 family
 
+// tile-codegen:begin elementwise.direct.7 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_add_bias_rows_f32(
     float* dst,
     const float* bias,
@@ -1227,10 +1270,12 @@ extern "C" __global__ void termite_add_bias_rows_f32(
     unsigned int col = idx % out_dim;
     dst[idx] += bias[col];
 }
+// tile-codegen:end elementwise.direct.7 family
 
 // Dense tensor-core epilogue used by encoder/span-head MLPs. The GEMM output
 // is already resident in F32; apply bias and ReLU in-place so large prefill
 // shapes do not make a second full-tensor allocation and memory pass.
+// tile-codegen:begin elementwise.direct.8 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_add_bias_relu_rows_f32(
     float* dst,
     const float* bias,
@@ -1244,6 +1289,7 @@ extern "C" __global__ void termite_add_bias_relu_rows_f32(
     float value = dst[idx] + bias[col];
     dst[idx] = value > 0.0f ? value : 0.0f;
 }
+// tile-codegen:end elementwise.direct.8 family
 
 template <unsigned int ROWS_PER_BLOCK, unsigned int COLS, unsigned int MODE>
 __device__ void termite_linear_bias_f32_tile_rows_cols(
@@ -1545,6 +1591,7 @@ extern "C" __global__ void termite_gemma4_a4b_rms_norm_triple_f32(ANTFLY_CUDA_GE
 //   rms(shared) + rms(routed) -> rms(combined) + attention residual.
 // The output buffer temporarily holds the rounded combined value so the final
 // denominator and result match the materialized unfused chain.
+// tile-codegen:begin elementwise.direct.9 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_a4b_parallel_ffn_post_residual_f32(
     float* dst,
     const float* shared,
@@ -1600,6 +1647,7 @@ extern "C" __global__ void termite_gemma4_a4b_parallel_ffn_post_residual_f32(
         dst[idx] = dst[idx] * combined_scale * combined_weight[i] + residual[idx];
     }
 }
+// tile-codegen:end elementwise.direct.9 family
 
 template<bool Add>
 __device__ __forceinline__ void termite_layer_norm_impl(
@@ -1631,6 +1679,7 @@ extern "C" __global__ void termite_add_layer_norm_f32(ANTFLY_CUDA_ADD_LAYER_NORM
 }
 // tile-codegen:end layer_norm family
 
+// tile-codegen:begin elementwise.direct.10 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_elementwise_f32(
     float* dst,
     const float* a,
@@ -1710,7 +1759,9 @@ extern "C" __global__ void termite_elementwise_f32(
     }
     dst[i] = out;
 }
+// tile-codegen:end elementwise.direct.10 family
 
+// tile-codegen:begin tensor.layout.direct.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_elementwise_broadcast_f32(
     float* dst,
     const float* a,
@@ -1758,7 +1809,9 @@ extern "C" __global__ void termite_elementwise_broadcast_f32(
     else if (op == 9u) dst[idx] = x / y;
     else dst[idx] = x < y ? 1.0f : 0.0f;
 }
+// tile-codegen:end tensor.layout.direct.5 family
 
+// tile-codegen:begin tensor.layout.direct.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_where_f32(
     float* output,
     const float* cond,
@@ -1769,12 +1822,14 @@ extern "C" __global__ void termite_primitive_where_f32(
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < count) output[idx] = cond[idx] != 0.0f ? on_true[idx] : on_false[idx];
 }
+// tile-codegen:end tensor.layout.direct.6 family
 
 // Dense dot_general specialization used by training attention gradients.
 // Batch dimensions are flattened ahead of the final matrix dimensions:
 //   lhs [batch, m, k] when lhs_contract_last != 0, otherwise [batch, k, m]
 //   rhs [batch, n, k] when rhs_contract_last != 0, otherwise [batch, k, n]
 //   out [batch, m, n]
+// tile-codegen:begin projection.direct.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_batched_dot_f32(ANTFLY_CUDA_PRIMITIVE_BATCHED_DOT_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int output_count = batch_count * m * n;
@@ -1803,7 +1858,9 @@ extern "C" __global__ void termite_primitive_batched_dot_f32(ANTFLY_CUDA_PRIMITI
     }
     output[idx] = acc;
 }
+// tile-codegen:end projection.direct.0 family
 
+// tile-codegen:begin elementwise.direct.11 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_silu_multiply_f32(
     float* dst,
     const float* gate,
@@ -1815,7 +1872,9 @@ extern "C" __global__ void termite_silu_multiply_f32(
     float x = gate[i];
     dst[i] = (x / (1.0f + expf(-x))) * up[i];
 }
+// tile-codegen:end elementwise.direct.11 family
 
+// tile-codegen:begin elementwise.direct.12 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_activation_multiply_f32(
     float* dst,
     const float* gate,
@@ -1843,7 +1902,9 @@ extern "C" __global__ void termite_activation_multiply_f32(
     }
     dst[i] = act * up[i];
 }
+// tile-codegen:end elementwise.direct.12 family
 
+// tile-codegen:begin tensor.layout.direct.7 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_activation_multiply_slice_last_dim_f32(
     float* dst,
     const float* gate,
@@ -1861,6 +1922,7 @@ extern "C" __global__ void termite_activation_multiply_slice_last_dim_f32(
     unsigned int col = i - row * out_cols;
     dst[i] = termite_decoder_activation_f32(gate[i], activation) * source[row * source_cols + start + col];
 }
+// tile-codegen:end tensor.layout.direct.7 family
 
 // Strided gate/up activation multiply over the output of a concatenated
 // gate|up GEMM. `fused` is row-major [rows, 2*f]: within each row, columns
@@ -1869,6 +1931,7 @@ extern "C" __global__ void termite_activation_multiply_slice_last_dim_f32(
 // dst[r][c] = act(fused[r][c]) * fused[r][f + c]. Activation ids match
 // termite_activation_multiply_f32 (0/1 gelu tanh, 2 silu, 3 relu,
 // 4 quick gelu, else relu^2).
+// tile-codegen:begin projection.direct.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_activation_multiply_fused_gate_up_f32(
     float* dst,
     const float* fused,
@@ -1884,6 +1947,7 @@ extern "C" __global__ void termite_activation_multiply_fused_gate_up_f32(
     const float* fused_row = fused + (size_t)row * (2u * f);
     dst[i] = termite_decoder_activation_f32(fused_row[col], activation) * fused_row[f + col];
 }
+// tile-codegen:end projection.direct.1 family
 
 // One storage-conversion owner for typed embedding and primitive gather.
 template<unsigned int Format, typename Storage>
@@ -1963,6 +2027,7 @@ extern "C" __global__ void termite_embedding_lookup_i32_f16_weight_f32(
 }
 // tile-codegen:end reduce.embedding_lookup family
 
+// tile-codegen:begin tensor.layout.direct.8 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_take_rows_f32(
     float* dst,
     const float* input,
@@ -1979,7 +2044,9 @@ extern "C" __global__ void termite_take_rows_f32(
     unsigned int src_row = row_ids[row];
     dst[idx] = src_row < source_rows ? input[src_row * dim + col] : 0.0f;
 }
+// tile-codegen:end tensor.layout.direct.8 family
 
+// tile-codegen:begin sequence.transforms.direct.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gliner_gather_concat_relu_f32(
     float* dst,
     const float* start,
@@ -2003,7 +2070,9 @@ extern "C" __global__ void termite_gliner_gather_concat_relu_f32(
     float y = src_row < source_rows ? src[src_row * dim + inner_col] : 0.0f;
     dst[idx] = y < 0.0f ? 0.0f : y;
 }
+// tile-codegen:end sequence.transforms.direct.0 family
 
+// tile-codegen:begin tensor.layout.direct.9 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_slice_last_dim_f32(
     float* dst,
     const float* input,
@@ -2019,7 +2088,9 @@ extern "C" __global__ void termite_slice_last_dim_f32(
     unsigned int out_col = idx - row * out_cols;
     dst[idx] = input[row * cols + start + out_col];
 }
+// tile-codegen:end tensor.layout.direct.9 family
 
+// tile-codegen:begin sequence.transforms.direct.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gliner_word_embeddings_f32(
     float* dst,
     const float* hidden,
@@ -2049,7 +2120,9 @@ extern "C" __global__ void termite_gliner_word_embeddings_f32(
     }
     dst[idx] = 0.0f;
 }
+// tile-codegen:end sequence.transforms.direct.1 family
 
+// tile-codegen:begin tensor.layout.direct.10 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_repeat_first_row_f32(
     float* dst,
     const float* src,
@@ -2062,7 +2135,9 @@ extern "C" __global__ void termite_repeat_first_row_f32(
     unsigned int col = idx % dim;
     dst[idx] = src[col];
 }
+// tile-codegen:end tensor.layout.direct.10 family
 
+// tile-codegen:begin sequence.transforms.direct.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gliner_gru_combine_f32(
     float* dst,
     const float* label_embeddings,
@@ -2084,7 +2159,9 @@ extern "C" __global__ void termite_gliner_gru_combine_f32(
     float h1 = (1.0f - z) * n + z * h0;
     dst[idx] = h1 + h0;
 }
+// tile-codegen:end sequence.transforms.direct.2 family
 
+// tile-codegen:begin tensor.layout.direct.11 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_concat_lastdim_f32(
     float* dst,
     const float* a,
@@ -2105,7 +2182,9 @@ extern "C" __global__ void termite_concat_lastdim_f32(
         dst[idx] = b[row * dim_b + (col - dim_a)];
     }
 }
+// tile-codegen:end tensor.layout.direct.11 family
 
+// tile-codegen:begin convolution.direct family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_conv2d_f32(ANTFLY_CUDA_CONV2D_F32_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = batch * out_channels * out_h * out_w;
@@ -2136,7 +2215,9 @@ extern "C" __global__ void termite_conv2d_f32(ANTFLY_CUDA_CONV2D_F32_PARAMS) {
     }
     dst[idx] = acc;
 }
+// tile-codegen:end convolution.direct family
 
+// tile-codegen:begin attention.direct.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_attention_f32(ANTFLY_CUDA_DENSE_ATTENTION_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int hidden = num_heads * head_dim;
@@ -2192,6 +2273,7 @@ extern "C" __global__ void termite_attention_f32(ANTFLY_CUDA_DENSE_ATTENTION_PAR
     }
     dst[idx] = denom > 0.0f ? acc / denom : 0.0f;
 }
+// tile-codegen:end attention.direct.0 family
 
 // tile-codegen:begin attention.block family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_attention_f32_block(ANTFLY_CUDA_DENSE_ATTENTION_PARAMS) {
@@ -2213,6 +2295,7 @@ extern "C" __global__ void termite_attention_f32_block(ANTFLY_CUDA_DENSE_ATTENTI
 // The symbol remains present in the portable sm_75 artifact, but its body is
 // intentionally empty there.  Runtime dispatch requires SM80+ before it can
 // select this kernel.
+// tile-codegen:begin attention.direct.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ __launch_bounds__(256) void termite_qwen3vl_vision_attention_tc_bf16_m32n16(
     float* dst,
     const float* q,
@@ -2225,6 +2308,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_qwen3vl_vision_attenti
 ) {
 #include "../kernels/vision_bf16_attention_m32n16.cuh"
 }
+// tile-codegen:end attention.direct.1 family
 
 // Shape-specialized BERT encoder prefill attention for the BGE-M3/XLM-R hot
 // path: full attention over head-major [batch, heads, 256, 64] tensors.
@@ -2236,6 +2320,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_qwen3vl_vision_attenti
 // phase boundaries. It is deliberately narrow and selected only when all
 // semantics match exactly (non-causal, unmasked, unbiased, head-major S=256
 // and D=64); other attention routes retain the generic implementation.
+// tile-codegen:begin attention.direct.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64(ANTFLY_CUDA_DENSE_ATTENTION_PARAMS) {
     (void)mask;
     (void)bias;
@@ -2329,6 +2414,7 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64(ANTFLY_C
         dst[q_base + tid] = acc / shared_denom;
     }
 }
+// tile-codegen:end attention.direct.2 family
 
 // Eight-query tile of the same S=256, D=64 BERT attention.  Each warp owns a
 // query row, which removes the cross-warp hand-offs in the single-query
@@ -2473,6 +2559,7 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q16(ANTF
 // dominant P*V term uses f16 tensor cores and then adds the two FP32 residual
 // terms, so value/probability narrowing does not change the result. Online
 // softmax and output stay f32. This is separate from the exact q8 path above.
+// tile-codegen:begin attention.direct.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_mma(ANTFLY_CUDA_DENSE_ATTENTION_PARAMS) {
     (void)mask;
     (void)bias;
@@ -2642,7 +2729,9 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_mma(ANTF
         dst[base + (query_start + row1) * dim + col] = output[row1 * dim + col] * inv_denom1;
     }
 }
+// tile-codegen:end attention.direct.3 family
 
+// tile-codegen:begin attention.direct.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_cross_attention_f32(
     float* dst,
     const float* q,
@@ -2698,7 +2787,9 @@ extern "C" __global__ void termite_cross_attention_f32(
     }
     dst[idx] = denom > 0.0f ? acc / denom : 0.0f;
 }
+// tile-codegen:end attention.direct.4 family
 
+// tile-codegen:begin attention.direct.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_cross_attention_q1_f32(
     float* dst,
     const float* q,
@@ -2775,7 +2866,9 @@ extern "C" __global__ void termite_cross_attention_q1_f32(
         dst[dst_idx] = denom > 0.0f ? acc / denom : 0.0f;
     }
 }
+// tile-codegen:end attention.direct.5 family
 
+// tile-codegen:begin tensor.layout.direct.12 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_token_to_nchw_f32(ANTFLY_CUDA_TOKEN_TO_NCHW_F32_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = batch * height * width * channels;
@@ -2789,7 +2882,9 @@ extern "C" __global__ void termite_token_to_nchw_f32(ANTFLY_CUDA_TOKEN_TO_NCHW_F
     unsigned int dst_idx = ((b * channels + c) * height + y) * width + x;
     dst[dst_idx] = src[idx];
 }
+// tile-codegen:end tensor.layout.direct.12 family
 
+// tile-codegen:begin tensor.layout.direct.13 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_nchw_to_token_f32(ANTFLY_CUDA_TOKEN_TO_NCHW_F32_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = batch * height * width * channels;
@@ -2803,7 +2898,9 @@ extern "C" __global__ void termite_nchw_to_token_f32(ANTFLY_CUDA_TOKEN_TO_NCHW_F
     unsigned int src_idx = ((b * channels + c) * height + y) * width + x;
     dst[idx] = src[src_idx];
 }
+// tile-codegen:end tensor.layout.direct.13 family
 
+// tile-codegen:begin tensor.layout.direct.14 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_pack_windows_f32(ANTFLY_CUDA_PACK_WINDOWS_F32_PARAMS) {
     unsigned int windows_h = padded_h / window_size;
     unsigned int windows_w = padded_w / window_size;
@@ -2831,7 +2928,9 @@ extern "C" __global__ void termite_pack_windows_f32(ANTFLY_CUDA_PACK_WINDOWS_F32
     unsigned int src_idx = (b * height * width + src_y * width + src_x) * dim + feature;
     dst[idx] = src[src_idx];
 }
+// tile-codegen:end tensor.layout.direct.14 family
 
+// tile-codegen:begin tensor.layout.direct.15 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_unpad_windows_f32(ANTFLY_CUDA_PACK_WINDOWS_F32_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = batch * height * width * dim;
@@ -2853,7 +2952,9 @@ extern "C" __global__ void termite_unpad_windows_f32(ANTFLY_CUDA_PACK_WINDOWS_F3
     unsigned int src_idx = (window_idx * window_size * window_size + token) * dim + feature;
     dst[idx] = src[src_idx];
 }
+// tile-codegen:end tensor.layout.direct.15 family
 
+// tile-codegen:begin attention.direct.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_channel_scores_softmax_f32(
     float* scores,
     const float* qkv,
@@ -2928,7 +3029,9 @@ extern "C" __global__ void termite_channel_scores_softmax_f32(
         scores[score_idx] = denom > 0.0f ? row_scores[tid] / denom : 0.0f;
     }
 }
+// tile-codegen:end attention.direct.6 family
 
+// tile-codegen:begin attention.direct.7 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_channel_apply_f32(
     float* dst,
     const float* qkv,
@@ -2957,6 +3060,7 @@ extern "C" __global__ void termite_channel_apply_f32(
     }
     dst[idx] = acc;
 }
+// tile-codegen:end attention.direct.7 family
 
 __device__ float termite_load_tail_weight_f32(const void* ptr, unsigned int dtype, unsigned int offset) {
     if (dtype == 1u) return __half2float(reinterpret_cast<const __half*>(ptr)[offset]);
@@ -2964,6 +3068,7 @@ __device__ float termite_load_tail_weight_f32(const void* ptr, unsigned int dtyp
     return reinterpret_cast<const float*>(ptr)[offset];
 }
 
+// tile-codegen:begin elementwise.direct.13 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_florence_vision_tail_sources_f32(ANTFLY_CUDA_FLORENCE_VISION_TAIL_SOURCES_F32_PARAMS) {
     unsigned int token_count = height * width;
     unsigned int out_seq = token_count + 1u;
@@ -3000,6 +3105,7 @@ extern "C" __global__ void termite_florence_vision_tail_sources_f32(ANTFLY_CUDA_
         : termite_load_tail_weight_f32(row_embed, row_dtype, y * row_dim + (feature - col_dim));
     dst[idx] = tokens[(b * token_count + token) * dim + feature] + pos + temporal;
 }
+// tile-codegen:end elementwise.direct.13 family
 
 __device__ float termite_rope_frequency(unsigned int pair_index, unsigned int rope_dim, float theta) {
     return 1.0f / powf(theta, (2.0f * (float)pair_index) / (float)rope_dim);
@@ -3173,6 +3279,7 @@ extern "C" __global__ void termite_rope_decode_scalars_f32(ANTFLY_CUDA_ROPE_DECO
 }
 // tile-codegen:end reduce.rope.2 family
 
+// tile-codegen:begin kv.storage.direct.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_decode_scalars_advance(
     unsigned int* decode_scalars,
     unsigned int position_delta,
@@ -3188,6 +3295,7 @@ extern "C" __global__ void termite_decode_scalars_advance(
     decode_scalars[3] += total_sequence_delta;
     decode_scalars[4] += kv_position_delta;
 }
+// tile-codegen:end kv.storage.direct.0 family
 
 // tile-codegen:begin reduce.rope.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_rope_scaled_f32(ANTFLY_CUDA_ROPE_SCALED_PARAMS) {
@@ -3286,6 +3394,7 @@ extern "C" __global__ void termite_rms_norm_heads_rope_decode_scalars_f32(ANTFLY
 }
 // tile-codegen:end reduce.rope.4 family
 
+// tile-codegen:begin attention.direct.8 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_f32(
     float* dst,
     const float* q,
@@ -3369,6 +3478,7 @@ extern "C" __global__ void termite_gqa_attention_f32(
 
     dst[idx] = denom > 0.0f ? acc / denom : 0.0f;
 }
+// tile-codegen:end attention.direct.8 family
 
 // tile-codegen:begin attention.gqa_fast family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_decode_scalars_fast_f32(
@@ -5082,23 +5192,6 @@ static __device__ bool validate_launch(
     return true;
 }
 
-template <int HeadDim>
-static __device__ __forceinline__ size_t flash_shared_bytes() {
-    // Keep this layout mirrored by the typed renderer and qualification harness.
-    if constexpr (kKvHeads == 2u) {
-        return (kQueryTile + 2u * kKeyTile) * HeadDim * sizeof(half) + 3u * kQueryTile * sizeof(float) +
-            kQueryTile * kKeyTile * sizeof(half) +
-            (kKeyTile + 1u) * sizeof(unsigned);
-    }
-    return
-        2u * kQueryTile * HeadDim * sizeof(half) + // Q tile + K/V tile
-        kQueryTile * kKeyTile * sizeof(float) +   // scores
-        kQueryTile * kKeyTile * sizeof(half) +    // probabilities
-        kWarps * kQueryTile * 16u * sizeof(float) + // per-warp WMMA scratch
-        3u * kQueryTile * sizeof(unsigned) +       // physical, begin, end
-        4u * kQueryTile * sizeof(float) +          // max, denom, alpha, beta
-        sizeof(unsigned);                          // shared error
-}
 
 template <int HeadDim, int SlidingWindow>
 static __device__ void flash_prefill_body(
@@ -6368,6 +6461,7 @@ __device__ __forceinline__ bool termite_kv_suffix_start(const unsigned int* deco
     return true;
 }
 
+// tile-codegen:begin kv.storage.direct.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_kv_write_suffix_decode_scalars_f32(ANTFLY_CUDA_KV_SUFFIX_DENSE_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = suffix_token_count * row_width;
@@ -6378,6 +6472,7 @@ extern "C" __global__ void termite_kv_write_suffix_decode_scalars_f32(ANTFLY_CUD
     k_dst[dst_idx] = k_src[idx];
     v_dst[dst_idx] = v_src[idx];
 }
+// tile-codegen:end kv.storage.direct.1 family
 
 __device__ __forceinline__ unsigned char termite_tq_encode_polar4_scalar(float value) {
     float clipped = fminf(fmaxf(value, -1.0f), 1.0f);
@@ -6624,6 +6719,7 @@ __device__ __forceinline__ float termite_tq_value_at(
     return 0.0f;
 }
 
+// tile-codegen:begin kv.storage.direct.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_kv_write_suffix_turboquant_f32(ANTFLY_CUDA_KV_SUFFIX_TQ_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (suffix_token_count == 0u || row_width == 0u || key_row_bytes == 0u || base_key_row_bytes == 0u || value_row_bytes == 0u) return;
@@ -6721,6 +6817,7 @@ extern "C" __global__ void termite_kv_write_suffix_turboquant_f32(ANTFLY_CUDA_KV
         }
     }
 }
+// tile-codegen:end kv.storage.direct.2 family
 
 __device__ __forceinline__ void termite_tq_fast_online_impl(ANTFLY_CUDA_PAGED_ATTENTION_PARAMS,
     unsigned int lane, unsigned int q_base, unsigned int kv_head,
@@ -6739,6 +6836,7 @@ __device__ __forceinline__ void termite_tq_fast_online_impl(ANTFLY_CUDA_PAGED_AT
     }
 }
 
+// tile-codegen:begin attention.direct.9 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_decode_turboquant_fast_f32(ANTFLY_CUDA_PAGED_ATTENTION_PARAMS) {
     if (decode_scalars != 0) {
         kv_position_offset = decode_scalars[4];
@@ -6784,7 +6882,9 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_fast_f32(ANTF
     unsigned int q_base = head * head_dim;
     termite_tq_fast_online_impl(dst, q, k, v, block_table, attn_or_mask, bias, batch, q_seq_len, kv_seq_len, num_heads, num_kv_heads, head_dim, query_position_offset, kv_position_offset, sliding_window, total_sequence_len, mask_len, bias_mode, key_row_bytes, base_key_row_bytes, value_row_bytes, block_count, page_size_tokens, format, value_format, physical_token_capacity, decode_scalars, lane, q_base, kv_head, key_start, key_end);
 }
+// tile-codegen:end attention.direct.9 family
 
+// tile-codegen:begin attention.direct.10 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_prefill_turboquant_fast_f32(ANTFLY_CUDA_PAGED_ATTENTION_PARAMS) {
     (void)attn_or_mask;
     (void)bias;
@@ -6835,6 +6935,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_fast_f32(ANT
     unsigned int q_base = (b * q_seq_len + qi) * q_hidden + head * head_dim;
     termite_tq_fast_online_impl(dst, q, k, v, block_table, attn_or_mask, bias, batch, q_seq_len, kv_seq_len, num_heads, num_kv_heads, head_dim, query_position_offset, kv_position_offset, sliding_window, total_sequence_len, mask_len, bias_mode, key_row_bytes, base_key_row_bytes, value_row_bytes, block_count, page_size_tokens, format, value_format, physical_token_capacity, decode_scalars, lane, q_base, kv_head, key_start, key_end);
 }
+// tile-codegen:end attention.direct.10 family
 
 // Exact-F16 paged GQA prefill candidate. One CTA owns a 16-query tile for a
 // single query head. Keys are visited once in chronological order and reused
@@ -6842,6 +6943,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_fast_f32(ANT
 // dimension, preserving the established fast kernel's F32 block-reduction
 // topology while avoiding both BF16 staging and K/V tile regrouping.
 // Grid: (num_heads, ceil(q_seq_len / 16)); blockDim.x = head_dim (256 or 512).
+// tile-codegen:begin attention.direct.11 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_prefill_tiled_f16_exact_f32(ANTFLY_CUDA_PAGED_ATTENTION_PARAMS) {
     (void)attn_or_mask;
     (void)bias;
@@ -6996,12 +7098,14 @@ extern "C" __global__ void termite_gqa_attention_prefill_tiled_f16_exact_f32(ANT
         }
     }
 }
+// tile-codegen:end attention.direct.11 family
 
 // Raw-F16 warp-tiled GQA prefill candidate. Eight warps own two queries each.
 // For every 32-key span, lanes compute QK scores independently in parallel,
 // then replay those scores and raw F16 values in chronological key order so
 // online-softmax/PV semantics never depend on a BF16 staging tile.
 // Grid: (num_heads, ceil(q_seq_len / 16)); blockDim.x = 256.
+// tile-codegen:begin attention.direct.12 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_prefill_tiled_f16_warp_f32(ANTFLY_CUDA_PAGED_ATTENTION_PARAMS) {
     (void)attn_or_mask;
     (void)bias;
@@ -7169,6 +7273,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_tiled_f16_warp_f32(ANTF
         }
     }
 }
+// tile-codegen:end attention.direct.12 family
 
 // Tiled prefill attention over turboquant pages. Each warp owns TWO query
 // rows (TILE_M = 16 rows per block, 8 warps) so every K/V element staged
@@ -7185,6 +7290,7 @@ __device__ __forceinline__ float termite_bf16_bits_to_f32(unsigned short bits) {
     return __uint_as_float(((unsigned int)bits) << 16);
 }
 
+// tile-codegen:begin attention.direct.13 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(ANTFLY_CUDA_PAGED_ATTENTION_PARAMS) {
     (void)attn_or_mask;
     (void)bias;
@@ -7437,6 +7543,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(AN
         }
     }
 }
+// tile-codegen:end attention.direct.13 family
 
 // Tensor-core (wmma f16, 16x16x16) variant of the tiled prefill kernel.
 // One block handles 16 query rows for one head; keys stream through shared
@@ -7449,10 +7556,12 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(AN
 // are post-norm and P is in [0,1], where f16 carries more mantissa than
 // bf16. Requires the >48KB dynamic-smem opt-in on the function (65280 bytes
 // at head_dim 256); host code sets CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE.
+// tile-codegen:begin attention.direct.14 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_prefill_turboquant_mma_f32(ANTFLY_CUDA_PAGED_ATTENTION_PARAMS) {
 #define TERMITE_TQ_MMA_PREFILL_ROWS 16u
 #include "../kernels/tq_mma_prefill.cuh"
 }
+// tile-codegen:end attention.direct.14 family
 
 // TILE_M=32 variant of the tensor-core prefill kernel (head_dim <= 256,
 // sm80+ shared-memory budget: 320*head_dim + 14848 bytes, 96768 at 256).
@@ -7461,10 +7570,12 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_mma_f32(ANTF
 // 32x64 score matrix (m-chunk = warp/4, n-chunk = warp%4), then four query
 // rows for the online softmax, then 2*(head_dim/16) output tiles round-robin
 // for O += P*V.
+// tile-codegen:begin attention.direct.15 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_prefill_turboquant_mma_m32_f32(ANTFLY_CUDA_PAGED_ATTENTION_PARAMS) {
 #define TERMITE_TQ_MMA_PREFILL_ROWS 32u
 #include "../kernels/tq_mma_prefill.cuh"
 }
+// tile-codegen:end attention.direct.15 family
 
 // Opt-in E4B F16 decode: independent warp softmax avoids per-key CTA barriers.
 // Each CTA emits the existing split-attention partial ABI. Window-relative
@@ -7688,14 +7799,19 @@ __device__ __forceinline__ void termite_tq_split_stage1_impl(ANTFLY_CUDA_TQ_SPLI
     }
 }
 
+// tile-codegen:begin attention.direct.16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage1_f32(ANTFLY_CUDA_TQ_SPLIT_STAGE1_PARAMS) {
     termite_tq_split_stage1_impl<false >(partial_acc, partial_meta, q, k, v, block_table, kv_seq_len, num_heads, num_kv_heads, head_dim, query_position_offset, kv_position_offset, sliding_window, key_row_bytes, value_row_bytes, block_count, page_size_tokens, format, value_format, physical_token_capacity, decode_scalars, chunk_size, chunk_count);
 }
+// tile-codegen:end attention.direct.16 family
 
+// tile-codegen:begin attention.direct.17 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32(ANTFLY_CUDA_TQ_SPLIT_STAGE1_PARAMS) {
     termite_tq_split_stage1_impl<true >(partial_acc, partial_meta, q, k, v, block_table, kv_seq_len, num_heads, num_kv_heads, head_dim, query_position_offset, kv_position_offset, sliding_window, key_row_bytes, value_row_bytes, block_count, page_size_tokens, format, value_format, physical_token_capacity, decode_scalars, chunk_size, chunk_count);
 }
+// tile-codegen:end attention.direct.17 family
 
+// tile-codegen:begin attention.direct.18 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage2_f32(
     float* dst,
     const float* partial_acc,
@@ -7755,7 +7871,9 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage2_
         dst[head * head_dim + lane] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
     }
 }
+// tile-codegen:end attention.direct.18 family
 
+// tile-codegen:begin attention.direct.19 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(ANTFLY_CUDA_PAGED_ATTENTION_PARAMS) {
     if (decode_scalars != 0) {
         kv_position_offset = decode_scalars[4];
@@ -7906,6 +8024,7 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(ANTFLY_CU
         dst[out_idx] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
     }
 }
+// tile-codegen:end attention.direct.19 family
 
 __device__ float termite_q8_0_value_broadcast_scale(const unsigned char* bp, unsigned int lane) {
     float d = 0.0f;
@@ -8114,6 +8233,7 @@ extern "C" __global__ void termite_linear_q8_0_bias_add_f32_fast_r4c4(ANTFLY_CUD
 // conversion. Adjacent threads write adjacent elements rather than each
 // thread issuing 32 strided stores. The grid-stride loop preserves the ABI
 // and handles partial groups; used by both resident and bounded BF16 staging.
+// tile-codegen:begin elementwise.direct.14 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_dequant_q4_0_bf16(unsigned short* dst, const unsigned char* src, unsigned int block_count) {
     const size_t pairs = size_t(block_count) * 16u;
     const size_t stride = size_t(gridDim.x) * blockDim.x;
@@ -8127,12 +8247,14 @@ extern "C" __global__ void termite_dequant_q4_0_bf16(unsigned short* dst, const 
         out[16] = termite_f32_to_bf16(float(int(packed >> 4u) - 8) * d);
     }
 }
+// tile-codegen:end elementwise.direct.14 family
 
 // Repack GGUF Q8_0 blocks (f16 scale followed by 32 signed bytes) into the
 // tensor-core layout consumed by termite_q8_0_tc_value_at: all scales first,
 // followed by all quant bytes. The encoded size is unchanged. Doing this on
 // the device avoids millions of tiny host memcpy calls and a second H2D copy
 // when a Q8 projector is prepared lazily.
+// tile-codegen:begin tensor.layout.direct.16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_pack_q8_0_tensor_core(
     unsigned char* dst,
     const unsigned char* src,
@@ -8156,6 +8278,7 @@ extern "C" __global__ void termite_pack_q8_0_tensor_core(
         }
     }
 }
+// tile-codegen:end tensor.layout.direct.16 family
 
 __device__ __forceinline__ void termite_store_half_bytes(unsigned char* dst, float value) {
     unsigned short raw = __half_as_ushort(__float2half_rn(value));
@@ -8182,52 +8305,9 @@ __device__ __forceinline__ int termite_load_i8x4_aligned(const signed char* valu
     return *((const int*)values);
 }
 
-__device__ __forceinline__ int termite_pack_q4_0_raw_i8x4(const unsigned char* bp, unsigned int base_lane) {
-    unsigned int packed = 0u;
-    #pragma unroll
-    for (unsigned int j = 0u; j < 4u; ++j) {
-        unsigned int lane = base_lane + j;
-        unsigned char byte = bp[2u + (lane & 15u)];
-        unsigned int q = lane < 16u ? (unsigned int)(byte & 0x0fu) : (unsigned int)(byte >> 4);
-        packed |= (q & 0xffu) << (j * 8u);
-    }
-    return (int)packed;
-}
 
-__device__ __forceinline__ int termite_pack_q4_0_centered_i8x4(const unsigned char* bp, unsigned int base_lane) {
-    unsigned int packed = 0u;
-    #pragma unroll
-    for (unsigned int j = 0u; j < 4u; ++j) {
-        unsigned int lane = base_lane + j;
-        unsigned char byte = bp[2u + (lane & 15u)];
-        int q = lane < 16u ? (int)(byte & 0x0fu) : (int)(byte >> 4);
-        signed char centered = (signed char)(q - 8);
-        packed |= ((unsigned int)(unsigned char)centered) << (j * 8u);
-    }
-    return (int)packed;
-}
 
-__device__ __forceinline__ int termite_pack_q4_0_low_centered_i8x4(const unsigned char* bp, unsigned int base_lane) {
-    unsigned int packed = 0u;
-    #pragma unroll
-    for (unsigned int j = 0u; j < 4u; ++j) {
-        unsigned char byte = bp[2u + base_lane + j];
-        signed char centered = (signed char)((int)(byte & 0x0fu) - 8);
-        packed |= ((unsigned int)(unsigned char)centered) << (j * 8u);
-    }
-    return (int)packed;
-}
 
-__device__ __forceinline__ int termite_pack_q4_0_high_centered_i8x4(const unsigned char* bp, unsigned int base_lane) {
-    unsigned int packed = 0u;
-    #pragma unroll
-    for (unsigned int j = 0u; j < 4u; ++j) {
-        unsigned char byte = bp[2u + base_lane + j];
-        signed char centered = (signed char)((int)(byte >> 4) - 8);
-        packed |= ((unsigned int)(unsigned char)centered) << (j * 8u);
-    }
-    return (int)packed;
-}
 
 struct termite_q4_0_centered_i8x4_pair {
     int low;
@@ -8354,6 +8434,7 @@ __device__ __forceinline__ void termite_store_q4_0_cols_warp_sum_warps(
     }
 }
 
+// tile-codegen:begin projection.direct.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q8_0_f32(ANTFLY_CUDA_QUANT_LINEAR_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = rows * out_dim;
@@ -8373,6 +8454,7 @@ extern "C" __global__ void termite_linear_q8_0_f32(ANTFLY_CUDA_QUANT_LINEAR_PARA
     }
     dst[idx] = acc;
 }
+// tile-codegen:end projection.direct.2 family
 
 template <unsigned int COLS>
 __device__ void termite_q8_0_tile_cols(
@@ -8431,6 +8513,7 @@ extern "C" __global__ void termite_linear_q8_0_f32_tile4(ANTFLY_CUDA_QUANT_LINEA
 }
 // tile-codegen:end quant_cuda.q8_0_tile.1 family
 
+// tile-codegen:begin projection.direct.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q8_0_gated_down_f32_tile4(ANTFLY_CUDA_QUANT_GATED_DOWN_PARAMS) {
     unsigned int col_tile = blockIdx.x * 4u;
     unsigned int row = blockIdx.y;
@@ -8460,7 +8543,9 @@ extern "C" __global__ void termite_linear_q8_0_gated_down_f32_tile4(ANTFLY_CUDA_
     for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] = acc[c];
 #include "../kernels/quant_tile4_publish.cuh"
 }
+// tile-codegen:end projection.direct.3 family
 
+// tile-codegen:begin projection.direct.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_f32(ANTFLY_CUDA_QUANT_LINEAR_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = rows * out_dim;
@@ -8477,6 +8562,7 @@ extern "C" __global__ void termite_linear_q4_0_f32(ANTFLY_CUDA_QUANT_LINEAR_PARA
     }
     dst[idx] = acc;
 }
+// tile-codegen:end projection.direct.4 family
 
 template <unsigned int COLS, unsigned int WARPS = 8u, bool Gated = false>
 __device__ __forceinline__ void termite_q4_0_tile_cols_at(
@@ -8762,6 +8848,7 @@ __device__ __forceinline__ void termite_q4_0_q8_1_rows_impl(
 }
 
 // Named two-row operand staging retains SM100 register usage (32 versus 40).
+// tile-codegen:begin projection.direct.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows2(ANTFLY_CUDA_Q8_INPUT_LINEAR_PARAMS) {
     const unsigned int cols = 4u;
     const unsigned int rows_per_block = 2u;
@@ -8862,6 +8949,7 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows2(ANTFLY_CU
         }
     }
 }
+// tile-codegen:end projection.direct.5 family
 
 // tile-codegen:begin quant_cuda.q4_0_tile.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows4(ANTFLY_CUDA_Q8_INPUT_LINEAR_PARAMS) {
@@ -8890,6 +8978,7 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down(
 }
 // tile-codegen:end quant_cuda.q4_0_tile.2 family
 
+// tile-codegen:begin projection.direct.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows(
     float* dst,
     const unsigned char* q8_input,
@@ -8908,6 +8997,7 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows(
     termite_q4_0_q8_1_cols_partial<4u>(acc, q8_input, weight, row, row_blocks, 0u, col_tile, true, tid);
     termite_store_q4_0_cols_warp_sum_warps<4u, 8u, true, true>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
+// tile-codegen:end projection.direct.6 family
 
 // tile-codegen:begin quant_cuda.q4_0_tile.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w10_e4b_down(
@@ -8928,6 +9018,7 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w10_e4b_down(
 }
 // tile-codegen:end quant_cuda.q4_0_tile.3 family
 
+// tile-codegen:begin projection.direct.7 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile8(ANTFLY_CUDA_Q8_INPUT_LINEAR_PARAMS) {
     const unsigned int cols = 8u;
     unsigned int col_tile = blockIdx.x * cols;
@@ -8943,6 +9034,7 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile8(ANTFLY_CUDA_Q8_INP
     termite_q4_0_q8_1_cols_partial<8u>(acc, q8_input, weight, row, row_blocks, out_dim, col_tile, full_tile, tid);
     termite_store_q4_0_cols_warp_sum_warps<8u, 4u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
+// tile-codegen:end projection.direct.7 family
 
 // tile-codegen:begin quant_cuda.q4_0_tile.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_f32_tile8(ANTFLY_CUDA_QUANT_LINEAR_PARAMS) {
@@ -9043,6 +9135,7 @@ extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_f32_til
 }
 // tile-codegen:end quant_cuda.q4_0_tile.5 family
 
+// tile-codegen:begin projection.direct.8 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4(
     float* dst,
     const unsigned char* q8_input,
@@ -9087,6 +9180,7 @@ extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_q8_1_f3
         }
     }
 }
+// tile-codegen:end projection.direct.8 family
 
 // tile-codegen:begin quant_cuda.q4_0_tile.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_gated_down_f32_tile4(ANTFLY_CUDA_QUANT_GATED_DOWN_PARAMS) {
@@ -9106,14 +9200,6 @@ extern "C" __global__ void termite_linear_q4_0_gated_down_f32_tile16(ANTFLY_CUDA
 }
 // tile-codegen:end quant_cuda.q4_0_tile.6 family
 
-__device__ __forceinline__ int termite_pack_q6k_i8x4(const unsigned char* bp, unsigned int base_value_index) {
-    signed char values[4];
-    #pragma unroll
-    for (unsigned int i = 0u; i < 4u; ++i) {
-        values[i] = (signed char)termite_q6k_quant_i32(bp, base_value_index + i);
-    }
-    return termite_pack_i8x4(values);
-}
 
 __device__ __forceinline__ int termite_pack_q6k_i8x4_sub(const unsigned char* bp, unsigned int sub, unsigned int sub_offset) {
     signed char values[4];
@@ -10061,6 +10147,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile4(ANTFLY_CUDA
 }
 // tile-codegen:end quant_cuda.q4_0_projections.0 family
 
+// tile-codegen:begin projection.direct.9 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile4_w4(ANTFLY_CUDA_QUANT_PAIR_PARAMS) {
     const unsigned int cols = 4u;
     unsigned int tiles = (out_dim + cols - 1u) / cols;
@@ -10075,6 +10162,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile4_w4(ANTFLY_C
     float* dst = projection == 0u ? dst_a : dst_b;
     termite_q4_0_tile_cols_at<4u, 4u>(dst, input, weight, rows, in_dim, out_dim, row, col_tile);
 }
+// tile-codegen:end projection.direct.9 family
 
 template<unsigned int Warps>
 __device__ __forceinline__ void termite_q4_0_pair_q8_1_tile4_impl(
@@ -10144,6 +10232,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile4_w8(ANT
 }
 // tile-codegen:end quant_cuda.q4_0_projections.1 family
 
+// tile-codegen:begin projection.direct.10 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile8(ANTFLY_CUDA_Q8_INPUT_PAIR_PARAMS) {
     const unsigned int cols = 8u;
     unsigned int tiles = (out_dim + cols - 1u) / cols;
@@ -10181,7 +10270,9 @@ extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile8(ANTFLY
     }
     termite_store_q4_0_cols_warp_sum_warps<8u, 4u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
+// tile-codegen:end projection.direct.10 family
 
+// tile-codegen:begin projection.direct.11 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_pair_activation_f32_tile4_w4(
     float* dst,
     const float* input,
@@ -10257,6 +10348,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_f32_tile4_w4(
         }
     }
 }
+// tile-codegen:end projection.direct.11 family
 
 template<unsigned int Warps>
 __device__ __forceinline__ void termite_q4_0_pair_activation_q8_1_tile4_impl(
@@ -10388,6 +10480,7 @@ __device__ __forceinline__ float termite_a4b_exp_approx_f32(float x_in) {
     return __fmul_rn(p, __int_as_float((ki + 127) << 23));
 }
 
+// tile-codegen:begin selection.direct.9 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_a4b_topk_rows_f32(
     unsigned int* route_ids,
     float* route_weights,
@@ -10450,7 +10543,9 @@ extern "C" __global__ void termite_gemma4_a4b_topk_rows_f32(
         }
     }
 }
+// tile-codegen:end selection.direct.9 family
 
+// tile-codegen:begin expert.projection.direct.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_a4b_q4_0_gate_up_rows_q8_1_f32(ANTFLY_CUDA_GEMMA4_A4B_Q4_0_GATE_UP_ROWS_Q8_1_F32_PARAMS) {
     const unsigned int cols = 4u;
     const unsigned int tiles = (out_dim + cols - 1u) / cols;
@@ -10512,7 +10607,9 @@ extern "C" __global__ void termite_gemma4_a4b_q4_0_gate_up_rows_q8_1_f32(ANTFLY_
         }
     }
 }
+// tile-codegen:end expert.projection.direct.0 family
 
+// tile-codegen:begin expert.projection.direct.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_a4b_q4_0_down_rows_q8_1_f32(ANTFLY_CUDA_GEMMA4_A4B_Q4_0_DOWN_ROWS_Q8_1_F32_PARAMS) {
     const unsigned int cols = 8u;
     const unsigned int col_tile = blockIdx.x * cols;
@@ -10542,10 +10639,12 @@ extern "C" __global__ void termite_gemma4_a4b_q4_0_down_rows_q8_1_f32(ANTFLY_CUD
     }
     termite_store_q4_0_cols_warp_sum_warps<8u, 4u>(expert_output, route, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
+// tile-codegen:end expert.projection.direct.1 family
 
 // Decode-only A4B down projection. Its 704-wide input has 22 Q4_0 blocks, so
 // only 44 threads contribute. Two warps retain the original thread/block
 // mapping and arithmetic while avoiding two idle warps per CTA.
+// tile-codegen:begin expert.projection.direct.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_a4b_q4_0_down_rows_q8_1_f32_compact(ANTFLY_CUDA_GEMMA4_A4B_Q4_0_DOWN_ROWS_Q8_1_F32_PARAMS) {
     if (rows != 1u || top_k != 8u || in_dim != 704u || out_dim != 2816u || blockDim.x != 64u) return;
     const unsigned int cols = 8u;
@@ -10582,7 +10681,9 @@ extern "C" __global__ void termite_gemma4_a4b_q4_0_down_rows_q8_1_f32_compact(AN
         warp
     );
 }
+// tile-codegen:end expert.projection.direct.2 family
 
+// tile-codegen:begin expert.projection.direct.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gemma4_a4b_combine_rows_f32(
     float* dst,
     const float* expert_output,
@@ -10603,6 +10704,7 @@ extern "C" __global__ void termite_gemma4_a4b_combine_rows_f32(
     }
     dst[index] = value;
 }
+// tile-codegen:end expert.projection.direct.3 family
 
 template<unsigned int Warps>
 __device__ __forceinline__ void termite_e4b_ffn_pair_impl(float* dst,
@@ -11276,6 +11378,7 @@ float x = activated[warp][lane];
 // quant-kernel-codegen:end cuda e4b ffn packed_weights_first
 }
 
+// tile-codegen:begin projection.direct.12 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile8(ANTFLY_CUDA_Q8_INPUT_PAIR_ACTIVATION_PARAMS) {
     const unsigned int cols = 8u;
     unsigned int tiles = (out_dim + cols - 1u) / cols;
@@ -11341,6 +11444,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile8(AN
         }
     }
 }
+// tile-codegen:end projection.direct.12 family
 
 // tile-codegen:begin quant_cuda.q4_0_projections.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile8(ANTFLY_CUDA_QUANT_PAIR_PARAMS) {
@@ -11572,6 +11676,7 @@ extern "C" __global__ void termite_linear_q6_k_argmax_rows_stage1_tile16(ANTFLY_
 }
 // tile-codegen:end quant_cuda.q4_0_projections.5 family
 
+// tile-codegen:begin projection.direct.13 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8(ANTFLY_CUDA_Q8_QUANT_ARGMAX_PARAMS) {
     const unsigned int cols = 8u;
     unsigned int col_tiles = (out_dim + cols - 1u) / cols;
@@ -11702,6 +11807,7 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8(ANT
         partial_indices[global_tile] = best_index;
     }
 }
+// tile-codegen:end projection.direct.13 family
 
 __device__ __forceinline__ int termite_q6k_pack_i8x4_exact_2816(
     const unsigned char* block,
@@ -11753,6 +11859,7 @@ __device__ __forceinline__ int termite_q6k_q8_1_dot16_exact_2816(
 // lets ptxas hoist Q6_K address arithmetic and avoids the generic kernel's
 // dynamic shape/suppression branches. Six warps cover the 176 useful
 // block/sub-block tasks without an inactive tail warp.
+// tile-codegen:begin projection.direct.14 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b(ANTFLY_CUDA_Q8_QUANT_ARGMAX_PARAMS) {
     (void)suppress_token_ids;
     if (rows != 1u || in_dim != 2816u || out_dim == 0u || (out_dim & 7u) != 0u ||
@@ -11820,7 +11927,9 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b
     partial_values[global_tile] = best_value;
     partial_indices[global_tile] = best_index;
 }
+// tile-codegen:end projection.direct.14 family
 
+// tile-codegen:begin projection.direct.15 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b(ANTFLY_CUDA_Q8_QUANT_ARGMAX_PARAMS) {
     (void)suppress_token_ids;
     (void)rows;
@@ -11854,7 +11963,9 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b
         partial_indices[global_tile] = best_index;
     }
 }
+// tile-codegen:end projection.direct.15 family
 
+// tile-codegen:begin projection.direct.16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q6_k_q8_1_f32_tile8_e4b(
     float* dst,
     const unsigned char* input_q8_1,
@@ -11880,6 +11991,7 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_f32_tile8_e4b(
         }
     }
 }
+// tile-codegen:end projection.direct.16 family
 
 template<unsigned int MaxWarps>
 __device__ __forceinline__ void termite_argmax_reduce_pairs_impl(
@@ -12034,6 +12146,7 @@ extern "C" __global__ void termite_linear_bf16_weight_f32_qkv_nobias_tiled(ANTFL
 }
 // tile-codegen:end attention.qkv_tiled family
 
+// tile-codegen:begin projection.direct.17 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q8_0_qkv_nobias_f32_tile4(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
     const unsigned int cols = 4u;
     unsigned int q_tiles = (q_out_dim + cols - 1u) / cols;
@@ -12067,6 +12180,7 @@ extern "C" __global__ void termite_linear_q8_0_qkv_nobias_f32_tile4(ANTFLY_CUDA_
 
 #include "../kernels/q8_projection_tile4.cuh"
 }
+// tile-codegen:end projection.direct.17 family
 
 // F32 QKV variants select the projection here, then use the existing ordinary
 // Q4_0 dot schedule with their exact column and warp extents.
@@ -12111,9 +12225,11 @@ extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile4(ANTFLY_CUDA_
 }
 // tile-codegen:end quant_cuda.q4_0_projections.6 family
 
+// tile-codegen:begin projection.direct.18 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile4_w4(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
     termite_q4_0_qkv_projection_impl<4u, 4u>(dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
 }
+// tile-codegen:end projection.direct.18 family
 
 template<unsigned int Columns>
 __device__ __forceinline__ void termite_packed_qkv_projection_impl(    float* dst_q,      float* dst_k,      float* dst_v,      const unsigned char* q8_input,      const unsigned char* weight_q,      const unsigned char* weight_k,      const unsigned char* weight_v,      unsigned int rows,      unsigned int in_dim,      unsigned int q_out_dim,      unsigned int kv_out_dim
@@ -12190,10 +12306,13 @@ extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile4(ANTFLY_
 }
 // tile-codegen:end quant_cuda.qkv_q8_1.0 family
 
+// tile-codegen:begin projection.direct.19 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8(ANTFLY_CUDA_Q8_INPUT_QKV_PARAMS) {
     termite_packed_qkv_projection_impl<8u>(dst_q, dst_k, dst_v, q8_input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
 }
+// tile-codegen:end projection.direct.19 family
 
+// tile-codegen:begin projection.direct.20 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4(ANTFLY_CUDA_Q8_INPUT_QKV_PARAMS) {
     const unsigned int cols = 8u;
     const unsigned int rows_per_block = 4u;
@@ -12327,6 +12446,7 @@ extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4(A
         }
     }
 }
+// tile-codegen:end projection.direct.20 family
 
 // tile-codegen:begin quant_cuda.qkv_q8_1.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8(ANTFLY_CUDA_Q8_INPUT_QKV_PARAMS) {
@@ -12393,6 +12513,7 @@ extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile8(ANTFLY_CUDA_
 }
 // tile-codegen:end quant_cuda.q4_0_projections.7 family
 
+// tile-codegen:begin projection.direct.21 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_k_qkv_nobias_f32_tiled(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
     unsigned int q_plane = rows * q_out_dim;
     unsigned int kv_plane = rows * kv_out_dim;
@@ -12441,7 +12562,9 @@ extern "C" __global__ void termite_linear_q4_k_qkv_nobias_f32_tiled(ANTFLY_CUDA_
     }
     if (tid == 0u) dst[local] = partial[0];
 }
+// tile-codegen:end projection.direct.21 family
 
+// tile-codegen:begin projection.direct.22 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled(ANTFLY_CUDA_LINEAR_Q4_K_Q4_K_F32_QKV_NOBIAS_TILED_PARAMS) {
     unsigned int q_plane = rows * q_out_dim;
     unsigned int kv_plane = rows * kv_out_dim;
@@ -12498,6 +12621,7 @@ extern "C" __global__ void termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled(ANTFLY_
     }
     if (tid == 0u) dst[local] = partial[0];
 }
+// tile-codegen:end projection.direct.22 family
 
 template<unsigned int Format, typename Index>
 __device__ __forceinline__ void termite_embedding_quant_impl(
@@ -12573,6 +12697,7 @@ extern "C" __global__ void termite_embedding_add_weighted_i32_q6_k_f32(
 }
 // tile-codegen:end quant_cuda.embedding.0 family
 
+// tile-codegen:begin normalization.direct.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_rms_norm_add_weighted_embedding_i32_q6_k_f32(ANTFLY_CUDA_RMS_NORM_ADD_WEIGHTED_EMBEDDING_I32_Q6_K_F32_PARAMS) {
     unsigned int group_row = blockIdx.x;
     unsigned int rows = total * num_groups;
@@ -12607,6 +12732,7 @@ extern "C" __global__ void termite_rms_norm_add_weighted_embedding_i32_q6_k_f32(
         dst[idx] = token_value * lhs_scale + normed_value * rhs_scale;
     }
 }
+// tile-codegen:end normalization.direct.0 family
 
 // tile-codegen:begin quant_cuda.embedding.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_embedding_lookup_i32_q8_0_f32(ANTFLY_CUDA_EMBEDDING_LOOKUP_I32_Q4_K_F32_PARAMS) {
@@ -12666,6 +12792,7 @@ __device__ __forceinline__ float termite_deberta_attention_score_f32(
 // One block owns one (batch, head, query) row. Scores are computed once per
 // key and shared by every output channel; the legacy kernel recomputed all
 // three DeBERTa dot products twice for every channel.
+// tile-codegen:begin attention.direct.20 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_deberta_attention_f32(ANTFLY_CUDA_DEBERTA_ATTENTION_F32_PARAMS) {
     unsigned int row = blockIdx.x;
     unsigned int qi = row % seq_len;
@@ -12731,10 +12858,12 @@ extern "C" __global__ void termite_deberta_attention_f32(ANTFLY_CUDA_DEBERTA_ATT
         dst[(b * seq_len + qi) * hidden + head_off + d] = denom > 0.0f ? acc / denom : 0.0f;
     }
 }
+// tile-codegen:end attention.direct.20 family
 
 // Training kernels intentionally use FP32 state.  They share the inference
 // stream, so graph outputs, accumulated gradients, clipping and AdamW updates
 // remain ordered without host synchronization between operations.
+// tile-codegen:begin training.direct.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_training_accumulate_f32(
     float* accum,
     const float* grad,
@@ -12747,7 +12876,9 @@ extern "C" __global__ void termite_training_accumulate_f32(
     float value = grad[i] * scale;
     accum[i] = first ? value : accum[i] + value;
 }
+// tile-codegen:end training.direct.0 family
 
+// tile-codegen:begin training.direct.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_training_adamw_f32(ANTFLY_CUDA_TRAIN_ADAMW_PARAMS) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
@@ -12761,7 +12892,9 @@ extern "C" __global__ void termite_training_adamw_f32(ANTFLY_CUDA_TRAIN_ADAMW_PA
     float w = weight[i];
     weight[i] = w - lr * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * w);
 }
+// tile-codegen:end training.direct.1 family
 
+// tile-codegen:begin training.direct.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_training_sum_squares_f32(
     float* output,
     const float* input,
@@ -12787,7 +12920,9 @@ extern "C" __global__ void termite_training_sum_squares_f32(
     }
     if (threadIdx.x == 0u) output[0] += partial[0];
 }
+// tile-codegen:end training.direct.2 family
 
+// tile-codegen:begin training.direct.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_masked_bce_accumulate_f32(
     float* accum,
     const float* logits,
@@ -12808,7 +12943,9 @@ extern "C" __global__ void termite_masked_bce_accumulate_f32(
     atomicAdd(accum, bce * label_weight * m);
     atomicAdd(accum + 1, label_weight * m);
 }
+// tile-codegen:end training.direct.3 family
 
+// tile-codegen:begin training.direct.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_masked_bce_finalize_f32(
     float* accum,
     float eps,
@@ -12818,7 +12955,9 @@ extern "C" __global__ void termite_masked_bce_finalize_f32(
         accum[0] /= accum[1] + eps;
     }
 }
+// tile-codegen:end training.direct.4 family
 
+// tile-codegen:begin training.direct.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_masked_bce_backward_f32(ANTFLY_CUDA_MASKED_BCE_BACKWARD_F32_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
@@ -12834,7 +12973,9 @@ extern "C" __global__ void termite_masked_bce_backward_f32(ANTFLY_CUDA_MASKED_BC
     if (mean_reduction) scale /= accum[1] + eps;
     output[idx] = scale * label_weight * m * (sigmoid - label);
 }
+// tile-codegen:end training.direct.5 family
 
+// tile-codegen:begin tensor.layout.direct.17 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_reduce_f32(
     float* output,
     const float* input,
@@ -12907,7 +13048,9 @@ extern "C" __global__ void termite_primitive_reduce_f32(
     if (mode == 2u && reduce_count != 0u) acc /= (float)reduce_count;
     output[out_idx] = acc;
 }
+// tile-codegen:end tensor.layout.direct.17 family
 
+// tile-codegen:begin tensor.layout.direct.18 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_broadcast_f32(
     float* output,
     const float* input,
@@ -12938,7 +13081,9 @@ extern "C" __global__ void termite_primitive_broadcast_f32(
     }
     output[out_idx] = input[input_flat];
 }
+// tile-codegen:end tensor.layout.direct.18 family
 
+// tile-codegen:begin training.direct.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_layer_norm_backward_f32(ANTFLY_CUDA_LAYER_NORM_BACKWARD_PARAMS) {
     unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int input_count = rows * dim;
@@ -12969,7 +13114,9 @@ extern "C" __global__ void termite_layer_norm_backward_f32(ANTFLY_CUDA_LAYER_NOR
         atomicAdd(output + input_count + dim + d, d_y[base + d]);
     }
 }
+// tile-codegen:end training.direct.6 family
 
+// tile-codegen:begin elementwise.direct.15 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_softmax_f32(ANTFLY_CUDA_PRIMITIVE_SOFTMAX_PARAMS) {
     unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int rows = count / last_dim;
@@ -12984,10 +13131,12 @@ extern "C" __global__ void termite_primitive_softmax_f32(ANTFLY_CUDA_PRIMITIVE_S
         output[idx] = log_softmax ? input[idx] - row_max - logf(sum) : expf(input[idx] - row_max) / sum;
     }
 }
+// tile-codegen:end elementwise.direct.15 family
 
 // One block per selected (row, token) pair. Parallel reductions across the
 // vocabulary avoid both the full log-softmax output and the one-thread-per-row
 // serial scan used by the generic primitive.
+// tile-codegen:begin elementwise.direct.16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_selected_token_logprobs_f32(
     float* output,
     const float* logits,
@@ -13029,6 +13178,7 @@ extern "C" __global__ void termite_selected_token_logprobs_f32(
     }
     if (threadIdx.x == 0) output[selected] = row_logits[token] - row_max - logf(reduction[0]);
 }
+// tile-codegen:end elementwise.direct.16 family
 
 template<unsigned int Format, typename Storage>
 __device__ __forceinline__ void termite_primitive_gather_impl(
@@ -13050,29 +13200,41 @@ __device__ __forceinline__ void termite_primitive_gather_integer_impl(float* out
 #undef TERMITE_PRIMITIVE_INTEGER_INDICES
 }
 
+// tile-codegen:begin tensor.layout.direct.19 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_gather_f32(ANTFLY_CUDA_PRIMITIVE_GATHER_PARAMS) {
     termite_primitive_gather_impl<0u>(output, input, indices, output_count, index_count, axis_extent, suffix_size);
 }
+// tile-codegen:end tensor.layout.direct.19 family
 
+// tile-codegen:begin tensor.layout.direct.20 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_gather_bf16_f32(ANTFLY_CUDA_PRIMITIVE_GATHER_BF16_PARAMS) {
     termite_primitive_gather_impl<1u>(output, input, indices, output_count, index_count, axis_extent, suffix_size);
 }
+// tile-codegen:end tensor.layout.direct.20 family
 
+// tile-codegen:begin tensor.layout.direct.21 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_gather_f32_i32(ANTFLY_CUDA_PRIMITIVE_GATHER_I32_PARAMS) {
     termite_primitive_gather_integer_impl<0u, float, int>(output, input, indices, output_count, index_count, axis_extent, suffix_size);
 }
+// tile-codegen:end tensor.layout.direct.21 family
 
+// tile-codegen:begin tensor.layout.direct.22 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_gather_f32_i64(ANTFLY_CUDA_PRIMITIVE_GATHER_I64_PARAMS) {
     termite_primitive_gather_integer_impl<0u, float, long long>(output, input, indices, output_count, index_count, axis_extent, suffix_size);
 }
+// tile-codegen:end tensor.layout.direct.22 family
 
+// tile-codegen:begin tensor.layout.direct.23 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_gather_bf16_f32_i32(ANTFLY_CUDA_PRIMITIVE_GATHER_BF16_I32_PARAMS) {
     termite_primitive_gather_integer_impl<1u, unsigned short, int>(output, input, indices, output_count, index_count, axis_extent, suffix_size);
 }
+// tile-codegen:end tensor.layout.direct.23 family
 
+// tile-codegen:begin tensor.layout.direct.24 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_gather_bf16_f32_i64(ANTFLY_CUDA_PRIMITIVE_GATHER_BF16_I64_PARAMS) {
     termite_primitive_gather_integer_impl<1u, unsigned short, long long>(output, input, indices, output_count, index_count, axis_extent, suffix_size);
 }
+// tile-codegen:end tensor.layout.direct.24 family
 
 template<typename Index>
 __device__ __forceinline__ void termite_primitive_scatter_add_axis0_integer_impl(float* output, const float* input, const Index* indices, unsigned int rows, unsigned int cols, unsigned int output_rows) {
@@ -13081,18 +13243,25 @@ __device__ __forceinline__ void termite_primitive_scatter_add_axis0_integer_impl
 #undef TERMITE_PRIMITIVE_INTEGER_INDICES
 }
 
+// tile-codegen:begin tensor.layout.direct.25 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_scatter_add_axis0_f32(ANTFLY_CUDA_PRIMITIVE_SCATTER_PARAMS) {
 #include "../kernels/primitive_scatter.cuh"
 }
+// tile-codegen:end tensor.layout.direct.25 family
 
+// tile-codegen:begin tensor.layout.direct.26 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_scatter_add_axis0_f32_i32(ANTFLY_CUDA_PRIMITIVE_SCATTER_I32_PARAMS) {
     termite_primitive_scatter_add_axis0_integer_impl<int>(output, input, indices, rows, cols, output_rows);
 }
+// tile-codegen:end tensor.layout.direct.26 family
 
+// tile-codegen:begin tensor.layout.direct.27 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_scatter_add_axis0_f32_i64(ANTFLY_CUDA_PRIMITIVE_SCATTER_I64_PARAMS) {
     termite_primitive_scatter_add_axis0_integer_impl<long long>(output, input, indices, rows, cols, output_rows);
 }
+// tile-codegen:end tensor.layout.direct.27 family
 
+// tile-codegen:begin tensor.layout.direct.28 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_transpose_f32(
     float* output,
     const float* input,
@@ -13123,9 +13292,11 @@ extern "C" __global__ void termite_primitive_transpose_f32(
     }
     output[out_idx] = input[input_idx];
 }
+// tile-codegen:end tensor.layout.direct.28 family
 
 // Coalesced rank-2 transpose. A 256-thread block covers one 32x32 tile in
 // four 32x8 strips; the padded shared-memory stride avoids bank conflicts.
+// tile-codegen:begin tensor.layout.direct.29 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_transpose_2d_f32(
     float* output,
     const float* input,
@@ -13159,7 +13330,9 @@ extern "C" __global__ void termite_primitive_transpose_2d_f32(
         }
     }
 }
+// tile-codegen:end tensor.layout.direct.29 family
 
+// tile-codegen:begin tensor.layout.direct.30 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_concat_f32(
     float* output,
     const float* a,
@@ -13183,7 +13356,9 @@ extern "C" __global__ void termite_primitive_concat_f32(
         output[idx] = b[(outer * b_axis + b_coord) * inner + inner_coord];
     }
 }
+// tile-codegen:end tensor.layout.direct.30 family
 
+// tile-codegen:begin tensor.layout.direct.31 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_primitive_slice_f32(
     float* output,
     const float* input,
@@ -13217,6 +13392,7 @@ extern "C" __global__ void termite_primitive_slice_f32(
     }
     output[out_idx] = input[input_idx];
 }
+// tile-codegen:end tensor.layout.direct.31 family
 
 __device__ __forceinline__ float termite_deberta_training_score(
     const float* q,
@@ -13265,84 +13441,12 @@ __device__ __forceinline__ float termite_deberta_training_dp(
     return value;
 }
 
-__device__ __forceinline__ void termite_deberta_training_row_stats(
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* q_r,
-    const float* k_r,
-    const long long* mask,
-    const float* attn_bias,
-    unsigned int use_bias,
-    const float* d_out,
-    unsigned int b,
-    unsigned int qi,
-    unsigned int head,
-    unsigned int seq_len,
-    unsigned int num_heads,
-    unsigned int head_dim,
-    float* row_max,
-    float* denom,
-    float* dot_p_dp
-) {
-    float max_value = -3.402823466e+38f;
-    bool any = false;
-    for (unsigned int ki = 0; ki < seq_len; ++ki) {
-        if (mask[b * seq_len + ki] == 0ll) continue;
-        any = true;
-        max_value = fmaxf(max_value, termite_deberta_training_score(q, k, q_r, k_r, b, qi, ki, head, seq_len, num_heads, head_dim));
-    }
-    float sum = 0.0f;
-    float weighted_dp = 0.0f;
-    if (any) {
-        for (unsigned int ki = 0; ki < seq_len; ++ki) {
-            if (mask[b * seq_len + ki] == 0ll) continue;
-            float score = termite_deberta_training_score(q, k, q_r, k_r, b, qi, ki, head, seq_len, num_heads, head_dim);
-            float e = expf(score - max_value);
-            sum += e;
-            weighted_dp += e * termite_deberta_training_dp(v, d_out, b, qi, ki, head, seq_len, num_heads, head_dim);
-        }
-    }
-    *row_max = max_value;
-    *denom = sum;
-    *dot_p_dp = sum > 0.0f ? weighted_dp / sum : 0.0f;
-}
 
-__device__ __forceinline__ void termite_deberta_training_pair(
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* q_r,
-    const float* k_r,
-    const float* d_out,
-    unsigned int b,
-    unsigned int qi,
-    unsigned int ki,
-    unsigned int head,
-    unsigned int seq_len,
-    unsigned int num_heads,
-    unsigned int head_dim,
-    float row_max,
-    float denom,
-    float dot_p_dp,
-    float* probability,
-    float* dscore
-) {
-    if (denom <= 0.0f) {
-        *probability = 0.0f;
-        *dscore = 0.0f;
-        return;
-    }
-    float score = termite_deberta_training_score(q, k, q_r, k_r, b, qi, ki, head, seq_len, num_heads, head_dim);
-    float p = expf(score - row_max) / denom;
-    float dp = termite_deberta_training_dp(v, d_out, b, qi, ki, head, seq_len, num_heads, head_dim);
-    *probability = p;
-    *dscore = p * (dp - dot_p_dp);
-}
 
 // Compute softmax probabilities and d(score) once per attention pair. One
 // block owns a complete (batch, head, query) row, so reductions stay local and
 // deterministic while every packed-gradient output can reuse the result.
+// tile-codegen:begin training.direct.7 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_deberta_attention_backward_scores_f32(ANTFLY_CUDA_DEBERTA_ATTENTION_BACKWARD_SCORES_F32_PARAMS) {
     unsigned int row = blockIdx.x;
     unsigned int qi = row % seq_len;
@@ -13413,9 +13517,11 @@ extern "C" __global__ void termite_deberta_attention_backward_scores_f32(ANTFLY_
         d_scores[pair_base + ki] = probability * (d_probability[ki] - dot_p_dp);
     }
 }
+// tile-codegen:end training.direct.7 family
 
 // Deterministic packed VJP. Each output element has a unique writer; the
 // expensive score/softmax work above is shared by every gradient segment.
+// tile-codegen:begin training.direct.8 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_deberta_attention_backward_f32(ANTFLY_CUDA_DEBERTA_ATTENTION_BACKWARD_F32_PARAMS) {
     unsigned int hidden = num_heads * head_dim;
     unsigned int token_elems = batch * seq_len * hidden;
@@ -13490,6 +13596,7 @@ extern "C" __global__ void termite_deberta_attention_backward_f32(ANTFLY_CUDA_DE
     }
     dst[idx] = result;
 }
+// tile-codegen:end training.direct.8 family
 
 // Fused DeBERTa-v3 disentangled attention for encoder prefill.  The legacy
 // elementwise implementation above computes the same score independently for
@@ -13498,6 +13605,7 @@ extern "C" __global__ void termite_deberta_attention_backward_f32(ANTFLY_CUDA_DE
 // keeps the normalized probabilities in shared memory, then cooperatively
 // applies V.  GLiNER2's 64-wide heads and <=512-token encoder inputs fit the
 // fixed shared-memory tile; other shapes retain the general implementation.
+// tile-codegen:begin attention.direct.21 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_deberta_attention_fused_f32(ANTFLY_CUDA_DEBERTA_ATTENTION_PARAMS) {
     constexpr unsigned int kThreads = 256u;
     constexpr unsigned int kWarps = kThreads / 32u;
@@ -13585,6 +13693,7 @@ extern "C" __global__ void termite_deberta_attention_fused_f32(ANTFLY_CUDA_DEBER
         dst[(b * seq_len + qi) * hidden + head_off + tid] = denom > 0.0f ? acc / denom : 0.0f;
     }
 }
+// tile-codegen:end attention.direct.21 family
 
 // FP16-storage DeBERTa-v3 encoder prefill attention.  Unlike the F32 fused
 // fallback above, each warp owns a query and performs an online softmax while
@@ -13599,6 +13708,7 @@ extern "C" __global__ void termite_deberta_attention_fused_f32(ANTFLY_CUDA_DEBER
 // and k).  They are therefore evaluated with coalesced half loads and FP32
 // accumulation.  Tensor-core score/PV candidates belong in a separate
 // materialized-score schedule; this streaming route is the latency baseline.
+// tile-codegen:begin attention.direct.22 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_deberta_attention_stream_f16(ANTFLY_CUDA_DEBERTA_ATTENTION_STREAM_F16_PARAMS) {
     constexpr unsigned int kWarpsPerBlock = 8u;
     constexpr unsigned int kHeadDim = 64u;
@@ -13656,6 +13766,7 @@ extern "C" __global__ void termite_deberta_attention_stream_f16(ANTFLY_CUDA_DEBE
     dst[q_base + lane] = value0 * inv_sum;
     dst[q_base + lane + 32u] = value1 * inv_sum;
 }
+// tile-codegen:end attention.direct.22 family
 
 // Generated tensor-core schedule for DeBERTa-v3 encoder prefill.  A CTA owns
 // sixteen query rows of one [batch, head] matrix and streams 32-key blocks.
@@ -13672,10 +13783,12 @@ extern "C" __global__ void termite_deberta_attention_stream_f16(ANTFLY_CUDA_DEBE
 // correctness fallback for all other shapes.
 
 
+// tile-codegen:begin attention.direct.23 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ __launch_bounds__(256) void termite_deberta_attention_tc_f16_m16n32(ANTFLY_CUDA_DEBERTA_ATTENTION_PARAMS) {
     constexpr unsigned int QueryTile = 16u, KeyTile = 32u;
 #include "../kernels/relative_attention_tensor_tiles.cuh"
 }
+// tile-codegen:end attention.direct.23 family
 
 // Larger-query generated tensor-core DeBERTa prefill schedule.  The M16xN32
 // variant above minimizes per-CTA shared memory, but it rereads every K/V row
@@ -13683,15 +13796,18 @@ extern "C" __global__ __launch_bounds__(256) void termite_deberta_attention_tc_f
 // tensor-core work while halving CTA count and K/V rereads.  Its 42 KiB static
 // shared footprint remains below the portable 48 KiB limit, so it needs no
 // occupancy or shared-memory carveout API special case on SM80+.
+// tile-codegen:begin attention.direct.24 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ __launch_bounds__(256) void termite_deberta_attention_tc_f16_m32n16(ANTFLY_CUDA_DEBERTA_ATTENTION_PARAMS) {
     constexpr unsigned int QueryTile = 32u, KeyTile = 16u;
 #include "../kernels/relative_attention_tensor_tiles.cuh"
 }
+// tile-codegen:end attention.direct.24 family
 
 // Pack graph-layout [B, S, H, D] tensors into the head-major layout consumed
 // by strided-batched tensor-core GEMMs. Relative projections are intentionally
 // replicated over B: this gives cuBLASLt regular, contiguous strided batches
 // without pointer-array setup or a broadcast-specific algorithm assumption.
+// tile-codegen:begin tensor.layout.direct.32 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_deberta_pack_heads_f16(ANTFLY_CUDA_DEBERTA_PACK_HEADS_F16_PARAMS) {
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int hidden = num_heads * head_dim;
@@ -13724,10 +13840,12 @@ extern "C" __global__ void termite_deberta_pack_heads_f16(ANTFLY_CUDA_DEBERTA_PA
         k_r_out[idx] = __half_as_ushort(__float2half_rn(k_r[src]));
     }
 }
+// tile-codegen:end tensor.layout.direct.32 family
 
 // Adds DeBERTa's two relative-position score terms to tensor-core materialized
 // GEMMs and normalizes each row in-place. Input/output `content_scores` is
 // [B*H, S, S]; c2p/p2c are [B*H, S, 2S-1].
+// tile-codegen:begin elementwise.direct.17 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_deberta_scores_softmax_f32(
     float* content_scores,
     const float* c2p_scores,
@@ -13787,7 +13905,9 @@ extern "C" __global__ void termite_deberta_scores_softmax_f32(
     const float inv_sum = reductions[0] > 0.0f ? 1.0f / reductions[0] : 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += kThreads) content_scores[score_base + ki] *= inv_sum;
 }
+// tile-codegen:end elementwise.direct.17 family
 
+// tile-codegen:begin tensor.layout.direct.33 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_deberta_unpack_heads_f32(
     float* dst,
     const float* packed,
@@ -13808,7 +13928,9 @@ extern "C" __global__ void termite_deberta_unpack_heads_f32(
     const unsigned int src = ((b * num_heads + h) * seq_len + t) * head_dim + d;
     dst[idx] = packed[src];
 }
+// tile-codegen:end tensor.layout.direct.33 family
 
+// tile-codegen:begin tensor.layout.direct.34 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_split_last_dim3_f32(
     float* first,
     float* second,
@@ -13827,6 +13949,7 @@ extern "C" __global__ void termite_split_last_dim3_f32(
     second[idx] = input[src + dim];
     third[idx] = input[src + dim * 2u];
 }
+// tile-codegen:end tensor.layout.direct.34 family
 
 // quant-kernel-codegen:begin generated CUDA promoted matmul kernels (do not edit; run: zig build quant-kernel-codegen -- --write)
 // One of two 16-value contributions for a Q4_0/Q8_1 block. Keeping Q4
@@ -14854,6 +14977,7 @@ extern "C" __global__ void termite_laya_local_attention_f32(
 
 // Laya action features use uncalibrated, padded-option-masked logits.
 // One block owns each question; only thread zero reduces the at-most-20 options.
+// tile-codegen:begin sequence.transforms.direct.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_laya_action_features_f32(
     float* dst, const float* hidden, const float* logits, const long long* markers,
     unsigned int batch, unsigned int seq, unsigned int count, unsigned int dim
@@ -14886,6 +15010,7 @@ extern "C" __global__ void termite_laya_action_features_f32(
     dst[row * (dim + 4u) + dim + 2u] = entropy / logf((float)valid);
     dst[row * (dim + 4u) + dim + 3u] = (float)valid / 255.0f;
 }
+// tile-codegen:end sequence.transforms.direct.3 family
 
 // Four warps score independent keys. No block barrier inside the key loop.
 // All reductions and activations remain FP32; no tensor-core narrowing.
@@ -14961,6 +15086,7 @@ extern "C" __global__ void termite_laya_attention_warp_f32(
 }
 // tile-codegen:end attention.warp.0 family
 
+// tile-codegen:begin sequence.transforms.direct.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_laya_packed_geglu_f32(
     float* dst, const float* src, unsigned int rows, unsigned int width
 ) {
@@ -14971,10 +15097,12 @@ extern "C" __global__ void termite_laya_packed_geglu_f32(
     float gelu = isfinite(x) ? 0.5f * x * (1.0f + erff(x * 0.7071067811865476f)) : 0.0f;
     dst[i] = gelu * src[(size_t)row * 2u * width + width + col];
 }
+// tile-codegen:end sequence.transforms.direct.4 family
 
 // Full-head split-half RoPE for the GLiNER ModernBERT encoder. One thread
 // rotates a pair in both Q and K and copies V from the packed projection,
 // avoiding three slices and repeated trigonometry in separate RoPE launches.
+// tile-codegen:begin normalization.direct.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gliner_qkv_rope_f32(
     float* q, float* k, float* v, const float* packed,
     unsigned int batch, unsigned int sequence, unsigned int heads,
@@ -15001,6 +15129,7 @@ extern "C" __global__ void termite_gliner_qkv_rope_f32(
     v[dest] = packed[source + 2u * hidden];
     v[dest + half] = packed[source + 2u * hidden + half];
 }
+// tile-codegen:end normalization.direct.1 family
 
 // GLiNER ModernBERT: dynamic shared scores cover only the attended key
 // window. Global layers support 8192 keys; local layers retain bounded scratch.
@@ -15019,6 +15148,7 @@ extern "C" __global__ void termite_gliner_encoder_attention_f32(
 // probabilities feed tensor cores; online softmax and output accumulate F32.
 // M32/N64 amortizes synchronization across four key fragments. Unlike the
 // vision primitive this consumes per-document key masks, including empty rows.
+// tile-codegen:begin attention.direct.25 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attention_tc_f16(
     float* dst, const float* q, const float* k, const float* v,
     const long long* mask, unsigned int batch, unsigned int seq,
@@ -15128,11 +15258,13 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
     (void)dst; (void)q; (void)k; (void)v; (void)mask; (void)batch; (void)seq; (void)heads; (void)dim; (void)radius;
 #endif
 }
+// tile-codegen:end attention.direct.25 family
 
 // Inference-only boundary attention uses the direct boundary descriptor ABI.
 // A block owns one query/head and reduces 64 keys at a time, avoiding the
 // per-key serial softmax recurrence of the generic boundary kernel. Query and
 // key masks retain the boundary contract: padded query outputs are zero.
+// tile-codegen:begin attention.direct.26 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gliner_boundary_attention_f32(
     const float* q, const float* k, const float* v, const float* qr,
     const float* kr, const float* buckets_f32, const float* mask_f32,
@@ -15216,9 +15348,11 @@ extern "C" __global__ void termite_gliner_boundary_attention_f32(
     }
     if (tid < dim) output[qo + tid] = invalid == 0u && state[1] > 0.0f ? value / state[1] : NAN;
 }
+// tile-codegen:end attention.direct.26 family
 
 // Diagnostic boundary FP16 attention: compact relative tiles use the exact
 // processor bucket map. Model storage, heads, softmax, and outputs remain F32.
+// tile-codegen:begin attention.direct.27 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16(ANTFLY_CUDA_GLINER_BOUNDARY_PARAMS) {
     const unsigned int batch = p.dims[0], seq_len = p.dims[1], num_heads = p.dims[2], head_dim = p.dims[3];
     const int* mask = reinterpret_cast<const int*>(mask_values);
@@ -15413,10 +15547,12 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attent
         }
     }
 }
+// tile-codegen:end attention.direct.27 family
 
 // Long global attention reuses each K/V tile across 64 queries. The online
 // output lives in WMMA fragments; score storage becomes probabilities and a
 // 32-row rescaling scratch after every lane has consumed its scores.
+// tile-codegen:begin attention.direct.28 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attention_tc_f16_m64(
     float* dst, const float* q, const float* k, const float* v,
     const long long* mask, unsigned int batch, unsigned int seq,
@@ -15544,6 +15680,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
         __syncthreads();
     }
 }
+// tile-codegen:end attention.direct.28 family
 
 // Wider direct boundary attention for sequences of at least 512 tokens.
 // Query/key fragments stay in registers; 16-column relative tiles scatter

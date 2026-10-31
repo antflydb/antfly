@@ -1183,10 +1183,6 @@ pub fn appleSimdgroupFeatureEnabled(comptime name: [*:0]const u8, default_eligib
     return @import("antfly_platform").env.getenvBoolDefault(name, default_eligible and appleSimdgroupDeviceDefault());
 }
 
-fn a4bHighMemoryFastPathEnabled() bool {
-    return a4b_feature_flags.highMemoryFastPathEnabled();
-}
-
 fn a4bHighMemoryFeatureEnabled(
     comptime enable_name: [*:0]const u8,
     comptime disable_name: [*:0]const u8,
@@ -1421,10 +1417,6 @@ fn tensorHostSlice(tensor: *MetalTensor) ![]f32 {
 
 fn tensorHostConstPtr(tensor: *MetalTensor) ![*c]const f32 {
     return (try tensorHostSlice(tensor)).ptr;
-}
-
-fn tensorHostPtr(tensor: *MetalTensor) ![*]f32 {
-    return @ptrCast((try tensorHostSlice(tensor)).ptr);
 }
 
 pub const CompressedAttentionGatedFfnPath = enum {
@@ -7539,23 +7531,8 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
     if (token_count > std.math.maxInt(i32) or hidden > std.math.maxInt(i32)) return null;
     const batch_heads = std.math.mul(usize, request.batch, request.num_heads) catch return null;
     if (batch_heads > std.math.maxInt(i32) or request.seq_len > std.math.maxInt(i32) or request.head_dim > std.math.maxInt(i32)) return null;
-    const seq_major_shape = [_]i32{ @intCast(token_count), @intCast(hidden) };
-    const head_major_3d_shape = [_]i32{ @intCast(batch_heads), @intCast(request.seq_len), @intCast(request.head_dim) };
-    const head_major_4d_shape = [_]i32{ @intCast(request.batch), @intCast(request.num_heads), @intCast(request.seq_len), @intCast(request.head_dim) };
-    const layout: u32 = if (std.mem.eql(i32, request.q.shape(), &seq_major_shape) and
-        std.mem.eql(i32, request.k.shape(), &seq_major_shape) and
-        std.mem.eql(i32, request.v.shape(), &seq_major_shape))
-        1
-    else if (std.mem.eql(i32, request.q.shape(), &head_major_3d_shape) and
-        std.mem.eql(i32, request.k.shape(), &head_major_3d_shape) and
-        std.mem.eql(i32, request.v.shape(), &head_major_3d_shape))
-        0
-    else if (std.mem.eql(i32, request.q.shape(), &head_major_4d_shape) and
-        std.mem.eql(i32, request.k.shape(), &head_major_4d_shape) and
-        std.mem.eql(i32, request.v.shape(), &head_major_4d_shape))
-        0
-    else
-        return null;
+    if (!std.mem.eql(i32, request.q.shape(), request.k.shape()) or !std.mem.eql(i32, request.q.shape(), request.v.shape())) return null;
+    const layout: u32 = @backingInt(kernel_geometry.DenseAttentionLayout.fromShape(i32, request.q.shape(), request.batch, request.seq_len, request.num_heads, request.head_dim) orelse return null);
     const bias_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "bias")) request.bias else null;
     const mask_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "mask")) request.mask else null;
     const bias_mode: u32 = if (@hasField(@TypeOf(request), "bias_mode")) request.bias_mode else 0;
@@ -12874,16 +12851,6 @@ fn workloadProfileEncodingId(name: []const u8) ?u8 {
     if (std.mem.eql(u8, name, "f32")) return 0;
     if (std.mem.eql(u8, name, "bf16")) return 1;
     if (std.mem.eql(u8, name, "f16")) return 2;
-    return null;
-}
-
-fn workloadProfileEpilogueId(name: []const u8) ?u8 {
-    if (std.mem.eql(u8, name, "none")) return 0;
-    if (std.mem.eql(u8, name, "pair_activation_mul")) return 1;
-    if (std.mem.eql(u8, name, "qkv")) return 2;
-    if (std.mem.eql(u8, name, "pair")) return 3;
-    if (std.mem.eql(u8, name, "activation_rhs_mul")) return 4;
-    if (std.mem.eql(u8, name, "pair_activation_rms_scale_1x")) return 5;
     return null;
 }
 
@@ -29958,13 +29925,6 @@ const DirectQuantizedBlockFormats = struct {
     ffn_down: MetalQuantFormat,
     ple: MetalQuantFormat = .unsupported,
 };
-
-fn preparedQuantizedLinearSlotKind(self: anytype, slot: usize, in_dim: usize, out_dim: usize) RawQuantizedRuntimeLinearKind {
-    if (slot >= decoder_runtime_linear_slot_capacity) return .none;
-    if (!self.raw_linear_slots_prepared[slot]) return .none;
-    if (self.raw_linear_slot_kinds[slot] != .quantized) return .none;
-    return ensureQuantizedRuntimeLinearSlotPrepared(self, slot, in_dim, out_dim);
-}
 
 fn directQuantizedBlockFormatForKind(kind: RawQuantizedRuntimeLinearKind) ?MetalQuantFormat {
     return switch (kind) {

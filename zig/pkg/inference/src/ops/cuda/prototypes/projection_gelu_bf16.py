@@ -52,77 +52,22 @@ def lighton_vision_up(
 
 def generate(output, libdevice_path):
     import hashlib
-    import json
     from pathlib import Path
-    from triton.compiler import ASTSource
-    from triton.backends.compiler import GPUTarget
+    from producer_support import profiles, compile_program, emit, write_manifest, LIBDEVICE_SHA256
 
-    if triton.__version__ != "3.7.1":
-        raise RuntimeError("Regeneration requires Triton 3.7.1")
-    triton.knobs.compilation.disable_line_info = True
-    if (
-        hashlib.sha256(Path(libdevice_path).read_bytes()).hexdigest()
-        != "91334d6e12748f6cb5bbf0a1cd965a56bcd93dc4f496d2e5c5f8c6e523094356"
-    ):
+    if hashlib.sha256(Path(libdevice_path).read_bytes()).hexdigest() != LIBDEVICE_SHA256:
         raise RuntimeError("Regeneration requires the qualified CUDA 13.0 libdevice")
-    output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
     records = []
-    for hidden, wide in [(768, 3072), (1024, 4096)]:
-        for rounded in [False, True]:
-            signature = dict(
-                x="*bf16",
-                w="*bf16",
-                bias="*bf16" if rounded else "*fp32",
-                out="*bf16",
-                rows="i32",
-            )
-            constants = dict(
-                K=hidden, N=wide, ROUND_BEFORE=rounded, BM=128, BN=64, BK=32
-            )
-            compiled = triton.compile(
-                ASTSource(
-                    lighton_vision_up,
-                    signature,
-                    constexprs=constants,
-                    attrs={(i,): [["tt.divisibility", 16]] for i in range(4)},
-                ),
-                target=GPUTarget("cuda", 121, 32),
-                options=dict(
-                    ptx_version=90,
-                    num_warps=4,
-                    num_stages=3,
-                    enable_fp_fusion=not rounded,
-                    extern_libs={"libdevice": str(libdevice_path)},
-                ),
-            )
-            meta = compiled.metadata
-            assert meta.shared == 24576 and meta.num_warps == 4 and meta.num_ctas == 1
-            assert meta.global_scratch_size == 0 and meta.profile_scratch_size == 0
-            name = f"projection_gelu_sm121_k{hidden}_n{wide}_bias_{'bf16' if rounded else 'f32'}.ptx"
-            data = compiled.asm["ptx"].encode()
-            (output / name).write_bytes(data)
-            records.append(
-                dict(
-                    file=name,
-                    sha256=hashlib.sha256(data).hexdigest(),
-                    shared_bytes=meta.shared,
-                    threads=128,
-                )
-            )
-    (output / "projection_gelu_bf16_manifest.json").write_text(
-        json.dumps(
-            dict(
-                triton=triton.__version__,
-                libdevice_sha256=hashlib.sha256(
-                    Path(libdevice_path).read_bytes()
-                ).hexdigest(),
-                kernels=records,
-            ),
-            indent=2,
-        )
-        + "\n"
-    )
+    for spec in profiles("projection_gelu"):
+        rounded = spec["bf16"]
+        data = compile_program(
+            lighton_vision_up,
+            dict(x="*bf16", w="*bf16", bias="*bf16" if rounded else "*fp32", out="*bf16", rows="i32"),
+            dict(K=spec["hidden"], N=spec["wide"], ROUND_BEFORE=rounded, BM=128, BN=64, BK=32),
+            range(4), spec,
+            dict(num_stages=3, enable_fp_fusion=not rounded, extern_libs={"libdevice": str(libdevice_path)}))
+        records.append(emit(output, spec, data))
+    write_manifest(output, records, triton=triton.__version__, libdevice_sha256=LIBDEVICE_SHA256)
 
 
 if __name__ == "__main__":

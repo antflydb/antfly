@@ -826,12 +826,6 @@ fn ggufGetPackedMoeQuantizedStorage(
     };
 }
 
-fn reversedShape(allocator: std.mem.Allocator, shape: []const i64) ![]i64 {
-    const reversed = try allocator.alloc(i64, shape.len);
-    for (0..shape.len) |i| reversed[i] = shape[shape.len - 1 - i];
-    return reversed;
-}
-
 fn normalizedShapeFromDims(allocator: std.mem.Allocator, dimensions: []const u64) ![]i64 {
     const shape = try allocator.alloc(i64, dimensions.len);
     for (0..dimensions.len) |i| shape[i] = @intCast(dimensions[dimensions.len - 1 - i]);
@@ -902,52 +896,6 @@ fn slicePackedExpertTensor(
         .dtype = tensor.dtype,
         .shape = out_shape,
         .name = name,
-        .allocator = allocator,
-        .owns_data = true,
-        .owns_shape = true,
-    };
-}
-
-fn normalizeGgufTensorLayout(
-    allocator: std.mem.Allocator,
-    tensor: *const @import("../backends/tensor.zig").Tensor,
-) !@import("../backends/tensor.zig").Tensor {
-    const rank = tensor.shape.len;
-    if (rank < 2) return error.InvalidPackedExpertTensor;
-
-    const new_shape = try allocator.alloc(i64, rank);
-    errdefer allocator.free(new_shape);
-    for (0..rank) |i| new_shape[i] = tensor.shape[rank - 1 - i];
-
-    const elem_size = tensor.dtype.byteSize();
-    const count = elementCount(tensor.shape) orelse return error.InvalidTensorShape;
-    const new_bytes = try allocator.alloc(u8, count * elem_size);
-    errdefer allocator.free(new_bytes);
-
-    const in_strides = try computeRowMajorStrides(allocator, tensor.shape);
-    defer allocator.free(in_strides);
-    const out_strides = try computeRowMajorStrides(allocator, new_shape);
-    defer allocator.free(out_strides);
-
-    const out_indices = try allocator.alloc(usize, rank);
-    defer allocator.free(out_indices);
-    var in_indices = try allocator.alloc(usize, rank);
-    defer allocator.free(in_indices);
-
-    for (0..count) |linear_out| {
-        linearIndexToIndices(linear_out, new_shape, out_strides, out_indices);
-        for (0..rank) |i| in_indices[rank - 1 - i] = out_indices[i];
-        const in_linear = indicesToLinearIndex(in_indices, in_strides);
-        const src_start = in_linear * elem_size;
-        const dst_start = linear_out * elem_size;
-        @memcpy(new_bytes[dst_start .. dst_start + elem_size], tensor.data[src_start .. src_start + elem_size]);
-    }
-
-    return .{
-        .data = new_bytes,
-        .dtype = tensor.dtype,
-        .shape = new_shape,
-        .name = tensor.name,
         .allocator = allocator,
         .owns_data = true,
         .owns_shape = true,

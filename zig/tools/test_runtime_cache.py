@@ -1837,6 +1837,9 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/cuda/prototypes/projection_top1_bf16.py",
                     "src/ops/cuda/prototypes/projection_gelu_bf16.py",
                     "src/ops/cuda/prototypes/projection_dot_bias_bf16.py",
+        "src/ops/cuda/prototypes/producer_support.py",
+        "src/ops/cuda/generated/standalone_programs.json",
+        "src/ops/cuda/generated/standalone_images.zig",
                     "src/ops/cuda/prototypes/projection_residual_bf16.py",
                     "src/ops/cuda/projection_gelu_sm121_k768_n3072_bias_f32.ptx",
                     "src/ops/cuda/projection_residual_sm121_k3072_n768_io_f32.ptx",
@@ -1909,7 +1912,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     str((Path(directory) / name).relative_to(self.root / "zig/pkg/inference"))
                     for directory, _, names in os.walk(self.root / "zig/pkg/inference/src/tile", followlinks=True)
                     for name in names
-                    if name.endswith(".zig") and name != "source_inputs.zig"
+                    if name.endswith((".zig", ".cu", ".metal", ".m")) and name != "source_inputs.zig"
                 )
                 self.assertEqual(after[1], self.bundle_digest(qualifier))
                 if backend == "cuda":

@@ -41,7 +41,6 @@ const florence_mod = @import("../models/florence.zig");
 const clip_mod = @import("../models/clip.zig");
 const clap_mod = @import("../models/clap.zig");
 const deberta_mod = @import("../models/deberta.zig");
-const layoutlmv3_mod = @import("../models/layoutlmv3.zig");
 const boundary_bundle = @import("../models/gliner_boundary_bundle.zig");
 const boundary_resident = @import("../ops/gliner_boundary_resident.zig");
 const bert_arch = @import("bert.zig");
@@ -119,38 +118,6 @@ const gpu_hosted_mod = struct {
         unreachable;
     }
 };
-const gpu_hosted_quant_mod = struct {
-    pub const Provider = void;
-    pub fn nullProvider() void {
-        return {};
-    }
-    pub fn defaultProvider() void {
-        return {};
-    }
-};
-const gpu_hosted_c = struct {
-    pub const resident_stream = void;
-    pub const resident_map_string_to_array = void;
-    pub const resident_array = void;
-    pub fn resident_map_string_to_array_iterator_new(_: anytype) void {
-        unreachable;
-    }
-    pub fn resident_map_string_to_array_iterator_free(_: anytype) c_int {
-        unreachable;
-    }
-    pub fn resident_array_new() void {
-        unreachable;
-    }
-    pub fn resident_array_free(_: anytype) c_int {
-        unreachable;
-    }
-    pub fn resident_map_string_to_array_iterator_next(_: anytype, _: anytype, _: anytype) c_int {
-        unreachable;
-    }
-    pub fn resident_transpose(_: anytype, _: anytype, _: anytype) c_int {
-        unreachable;
-    }
-};
 const metal_runtime = if (build_options.enable_metal) @import("../backends/metal_runtime.zig") else struct {
     fn metalDeviceAvailable() bool {
         return false;
@@ -209,26 +176,12 @@ fn gpuHostedEagerDenseMaxBytes() u64 {
     return mb * 1024 * 1024;
 }
 
-fn forceGpuHostedEagerDenseLoadDebug() bool {
-    return platform.env.getenvBool("TERMITE_FORCE_METAL_EAGER_DENSE");
-}
-
 fn disablePrefetchWorkerDebug() bool {
     return platform.env.getenvBool("TERMITE_DISABLE_PREFETCH_WORKER");
 }
 
 fn graphRuntimeStrategyEnabled(strategy: ?graph_runtime.Strategy) bool {
     return if (strategy) |s| s != .interpreter else false;
-}
-
-fn shouldUseSharedGpuHostedEagerDenseLoad(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest, arch_config: ArchConfig) bool {
-    if (forceGpuHostedEagerDenseLoadDebug()) return true;
-    switch (arch_config) {
-        .gpt => |cfg| if (cfg.usesMoe()) return false,
-        else => {},
-    }
-    const total_bytes = estimateNativeWeightBytes(allocator, mf) catch return false;
-    return total_bytes > 0 and total_bytes <= gpuHostedEagerDenseMaxBytes();
 }
 
 fn shouldUseMetalHostedEagerDenseLoad(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest, arch_config: ArchConfig) bool {
@@ -256,27 +209,6 @@ fn shouldPreferGpuHostedF32DenseTensors(arch_config: ArchConfig) bool {
         .layoutlmv3, .embedding_gemma2 => true,
         else => false,
     };
-}
-
-fn shouldForceGpuHostedF32DenseTensorByName(arch_config: ArchConfig, name: []const u8) bool {
-    if (!shouldPreferGpuHostedF32DenseTensors(arch_config)) return false;
-    if (arch_config == .embedding_gemma2) return true;
-    const is_large_non_linear_weight = std.mem.startsWith(u8, name, "vision_tower.") or
-        std.mem.startsWith(u8, name, "multi_modal_projector.") or
-        std.mem.endsWith(u8, name, "token_embd.weight");
-    if (arch_config == .layoutlmv3) return !is_large_non_linear_weight;
-    return !is_large_non_linear_weight;
-}
-
-fn estimateGpuHostedResidentTensorBytes(tensor: *const Tensor, force_f32: bool) usize {
-    if (force_f32 and (tensor.dtype == .f16 or tensor.dtype == .bf16)) {
-        var elements: usize = 1;
-        for (tensor.shape) |dim| {
-            elements = std.math.mul(usize, elements, @intCast(dim)) catch return tensor.data.len;
-        }
-        return std.math.mul(usize, elements, @sizeOf(f32)) catch return tensor.data.len;
-    }
-    return tensor.data.len;
 }
 
 pub fn estimateNativeWeightBytes(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest) !u64 {
@@ -692,13 +624,6 @@ fn qualifiedA4bArtifact(report: GgufInspectionReport) bool {
     return report.a4b_packed_expert_layout_qualified and
         report.packed_moe_expert_tensor_count == report.packed_moe_q4_0_tensor_count and
         report.missing_required_tensors.len == 0;
-}
-
-fn ggufReportHasQuantizedTensors(report: GgufInspectionReport) bool {
-    for (report.all_tensor_types) |entry| {
-        if (entry.tensor_type.isQuantized()) return true;
-    }
-    return false;
 }
 
 fn requiresModernBertSpanClassifier(manifest: manifest_mod.ModelManifest) bool {
@@ -2345,108 +2270,6 @@ test "Metal JIT load policy is backend independent" {
         .mode = .on,
         .qualified_profile_path = "/tmp/qualified-profile.json",
     }, .startup_preload);
-}
-
-fn eagerLoadResidentsFromStore(
-    allocator: std.mem.Allocator,
-    resident_weights: anytype,
-    tensor_store: tensor_store_mod.TensorStore,
-    mf: manifest_mod.ModelManifest,
-    arch_config: *ArchConfig,
-    all_names: [][]const u8,
-    source: weight_source_mod.WeightSource,
-    actual_prefix: []const u8,
-    is_gliner: bool,
-) !usize {
-    if (comptime !false) return error.GpuHostedNotEnabled;
-    var resident_weight_estimate_bytes: usize = 0;
-    var eager_sharded_source: ?*weight_source_mod.ShardedSafetensorsSource = null;
-    defer if (eager_sharded_source) |src| src.weightSource().deinit();
-    if (mf.safetensors_index_path) |index_path| {
-        eager_sharded_source = try weight_source_mod.ShardedSafetensorsSource.initAbsolute(allocator, index_path);
-    }
-    for (all_names) |full_name| {
-        if (isPackedMoeExpertTensor(full_name)) continue;
-        const base_key = if (is_gliner)
-            glinerBaseWeightKey(full_name)
-        else if (actual_prefix.len > 0 and std.mem.startsWith(u8, full_name, actual_prefix) and full_name.len > actual_prefix.len and full_name[actual_prefix.len] == '.')
-            full_name[actual_prefix.len + 1 ..]
-        else
-            full_name;
-        var key_buf: [256]u8 = undefined;
-        const key = try normalizeWeightKey(tensor_store.kind(), arch_config.*, base_key, &key_buf);
-
-        const source_copy = source;
-        var loaded = if (eager_sharded_source) |src| loaded_blk: {
-            const resolved = src.findTensorMeta(full_name) catch break :loaded_blk source_copy.getTensor(full_name) catch continue;
-            break :loaded_blk LoadedWeight{
-                .tensor = try resolved.reader.readTensor(full_name),
-                .quantized = false,
-            };
-        } else source_copy.getTensor(full_name) catch continue;
-        defer loaded.deinit();
-
-        if (arch_config.* == .gpt and arch_config.gpt.family == .gpt2 and tensor_store.kind() == .safetensors) {
-            try transposeGpt2Conv1dLoadedWeightInPlace(allocator, key, &loaded);
-        }
-
-        const force_f32 = shouldForceGpuHostedF32DenseTensorByName(arch_config.*, full_name);
-        resident_weight_estimate_bytes += estimateGpuHostedResidentTensorBytes(&loaded.tensor, force_f32);
-        const arr = try gpu_hosted_mod.arrayFromTensor(allocator, &loaded.tensor, force_f32);
-        try gpu_hosted_mod.insertWeight(resident_weights.*, allocator, key, arr);
-    }
-    try refineArchConfigFromStore(allocator, tensor_store, all_names, arch_config);
-    return resident_weight_estimate_bytes;
-}
-
-fn loadSafetensorsIntoResident(
-    allocator: std.mem.Allocator,
-    stream: GpuHostedStream,
-    resident_weights: anytype,
-    st_path: []const u8,
-    arch_config: ArchConfig,
-) ![]const u8 {
-    if (comptime !false) return error.GpuHostedNotEnabled;
-    resident_weights.* = try gpu_hosted_mod.loadSafetensors(st_path, allocator, stream);
-    if (arch_config == .gpt and arch_config.gpt.family == .gpt2) {
-        try transposeGpt2Conv1dResidentGpuHostedWeights(allocator, resident_weights, stream);
-    }
-    return switch (arch_config) {
-        .t5, .gpt, .whisper, .florence, .clip, .clap, .modern_bert, .gliner_modern_bert, .nomic_bert, .embedding_gemma2 => "",
-        .gliner, .gliner_boundary => "encoder",
-        .deberta => "deberta",
-        .layoutlmv3 => "layoutlmv3",
-        .bert => |cfg| detected: {
-            var detected = cfg.effectivePrefix();
-            const it = gpu_hosted_c.resident_map_string_to_array_iterator_new(resident_weights.*);
-            defer _ = gpu_hosted_c.resident_map_string_to_array_iterator_free(it);
-            while (true) {
-                var key: [*c]const u8 = null;
-                var val = gpu_hosted_c.resident_array_new();
-                defer _ = gpu_hosted_c.resident_array_free(val);
-                if (gpu_hosted_c.resident_map_string_to_array_iterator_next(&key, &val, it) != 0) break;
-                if (key == null) break;
-                const name = std.mem.span(key);
-                if (std.mem.startsWith(u8, name, "bert.")) {
-                    detected = "bert";
-                    break;
-                } else if (std.mem.startsWith(u8, name, "deberta.")) {
-                    detected = "deberta";
-                    break;
-                } else if (std.mem.startsWith(u8, name, "roberta.")) {
-                    detected = "roberta";
-                    break;
-                } else if (std.mem.startsWith(u8, name, "distilbert.")) {
-                    detected = "distilbert";
-                    break;
-                } else if (arch_config == .gpt and std.mem.startsWith(u8, name, "language_model.")) {
-                    detected = "language_model";
-                    break;
-                }
-            }
-            break :detected detected;
-        },
-    };
 }
 
 fn createGpuHostedSessionWithTaskOverride(
@@ -4984,15 +4807,6 @@ fn ensureGpuHostedSessionAvailable(backend_type: BackendType) !void {
     };
 }
 
-const GpuHostedStream = if (false) gpu_hosted_c.resident_stream else void;
-
-fn openGpuHostedStream(backend_type: BackendType) !GpuHostedStream {
-    return switch (backend_type) {
-        .metal => openMetalHostedStream(),
-        else => unreachable,
-    };
-}
-
 fn ensureMetalHostedSessionAvailable() !void {
     if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     if (!metal_runtime.metalDeviceAvailable()) return error.MetalDeviceUnavailable;
@@ -5096,14 +4910,6 @@ test "A4B configured GGUF passes metadata-only production qualification" {
     try std.testing.expectEqual(backend_contracts.A4bResidencyMode.streamed, qualified.residency_mode);
     try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024 * 1024), qualified.memory_budget_bytes);
     try std.testing.expectEqual(@as(u8, 8), qualified.expert_cache_slots);
-}
-
-fn openMetalHostedStream() !GpuHostedStream {
-    try ensureMetalHostedSessionAvailable();
-    if (comptime false) {
-        return std.mem.zeroes(GpuHostedStream);
-    }
-    return {};
 }
 
 const GpuHostedBudgetPolicy = struct {
@@ -5432,13 +5238,6 @@ fn makeGpuHostedBackendData(
     };
 }
 
-fn metalHostedQuantProvider() gpu_hosted_quant_mod.Provider {
-    if (comptime false) {
-        return gpu_hosted_quant_mod.nullProvider();
-    }
-    return {};
-}
-
 fn widenGpuHostedTierCache(self: *ArchSession, budget: *runtime.tier.memory.RunBudget) void {
     if (gpuBackendData(self).tier_cache) |*tier_cache| {
         tier_cache.widenToAtLeast(.{
@@ -5528,12 +5327,6 @@ fn widenLimits(base: runtime.tier.memory.Limits, floor: runtime.tier.memory.Limi
         .kv_limit_bytes = @max(base.kv_limit_bytes, floor.kv_limit_bytes),
         .scratch_limit_bytes = @max(base.scratch_limit_bytes, floor.scratch_limit_bytes),
     };
-}
-
-fn packedExpertByteLen(total_byte_len: usize, expert_count: u32) usize {
-    if (expert_count == 0) return total_byte_len;
-    const count: usize = @intCast(expert_count);
-    return @max(@as(usize, 1), total_byte_len / count);
 }
 
 fn mib(value: usize) usize {
@@ -5728,58 +5521,6 @@ fn applyJinaV5RetrievalAdapterIfPresent(
     while (it.next()) |entry| {
         try adapter.mergeIntoLoadedWeight(entry.key_ptr.*, entry.value_ptr);
     }
-}
-
-fn transposeGpt2Conv1dResidentGpuHostedWeights(
-    allocator: std.mem.Allocator,
-    weights: anytype,
-    stream: GpuHostedStream,
-) !void {
-    if (comptime !false) return error.GpuHostedNotEnabled;
-
-    const rebuilt = gpu_hosted_c.resident_map_string_to_array_new();
-    errdefer _ = gpu_hosted_c.resident_map_string_to_array_free(rebuilt);
-
-    const it = gpu_hosted_c.resident_map_string_to_array_iterator_new(weights.*);
-    defer _ = gpu_hosted_c.resident_map_string_to_array_iterator_free(it);
-
-    while (true) {
-        var key: [*c]const u8 = null;
-        var val = gpu_hosted_c.resident_array_new();
-        if (gpu_hosted_c.resident_map_string_to_array_iterator_next(&key, &val, it) != 0) {
-            _ = gpu_hosted_c.resident_array_free(val);
-            break;
-        }
-        if (key == null) {
-            _ = gpu_hosted_c.resident_array_free(val);
-            break;
-        }
-
-        const name = std.mem.span(key);
-        const name_z = try allocator.dupeSentinel(u8, name, 0);
-        defer allocator.free(name_z);
-
-        if (isGpt2Conv1dWeight(name) and
-            gpu_hosted_c.resident_array_ndim(val) == 2 and
-            gpu_hosted_c.resident_array_dtype(val) == gpu_hosted_c.GPU_HOSTED_FLOAT32)
-        {
-            var transposed = gpu_hosted_c.resident_array_new();
-            errdefer _ = gpu_hosted_c.resident_array_free(transposed);
-            try gpu_hosted_mod.check(gpu_hosted_c.resident_transpose(&transposed, val, stream));
-            if (gpu_hosted_c.resident_map_string_to_array_insert(rebuilt, name_z.ptr, transposed) != 0) {
-                return error.GpuHostedMapInsertFailed;
-            }
-            _ = gpu_hosted_c.resident_array_free(transposed);
-        } else {
-            if (gpu_hosted_c.resident_map_string_to_array_insert(rebuilt, name_z.ptr, val) != 0) {
-                return error.GpuHostedMapInsertFailed;
-            }
-        }
-        _ = gpu_hosted_c.resident_array_free(val);
-    }
-
-    _ = gpu_hosted_c.resident_map_string_to_array_free(weights.*);
-    weights.* = rebuilt;
 }
 
 fn isGpt2Conv1dWeight(key: []const u8) bool {
@@ -10210,24 +9951,6 @@ fn runBertClassifier(
     const pooled = try maybeApplyPooler(cb, allocator, cls_embeddings, batch, hidden_size, "pooler.dense.weight", "pooler.dense.bias");
     defer allocator.free(pooled);
     return runLinearHead(allocator, cb, pooled, batch, hidden_size, cfg.num_labels, "classifier.weight", "classifier.bias");
-}
-
-fn runDebertaSequenceClassifier(
-    cb: *const ops.ComputeBackend,
-    allocator: std.mem.Allocator,
-    cfg: deberta_mod.Config,
-    hidden: []const f32,
-    batch: usize,
-    seq_len: usize,
-) ![]f32 {
-    const H: usize = @intCast(cfg.hidden_size);
-    const cls_embeddings = try extractClsEmbeddings(allocator, hidden, batch, seq_len, H);
-    defer allocator.free(cls_embeddings);
-
-    const pooled = try maybeApplyPooler(cb, allocator, cls_embeddings, batch, H, "pooler.dense.weight", "pooler.dense.bias");
-    defer allocator.free(pooled);
-
-    return runLinearHead(allocator, cb, pooled, batch, H, cfg.num_labels, "classifier.weight", "classifier.bias");
 }
 
 fn runDebertaSequenceClassifierCt(

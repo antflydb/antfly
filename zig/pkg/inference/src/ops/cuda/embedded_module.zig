@@ -73,6 +73,11 @@ pub fn EmbeddedModule(comptime image: [:0]const u8, comptime entries: anytype) t
 /// tuned schedule. Cached lookups add no driver calls or dynamic ABI packing.
 pub const Image = struct { image: [:0]const u8, entry: [:0]const u8 };
 
+/// Resolve a fixed offline profile at compile time; no serving-time catalog lookup.
+pub fn profile(comptime spec: anytype) Image {
+    return .{ .image = @field(@import("generated/standalone_images.zig").images, spec.file), .entry = spec.entry };
+}
+
 pub fn EmbeddedPrograms(comptime descriptors: anytype) type {
     const fields = @typeInfo(@TypeOf(descriptors)).@"struct".field_names;
     const images: [fields.len]Image = comptime blk: {

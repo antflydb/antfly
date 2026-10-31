@@ -26,21 +26,6 @@
 //! contains `{{`, but may put `{` right before a tag.
 
 const std = @import("std");
-const region = @import("region.zig");
-
-/// Rendered Metal kernel text as metal_kernels.m lines: the `//` lines before
-/// `kernel void` stay Objective-C comments, the rest becomes C-string lines.
-pub fn metal(comptime text: []const u8) []const u8 {
-    comptime {
-        const start = std.mem.indexOf(u8, text, "kernel void ").?;
-        var out: []const u8 = "";
-        var lines = std.mem.splitScalar(u8, text[0..start], '\n');
-        while (lines.next()) |line| {
-            if (line.len != 0) out = out ++ region.metal_indent ++ line ++ "\n";
-        }
-        return out ++ region.metalLines(region.metal_indent, text[start..]);
-    }
-}
 
 pub fn render(comptime tmpl: []const u8, comptime ctx: anytype) []const u8 {
     comptime {

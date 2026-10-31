@@ -532,11 +532,6 @@ fn linearWithBias(
     return cb.linearNoBias(input, w, rows, in_dim, out_dim);
 }
 
-fn getEncoderWeight(cb: *const ComputeBackend, layer: usize, suffix: []const u8, buf: *[256]u8) !CT {
-    const name = std.fmt.bufPrint(buf, "model.encoder.layers.{d}.{s}", .{ layer, suffix }) catch return error.NameTooLong;
-    return cb.getWeight(name);
-}
-
 fn getDecoderWeight(cb: *const ComputeBackend, layer: usize, suffix: []const u8, buf: *[256]u8) !CT {
     const name = std.fmt.bufPrint(buf, "model.decoder.layers.{d}.{s}", .{ layer, suffix }) catch return error.NameTooLong;
     return cb.getWeight(name);

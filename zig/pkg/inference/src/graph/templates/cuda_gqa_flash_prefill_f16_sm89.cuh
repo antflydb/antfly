@@ -286,23 +286,6 @@ static __device__ bool validate_launch(
     return true;
 }
 
-template <int HeadDim>
-static __device__ __forceinline__ size_t flash_shared_bytes() {
-    // Keep this layout mirrored by the typed renderer and qualification harness.
-    if constexpr (kKvHeads == 2u) {
-        return (kQueryTile + 2u * kKeyTile) * HeadDim * sizeof(half) + 3u * kQueryTile * sizeof(float) +
-            kQueryTile * kKeyTile * sizeof(half) +
-            (kKeyTile + 1u) * sizeof(unsigned);
-    }
-    return
-        2u * kQueryTile * HeadDim * sizeof(half) + // Q tile + K/V tile
-        kQueryTile * kKeyTile * sizeof(float) +   // scores
-        kQueryTile * kKeyTile * sizeof(half) +    // probabilities
-        kWarps * kQueryTile * 16u * sizeof(float) + // per-warp WMMA scratch
-        3u * kQueryTile * sizeof(unsigned) +       // physical, begin, end
-        4u * kQueryTile * sizeof(float) +          // max, denom, alpha, beta
-        sizeof(unsigned);                          // shared error
-}
 
 template <int HeadDim, int SlidingWindow>
 static __device__ void flash_prefill_body(

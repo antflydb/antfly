@@ -83,16 +83,8 @@ def lighton_head_top1_finish(
 
 
 def generate(output):
-    import json
-    import hashlib
-    from pathlib import Path
-    from triton.compiler import ASTSource
-    from triton.backends.compiler import GPUTarget
+    from producer_support import profiles, compile_program, emit, write_manifest
 
-    assert triton.__version__ == "3.7.1"
-    triton.knobs.compilation.disable_line_info = True
-    output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
     jobs = [
         (
             lighton_head_top1_partial,
@@ -118,32 +110,12 @@ def generate(output):
         ),
     ]
     records = []
-    for fn, signature, constants, attrs, options in jobs:
-        compiled = triton.compile(
-            ASTSource(fn, signature, constexprs=constants, attrs=attrs),
-            target=GPUTarget("cuda", 121, 32),
-            options=options,
-        )
-        meta = compiled.metadata
-        assert meta.global_scratch_size == 0 and meta.profile_scratch_size == 0
-        assert meta.num_ctas == 1
-        assert (
-            meta.shared == 32768
-            if fn is lighton_head_top1_partial
-            else meta.shared == 16
-        )
-        data = compiled.asm["ptx"].encode()
-        name = "projection_top1_bf16_k1024_n248320_" + ("partial" if fn is lighton_head_top1_partial else "finish") + ".ptx"
-        (output / name).write_bytes(data)
-        records.append(
-            dict(
-                file=name,
-                sha256=hashlib.sha256(data).hexdigest(),
-                shared=meta.shared,
-                threads=meta.num_warps * 32,
-            )
-        )
-    (output / "manifest.json").write_text(json.dumps(records, indent=2) + "\n")
+    for spec, (fn, signature, constants, attrs, options) in zip(profiles("projection_top1"), jobs, strict=True):
+        # Alignment positions remain ABI policy; resources and image identities
+        # come from the same catalog used by serving launches.
+        data = compile_program(fn, signature, constants, (i[0] for i in attrs), spec, options)
+        records.append(emit(output, spec, data))
+    write_manifest(output, records)
 
 
 if __name__ == "__main__":

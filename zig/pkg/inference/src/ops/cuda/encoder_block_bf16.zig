@@ -78,12 +78,8 @@ fn disjoint(a: buffer.DeviceBuffer, a_bytes: usize, b: buffer.DeviceBuffer, b_by
 }
 
 // Historical device entry names are compatibility ABI, not model-specific ownership.
-const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("encoder_block_phases_bf16.ptx") ++ "\x00", .{
-    .norm = "lighton_bf16_vision_norm",
-    .add = "lighton_bf16_vision_add",
-    .gelu = "lighton_bf16_vision_gelu",
-    .qkv_rope = "lighton_bf16_vision_qkv_rope",
-});
+const catalog = @import("../../tile/cuda_standalone.zig");
+const Program = @import("embedded_module.zig").EmbeddedModule(@import("embedded_module.zig").profile(catalog.encoder).image, catalog.encoder_entries);
 
 pub const Module = struct {
     program: Program = .{},

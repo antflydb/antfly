@@ -2331,31 +2331,6 @@ fn dequantizeNVFP4(data: []const u8, output: []f32) !void {
     }
 }
 
-fn packedExpertMatrixShape(
-    allocator: std.mem.Allocator,
-    full_shape: []const i64,
-    expert_axis: usize,
-    expert_index: u32,
-    row_count_override: ?usize,
-) ![]i64 {
-    if (full_shape.len != 3) return error.InvalidPackedExpertTensor;
-    if (expert_axis >= full_shape.len - 1) return error.InvalidPackedExpertTensor;
-    if (expert_index >= @as(u32, @intCast(full_shape[expert_axis]))) return error.InvalidPackedExpertTensor;
-
-    const matrix_shape = try allocator.alloc(i64, 2);
-    var dst: usize = 0;
-    for (full_shape, 0..) |dim, axis| {
-        if (axis == expert_axis) continue;
-        matrix_shape[dst] = if (dst == 0 and row_count_override != null)
-            @intCast(row_count_override.?)
-        else
-            dim;
-        dst += 1;
-    }
-    if (dst != 2) return error.InvalidPackedExpertTensor;
-    return matrix_shape;
-}
-
 fn packedExpertRowBlockBase(
     full_shape: []const i64,
     expert_axis: usize,

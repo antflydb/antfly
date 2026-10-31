@@ -16,6 +16,8 @@
 //! Export instances of the qualified native schedules. Existing quant-codegen
 //! regions remain owned by their canonical cross-backend generators.
 const r = @import("../region.zig");
+const program = @import("../native_program.zig");
+const cuda_phases = @import("native/cuda_phases.zig");
 
 pub const regions = r.regions(&.{
     r.metalFamily("rms_norm", @import("native/metal_rms_norm.zig")),
@@ -107,4 +109,34 @@ pub const regions = r.regions(&.{
     r.cudaFamily("attention.ragged_tc", @import("native/cuda_attention_ragged_tc.zig")),
     r.metalFamily("projection.bf16_vec4", @import("native/metal_projection_bf16_vec4.zig")),
     r.metalFamily("projection.dot_small_m", @import("native/metal_projection_dot_small_m.zig")),
+    r.cudaSourceFamily("attention.direct", program.render(@embedFile("native/cuda/attention_direct.cu"), cuda_phases.attention)),
+    r.cudaSourceFamily("convolution.direct", @embedFile("native/cuda/convolution.cu")),
+    r.cudaSourceFamily("elementwise.direct", @embedFile("native/cuda/elementwise_direct.cu")),
+    r.cudaSourceFamily("expert.projection.direct", @embedFile("native/cuda/expert_projection.cu")),
+    r.cudaSourceFamily("kv.storage.direct", @embedFile("native/cuda/kv_storage.cu")),
+    r.cudaSourceFamily("normalization.direct", @embedFile("native/cuda/normalization_direct.cu")),
+    r.cudaSourceFamily("projection.direct", program.render(@embedFile("native/cuda/projection_direct.cu"), cuda_phases.projection)),
+    r.cudaSourceFamily("selection.direct", @embedFile("native/cuda/selection.cu")),
+    r.cudaSourceFamily("sequence.transforms.direct", @embedFile("native/cuda/sequence_transforms.cu")),
+    r.cudaSourceFamily("tensor.layout.direct", @embedFile("native/cuda/tensor_layout.cu")),
+    r.cudaSourceFamily("training.direct", @embedFile("native/cuda/training.cu")),
+    r.encodedMetalSourceFamily("attention.direct", @embedFile("native/metal/attention_direct.m")),
+    r.encodedMetalSourceFamily("audio.direct", @embedFile("native/metal/audio.m")),
+    r.metalSourceFamily("convolution.direct", @embedFile("native/metal/convolution.metal")),
+    r.metalSourceFamily("elementwise.direct", @embedFile("native/metal/elementwise_direct.metal")),
+    r.encodedMetalSourceFamily("expert.projection.direct", @embedFile("native/metal/expert_projection.m")),
+    r.metalSourceFamily("kv.storage.direct", @embedFile("native/metal/kv_storage.metal")),
+    r.metalSourceFamily("normalization.direct", @embedFile("native/metal/normalization_direct.metal")),
+    r.metalSourceFamily("projection.direct", @embedFile("native/metal/projection_direct.metal")),
+    r.metalSourceFamily("recurrence.direct", @embedFile("native/metal/recurrence.metal")),
+    r.metalSourceFamily("selection.direct", @embedFile("native/metal/selection.metal")),
+    r.metalSourceFamily("sequence.transforms.direct", @embedFile("native/metal/sequence_transforms.metal")),
+    r.metalSourceFamily("tensor.layout.direct", @embedFile("native/metal/tensor_layout.metal")),
+    r.encodedMetalSourceFamily("training.direct", @embedFile("native/metal/training.m")),
+    r.encodedMetalSourceFamily("attention.direct.abi", @embedFile("native/metal/attention_direct_abi.m")),
+    r.encodedMetalSourceFamily("audio.abi", @embedFile("native/metal/audio_abi.m")),
+    r.encodedMetalSourceFamily("elementwise.direct.abi", @embedFile("native/metal/elementwise_direct_abi.m")),
+    r.encodedMetalSourceFamily("expert.projection.abi", @embedFile("native/metal/expert_projection_abi.m")),
+    r.encodedMetalSourceFamily("projection.direct.abi", @embedFile("native/metal/projection_direct_abi.m")),
+    r.encodedMetalSourceFamily("tensor.layout.abi", @embedFile("native/metal/tensor_layout_abi.m")),
 });

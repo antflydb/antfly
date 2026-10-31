@@ -24,6 +24,7 @@ The agent-facing rules are in `zig/pkg/inference/src/ops/AGENTS.md`.
 | Segmented inference tile attention | `ANTFLY_MSL_SEGMENT_*` phases in `metal_kernels.m` | Wide/blocked row ownership, 8/16-key MMA and softmax schedules, explicit scales and GQA storage |
 | Range/segment training attention | `range_attention_reference.zig`, `segment_training_attention.zig`, Metal segment fragments | Mask/control layout, replay/dropout, orientation, tile geometry and gradient ownership |
 | Relative training attention | `kernels/relative_attention_training.cuh`, `relative_attention_tensor_*` and the GPU training renderer | Relative terms, bucket layout, deterministic replay and distinct tensor-core schedules |
+| Dense attention physical storage | `src/ops/kernel_geometry.zig` (`DenseAttentionLayout`) | Token-major 2D and head-major 3D/4D contracts; reject mixed layouts and preserve backend compatibility defaults |
 | CPU online attention rows | `linalg.attention.updateOnlineRow` | Conditional/scalar/SIMD maxima, empty-tile handling, rescale guards, vector width and statistic read/store order |
 | Quantized Metal matrix phases | `ANTFLY_MSL_QUANT_SWIZZLE16`, `ANTFLY_MSL_MATRIX_4X1_*`, `ANTFLY_MSL_MATRIX_4X2_*` | Swizzle groups, scalar/vector acquisition, unroll and SIMD barriers, M32/M64 right-operand advance, output pitch and scratch publication |
 | Wide CPU segment GEMM | `native.WideSegmentAttentionGemm` | 512-query BLAS tile, explicit key reuse; model admission remains in adapters |
@@ -141,6 +142,38 @@ prototype Metal kernels and checks the actual opt-in catalog hook against an
 independent logits reference, canaries and optional AA/AB/BA timing controls.
 Moving existing programs into generated regions earns no reduction credit; all
 Tile renderer and native specialization sources remain authored production code.
+
+## Native source files and offline programs
+
+Direct Metal/CUDA exports belong to a generated region. Freshness checking
+rejects new direct or ABI-macro exports outside generator ownership. Fourteen
+legacy ABI shells contain quant-owned numerical regions and retain that owner.
+Do not add a second generator around them.
+
+New native families can keep readable `.cu` or `.metal` source under
+`src/tile/families/native/`. Use `cudaSourceFamily` or `metalSourceFamily` and
+`// native-program:entry SYMBOL` descriptions. Source order determines the
+family's region order. The extractor validates unique names and boundaries;
+Metal encoding happens once at the Objective-C boundary. Existing Objective-C
+macro splices use `encodedMetalSourceFamily`. These files participate in the
+checked source-input manifest and backend qualification identity.
+
+`src/tile/cuda_standalone.zig` owns offline CUDA image identities, export names
+and fixed launch resources. Tile codegen exports its JSON for the Python
+producers; host launch owners consume the same typed catalog. Shared producer
+support enforces pinned compiler, export and zero-scratch/resource contracts.
+Normal serving does not require Python, Triton or source parsing.
+
+On the qualified Linux toolchain, run:
+
+```sh
+python3 -B zig/pkg/inference/scripts/regen_cuda_standalone.py --report RECEIPT.json
+```
+
+The default checks all twelve images byte-for-byte. `--write` publishes images
+only after every image's export contract passes. Scratch and compiler caches
+stay in the worktree. This path requires NVCC 13.0.88 and Triton 3.7.1; canonical
+multi-architecture fatbin generation separately uses NVCC 13.2.86.
 
 ## CUDA artifact size and export ownership
 

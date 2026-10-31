@@ -368,10 +368,6 @@ test "shared backend context retains exact compute backend identity" {
     try std.testing.expectEqual(BackendType.native, shared.backendType());
 }
 
-fn metalShaderValidationEnabledForTest() bool {
-    const c_std = std.c;
-    return c_std.getenv("MTL_SHADER_VALIDATION") != null;
-}
 
 fn expectSimpleAddRoundTrip(ctx: *BackendContext, allocator: std.mem.Allocator) !void {
     var cb = ctx.computeBackend();

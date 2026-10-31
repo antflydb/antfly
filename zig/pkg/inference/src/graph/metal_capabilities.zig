@@ -2459,33 +2459,6 @@ test "seeded resident backend descriptors keep tiny device chains on metal" {
     try std.testing.expectEqual(contracts.BackendKind.metal, plan.partitions[plan.node_assignment[out]].backend);
 }
 
-fn expectNamedWeightLinearConsumersOnMetal(
-    graph: *const Graph,
-    plan: *const partition.PartitionPlan,
-    weight_name: []const u8,
-    expected_operator: operator_plan.Operator,
-) !void {
-    var found = false;
-    for (0..graph.nodeCount()) |idx| {
-        const node_id: NodeId = @intCast(idx);
-        const node = graph.node(node_id);
-        switch (node.op) {
-            .fused_linear, .fused_linear_no_bias => {},
-            else => continue,
-        }
-        const inputs = node.getInputs();
-        if (inputs.len < 2 or inputs[1] == null_node) continue;
-        const weight = graph.node(inputs[1]);
-        if (std.meta.activeTag(weight.op) != .parameter) continue;
-        if (!std.mem.eql(u8, graph.parameterName(weight), weight_name)) continue;
-
-        found = true;
-        try std.testing.expectEqual(contracts.BackendKind.metal, plan.partitions[plan.node_assignment[node_id]].backend);
-        try std.testing.expectEqual(expected_operator, plan.operatorPlanForNode(node_id).?.operator());
-    }
-    try std.testing.expect(found);
-}
-
 fn expectReachableNamedWeightLinearConsumersOnMetal(
     graph: *const Graph,
     plan: *const partition.PartitionPlan,

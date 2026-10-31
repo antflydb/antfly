@@ -1406,9 +1406,6 @@ fn shapeSliceFromOwnedShape(allocator: std.mem.Allocator, shape: Shape) ![]i64 {
     return dims;
 }
 
-fn shapeSliceFromShape(shape: Shape) []const i64 {
-    return shape.dims[0..shape.rank()];
-}
 
 fn dtypeFromShape(shape: Shape) DType {
     return switch (shape.dtype) {

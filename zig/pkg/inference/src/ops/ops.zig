@@ -4621,6 +4621,10 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    /// Dense attention uses token-major [batch*seq, heads*dim] tensors.
+    /// Native, Metal and CUDA also honor explicit head-major 3D/4D storage;
+    /// output retains the input's physical layout. Model adapters can keep QKV
+    /// linear outputs token-major instead of inserting layout conversions.
     pub fn scaledDotProductAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
         return self.vtable.scaledDotProductAttention(self.ptr, Q, K, V, mask, attn_bias, batch, seq_len, num_heads, head_dim);
     }

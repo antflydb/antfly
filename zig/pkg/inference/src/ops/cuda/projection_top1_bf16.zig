@@ -21,7 +21,9 @@ const context = @import("context.zig");
 const driver = @import("driver.zig");
 const buffer = @import("buffer.zig");
 
-pub const tiles = 970;
+const catalog = @import("../../tile/cuda_standalone.zig");
+const image = @import("embedded_module.zig").profile;
+pub const tiles = (catalog.top1[0].wide + 255) / 256;
 pub const Request = struct {
     input: buffer.DeviceBuffer,
     weight: buffer.DeviceBuffer,
@@ -47,8 +49,8 @@ pub fn validate(r: Request) !void {
 
 // These historical device entries are retained compatibility ABI names.
 const Programs = @import("embedded_module.zig").EmbeddedPrograms(.{
-    .partial = .{ .image = @embedFile("projection_top1_bf16_k1024_n248320_partial.ptx") ++ "\x00", .entry = "lighton_head_top1_partial" },
-    .finish = .{ .image = @embedFile("projection_top1_bf16_k1024_n248320_finish.ptx") ++ "\x00", .entry = "lighton_head_top1_finish" },
+    .partial = image(catalog.top1[0]),
+    .finish = image(catalog.top1[1]),
 });
 
 pub const Module = struct {
@@ -77,10 +79,10 @@ pub const Module = struct {
         // The pinned generator asserts both hidden ABI scratch sizes are zero.
         var scratch: u64 = 0;
         var first = [_]?*anyopaque{ &p[0], &p[1], &p[2], &p[3], &p[4], &rows, &count, &scratch, &scratch };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(.partial), tiles, 1, 1, 256, 1, 1, 32768, ctx.stream, &first, null));
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(.partial), tiles, 1, 1, catalog.top1[0].threads, 1, 1, catalog.top1[0].shared, ctx.stream, &first, null));
         ctx.noteKernelLaunch();
         var last = [_]?*anyopaque{ &p[2], &p[3], &p[5], &scratch, &scratch };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(.finish), @intCast(r.rows), 1, 1, 128, 1, 1, 16, ctx.stream, &last, null));
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(.finish), @intCast(r.rows), 1, 1, catalog.top1[1].threads, 1, 1, catalog.top1[1].shared, ctx.stream, &last, null));
         ctx.noteKernelLaunch();
         self.calls += 1;
     }

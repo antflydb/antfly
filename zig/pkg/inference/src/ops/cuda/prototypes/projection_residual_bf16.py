@@ -57,57 +57,18 @@ def lighton_vision_down(
 
 
 def generate(output):
-    import hashlib
-    import json
-    from pathlib import Path
-    from triton.compiler import ASTSource
-    from triton.backends.compiler import GPUTarget
+    from producer_support import profiles, compile_program, emit, write_manifest
 
-    assert triton.__version__ == "3.7.1"
-    triton.knobs.compilation.disable_line_info = True
-    output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
     records = []
-    for hidden, wide in [(768, 3072), (1024, 4096)]:
-        for bf16 in [False, True]:
-            scalar = "*bf16" if bf16 else "*fp32"
-            signature = dict(
-                x="*bf16",
-                w="*bf16",
-                bias=scalar,
-                residual=scalar,
-                out=scalar,
-                rows="i32",
-            )
-            compiled = triton.compile(
-                ASTSource(
-                    lighton_vision_down,
-                    signature,
-                    constexprs=dict(
-                        K=wide, N=hidden, BM=128, BN=64, BK=64, BF16_IO=bf16
-                    ),
-                    attrs={(i,): [["tt.divisibility", 16]] for i in range(5)},
-                ),
-                target=GPUTarget("cuda", 121, 32),
-                options=dict(
-                    num_warps=4, num_stages=3, ptx_version=90, enable_fp_fusion=False
-                ),
-            )
-            meta = compiled.metadata
-            assert meta.global_scratch_size == 0 and meta.profile_scratch_size == 0
-            assert meta.num_ctas == 1 and meta.shared == 49152 and meta.num_warps == 4
-            name = f"projection_residual_sm121_k{wide}_n{hidden}_io_{'bf16' if bf16 else 'f32'}.ptx"
-            data = compiled.asm["ptx"].encode()
-            (output / name).write_bytes(data)
-            records.append(
-                dict(
-                    file=name,
-                    sha256=hashlib.sha256(data).hexdigest(),
-                    shared=meta.shared,
-                    threads=meta.num_warps * 32,
-                )
-            )
-    (output / "manifest.json").write_text(json.dumps(records, indent=2) + "\n")
+    for spec in profiles("projection_residual"):
+        scalar = "*bf16" if spec["bf16"] else "*fp32"
+        data = compile_program(
+            lighton_vision_down,
+            dict(x="*bf16", w="*bf16", bias=scalar, residual=scalar, out=scalar, rows="i32"),
+            dict(K=spec["wide"], N=spec["hidden"], BM=128, BN=64, BK=64, BF16_IO=spec["bf16"]),
+            range(5), spec, dict(num_stages=3, enable_fp_fusion=False))
+        records.append(emit(output, spec, data))
+    write_manifest(output, records)
 
 
 if __name__ == "__main__":

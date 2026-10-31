@@ -719,6 +719,10 @@ pub fn build(b: *std.Build) void {
         "--check",
         "--all",
     });
+    const cuda_standalone_check = b.addSystemCommand(&.{ "python3", "-B" });
+    cuda_standalone_check.addFileArg(b.path("scripts/regen_cuda_standalone.py"));
+    cuda_standalone_check.addPassthruArgs();
+    b.step("cuda-standalone-check", "Regenerate and verify standalone CUDA programs with pinned NVCC/Triton").dependOn(&cuda_standalone_check.step);
     const cuda_artifacts_check_step = b.step("cuda-artifacts-check", "Verify checked-in CUDA artifacts with CUDA 13.2");
     cuda_artifacts_check_step.dependOn(&cuda_artifacts_freshness_check.step);
 

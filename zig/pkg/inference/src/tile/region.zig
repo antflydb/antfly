@@ -62,6 +62,14 @@ const std = @import("std");
 /// One region has the family name; multiple regions retain numbered suffixes.
 fn sourceCount(comptime source: type) usize {
     comptime {
+        if (@hasDecl(source, "sources")) {
+            for (std.meta.declarations(source)) |decl| {
+                if (std.mem.startsWith(u8, decl, "source_"))
+                    @compileError("native family cannot mix file exports and source_N declarations");
+            }
+            if (source.sources.len == 0) @compileError("native family has no source regions");
+            return source.sources.len;
+        }
         var count: usize = 0;
         for (std.meta.declarations(source)) |decl| {
             if (std.mem.startsWith(u8, decl, "source_")) count += 1;
@@ -95,6 +103,25 @@ pub fn cudaFamily(comptime name: []const u8, comptime source: type) Family {
     return nativeFamily(cuda_bundle, "", name, source);
 }
 
+fn sourceFamily(comptime path: []const u8, comptime indent: []const u8, comptime name: []const u8, comptime text: []const u8, comptime encoding: @import("native_sources.zig").Encoding) Family {
+    return nativeFamily(path, indent, name, struct {
+        pub const sources = @import("native_sources.zig").sources(text, encoding);
+    });
+}
+
+pub fn cudaSourceFamily(comptime name: []const u8, comptime text: []const u8) Family {
+    return sourceFamily(cuda_bundle, "", name, text, .cuda);
+}
+
+pub fn metalSourceFamily(comptime name: []const u8, comptime text: []const u8) Family {
+    return sourceFamily(metal_kernels_m, metal_indent, name, text, .metal);
+}
+
+/// Host ABI macro splices retain their existing Objective-C encoding.
+pub fn encodedMetalSourceFamily(comptime name: []const u8, comptime text: []const u8) Family {
+    return sourceFamily(metal_kernels_m, metal_indent, name, text, .encoded_metal);
+}
+
 fn regionCount(comptime families: []const Family) usize {
     comptime {
         @setEvalBranchQuota(1_000_000);
@@ -114,7 +141,8 @@ pub fn regions(comptime families: []const Family) [regionCount(families)]Region 
             const count = sourceCount(item.source);
             for (0..count) |i| {
                 const key = if (count == 1) item.name else std.fmt.comptimePrint("{s}.{d}", .{ item.name, i });
-                result[cursor] = region(item.path, item.indent, key, @field(item.source, std.fmt.comptimePrint("source_{d}", .{i})));
+                const data = if (@hasDecl(item.source, "sources")) item.source.sources[i] else @field(item.source, std.fmt.comptimePrint("source_{d}", .{i}));
+                result[cursor] = region(item.path, item.indent, key, data);
                 cursor += 1;
             }
         }

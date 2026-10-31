@@ -589,45 +589,6 @@ fn assignSlotAllocation(
     });
 }
 
-fn slotReferencedByPartition(
-    plan: *const BufferPlan,
-    slot_id: SlotId,
-    partition_index: u32,
-) bool {
-    for (plan.transfers) |transfer| {
-        if (transfer.source_slot == slot_id and
-            (transfer.source_partition == partition_index or transfer.target_partition == partition_index))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn partitionSlotRoles(
-    plan: *const BufferPlan,
-    slot: LogicalSlot,
-    partition_index: u32,
-) PartitionSlotRoles {
-    var roles = PartitionSlotRoles{
-        .local = slot.partition_index == partition_index,
-        .graph_output = slot.roles.graph_output and slot.partition_index == partition_index,
-    };
-    if (roles.graph_output) roles.output = true;
-    for (plan.transfers) |transfer| {
-        if (transfer.source_slot != slot.id) continue;
-        if (transfer.source_partition == partition_index) {
-            roles.output = true;
-            roles.transfer_source = true;
-        }
-        if (transfer.target_partition == partition_index) {
-            roles.input = true;
-            roles.transfer_target = true;
-        }
-    }
-    return roles;
-}
-
 const AllocationInit = struct {
     kind: AllocationKind,
     backend: BackendKind,

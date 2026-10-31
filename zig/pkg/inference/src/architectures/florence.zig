@@ -2814,54 +2814,6 @@ const PaddedWindows = struct {
     window_area: usize,
 };
 
-fn padTokensToWindow(
-    allocator: std.mem.Allocator,
-    tokens: []const f32,
-    batch: usize,
-    height: usize,
-    width: usize,
-    dim: usize,
-    window_size: usize,
-) !PaddedWindows {
-    const pad_w = (window_size - (width % window_size)) % window_size;
-    const pad_h = (window_size - (height % window_size)) % window_size;
-    const padded_h = height + pad_h;
-    const padded_w = width + pad_w;
-    const windows_h = padded_h / window_size;
-    const windows_w = padded_w / window_size;
-    const window_count = batch * windows_h * windows_w;
-    const window_area = window_size * window_size;
-
-    const data = try allocator.alloc(f32, window_count * window_area * dim);
-    @memset(data, 0.0);
-
-    for (0..batch) |b| {
-        for (0..windows_h) |wh| {
-            for (0..windows_w) |ww| {
-                const window_index = ((b * windows_h) + wh) * windows_w + ww;
-                for (0..window_size) |dy| {
-                    for (0..window_size) |dx| {
-                        const src_y = wh * window_size + dy;
-                        const src_x = ww * window_size + dx;
-                        if (src_y >= height or src_x >= width) continue;
-                        const src_token = (b * height * width + src_y * width + src_x) * dim;
-                        const dst_token = (window_index * window_area + dy * window_size + dx) * dim;
-                        @memcpy(data[dst_token..][0..dim], tokens[src_token..][0..dim]);
-                    }
-                }
-            }
-        }
-    }
-
-    return .{
-        .data = data,
-        .padded_h = padded_h,
-        .padded_w = padded_w,
-        .window_count = window_count,
-        .window_area = window_area,
-    };
-}
-
 fn unpadWindowTokens(
     allocator: std.mem.Allocator,
     window_tokens: []const f32,
@@ -3883,24 +3835,6 @@ fn tryOptionalWeight(cb: *const ComputeBackend, name: []const u8) !?CT {
     };
 }
 
-fn backendLinearData(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    input: []const f32,
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-    weight: CT,
-    bias: CT,
-) ![]f32 {
-    const shape = [_]i32{ @intCast(rows), @intCast(in_dim) };
-    const input_ct = try cb.fromFloat32Shape(input, &shape);
-    defer cb.free(input_ct);
-    const out_ct = try cb.linear(input_ct, weight, bias, rows, in_dim, out_dim);
-    defer cb.free(out_ct);
-    return cb.toFloat32(out_ct, allocator);
-}
-
 fn backendLinearNoBiasData(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -4045,17 +3979,6 @@ fn backendNormedExactGeluMlpData(
     const fc2_ct = try cb.linear(activated_ct, fc2_weight, fc2_bias, rows, hidden_dim, in_dim);
     defer cb.free(fc2_ct);
     return cb.toFloat32(fc2_ct, allocator);
-}
-
-fn splitQkv(qkv: []const f32, q: []f32, k: []f32, v: []f32, dim: usize) void {
-    const rows = q.len / dim;
-    for (0..rows) |row| {
-        const src = row * dim * 3;
-        const dst = row * dim;
-        @memcpy(q[dst..][0..dim], qkv[src..][0..dim]);
-        @memcpy(k[dst..][0..dim], qkv[src + dim ..][0..dim]);
-        @memcpy(v[dst..][0..dim], qkv[src + 2 * dim ..][0..dim]);
-    }
 }
 
 fn channelAttention(
@@ -4207,143 +4130,6 @@ fn conv2d(
     }
 
     return .{ .data = out, .height = out_h, .width = out_w };
-}
-
-fn conv2dTokens(
-    allocator: std.mem.Allocator,
-    input: []const f32,
-    batch: usize,
-    in_channels: usize,
-    height: usize,
-    width: usize,
-    weight: []const f32,
-    bias: []const f32,
-    out_channels: usize,
-    kernel: usize,
-    stride: usize,
-    padding: usize,
-) ![]f32 {
-    const out_h = (height + 2 * padding - kernel) / stride + 1;
-    const out_w = (width + 2 * padding - kernel) / stride + 1;
-    const out = try allocator.alloc(f32, batch * out_h * out_w * out_channels);
-
-    for (0..batch) |b| {
-        for (0..out_h) |oy| {
-            for (0..out_w) |ox| {
-                const out_base = ((b * out_h + oy) * out_w + ox) * out_channels;
-                for (0..out_channels) |oc| {
-                    var acc = bias[oc];
-                    for (0..in_channels) |ic| {
-                        for (0..kernel) |ky| {
-                            for (0..kernel) |kx| {
-                                const in_y_signed = @as(isize, @intCast(oy * stride + ky)) - @as(isize, @intCast(padding));
-                                const in_x_signed = @as(isize, @intCast(ox * stride + kx)) - @as(isize, @intCast(padding));
-                                if (in_y_signed < 0 or in_x_signed < 0) continue;
-                                const in_y: usize = @intCast(in_y_signed);
-                                const in_x: usize = @intCast(in_x_signed);
-                                if (in_y >= height or in_x >= width) continue;
-                                const in_idx = ((b * height + in_y) * width + in_x) * in_channels + ic;
-                                const w_idx = (((oc * in_channels + ic) * kernel) + ky) * kernel + kx;
-                                acc += input[in_idx] * weight[w_idx];
-                            }
-                        }
-                    }
-                    out[out_base + oc] = acc;
-                }
-            }
-        }
-    }
-
-    return out;
-}
-
-fn depthwiseConv2d(
-    allocator: std.mem.Allocator,
-    input: []const f32,
-    batch: usize,
-    channels: usize,
-    height: usize,
-    width: usize,
-    weight: []const f32,
-    bias: []const f32,
-    kernel: usize,
-    stride: usize,
-    padding: usize,
-) !Conv2dResult {
-    const out_h = (height + 2 * padding - kernel) / stride + 1;
-    const out_w = (width + 2 * padding - kernel) / stride + 1;
-    const out = try allocator.alloc(f32, batch * channels * out_h * out_w);
-
-    for (0..batch) |b| {
-        for (0..channels) |c| {
-            for (0..out_h) |oy| {
-                for (0..out_w) |ox| {
-                    var acc = bias[c];
-                    for (0..kernel) |ky| {
-                        for (0..kernel) |kx| {
-                            const in_y_signed = @as(isize, @intCast(oy * stride + ky)) - @as(isize, @intCast(padding));
-                            const in_x_signed = @as(isize, @intCast(ox * stride + kx)) - @as(isize, @intCast(padding));
-                            if (in_y_signed < 0 or in_x_signed < 0) continue;
-                            const in_y: usize = @intCast(in_y_signed);
-                            const in_x: usize = @intCast(in_x_signed);
-                            if (in_y >= height or in_x >= width) continue;
-                            const in_idx = ((b * channels + c) * height + in_y) * width + in_x;
-                            const w_idx = (c * kernel + ky) * kernel + kx;
-                            acc += input[in_idx] * weight[w_idx];
-                        }
-                    }
-                    const out_idx = ((b * channels + c) * out_h + oy) * out_w + ox;
-                    out[out_idx] = acc;
-                }
-            }
-        }
-    }
-    return .{ .data = out, .height = out_h, .width = out_w };
-}
-
-fn depthwiseConvTokens(
-    allocator: std.mem.Allocator,
-    input: []const f32,
-    batch: usize,
-    channels: usize,
-    height: usize,
-    width: usize,
-    weight: []const f32,
-    bias: []const f32,
-    kernel: usize,
-    stride: usize,
-    padding: usize,
-) ![]f32 {
-    const out_h = (height + 2 * padding - kernel) / stride + 1;
-    const out_w = (width + 2 * padding - kernel) / stride + 1;
-    const out = try allocator.alloc(f32, batch * out_h * out_w * channels);
-
-    for (0..batch) |b| {
-        for (0..out_h) |oy| {
-            for (0..out_w) |ox| {
-                const out_base = ((b * out_h + oy) * out_w + ox) * channels;
-                for (0..channels) |c| {
-                    var acc = bias[c];
-                    for (0..kernel) |ky| {
-                        for (0..kernel) |kx| {
-                            const in_y_signed = @as(isize, @intCast(oy * stride + ky)) - @as(isize, @intCast(padding));
-                            const in_x_signed = @as(isize, @intCast(ox * stride + kx)) - @as(isize, @intCast(padding));
-                            if (in_y_signed < 0 or in_x_signed < 0) continue;
-                            const in_y: usize = @intCast(in_y_signed);
-                            const in_x: usize = @intCast(in_x_signed);
-                            if (in_y >= height or in_x >= width) continue;
-                            const in_idx = ((b * height + in_y) * width + in_x) * channels + c;
-                            const w_idx = (c * kernel + ky) * kernel + kx;
-                            acc += input[in_idx] * weight[w_idx];
-                        }
-                    }
-                    out[out_base + c] = acc;
-                }
-            }
-        }
-    }
-
-    return out;
 }
 
 fn tokensToImage(

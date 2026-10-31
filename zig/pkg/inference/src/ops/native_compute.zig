@@ -7552,9 +7552,10 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
     const hidden_dim = num_heads * head_dim;
     const expected_len = effective_batch * effective_seq_len * hidden_dim;
     const token_shape = [_]i64{ @intCast(effective_batch * effective_seq_len), @intCast(hidden_dim) };
-    const q_token_major = if (tensorStoredShape(q_ct)) |shape| std.mem.eql(i64, shape, &token_shape) else false;
-    const k_token_major = if (tensorStoredShape(k_ct)) |shape| std.mem.eql(i64, shape, &token_shape) else false;
-    const v_token_major = if (tensorStoredShape(v_ct)) |shape| std.mem.eql(i64, shape, &token_shape) else false;
+    const Layout = kernel_geometry.DenseAttentionLayout;
+    const q_token_major = if (tensorStoredShape(q_ct)) |shape| Layout.fromShape(i64, shape, effective_batch, effective_seq_len, num_heads, head_dim) == .token_major else false;
+    const k_token_major = if (tensorStoredShape(k_ct)) |shape| Layout.fromShape(i64, shape, effective_batch, effective_seq_len, num_heads, head_dim) == .token_major else false;
+    const v_token_major = if (tensorStoredShape(v_ct)) |shape| Layout.fromShape(i64, shape, effective_batch, effective_seq_len, num_heads, head_dim) == .token_major else false;
     if (num_heads > 1 and (q_token_major != k_token_major or q_token_major != v_token_major)) {
         return error.InvalidInputShape;
     }

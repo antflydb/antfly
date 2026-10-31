@@ -545,24 +545,15 @@ fn selfAttn(
     defer cb.free(Q_token);
     defer cb.free(K_token);
     defer cb.free(V_token);
-    const Q = if (causal) Q_token else try packTokenMajorToHeadMajor(cb, allocator, Q_token, batch, seq_len, num_heads, head_dim);
-    defer if (!causal) cb.free(Q);
-    const K = if (causal) K_token else try packTokenMajorToHeadMajor(cb, allocator, K_token, batch, seq_len, num_heads, head_dim);
-    defer if (!causal) cb.free(K);
-    const V = if (causal) V_token else try packTokenMajorToHeadMajor(cb, allocator, V_token, batch, seq_len, num_heads, head_dim);
-    defer if (!causal) cb.free(V);
-
     const attn_out = if (causal)
-        try cb.causalSelfAttention(Q, K, V, null, batch, seq_len, num_heads, head_dim)
+        try cb.causalSelfAttention(Q_token, K_token, V_token, null, batch, seq_len, num_heads, head_dim)
     else blk: {
         const ones = try allocator.alloc(i64, batch * seq_len);
         defer allocator.free(ones);
         @memset(ones, 1);
-        break :blk try cb.scaledDotProductAttention(Q, K, V, ones, null, batch, seq_len, num_heads, head_dim);
+        break :blk try cb.scaledDotProductAttention(Q_token, K_token, V_token, ones, null, batch, seq_len, num_heads, head_dim);
     };
     defer cb.free(attn_out);
-    const projected_input = if (causal) attn_out else try unpackHeadMajorToTokenMajor(cb, allocator, attn_out, batch, seq_len, num_heads, head_dim);
-    defer if (!causal) cb.free(projected_input);
 
     var o_w_buf: [128]u8 = undefined;
     var o_b_buf: [128]u8 = undefined;
@@ -570,142 +561,16 @@ fn selfAttn(
     defer cb.free(o_w);
     const o_b = try cb.getWeight(try fmt(&o_b_buf, "{s}.{d}.self_attn.out_proj.bias", .{ prefix, layer }));
     defer cb.free(o_b);
-    const projected = (try cb.linearAdd(projected_input, o_w, o_b, residual, total, hidden, hidden)) orelse blk: {
-        const projected = try cb.linear(projected_input, o_w, o_b, total, hidden, hidden);
+    const projected = (try cb.linearAdd(attn_out, o_w, o_b, residual, total, hidden, hidden)) orelse blk: {
+        const projected = try cb.linear(attn_out, o_w, o_b, total, hidden, hidden);
         defer cb.free(projected);
         break :blk try cb.add(residual, projected);
     };
     return projected;
 }
 
-fn packTokenMajorToHeadMajor(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    tensor: CT,
-    batch: usize,
-    seq_len: usize,
-    num_heads: usize,
-    head_dim: usize,
-) !CT {
-    if (cb.vtable.transposeOp != null and cb.vtable.reshapeOp != null) {
-        const shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim) };
-        const shaped = try cb.primReshape(tensor, &shape);
-        defer cb.free(shaped);
-        const transposed = try cb.primTranspose(shaped, &.{ 0, 2, 1, 3 }, &shape);
-        defer cb.free(transposed);
-        return cb.primReshape(transposed, &.{ @intCast(batch * num_heads), @intCast(seq_len), @intCast(head_dim) });
-    }
-    const token_major = try cb.toFloat32(tensor, allocator);
-    defer allocator.free(token_major);
-    const head_major = try packTokenMajorDataToHeadMajor(allocator, token_major, batch, seq_len, num_heads, head_dim);
-    defer allocator.free(head_major);
-    const shape = [_]i32{ @intCast(batch * num_heads), @intCast(seq_len), @intCast(head_dim) };
-    return cb.fromFloat32Shape(head_major, &shape);
-}
-
-fn unpackHeadMajorToTokenMajor(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    tensor: CT,
-    batch: usize,
-    seq_len: usize,
-    num_heads: usize,
-    head_dim: usize,
-) !CT {
-    if (cb.vtable.transposeOp != null and cb.vtable.reshapeOp != null) {
-        const shape = [_]i64{ @intCast(batch), @intCast(num_heads), @intCast(seq_len), @intCast(head_dim) };
-        const shaped = try cb.primReshape(tensor, &shape);
-        defer cb.free(shaped);
-        const transposed = try cb.primTranspose(shaped, &.{ 0, 2, 1, 3 }, &shape);
-        defer cb.free(transposed);
-        return cb.primReshape(transposed, &.{ @intCast(batch * seq_len), @intCast(num_heads * head_dim) });
-    }
-    const head_major = try cb.toFloat32(tensor, allocator);
-    defer allocator.free(head_major);
-    const token_major = try unpackHeadMajorDataToTokenMajor(allocator, head_major, batch, seq_len, num_heads, head_dim);
-    defer allocator.free(token_major);
-    const shape = [_]i32{ @intCast(batch * seq_len), @intCast(num_heads * head_dim) };
-    return cb.fromFloat32Shape(token_major, &shape);
-}
-
-fn packTokenMajorDataToHeadMajor(
-    allocator: std.mem.Allocator,
-    token_major: []const f32,
-    batch: usize,
-    seq_len: usize,
-    num_heads: usize,
-    head_dim: usize,
-) ![]f32 {
-    const hidden = num_heads * head_dim;
-    const expected = batch * seq_len * hidden;
-    if (token_major.len != expected) return error.InvalidAttentionShape;
-
-    const head_major = try allocator.alloc(f32, expected);
-    for (0..batch) |b| {
-        for (0..seq_len) |s| {
-            for (0..num_heads) |h| {
-                const src = (b * seq_len + s) * hidden + h * head_dim;
-                const dst = (b * num_heads + h) * seq_len * head_dim + s * head_dim;
-                @memcpy(head_major[dst..][0..head_dim], token_major[src..][0..head_dim]);
-            }
-        }
-    }
-    return head_major;
-}
-
-fn unpackHeadMajorDataToTokenMajor(
-    allocator: std.mem.Allocator,
-    head_major: []const f32,
-    batch: usize,
-    seq_len: usize,
-    num_heads: usize,
-    head_dim: usize,
-) ![]f32 {
-    const hidden = num_heads * head_dim;
-    const expected = batch * seq_len * hidden;
-    if (head_major.len != expected) return error.InvalidAttentionShape;
-
-    const token_major = try allocator.alloc(f32, expected);
-    for (0..batch) |b| {
-        for (0..num_heads) |h| {
-            for (0..seq_len) |s| {
-                const src = (b * num_heads + h) * seq_len * head_dim + s * head_dim;
-                const dst = (b * seq_len + s) * hidden + h * head_dim;
-                @memcpy(token_major[dst..][0..head_dim], head_major[src..][0..head_dim]);
-            }
-        }
-    }
-    return token_major;
-}
-
 fn fmt(buf: *[128]u8, comptime format: []const u8, args: anytype) ![]const u8 {
     return std.fmt.bufPrint(buf, format, args) catch return error.WeightNameTooLong;
-}
-
-test "clip attention layout pack round-trips token major hidden rows" {
-    const allocator = std.testing.allocator;
-    const batch = 2;
-    const seq_len = 3;
-    const num_heads = 2;
-    const head_dim = 2;
-    const hidden = num_heads * head_dim;
-
-    var token_major: [batch * seq_len * hidden]f32 = undefined;
-    for (&token_major, 0..) |*value, i| value.* = @floatFromInt(i);
-
-    const head_major = try packTokenMajorDataToHeadMajor(allocator, &token_major, batch, seq_len, num_heads, head_dim);
-    defer allocator.free(head_major);
-
-    try std.testing.expectEqual(@as(f32, 0), head_major[0]);
-    try std.testing.expectEqual(@as(f32, 1), head_major[1]);
-    try std.testing.expectEqual(@as(f32, 4), head_major[2]);
-    try std.testing.expectEqual(@as(f32, 5), head_major[3]);
-    try std.testing.expectEqual(@as(f32, 2), head_major[seq_len * head_dim]);
-    try std.testing.expectEqual(@as(f32, 3), head_major[seq_len * head_dim + 1]);
-
-    const round_trip = try unpackHeadMajorDataToTokenMajor(allocator, head_major, batch, seq_len, num_heads, head_dim);
-    defer allocator.free(round_trip);
-    try std.testing.expectEqualSlices(f32, &token_major, round_trip);
 }
 
 test "native clip vision patch weight direct path matches explicit 2d reshape" {

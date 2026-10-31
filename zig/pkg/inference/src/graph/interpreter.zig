@@ -5189,9 +5189,6 @@ const TestCompute = struct {
     fn stubSdpa(_: *anyopaque, _: CT, _: CT, _: CT, _: []const i64, _: ?CT, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
         return error.UnsupportedPrimitiveOp;
     }
-    fn stubCausalAttn(_: *anyopaque, _: CT, _: CT, _: CT, _: ?CT, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
-        return error.UnsupportedPrimitiveOp;
-    }
     fn stubCrossAttn(_: *anyopaque, _: CT, _: CT, _: CT, _: []const i64, _: usize, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
         return error.UnsupportedPrimitiveOp;
     }

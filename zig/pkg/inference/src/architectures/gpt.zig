@@ -39,7 +39,6 @@ const ComputeBackend = ops.ComputeBackend;
 const gpt_config = @import("../models/gpt.zig");
 const runtime = @import("../runtime/root.zig");
 const activations = @import("../backends/activations.zig");
-const native_blas = @import("../backends/native.zig");
 const native_compute_mod = @import("../ops/native_compute.zig");
 const metal_compute_mod = @import("../ops/metal_compute.zig");
 const deepseek_v4 = @import("deepseek_v4.zig");
@@ -9734,27 +9733,6 @@ test "qwen3.5 recurrent gated delta rule updates state" {
     try std.testing.expectApproxEqAbs(@as(f32, 3), state[0], 1e-4);
 }
 
-fn applyActivationHostInPlace(activation: ActivationType, data: []f32) void {
-    switch (activation) {
-        .gelu => activations.gelu(data),
-        .gelu_new => {
-            const k: f32 = 0.044715;
-            const s: f32 = 0.7978845608028654;
-            for (data) |*x| {
-                const v = x.*;
-                const inner = s * (v + k * v * v * v);
-                x.* = 0.5 * v * (1.0 + std.math.tanh(inner));
-            }
-        },
-        .silu => activations.silu(data),
-        .relu => activations.relu(data),
-        .relu_squared => {
-            activations.relu(data);
-            for (data) |*x| x.* *= x.*;
-        },
-    }
-}
-
 fn maybeDebugLayerTensor(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -12903,11 +12881,6 @@ fn prefetchFormattedModelWeight(cb: *const ComputeBackend, config: Config, buf: 
         cb.prefetchWeightHint(prefixed, hint);
         return;
     }
-    cb.prefetchWeightHint(name, hint);
-}
-
-fn prefetchFormattedWeight(cb: *const ComputeBackend, buf: *[256]u8, hint: u32, comptime fmt: []const u8, args: anytype) void {
-    const name = std.fmt.bufPrint(buf, fmt, args) catch return;
     cb.prefetchWeightHint(name, hint);
 }
 

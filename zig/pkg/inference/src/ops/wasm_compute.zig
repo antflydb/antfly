@@ -4010,18 +4010,6 @@ pub const WasmCompute = struct {
         return out_buf;
     }
 
-    fn gpuAdd(
-        a_buf: wasm_extern.GpuBufferId,
-        b_buf: wasm_extern.GpuBufferId,
-        out: []f32,
-    ) GpuTensor {
-        if (!build_options.enable_webgpu) unreachable;
-        const out_bytes: u32 = @intCast(out.len * @sizeOf(f32));
-        const out_buf = GpuTensor.create(out_bytes);
-        wasm_extern.add(a_buf, b_buf, out_buf.id, @intCast(out.len));
-        return out_buf;
-    }
-
     fn gpuGelu(
         inp_buf: wasm_extern.GpuBufferId,
         out: []f32,
@@ -4106,24 +4094,6 @@ pub const WasmCompute = struct {
             wasm_extern.logSoftmax(inp_buf, out_buf.id, @intCast(rows), @intCast(dim));
         } else {
             wasm_extern.softmax(inp_buf, out_buf.id, @intCast(rows), @intCast(dim));
-        }
-        return out_buf;
-    }
-
-    fn gpuReduceLastDim(
-        inp_buf: wasm_extern.GpuBufferId,
-        rows: usize,
-        dim: usize,
-        out: []f32,
-        comptime mode: enum { sum, max, mean },
-    ) GpuTensor {
-        if (!build_options.enable_webgpu) unreachable;
-        const out_bytes: u32 = @intCast(out.len * @sizeOf(f32));
-        const out_buf = GpuTensor.create(out_bytes);
-        switch (mode) {
-            .sum => wasm_extern.reduceSumLastDim(inp_buf, out_buf.id, @intCast(rows), @intCast(dim)),
-            .max => wasm_extern.reduceMaxLastDim(inp_buf, out_buf.id, @intCast(rows), @intCast(dim)),
-            .mean => wasm_extern.reduceMeanLastDim(inp_buf, out_buf.id, @intCast(rows), @intCast(dim)),
         }
         return out_buf;
     }

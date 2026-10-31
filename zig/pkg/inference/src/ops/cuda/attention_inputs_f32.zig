@@ -77,8 +77,9 @@ pub fn validate(r: Request) !void {
 }
 
 // Historical device entry names are compatibility ABI, not model-specific ownership.
-const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("attention_inputs_partial_mrope_f32.ptx") ++ "\x00", .{
-    .prepare = "lighton_qk_norm_partial_mrope_gate",
+const catalog = @import("../../tile/cuda_standalone.zig");
+const Program = @import("embedded_module.zig").EmbeddedModule(@import("embedded_module.zig").profile(catalog.attention).image, .{
+    .prepare = catalog.attention.entry,
 });
 
 pub const Module = struct {

@@ -316,10 +316,6 @@ fn loadLegacyGlinerEncoderConfigVerified(allocator: std.mem.Allocator, model_pat
     return deberta_mod.parseConfig(allocator, bytes);
 }
 
-fn loadGlinerModernBertEncoderConfig(allocator: std.mem.Allocator, model_path: []const u8) !modern_bert_arch.Config {
-    return loadGlinerModernBertEncoderConfigVerified(allocator, model_path, null);
-}
-
 fn loadGlinerModernBertEncoderConfigVerified(allocator: std.mem.Allocator, model_path: []const u8, expected: ?gliner_decide_qualification.Digest) !modern_bert_arch.Config {
     const io = compat.io();
     const managed_receipt = @import("../registry/managed_receipt.zig");

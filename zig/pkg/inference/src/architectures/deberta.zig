@@ -731,24 +731,6 @@ fn embeddings(
     return masked;
 }
 
-/// Build relative position embedding lookup for all (i,j) pairs in sequence.
-/// Returns a CT tensor of shape [seq_len, H] containing the rel_embeddings
-/// indexed by relative position buckets.
-fn buildRelativePositionEmb(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    config: Config,
-    seq_len: usize,
-) !CT {
-    const info = try buildRelativePositionEmbInfo(cb, allocator, config, seq_len);
-    if (info.full_to_unique) |ids| {
-        defer allocator.free(ids);
-        defer cb.free(info.embeddings);
-        return cb.embeddingLookup(info.embeddings, ids, info.full_count, config.hidden_size);
-    }
-    return info.embeddings;
-}
-
 fn buildRelativePositionEmbInfo(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
