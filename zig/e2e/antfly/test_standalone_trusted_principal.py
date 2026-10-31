@@ -31,7 +31,16 @@ import pytest
 from conftest import resolve_binary_path
 
 
-def _token(secret, *, tables=None, admin=False, issuer="cloudaf", expired=False):
+def _token(
+    secret,
+    *,
+    tables=None,
+    admin=False,
+    issuer="cloudaf",
+    expired=False,
+    operations=None,
+    row_filter=None,
+):
     def encode(value):
         return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=")
 
@@ -43,13 +52,111 @@ def _token(secret, *, tables=None, admin=False, issuer="cloudaf", expired=False)
         "exp": now - 60 if expired else now + 300,
         "admin": admin,
         "tables": tables or [],
-        "operations": [] if admin else ["read"],
+        "operations": operations
+        if operations is not None
+        else ([] if admin else ["read"]),
     }
+    if row_filter is not None:
+        payload["row_filter"] = row_filter
     message = encode({"alg": "HS256", "typ": "JWT"}) + b"." + encode(payload)
     signature = base64.urlsafe_b64encode(
         hmac.digest(secret.encode(), message, "sha256")
     ).rstrip(b"=")
     return (message + b"." + signature).decode()
+
+
+def _exercise_lake_writer(call, secret, tmp_path, admin):
+    table = "lake_events"
+    status, result = call(
+        "POST",
+        "/tables/" + table,
+        {
+            "storage": {"engine": "object"},
+            "schema": {
+                "storage_mode": "relational",
+                "default_type": "row",
+                "document_schemas": {
+                    "row": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer"},
+                                "body": {"type": "string"},
+                            },
+                        }
+                    }
+                },
+                "base_source": {
+                    "kind": "external",
+                    "format": "iceberg",
+                    "uri": (tmp_path / "lake").as_uri(),
+                    "table_id": "events",
+                    "schema_fingerprint": "auto",
+                    "write_policy": "iceberg_writer",
+                    "catalog": {"type": "managed"},
+                },
+            },
+        },
+        admin,
+    )
+    assert status == 200, result
+    status, result = call(
+        "POST",
+        f"/tables/{table}/lake/catalog",
+        {
+            "commit_id": "initialize",
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "identifier-field-ids": [1],
+                "fields": [
+                    {"id": 1, "name": "id", "required": True, "type": "long"},
+                    {"id": 2, "name": "body", "required": False, "type": "string"},
+                ],
+            },
+        },
+        admin,
+    )
+    assert status == 200, result
+    changes = {
+        "batch_id": "writer-upsert",
+        "source": "fixture",
+        "epoch": "1",
+        "checkpoint": "1",
+        "expected_checkpoint": None,
+        "key_fields": ["id"],
+        "changes": [{"op": "upsert", "row": {"id": 7, "body": "writer fixture"}}],
+    }
+    reader = _token(secret, tables=[table])
+    writer = _token(secret, tables=[table], operations=["read", "write"])
+    assert call("POST", f"/tables/{table}/lake/changes", changes, reader)[0] == 403
+    assert call("POST", "/tables/hidden/lake/changes", changes, writer)[0] == 403
+    for route in ("catalog", "commits", "maintenance"):
+        assert call("POST", f"/tables/{table}/lake/{route}", {}, writer)[0] == 403
+    # Even a table-admin principal must not bypass a row filter on CDC writes.
+    for operations in (["read", "write"], ["admin"]):
+        filtered = _token(
+            secret,
+            tables=[table],
+            operations=operations,
+            row_filter={table: {"term": {"path": "/id", "value": 7}}},
+        )
+        assert (
+            call("POST", f"/tables/{table}/lake/changes", changes, filtered)[0] == 403
+        )
+    status, accepted = call("POST", f"/tables/{table}/lake/changes", changes, writer)
+    assert status == 202, accepted
+    assert accepted["state"] == "accepted" and accepted["wal_lsn"] > 0
+    deleted = dict(
+        changes,
+        batch_id="writer-delete",
+        checkpoint="2",
+        expected_checkpoint="1",
+        changes=[{"op": "delete", "row": {"id": 7}}],
+    )
+    status, result = call("POST", f"/tables/{table}/lake/changes", deleted, writer)
+    assert status == 202 and result["wal_lsn"] > accepted["wal_lsn"], result
+    return deleted, result["wal_lsn"]
 
 
 def test_standalone_cli_loads_hosted_principal_without_local_password(tmp_path):
@@ -211,8 +318,14 @@ def test_standalone_cli_loads_hosted_principal_without_local_password(tmp_path):
         )
         assert status == 200, result
         assert len(result["responses"][0]["hits"]["hits"]) == 1, result
+        deleted, delete_lsn = _exercise_lake_writer(call, secret, tmp_path, admin)
         stop()
         start()
+        writer = _token(secret, tables=["lake_events"], operations=["read", "write"])
+        status, replay = call(
+            "POST", "/tables/lake_events/lake/changes", deleted, writer
+        )
+        assert status == 202 and replay["wal_lsn"] == delete_lsn, replay
         reader = _token(secret, tables=["visible", "visible_two", "hosted_sample"])
         assert call("GET", "/tables/visible", token=reader)[0] == 200
         assert call("GET", "/tables")[0] == 401

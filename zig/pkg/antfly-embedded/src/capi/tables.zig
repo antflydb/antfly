@@ -408,7 +408,7 @@ pub fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) callcon
         return @call(.auto, @extern(*const @TypeOf(antfly_db_list_tables_json), .{ .name = "antfly_db_list_tables_json" }), .{ ptr, out });
     h.capi.clearLastError();
     out.* = .{};
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = api.enterHandleWithIntent(ptr, .exclusive, .read_only) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return h.capi.ensureError(code, @src().fn_name);
@@ -438,7 +438,7 @@ pub fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?*anyopa
         return @call(.auto, @extern(*const @TypeOf(antfly_db_open_table), .{ .name = "antfly_db_open_table" }), .{ ptr, name, out });
     h.capi.clearLastError();
     out.* = null;
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = api.enterHandleWithIntent(ptr, .exclusive, .read_only) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return h.capi.ensureError(code, @src().fn_name);

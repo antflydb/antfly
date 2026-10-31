@@ -84,7 +84,7 @@ pub fn testDecoder() !void {
         .{ "contentBlockDelta", "{\"contentBlockIndex\":3,\"delta\":{\"reasoningContent\":{\"redactedContent\":\"cmVkYWN0ZWQ=\"}}}" },
         .{ "contentBlockStop", "{\"contentBlockIndex\":3}" },
         .{ "messageStop", "{\"stopReason\":\"tool_use\"}" },
-        .{ "metadata", "{\"usage\":{\"inputTokens\":10,\"outputTokens\":2,\"totalTokens\":12}}" },
+        .{ "metadata", "{\"metrics\":{\"latencyMs\":1},\"usage\":{\"inputTokens\":10,\"outputTokens\":2,\"totalTokens\":12}}" },
     };
     var sink: Sink = .{};
     defer sink.output.deinit(a);
@@ -159,6 +159,27 @@ pub fn testDecoder() !void {
         defer a.free(bytes);
         try std.testing.expectError(case.failure, invalid.push(bytes));
         try std.testing.expectEqual(@as(usize, 0), rejected.starts);
+        try std.testing.expect(!rejected.closed);
+    }
+
+    // Validate each decoded JSON event before publishing its delta. These
+    // payloads have valid frame CRCs and stream ordering but invalid AWS shapes.
+    for ([_][2][]const u8{
+        .{ "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"reasoningContent\":{\"signature\":7}}}" },
+        .{ "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"hi\",\"reasoningContent\":{\"text\":\"why\"}}}" },
+        .{ "contentBlockStart", "{\"contentBlockIndex\":0,\"start\":{\"toolUse\":{\"toolUseId\":\"c\"}}}" },
+        .{ "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"toolUse\":{\"input\":7}}}" },
+    }) |event| {
+        var rejected: Sink = .{};
+        defer rejected.output.deinit(a);
+        var invalid = stream.Decoder{ .alloc = a, .sink = rejected.view(), .model = "m" };
+        defer invalid.deinit();
+        try invalid.push(start);
+        const before = rejected.bytes;
+        const bytes = try frame(a, event[0], event[1], "event");
+        defer a.free(bytes);
+        try std.testing.expectError(error.InvalidInferenceResponse, invalid.push(bytes));
+        try std.testing.expectEqual(before, rejected.bytes);
         try std.testing.expect(!rejected.closed);
     }
     var interrupted: Sink = .{ .cancel = true };
