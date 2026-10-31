@@ -243,3 +243,98 @@ wrong owner, activation on existing namespaces, old adapters, real-time expiry,
 eviction/restart and publication/collection races. Keep the original hosted gate
 and complete independent diagnostics unchanged. No injected memory error test
 establishes the cause or resolution of historical live SQLITE_NOMEM.
+
+## Verified local outcome (2026-10-31)
+
+The implementation and trials establish a targeted warm point-read improvement,
+not a general order-of-magnitude application improvement. All new modes remain
+opt-in. No hosted profile is selected from these results.
+
+Both main matrices pass: 28 owner-only cases at `afc00ad655` and 28 detached-owner
+cases at `faf13a6428`. Twelve WAL-projection comparisons and six separate
+completed-metadata-cache prototype comparisons also pass correctness. In total,
+**74 final cases verify 7,872 measured reads and 1,792 durable writes**, including
+exact bodies, counts, required visibility, publication and final background drain.
+An independent audit verifies source/experiment, module/bundle hashes, unchanged
+native memory ceilings, empty recovered resource-failure histories and settled
+transcript reservations. Prototype bundle transforms are retained in their exact
+experiment snapshots; they are not production source changes.
+
+The following ranges contain both execution orders. Each cell is read/write p95
+in milliseconds. Each within-matrix pair uses the same modules, offered requests,
+corpus and capacities. Offered runs include eight concurrent writes per 128 reads;
+closed-loop bursts include 32 writes per 96 reads. The four-tenant, explicitly
+warmed 64-document offered profiles inject 50 ms per physical storage operation.
+The 512-document burst profiles inject 100 ms. All use the separate warm-setup,
+drained profile (`--setup-delay=0`); these are not physical-cold or cloud SLOs.
+
+| Profile | Flags-off comparator, owner-only matrix | Resident owner |
+| --- | --- | --- |
+| Warm offered latest, 8 reads/s | 121–122 / 126–127 | 11–12 / 125 |
+| Warm offered latest, 32 reads/s | 125–126 / 126–127 | 43–45 / 125–126 |
+| Warm offered minimum fence, 8 reads/s | 126 / 126–127 | 11 / 126–127 |
+| Warm latest bursts, 64 documents/tenant | 408–413 / 199–202 | 482–484 / 298–300 |
+| Warm latest bursts, 512 documents/tenant | 753–770 / 350–392 | 868–974 / 451–548 |
+| Unprimed mixed, 64 documents/tenant | 421–422 / 208–223 | 471–511 / 251–308 |
+| Unprimed mixed, 512 documents/tenant | 867–875 / 356–358 | 1,265–1,276 / 486–543 |
+
+| Profile | Flags-off comparator, detached matrix | Resident + detached misses |
+| --- | --- | --- |
+| Warm offered latest, 8 reads/s | 121–122 / 126–128 | 11–12 / 128–129 |
+| Warm offered latest, 32 reads/s | 124–125 / 128–129 | 44 / 122–126 |
+| Warm offered minimum fence, 8 reads/s | 125 / 123–124 | 11 / 126 |
+| Warm latest bursts, 64 documents/tenant | 418–458 / 199–201 | 499–518 / 296 |
+| Warm latest bursts, 512 documents/tenant | 758–766 / 348–355 | 908–974 / 448–547 |
+| Unprimed mixed, 64 documents/tenant | 412–416 / 199–204 | 417–418 / 298–301 |
+| Unprimed mixed, 512 documents/tenant | 865 / 368–371 | 1,279–1,291 / 468–542 |
+
+At 8 reads/s, owner-only read p95 improves **10.4–10.9×**, and the detached
+configuration improves **10.1–11.5×**. At 32 reads/s both improve about **2.8×**.
+These are offered-to-completion latencies, including client dispatch lag and
+queues. Completing a fixed 8/32 reads/s workload does not establish a maximum
+throughput or a corresponding throughput multiplier. Write p95 is essentially
+unchanged in these offered profiles; burst write p95 regresses.
+
+For each resident offered run, 124/128 measured reads at 8 reads/s and 122/128 at
+32 reads/s perform zero physical object-store calls across admission and query.
+These counts exclude the four postmeasurement validation reads. Native body
+cache hits cover only a minority of reads as cuts change; completed immutable
+page reuse also contributes to zero-I/O serving. The 95–97% zero-I/O coverage moves
+p95 but leaves cold misses in p99. Do not describe every warmed request as a
+native body-cache hit or generalize the result to 99% coverage.
+
+The exact-cut working set misses after relevant commits. Bursts expose cold
+immutable dependencies and queues; the fixed 32/16 MiB execution split also has
+a measured write-contention cost. Detached misses establish warm progress while
+cold I/O holds both transcript permits, not higher cold-I/O throughput. They do
+not consistently improve burst p95 and remain optional.
+
+The additional native WAL-document projection is not selected. At 512 documents,
+flags-off read/write p95 is 776–777 / 353–367 ms; projection alone is 769–771 /
+580 ms; resident plus projection is 742–896 / 757–761 ms. Small-corpus read results
+also reverse/regress across orders. The separate prototype consulting completed
+immutable coordinator-cache bytes produces 467–512 ms read p95 versus 472–511 ms
+for the ordinary owner and 414–424 ms for flags-off, without removing the misses.
+That two-file prototype is preserved only as experiment source/bundles.
+
+Native production remains `afc00ad655`; no native rebuild was needed for the
+shared JavaScript scheduler. Full WASM is 7,733,405 bytes, SHA-256
+`5f830322da602c799bf10a3518936786c557ef85436abe6fb612558c8e2963d9`.
+Final verification passes **552 Node tests, 54 actual-workerd checks, one mail
+workerd integration and 48 focused native tests**; three live-provider checks
+skip. The resident fixture forbids application SQL/KV, verifies zero physical
+I/O after real append-certificate expiry, runs both collectors, checks large-body
+promotion, concurrent writes/deletes and restart with a different native term.
+A separate delayed-PUT test proves that reconstruction fences the old writer.
+
+Activation currently requires a fresh compatible namespace. This increment does
+not implement an in-place format-1-to-format-2 migration tool. Existing namespace
+activation fails closed; disabling the flag is not rollback. Online partition
+splits, strongly latest replicas and a portable AWS/GCS exclusive-owner adapter
+remain separate protocol work. The generic native point cache preserves ordinary
+fresh admission on those providers.
+
+No new cloud resources or credentials were created. The unchanged hosted gate,
+complete live whole-window diagnostics, historical `SQLITE_NOMEM`, three paired
+hour-long trials, physical-cold samples and live provider latency qualification
+remain open. Local successes and injected late errors do not satisfy those gates.

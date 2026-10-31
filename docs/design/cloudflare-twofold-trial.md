@@ -239,3 +239,15 @@ The local evidence closure is `examples/cloudflare-serverless/dist/qualification
 `e342b56fb147750b14f23bc26d09d07911cc1460445458c69828c9aabfb6ec49`. All five preceding corrected closures and recorded
 window references reverify unchanged. Credentials are excluded. This preserves
 local comparisons and failed attempts, not a new hosted gate pass.
+
+## Resident serving follow-up
+
+The [resident design and local results](resident-serving-shards.md) record 74
+correct final cases, including matched offered-load trials and negative burst,
+projection and cache experiments. Version-2 serving authority requires a fresh
+compatible namespace and capable adapters; the old corrected control and all
+prior reports remain preserved. No new cloud resources/tokens were created.
+No profile is selected for hosted qualification: the targeted 10–11× warm local
+read gain is not a hosted gate pass, and burst/cold regressions remain.
+The original diagnostic completeness, recovered-error, paired duration and
+single-attempt physical-cold requirements remain unchanged.

@@ -656,3 +656,15 @@ collecting counters and pass with no recovered resource failures. This confirms
 accounting/error propagation for tested paths; it does not reproduce, identify
 or fix the historical hosted allocator failure. No new cloud resources were
 created. The hosted gate and historical memory error remain unresolved.
+
+## Resident serving does not resolve the historical error
+
+The [resident increment](resident-serving-shards.md) passes actual-workerd
+publication, both collectors, concurrent mutation, expiry and restart while
+application SQL/KV getters throw. Authoritative data remains native Antfly in
+object storage. Platform Durable Object infrastructure can still use its own
+storage implementation; avoiding application SQL is not a proof about the
+historical provider allocator failure. The shared detached-read scheduler retains
+charged buffers/permits through timeout and reports an injected late
+`SQLITE_NOMEM`; these are lifetime regression tests, not a reproduced root cause
+or resolution of the original live error. No new hosted qualification ran.

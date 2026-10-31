@@ -574,3 +574,15 @@ not convert local results into a hosted qualification pass. Guarded cache cleanu
 was attempted and skipped because a native build was active or process inspection
 was unavailable; the guard was not bypassed. Successful native test binaries
 were frozen before that attempt.
+
+## Resident point serving implementation and local outcome
+
+The opt-in owner protocol, native working set, immutable publication preparation
+and bounded detached misses are implemented. See [resident serving shards](resident-serving-shards.md#verified-local-outcome-2026-10-31)
+for all 74 final cases, both orders, source/module hashes and preserved regressions.
+The warmed offered latest workload improves read p95 about 10–11× at 8 reads/s
+and 2.8× at 32 reads/s, with unchanged capacities. Burst and unprimed large-corpus
+read/write results regress, and neither the WAL projection nor the coordinator
+cache prototype establishes a broad win. These results select no hosted profile.
+The native runtime flag also exposes the owned point cache after ordinary fresh
+S3/GCS/native admission; it does not grant portable exclusive-owner authority.
