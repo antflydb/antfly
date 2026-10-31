@@ -304,7 +304,7 @@ operations.
   of the corpus is replaced, because the graph is increasingly built from
   estimate-linked inserts. Deleted ids also still hold their codes.
 - Stored upper vectors save 3–4% of recomputations and do not change
-  recall under churn, for ~35% more index bytes at 256-d and 20–40% slower
+  recall under churn, for ~35% more index bytes at 256-d and 15–30% slower
   inserts. Not worth it as a default.
 
 Implications: consolidate on every maintenance pass and rebuild rarely (a
