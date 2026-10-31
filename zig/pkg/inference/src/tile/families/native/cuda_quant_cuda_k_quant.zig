@@ -15,6 +15,8 @@
 
 //! Qualified native program instances and specialization exports.
 
+const cuda_phases = @import("cuda_phases.zig");
+
 const program = @import("../../native_program.zig");
 
 const program_0 =
@@ -305,24 +307,18 @@ pub const source_0 = program.join(&.{
     \\
     ,
 
-    \\extern "C" __global__ void termite_linear_q4_k_bias_f32(ANTFLY_CUDA_QUANT_LINEAR_BIAS_PARAMS) {
-    \\    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    \\    unsigned int total = rows * out_dim;
-    \\    if (idx >= total) return;
-    \\    unsigned int row = idx / out_dim;
-    \\    unsigned int col = idx - row * out_dim;
-    \\    unsigned int row_blocks = in_dim / 256u;
-    \\    float acc = bias[col];
-    \\    for (unsigned int block = 0; block < row_blocks; ++block) {
-    \\        const unsigned char* bp = weight + (col * row_blocks + block) * 144u;
-    \\        for (unsigned int i = 0; i < 256u; ++i) {
-    \\            acc += input[row * in_dim + block * 256u + i] * termite_q4k_value(bp, i);
-    \\        }
-    \\    }
-    \\    dst[idx] = acc;
-    \\}
-    \\
-    ,
+    program.render(
+        \\extern "C" __global__ void termite_linear_q4_k_bias_f32(ANTFLY_CUDA_QUANT_LINEAR_BIAS_PARAMS) {
+        \\    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        \\    unsigned int total = rows * out_dim;
+        \\    if (idx >= total) return;
+        \\    unsigned int row = idx / out_dim;
+        \\    unsigned int col = idx - row * out_dim;
+        \\{{q4k_biased_dot}}
+        \\    dst[idx] = acc;
+        \\}
+        \\
+    , cuda_phases.projection),
 
     \\
     \\
@@ -379,30 +375,24 @@ pub const source_0 = program.join(&.{
     \\
     ,
 
-    \\extern "C" __global__ void termite_linear_q4_k_triple_bias_f32(ANTFLY_CUDA_LINEAR_Q4_K_TRIPLE_BIAS_F32_PARAMS) {
-    \\    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    \\    unsigned int plane = rows * out_dim;
-    \\    unsigned int total = plane * 3u;
-    \\    if (idx >= total) return;
-    \\    unsigned int projection = idx / plane;
-    \\    unsigned int local = idx - projection * plane;
-    \\    unsigned int row = local / out_dim;
-    \\    unsigned int col = local - row * out_dim;
-    \\    const unsigned char* weight = projection == 0u ? weight_a : (projection == 1u ? weight_b : weight_c);
-    \\    const float* bias = projection == 0u ? bias_a : (projection == 1u ? bias_b : bias_c);
-    \\    float* dst = projection == 0u ? dst_a : (projection == 1u ? dst_b : dst_c);
-    \\    unsigned int row_blocks = in_dim / 256u;
-    \\    float acc = bias[col];
-    \\    for (unsigned int block = 0; block < row_blocks; ++block) {
-    \\        const unsigned char* bp = weight + (col * row_blocks + block) * 144u;
-    \\        for (unsigned int i = 0; i < 256u; ++i) {
-    \\            acc += input[row * in_dim + block * 256u + i] * termite_q4k_value(bp, i);
-    \\        }
-    \\    }
-    \\    dst[local] = acc;
-    \\}
-    \\
-    ,
+    program.render(
+        \\extern "C" __global__ void termite_linear_q4_k_triple_bias_f32(ANTFLY_CUDA_LINEAR_Q4_K_TRIPLE_BIAS_F32_PARAMS) {
+        \\    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        \\    unsigned int plane = rows * out_dim;
+        \\    unsigned int total = plane * 3u;
+        \\    if (idx >= total) return;
+        \\    unsigned int projection = idx / plane;
+        \\    unsigned int local = idx - projection * plane;
+        \\    unsigned int row = local / out_dim;
+        \\    unsigned int col = local - row * out_dim;
+        \\    const unsigned char* weight = projection == 0u ? weight_a : (projection == 1u ? weight_b : weight_c);
+        \\    const float* bias = projection == 0u ? bias_a : (projection == 1u ? bias_b : bias_c);
+        \\    float* dst = projection == 0u ? dst_a : (projection == 1u ? dst_b : dst_c);
+        \\{{q4k_biased_dot}}
+        \\    dst[local] = acc;
+        \\}
+        \\
+    , cuda_phases.projection),
 
     \\
     \\

@@ -358,27 +358,13 @@ extern "C" __global__ void termite_cross_attention_f32(
 
     unsigned int q_base = (b * dec_seq + qi) * hidden + head * head_dim;
     float max_score = -3.402823466e+38f;
-    for (unsigned int ki = 0; ki < enc_seq; ++ki) {
-        if (mask != nullptr && mask[b * enc_seq + ki] == 0ll) continue;
-        unsigned int k_base = (b * enc_seq + ki) * hidden + head * head_dim;
-        float score = 0.0f;
-        for (unsigned int j = 0; j < head_dim; ++j) {
-            score += q[q_base + j] * k[k_base + j];
-        }
-        score *= scale;
+{{cross_attention_scores}}
         max_score = fmaxf(max_score, score);
     }
 
     float denom = 0.0f;
     float acc = 0.0f;
-    for (unsigned int ki = 0; ki < enc_seq; ++ki) {
-        if (mask != nullptr && mask[b * enc_seq + ki] == 0ll) continue;
-        unsigned int k_base = (b * enc_seq + ki) * hidden + head * head_dim;
-        float score = 0.0f;
-        for (unsigned int j = 0; j < head_dim; ++j) {
-            score += q[q_base + j] * k[k_base + j];
-        }
-        score *= scale;
+{{cross_attention_scores}}
         float e = expf(score - max_score);
         denom += e;
         unsigned int v_idx = (b * enc_seq + ki) * hidden + head * head_dim + d;
@@ -652,16 +638,7 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_fast_f32(ANTF
     unsigned int key_start = 0u;
     unsigned int key_end = 0u;
     unsigned int query_pos = query_position_offset;
-    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+{{visible_key_window}}
     }
 
     unsigned int heads_per_group = num_heads / num_kv_heads;
@@ -702,16 +679,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_fast_f32(ANT
 
     unsigned int key_start = 0u;
     unsigned int key_end = 0u;
-    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+{{visible_key_window}}
     }
 
     unsigned int heads_per_group = num_heads / num_kv_heads;
@@ -1756,12 +1724,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     constexpr unsigned int M = 32u, N = 64u, D = 64u, P = 72u, T = 256u; // Skew shared rows to avoid bank conflicts.
     if (!seq || seq > 8192u || dim != D || blockDim.x != T) return;
-    const unsigned int tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
-    const unsigned int tiles = (seq + M - 1u) / M;
-    const unsigned int start = (blockIdx.x % tiles) * M;
-    const unsigned int matrix = blockIdx.x / tiles, head = matrix % heads, b = matrix / heads;
-    if (b >= batch) return;
-    const unsigned int hidden = heads * D, head_off = head * D;
+{{tensor_attention_tile}}
     __shared__ __align__(16) half qt[M * P], kt[N * P], vt[N * P], probabilities[M * N];
     __shared__ __align__(16) float scores[M * N], output[M * D];
     __shared__ float maximum[M], denominator[M], alpha[M];
@@ -2144,12 +2107,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
 ) {
     constexpr unsigned int M = 64u, N = 64u, D = 64u, P = 72u, S = 68u, T = 256u;
     if (!seq || seq > 8192u || dim != D || radius < seq || blockDim.x != T) return;
-    const unsigned int tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
-    const unsigned int tiles = (seq + M - 1u) / M;
-    const unsigned int start = (blockIdx.x % tiles) * M;
-    const unsigned int matrix = blockIdx.x / tiles, head = matrix % heads, b = matrix / heads;
-    if (b >= batch) return;
-    const unsigned int hidden = heads * D, head_off = head * D;
+{{tensor_attention_tile}}
     __shared__ __align__(16) half qt[M * P], kt[N * P], vt[N * P];
     __shared__ __align__(16) float shared_scores[M * P / 2u + 32u * S];
     half* probabilities = reinterpret_cast<half*>(shared_scores);

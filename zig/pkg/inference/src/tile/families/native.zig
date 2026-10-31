@@ -18,6 +18,7 @@
 const r = @import("../region.zig");
 const program = @import("../native_program.zig");
 const cuda_phases = @import("native/cuda_phases.zig");
+const metal_phases = @import("native/metal_phases.zig");
 
 pub const regions = r.regions(&.{
     r.metalFamily("rms_norm", @import("native/metal_rms_norm.zig")),
@@ -120,7 +121,7 @@ pub const regions = r.regions(&.{
     r.cudaSourceFamily("sequence.transforms.direct", @embedFile("native/cuda/sequence_transforms.cu")),
     r.cudaSourceFamily("tensor.layout.direct", @embedFile("native/cuda/tensor_layout.cu")),
     r.cudaSourceFamily("training.direct", @embedFile("native/cuda/training.cu")),
-    r.encodedMetalSourceFamily("attention.direct", @embedFile("native/metal/attention_direct.m")),
+    r.encodedMetalSourceFamily("attention.direct", program.render(@embedFile("native/metal/attention_direct.m"), metal_phases.boundary)),
     r.encodedMetalSourceFamily("audio.direct", @embedFile("native/metal/audio.m")),
     r.metalSourceFamily("convolution.direct", @embedFile("native/metal/convolution.metal")),
     r.metalSourceFamily("elementwise.direct", @embedFile("native/metal/elementwise_direct.metal")),
@@ -132,11 +133,11 @@ pub const regions = r.regions(&.{
     r.metalSourceFamily("selection.direct", @embedFile("native/metal/selection.metal")),
     r.metalSourceFamily("sequence.transforms.direct", @embedFile("native/metal/sequence_transforms.metal")),
     r.metalSourceFamily("tensor.layout.direct", @embedFile("native/metal/tensor_layout.metal")),
-    r.encodedMetalSourceFamily("training.direct", @embedFile("native/metal/training.m")),
-    r.encodedMetalSourceFamily("attention.direct.abi", @embedFile("native/metal/attention_direct_abi.m")),
+    r.encodedMetalSourceFamily("training.direct", program.render(@embedFile("native/metal/training.m"), metal_phases.boundary)),
+    r.encodedMetalSourceFamily("attention.direct.abi", program.render(@embedFile("native/metal/attention_direct_abi.m"), metal_phases.boundary)),
     r.encodedMetalSourceFamily("audio.abi", @embedFile("native/metal/audio_abi.m")),
     r.encodedMetalSourceFamily("elementwise.direct.abi", @embedFile("native/metal/elementwise_direct_abi.m")),
     r.encodedMetalSourceFamily("expert.projection.abi", @embedFile("native/metal/expert_projection_abi.m")),
-    r.encodedMetalSourceFamily("projection.direct.abi", @embedFile("native/metal/projection_direct_abi.m")),
+    r.encodedMetalSourceFamily("projection.direct.abi", program.render(@embedFile("native/metal/projection_direct_abi.m"), metal_phases.boundary)),
     r.encodedMetalSourceFamily("tensor.layout.abi", @embedFile("native/metal/tensor_layout_abi.m")),
 });

@@ -22,8 +22,8 @@
 //!   {{#flag}}..{{/flag}}  kept when the bool field `flag` is true
 //!   {{^flag}}..{{/flag}}  kept when it is false
 //!
-//! Sections nest. A missing field is a compile error. Kernel text never
-//! contains `{{`, but may put `{` right before a tag.
+//! Sections nest. A missing field is a compile error. Tags use identifier
+//! names; native aggregate initializers such as `{{0, 0}, {0, 0}}` stay literal.
 
 const std = @import("std");
 
@@ -61,12 +61,21 @@ fn flag(comptime ctx: anytype, comptime name: []const u8) bool {
     return @field(ctx, name);
 }
 
-/// Start of the next tag at or after `from`. In `{{{` the first brace is
-/// kernel text.
+/// Start of the next identifier tag. In `{{{name}}` the first brace is
+/// kernel text; C/C++ aggregate initializers remain literal source.
 fn nextTag(comptime tmpl: []const u8, comptime from: usize) ?usize {
-    var open = std.mem.indexOfPos(u8, tmpl, from, "{{") orelse return null;
-    while (open + 2 < tmpl.len and tmpl[open + 2] == '{') open += 1;
-    return open;
+    var i = from;
+    while (std.mem.indexOfPos(u8, tmpl, i, "{{")) |open| {
+        i = open + 1;
+        var at = open + 2;
+        if (at < tmpl.len and (tmpl[at] == '#' or tmpl[at] == '^' or tmpl[at] == '/')) at += 1;
+        if (at == tmpl.len or !(std.ascii.isAlphabetic(tmpl[at]) or tmpl[at] == '_')) continue;
+        at += 1;
+        while (at < tmpl.len and (std.ascii.isAlphanumeric(tmpl[at]) or tmpl[at] == '_')) : (at += 1) {}
+        if (at == tmpl.len) @compileError("unclosed {{ in template");
+        if (std.mem.startsWith(u8, tmpl[at..], "}}")) return open;
+    }
+    return null;
 }
 
 /// Index of the `{{/name}}` closing the section opened just before `from`.

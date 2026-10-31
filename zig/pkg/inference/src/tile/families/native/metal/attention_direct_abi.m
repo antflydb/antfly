@@ -45,12 +45,7 @@
            "    simdgroup_float8x8 dg; simdgroup_load(dg, diag + uint(sg) * 64u, 8u);\n"
            "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
            "        simdgroup_multiply(o[dt], dg, o[dt]);\n"
-           "        simdgroup_store(o[dt], stage + s8 * BK, 8u);\n"
-           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint i = L; i < 64u; i += 32u) { uint r = s8 + i / 8u; if (r < nq) output[(q0 + r) * hidden + h * D + dt * 8u + i % 8u] = stage[s8 * BK + i]; }\n"
-           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    }\n"
-           "}\n"
+{{segment_tensor_publish}}
 // native-program:entry termite_sdpa_f32_segments_wide
            TERMITE_MSL_ABI_SEGMENTS_MATRIX(termite_sdpa_f32_segments_wide) "\n"
            "    constexpr uint BQ = 8u, BK = 8u, DM = 512u;\n"
@@ -389,10 +384,7 @@
            "        if (allowed) { uint k_base = (b * p.seq_len + ki) * hidden + head_off; uint rel_idx = qi + p.seq_len - 1u - ki; uint rel_row = p.reserved1 != 0u ? uint(relative_index[rel_idx]) : rel_idx; uint rel_base = rel_row * hidden + head_off; float acc = 0.0f;\n"
            "            if (p.head_dim == 64u) { const device float4 *q4 = reinterpret_cast<const device float4 *>(q + q_base); const device float4 *k4 = reinterpret_cast<const device float4 *>(k + k_base); const device float4 *kr4 = reinterpret_cast<const device float4 *>(k_r + rel_base); const device float4 *qr4 = reinterpret_cast<const device float4 *>(q_r + rel_base); for (uint x4 = 0u; x4 < 16u; ++x4) { float4 qx = q4[x4]; float4 kx = k4[x4]; acc += dot(qx, kx) + dot(qx, kr4[x4]) + dot(qr4[x4], kx); } } else { for (uint x = 0u; x < p.head_dim; ++x) { float qx = q[q_base + x]; acc += qx * k[k_base + x] + qx * k_r[rel_base + x] + q_r[rel_base + x] * k[k_base + x]; } }\n"
            "            score = acc * scale; local_best = max(local_best, score); }\n"
-           "        scores[ki] = score;\n"
-           "    }\n"
-           "    partials[lid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] = max(partials[lid], partials[lid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+{{attention_row_maximum}}
            // Barrier before partials is reused for the sum reduction: without it a
            // fast thread's write races the `best` read of a slower SIMD group.
            "    float best = partials[0]; threadgroup_barrier(mem_flags::mem_threadgroup); float local_sum = 0.0f;\n"

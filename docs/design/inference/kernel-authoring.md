@@ -71,6 +71,14 @@ The MPP gate fragment emits the same native programs for two storage/publication
 contracts. The segmented-attention backward score fragment retains the callers'
 original barrier sites and distinct dQ versus dK/dV accumulation directions.
 
+Use `native/cuda_phases.zig` and `native/metal_phases.zig` for exact shared
+indexing, score, reduction and publication phases. Expand readable MSL before
+`program.metal` encoding; existing Objective-C owners use the shared boundary
+representation. Keep specialization tags in their instance context. Tags use
+identifier names so native aggregate initializers stay literal. For this form of
+source sharing, freeze and compare the complete native compiler inputs byte for
+byte; shrinking the authored phase copies does not shrink the emitted kernels.
+
 The portable causal stencil is compiled directly as CUDA and stringified as MSL.
 It is not a runtime interpreter. Protect emitted source from host SDK macros and
 reserved shader identifiers. Separate-product rounding has an explicit CUDA

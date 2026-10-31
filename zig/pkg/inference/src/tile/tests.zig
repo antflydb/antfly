@@ -341,3 +341,19 @@ test {
     _ = @import("region.zig");
     _ = @import("native_sources.zig");
 }
+
+test "native template tags preserve aggregate initializers and nested sections" {
+    const template = @import("source_template.zig");
+    const actual = comptime template.render(
+        "float x[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}}; " ++
+            "Pair y = {{left, right}, {up, down}}; " ++
+            "{{#outer}}{{^disabled}}{{{value}}}{{/disabled}}{{/outer}}" ++
+            "{{^outer}}unused{{/outer}}{{#disabled}}unused{{/disabled}}",
+        .{ .outer = true, .disabled = false, .value = "42" },
+    );
+    try std.testing.expectEqualStrings(
+        "float x[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}}; " ++
+            "Pair y = {{left, right}, {up, down}}; {42}",
+        actual,
+    );
+}

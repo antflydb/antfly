@@ -115,9 +115,7 @@
            "}\n"
 // native-program:entry antfly_segment_training_attention_forward
            "kernel void antfly_segment_training_attention_forward(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device float *output [[buffer(2)]], device float *lse [[buffer(3)]], constant antfly_segment_training_attention_params &p [[buffer(4)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
-           "    const uint chunk = 256u; uint row = tg.x; uint qi = row / p.num_heads; uint h = row - qi * p.num_heads; if (qi >= p.tokens) return;\n"
-           "    uint lid = uint(tid); uint width = uint(tpg.x); uint hidden = p.num_heads * p.head_dim; uint q_base = qi * hidden + h * p.head_dim;\n"
-           "    device const float *k = qkv + p.tokens * hidden; device const float *v = qkv + 2u * p.tokens * hidden;\n"
+{{attention_row_geometry}}
            "    threadgroup float *scores = scratch; threadgroup float *partials = scratch + chunk; const float neg = -3.402823466e+38f;\n"
            "    float run_max = neg; float run_sum = 0.0f; float acc = 0.0f;\n"
            "    for (uint r = 0u; r < 3u; ++r) {\n"
@@ -141,9 +139,7 @@
            "}\n"
 // native-program:entry antfly_segment_training_attention_dq
            "kernel void antfly_segment_training_attention_dq(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device const float *dout [[buffer(2)]], device const float *replayed [[buffer(3)]], device const float *lse [[buffer(4)]], device float *delta [[buffer(5)]], device float *dq [[buffer(6)]], constant antfly_segment_training_attention_params &p [[buffer(7)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
-           "    const uint chunk = 256u; uint row = tg.x; uint qi = row / p.num_heads; uint h = row - qi * p.num_heads; if (qi >= p.tokens) return;\n"
-           "    uint lid = uint(tid); uint width = uint(tpg.x); uint hidden = p.num_heads * p.head_dim; uint q_base = qi * hidden + h * p.head_dim;\n"
-           "    device const float *k = qkv + p.tokens * hidden; device const float *v = qkv + 2u * p.tokens * hidden;\n"
+{{attention_row_geometry}}
            "    threadgroup float *weights = scratch; threadgroup float *partials = scratch + chunk; const float neg = -3.402823466e+38f;\n"
            "    float d_row = segment_reduce(partials, lid, width, lid < p.head_dim ? dout[q_base + lid] * replayed[q_base + lid] : 0.0f, false);\n"
            "    float row_lse = lse[qi * p.num_heads + h]; float acc = 0.0f;\n"
@@ -191,14 +187,7 @@
            "    threadgroup int rg[BQ * 6u];\n"
            "    threadgroup int qp[BQ], kp[BK];\n"
            "    threadgroup float mrow[BQ], lrow[BQ];\n"
-           "    const uint D = p.head_dim, hidden = p.num_heads * D, h = tg.y;\n"
-           "    const uint QB = (p.seq_len + BQ - 1u) / BQ;\n"
-           "    const uint row = tg.x / QB, blk = tg.x % QB;\n"
-           "    const uint row_start = row * p.seq_len, q0 = row_start + blk * BQ;\n"
-           "    const uint t = uint(tid), s8 = uint(sg) * 8u, L = uint(lane);\n"
-           "    const uint nq = min(BQ, p.seq_len - blk * BQ), nd = D / 8u;\n"
-           "    const float scale = p.scale, neg = -3.402823466e+38f;\n"
-           "    device const float *k = qkv + p.tokens * hidden;\n"
+{{segment_tensor_geometry}}
            "    device const float *v = qkv + 2u * p.tokens * hidden;\n"
            "    device const int *pos = ctrl + p.tokens * 6u;\n"
            "    threadgroup float *stage = ss;\n"
@@ -224,12 +213,7 @@
            "    simdgroup_float8x8 dg2; simdgroup_load(dg2, finrecip + uint(sg) * 64u, 8u);\n"
            "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
            "        simdgroup_multiply(o[dt], dg2, o[dt]);\n"
-           "        simdgroup_store(o[dt], stage + s8 * BK, 8u);\n"
-           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint i = L; i < 64u; i += 32u) { uint r = s8 + i / 8u; if (r < nq) output[(q0 + r) * hidden + h * D + dt * 8u + i % 8u] = stage[s8 * BK + i]; }\n"
-           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    }\n"
-           "}\n"
+{{segment_tensor_publish}}
 // native-program:entry antfly_segment_training_attention_flash_dq
            "kernel void antfly_segment_training_attention_flash_dq(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device const float *dout [[buffer(2)]], device const float *replayed [[buffer(3)]], device const float *lse [[buffer(4)]], device float *delta [[buffer(5)]], device float *dq [[buffer(6)]], constant antfly_segment_training_attention_params &p [[buffer(7)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    constexpr uint BQ = 32u, BK = 16u, DM = 64u;\n"
@@ -238,14 +222,7 @@
            "    threadgroup int rg[BQ * 6u];\n"
            "    threadgroup int qp[BQ], kp[BK];\n"
            "    threadgroup float lrow[BQ], drow[BQ];\n"
-           "    const uint D = p.head_dim, hidden = p.num_heads * D, h = tg.y;\n"
-           "    const uint QB = (p.seq_len + BQ - 1u) / BQ;\n"
-           "    const uint row = tg.x / QB, blk = tg.x % QB;\n"
-           "    const uint row_start = row * p.seq_len, q0 = row_start + blk * BQ;\n"
-           "    const uint t = uint(tid), s8 = uint(sg) * 8u, L = uint(lane);\n"
-           "    const uint nq = min(BQ, p.seq_len - blk * BQ), nd = D / 8u;\n"
-           "    const float scale = p.scale, neg = -3.402823466e+38f;\n"
-           "    device const float *k = qkv + p.tokens * hidden;\n"
+{{segment_tensor_geometry}}
            "    device const float *v = qkv + 2u * p.tokens * hidden;\n"
            "    device const int *pos = ctrl + p.tokens * 6u;\n"
            "    for (uint i = t; i < BQ * 6u; i += 128u) rg[i] = i / 6u < nq ? ctrl[(q0 + i / 6u) * 6u + i % 6u] : 0;\n"

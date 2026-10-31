@@ -311,14 +311,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_nobias_f32_tile4_w4(ANTFLY_C
     const unsigned int cols = 4u;
     unsigned int tiles = (out_dim + cols - 1u) / cols;
     unsigned int tiles_per_row = tiles * 2u;
-    unsigned int global = blockIdx.x;
-    unsigned int row = global / tiles_per_row;
-    if (row >= rows) return;
-    unsigned int tile_local = global - row * tiles_per_row;
-    unsigned int projection = tile_local / tiles;
-    unsigned int col_tile = (tile_local - projection * tiles) * cols;
-    const unsigned char* weight = projection == 0u ? weight_a : weight_b;
-    float* dst = projection == 0u ? dst_a : dst_b;
+{{pair_projection_tile}}
     termite_q4_0_tile_cols_at<4u, 4u>(dst, input, weight, rows, in_dim, out_dim, row, col_tile);
 }
 // native-program:entry termite_linear_q4_0_pair_nobias_q8_1_f32_tile8
@@ -326,14 +319,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile8(ANTFLY
     const unsigned int cols = 8u;
     unsigned int tiles = (out_dim + cols - 1u) / cols;
     unsigned int tiles_per_row = tiles * 2u;
-    unsigned int global = blockIdx.x;
-    unsigned int row = global / tiles_per_row;
-    if (row >= rows) return;
-    unsigned int tile_local = global - row * tiles_per_row;
-    unsigned int projection = tile_local / tiles;
-    unsigned int col_tile = (tile_local - projection * tiles) * cols;
-    const unsigned char* weight = projection == 0u ? weight_a : weight_b;
-    float* dst = projection == 0u ? dst_a : dst_b;
+{{pair_projection_tile}}
     unsigned int tid = threadIdx.x;
     unsigned int lane = tid & 31u;
     unsigned int warp = tid >> 5;
@@ -343,20 +329,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile8(ANTFLY
     #pragma unroll
     for (unsigned int c = 0; c < cols; ++c) acc[c] = 0.0f;
 
-    unsigned int iqs = (tid & 1u) * 2u;
-    for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
-        const unsigned char* q8_bp = q8_input + (row * row_blocks + block) * 36u;
-#include "../kernels/q4_a4b_q8_acquire.cuh"
-
-        #pragma unroll
-        for (unsigned int c = 0u; c < cols; ++c) {
-            unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
-                acc[c] += termite_q4_0_q8_1_partial_mmvq2(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-            }
-        }
-    }
+{{q4_q8_pair_dot}}
     termite_store_q4_0_cols_warp_sum_warps<8u, 4u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
 // native-program:entry termite_linear_q4_0_pair_activation_f32_tile4_w4
@@ -421,17 +394,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_f32_tile4_w4(
     if (tid == 0u) {
         #pragma unroll
         for (unsigned int c = 0; c < 4u; ++c) {
-            unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                float gate_y = 0.0f;
-                float up_y = 0.0f;
-                #pragma unroll
-                for (unsigned int w = 0; w < 4u; ++w) {
-                    gate_y += gate_partial[c][w];
-                    up_y += up_partial[c][w];
-                }
-                dst[row * out_dim + col] = termite_decoder_activation_f32(gate_y, activation) * up_y;
-            }
+{{gate_up_warp_publish}}
         }
     }
 }
@@ -487,17 +450,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile8(AN
     if (tid == 0u) {
         #pragma unroll
         for (unsigned int c = 0; c < 8u; ++c) {
-            unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                float gate_y = 0.0f;
-                float up_y = 0.0f;
-                #pragma unroll
-                for (unsigned int w = 0; w < 4u; ++w) {
-                    gate_y += gate_partial[c][w];
-                    up_y += up_partial[c][w];
-                }
-                dst[row * out_dim + col] = termite_decoder_activation_f32(gate_y, activation) * up_y;
-            }
+{{gate_up_warp_publish}}
         }
     }
 }
@@ -725,13 +678,7 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_f32_tile8_e4b(
 // native-program:entry termite_linear_q8_0_qkv_nobias_f32_tile4
 extern "C" __global__ void termite_linear_q8_0_qkv_nobias_f32_tile4(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
     const unsigned int cols = 4u;
-    unsigned int q_tiles = (q_out_dim + cols - 1u) / cols;
-    unsigned int kv_tiles = (kv_out_dim + cols - 1u) / cols;
-    unsigned int tiles_per_row = q_tiles + kv_tiles * 2u;
-    unsigned int global = blockIdx.x;
-    unsigned int row = global / tiles_per_row;
-    if (row >= rows) return;
-    unsigned int tile = global - row * tiles_per_row;
+{{qkv_projection_tile}}
 
 {{qkv_planes}}
 

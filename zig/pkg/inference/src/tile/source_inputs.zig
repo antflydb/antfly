@@ -90,6 +90,7 @@ pub const paths = [_][]const u8{
     "src/tile/families/native/metal_elementwise_gelu_backward.zig",
     "src/tile/families/native/metal_elementwise_lora.zig",
     "src/tile/families/native/metal_layer_norm.zig",
+    "src/tile/families/native/metal_phases.zig",
     "src/tile/families/native/metal_projection_bf16_vec4.zig",
     "src/tile/families/native/metal_projection_dot_small_m.zig",
     "src/tile/families/native/metal_quant_metal_bf16_gate_up_mm.zig",

@@ -15,6 +15,8 @@
 
 //! Qualified native program instances and specialization exports.
 
+const cuda_phases = @import("cuda_phases.zig");
+
 const program = @import("../../native_program.zig");
 
 const program_0 =
@@ -22,14 +24,7 @@ const program_0 =
     \\    const unsigned int cols = {{literal_0}};
     \\    unsigned int tiles = (out_dim + cols - 1u) / cols;
     \\    unsigned int tiles_per_row = tiles * 2u;
-    \\    unsigned int global = blockIdx.x;
-    \\    unsigned int row = global / tiles_per_row;
-    \\    if (row >= rows) return;
-    \\    unsigned int tile_local = global - row * tiles_per_row;
-    \\    unsigned int projection = tile_local / tiles;
-    \\    unsigned int col_tile = (tile_local - projection * tiles) * cols;
-    \\    const unsigned char* weight = projection == 0u ? weight_a : weight_b;
-    \\    float* dst = projection == 0u ? dst_a : dst_b;
+    \\{{pair_projection_tile}}
     \\    termite_q4_0_tile_cols_at<{{literal_5}}, 8u>(dst, input, weight, rows, in_dim, out_dim, row, col_tile);
     \\}
     \\
@@ -55,7 +50,7 @@ const program_2 =
     \\
 ;
 
-pub const source_0 = program.render(program_0, .{ .name = "termite_linear_q4_0_pair_nobias_f32_tile4", .literal_0 = "4u", .literal_5 = "4u" });
+pub const source_0 = program.render(program_0, .{ .name = "termite_linear_q4_0_pair_nobias_f32_tile4", .literal_0 = "4u", .literal_5 = "4u", .pair_projection_tile = cuda_phases.projection.pair_projection_tile });
 
 pub const source_1 = program.join(&.{
     \\extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile4(ANTFLY_CUDA_Q8_INPUT_PAIR_PARAMS) {
@@ -83,7 +78,7 @@ pub const source_2 = program.join(&.{
     program.render(program_1, .{ .name = "termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn", .literal_0 = "5u" }),
 });
 
-pub const source_3 = program.render(program_0, .{ .name = "termite_linear_q4_0_pair_nobias_f32_tile8", .literal_0 = "8u", .literal_5 = "8u" });
+pub const source_3 = program.render(program_0, .{ .name = "termite_linear_q4_0_pair_nobias_f32_tile8", .literal_0 = "8u", .literal_5 = "8u", .pair_projection_tile = cuda_phases.projection.pair_projection_tile });
 
 pub const source_4 = program.join(&.{
     \\extern "C" __global__ void termite_linear_q4_0_argmax_rows_stage1_tile4(ANTFLY_CUDA_QUANT_ARGMAX_PARAMS) {

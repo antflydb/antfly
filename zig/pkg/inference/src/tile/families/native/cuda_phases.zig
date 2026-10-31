@@ -16,6 +16,36 @@
 //! Exact numerical and ownership phases shared before CUDA compilation.
 
 pub const attention = .{
+    .visible_key_window =
+    \\    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+    \\        unsigned int visible = query_pos - kv_position_offset + 1u;
+    \\        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+    \\        if (sliding_window != 0u) {
+    \\            unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+    \\            if (window_start_abs > kv_position_offset) {
+    \\                key_start = window_start_abs - kv_position_offset;
+    \\                if (key_start > key_end) key_start = key_end;
+    \\            }
+    \\        }
+    ,
+    .tensor_attention_tile =
+    \\    const unsigned int tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    \\    const unsigned int tiles = (seq + M - 1u) / M;
+    \\    const unsigned int start = (blockIdx.x % tiles) * M;
+    \\    const unsigned int matrix = blockIdx.x / tiles, head = matrix % heads, b = matrix / heads;
+    \\    if (b >= batch) return;
+    \\    const unsigned int hidden = heads * D, head_off = head * D;
+    ,
+    .cross_attention_scores =
+    \\    for (unsigned int ki = 0; ki < enc_seq; ++ki) {
+    \\        if (mask != nullptr && mask[b * enc_seq + ki] == 0ll) continue;
+    \\        unsigned int k_base = (b * enc_seq + ki) * hidden + head * head_dim;
+    \\        float score = 0.0f;
+    \\        for (unsigned int j = 0; j < head_dim; ++j) {
+    \\            score += q[q_base + j] * k[k_base + j];
+    \\        }
+    \\        score *= scale;
+    ,
     .self_scores =
     \\        if (causal && ki > qi) continue;
     \\        if (has_mask && mask[b * seq_len + ki] == 0ll) continue;
@@ -47,6 +77,64 @@ pub const attention = .{
 };
 
 pub const projection = .{
+    .pair_projection_tile =
+    \\    unsigned int global = blockIdx.x;
+    \\    unsigned int row = global / tiles_per_row;
+    \\    if (row >= rows) return;
+    \\    unsigned int tile_local = global - row * tiles_per_row;
+    \\    unsigned int projection = tile_local / tiles;
+    \\    unsigned int col_tile = (tile_local - projection * tiles) * cols;
+    \\    const unsigned char* weight = projection == 0u ? weight_a : weight_b;
+    \\    float* dst = projection == 0u ? dst_a : dst_b;
+    ,
+    .q4_q8_pair_dot =
+    \\    unsigned int iqs = (tid & 1u) * 2u;
+    \\    for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
+    \\        const unsigned char* q8_bp = q8_input + (row * row_blocks + block) * 36u;
+    \\#include "../kernels/q4_a4b_q8_acquire.cuh"
+    \\
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0u; c < cols; ++c) {
+    \\            unsigned int col = col_tile + c;
+    \\            if (col < out_dim) {
+    \\                const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
+    \\                acc[c] += termite_q4_0_q8_1_partial_mmvq2(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+    \\            }
+    \\        }
+    \\    }
+    ,
+    .qkv_projection_tile =
+    \\    unsigned int q_tiles = (q_out_dim + cols - 1u) / cols;
+    \\    unsigned int kv_tiles = (kv_out_dim + cols - 1u) / cols;
+    \\    unsigned int tiles_per_row = q_tiles + kv_tiles * 2u;
+    \\    unsigned int global = blockIdx.x;
+    \\    unsigned int row = global / tiles_per_row;
+    \\    if (row >= rows) return;
+    \\    unsigned int tile = global - row * tiles_per_row;
+    ,
+    .q4k_biased_dot =
+    \\    unsigned int row_blocks = in_dim / 256u;
+    \\    float acc = bias[col];
+    \\    for (unsigned int block = 0; block < row_blocks; ++block) {
+    \\        const unsigned char* bp = weight + (col * row_blocks + block) * 144u;
+    \\        for (unsigned int i = 0; i < 256u; ++i) {
+    \\            acc += input[row * in_dim + block * 256u + i] * termite_q4k_value(bp, i);
+    \\        }
+    \\    }
+    ,
+    .gate_up_warp_publish =
+    \\            unsigned int col = col_tile + c;
+    \\            if (col < out_dim) {
+    \\                float gate_y = 0.0f;
+    \\                float up_y = 0.0f;
+    \\                #pragma unroll
+    \\                for (unsigned int w = 0; w < 4u; ++w) {
+    \\                    gate_y += gate_partial[c][w];
+    \\                    up_y += up_partial[c][w];
+    \\                }
+    \\                dst[row * out_dim + col] = termite_decoder_activation_f32(gate_y, activation) * up_y;
+    \\            }
+    ,
     .qkv_planes =
     \\    const unsigned char* weight;
     \\    float* dst;
