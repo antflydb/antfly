@@ -34588,6 +34588,70 @@ test "metal native decoderRuntimeApplyLinear iq2_xs matches trivial reference" {
     try std.testing.expectApproxEqAbs(@as(f32, 32.0), actual[0], 1e-4);
 }
 
+// Linked only by the Metal unit-test build; production has no failure switch.
+extern fn termite_metal_test_force_host_output_copy(enabled: c_int) void;
+
+test "metal native attention residual tl1 host ABI copies fallback output buffer" {
+    try testAttentionResidualHostCopyback(false);
+}
+
+test "metal native attention residual tl2 host ABI copies fallback output buffer" {
+    try testAttentionResidualHostCopyback(true);
+}
+
+fn testAttentionResidualHostCopyback(comptime tl2: bool) !void {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    termite_metal_test_force_host_output_copy(1);
+    defer termite_metal_test_force_host_output_copy(0);
+
+    const dim = 1536;
+    const raw_len = if (tl2)
+        gguf_tensor_types.byteLen(.bitnet_tl2, &.{ dim, dim }).?
+    else
+        dim * dim / 4 + 32;
+    const weight_raw = try std.testing.allocator.alloc(u8, @intCast(raw_len));
+    defer std.testing.allocator.free(weight_raw);
+    @memset(weight_raw, if (tl2) 0 else 0x88);
+    const view = if (tl2)
+        try quant_codec.bitnetTL2View(&.{ dim, dim }, weight_raw)
+    else
+        try quant_codec.bitnetTL1View(&.{ dim, dim }, weight_raw);
+    // Both packed fixtures represent an all-ones matrix before scaling.
+    if (tl2) @memset(weight_raw[0..view.three_values.len], 0xdd);
+    const scale_off = weight_raw.len - 32;
+    std.mem.writeInt(u32, weight_raw[scale_off..][0..4], @bitCast(@as(f32, 0.25)), .little);
+
+    var input: [dim]f32 = undefined;
+    var residual: [dim]f32 = undefined;
+    var dot: f32 = 0;
+    for (&input, &residual, 0..) |*x, *r, i| {
+        // Constant inputs are exactly representable by the TL activation
+        // quantizer, keeping this check focused on host result visibility.
+        x.* = 1;
+        r.* = @as(f32, @floatFromInt(i % 7)) * 0.0625;
+        dot += x.* * 0.25;
+    }
+    var backing: [dim + 2]f32 align(std.heap.page_size_min) = @splat(std.math.nan(f32));
+    const output = backing[1..][0..dim];
+    backing[0] = 12345;
+    backing[dim + 1] = -12345;
+    const none = std.math.maxInt(usize);
+    const rc = if (tl2)
+        termite_metal_decode_runtime_apply_attention_residual_tl2(runtime, &input, none, weight_raw.ptr, weight_raw.len, @intCast(scale_off), @intCast(view.three_values.len), @intCast(view.three_signs.len), @intCast(view.config.bm), @intCast(view.config.by), @intCast(view.config.bmm), @intCast(view.three_cols), @intCast(view.two_cols), none, &residual, dim, dim, 1e-5, output.ptr)
+    else
+        termite_metal_decode_runtime_apply_attention_residual_tl1(runtime, &input, none, weight_raw.ptr, weight_raw.len, @intCast(view.packed_bytes.len), @intCast(view.config.bm), @intCast(view.config.by), @intCast(view.config.bmm), none, &residual, dim, dim, 1e-5, output.ptr);
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    for (output, residual) |actual, r| try std.testing.expectApproxEqAbs(dot + r, actual, 1e-4);
+    try std.testing.expectEqual(@as(f32, 12345), backing[0]);
+    try std.testing.expectEqual(@as(f32, -12345), backing[dim + 1]);
+}
+
 test "metal native decoderRuntimeApplyLinear tl1 matches trivial reference" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
@@ -39222,6 +39286,49 @@ test "metal native activation device rows match host" {
                 return error.TestUnexpectedResult;
             }
         }
+    }
+}
+
+test "metal native layer norm host ABI copies fallback output before returning from frames" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    termite_metal_test_force_host_output_copy(1);
+    defer termite_metal_test_force_host_output_copy(0);
+
+    const rows = 3;
+    const hidden = 37;
+    var input: [rows * hidden]f32 = undefined;
+    var weight: [hidden]f32 = undefined;
+    var bias: [hidden]f32 = undefined;
+    for (&input, 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.125;
+    for (&weight, &bias, 0..) |*w, *b, i| {
+        w.* = 0.75 + @as(f32, @floatFromInt(i % 5)) * 0.03125;
+        b.* = @as(f32, @floatFromInt(i % 7)) * 0.0625;
+    }
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_layer_norm(runtime, 0, &weight, &bias, hidden));
+    var expected = input;
+    activations.layerNorm(&expected, &weight, &bias, hidden, 1e-5);
+
+    // Keep the output misaligned; the test build also forces wrapping to fail
+    // on devices that accept it. Check visibility before the caller drains a frame.
+    for (0..3) |mode| {
+        var backing: [rows * hidden + 2]f32 align(std.heap.page_size_min) = @splat(std.math.nan(f32));
+        const output = backing[1..][0 .. rows * hidden];
+        backing[0] = 12345;
+        backing[rows * hidden + 1] = -12345;
+        if (mode != 0) try beginFrame(runtime);
+        defer if (mode != 0) cancelFrame(runtime) catch {};
+        if (mode == 2) try beginPlannedComputeScope(runtime, @backingInt(ComputeSource.rms_norm), .ffn_norm);
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_layer_norm(runtime, 0, &input, rows, hidden, 1e-5, output.ptr));
+        for (expected, output) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-4);
+        try std.testing.expectEqual(@as(f32, 12345), backing[0]);
+        try std.testing.expectEqual(@as(f32, -12345), backing[rows * hidden + 1]);
+        if (mode != 0) try std.testing.expect(termite_metal_decode_runtime_has_active_frame(runtime) != 0);
     }
 }
 

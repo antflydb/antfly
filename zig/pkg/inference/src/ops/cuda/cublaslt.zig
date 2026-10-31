@@ -36,6 +36,7 @@ const CUBLASLT_MATMUL_DESC_TRANSA: c_int = 3;
 const CUBLASLT_MATMUL_DESC_TRANSB: c_int = 4;
 const CUBLASLT_MATMUL_DESC_EPILOGUE: c_int = 7;
 const CUBLASLT_MATMUL_DESC_BIAS_POINTER: c_int = 8;
+const CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE: c_int = 26;
 const CUBLASLT_EPILOGUE_BIAS: c_int = 4;
 const CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES: c_int = 1;
 const CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES: c_int = 5;
@@ -242,10 +243,16 @@ const AttentionPlan = struct {
     workspace: usize,
 };
 
+/// Supported LightOn projection selection. Unknown devices/models retain
+/// the ordinary exact-shape heuristic through the caller's .off profile.
+pub const LightOnProjectionProfile = enum { off, sm121 };
+
 pub const CublasLt = struct {
     // Immutable serving policy, scoped by the owning CUDA model profile.
     florence_canonical_f16_decode: bool = false,
-    lighton_canonical_gdn_decode: bool = false,
+    lighton_projection_profile: LightOnProjectionProfile = .off,
+    lighton_projection_probe_calls: usize = 0,
+    lighton_projection_probe_plans: usize = 0,
     canonical_gdn_calls: usize = 0,
     canonical_gdn_plans: usize = 0,
     canonical_f16_calls: usize = 0,
@@ -461,6 +468,12 @@ pub const CublasLt = struct {
         _ = try self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_32F, .{}, .dense_bias, bias);
     }
 
+    /// BF16 activations and checkpoint bias retain their BF16 storage. The
+    /// output type in the plan key keeps this descriptor separate from F32.
+    pub fn matmulBf16WeightBiasBf16Out(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) Error!void {
+        _ = try self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_16BF, .{}, .dense_bias, bias);
+    }
+
     /// Shape/alignment/workspace-specific bounded tuning, cached for replay.
     pub fn matmulBf16WeightBf16OutWithTuning(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize, tuning: MatmulTuning) Error!MatmulSelection {
         return self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_16BF, tuning, .dense, null);
@@ -571,7 +584,7 @@ pub const CublasLt = struct {
         };
         if (residual != null and (tuning.enabled or bias != null or kind != .dense or input_type != CUDA_R_16BF or output_type != CUDA_R_32F)) return error.CublasLtUnsupported;
         if (bias != null) {
-            if ((input_type != CUDA_R_32F and input_type != CUDA_R_16F and input_type != CUDA_R_16BF) or output_type != CUDA_R_32F or tuning.enabled) return error.CublasLtUnsupported;
+            if ((input_type != CUDA_R_32F and input_type != CUDA_R_16F and input_type != CUDA_R_16BF) or (output_type != CUDA_R_32F and !(input_type == CUDA_R_16BF and output_type == CUDA_R_16BF)) or tuning.enabled) return error.CublasLtUnsupported;
             spinLock(&self.bias_submission_mutex);
         }
         defer if (bias != null) self.bias_submission_mutex.unlock();
@@ -594,7 +607,7 @@ pub const CublasLt = struct {
         try requireDisjoint(workspace, workspace.len, weight, weight_bytes);
         try requireDisjoint(workspace, workspace.len, dst, dst_bytes);
         if (bias) |value| {
-            const bias_bytes = try checkedMatrixBytes(1, out_dim, @sizeOf(f32));
+            const bias_bytes = try checkedMatrixBytes(1, out_dim, if (output_type == CUDA_R_32F) @sizeOf(f32) else @sizeOf(u16));
             try checkRawBytes(value, bias_bytes);
             try requireDisjoint(dst, dst_bytes, value, bias_bytes);
             try requireDisjoint(workspace, workspace.len, value, bias_bytes);
@@ -618,7 +631,7 @@ pub const CublasLt = struct {
         defer plan_lease.deinit(self);
         const plan = plan_lease.plan;
         try checkRawBytes(workspace, plan.workspace_size);
-        if (bias) |value| try self.setBias(plan.op_desc, value);
+        if (bias) |value| try self.setBias(plan.op_desc, value, output_type);
 
         var alpha: f32 = 1.0;
         var beta: f32 = if (residual != null) 1.0 else 0.0;
@@ -659,13 +672,32 @@ pub const CublasLt = struct {
         return plan.selection;
     }
 
+    fn lightOnProjectionRows(rows: usize, in_dim: usize, out_dim: usize) u32 {
+        if (rows == 0 or rows > 128) return 0;
+        // Preserve the existing selected 0.8B GDN tile, including M128.
+        if (in_dim == 1024 and out_dim == 6144 and rows >= 65) return 128;
+        // Selected with cold weights on GB10; other projection shapes retain
+        // the ordinary heuristic. These descriptors never add compute rows.
+        const query: u32 = if (in_dim == 2560 and out_dim == 248320)
+            16
+        else if (in_dim == 1024 and out_dim == 6144 and rows >= 17 and rows <= 32)
+            96
+        else if (in_dim == 1024 and out_dim == 248320 and rows >= 33 and rows <= 64)
+            32
+        else
+            0;
+        return if (query == rows) 0 else query;
+    }
+
+    fn originalLightOnGdnProbe(key: TensorCorePlanKey) bool {
+        return key.in_dim == 1024 and key.out_dim == 6144 and key.rows >= 65 and key.rows <= 128;
+    }
+
     fn canonicalDecodeRows(self: *const CublasLt, kind: TensorCorePlanKind, input_type: c_int, output_type: c_int, batch_count: usize, rows: usize, in_dim: usize, out_dim: usize, tuning: MatmulTuning) u32 {
-        // Query a descriptor at M128, but execute only the real rows. GB10's
-        // M65..127 heuristic for the 0.8B GDN projection can select a slower
-        // tile. AlgoCheck below still validates the exact original layouts.
-        if (self.lighton_canonical_gdn_decode and kind == .dense and input_type == CUDA_R_16BF and
-            output_type == CUDA_R_32F and batch_count == 1 and rows >= 65 and rows <= 128 and
-            in_dim == 1024 and out_dim == 6144 and !tuning.enabled) return 128;
+        // Only the CPU heuristic descriptor changes. AlgoCheck validates the
+        // original layouts, and launches still read/write exactly real rows.
+        if (self.lighton_projection_profile == .sm121 and kind == .dense and input_type == CUDA_R_16BF and
+            output_type == CUDA_R_32F and batch_count == 1 and !tuning.enabled) return lightOnProjectionRows(rows, in_dim, out_dim);
         return if (self.florence_canonical_f16_decode and input_type == CUDA_R_16F and output_type == CUDA_R_32F and
             (kind == .dense or kind == .dense_bias) and batch_count == 1 and rows >= 1 and rows <= 64 and !tuning.enabled) 32 else 0;
     }
@@ -708,7 +740,9 @@ pub const CublasLt = struct {
             .canonical_rows = self.canonicalDecodeRows(kind, input_type, output_type, batch_count, rows, in_dim, out_dim, effective_tuning),
         };
         if (key.canonical_rows != 0) {
-            if (key.input_type == CUDA_R_16BF) self.canonical_gdn_calls += 1 else self.canonical_f16_calls += 1;
+            if (key.input_type == CUDA_R_16BF) {
+                if (originalLightOnGdnProbe(key)) self.canonical_gdn_calls += 1 else self.lighton_projection_probe_calls += 1;
+            } else self.canonical_f16_calls += 1;
         }
 
         // Keep the steady-state path to one short plan-map lookup. The much
@@ -808,7 +842,7 @@ pub const CublasLt = struct {
         const output_dim = if (key.kind == .dense_input_gradient) key.in_dim else key.out_dim;
         try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.c_desc, key.output_type, output_dim, key.rows, output_dim));
         try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.d_desc, key.output_type, output_dim, key.rows, output_dim));
-        if (key.kind == .dense_bias) try self.setBias(plan.op_desc, invocation.bias orelse return error.CublasLtUnsupported);
+        if (key.kind == .dense_bias) try self.setBias(plan.op_desc, invocation.bias orelse return error.CublasLtUnsupported, key.output_type);
 
         if (key.kind == .strided_batched) {
             var row_order = CUBLASLT_ORDER_ROW;
@@ -840,10 +874,10 @@ pub const CublasLt = struct {
 
         var heuristics: [maximum_matmul_heuristics]MatmulHeuristicResult = undefined;
         var returned: c_int = 0;
-        const gdn_probe = key.canonical_rows != 0 and key.input_type == CUDA_R_16BF;
+        const lighton_probe = key.canonical_rows != 0 and key.input_type == CUDA_R_16BF;
         const requested: c_int = if (tuning.enabled)
             @intCast(tuning.candidate_count)
-        else if (gdn_probe and key.rows != key.canonical_rows) 2 else 1;
+        else if (lighton_probe and key.rows != key.canonical_rows) 2 else 1;
         if (key.canonical_rows != 0 and key.rows != key.canonical_rows) {
             // Query only descriptors at the canonical row count. No probe
             // GEMM executes and no extra device storage is allocated. The
@@ -852,7 +886,7 @@ pub const CublasLt = struct {
             probe_key.rows = key.canonical_rows;
             probe_key.canonical_rows = 0;
             const probe = self.createTensorCorePlan(probe_key, .{}, ctx, invocation) catch |err| {
-                if (!gdn_probe or err != error.CublasLtUnsupported) return err;
+                if (!lighton_probe or err != error.CublasLtUnsupported) return err;
                 // A library may decline the descriptor probe while supporting
                 // the real shape. Preserve its ordinary cuBLAS route.
                 var ordinary_key = key;
@@ -864,7 +898,7 @@ pub const CublasLt = struct {
             defer self.destroyTensorCorePlan(probe);
             heuristics[0] = .{ .algo = probe.algo, .workspace_size = probe.workspace_size, .state = CUBLAS_STATUS_SUCCESS, .waves_count = 0, .reserved = @splat(0) };
             returned = 1;
-            if (gdn_probe) {
+            if (lighton_probe) {
                 // Keep the ordinary exact-shape heuristic as a fallback when
                 // the preferred tile cannot execute these actual buffers.
                 var ordinary_count: c_int = 0;
@@ -913,7 +947,9 @@ pub const CublasLt = struct {
             return error.CublasLtUnsupported;
         };
         if (key.canonical_rows != 0) {
-            if (gdn_probe) self.canonical_gdn_plans += 1 else self.canonical_f16_plans += 1;
+            if (lighton_probe) {
+                if (originalLightOnGdnProbe(key)) self.canonical_gdn_plans += 1 else self.lighton_projection_probe_plans += 1;
+            } else self.canonical_f16_plans += 1;
         }
 
         var selected = fallback;
@@ -1392,9 +1428,10 @@ pub const CublasLt = struct {
         _ = try self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_32F, CUDA_R_32F, .{}, .dense_bias, bias);
     }
 
-    fn setBias(self: *const CublasLt, desc: MatmulDesc, bias: buffer_mod.DeviceBuffer) Error!void {
+    fn setBias(self: *const CublasLt, desc: MatmulDesc, bias: buffer_mod.DeviceBuffer, output_type: c_int) Error!void {
         const epilogue: c_int = CUBLASLT_EPILOGUE_BIAS;
         const pointer: *const anyopaque = try devicePointer(bias.ptr);
+        try self.check(self.fns.cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &output_type, @sizeOf(c_int)));
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, @sizeOf(c_int)));
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, @ptrCast(&pointer), @sizeOf(@TypeOf(pointer))));
     }
@@ -1679,4 +1716,38 @@ test "LightOnOCR3 CUDA channel GEMM alignment accounts for every strided group" 
     try std.testing.expectEqual(@as(u32, 256), stridedPointerAlignment(4096, 32, 2, 1));
     try std.testing.expectEqual(@as(u32, 256), stridedPointerAlignment(4096, 0, 2, 32));
     try std.testing.expectEqual(@as(u32, 32), stridedPointerAlignment(4096 + 32, 64, 2, 32));
+}
+
+test "LightOnOCR3 CUDA projection descriptor policy keeps actual rows and conservative dtype scope" {
+    var blas: CublasLt = undefined;
+    blas.lighton_projection_profile = .sm121;
+    blas.florence_canonical_f16_decode = false;
+    const Case = struct { rows: usize, inner: usize, out: usize, query: u32 };
+    for ([_]Case{
+        .{ .rows = 1, .inner = 2560, .out = 4096, .query = 0 },
+        .{ .rows = 1, .inner = 2560, .out = 248320, .query = 16 },
+        .{ .rows = 7, .inner = 2560, .out = 248320, .query = 16 },
+        .{ .rows = 16, .inner = 2560, .out = 248320, .query = 0 },
+        .{ .rows = 85, .inner = 2560, .out = 248320, .query = 16 },
+        .{ .rows = 128, .inner = 2560, .out = 248320, .query = 16 },
+        .{ .rows = 129, .inner = 2560, .out = 248320, .query = 0 },
+        .{ .rows = 16, .inner = 1024, .out = 3072, .query = 0 },
+        .{ .rows = 21, .inner = 1024, .out = 6144, .query = 96 },
+        .{ .rows = 43, .inner = 1024, .out = 248320, .query = 32 },
+        .{ .rows = 43, .inner = 1024, .out = 3072, .query = 0 },
+        .{ .rows = 85, .inner = 1024, .out = 6144, .query = 128 },
+        .{ .rows = 128, .inner = 1024, .out = 6144, .query = 128 },
+        .{ .rows = 85, .inner = 2560, .out = 8192, .query = 0 },
+        .{ .rows = 85, .inner = 2560, .out = 4096, .query = 0 },
+        .{ .rows = 128, .inner = 2560, .out = 4096, .query = 0 },
+        .{ .rows = 129, .inner = 2560, .out = 4096, .query = 0 },
+    }) |item| try std.testing.expectEqual(item.query, blas.canonicalDecodeRows(.dense, CUDA_R_16BF, CUDA_R_32F, 1, item.rows, item.inner, item.out, .{}));
+    for ([_]TensorCorePlanKind{ .dense_bias, .dense_input_gradient, .strided_batched }) |kind|
+        try std.testing.expectEqual(@as(u32, 0), blas.canonicalDecodeRows(kind, CUDA_R_16BF, CUDA_R_32F, 1, 85, 2560, 4096, .{}));
+    try std.testing.expectEqual(@as(u32, 0), blas.canonicalDecodeRows(.dense, CUDA_R_16BF, CUDA_R_32F, 2, 85, 2560, 4096, .{}));
+    try std.testing.expectEqual(@as(u32, 0), blas.canonicalDecodeRows(.dense, CUDA_R_32F, CUDA_R_32F, 1, 85, 2560, 4096, .{}));
+    try std.testing.expectEqual(@as(u32, 0), blas.canonicalDecodeRows(.dense, CUDA_R_16BF, CUDA_R_16BF, 1, 85, 2560, 4096, .{}));
+    try std.testing.expectEqual(@as(u32, 0), blas.canonicalDecodeRows(.dense, CUDA_R_16BF, CUDA_R_32F, 1, 85, 2560, 4096, .{ .enabled = true }));
+    blas.lighton_projection_profile = .off;
+    try std.testing.expectEqual(@as(u32, 0), blas.canonicalDecodeRows(.dense, CUDA_R_16BF, CUDA_R_32F, 1, 85, 2560, 4096, .{}));
 }

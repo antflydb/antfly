@@ -41,6 +41,7 @@ const lib_chunker = @import("inference_chunker");
 const hf_tokenizer_mod = @import("inference_hf_tokenizer");
 const backends_mod = @import("../backends/backends.zig");
 const session_factory = @import("../architectures/session_factory.zig");
+const qwen35_execution = @import("../architectures/qwen35_execution.zig");
 const registry_mod = @import("../registry/registry.zig");
 const extractors_mod = @import("../extractors/extractor.zig");
 const cache_mod = @import("../cache/cache.zig");
@@ -1617,7 +1618,7 @@ const max_chunk_results = lib_chunker.max_chunk_results;
 const max_chunk_target_tokens = lib_chunker.max_chunk_target_tokens;
 const max_chunk_audio_window_ms = lib_chunker.max_chunk_audio_window_ms;
 const default_read_admission_max_tokens: usize = 256;
-const max_read_tokens: usize = 1024;
+const max_read_tokens: usize = 8192;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 const default_max_request_media_bytes: usize = 100 * 1024 * 1024;
 const read_admission_bytes_per_unit: usize = 16 * 1024 * 1024;
@@ -7751,8 +7752,9 @@ pub const Node = struct {
             item.source_fingerprint = if (image.source_fingerprint) |value| try allocator.dupe(u8, value) else null;
             item.page_number = image.page_number;
         }
+        const usage = try readers_api.measuredUsage(out);
         const execution = try qwenReadExecution(allocator, results);
-        return .{ .items = out, .execution = execution };
+        return .{ .items = out, .execution = execution, .usage = usage };
     }
 
     const ConcurrentOcrBenchTask = struct {
@@ -8226,6 +8228,26 @@ pub const Node = struct {
         io: std.Io,
         control: InferenceExecutionControl,
 
+        /// The epoch backend carries no request control, so its per-layer
+        /// vision checks never fire. A page encoding alone checks its own
+        /// deadline at each command-buffer boundary and then frees the gate.
+        fn pageBackend(request: *const @This()) ops.ComputeBackend {
+            var cb = request.ctx.cb.?;
+            cb.execution_control = request.control;
+            return cb;
+        }
+
+        /// Conservative epochs have no vision broker. Encode one page under
+        /// the step lock, exactly as generation does without a hook.
+        fn encodeSerial(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            try request.control.check();
+            try request.ctx.lockStep(request.control);
+            defer request.ctx.unlockStep();
+            var cb = request.pageBackend();
+            return qwen3vl_projector.encodeProjectedImagesResident(&cb, allocator, request.ctx.cfg, images, limits);
+        }
+
         fn encodeCpuPrepared(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, original_limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
             const request: *@This() = @ptrCast(@alignCast(raw));
             try request.control.check();
@@ -8236,7 +8258,8 @@ pub const Node = struct {
             if (images.len != 1) {
                 try ctx.lockStep(request.control);
                 defer ctx.unlockStep();
-                return qwen3vl_projector.encodeProjectedImagesResident(&ctx.cb.?, allocator, ctx.cfg, images, limits);
+                var cb = request.pageBackend();
+                return qwen3vl_projector.encodeProjectedImagesResident(&cb, allocator, ctx.cfg, images, limits);
             }
             const started = platform.time.monotonicNs();
             var prepared = try qwen3vl_projector.prepareProjectedImageResident(allocator, ctx.cfg, images[0], limits, request.control.imageWorkControl());
@@ -8268,12 +8291,13 @@ pub const Node = struct {
             defer ctx.unlockStep();
             ctx.cpu_preprocess_items += 1;
             ctx.cpu_preprocess_ns +|= elapsed;
+            var cb = request.pageBackend();
             if (ctx.features.device_vision_features) {
-                const result = try qwen3vl_projector.encodePreparedProjectedImagesDeviceBatched(&ctx.cb.?, allocator, ctx.cfg, &.{&prepared}, limits);
+                const result = try qwen3vl_projector.encodePreparedProjectedImagesDeviceBatched(&cb, allocator, ctx.cfg, &.{&prepared}, limits);
                 defer allocator.free(result);
                 return result[0];
             }
-            return qwen3vl_projector.encodePreparedProjectedImageResident(&ctx.cb.?, allocator, ctx.cfg, &prepared, limits);
+            return qwen3vl_projector.encodePreparedProjectedImageResident(&cb, allocator, ctx.cfg, &prepared, limits);
         }
 
         fn encode(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
@@ -8290,7 +8314,8 @@ pub const Node = struct {
             if (geometry == 0) {
                 try ctx.lockStep(request.control);
                 defer ctx.unlockStep();
-                return qwen3vl_projector.encodeProjectedImagesResident(&ctx.cb.?, allocator, ctx.cfg, images, limits);
+                var cb = request.pageBackend();
+                return qwen3vl_projector.encodeProjectedImagesResident(&cb, allocator, ctx.cfg, images, limits);
             }
             const Cancel = struct {
                 fn check(ptr: *const anyopaque) bool {
@@ -8522,7 +8547,7 @@ pub const Node = struct {
         cfg.compact_qwen35_kv = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_COMPACT_KV");
         const backend: runtime.kv.pool.BackendKind = if (model.session.backend() == .cuda) .cuda else .metal;
         cfg.qwen35_device_only_state = cfg.hasQwen35VisionArchitectureContract() and
-            ((backend == .cuda and cudaLightOnBatchProfileEnabled()) or
+            ((backend == .cuda and cfg.qwen35_device_only_state) or
                 (metal_runtime.appleSimdgroupDeviceDefault() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE")));
         cfg.qwen35_metal_resident_vision = metal_runtime.appleSimdgroupDeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
             qwen3vl_projector.supportsResidentVisionBudget(cfg) and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET");
@@ -8563,6 +8588,20 @@ pub const Node = struct {
         if (image.len > @min(readInlineSourceByteCap(self), contract.batch.max_encoded_media_bytes) or
             (try measureExecutorDecodedImages(&model.manifest, &.{image})) > (contract.batch.max_decoded_pixels orelse std.math.maxInt(u64)))
             return error.MicrobatchResourceLimitExceeded;
+        // Admission below waits for peers to retire, but this page's own
+        // shared peaks stay leased while it waits. Reject a plan that cannot
+        // fit even alone instead of returning retryable capacity errors.
+        const solo = try features.soloPagePlan(
+            amounts,
+            try std.math.add(usize, if (share_vision_peak) shared_vision_bytes else 0, memory.decoder_backend_peak),
+            if (share_vision_peak) shared_vision_host_bytes else 0,
+        );
+        if (!(solo.fitsLimits(limits) catch false)) {
+            std.log.warn("LightOnOCR3 read page exceeds the generation budget even when admitted alone scratch_bytes={d} scratch_limit_bytes={d}; raise --scratch-budget-mb or the other generation budgets", .{
+                solo.host_scratch_bytes +| solo.backend_scratch_bytes, limits.scratch_limit_bytes,
+            });
+            return error.ResourceLimitExceeded;
+        }
         const extended_epoch = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_EXTENDED_EPOCH");
         // Refill completed slots in the same resident epoch. The simultaneous
         // window and every GPU forward retain their existing independent caps.
@@ -8689,7 +8728,7 @@ pub const Node = struct {
         var vision_request = LightOnVisionRequest{ .ctx = ctx, .io = page_io, .control = control };
         var pipeline = generation.NativeGenerationPipeline{
             .qwen_prefill_batch = if (ctx.features.prefill_batch or ctx.features.packed_mixed) .{ .ptr = &vision_request, .run_fn = batchLightOnPreparedPrefill } else null,
-            .qwen_vision_batch = if (ctx.features.cpu_preprocess) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encodeCpuPrepared } else if (vision_batch_enabled) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encode } else null,
+            .qwen_vision_batch = if (ctx.features.cpu_preprocess) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encodeCpuPrepared } else if (vision_batch_enabled) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encode } else .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encodeSerial },
             .allocator = a,
             .io = page_io,
             .cb = ctx.cb.?,
@@ -11398,6 +11437,14 @@ pub const Node = struct {
             observer.emit(.{ .phase = .model });
             break :tokens count;
         } else 0;
+        // The reference device path has no resident workspace to size from
+        // tokens, so plan its encoder bytes from the exact prepared request.
+        const reference_encoder_bytes: ?usize = if ((backend == .metal or backend == .cuda) and execution_options.metal_execution_policy != .optimized_v2) bytes: {
+            failure.* = .{ .stage = "tokenizing" };
+            const planned = try boundary_executor.referenceEncoderDeviceBytes(if (backend == .cuda) .cuda else .metal, scratch, &config, loaded.getTokenizer(), &request, execution_options);
+            failure.* = .{ .stage = "model" };
+            break :bytes planned;
+        } else null;
         const execution_mutex = loaded.targetInferenceExecutionMutex();
         const effective = control orelse InferenceExecutionControl{};
         // A waiting GPU boundary request cannot use the session workspace
@@ -11425,24 +11472,30 @@ pub const Node = struct {
             var device_lease: ?runtime.tier.memory.AdmissionLease = null;
             defer if (device_lease) |*owned| owned.release();
             if (backend == .metal or backend == .cuda) {
-                const full_device_bytes = try boundary_executor.deviceScratchUpperBound(execution_options);
+                if (workspace_plan) |plan| {
+                    request_options.device.max_encoder_device_bytes = try plan.requestEncoderLimit(execution_options.device.max_encoder_device_bytes);
+                    request_options.profile_encoder_device_limit = execution_options.device.max_encoder_device_bytes;
+                } else if (reference_encoder_bytes) |needed| {
+                    // Size the encoder owner to this request instead of the
+                    // configured ceiling; the profile keeps the declared one.
+                    request_options.device.max_encoder_device_bytes = needed;
+                    request_options.profile_encoder_device_limit = execution_options.device.max_encoder_device_bytes;
+                }
+                const request_device_bytes = try boundary_executor.deviceScratchUpperBound(request_options);
+                // The optimized path's per-run ceiling includes the whole
+                // borrowed workspace, which the controller owns through a
+                // separate persistent lease. The reference path has none, so
+                // its run reserves only what this request plans to use.
+                const run_device_bytes = if (workspace_plan == null) request_device_bytes else try boundary_executor.deviceScratchUpperBound(execution_options);
                 const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                     self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu)),
                     self.config.generation_budget_overrides.scratch_limit_bytes,
                     working_bytes,
-                    full_device_bytes,
+                    run_device_bytes,
                 );
-                if (workspace_plan) |plan| {
-                    request_options.device.max_encoder_device_bytes = try plan.requestEncoderLimit(execution_options.device.max_encoder_device_bytes);
-                    request_options.profile_encoder_device_limit = execution_options.device.max_encoder_device_bytes;
-                }
-                const request_device_bytes = try boundary_executor.deviceScratchUpperBound(request_options);
-                // The per-run ceiling includes the whole borrowed workspace.
-                // The controller owns that buffer through a separate persistent
-                // lease, so only the remaining capacity is requested here.
                 budget.* = runtime.tier.memory.RunBudget.init(device_limits);
                 try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = working_bytes, .scratch_tier = .host });
-                try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = full_device_bytes, .scratch_tier = .backend });
+                try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = run_device_bytes, .scratch_tier = .backend });
                 if (workspace_plan) |plan| if (plan.replacement_amounts) |amounts| {
                     workspace_permit = try self.model_manager.acquireRunResourceAmounts(.gpu, device_limits, amounts);
                 };
@@ -20827,7 +20880,7 @@ pub const Node = struct {
         var max_tokens = validateReadMaxTokens(body.max_tokens) catch
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
-                .message = "'max_tokens' must be between 1 and 1024",
+                .message = "'max_tokens' must be between 1 and 8192",
             });
         const inline_source_cap = readInlineSourceByteCap(self);
         var inline_source_bytes: usize = 0;
@@ -24974,6 +25027,18 @@ pub const Node = struct {
         var loaded_snapshot = try self.model_manager.acquireLoadedModelSnapshot(ctx.allocator);
         defer loaded_snapshot.deinit();
 
+        var recurrent_cuda: u64 = 0;
+        var recurrent_host: u64 = 0;
+        for (loaded_snapshot.handles) |handle| {
+            if (session_factory.getRecurrentExecution(handle.get().session)) |decision| {
+                switch (decision.placement) {
+                    .cuda => recurrent_cuda += 1,
+                    .host => recurrent_host += 1,
+                }
+            }
+        }
+        try appendPromMetric(&writer.writer, "antfly_inference_recurrent_cuda_models", "gauge", "Loaded CUDA models whose recurrent state executes on device", recurrent_cuda);
+        try appendPromMetric(&writer.writer, "antfly_inference_recurrent_host_models", "gauge", "Loaded CUDA models using an explicit host recurrent fallback", recurrent_host);
         // Derive gauges from live owners rather than an increment-only cache.
         self.metrics.models_loaded.set(@intCast(loaded_snapshot.handles.len));
         // Core metrics via prometheus lib
@@ -28540,7 +28605,7 @@ fn effectiveLightOnReadRows() usize {
 
 fn cudaLightOnBatchProfileEnabled() bool {
     return build_options.enable_cuda and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_BATCH") and
-        platform.env.getenvBool("TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE");
+        qwen35_execution.cudaCoreEnabled();
 }
 
 fn effectiveLightOnReadWindow() usize {
@@ -29422,7 +29487,6 @@ test "standalone inference model catalog publishes resolved native reader batchi
     try std.testing.expectEqual(@as(i64, 32 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_encoded_media_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, 8 * 1024 * 1024), resolved.object.get("batch").?.object.get("max_decoded_pixels").?.integer);
     const task_limits = resolved.object.get("task_limits").?.object;
-    try std.testing.expectEqual(@as(i64, max_read_tokens), task_limits.get("max_output_tokens_per_item").?.integer);
     try std.testing.expect(task_limits.get("max_candidates_per_request").? == .null);
     const transform = resolved.object.get("image_transform").?.object;
     try std.testing.expectEqual(@as(i64, 768), transform.get("target_width").?.integer);
@@ -33259,6 +33323,7 @@ test "Qwen3-VL encoded read results own page identities and report serial execut
             defer batch.deinit(allocator);
             try std.testing.expectEqual(@as(i64, 21), batch.usage.?.prompt_tokens);
             try std.testing.expectEqual(@as(i64, 4), batch.usage.?.completion_tokens);
+            try std.testing.expectEqual(@as(i64, 25), batch.usage.?.total_tokens);
             try std.testing.expectEqual(readers_api.Completion.complete, batch.items[0].completion);
             try std.testing.expectEqual(readers_api.Completion.length, batch.items[1].completion);
             try std.testing.expectEqual(@as(?usize, 11), batch.items[1].prompt_tokens);
@@ -33287,7 +33352,8 @@ test "read admission units scale with image batch and decode length" {
     try std.testing.expectEqual(@as(usize, 1), estimateReadAdmissionUnits(1, null));
     try std.testing.expectEqual(@as(usize, 4), estimateReadAdmissionUnits(4, null));
     try std.testing.expectEqual(@as(usize, 8), estimateReadAdmissionUnits(4, default_read_admission_max_tokens + 1));
-    try std.testing.expectEqual(@as(usize, 16), estimateReadAdmissionUnits(4, max_read_tokens));
+    try std.testing.expectEqual(@as(usize, 16), estimateReadAdmissionUnits(4, 1024));
+    try std.testing.expectEqual(@as(usize, 128), estimateReadAdmissionUnits(4, 8192));
 }
 
 test "Qwen3-VL read admission includes one serial multimodal generation" {
@@ -33360,16 +33426,16 @@ test "Qwen3-VL direct read rejects insufficient generation capacity before fetch
 }
 
 test "direct extraction validates read max tokens" {
-    var valid = try parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":1024}");
+    var valid = try parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":8192}");
     defer valid.deinit();
-    try std.testing.expectEqual(@as(?usize, max_read_tokens), valid.max_tokens);
+    try std.testing.expectEqual(@as(?usize, 8192), valid.max_tokens);
     try std.testing.expectError(
         error.InvalidMaxTokens,
         parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":-1}"),
     );
     try std.testing.expectError(
         error.InvalidMaxTokens,
-        parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":1025}"),
+        parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":8193}"),
     );
 }
 
@@ -44827,6 +44893,7 @@ test "LightOnOCR3 decoder peak ownership preserves caps across failed growth and
     var model: model_manager_mod.LoadedModel = undefined;
     model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
     var ctx: Context = undefined;
+    ctx.cb = null;
     ctx.features = .{};
     ctx.cfg = .{};
     ctx.auxiliary_ready = .init(true);
@@ -44979,6 +45046,7 @@ test "LightOnOCR3 epoch admission owns shared scratch across page retirement and
     var model: model_manager_mod.LoadedModel = undefined;
     model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
     var ctx: Context = undefined;
+    ctx.cb = null;
     ctx.features = features;
     ctx.cfg = .{};
     ctx.auxiliary_lease = null;
@@ -45349,7 +45417,8 @@ test "LightOnOCR3 CUDA sixteen prefix admission keeps all per page state and res
     }
     try group.add(cfg, 662, 256, decoder, .{});
     try std.testing.expectEqual(decoder.backend_kv_bytes, group.amounts.backend_kv_bytes);
-    const working = (try runtime.tier.memory.estimateGptGeneration(.cuda, .f16, cfg, 662, 256, 256)).scratch_bytes;
+    const working = (try runtime.tier.memory.estimateGptGeneration(.cuda, .f16, cfg, 662, 256, 256)).scratch_bytes -
+        try runtime.tier.memory.gptRecurrentBackendStateBytes(.cuda, cfg);
     try std.testing.expect(group.decoder_backend_peak >= working * 2 * 16 + 128 * cfg.vocab_size * @sizeOf(f32));
     const complete = try group.finish();
     const cap = complete.hostTotalBytes() + complete.backendTotalBytes();
@@ -47443,4 +47512,23 @@ test "Whisper HTTP pipelines inherit narrowed output policy and preserve typed f
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 413), response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "OUTPUT_TOKEN_LIMIT_EXCEEDED") != null);
+}
+
+test "LightOnOCR3 serial and cohort CUDA admission charge persistent recurrent state exactly once" {
+    var cfg = try gpt_model_mod.parseConfig(std.testing.allocator, @embedFile("../models/testdata/lightonocr3/config-4b.json"));
+    cfg.qwen35_device_only_state = true;
+    const memory = runtime.tier.memory;
+    const estimate = try memory.estimateGptGeneration(.cuda, .f16, cfg, 128, 64, 128);
+    const decoder = memory.AdmissionAmounts.fromEstimate(estimate);
+    var serial = Node.LightOnCohortMemory{ .backend = .cuda };
+    try serial.add(cfg, 128, 64, decoder, .{});
+    try std.testing.expectEqual(decoder.backend_scratch_bytes + 128 * cfg.hidden_size * @sizeOf(f32), serial.amounts.backend_scratch_bytes);
+    var cohort = Node.LightOnCohortMemory{ .backend = .cuda, .share_decoder_scratch = true, .decoder_rows = 2 };
+    try cohort.add(cfg, 128, 64, decoder, .{});
+    const first = cohort.amounts;
+    const peak = cohort.decoder_backend_peak;
+    try cohort.add(cfg, 128, 64, decoder, .{});
+    try std.testing.expectEqual(first.backend_scratch_bytes * 2, cohort.amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(first.backend_kv_bytes * 2, cohort.amounts.backend_kv_bytes);
+    try std.testing.expectEqual(peak, cohort.decoder_backend_peak);
 }
