@@ -310,8 +310,10 @@ Guidance:
   applied sequence is recorded) writes `leann.store` atomically with a CRC:
   the key map, the exact buffer, and the serialized graph. When at least
   20% of graph nodes are deleted, `sync` first rebuilds the graph from the
-  live nodes' stored vectors. Rebuilds are deterministic (seeded levels,
-  node order), so replicas that apply the same writes converge.
+  live nodes' stored vectors. In this replica-local mode, replicas on the
+  same binary and CPU converge, but floating-point differences across CPUs
+  (for example AVX-512 vs. NEON) can pick different neighbors, so graphs
+  may drift apart. [Leader replication](#leader-replication) removes that.
 - **Guards.** `pruneDenseSplitRange` and `handoffDenseFrom` fail with
   `error.UnsupportedLeannSplit` before moving any state.
   `nativeBackupSupportsImmutableCheckpoint` returns false, so backups take
@@ -346,8 +348,91 @@ below.
 4. **Filter-aware traversal.** Filters are applied after an over-fetched
    search today; very selective filters would be better served by passing
    them into the graph walk.
-5. **Leader-built rebuilds.** Rebuilds are replica-local and deterministic
-   today. Large rebuilds could move to the Raft leader and ship the result,
-   as `CLAUDE.md` requires for background mutation work.
+5. **Leader replication wiring.** See
+   [Leader replication](#leader-replication): the state machine is done;
+   the Raft entry, apply path, leader planner job and generation transfer
+   remain.
 6. **E2E coverage.** Add a Python e2e test that creates an
    `algorithm: "leann"` index over HTTP and queries it.
+
+## Leader replication
+
+Goal: only the Raft leader computes graph changes (as `CLAUDE.md` requires
+for background mutation work), and every replica holds a byte-identical
+graph regardless of CPU.
+
+### State machine (done)
+
+`pkg/antfly-embedded/src/storage/leann_replica.zig`, on top of
+`leann.Index.planInsert` / `planDelete` / `applyDeltaUndoable` /
+`revertDelta`:
+
+- **Keys, not vector ids.** Nodes are keyed by document or artifact key,
+  identical on every replica. Vector ids stay replica-local bindings.
+- **Records.** The leader turns pending work (upserts and deletes by key)
+  into one record, planned against `(generation, version)`. Planning
+  applies each op so the next one sees it, then reverts, so the leader's
+  state only changes when the record commits.
+- **Apply in log order, everywhere.** Each replica, the leader included,
+  applies committed records in order. A record planned against another
+  state is skipped (`stale`); one that fails validation is rolled back
+  (`rejected`). Both decisions are identical on every replica, so the
+  leader simply re-plans the affected keys. No lock spans plan and commit,
+  and a leader change mid-flight only causes a re-plan.
+- **Divergence check.** Replace edits carry the id they overwrite; a
+  replica whose graph differs rejects the record instead of drifting.
+- **Two kinds of content.** Before the first graph exists, records carry raw
+  vectors for an exact buffer. Afterwards they carry deltas (~200 bytes per
+  insert at 768-d).
+- **Generations.** Builds (the first one at `build_threshold`, rebuilds
+  after deletes, split children) run on the leader. An install op carries
+  the generation bytes inline when small, otherwise only a digest; replicas
+  fetch the bytes out of band and verify the digest. A failed fetch leaves
+  state unchanged so the record can be retried.
+
+Tests: `leann.zig` (replicas applying encoded deltas stay identical; batch
+plan-then-revert is exact; stale and corrupt deltas are rejected) and
+`leann_replica.zig` (simulated log with three replicas, two leader changes,
+lagging followers, a deposed leader's late record, inline first build,
+out-of-band rebuild, missing and corrupt generations, restart).
+
+### Wiring into Raft (remaining)
+
+1. **Raft entry.** Add `leann_record: ?{index_name, record}` to
+   `BatchRequest` (`storage/db/types.zig`) and its wire codec, a new
+   `batch_leann_record_protocol_version = 25` in
+   `common/data_raft_protocol.zig`, and a case in
+   `requiredRaftBatchProtocolVersion` (`data/runtime.zig`). Versions are per
+   entry, so only LEANN entries require 25; older replicas reject just
+   those. Exempt it from the timestamp override, like artifact publication.
+2. **Apply path.** Dense indexes are fed asynchronously by each replica's
+   derived replay, which does not follow Raft order. LEANN records instead
+   apply at Raft apply time: `batchInternal` (with `ordered_apply_receipt`)
+   persists the record and the Raft index in the primary transaction, then
+   the index manager hands it to the index's `Replica`. The LEANN state
+   file stores the last applied Raft index; on open, persisted records after
+   it are replayed in order.
+3. **Leader planner.** On the leader, derived replay feeds LEANN work
+   (key + vector, or delete) to a queue instead of mutating the graph; a
+   leader-only job (the enrichment executor's leadership hooks) plans one
+   record per index at a time and proposes it through the artifact
+   publication dispatcher's path (`DataServer.enqueue...` →
+   `proposeRaftBatchGroup`). Work stays queued until its record applies;
+   skipped records re-queue it. Followers' derived replay only updates
+   vector-id bindings.
+4. **Generation transfer.** Raft snapshots deliberately exclude index files
+   (`raft/storage/native_snapshot.zig`), so generations travel out of band:
+   the leader publishes the bytes under `(index, generation, digest)` with
+   the chunked file transfer used for snapshots
+   (`file_snapshot_store.zig`) or object storage, and the install record
+   carries only the digest. New or lagging replicas install the latest
+   generation, then replay records after it.
+5. **Splits.** Each child's leader builds a generation from its key range.
+6. **Simulation.** Extend `DerivedWorkflowScenario`
+   (`vopr/domain_vopr.zig`) with leader-built generations, install at a
+   log position, and leader changes; add a production-cluster VOPR that
+   checks replica graph equality.
+
+Note: the server-side pieces (steps 1, 3, 4) live in the data runtime,
+whose test build declares more memory than the sandbox this was written in,
+so they need CI to compile and run.
