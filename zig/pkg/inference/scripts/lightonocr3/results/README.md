@@ -1,5 +1,13 @@
 # OCR performance evidence
 
+The historical [fatbin compression receipt](fatbin-size-1331.json) records native
+`--compress-mode=size`: 58,185,464 to 7,942,584 bytes (86.35% smaller),
+with all seven cubin targets and the PTX fallback retained. Required symbols
+are inspected through `cuobjdump`, since compressed bytes hide their names.
+All 41 selected focused CUDA tests pass with that compressed image. The current
+artifact recipe uses fast compression instead; see the BK consolidation report
+for its measured size/startup tradeoff.
+
 The [uncached-forward regression](uncached-forwards-1331.json) records the
 follow-up CUDA fix for null decode contexts: temporary device state owns its
 admission lease and is released after each full-prefix forward. The focused
