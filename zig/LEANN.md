@@ -275,6 +275,44 @@ Guidance:
   CPU it suits batch or offline retrieval. The paper reports ~2.5 s on an
   RTX 4090 with Contriever.
 
+### Mixed workload (deletes and updates)
+
+`leann_bench --churn 10 --churn-frac 0.05` on NYTimes-256 (100k, cosine,
+RaBitQ bounds ×1, 200 queries): ten rounds of 5,000 deletes plus 5,000
+inserts of new vectors (50% of the corpus replaced), with exact ground truth
+over the live set after every round. Every variant replays the same
+operations.
+
+| Variant | Recall@10, ef 1024: start → worst → end | Recomputed/q | Embeddings for rebuilds | Maintenance |
+|---|---|---:|---:|---|
+| Tombstones, rebuild at 20% deleted | 0.892 → 0.876 → 0.889 | 193–211 | 200,000 (2 rebuilds) | ~4 min CPU per rebuild |
+| + stored upper vectors | 0.892 → 0.877 → 0.891 | 185–204 | 200,000 | same |
+| Consolidate deletes each round, never rebuild | 0.892 → 0.863 → 0.869 | 205–215 | 0 | ~1 s per round |
+| + stored upper vectors | 0.892 → 0.865 → 0.865 | 198–204 | 0 | ~1 s per round |
+
+- Writes cost no embeddings: RaBitQ inserts link with estimates (~0.6 ms
+  each) and deletes are tombstones.
+- Tombstones cost little: recall slips ~0.015 by 17% deleted and recomputes
+  fall slightly, because deleted nodes are skipped at rerank time.
+- Rebuilds dominate the cost of churn. Each re-embeds the whole live set:
+  here 4 embeddings per updated document, amortized. Today LEANN reads stored
+  embedding artifacts, so a rebuild is CPU only; once vectors are
+  re-embedded from text, one 100k rebuild is ~2 hours of the 4-core CPU
+  embedder measured above.
+- Consolidation (FreshDiskANN-style patching around deleted nodes, no
+  recomputation) avoids rebuilds but drifts: recall falls ~0.025 after 50%
+  of the corpus is replaced, because the graph is increasingly built from
+  estimate-linked inserts. Deleted ids also still hold their codes.
+- Stored upper vectors save 3–4% of recomputations and do not change
+  recall under churn, for ~35% more index bytes at 256-d and 20–40% slower
+  inserts. Not worth it as a default.
+
+Implications: consolidate on every maintenance pass and rebuild rarely (a
+much higher deleted threshold, or a recall-drift trigger), and make
+rebuilds stop needing embeddings, for example by rebuilding the graph from
+the stored codes (or a small int8 copy) instead of exact vectors. That
+experiment is next.
+
 ## Table integration
 
 ```json
