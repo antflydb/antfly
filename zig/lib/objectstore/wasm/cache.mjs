@@ -29,10 +29,10 @@ export function createImmutableReadCache({ maxBytes = 8 * 1024 * 1024, maxEntrie
   const cacheKey=(scope,request)=>JSON.stringify([scope, request.bucket, request.key, request.range ?? null, request.if_match_etag ?? null]);
   function remember(key,bytes,json,preserveProtected=false){
     const charge=bytes.byteLength+key.length*2+JSON.stringify(json).length*2+256;
-    if(charge>maxBytes||maxEntries<1)return;
+    if(charge>maxBytes||maxEntries<1)return false;
     if(preserveProtected){
       const previous=entries.get(key),chargeWithoutPrevious=protectedBytes-(previous?.protected?previous.charge:0),countWithoutPrevious=protectedEntries.size-(previous?.protected?1:0);
-      if(charge+chargeWithoutPrevious>maxBytes||countWithoutPrevious>=maxEntries)return;
+      if(charge+chargeWithoutPrevious>maxBytes||countWithoutPrevious>=maxEntries)return false;
     }
     evict(key);
     while(entries.size>=maxEntries||charge>maxBytes-retained){
@@ -40,11 +40,21 @@ export function createImmutableReadCache({ maxBytes = 8 * 1024 * 1024, maxEntrie
       // wrapper may consult this cache without changing its admission order.
       const victim=probation.keys().next().value??protectedEntries.keys().next().value;evict(victim);
     }
-    const item={body:bytes.slice(),json:{...json},charge,protected:false};entries.set(key,item);probation.set(key,item);retained+=charge;
+    const item={body:bytes.slice(),json:{...json},charge,protected:false};entries.set(key,item);probation.set(key,item);retained+=charge;return true;
   }
   return {
     clear(){entries.clear();probation.clear();protectedEntries.clear();retained=0;protectedBytes=0;},
     retainedBytes: () => retained,
+    // Completed full-object bytes only. This grants no authority and retains no
+    // transport/context. Admission uses the existing entry/byte limits; callers
+    // must still check leases/floors before using a cached immutable object.
+    admit(scope,request,result,{populate=true,preserveProtected=false}={}){
+      if(!populate||maxBytes===0||maxEntries===0||request.op!=="get"||request.range!=null||!eligible(request.key??"")||!(result.body instanceof Uint8Array))return false;
+      if(result.json?.content_length!=null&&result.json.content_length!==result.body.byteLength)return false;
+      const key=cacheKey(scope,request);
+      if(entries.has(key))return false;
+      return remember(key,result.body,JSON.parse(JSON.stringify(result.json??{})),preserveProtected);
+    },
     wrap(transport, scope, bindingOrOptions, options=bindingOrOptions??{}) {
       const {populate=true,protect=false,preserveProtected=false}=options;
       return async (request, body) => {

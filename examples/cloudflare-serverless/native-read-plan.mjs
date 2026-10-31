@@ -38,14 +38,14 @@ export function withNativeReadPreparation(transport,{onMetrics=()=>{}}={}){
 // Native code issues the barrier only after immutable preparation. Fresh
 // admission is already running independently. Once the barrier resolves, the
 // ordinary native live reader validates HEAD, floors, pins and the WAL overlay.
-export function withNativeReadPlan(transport,coordinator,namespace,{fresh,onMetrics=()=>{}}){
+export function withNativeReadPlan(transport,coordinator,namespace,{fresh,onMetrics=()=>{},retainImmutable}){
  let admitted=null,barrier=false;
  return async(request,body)=>{
   if(request.op==='read_view_barrier'){
    if(barrier)throw new ObjectStoreError(3,'duplicate read admission barrier');
    barrier=true;const admission=await fresh;
    if(!admission?.view||admission.legacy)throw new ObjectStoreError(3,'native read admission required');
-   admitted=withReadView(transport,coordinator,namespace,{initial:admission.view,admittedAt:admission.started,onMetrics});
+   admitted=withReadView(transport,coordinator,namespace,{initial:admission.view,admittedAt:admission.started,onMetrics,retainImmutable});
    onMetrics(admission.physical??{});onMetrics({native_read_plan_barriers:1});return{};
   }
   if(admitted)return admitted(request,body);

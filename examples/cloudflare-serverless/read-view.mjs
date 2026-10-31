@@ -60,7 +60,7 @@ export async function captureReadView(tx,keys,{version,immutable=true,read_lease
 }
 // Ordinary views belong to one operation. Explicit leases permit bounded fenced
 // reuse; every transport remains guarded by the original collector deadline.
-export function withReadView(transport,coordinator,namespace,{onMetrics=()=>{},initial,admittedAt=performance.now()}={}){
+export function withReadView(transport,coordinator,namespace,{onMetrics=()=>{},initial,admittedAt=performance.now(),retainImmutable}={}){
  const mapView=view=>{if(view.format!==1)throw new Error("InvalidReadView");return {records:new Map(view.entries),immutable:new Map(normalizeReadHints(namespace,view.version,{version:view.version,records:view.immutable})?.records??[])};};
  let pending=initial?Promise.resolve(mapView(initial)):null,hint;const started=admittedAt;
  const progress=`antfly/progress/${namespace}/`,manifest=`antfly/manifests/${namespace}/manifests/`;
@@ -90,7 +90,11 @@ export function withReadView(transport,coordinator,namespace,{onMetrics=()=>{},i
     let bytes=record.body;
     if(request.op==="get"&&request.range!=null){const {offset,length}=request.range;if(!Number.isSafeInteger(offset)||offset<0||length!=null&&(!Number.isSafeInteger(length)||length<=0)||offset>=bytes.byteLength)throw new ObjectStoreError(3,"invalid immutable hint range");bytes=bytes.subarray(offset,length==null?undefined:offset+length);}
     if(request.op==="get"&&bytes.byteLength>(request.max_response_bytes??Infinity))throw new ObjectStoreError(4,"immutable hint response exceeds budget");
-    onMetrics({snapshot_immutable_reads:1});return{json:{bucket:request.bucket,key:request.key,etag:record.etag,content_length:record.body.byteLength,content_type:record.contentType},body:request.op==="get"?bytes.slice():undefined};
+    const json={bucket:request.bucket,key:request.key,etag:record.etag,content_length:record.body.byteLength,content_type:record.contentType};
+    // Retain only immutable bytes after admission/lease/condition checks. Keep
+    // this guard outside the data cache: a hit must never bypass view expiry.
+    if(request.op==="get"&&retainImmutable){onMetrics({snapshot_immutable_cache_offers:1});if(retainImmutable({op:"get",bucket:request.bucket,key:request.key},{json,body:record.body}))onMetrics({snapshot_immutable_cache_admissions:1});}
+    onMetrics({snapshot_immutable_reads:1});return{json,body:request.op==="get"?bytes.slice():undefined};
    }
   }
   const result=await transport(request,body);checkLease();return result;
