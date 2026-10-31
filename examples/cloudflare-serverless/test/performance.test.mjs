@@ -597,11 +597,16 @@ test("publication hints retain only confirmed immutable objects within the exist
  assert.equal(hints.forHead({op:'put',key:'antfly/progress/other/HEAD'},utf8.encode('7')),undefined);assert.equal(hints.forVersion('18446744073709551616'),undefined);
 });
 
-test("publication hints prioritize the current manifest and native facts root over small page churn",async()=>{
- const{PublicationReadHints,normalizeReadHints}=await import('../publication-read-hints.mjs'),hints=new PublicationReadHints('priority'),manifest='antfly/manifests/priority/manifests/7.bin',facts='antfly/artifacts/sha256/aa/'+'b'.repeat(62),root=new Uint8Array(576);root.set(utf8.encode('AFDFACTA'));
- const transport=hints.wrap(async()=>({json:{etag:'durable'}}));await transport({op:'put',key:manifest,if_none_match:true},new Uint8Array(1000));await transport({op:'put',key:facts,if_none_match:true},root);
- for(let i=0;i<30;i++)await transport({op:'put',key:'antfly/artifacts/graph/'+'a'.repeat(64)+'/'+'b'.repeat(32)+'/'+i.toString(16).padStart(64,'0'),if_none_match:true},new Uint8Array(1024));
- const records=new Map(hints.forVersion('7').records);assert.ok(records.has(manifest)&&records.has(facts));assert.equal(normalizeReadHints('priority','8',hints.forVersion('7')),null);assert.ok(!new Map(hints.forVersion('8').records).has(manifest));
+test("publication hints prioritize legacy and packed facts roots through cache and persisted page churn",async()=>{
+ const{PublicationReadHints,normalizeReadHints,encodeReadHints,decodeReadHints}=await import('../publication-read-hints.mjs');
+ for(const[magic,bytes]of[['AFDFACTA',576],['AFDFACTD',1344],['AFDFACTE',1856]]){
+  const hints=new PublicationReadHints('priority'),manifest='antfly/manifests/priority/manifests/7.bin',facts='antfly/artifacts/sha256/aa/'+'b'.repeat(62),root=new Uint8Array(bytes);root.set(utf8.encode(magic));
+  const transport=hints.wrap(async()=>({json:{etag:'durable'}}));await transport({op:'put',key:manifest,if_none_match:true},new Uint8Array(1000));await transport({op:'put',key:facts,if_none_match:true},root);
+  for(let i=0;i<30;i++)await transport({op:'put',key:'antfly/artifacts/graph/'+'a'.repeat(64)+'/'+'b'.repeat(32)+'/'+i.toString(16).padStart(64,'0'),if_none_match:true},new Uint8Array(1024));
+  const value=hints.forVersion('7'),records=new Map(value.records);assert.ok(records.has(manifest)&&records.has(facts),magic);
+  const persisted=decodeReadHints('priority','7',encodeReadHints('priority','7',value));assert.ok(persisted);const restored=new Map(persisted.records);assert.ok(restored.has(manifest)&&restored.has(facts),magic);
+  assert.equal(normalizeReadHints('priority','8',value),null);assert.ok(!new Map(hints.forVersion('8').records).has(manifest));
+ }
 });
 
 test("immutable read hints preserve conditional ranges, deadlines and fresh mutable authority",async()=>{
