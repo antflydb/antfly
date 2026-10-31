@@ -2914,8 +2914,35 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const run_serverless_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, serverless_tests, selectTestFilters(b, &serverless_default_filters));
+    const multiprovider_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &serverless_default_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_multiprovider_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, multiprovider_tests, &.{ "multiprovider", "indexed WAL selection" });
+    b.step("antfly-multiprovider-test", "Run shared provider revision, runtime ownership and indexed WAL selection contracts").dependOn(&run_multiprovider_tests.step);
     const serverless_test_step = b.step("antfly-serverless-test", "Run serverless and serverless transport tests");
     serverless_test_step.dependOn(&run_serverless_tests.step);
+
+    // The page engine is shared with Lite/object-store users. Dependency
+    // module tests need their own compilation root after the extraction.
+    const ordered_tree_mod = b.createModule(.{ .root_source_file = b.path("lib/objectstore/src/ordered_tree.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, ordered_tree_mod, true, true);
+    const ordered_tree_tests = b.addTest(.{ .root_module = ordered_tree_mod, .filters = &.{"serverless"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_ordered_tree_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, ordered_tree_tests, &.{"serverless"});
+    serverless_test_step.dependOn(&run_ordered_tree_tests.step);
+    b.step("antfly-ordered-tree-test", "Run shared immutable ordered page contracts").dependOn(&run_ordered_tree_tests.step);
+
+    const object_store_test_step = b.step("antfly-object-store-test", "Run shared object transaction and commit protocols");
+    object_store_test_step.dependOn(&run_ordered_tree_tests.step);
+    for ([_]struct { path: []const u8, filter: []const u8 }{ .{ .path = "lib/objectstore/src/immutable_log.zig", .filter = "immutable log" }, .{ .path = "lib/objectstore/src/transactional_store.zig", .filter = "object-native" } }) |suite| {
+        const mod = b.createModule(.{ .root_source_file = b.path(suite.path), .target = target, .optimize = optimize });
+        test_imports.configure(b, mod, true, true);
+        const tests = b.addTest(.{ .root_module = mod, .filters = &.{suite.filter}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+        const run = addFilteredTestRunArtifactWithRuntimeFilters(b, tests, &.{suite.filter});
+        object_store_test_step.dependOn(&run.step);
+        serverless_test_step.dependOn(&run.step);
+    }
 
     const document_facts_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/serverless_facts_test_root.zig"),
@@ -2932,6 +2959,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_document_facts_tests = addFilteredTestRunArtifact(b, document_facts_tests);
     b.step("antfly-document-facts-test", "Run focused immutable document facts and scheduling tests").dependOn(&run_document_facts_tests.step);
 
+    const publication_protocol_tests = b.addTest(.{
+        .root_module = document_facts_test_mod,
+        .filters = selectTestFilters(b, &.{ "publication input", "publication postings", "publication continuation", "native write plan", "native read plan" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_publication_protocol_tests = addFilteredTestRunArtifact(b, publication_protocol_tests);
+    b.step("antfly-publication-protocol-test", "Run native publication continuation and read/write planning tests").dependOn(&run_publication_protocol_tests.step);
+    serverless_test_step.dependOn(&run_publication_protocol_tests.step);
+
+    const read_state_tests = b.addTest(.{
+        .root_module = document_facts_test_mod,
+        .filters = selectTestFilters(b, &.{ "native read plan", "indexed WAL document projection", "resident serving shard" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-read-state-test", "Run native read-state ownership, point projection and retention contracts").dependOn(&addFilteredTestRunArtifact(b, read_state_tests).step);
+
     const graph_page_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/graph_page_tree_test_root.zig"),
         .target = target,
@@ -2941,12 +2984,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     graph_page_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const graph_page_tests = b.addTest(.{
         .root_module = graph_page_test_mod,
-        .filters = selectTestFilters(b, &.{ "serverless.graph_segment.", "serverless.artifacts.fs_store.", "serverless.build.lake_build_limits." }),
+        .filters = selectTestFilters(b, &.{ "serverless.graph_segment.", "serverless graph", "serverless.artifacts.fs_store.", "serverless.build.lake_build_limits." }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const graph_test_step = b.step("antfly-graph-test", "Run graph algorithms, topology, pages, query and recovery tests");
-    b.step("antfly-graph-pages-test", "Run immutable page publication and upload admission contracts")
-        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, graph_page_tests, selectTestFilters(b, &.{ "serverless.graph_segment.", "serverless.artifacts.fs_store.", "serverless.build.lake_build_limits." })).step);
+    const graph_pages_step = b.step("antfly-graph-pages-test", "Run immutable page publication and upload admission contracts");
+    graph_pages_step.dependOn(&run_ordered_tree_tests.step);
+    graph_pages_step.dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, graph_page_tests, selectTestFilters(b, &.{ "serverless.graph_segment.", "serverless graph", "serverless.artifacts.fs_store.", "serverless.build.lake_build_limits." })).step);
 
     const serverless_manifest_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/serverless_manifest_test_root.zig"),
@@ -3046,12 +3090,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, filtered_topk_mod, true, true);
     const filtered_topk_tests = b.addTest(.{
         .root_module = filtered_topk_mod,
-        .filters = &.{ "producer top k", "logical value borrowed", "deferred membership refines", "PostingsIterator advanceTo", "observed physical ordering", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "public tie row cursors", "warm tie pagination", "sparse predicate planning", "text statistics", "necessary term routing", "retained closure", "dynamic exact keys", "rank cursors" },
+        .filters = &.{ "producer top k", "logical value borrowed", "deferred membership refines", "PostingsIterator advanceTo", "observed physical ordering", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "public tie row cursors", "warm tie pagination", "sparse predicate planning", "text statistics", "necessary term routing", "retained closure", "dynamic exact keys" },
         .max_rss = 8 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("lake-filtered-topk-test", "Verify bounded native membership, exclusion masks and cached public ties")
-        .dependOn(&addFilteredTestRunArtifact(b, filtered_topk_tests).step);
+    const filtered_topk_step = b.step("lake-filtered-topk-test", "Verify bounded native membership, exclusion masks and cached public ties");
+    filtered_topk_step.dependOn(&addFilteredTestRunArtifact(b, filtered_topk_tests).step);
+    // Rank cursors belong to the shared objectstore engine after extraction.
+    // Keep their coverage in this lake gate without silently accepting an
+    // empty local-owner selection or importing a second copy of the engine.
+    const run_ordered_rank_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, ordered_tree_tests, &.{"rank cursors"});
+    filtered_topk_step.dependOn(&run_ordered_rank_tests.step);
     const lake_refinement_bench_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_refinement_bench_root.zig"),
         .target = target,
@@ -6089,7 +6138,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_graph_metric_unit_tests.step);
     @import("../../../build_support/antfly/test_support.zig").addOwnerTestRuns(b, graph_test_step, &.{
         .{ .artifact = graph_metric_unit_tests, .filters = &.{"graph."} },
-        .{ .artifact = graph_page_tests, .filters = &.{ "serverless.graph_segment.", "serverless.artifacts.fs_store." } },
+        .{ .artifact = graph_page_tests, .filters = &.{ "serverless.graph_segment.", "serverless graph", "serverless.artifacts.fs_store." } },
     }, &.{});
     integration_test_step.dependOn(&run_maintenance_worker_tests.step);
 

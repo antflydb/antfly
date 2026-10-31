@@ -14,6 +14,21 @@
 // limitations under the License.
 
 test {
+    _ = @import("serverless/hosted_publication_plan.zig");
+    _ = @import("serverless/build/publication_input.zig");
+    _ = @import("serverless/build/publication_postings.zig");
+    _ = @import("serverless/query/read_plan.zig");
+    _ = @import("serverless/query/serving_shard.zig");
+    _ = @import("serverless/query/read_state_cache.zig");
+    _ = @import("serverless/wal/write_plan.zig");
+    _ = @import("serverless/wal/indexed_object_store.zig");
+    _ = @import("serverless/wal/collector.zig");
+    _ = @import("serverless/hosted_reindex.zig");
+    _ = @import("serverless/text_segment/paged.zig");
+    _ = @import("serverless/sparse_segment/paged.zig");
+    _ = @import("serverless/vector_segment/paged.zig");
+    _ = @import("serverless/query/top_docs.zig");
+    _ = @import("serverless/query/exact_scan.zig");
     _ = @import("serverless/build/external_source_plan_resolver.zig");
     _ = @import("serverless/build/external_source_publish.zig");
     _ = @import("serverless/build/external_source_read_authority.zig");
@@ -34,6 +49,8 @@ test {
     _ = @import("serverless/catalog/object_progress_store.zig");
     _ = @import("serverless/enrichment/worker.zig");
 }
+
+pub const antfly_sources = @import("source_owner_physical.zig");
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

@@ -1,0 +1,30 @@
+{
+  "name": "antfly-cloudflare-serverless",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/io-branch.test.mjs test/read-dependencies.test.mjs test/immutable-view-cache.test.mjs test/observation-plan.test.mjs test/observer-readiness.test.mjs test/rpc-data.test.mjs test/idle-checkpoint.test.mjs test/destination-history.test.mjs test/destination-health.test.mjs test/rehearsal-seed-resume.test.mjs test/rehearsal-corpus.test.mjs test/otlp-chunks.test.mjs test/diagnostic-memory.test.mjs test/canonical-windows.test.mjs test/placement.test.mjs test/host.test.mjs test/collection.test.mjs test/batch.test.mjs test/r2-coordinator.test.mjs test/performance.test.mjs test/publication-protocol.test.mjs test/gate.test.mjs test/exact-search.test.mjs test/metrics-tail.test.mjs test/independent-counters.test.mjs test/coverage-seed-resume.test.mjs test/persisted-diagnostics.test.mjs test/file-bucket.test.mjs test/invocation-accounting.test.mjs test/latency-experiments.test.mjs test/provider-contracts.test.mjs test/proof-overlap.test.mjs test/logpush-probe.test.mjs test/otel-evidence.test.mjs test/tail-counter.test.mjs test/tail-counter-evidence.test.mjs test/paired-observer.test.mjs test/mail.test.mjs test/mail-ui.test.mjs test/paired-observer-client.test.mjs test/paired-evidence-reader.test.mjs test/paired-export-receiver.test.mjs test/read-view-lease.test.mjs test/private-phase-profile.test.mjs test/immutable-read-wave.test.mjs test/resident-point-read.test.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:r2": "wrangler deploy --config wrangler.r2.jsonc",
+    "test:workerd": "node test/prepare-worker.mjs && node --test test/workerd.test.mjs test/r2-workerd.test.mjs test/split-workerd.test.mjs test/qualification-workerd.test.mjs test/logpush-workerd.test.mjs test/paired-observer-workerd.test.mjs test/paired-export-workerd.test.mjs && node --test --test-concurrency=1 test/rpc-data-workerd.test.mjs test/metadata-hint-workerd.test.mjs test/observation-continuation-workerd.test.mjs test/point-continuation-workerd.test.mjs test/resident-serving-workerd.test.mjs",
+    "test:native": "node test/native.mjs",
+    "test:mail": "node --test test/mail.test.mjs test/mail-ui.test.mjs",
+    "test:mail-workerd": "node test/prepare-mail-worker.mjs && node --test test/mail-workerd.test.mjs",
+    "dev:mail": "node dev-mail.mjs",
+    "test:metadata-hints-workerd": "node --test test/metadata-hint-workerd.test.mjs"
+  },
+  "devDependencies": {
+    "binaryen": "132.0.0",
+    "esbuild": "0.28.2",
+    "miniflare": "5.20261019.2-beta",
+    "undici": "7.29.1",
+    "wrangler": "4.152.0",
+    "ws": "8.21.0",
+    "jsdom": "29.1.1"
+  },
+  "dependencies": {
+    "postal-mime": "4.2.0"
+  }
+}

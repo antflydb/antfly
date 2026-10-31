@@ -1,0 +1,64 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import{FencedReadLeases}from"../../zig/lib/objectstore/wasm/read-view-lease.mjs";
+import {edgeCacheForEnv} from "./edge-immutable-cache.mjs";
+import {AuthorityAdmission} from "./authority-admission.mjs";
+import {R2CoordinatorStore} from "./r2-coordinator-store.mjs";
+import {openAuthority,coordinatorAuthorityMode} from "./coordinator-authority.mjs";
+import {metadataKeys,captureReadView} from "./read-view.mjs";
+import {MIGRATION} from "./r2-coordinator-migration.mjs";
+import {FreshReadAdmissions} from "./fresh-read-admissions.mjs";
+import {readAheadBudgetFor} from "../../zig/lib/objectstore/wasm/read-ahead.mjs";
+
+// A reader authenticates committed metadata locally. It owns no mutable session
+// and can never create authority, acquire ownership or extend a durable pin.
+export class NativeReadViews {
+ constructor(module,env,{kernel,cache,clock=Date.now,onMetrics,background,cohortDelayMs=2}={}){
+  this.env=env;this.clock=clock;this.cohorts=new FreshReadAdmissions({delayMs:cohortDelayMs});this.authorityAdmission=new AuthorityAdmission(()=>openAuthority(env,coordinatorAuthorityMode(env),{allowCreate:false}));
+  const observation={request:(input,options)=>kernel.request(input,{...options,...(env.NATIVE_READ_AFFINITY==="true"?{affinityKey:env.ANTFLY_INCARNATION}:{}),kernelVariant:"observe",memoryReservationBytes:8*1024*1024,reservationClass:"authority"})};
+  this.background=background;this.leaseCapacity=env.FENCED_READ_LEASES==="false"?0:32768;
+  this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,readBatch:env.NATIVE_METADATA_READ_BATCH!=="false",rowBudgetBytes:512*1024-this.leaseCapacity,readContinuations:env.NATIVE_METADATA_CONTINUATIONS==="true",readKernel:observation,cache,onMetrics,proofBudget:(env.DETACHED_METADATA_PROOFS==="true"||env.NATIVE_METADATA_CONTINUATIONS==="true")&&kernel.slots?.length?readAheadBudgetFor(kernel,Math.min(4,kernel.slots.length)):undefined,remoteCache:edgeCacheForEnv(env,{background})});
+ }
+ offerRootHint(hint){return this.env.METADATA_COMMIT_HINTS==="true"&&this.store.offerRootHint(hint);}
+ async leaseCache(){if(!this.leaseCapacity)return null;if(!this.leases){const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);this.leases??=new FencedReadLeases({scope:keys.wal.match(/wal-v1\/([a-f0-9]{64})\/HEAD$/)[1],clock:this.clock,maxBytes:this.leaseCapacity});}return this.leases;}
+ async open(options={}){const cache=options.allow_cached?await this.leaseCache():null;try{return cache?await cache.run(options.required_visibility,'native',()=>this.freshOpen(options),options.onLease):await this.freshOpen(options);}catch(error){if(!/^(ReadSnapshotNeeds(?:Admission|Pin)|CoordinatorAuthorityMissing|CoordinatorRecovering)$/.test(error.message))this.leases?.clear();throw error;}}
+ async admit(options,load){const cache=options.allow_cached?await this.leaseCache():null;return cache?cache.run(options.required_visibility,'rpc',load,options.onLease):load();}
+ invalidate(){this.leases?.clear();}
+ confirm(view,token){return this.leases?.confirm(view,token)??false;}
+ metrics(){return{read_view_lease_bytes:this.leases?.bytes??0,read_view_lease_hits:this.leases?.hits??0,read_view_lease_joins:this.leases?.joins??0};}
+ freshOpen(options={}){const observedAt=this.clock();
+  return this.cohorts.run(JSON.stringify([options.version??"latest",options.durable_pin===true]),async(traceIds,close,publish)=>{
+   const mode=coordinatorAuthorityMode(this.env),loading=this.authorityAdmission.get(),parallel=mode==="r2-bounded"&&!this.authorityAdmission.value;
+   // This speculative observation is GET-only. Verify the persisted authority
+   // before using rows, granting a read lease, or publishing a prepared view.
+   // Join both lifetimes on failure too; no request-owned I/O survives unseen.
+   loading.catch(()=>{});
+   const verified=authority=>{if(authority.descriptor.mode!==mode){this.authorityAdmission.value=null;throw Error("CoordinatorMigrationRequired");}this.store.configureAuthority(authority.descriptor);return authority;};
+   let authority;
+   if(parallel)this.store.configureAuthority({mode});else authority=verified(await loading);
+   try{
+    const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);
+    return await this.store.readOnly(async tx=>{
+     authority??=verified(await loading);
+     const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,keys.hints]);
+     if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||authority.descriptor.mode!==mode)throw Error("CoordinatorMigrationRequired");
+     const view=await captureReadView(tx,keys,{...options,lease_observed_at_ms:observedAt,allow_ephemeral_pin:this.store.rootBackend!=="journal",read_lease_policy:this.leaseCapacity||this.store.rootBackend!=="journal"?authority.descriptor.read_lease_policy:undefined},this.clock);publish(view);return view;
+    },{traceId:options.trace_id,traceIds,onAdmission:close,background:options.background??this.background,deadlineMs:options.deadlineMs,...(this.env.FUSED_READ_ADMISSION==="true"?{readKeys:[MIGRATION,keys.head,keys.wal,keys.floor,keys.hints],readPrefix:keys.progress+"READ_PINS/"}:{})});
+   }catch(error){if(!authority){this.store.observedState=null;this.store.observedProof=null;this.leases?.clear();}throw error;}
+   finally{if(parallel)await Promise.allSettled([loading]);}
+  },options.trace_id,{untilAdmission:true,onPrepared:options.onPrepared,onAdmitted:options.onAdmitted});
+ }
+}

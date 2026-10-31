@@ -40,7 +40,7 @@ const ScoredDocValue = struct {
     distance: ?f32 = null,
 };
 
-const ScoredCluster = struct {
+pub const ScoredCluster = struct {
     cluster_index: usize,
     score: f32,
 };
@@ -323,8 +323,9 @@ fn warmResolvedSearchPath(session: *runtime_mod.QuerySession, lanes: ResolvedSea
     }
 }
 
-fn searchTextAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, req: query_request.QueryRequest) ![]ScoredDoc {
+pub fn searchTextAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, req: query_request.QueryRequest) ![]ScoredDoc {
     const text_index = try resolveTextArtifactIndex(session, req);
+    if (session.manifest.artifacts[text_index].metadata_version == @import("../text_segment/paged.zig").metadata_version) return @import("../text_segment/paged.zig").searchAlloc(alloc, session, session.manifest.artifacts[text_index], req);
     const text_payload = try session.fetchArtifactAlloc(text_index);
     defer alloc.free(text_payload);
     var text_segment = try text_segment_mod.decodeAlloc(alloc, text_payload);
@@ -477,6 +478,7 @@ fn applyTextFilterSetsAlloc(
     req: query_request.QueryRequest,
 ) ![]ScoredDoc {
     const text_index = try resolveTextArtifactIndex(session, req);
+    if (session.manifest.artifacts[text_index].metadata_version == @import("../text_segment/paged.zig").metadata_version) return applyPagedTextFilterSetsAlloc(alloc, session, text_index, hits, req);
     const text_payload = try session.fetchArtifactAlloc(text_index);
     defer alloc.free(text_payload);
     var text_segment = try text_segment_mod.decodeAlloc(alloc, text_payload);
@@ -522,7 +524,44 @@ fn applyTextFilterSetsAlloc(
     return try filtered.toOwnedSlice(alloc);
 }
 
-fn resolveTextArtifactIndex(
+fn applyPagedTextFilterSetsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, index: usize, hits: []const ScoredDoc, req: query_request.QueryRequest) ![]ScoredDoc {
+    var allowed = std.StringHashMapUnmanaged(void).empty;
+    defer allowed.deinit(alloc);
+    var excluded = std.StringHashMapUnmanaged(void).empty;
+    defer excluded.deinit(alloc);
+    var filter_req = req;
+    filter_req.offset = 0;
+    filter_req.min_score = 0;
+    filter_req.limit = std.math.cast(usize, session.manifest.stats.document_count) orelse return error.QueryCandidateBudgetExceeded;
+    const required = if (req.filter_text) |text| blk: {
+        filter_req.text = @constCast(text);
+        filter_req.operator = req.filter_operator;
+        break :blk try @import("../text_segment/paged.zig").searchAlloc(alloc, session, session.manifest.artifacts[index], filter_req);
+    } else try alloc.alloc(ScoredDoc, 0);
+    defer freeScoredDocs(alloc, required);
+    for (required) |hit| try allowed.put(alloc, hit.doc_id, {});
+    const rejected = if (req.exclusion_text) |text| blk: {
+        filter_req.text = @constCast(text);
+        filter_req.operator = req.exclusion_operator;
+        break :blk try @import("../text_segment/paged.zig").searchAlloc(alloc, session, session.manifest.artifacts[index], filter_req);
+    } else try alloc.alloc(ScoredDoc, 0);
+    defer freeScoredDocs(alloc, rejected);
+    for (rejected) |hit| try excluded.put(alloc, hit.doc_id, {});
+    var result = std.ArrayListUnmanaged(ScoredDoc).empty;
+    errdefer {
+        for (result.items) |hit| alloc.free(hit.doc_id);
+        result.deinit(alloc);
+    }
+    for (hits) |hit| {
+        if ((req.filter_text != null and !allowed.contains(hit.doc_id)) or excluded.contains(hit.doc_id)) continue;
+        const id = try alloc.dupe(u8, hit.doc_id);
+        errdefer alloc.free(id);
+        try result.append(alloc, .{ .doc_id = id, .score = hit.score, .distance = hit.distance });
+    }
+    return result.toOwnedSlice(alloc);
+}
+
+pub fn resolveTextArtifactIndex(
     session: *runtime_mod.QuerySession,
     req: query_request.QueryRequest,
 ) !usize {
@@ -537,7 +576,7 @@ fn resolveTextArtifactIndex(
     return session.findArtifactIndex(.text_segment) orelse error.TextSegmentNotFound;
 }
 
-fn resolveVectorArtifactIndex(
+pub fn resolveVectorArtifactIndex(
     session: *runtime_mod.QuerySession,
     req: query_request.QueryRequest,
 ) !usize {
@@ -665,6 +704,8 @@ fn searchSparseArtifactAlloc(
     sparse_index: usize,
     req: query_request.QueryRequest,
 ) ![]ScoredDoc {
+    if (session.manifest.artifacts[sparse_index].metadata_version == 2) return @import("../sparse_segment/paged.zig").searchAlloc(alloc, session, session.manifest.artifacts[sparse_index], req);
+
     const sparse_query = req.sparse orelse return error.SparseQueryRequired;
     if (sparse_query.len == 0) return try alloc.alloc(ScoredDoc, 0);
 
@@ -761,8 +802,11 @@ fn searchVectorSegmentAlloc(
     defer if (vector_segment.metric == .cosine) alloc.free(@constCast(effective_query));
     const query_measure = vectorQueryMeasure(effective_query, vector_segment.metric);
 
-    var quantizer = try vector_quantizer.RaBitQuantizer.init(alloc, @intCast(vector_segment.dims), 42, vector_segment.metric);
-    defer quantizer.deinit();
+    const has_quantized = for (vector_segment.clusters) |cluster| {
+        if (cluster.quantized_set.len != 0) break true;
+    } else false;
+    var quantizer: ?vector_quantizer.RaBitQuantizer = if (has_quantized) try vector_quantizer.RaBitQuantizer.init(alloc, @intCast(vector_segment.dims), 42, vector_segment.metric) else null;
+    defer if (quantizer) |*q| q.deinit();
 
     var clusters = try alloc.alloc(ScoredCluster, vector_segment.clusters.len);
     defer alloc.free(clusters);
@@ -798,7 +842,7 @@ fn searchVectorSegmentAlloc(
             const error_bounds = try alloc.alloc(f32, count);
             defer alloc.free(error_bounds);
             try cancellation.check();
-            try quantizer.estimateDistancesCancellable(
+            try quantizer.?.estimateDistancesCancellable(
                 &quantized,
                 effective_query,
                 distances,
@@ -820,7 +864,7 @@ fn searchVectorSegmentAlloc(
             try cancellation.check();
             std.mem.sort(ApproxCandidate, local_candidates.items, {}, lessApproxCandidate);
             try cancellation.check();
-            const local_cap = clusterCandidateCap(local_candidates.items, cluster, needed, probes, probe_rank);
+            const local_cap = if (normalizedSearchEffort(req.search_effort) == 1) local_candidates.items.len else clusterCandidateCap(local_candidates.items, cluster, needed, probes, probe_rank);
             stats.quantized_candidate_count += local_candidates.items.len;
             if (local_cap < local_candidates.items.len) stats.cluster_prune_count += 1;
             for (local_candidates.items[0..@min(local_candidates.items.len, local_cap)]) |candidate| {
@@ -846,7 +890,7 @@ fn searchVectorSegmentAlloc(
     try cancellation.check();
     std.mem.sort(ApproxCandidate, candidates.items, {}, lessApproxCandidate);
     try cancellation.check();
-    const shortlist_count = vectorShortlistCount(candidates.items.len, probes, req.limit, req.offset, vector_segment.shortlist_multiplier);
+    const shortlist_count = if (normalizedSearchEffort(req.search_effort) == 1) candidates.items.len else vectorShortlistCount(candidates.items.len, probes, req.limit, req.offset, vector_segment.shortlist_multiplier);
     stats.actual_shortlist_count = shortlist_count;
 
     var scored = std.ArrayListUnmanaged(ScoredDoc).empty;
@@ -866,7 +910,7 @@ fn searchVectorSegmentAlloc(
 
     for (candidates.items[0..shortlist_count], 0..) |candidate, candidate_index| {
         if (candidate_index % 64 == 0) try cancellation.check();
-        if (optimisticScoreCannotBeatFloor(candidate, vector_segment.metric, scored.items, needed)) break;
+        if (normalizedSearchEffort(req.search_effort) != 1 and optimisticScoreCannotBeatFloor(candidate, vector_segment.metric, scored.items, needed)) break;
         if (exact_blocks[candidate.cluster_index] == null) {
             const cluster = vector_segment.clusters[candidate.cluster_index];
             exact_blocks[candidate.cluster_index] = try vector_segment_mod.decodeExactEntriesAlloc(
@@ -952,6 +996,8 @@ fn searchVectorArtifactAlloc(
     query_vector: []const f32,
     stats: *SearchExecutionStats,
 ) ![]ScoredDoc {
+    if (session.manifest.artifacts[vector_index].metadata_version == 2) return @import("../vector_segment/paged.zig").searchAlloc(alloc, session, session.manifest.artifacts[vector_index], req, stats);
+
     const header_block_id = try vectorBlockIdAlloc(alloc, .header, 0);
     defer alloc.free(header_block_id);
     const header_bytes = try session.fetchArtifactBlockRangeAlloc(vector_index, header_block_id, 0, vector_segment_mod.header_len);
@@ -1034,7 +1080,7 @@ fn searchVectorArtifactAlloc(
                 });
             }
             std.mem.sort(ApproxCandidate, local_candidates.items, {}, lessApproxCandidate);
-            const local_cap = clusterCandidateCap(local_candidates.items, cluster, needed, probes, probe_rank);
+            const local_cap = if (normalizedSearchEffort(req.search_effort) == 1) local_candidates.items.len else clusterCandidateCap(local_candidates.items, cluster, needed, probes, probe_rank);
             stats.quantized_candidate_count += local_candidates.items.len;
             if (local_cap < local_candidates.items.len) stats.cluster_prune_count += 1;
             for (local_candidates.items[0..@min(local_candidates.items.len, local_cap)]) |candidate| {
@@ -1076,7 +1122,7 @@ fn searchVectorArtifactAlloc(
     if (candidates.items.len == 0) return try alloc.alloc(ScoredDoc, 0);
 
     std.mem.sort(ApproxCandidate, candidates.items, {}, lessApproxCandidate);
-    const shortlist_count = vectorShortlistCount(candidates.items.len, probes, req.limit, req.offset, header.shortlist_multiplier);
+    const shortlist_count = if (normalizedSearchEffort(req.search_effort) == 1) candidates.items.len else vectorShortlistCount(candidates.items.len, probes, req.limit, req.offset, header.shortlist_multiplier);
     stats.actual_shortlist_count = shortlist_count;
 
     var scored = std.ArrayListUnmanaged(ScoredDoc).empty;
@@ -1098,7 +1144,7 @@ fn searchVectorArtifactAlloc(
 
     for (candidates.items[0..shortlist_count], 0..) |candidate, candidate_index| {
         if (candidate_index % 64 == 0) try session.checkCancellation();
-        if (optimisticScoreCannotBeatFloor(candidate, header.metric, scored.items, needed)) break;
+        if (normalizedSearchEffort(req.search_effort) != 1 and optimisticScoreCannotBeatFloor(candidate, header.metric, scored.items, needed)) break;
         if (exact_blocks[candidate.cluster_index] == null) {
             const cluster = clusters[candidate.cluster_index];
             const exact_block_id = try vectorBlockIdAlloc(alloc, .exact, candidate.cluster_index);
@@ -1154,6 +1200,8 @@ fn warmVectorArtifact(
     req: query_request.QueryRequest,
     query_vector: []const f32,
 ) !void {
+    if (session.manifest.artifacts[vector_index].metadata_version == 2) return;
+
     const alloc = session.alloc;
     const header_block_id = try vectorBlockIdAlloc(alloc, .header, 0);
     defer alloc.free(header_block_id);
@@ -1216,6 +1264,8 @@ fn warmVectorArtifact(
 }
 
 fn warmSparseArtifact(session: *runtime_mod.QuerySession, sparse_index: usize, req: query_request.QueryRequest) !void {
+    if (session.manifest.artifacts[sparse_index].metadata_version == 2) return;
+
     const alloc = session.alloc;
     const sparse_query = req.sparse orelse return error.SparseQueryRequired;
     if (sparse_query.len == 0) return;
@@ -1326,7 +1376,7 @@ fn metricScore(lhs: []const f32, rhs: []const f32, metric: vector_types.Distance
     };
 }
 
-fn normalizedCosineQueryAlloc(
+pub fn normalizedCosineQueryAlloc(
     alloc: Allocator,
     metric: vector_types.DistanceMetric,
     query: []const f32,
@@ -1337,7 +1387,7 @@ fn normalizedCosineQueryAlloc(
     return normalized;
 }
 
-fn vectorQueryMeasure(query: []const f32, metric: vector_types.DistanceMetric) f32 {
+pub fn vectorQueryMeasure(query: []const f32, metric: vector_types.DistanceMetric) f32 {
     return switch (metric) {
         .l2_squared => vector_types.dot(query, query),
         .inner_product => 0,
@@ -1345,7 +1395,7 @@ fn vectorQueryMeasure(query: []const f32, metric: vector_types.DistanceMetric) f
     };
 }
 
-fn routingScoreForQuery(
+pub fn routingScoreForQuery(
     query: []const f32,
     query_measure: f32,
     candidate: []const f32,
@@ -1366,7 +1416,7 @@ fn similarityForMetric(lhs: []const f32, rhs: []const f32, metric: vector_types.
     };
 }
 
-fn similarityForQuery(
+pub fn similarityForQuery(
     query: []const f32,
     query_measure: f32,
     candidate: []const f32,
@@ -1435,7 +1485,7 @@ fn optimisticDistance(candidate: ApproxCandidate) f32 {
     return @max(@as(f32, 0), candidate.distance - candidate.error_bound);
 }
 
-fn effectiveProbeCount(req: query_request.QueryRequest, minimum_hint: u32, ranked_clusters: []const ScoredCluster) usize {
+pub fn effectiveProbeCount(req: query_request.QueryRequest, minimum_hint: u32, ranked_clusters: []const ScoredCluster) usize {
     const cluster_count = ranked_clusters.len;
     if (cluster_count == 0) return 0;
     const auto = autoProbeCount(cluster_count);
@@ -1496,13 +1546,15 @@ fn optimisticScoreCannotBeatFloor(
     needed: usize,
 ) bool {
     if (needed == 0 or scored.len < needed) return false;
-    const optimistic_distance = @max(@as(f32, 0), candidate.distance - candidate.error_bound);
-    return scoreFromSimilarity(vector_types.similarityFromDistance(optimistic_distance, metric)) <= scored[needed - 1].score;
+    const optimistic_distance = if (metric == .inner_product) candidate.distance - candidate.error_bound else @max(@as(f32, 0), candidate.distance - candidate.error_bound);
+    return scoreFromSimilarity(vector_types.similarityFromDistance(optimistic_distance, metric)) < scored[needed - 1].score;
 }
 
-fn scoreFromSimilarity(similarity: f32) u32 {
+pub fn scoreFromSimilarity(similarity: f32) u32 {
     if (similarity <= 0) return 0;
-    const scaled = @min(similarity * 1000.0, @as(f32, @floatFromInt(std.math.maxInt(u32))));
+    const scaled = similarity * 1000.0;
+    // maxInt(u32) rounds up in f32; clamp before converting that endpoint.
+    if (scaled >= @as(f32, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
     return @intFromFloat(scaled);
 }
 
@@ -1806,12 +1858,14 @@ fn findBody(entries: []const materializer_mod.Document, doc_id: []const u8) ?[]c
     return null;
 }
 
-fn lessScoredDoc(_: void, lhs: ScoredDoc, rhs: ScoredDoc) bool {
+pub fn lessScoredDoc(_: void, lhs: ScoredDoc, rhs: ScoredDoc) bool {
     if (lhs.score != rhs.score) return lhs.score > rhs.score;
+    if ((lhs.distance != null) != (rhs.distance != null)) return lhs.distance != null;
+    if (lhs.distance != null and rhs.distance != null and lhs.distance.? != rhs.distance.?) return lhs.distance.? < rhs.distance.?;
     return std.mem.order(u8, lhs.doc_id, rhs.doc_id) == .lt;
 }
 
-fn lessScoredCluster(_: void, lhs: ScoredCluster, rhs: ScoredCluster) bool {
+pub fn lessScoredCluster(_: void, lhs: ScoredCluster, rhs: ScoredCluster) bool {
     if (lhs.score != rhs.score) return lhs.score > rhs.score;
     return lhs.cluster_index < rhs.cluster_index;
 }
@@ -2423,4 +2477,42 @@ test "hybrid weighted sum favors higher raw modality score" {
     const hits = try ownedScoredDocsFromFloatMap(alloc, merged, 0, 10);
     defer freeScoredDocs(alloc, hits);
     try std.testing.expectEqualStrings("doc-a", hits[0].doc_id);
+}
+
+test "serverless full effort reranks every quantized candidate and matches brute force" {
+    const a = std.testing.allocator;
+    const dims = 16;
+    const entries = try a.alloc(vector_segment_mod.Entry, 512);
+    var seed: u32 = 71;
+    for (entries, 0..) |*entry, i| {
+        entry.* = .{ .doc_id = try std.fmt.allocPrint(a, "doc-{d:0>4}", .{i}), .vector = try a.alloc(f32, dims) };
+        for (entry.vector) |*value| {
+            seed = seed *% 1664525 +% 1013904223;
+            value.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1;
+        }
+    }
+    var segment = try @import("../build/vector_index.zig").buildClusteredSegmentWithPolicyAlloc(a, .cosine, dims, entries, .{ .target_cluster_count = 1 });
+    defer segment.deinit(a);
+    var query: [dims]f32 = undefined;
+    for (&query) |*value| {
+        seed = seed *% 1664525 +% 1013904223;
+        value.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1;
+    }
+    const normalized = try normalizedCosineQueryAlloc(a, .cosine, &query);
+    defer a.free(@constCast(normalized));
+    const measure = vectorQueryMeasure(normalized, .cosine);
+    var oracle = std.ArrayList(ScoredDoc).empty;
+    defer oracle.deinit(a);
+    for (segment.entries) |entry| {
+        const similarity = similarityForQuery(normalized, measure, entry.vector, .cosine);
+        if (similarity <= 0) continue;
+        try oracle.append(a, .{ .doc_id = entry.doc_id, .score = scoreFromSimilarity(similarity), .distance = vector_types.distanceToQuery(normalized, measure, entry.vector, .cosine) });
+    }
+    std.mem.sort(ScoredDoc, oracle.items, {}, lessScoredDoc);
+    var stats: SearchExecutionStats = .{};
+    const hits = try searchVectorSegmentDocIdsAlloc(a, segment, &query, 0, 10, 0, 1, 1, &stats);
+    defer freeScoredDocs(a, hits);
+    try std.testing.expectEqual(@as(usize, 512), stats.quantized_candidate_count);
+    try std.testing.expectEqual(oracle.items.len, stats.exact_rerank_count);
+    for (hits, oracle.items[0..hits.len]) |actual, expected| try std.testing.expectEqualStrings(expected.doc_id, actual.doc_id);
 }

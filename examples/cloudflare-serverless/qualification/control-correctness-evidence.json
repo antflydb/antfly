@@ -1,0 +1,45 @@
+{
+  "baseline_revision": "d5102ee70321ca2b0cb0b18fe22fb871c7c6ace4",
+  "baseline_full_wasm_sha256": "563936db3958bdab50c404db4a6ccef15e095e798e49198ab2304d87322dac97",
+  "baseline_compact_wasm_sha256": "789469d743cf69bb9cdcc3e3c59caa4f05663fe4e73958908800d780b1d85f77",
+  "patch_sha256": "af4f75e89aa45e493eb9e3ec29104346b3dd730bb67b4bc9d650588b9810cde9",
+  "context": {
+    "baseline_revision": "d5102ee70321ca2b0cb0b18fe22fb871c7c6ace4",
+    "source": "examples/cloudflare-serverless/request-pool.mjs",
+    "source_sha256": "fecb5caad978107c57bcb0f6dd674724c4340d5da699f2c921d5291a1520f045",
+    "fixed_source_sha256": "4f303b612de0ba8791b8425c8108905a741574185f502fe9dc67d41f66401dcf",
+    "results": [
+      {
+        "variant": "original",
+        "status": 200,
+        "context_matches": false
+      },
+      {
+        "variant": "context-fixed",
+        "status": 200,
+        "context_matches": true
+      }
+    ]
+  },
+  "clock": {
+    "results": [
+      {
+        "variant": "original",
+        "error": "Error: ManifestReadLeaseExpired",
+        "refreshes": 0,
+        "usable": false
+      },
+      {
+        "variant": "clock-fixed",
+        "count": "1",
+        "refreshes": 1,
+        "usable": true,
+        "real_rollback_rejected": true
+      }
+    ]
+  },
+  "qualification": false,
+  "live_baseline_code_changed": false,
+  "replacement_control_revision": "21205a7021",
+  "replacement_approved": true
+}

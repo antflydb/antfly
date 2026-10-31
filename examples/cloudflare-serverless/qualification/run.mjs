@@ -1,0 +1,172 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import { readFile, writeFile } from "node:fs/promises";
+import { performance } from "node:perf_hooks";
+import assert from "node:assert/strict";
+const manifest = process.argv[2], origin = process.argv[3];
+if (!manifest || !origin?.startsWith("https://")) throw new Error("usage: node qualification/run.mjs RUN_JSON HTTPS_ORIGIN [--drain]");
+const run = JSON.parse(await readFile(manifest, "utf8")), token = (await readFile(run.token_file, "utf8")).trim();
+if (!run.id.startsWith("antfly-1278-") || !new URL(origin).hostname.startsWith(`${run.id}.`) || !new URL(origin).hostname.endsWith(".workers.dev")) throw new Error("qualification deployment identity mismatch");
+const measurements = [], start = Date.now();
+async function call(input, path = "/api") {
+  let last;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const begin = performance.now();
+    const response = await fetch(new URL(path, origin), {method: "POST", headers: {Authorization: `Bearer ${token}`, "Content-Type": "application/json"}, body: JSON.stringify(input), signal: AbortSignal.timeout(35000)});
+    const body = await response.json();
+    last = {status: response.status, body};
+    if (attempt % 10 === 0 && response.status !== 200) console.error("qualification retry", input.op ?? path, JSON.stringify(last));
+    if (response.status === 503 || (response.status === 409 && /WorkLeaseLost|WalCommitContended|CollectionLeaseLost/.test(body.error))) { await new Promise(resolve => setTimeout(resolve, 1000)); continue; }
+    assert.equal(response.status, 200, JSON.stringify({status: response.status, body}));
+    measurements.push({op: input.op ?? path, duration_ms: performance.now() - begin, version: response.headers.get("X-Antfly-Version")});
+    return body;
+  }
+  throw new Error(`admission retries exhausted: ${JSON.stringify({op: input.op, last})}`);
+}
+if (process.argv.includes("--diagnostics")) { console.log(JSON.stringify(await call({}, "/_qualification/diagnostics"))); process.exit(0); }
+if (process.argv.includes("--probe") || process.argv.includes("--status")) {
+  for (const op of process.argv.includes("--status") ? ["status"] : ["status", "publish", "status"]) console.log(op, JSON.stringify(await call({op})));
+  process.exit(0);
+}
+if (process.argv.includes("--drain")) {
+  const report={deleted_objects:0,deleted_bytes:0,bytes_complete:true,billed_cost:null};
+  for (let i = 0; i < 10000; i++) {
+    const result=await call({}, "/_qualification/drain");report.deleted_objects+=result.deleted??0;
+    if(result.bytes==null)report.bytes_complete=false;else report.deleted_bytes+=result.bytes;
+    if(result.done){await writeFile(run.dir+"/drain-report.json",JSON.stringify(report,null,2));console.log("disposable R2 and coordinator state drained",report);process.exit(0);}
+  }
+  throw new Error("cleanup limit exceeded");
+}
+if (process.argv.includes("--collect-only")) {
+  const before = await call({op: "count"});
+  let job;
+  for (let i = 0; i < 1000; i++) {
+    const result = await call({op: "collect", ...(job ? {job_id: job} : {})}); job = result.job_id;
+    if (i % 25 === 0) console.log("collection progress", result.phase, i);
+    if (result.done) {
+      assert.equal((await call({op: "count"})).count, before.count);
+      assert.equal((await call({op: "search", text: "replacementneedle"})).hits[0].doc_id, "scale/000000");
+      await writeFile(`${run.dir}/scale-collection-report.json`, JSON.stringify({checks: {paged_collection: true, preserved_count: true, preserved_search: true}, measurements}, null, 2));
+      console.log("Live paged text collection passed"); process.exit(0);
+    }
+    if (result.delay_seconds) await new Promise(resolve => setTimeout(resolve, Math.min(60000, result.delay_seconds * 1000 + 100)));
+  }
+  throw new Error("Paged collection did not converge");
+}
+if (process.argv.includes("--collect-metadata")) {
+  const before = await call({op:"count"}); let job, done=false;
+  for (let i=0;i<10000;i++) {
+    const result=await call({op:"collect_metadata",...(job?{job_id:job}:{})}); job=result.job_id;
+    if (result.done) {done=true;break;}
+    if (result.delay_seconds) await new Promise(resolve=>setTimeout(resolve,Math.min(60000,result.delay_seconds*1000+100)));
+  }
+  assert.ok(done,"metadata collection did not converge");
+  assert.equal((await call({op:"count"})).count,before.count);
+  assert.equal((await call({op:"collect_metadata",job_id:job})).done,true);
+  await writeFile(`${run.dir}/metadata-report.json`,JSON.stringify({checks:{native_metadata_collection:true,preserved_count:true,late_delivery:true},measurements},null,2));
+  console.log("Live Antfly-native metadata collection passed");process.exit(0);
+}
+if (process.argv.includes("--scale")) {
+  const count = Number(process.argv.find(arg => arg.startsWith("--documents="))?.slice(12) ?? 5000);
+  assert.ok(Number.isSafeInteger(count) && count >= 300 && count <= 20000);
+  async function awaitPublished(receipt) {
+    const target = BigInt(`0x${receipt.visibility.slice(-16)}`);
+    for (let i = 0; i < 180; i++) {
+      const status = await call({op: "status"});
+      if (status.published && BigInt(status.published_lsn) >= target) return;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    throw new Error("Queue publication did not reach the accepted watermark");
+  }
+  for (let offset = 0; offset < count; offset += 128) {
+    const receipt = await call({op: "mutate", operation_id: `${run.id}/scale/${offset}`, mutations: Array.from({length: Math.min(128, count - offset)}, (_, i) => ({kind: "upsert", doc_id: `scale/${String(offset+i).padStart(6,"0")}`, body: JSON.stringify({text: `durable searchable message ${offset+i}`})}))});
+    await awaitPublished(receipt);
+    if (offset % 1024 === 0) console.log("scale publication", Math.min(count, offset + 128));
+  }
+  assert.equal((await call({op: "count"})).count, String(count));
+  const first = await call({op: "search", text: "durable", limit: 2});
+  assert.equal(first.hits.length, 2);
+  const edited = await call({op: "mutate", operation_id: `${run.id}/scale/edit`, mutations: [{kind: "upsert", doc_id: "scale/000000", body: '{"text":"replacementneedle"}'}, {kind: "delete", doc_id: "scale/000001"}]});
+  await awaitPublished(edited);
+  assert.equal((await call({op: "count"})).count, String(count - 1));
+  assert.equal((await call({op: "search", text: "replacementneedle"})).hits[0].doc_id, "scale/000000");
+  assert.deepEqual((await call({op: "search", text: "durable", limit: 2, cursor: first.cursor})).hits.map(hit => hit.doc_id), ["scale/000002", "scale/000003"]);
+  assert.equal((await call({op: "compact"})).published, false);
+  const report = {documents: count, checks: {paged_text: true, point_edits: true, deletion: true, prior_generation_cursor: true, compaction_no_rebuild: true}, measurements};
+  await writeFile(`${run.dir}/scale-report.json`, JSON.stringify(report, null, 2));
+  console.log("Live paged text scale qualification passed", count); process.exit(0);
+}
+if (process.argv.includes("--enrichment")) {
+  const windowed = process.argv.includes("--windows"), docId = windowed ? "message/windows" : "message/a";
+  const source = windowed ? Array.from({length: 48 * 8}, (_, i) => ["durable", "cloudflare", "message"][i % 3]).join(" ") : "Cloudflare stores durable searchable messages.";
+  const baseReport = windowed ? "window-enrichment-report.json" : "enrichment-report.json";
+  const receipt = await call({op: "mutate", operation_id: `${run.id}/embedding${windowed ? "/windows" : ""}`, mutations: [{kind: "upsert", doc_id: docId, body: JSON.stringify({text: source})}]});
+  if (process.argv.includes("--reopen")) {
+    const before = JSON.parse(await readFile(`${run.dir}/${baseReport}`, "utf8"));
+    assert.equal(receipt.visibility, before.visibility, "reopen must preserve the original retry receipt");
+    assert.notEqual(measurements[0].version, before.measurements[0].version, "reopen fixture requires a replacement deployment");
+  }
+  let ready = false;
+  for (let i = 0; i < 180; i++) {
+    const status = await call({op: "status"});
+    if (status.published && BigInt(status.published_lsn) > BigInt(`0x${receipt.visibility.slice(-16)}`) && status.pending_embeddings === "0") {ready = true; break;}
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  assert.ok(ready, "native enrichment did not converge");
+  await call({op: "compact"});
+  const document = JSON.parse((await call({op: "lookup", doc_id: docId, required_visibility: receipt.visibility})).body);
+  assert.ok(document.chunk_embeddings.length >= (windowed ? 48 : 1));
+  const vector = (await call({text: ["durable messages"]}, "/ai")).data[0];
+  const hits = await call({op: "search", mode: "vector", vector, required_visibility: receipt.visibility, fresh: true});
+  assert.ok(hits.hits.some(hit => hit.doc_id === docId));
+  const filename = process.argv.includes("--reopen") ? `reopen-${baseReport}` : baseReport;
+  await writeFile(`${run.dir}/${filename}`, JSON.stringify({visibility: receipt.visibility, chunks: document.chunk_embeddings.length, checks: {native_gateway_enrichment: true, fenced_vector: true, native_compaction: true, windowed, reopen: process.argv.includes("--reopen")}, measurements}, null, 2));
+  console.log("live native Gateway enrichment and fenced vector search passed");
+  process.exit(0);
+}
+const initial = {op: "mutate", operation_id: `${run.id}/initial`, mutations: Array.from({length: 300}, (_, i) => ({kind: "upsert", doc_id: `doc/${String(i).padStart(4,"0")}`, body: JSON.stringify({text: `qualification durable document ${i}`, read: false})}))};
+const accepted = await call(initial);
+assert.equal(accepted.committed, true);
+assert.equal((await call(initial)).visibility, accepted.visibility);
+assert.equal(JSON.parse((await call({op: "lookup", doc_id: "doc/0000", required_visibility: accepted.visibility})).body).read, false);
+let published = false;
+for (let i = 0; i < 180; i++) {
+  const status = await call({op: "status"});
+  if (status.published && BigInt(status.published_lsn) >= 300n) {published = true; break;}
+  await new Promise(resolve => setTimeout(resolve, 1000));
+}
+assert.ok(published, "durable Queue publication did not converge");
+assert.ok((await call({op: "search", text: "durable"})).hits.length);
+await Promise.all(Array.from({length: 8}, (_, i) => call({op: "mutate", operation_id: `${run.id}/race/${i}`, mutations: [{kind: "upsert", doc_id: `race/${i}`, body: JSON.stringify({text: `racing ${i}`})}]})));
+for (let i = 0; i < (process.argv.includes("--quick") ? 3 : 30); i++) await call({op: "lookup", doc_id: `doc/${String(i % 10).padStart(4, "0")}`});
+await call({op: "compact"});
+let job, complete = false;
+for (let i = 0; i < 1000; i++) {
+  const result = await call({op: "collect", ...(job ? {job_id: job} : {})}); job = result.job_id;
+  if (i % 25 === 0) console.log("collection progress", result.phase, i);
+  if (result.done) {complete = true; break;}
+  if (result.delay_seconds) await new Promise(resolve => setTimeout(resolve, Math.min(60000, result.delay_seconds * 1000 + 100)));
+}
+assert.ok(complete, "live collection did not converge");
+assert.equal((await call(initial)).visibility, accepted.visibility);
+assert.ok((await call({op: "search", text: "durable"})).hits.length);
+const embedding = await call({text: ["Antfly Cloudflare qualification"]}, "/ai");
+assert.equal(embedding.data?.[0]?.length, 384);
+assert.ok(embedding.data[0].every(Number.isFinite));
+const durations = measurements.filter(item => item.op === "lookup").map(item => item.duration_ms).sort((a,b) => a-b);
+const report = {run: run.id, origin, started_at: new Date(start).toISOString(), finished_at: new Date().toISOString(), checks: {idempotent_batch: true, fenced_lookup: true, publication: true, racing_writers: true, compaction: true, collection: true, gateway_embedding: true}, lookup_ms: {p50: durations[Math.floor(durations.length*.5)], p95: durations[Math.floor(durations.length*.95)]}, memory: {total_isolate_bytes: null, qualification: "No resource-limit error in this fixture; total isolate memory was not measured"}, measurements};
+await writeFile(`${run.dir}/report.json`, JSON.stringify(report, null, 2));
+console.log(JSON.stringify({...report, measurements: `${measurements.length} recorded`}, null, 2));

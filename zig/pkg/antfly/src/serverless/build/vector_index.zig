@@ -21,6 +21,7 @@ const vector_segment_mod = @import("../vector_segment/mod.zig");
 const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 
 pub const BuildPolicy = struct {
+    quantize: bool = true,
     target_cluster_count: ?usize = null,
     base_probe_count: ?u32 = null,
     shortlist_multiplier: ?u32 = null,
@@ -147,8 +148,8 @@ pub fn buildClusteredSegmentWithPolicyAllocUntil(
         sorted_initialized[dst] = true;
     }
 
-    var quantizer = try vector_quantizer.RaBitQuantizer.init(alloc, dim_count, 42, metric);
-    defer quantizer.deinit();
+    var quantizer: ?vector_quantizer.RaBitQuantizer = if (policy.quantize) try vector_quantizer.RaBitQuantizer.init(alloc, dim_count, 42, metric) else null;
+    defer if (quantizer) |*q| q.deinit();
     for (clusters) |*cluster| {
         try maintenance_cancellation.check(cancellation);
         const start: usize = cluster.start_index;
@@ -186,12 +187,13 @@ pub fn buildClusteredSegmentWithPolicyAllocUntil(
         alloc.free(cluster.exact_entries);
         cluster.exact_entries = encoded_exact;
 
+        if (!policy.quantize) continue;
         const flat_vectors = try alloc.alloc(f32, @as(usize, cluster.entry_count) * dim_count);
         defer alloc.free(flat_vectors);
         for (sorted_entries[start..end], 0..) |entry, idx| {
             @memcpy(flat_vectors[idx * dim_count ..][0..dim_count], entry.vector);
         }
-        var quantized = try quantizer.quantize(cluster.centroid, flat_vectors, @intCast(cluster.entry_count));
+        var quantized = try quantizer.?.quantize(cluster.centroid, flat_vectors, @intCast(cluster.entry_count));
         defer quantized.deinit(alloc);
         const encoded_quantized = try quantized.encode(alloc);
         alloc.free(cluster.quantized_set);

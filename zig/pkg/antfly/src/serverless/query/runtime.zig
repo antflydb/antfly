@@ -262,6 +262,10 @@ pub const QueryRuntime = struct {
     metrics: QueryExecutionMetrics = .{},
     namespace_metrics: std.StringHashMapUnmanaged(QueryExecutionMetrics) = .empty,
     read_leases: read_lease.Cache = .{},
+    shared_read_leases: ?*read_lease.Cache = null,
+    bounded_manifest_reads: bool = false,
+    decoded_manifests: ?*manifest_mod.decoded_cache.Cache = null,
+    decoded_manifest_allocator: ?Allocator = null,
 
     pub fn init(
         alloc: Allocator,
@@ -303,13 +307,22 @@ pub const QueryRuntime = struct {
     }
 
     pub fn openVersionSessionWithCancellation(self: *QueryRuntime, namespace: []const u8, version: u64, cancellation: CancellationToken) !QuerySession {
-        var manifest = try self.manifests.getAllocWithCancellation(namespace, version, cancellation);
+        try cancellation.check();
+        if (self.decoded_manifests != null) if (try self.progress.getManifestGcFloor(namespace)) |floor| if (version < floor) return error.ManifestVersionRetired;
+        var manifest = if (self.decoded_manifests) |cache|
+            (try cache.get(self.alloc, namespace, version)) orelse blk: {
+                const fetched = try self.manifests.getAllocWithCancellation(namespace, version, cancellation);
+                cache.remember(self.decoded_manifest_allocator orelse self.alloc, fetched);
+                break :blk fetched;
+            }
+        else
+            try self.manifests.getAllocWithCancellation(namespace, version, cancellation);
         errdefer manifest.deinit(self.alloc);
         var lease: ?read_lease.Lease = null;
         for (manifest.artifacts) |artifact| {
             if (artifact.kind == .document_facts or (artifact.kind == .graph_segment and artifact.metadata_version == graph_segment_mod.page_graph.Root.metadata_version)) {
                 try cancellation.check();
-                lease = try self.read_leases.acquire(self.progress, namespace, version);
+                lease = if (self.bounded_manifest_reads) try read_lease.acquireBoundedAt(self.progress, namespace, version, @import("antfly_platform").time.realtimeNs(), @import("antfly_platform").time.authorityNs()) else try (self.shared_read_leases orelse &self.read_leases).acquire(self.progress, namespace, version);
                 break;
             }
         }
@@ -418,8 +431,9 @@ pub const QuerySession = struct {
     graph_metric_transport_credit: usize = 0,
 
     pub fn graphAdjacencyCache(self: *QuerySession) ?@import("../graph_segment/topology_reader.zig").ReadCache {
+        if (comptime @import("builtin").os.tag == .freestanding) return null;
         if (self.cache == null) return null;
-        return .{ .ptr = self, .read = readGraphAdjacencyBlock };
+        return .{ .ptr = self, .read = readGraphAdjacencyBlock, .read_many = readGraphAdjacencyBlocks };
     }
 
     fn readGraphAdjacencyBlock(ptr: *anyopaque, alloc: Allocator, artifacts: *artifacts_mod.ArtifactStore, source: manifest_mod.ArtifactRef, offset: u64, len: usize, checksum: [32]u8, cancellation: CancellationToken, remaining: *u64) ![]u8 {
@@ -459,6 +473,64 @@ pub const QuerySession = struct {
         try cancellation.check();
         batch.publish(self.io);
         return alloc.dupe(u8, item.bytes());
+    }
+
+    /// Claim immutable page misses as one cache batch, coalesce their packed
+    /// physical ranges through the shared PageStore, then publish only after
+    /// every page has passed digest/domain/structure validation. Duplicate refs
+    /// are scattered from a single claim, never turned into self-waiters.
+    fn readGraphAdjacencyBlocks(ptr: *anyopaque, a: Allocator, artifacts: *artifacts_mod.ArtifactStore, domain: [32]u8, refs_: []const @import("../graph_segment/page_tree.zig").Ref, output: [][]u8, cancellation: CancellationToken, remaining: *u64) !void {
+        const self: *QuerySession = @ptrCast(@alignCast(ptr));
+        const tree = @import("../graph_segment/page_tree.zig");
+        const PageStore = @import("../graph_segment/page_store.zig").PageStore;
+        const fills = @import("authenticated_block_fills.zig");
+        if (refs_.len != output.len or refs_.len > tree.max_read_batch) return error.InvalidGraphPage;
+        var specs: [tree.max_read_batch]fills.Cache.Spec = undefined;
+        var unique: [tree.max_read_batch]tree.Ref = undefined;
+        var positions: [tree.max_read_batch]usize = undefined;
+        var count: usize = 0;
+        for (refs_, 0..) |ref, i| {
+            try ref.validate();
+            const id = try PageStore.identity(domain, ref);
+            const key = fills.blockKey(&id, id[7..71], ref.offset(), ref.bytes, &ref.digest);
+            const found = for (specs[0..count], 0..) |spec, j| {
+                if (std.mem.eql(u8, &spec.key, &key)) break j;
+            } else null;
+            positions[i] = found orelse count;
+            if (found == null) {
+                specs[count] = .{ .key = key, .len = ref.bytes };
+                unique[count] = ref;
+                count += 1;
+            }
+        }
+        const cache = self.cache.?;
+        var batch = try cache.graph_metric_blocks.acquire(cache.alloc, a, specs[0..count], self.io, cancellation);
+        defer batch.deinit();
+        var misses: [tree.max_read_batch]tree.Ref = undefined;
+        var owners: [tree.max_read_batch]usize = undefined;
+        var needed: usize = 0;
+        for (batch.items, unique[0..count], 0..) |item, ref, i| if (item.producer) {
+            misses[needed] = ref;
+            owners[needed] = i;
+            needed += 1;
+        };
+        if (needed != 0) {
+            var no_writes: u64 = 0;
+            var pages = PageStore{ .domain = domain, .artifacts = artifacts, .cancellation = cancellation, .remaining_read_bytes = remaining, .remaining_write_bytes = &no_writes, .coalesce_reads = true };
+            const store = pages.store();
+            var decoded: [tree.max_read_batch]tree.Page = undefined;
+            try store.read_many.?.read(store.read_many.?.ptr, a, misses[0..needed], decoded[0..needed]);
+            defer for (decoded[0..needed]) |*page| page.deinit(a);
+            for (decoded[0..needed], owners[0..needed]) |page, owner| @memcpy(batch.items[owner].buffer(), page.bytes);
+        }
+        try cancellation.check();
+        batch.publish(self.io);
+        var initialized: usize = 0;
+        errdefer for (output[0..initialized]) |bytes| a.free(bytes);
+        for (positions[0..refs_.len], output) |position, *bytes| {
+            bytes.* = try a.dupe(u8, batch.items[position].bytes());
+            initialized += 1;
+        }
     }
 
     pub fn deinit(self: *QuerySession) void {
@@ -619,7 +691,7 @@ pub const QuerySession = struct {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactForQuery(artifact);
-        const result = if (self.cache) |cache|
+        const result = if (if (@import("builtin").os.tag == .freestanding) @as(?*cache_mod.QueryCache, null) else self.cache) |cache|
             try cache.getOrFetchVerifiedAllocWithCancellationUsingAllocator(
                 self.alloc,
                 self.artifacts,
@@ -662,7 +734,7 @@ pub const QuerySession = struct {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
-        const result = if (self.cache) |cache|
+        const result = if (if (@import("builtin").os.tag == .freestanding) @as(?*cache_mod.QueryCache, null) else self.cache) |cache|
             try cache.getVerifiedRangeOrFetchAllocWithCancellationUsingAllocator(
                 self.alloc,
                 self.artifacts,
@@ -692,7 +764,7 @@ pub const QuerySession = struct {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
-        const result = if (self.cache) |cache|
+        const result = if (if (@import("builtin").os.tag == .freestanding) @as(?*cache_mod.QueryCache, null) else self.cache) |cache|
             try cache.getVerifiedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
                 self.alloc,
                 self.artifacts,
@@ -731,7 +803,7 @@ pub const QuerySession = struct {
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
         if (len == 0) return error.InvalidArtifactRange;
-        const result = if (self.cache) |cache|
+        const result = if (if (@import("builtin").os.tag == .freestanding) @as(?*cache_mod.QueryCache, null) else self.cache) |cache|
             try cache.getAuthenticatedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
                 self.alloc,
                 self.artifacts,
@@ -775,6 +847,7 @@ pub const QuerySession = struct {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
+        if (comptime @import("builtin").os.tag == .freestanding) return null;
         const cache = self.cache orelse return null;
         return cache.readAuthenticatedBlockIfPresentLease(alloc, artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, len, self.readCancellation()) catch |err| switch (err) {
             error.OutOfMemory, error.Canceled => return err,
@@ -785,6 +858,7 @@ pub const QuerySession = struct {
     }
 
     pub fn cacheAuthenticatedBlocks(self: *QuerySession, index: usize, blocks: []const AuthenticatedBlockPublication) !void {
+        if (comptime @import("builtin").os.tag == .freestanding) return;
         const cache = self.cache orelse return;
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         cache.retainAuthenticatedBlocks(artifact.artifact_id, artifact.byte_len, artifact.checksum, blocks);

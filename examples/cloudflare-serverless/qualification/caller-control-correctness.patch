@@ -1,0 +1,82 @@
+diff --git a/examples/cloudflare-serverless/mutation-groups.mjs b/examples/cloudflare-serverless/mutation-groups.mjs
+index 41e07a366f..d0c6d9da53 100644
+--- a/examples/cloudflare-serverless/mutation-groups.mjs
++++ b/examples/cloudflare-serverless/mutation-groups.mjs
+@@ -25,20 +25,27 @@ export class MutationGroups {
+     if(this.pending>=16||this.bytes+bytes>4*1024*1024)throw new Error("CoordinatorCommitBusy");
+     const release=reserveInput(bytes);
+     this.pending++;this.bytes+=bytes;
+-    return new Promise((resolve,reject)=>{this.queue.push({input,bytes,resolve,reject,release,deadline:this.clock()+30000});this.schedule();});
++    return new Promise((resolve,reject)=>{
++      let admit;const ready=new Promise(start=>admit=start);
++      ready.then(async owner=>{if(!owner)return;await new Promise(start=>setTimeout(start,2));await this.drain();});
++      this.queue.push({input,bytes,resolve:value=>{admit(false);resolve(value);},reject:error=>{admit(false);reject(error);},startGroup:()=>admit(true),release,deadline:this.clock()+30000});this.schedule();
++    });
+   }
+-  schedule(){if(!this.running){this.running=true;setTimeout(()=>this.drain(),2);}}
++  schedule(){if(!this.running&&this.queue.length){this.running=true;this.queue[0].startGroup();}}
+   async drain(){
+-    const group=[];let bytes=0,records=0;
+-    while(this.queue.length&&group.length<16){const next=this.queue[0];if(this.clock()>=next.deadline){this.queue.shift();this.pending--;this.bytes-=next.bytes;next.release();next.reject(new Error("DeadlineExceeded"));continue;}const count=next.input.mutations?.length??0;if(group.length&&(bytes+next.bytes>768*1024||records+count>1024))break;group.push(this.queue.shift());bytes+=next.bytes;records+=count;}
+-    if(!group.length){this.running=false;if(this.queue.length)this.schedule();return;}
++    const group=[],expired=[];let bytes=0,records=0;
++    while(this.queue.length&&group.length<16){const next=this.queue[0];if(this.clock()>=next.deadline){expired.push(this.queue.shift());if(!group.length)break;continue;}const count=next.input.mutations?.length??0;if(group.length&&(bytes+next.bytes>768*1024||records+count>1024))break;group.push(this.queue.shift());bytes+=next.bytes;records+=count;}
++    const expire=()=>{for(const item of expired){this.pending--;this.bytes-=item.bytes;item.release();item.reject(new Error("DeadlineExceeded"));}};
++    if(!group.length){this.running=false;this.schedule();expire();return;}
+     const settle=async items=>{
+       try{const results=await this.commit(items.map(item=>item.input),Math.min(...items.map(item=>item.deadline)));if(results.length!==items.length)throw new Error("InvalidMutationGroupResults");return results.map(value=>({value}));}
+       catch(error){if(items.length>1&&/WalIdempotencyConflict|InvalidDocumentMutation|InvalidWalOperationId|InvalidWalBatch|WalRecordTooLarge|GraphPageRecordTooLarge|SyntaxError|UnexpectedToken|UnexpectedEndOfInput|InvalidCharacter|InvalidNumber|MissingField|UnknownField|Overflow/.test(String(error))){const results=[];for(const item of items)results.push(...await settle([item]));return results;}return items.map(()=>({error}));}
+     };
+     const results=await settle(group);
+     this.pending-=group.length;this.bytes-=bytes;this.running=false;
++    // Handoff and accounting finish before answering the owner RPC. Future
++    // groups run through their own submitter, not this timer's old context.
++    this.schedule();expire();
+     group.forEach((item,i)=>{item.release();results[i].error?item.reject(results[i].error):item.resolve(results[i].value);});
+-    if(this.queue.length)this.schedule();
+   }
+ }
+diff --git a/examples/cloudflare-serverless/runtime-actors.mjs b/examples/cloudflare-serverless/runtime-actors.mjs
+index 8d75db0091..102de2231a 100644
+--- a/examples/cloudflare-serverless/runtime-actors.mjs
++++ b/examples/cloudflare-serverless/runtime-actors.mjs
+@@ -33,21 +33,25 @@ class RuntimeActor extends DurableObject {
+   if(bytes>1024*1024)throw new Error("RequestTooLarge");
+   if(this.pending.length+(this.running?1:0)>=8||this.pendingBytes+bytes>4*1024*1024)throw new Error("CoordinatorCommitBusy");
+   const release=reserveInput(bytes);
+-  return new Promise((resolve,reject)=>{this.pendingBytes+=bytes;this.pending.push({input,collection,traceId:traceMeta?.trace_id,bytes,resolve,reject,at:Date.now(),deadline:Date.now()+30000,release});this.drain();});
++  return new Promise((resolve,reject)=>{
++   let admit;const ready=new Promise(start=>admit=start),job={input,collection,traceId:traceMeta?.trace_id,bytes,at:Date.now(),deadline:Date.now()+30000,release,admit:()=>admit()};
++   ready.then(async()=>{
++    let result;try{result=await this.executeAdmitted(job);}catch(error){result={error};}
++    this.running=false;this.drain();result.error?reject(result.error):resolve(result.value);
++   });
++   this.pendingBytes+=bytes;this.pending.push(job);this.drain();
++  });
+  }
+- async drain(){
+-  if(this.running)return;this.running=true;
+-  while(this.pending.length){
+-   // Publication takes the next slot ahead of queued collection; aged work
+-   // becomes equally eligible. An executing bounded step is never preempted.
+-   let index=0;if(this.role==="builder"){const urgent=this.pending.findIndex(job=>["publish","enrich"].includes(job.input.op));if(urgent>=0&&Date.now()-this.pending[0].at<5000)index=urgent;}
+-   const job=this.pending.splice(index,1)[0];
+-   const trace=new CriticalPath({id:job.traceId,scope:"actor:"+this.role});trace.stage({name:"actor_queue",duration_ms:Date.now()-job.at});
+-   try{if(Date.now()>=job.deadline)throw new Error("DeadlineExceeded");const result=await this.perform(job.input,job.collection,AbortSignal.timeout(Math.max(1,job.deadline-Date.now())),trace);this.pendingBytes-=job.bytes;job.release();job.resolve(result);}
+-   catch(error){this.pendingBytes-=job.bytes;job.release();job.reject(error);}
+-   finally{trace.emit(this.runtimeEnv.LOG_METRICS==="true");}
+-  }
+-  this.running=false;
++ drain(){
++  if(this.running||!this.pending.length)return;this.running=true;
++  let index=0;if(this.role==="builder"){const urgent=this.pending.findIndex(job=>["publish","enrich"].includes(job.input.op));if(urgent>=0&&Date.now()-this.pending[0].at<5000)index=urgent;}
++  this.pending.splice(index,1)[0].admit();
++ }
++ async executeAdmitted(job){
++  const trace=new CriticalPath({id:job.traceId,scope:"actor:"+this.role});trace.stage({name:"actor_queue",duration_ms:Date.now()-job.at});
++  try{if(Date.now()>=job.deadline)throw new Error("DeadlineExceeded");return{value:await this.perform(job.input,job.collection,AbortSignal.timeout(Math.max(1,job.deadline-Date.now())),trace)};}
++  catch(error){return{error};}
++  finally{this.pendingBytes-=job.bytes;job.release();trace.emit(this.runtimeEnv.LOG_METRICS==="true");}
+  }
+  perform(input,collection,signal,trace){
+   const env=this.runtimeEnv,stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION);
