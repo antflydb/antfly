@@ -743,6 +743,8 @@ const DerivedRecoverableRetryCounters = struct {
         switch (err) {
             error.WriterLocked, error.WouldBlock, error.FileBusy => _ = self.writer_locked.fetchAdd(1, .monotonic),
             error.ResourceBudgetExceeded,
+            error.CapacityUnavailable,
+            error.CapacityObservationStale,
             error.PostingWalTooLarge,
             error.PersistentDescriptorAdmissionExhausted,
             error.TextMergeBackpressureTimeout,
