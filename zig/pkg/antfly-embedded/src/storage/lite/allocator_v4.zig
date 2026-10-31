@@ -114,6 +114,7 @@ pub const State = struct {
     free_pages: u64 = 0,
     data_pending: u64 = 0,
     pending: std.AutoHashMapUnmanaged(u64, Retirement) = .empty,
+    pending_removals_since_rehash: usize = 0,
     heap: Heap,
     metadata_heap: Heap,
     chains_heap: Heap,
@@ -467,7 +468,7 @@ pub const State = struct {
         if (linked.previous != 0) self.pending.getPtr(linked.previous).?.next = linked.next else self.first_pending = linked.next;
         if (linked.next != 0) self.pending.getPtr(linked.next).?.previous = linked.previous else self.last_pending = linked.previous;
         if (self.root.build_cursor == item.id) self.root.build_cursor = linked.next;
-        _ = self.pending.remove(item.id);
+        _ = self.removePending(item.id);
         self.collected +|= 1;
         if (item.kind != .metadata and item.kind != .allocator_chain) self.data_pending -= 1;
     }
@@ -487,7 +488,22 @@ pub const State = struct {
         self.force_checkpoint = true;
     }
 
+    fn removePending(self: *State, id: u64) bool {
+        if (!self.pending.remove(id)) return false;
+        self.pending_removals_since_rehash +|= 1;
+        return true;
+    }
+
     pub fn clean(self: *State) void {
+        // Monotonic retirement IDs eventually leave no genuinely empty hash
+        // buckets, even when very few objects remain. Missing-key lookups then
+        // scan the entire retained capacity. Rehash without allocating at this
+        // stable boundary; the linear sweep is amortized over prior removals.
+        // No pending-entry pointer survives persistence/cleanup.
+        if (self.pending_removals_since_rehash >= @max(@as(usize, 64), @as(usize, self.pending.capacity()) / 16)) {
+            self.pending.rehash(std.hash_map.AutoContext(u64){});
+            self.pending_removals_since_rehash = 0;
+        }
         self.changes.clearRetainingCapacity();
         self.added.clearRetainingCapacity();
         self.completed.clearRetainingCapacity();
@@ -609,7 +625,7 @@ pub const State = struct {
                     3 => {
                         const id = get64(entry, 8);
                         if (id == 0 or id >= self.root.next_id) return error.InvalidNativeAllocator;
-                        if (!self.pending.remove(id) and get64(raw, 56) == 1) return error.InvalidNativeAllocator;
+                        if (!self.removePending(id) and get64(raw, 56) == 1) return error.InvalidNativeAllocator;
                     },
                     else => return error.InvalidNativeAllocator,
                 }
@@ -1198,6 +1214,37 @@ test "lite allocator v4 pending digest memory follows live chunks rather than hi
     try std.testing.expectEqual(@as(usize, 3), state.digest_cache.?.pending.nodes);
     try state.complete(state.eligible(7, 7).?);
     try expectDigestMatchesRebuild(&state);
+}
+
+test "lite allocator v4 retirement churn keeps absent pending lookups bounded" {
+    for ([_]u32{ 256, 4096 }) |reserve| {
+        var state = State.init(std.testing.allocator);
+        defer state.deinit();
+        try state.ensure(2);
+        try state.pending.ensureTotalCapacity(state.allocator, reserve);
+        // Keep one protected retirement alive while monotonically increasing
+        // IDs are inserted and collected, as in a long maintenance drain.
+        try state.retire(.{ .epoch = 1000, .page = 1, .kind = .page });
+        const capacity = state.pending.capacity();
+        for (0..@as(usize, capacity) * 16) |_| {
+            try state.retire(.{ .epoch = 1, .page = 2, .kind = .page });
+            try state.complete(state.eligible(1, 1).?);
+            state.clean();
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.pending.count());
+        const absent = state.root.next_id;
+        try std.testing.expect(state.pending.get(absent) == null);
+        // Count the metadata probes made by an absent-key lookup. Timing is
+        // deliberately excluded: a tombstone-filled table scans its retained
+        // capacity despite containing just one live entry.
+        const context: std.hash_map.AutoContext(u64) = .{};
+        var index: usize = @intCast(context.hash(absent) & @as(u64, capacity - 1));
+        var probes: usize = 1;
+        while (!state.pending.metadata.?[index].isFree() and probes <= capacity) : (probes += 1)
+            index = (index + 1) & (capacity - 1);
+        try std.testing.expect(probes <= 16);
+        try expectDigestMatchesRebuild(&state);
+    }
 }
 
 test "lite allocator v4 canceled digest initialization retains no partial cache" {
