@@ -2213,6 +2213,39 @@ pub fn attentionMatchSplitScratchBytes(queries: usize) !usize {
     return bytes;
 }
 
+fn rmsQ8RangesOverlap(a: buffer_mod.DeviceBuffer, b: buffer_mod.DeviceBuffer) bool {
+    if (a.ptr == 0 or b.ptr == 0 or a.len == 0 or b.len == 0) return false;
+    return a.ptr < b.ptr +| b.len and b.ptr < a.ptr +| a.len;
+}
+
+test "CUDA RMS Q8 tiled launch rejects overlapping outputs before GPU work" {
+    var module = KernelModule{ .rms_q8_1_2560 = @ptrFromInt(1) };
+    var context: context_mod.CudaContext = undefined;
+    const input = buffer_mod.DeviceBuffer{ .ptr = 0x10000, .len = 2560 * @sizeOf(f32) };
+    const weight = buffer_mod.DeviceBuffer{ .ptr = 0x30000, .len = 2560 * @sizeOf(f32) };
+    const q8 = buffer_mod.DeviceBuffer{ .ptr = 0x50000, .len = 80 * 36 };
+    try std.testing.expectError(error.InvalidCudaState, module.launchRmsQ8Mirror2560(&context, .norm, .{ .ptr = input.ptr + 4, .len = input.len }, q8, input, weight, .{}, .{}, 1e-6));
+    try std.testing.expectError(error.InvalidCudaState, module.launchRmsQ8Mirror2560(&context, .norm, .{ .ptr = 0x70000, .len = input.len }, .{ .ptr = q8.ptr, .len = 1 }, input, weight, .{}, .{}, 1e-6));
+}
+
+test "CUDA E4B prefetch keeps A100 on generic kernels and requires GB10 opt in" {
+    var module = KernelModule{
+        .e4b_head_prefetch_l2 = @ptrFromInt(1),
+        .e4b_pair_prefetch_l2 = @ptrFromInt(2),
+        .e4b_down_prefetch_l2 = @ptrFromInt(3),
+    };
+    const routes = [_]KernelModule.E4bPrefetchRoute{ .head, .pair, .down };
+    for (routes, 0..) |route, index| {
+        // Even an inherited GB10 flag cannot select its kernels on SM80.
+        try std.testing.expect(module.e4bPrefetchFunctionForDevice(true, 8, 0, route) == null);
+        try std.testing.expect(module.e4bPrefetchFunctionForDevice(true, 12, 0, route) == null);
+        try std.testing.expect(module.e4bPrefetchFunctionForDevice(false, 12, 1, route) == null);
+        try std.testing.expectEqual(@as(driver_mod.CUfunction, @ptrFromInt(index + 1)), module.e4bPrefetchFunctionForDevice(true, 12, 1, route));
+    }
+    var missing = KernelModule{};
+    try std.testing.expect(missing.e4bPrefetchFunctionForDevice(true, 12, 1, .head) == null);
+}
+
 pub const KernelModule = struct {
     module: driver_mod.CUmodule = null,
     runtime_jit_modules: [quant_kernel_compiler.first_generated_artifacts.len]driver_mod.CUmodule =
@@ -2282,6 +2315,14 @@ pub const KernelModule = struct {
     linear_pair_bias_f32_tile4_r2: driver_mod.CUfunction = null,
     linear_triple_bias_f32_tile4_r2: driver_mod.CUfunction = null,
     rms_norm_f32: driver_mod.CUfunction = null,
+    e4b_head_prefetch_l2: driver_mod.CUfunction = null,
+    e4b_pair_prefetch_l2: driver_mod.CUfunction = null,
+    e4b_down_prefetch_l2: driver_mod.CUfunction = null,
+    e4b_prefetch_reported: [3]bool = @splat(false),
+    e4b_prefetch_missing_reported: [3]bool = @splat(false),
+    rms_q8_1_2560: driver_mod.CUfunction = null,
+    rms_add_q8_1_2560: driver_mod.CUfunction = null,
+    rms_add_scale_q8_1_2560: driver_mod.CUfunction = null,
     rms_norm_f32_bf16: driver_mod.CUfunction = null,
     rms_norm_add_f32_bf16: driver_mod.CUfunction = null,
     rms_norm_add_f32: driver_mod.CUfunction = null,
@@ -3422,6 +3463,12 @@ pub const KernelModule = struct {
         var rms_norm_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_f32, module, "termite_rms_norm_f32"));
         const rms_norm_f32_bf16 = loadOptionalFunction(ctx, module, "termite_rms_norm_f32_bf16");
+        const e4b_head_prefetch_l2 = loadOptionalFunction(ctx, module, "antfly_gemma4_e4b_head_prefetch_l2");
+        const e4b_pair_prefetch_l2 = loadOptionalFunction(ctx, module, "antfly_gemma4_e4b_pair_prefetch_l2");
+        const e4b_down_prefetch_l2 = loadOptionalFunction(ctx, module, "antfly_gemma4_e4b_down_prefetch_l2");
+        const rms_q8_1_2560 = loadOptionalFunction(ctx, module, "antfly_rms_q8_1_2560_tile256");
+        const rms_add_q8_1_2560 = loadOptionalFunction(ctx, module, "antfly_rms_add_q8_1_2560_tile256");
+        const rms_add_scale_q8_1_2560 = loadOptionalFunction(ctx, module, "antfly_rms_add_scale_q8_1_2560_tile256");
         const rms_norm_add_f32_bf16 = loadOptionalFunction(ctx, module, "termite_rms_norm_add_f32_bf16");
         var rms_norm_add_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_add_f32, module, "termite_rms_norm_add_f32"));
@@ -3976,6 +4023,12 @@ pub const KernelModule = struct {
             .linear_pair_bias_f32_tile4_r2 = linear_pair_bias_f32_tile4_r2,
             .linear_triple_bias_f32_tile4_r2 = linear_triple_bias_f32_tile4_r2,
             .rms_norm_f32 = rms_norm_f32,
+            .e4b_head_prefetch_l2 = e4b_head_prefetch_l2,
+            .e4b_pair_prefetch_l2 = e4b_pair_prefetch_l2,
+            .e4b_down_prefetch_l2 = e4b_down_prefetch_l2,
+            .rms_q8_1_2560 = rms_q8_1_2560,
+            .rms_add_q8_1_2560 = rms_add_q8_1_2560,
+            .rms_add_scale_q8_1_2560 = rms_add_scale_q8_1_2560,
             .rms_norm_f32_bf16 = rms_norm_f32_bf16,
             .rms_norm_add_f32_bf16 = rms_norm_add_f32_bf16,
             .rms_norm_add_f32 = rms_norm_add_f32,
@@ -4432,6 +4485,12 @@ pub const KernelModule = struct {
             self.linear_pair_bias_f32_tile4_r2 = null;
             self.linear_triple_bias_f32_tile4_r2 = null;
             self.rms_norm_f32 = null;
+            self.e4b_head_prefetch_l2 = null;
+            self.e4b_pair_prefetch_l2 = null;
+            self.e4b_down_prefetch_l2 = null;
+            self.rms_q8_1_2560 = null;
+            self.rms_add_q8_1_2560 = null;
+            self.rms_add_scale_q8_1_2560 = null;
             self.rms_norm_f32_bf16 = null;
             self.rms_norm_add_f32_bf16 = null;
             self.rms_norm_add_mul_scalar_f32 = null;
@@ -6560,12 +6619,6 @@ pub const KernelModule = struct {
         const use_e4b_stage1 =
             !use_a4b_stage1 and rows == 1 and in_dim == 2560 and out_dim == 262144 and suppress_count == 0 and
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b != null;
-        const stage1 = if (use_a4b_stage1)
-            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b orelse return error.CudaKernelUnavailable
-        else if (use_e4b_stage1)
-            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b orelse return error.CudaKernelUnavailable
-        else
-            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 orelse return error.CudaKernelUnavailable;
         const reduce = self.argmax_reduce_rows_pairs_f32_w16 orelse (self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable);
         if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
         const row_blocks = in_dim / q6_k_values_per_block;
@@ -6578,6 +6631,14 @@ pub const KernelModule = struct {
         try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, q8_row_blocks), q8_1_block_bytes));
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
         try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
+
+        const prefetch = if (use_e4b_stage1) self.e4bPrefetchFunction(ctx, .head) else null;
+        const stage1 = if (prefetch) |function| function else if (use_a4b_stage1)
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b orelse return error.CudaKernelUnavailable
+        else if (use_e4b_stage1)
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b orelse return error.CudaKernelUnavailable
+        else
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 orelse return error.CudaKernelUnavailable;
 
         var partial_values_ptr = partial_values.ptr;
         var partial_indices_ptr = partial_indices.ptr;
@@ -6601,6 +6662,7 @@ pub const KernelModule = struct {
         };
         const stage1_threads: usize = if (use_a4b_stage1) 192 else if (use_e4b_stage1) 160 else q6KQ8_1Tile8Stage1Threads(row_blocks);
         try launchBlocks(stage1, ctx, partial_count, stage1_threads, &stage1_params);
+        if (prefetch != null) self.noteE4bPrefetchLaunch(.head);
 
         var dst_ptr = dst.ptr;
         var col_tiles_u32 = try toU32(col_tiles);
@@ -7337,6 +7399,112 @@ pub const KernelModule = struct {
         };
         const bindings = [_]F32RowBinding{ .{ .pointer = &dst_ptr, .base = dst_ptr, .row_bytes = out_dim * @sizeOf(f32) }, .{ .pointer = &input_ptr, .base = input_ptr, .row_bytes = in_dim * @sizeOf(f32) } };
         try launchF32RowTiles(function, ctx, rows, in_dim, out_dim, &rows_u32, &bindings, &params);
+    }
+
+    const E4bPrefetchRoute = enum { head, pair, down };
+
+    fn e4bPrefetchFunction(self: *KernelModule, ctx: *const context_mod.CudaContext, route: E4bPrefetchRoute) driver_mod.CUfunction {
+        const enabled = platform.env.getenvBoolDefault(switch (route) {
+            .head => "ANTFLY_INFERENCE_CUDA_E4B_HEAD_PREFETCH_L2",
+            .pair => "ANTFLY_INFERENCE_CUDA_E4B_PAIR_PREFETCH_L2",
+            .down => "ANTFLY_INFERENCE_CUDA_E4B_DOWN_PREFETCH_L2",
+        }, false);
+        return self.e4bPrefetchFunctionForDevice(enabled, ctx.info.compute_major, ctx.info.compute_minor, route);
+    }
+
+    fn e4bPrefetchFunctionForDevice(self: *KernelModule, enabled: bool, compute_major: i32, compute_minor: i32, route: E4bPrefetchRoute) driver_mod.CUfunction {
+        if (!enabled) return null;
+        const index = @backingInt(route);
+        const device_supported = compute_major == 12 and compute_minor == 1;
+        const function = if (device_supported) switch (route) {
+            .head => self.e4b_head_prefetch_l2,
+            .pair => self.e4b_pair_prefetch_l2,
+            .down => self.e4b_down_prefetch_l2,
+        } else null;
+        if (function == null) {
+            if (!self.e4b_prefetch_missing_reported[index]) {
+                self.e4b_prefetch_missing_reported[index] = true;
+                std.log.warn("cuda_e4b_prefetch: route={s} requested=1 active=0 reason={s}", .{
+                    @tagName(route), if (device_supported) @as([]const u8, "kernel_unavailable") else "unsupported_device",
+                });
+            }
+            return null;
+        }
+        return function;
+    }
+
+    fn noteE4bPrefetchLaunch(self: *KernelModule, route: E4bPrefetchRoute) void {
+        const index = @backingInt(route);
+        if (!self.e4b_prefetch_reported[index]) {
+            self.e4b_prefetch_reported[index] = true;
+            const symbol = switch (route) {
+                .head => "antfly_gemma4_e4b_head_prefetch_l2",
+                .pair => "antfly_gemma4_e4b_pair_prefetch_l2",
+                .down => "antfly_gemma4_e4b_down_prefetch_l2",
+            };
+            std.log.info("cuda_e4b_prefetch: route={s} requested=1 active=1 cache=L2 next_column=1 arithmetic=unchanged kernel={s}", .{ @tagName(route), symbol });
+        }
+    }
+
+    pub const RmsQ8Operation = enum { norm, add, add_scale };
+
+    pub fn hasRmsQ8Mirror2560(self: *const KernelModule, operation: RmsQ8Operation) bool {
+        return switch (operation) {
+            .norm => self.rms_q8_1_2560 != null,
+            .add => self.rms_add_q8_1_2560 != null,
+            .add_scale => self.rms_add_scale_q8_1_2560 != null,
+        };
+    }
+
+    /// Qualified exact single-row E4B shape. The tiled reduction reads the
+    /// whole row in every CTA; all outputs must therefore be disjoint inputs.
+    pub fn launchRmsQ8Mirror2560(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        operation: RmsQ8Operation,
+        dst: buffer_mod.DeviceBuffer,
+        q8: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        residual: buffer_mod.DeviceBuffer,
+        scalar: buffer_mod.DeviceBuffer,
+        eps: f32,
+    ) driver_mod.Error!void {
+        const function = switch (operation) {
+            .norm => self.rms_q8_1_2560,
+            .add => self.rms_add_q8_1_2560,
+            .add_scale => self.rms_add_scale_q8_1_2560,
+        } orelse return error.CudaKernelUnavailable;
+        try checkBytes(dst, 2560);
+        try checkBytes(input, 2560);
+        try checkBytes(weight, 2560);
+        if (q8.ptr == 0 or q8.len < 80 * 36) return error.InvalidCudaState;
+        if (operation != .norm) try checkBytes(residual, 2560);
+        if (operation == .add_scale) try checkBytes(scalar, 1);
+        const output_range = buffer_mod.DeviceBuffer{ .ptr = dst.ptr, .len = 2560 * @sizeOf(f32) };
+        const q8_range = buffer_mod.DeviceBuffer{ .ptr = q8.ptr, .len = 80 * 36 };
+        if (rmsQ8RangesOverlap(output_range, q8_range)) return error.InvalidCudaState;
+        for ([_]buffer_mod.DeviceBuffer{
+            input,                                     weight,
+            if (operation != .norm) residual else .{}, if (operation == .add_scale) scalar else .{},
+        }) |source| {
+            if (rmsQ8RangesOverlap(output_range, source) or rmsQ8RangesOverlap(q8_range, source)) return error.InvalidCudaState;
+        }
+        var dst_ptr = dst.ptr;
+        var q8_ptr = q8.ptr;
+        var mirror_ptr: driver_mod.CUdeviceptr = 0;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var residual_ptr = residual.ptr;
+        var scalar_ptr = scalar.ptr;
+        var rows_u32: u32 = 1;
+        var eps_value = eps;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),    @ptrCast(&q8_ptr),     @ptrCast(&mirror_ptr),
+            @ptrCast(&input_ptr),  @ptrCast(&weight_ptr), @ptrCast(&residual_ptr),
+            @ptrCast(&scalar_ptr), @ptrCast(&rows_u32),   @ptrCast(&eps_value),
+        };
+        try launchBlocks(function, ctx, 10, 256, &params);
     }
 
     pub fn launchRmsNormF32(
@@ -14934,13 +15102,16 @@ pub const KernelModule = struct {
         }
         if (in_dim == 10240 and out_dim == 2560) {
             if (rows == 1 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN", false)) {
-                if (self.linear_q4_0_q8_1_f32_tile4_w10_e4b_down) |function| {
+                const prefetch = self.e4bPrefetchFunction(ctx, .down);
+                const selected = if (prefetch != null) prefetch else self.linear_q4_0_q8_1_f32_tile4_w10_e4b_down;
+                if (selected) |function| {
                     var params = [_]?*anyopaque{
                         @ptrCast(&dst_ptr),
                         @ptrCast(&input_ptr),
                         @ptrCast(&weight_ptr),
                     };
                     try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads_w10, &params);
+                    if (prefetch != null) self.noteE4bPrefetchLaunch(.down);
                     return;
                 }
             }
@@ -16889,7 +17060,9 @@ pub const KernelModule = struct {
                     return;
                 }
             }
-            if (self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn) |function| {
+            const prefetch = self.e4bPrefetchFunction(ctx, .pair);
+            const selected = if (prefetch != null) prefetch else self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn;
+            if (selected) |function| {
                 var params = [_]?*anyopaque{
                     @ptrCast(&dst_ptr),
                     @ptrCast(&input_ptr),
@@ -16898,6 +17071,7 @@ pub const KernelModule = struct {
                     @ptrCast(&activation_u32),
                 };
                 try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads, &params);
+                if (prefetch != null) self.noteE4bPrefetchLaunch(.pair);
                 return;
             }
         }

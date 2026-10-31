@@ -54,9 +54,32 @@ class QualificationTests(unittest.TestCase):
                 result = qualification.sse_generate("http://localhost", "model", 3)
         self.assertEqual(result["decode_tokens_per_second"], 1.0)
         self.assertEqual(result["end_to_end_tokens_per_second"], 0.75)
+        self.assertEqual(result["stream_accounting"]["content_chunks"], 1)
+        self.assertEqual(result["stream_accounting"]["first_content_characters"], 5)
+        self.assertEqual(result["engine_reported_timings"], [])
         with patch.object(qualification.urllib.request, "urlopen", return_value=Response(chunks)):
             with self.assertRaisesRegex(RuntimeError, "DONE"):
                 qualification.sse_generate("http://localhost", "model", 3)
+
+    def test_stream_preserves_reported_timings_and_chunk_sizes_without_inferred_tokens(self):
+        class Response(io.BytesIO):
+            headers = {}
+        events = [
+            {"choices": [{"delta": {"reasoning_content": "hidden"}}]},
+            {"choices": [{"delta": {"content": "a whole chunk"}}]},
+            {"choices": [{"delta": {"content": "é"}}]},
+            {"choices": [], "timings": {"predicted_n": 3, "predicted_ms": 2000},
+             "usage": {"completion_tokens": 3, "prompt_tokens": 5}},
+        ]
+        data = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events) + b"data: [DONE]\n\n"
+        with patch.object(qualification.urllib.request, "urlopen", return_value=Response(data)):
+            with patch.object(qualification.time, "perf_counter", side_effect=[0.0, 1.0, 3.0, 4.0]):
+                result = qualification.sse_generate("http://localhost", "model", 3)
+        self.assertEqual(result["text"], "a whole chunké")
+        self.assertEqual(result["stream_accounting"]["content_chunks"], 2)
+        self.assertEqual(result["stream_accounting"]["first_content_characters"], 13)
+        self.assertNotIn("tokens_per_chunk", result["stream_accounting"])
+        self.assertEqual(result["engine_reported_timings"], [{"predicted_n": 3, "predicted_ms": 2000}])
 
 
     def test_stream_preserves_plain_text_generation_errors(self):
