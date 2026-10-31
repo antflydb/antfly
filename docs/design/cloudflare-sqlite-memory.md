@@ -616,3 +616,24 @@ native checks passing. Guarded cache GC was attempted when disk space became low
 and skipped because a native build was active or process inspection unavailable;
 the guard was not bypassed. Final modules, native test binary, logs and control
 source had already been frozen outside build caches.
+
+
+### Detached observation lifetime verification
+
+The warm native continuation experiment releases its WASM slot while the exact
+journal GET is blocked. An actual-workerd regression admits another kernel job
+at zero reserved reader bytes, times out the first request after five seconds,
+and checks that its auxiliary permit remains reserved until physical I/O settles.
+An injected late `SQLITE_NOMEM` remains visible with matching lifecycle identity;
+it is not relabeled absence or a successful read. Writer application SQL/KV
+access remains forbidden in this fixture. This tests error retention and lifetime
+accounting, not the cause or resolution of the historical hosted memory error.
+
+Bounded completed immutable-header retention keeps all original lease/condition
+checks and cache ceilings. A split-worker publication/restart test verifies real
+admission, then an older adapter without `admit` verifies compatibility. Both
+new switches remain off by default. Provenance now seals those switches and the
+previous advisory-hint switch, closing an omission without relaxing any gate.
+The local performance ranges and their regressions are recorded in
+[the native design](serverless-metadata-recovery.md). No cloud resources were
+created, and the hosted gate and recovered memory error remain unqualified.

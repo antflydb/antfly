@@ -188,3 +188,22 @@ manifest and all 224 window references. SHA-256
 `f45e851f196919f6ccb4ee562b151bae6baf98e790780b34ec66c661801177fa`.
 Its summary is written to a separate excluded output path. No hosted result,
 qualification outcome or captured diagnostic data changed.
+
+
+### Subsequent local continuation comparisons
+
+Native warm journal continuations and bounded completed-header retention are
+implemented behind separate opt-in switches. Twenty local cases pass correctness
+(1,920 reads / 640 writes), across both orders and two injected-delay workloads.
+Continuations improve small read p95 about 9%; the larger on/off comparison is
+mixed. Header retention adds about 2% on the small workload and reverses from a
+3% improvement to a 4% regression on the larger workload. Neither establishes
+another twofold improvement or justifies selecting a hosted profile. Full tables,
+frozen sources/modules and protocol invariants are in
+[the native design](serverless-metadata-recovery.md).
+
+A new workerd lifetime fixture preserves an injected late memory failure after
+timeout and releases the WASM slot during blocked journal I/O. This does not
+resolve the historical live `SQLITE_NOMEM`. No new hosted experiment or cloud
+resource was created. Read target, complete live coverage, three hour-long
+trials and physical cold samples remain required for qualification.

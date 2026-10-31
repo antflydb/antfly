@@ -389,3 +389,98 @@ explicitly superseded in [the hosted record](cloudflare-twofold-trial.md).
 The older 163-artifact availability gap remains historical. Credentials,
 including local fixture token files, are excluded. No hosted gate pass or
 resolution of the historical live memory error is claimed.
+
+
+### Warm observation continuations and completed header reuse
+
+The next implementation adds two independent, disabled-by-default experiments.
+`NATIVE_METADATA_CONTINUATIONS=true` detaches the next journal-slot GET from a
+warm observation's WASM slot. Native `observe_step` validates the source before
+issuing a request-owned plan and authenticates its response on resumption. The
+purpose-separated MAC binds namespace, scope, accepted state/root, caller owner,
+follow-owner policy, original source and observation anchors, and step count.
+This plan cannot serve as a write proof. A missing slot certifies only the
+original pre-I/O observation anchor; resumption and replay cannot renew it, and
+the source proof must remain valid throughout.
+
+Eight positive frames hand off to native batched recovery within the existing
+64-step total allowance. Partial recovery retains the old source deadline.
+Cold/expired sources, sufficiently advanced hints, older modules and callers
+without an owned background lifetime retain native recovery. Capability
+`observation_plan_supported` enables negotiation without a persisted-format
+migration. The shared object-store protocol can support other providers; these
+measurements establish no S3/GCS latency improvement.
+
+Detached reads use the existing four permits and proof-prefetch byte limit.
+Same-namespace shared observation admission is counted and fair to queued
+exclusive requests. Exact keys, bounded UTF-8 headers/bodies and typed absence
+are checked; resource failures propagate. Logical timeout retains both permit
+and caller-owned lifetime through physical settlement, with paired lifecycle
+metrics. No request-owned plan, authority, lease or proof is cached.
+
+`READ_VIEW_CACHE_SEEDING=true` offers completed immutable header bytes to the
+existing scoped data cache while inside the original read-view lease, condition,
+range and size checks. It accepts only full immutable GETs, copies byte buffers
+and plain JSON metadata, and uses unchanged entry/byte ceilings. It never moves
+cache access outside that guard. Legacy cache adapters without `admit` fall back
+normally. Offers and new admissions are separately counted.
+
+Local closed-loop comparisons use four tenants, eight rounds, 64 documents with
+50 ms injected binding delay or 512 documents with 100 ms delay. Each table row
+covers forward and reverse order, with unchanged capacities and frozen sources,
+modules and bundles. Stage A has 12 correct cases (1,152 reads, 384 writes):
+
+| Read p95 | Frozen prior candidate | New module, feature off | Continuations on |
+| --- | ---: | ---: | ---: |
+| 64 documents | 454–456 ms | 453–454 ms | 412–413 ms |
+| 512 documents | 958–964 ms | 867–955 ms | 786–874 ms |
+
+Small-workload read improvement is repeatable at about 9%; the larger on/off
+comparison is mixed (955→786 ms in one order, 867→874 ms in reverse).
+Writes range from approximately 202–218 ms small and 661–676 ms large. This is not
+another twofold application improvement. Request phase timings overlap and
+must not be added; retained traces distinguish admission, kernel queue, native
+I/O and detached observation. Observed point workspace remains about 80–83 KiB
+and observed linear memory at most 7.3 MiB; snapshots do not prove worst-case
+allocator bounds. Final role I/O counters are zero; initial background I/O is
+reported separately in the original cases.
+
+Stage B compares the same native modules and JS bundles with continuations on,
+then toggles only header retention: eight correct cases, 768 reads / 256 writes.
+
+| Read p95 | Continuations only | With header retention |
+| --- | ---: | ---: |
+| 64 documents, forward | 423 ms | 415 ms |
+| 64 documents, reverse | 426 ms | 417 ms |
+| 512 documents, forward | 910 ms | 883 ms |
+| 512 documents, reverse | 878 ms | 912 ms |
+
+Only eight new headers are admitted per small case and four per large case;
+repeat offers are not new admissions. The larger result reverses with order.
+Both switches remain opt-in; these results do not justify a new hosted profile.
+A separate fake-bucket diagnostic finds generated facts roots of 832–3,270 bytes;
+it does not support attributing the limited admissions to a 4 KiB header cap.
+Qualification provenance now seals both switches and `METADATA_COMMIT_HINTS`;
+changing any declared switch invalidates the sealed profile.
+
+Final native source is `5ae493b815`; frozen module SHA-256 values are:
+
+- Full: `f2e533a2f080eae63b61ec4cfc3a8509883239328404ef3e49a4ef6427adc12f`
+- Compact: `811fbf6c5a3081fca2259ee4aad4e448b73fa1cf398077ea7964ee439c8027ec`
+- Observe: `6562d4dbbd85621ed1a4152e90cbd7dd4f344bd0afa9819939f892ce312b1d84`
+
+All 198 native object-store tests pass (two live-provider skips), including 43
+focused checks. Allocation-failure, malformed/tampered plan, clock, owner,
+source expiry, missing/positive slot, concurrent append, handoff and total-budget
+checks cover the protocol. The first local app attempt failed an outdated
+instrumentation assertion recognizing only `observe_read`; that report remains
+preserved separately. Final comparisons recognize fused `observe_step` and
+independently require detached GET samples. No original failed run is promoted.
+
+Final compatibility validation also passes all **525 Node tests and 25 actual
+workerd tests**: detached observation lifetime, RPC ownership, publication/header
+reuse/legacy adapter/restart, five observer tests, sixteen native R2 tests and
+mail auth/isolation/search/attachments/restart. Both preparation steps pass.
+The native R2 run includes its full collector grace period. These checks apply
+to the final compatibility code; the frozen performance runs retain their own
+recorded earlier source revisions.

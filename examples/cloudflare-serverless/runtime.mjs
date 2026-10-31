@@ -172,7 +172,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     }
     const cachePolicy=env.FOREGROUND_CACHE_POLICY==="true"?{populate:input.op!=="list"&&!(input.op==="search"&&input.exact_scan),protect:input.op==="lookup"||input.op==="search"&&!input.exact_scan,preserveProtected:!(input.op==="lookup"||input.op==="search"&&!input.exact_scan)}:undefined;
     const immutableCache=cache.forBucket?.(env.DATABASE)??cache;
-    const retainImmutable=env.READ_VIEW_CACHE_SEEDING==="true"?(request,result)=>immutableCache.admit(env.ANTFLY_INCARNATION,request,result,cachePolicy):undefined;
+    const retainImmutable=env.READ_VIEW_CACHE_SEEDING==="true"&&typeof immutableCache.admit==="function"?(request,result)=>immutableCache.admit(env.ANTFLY_INCARNATION,request,result,cachePolicy):undefined;
     let transport = cache.wrap(withCommitCoordinator(edgeCacheForEnv(env,{background:requestBackground,budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({ database: env.DATABASE }, {maxPutBytes}),physical)),
       env.COORDINATOR_BACKEND==="r2"&&["publish","compact"].includes(input.op)?preparedPublication??publicationCoordinator({objectCall:coordinator.objectCall,publicationCall:(request,body,expected)=>rpc("publicationCall",request,body,expected,readHints?.forHead(request,body))},publicationView):coordinator, collection), env.ANTFLY_INCARNATION, env.DATABASE,cachePolicy);
     if(readHints)transport=readHints.wrap(transport);
