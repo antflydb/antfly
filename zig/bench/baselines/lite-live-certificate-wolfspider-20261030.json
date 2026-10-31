@@ -11682,6 +11682,32 @@
         }
       ]
     },
+    "owner_queue_without_signal_pin": {
+      "accepted": false,
+      "build_inputs": {
+        "base_revision": "197d177f6849a47d5dee5bc76840b5928bb0b4f9",
+        "sha256": {
+          "zig/pkg/antfly-embedded/src/capi/db.zig": "3c33196a5a861d8535f2f594c7b628302c5089708773114bf1a8132d14b503a1",
+          "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "ae7471d201f6f4e867ddeb397c4af62f6c78dbbc7601ffdc85b196b9ad476fd1",
+          "zig/pkg/antfly-embedded/src/storage/db/derived/derived_worker.zig": "56cc22f8ebdd9b02800c15e910785644303a0601730830755603a1e07dea7052",
+          "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "975636bb159e04b1a8107cc50b6bb5559b63929581c22fc6af5cb1d320080c97",
+          "zig/pkg/antfly-embedded/src/storage/lite/path_lock_wait.zig": "5d413efcf6ede9cd997b333420c0e613af22991fa68aef6ea3bd6d8a770f0ab6",
+          "zig/pkg/antfly/src/capi/db_test.zig": "b1b2b8a3358c661eb56ea48ceb259e92719b6914b1ac93478ea47825ed7480fc"
+        }
+      },
+      "capi_gate": {
+        "failed": 0,
+        "leaked": 0,
+        "passed": 270,
+        "skipped": 3,
+        "unexpected_error_logs": 0
+      },
+      "phase_exit_codes": {
+        "library": 0,
+        "smoke": 1
+      },
+      "reason": "C ABI smoke rejected SIGIO disposition restoration after the last database closed. Retain io_lifetime until the owner executor has shut down."
+    },
     "queued_without_executor": {
       "accepted": false,
       "build_inputs": {
@@ -24318,6 +24344,161 @@
     }
   },
   "complete": false,
+  "issue1431_followup": {
+    "capacity_retry": {
+      "errors": [
+        "CapacityUnavailable",
+        "CapacityObservationStale"
+      ],
+      "log_sha256": "7cbb532b80c5512b0492639d32a4df7ad312fa270cd99118f60acd8d1e0f4517",
+      "persisted_progress_verified": true,
+      "status": "passed"
+    },
+    "complete": false,
+    "coordinated_proof_debug_five_second_background_cap": {
+      "native_abi_export_count": 134,
+      "observations": [
+        {
+          "observations": [
+            {
+              "admission_busy_calls": 0,
+              "applied_sequence": 373,
+              "per_worker_progress": [
+                78,
+                62,
+                77,
+                77,
+                77,
+                77,
+                57,
+                77
+              ],
+              "round": 0,
+              "target_sequence": 31,
+              "visibility_seconds": 20.71457279101014
+            },
+            {
+              "admission_busy_calls": 0,
+              "applied_sequence": 705,
+              "per_worker_progress": [
+                28,
+                37,
+                44,
+                44,
+                43,
+                43,
+                43,
+                43
+              ],
+              "round": 1,
+              "target_sequence": 615,
+              "visibility_seconds": 32.585434209089726
+            }
+          ],
+          "workers": 8
+        }
+      ],
+      "replay_window_one": "also failed deadline; not a window-size-only fix",
+      "sample": "Background coordinator waiting in path_lock_wait during LSM WAL checkpoint publication.",
+      "writers32": "failed to reach persisted target within 120 seconds; every foreground writer advanced",
+      "writers8": "passed"
+    },
+    "coordinated_proof_debug_one_second_background_cap": {
+      "library_sha256": "672601589911548e052f2e6cb35118f40ef7caa78b6d003579caa4dc6ea61056",
+      "runtime_connection_source_sha256": "7211dc46aaccd59f8e8dba19e9f72b83e5a0a06c60b569d5c8b88dfa9ddab131",
+      "writers32": {
+        "reason": "Background path queue exceeds one-second cap; foreground workers all advanced.",
+        "status": "failed",
+        "visibility_deadline_seconds": 120
+      },
+      "writers8": {
+        "observations": [
+          {
+            "admission_busy_calls": 0,
+            "applied_sequence": 401,
+            "per_worker_progress": [
+              80,
+              80,
+              80,
+              80,
+              80,
+              80,
+              65,
+              55
+            ],
+            "round": 0,
+            "target_sequence": 31,
+            "visibility_seconds": 21.34819579217583
+          },
+          {
+            "admission_busy_calls": 0,
+            "applied_sequence": 733,
+            "per_worker_progress": [
+              44,
+              43,
+              29,
+              44,
+              43,
+              44,
+              37,
+              44
+            ],
+            "round": 1,
+            "target_sequence": 633,
+            "visibility_seconds": 33.29204516718164
+          }
+        ],
+        "status": "passed",
+        "visibility_deadline_seconds": 90
+      }
+    },
+    "frozen_import_debug": {
+      "append_regression_target_reached": false,
+      "failed_thread_ordinal": 5,
+      "failure": "SQLx pool acquisition timed out during native SQL-session initialization. Reproduced on isolated clones of the four-thread prefix.",
+      "private_fixture_published": false,
+      "sample": "438/439 native SQL-session samples are inside artifact lease publication; 425 inside staging the complete allocator certificate.",
+      "status": "incomplete",
+      "threads_completed": 4
+    },
+    "full_capi_gate": {
+      "cache_loss_log_sha256": "fb5bd390fa237c297c7902a2c0e42ed79aa9b74291094b5580e2062347d7e0ad",
+      "reason": "The local .zig-cache directory disappeared during compilation; no full test gate result is accepted.",
+      "status": "retrying"
+    },
+    "negative_proof_livelock": {
+      "finding": "Unverified peer runtime opens publish index leases between detached proofs.",
+      "optimize": "debug",
+      "proofs_per_writer_max": 99,
+      "proofs_per_writer_min": 94,
+      "successful_calls_per_writer": 0,
+      "writers": 8
+    },
+    "next_candidate": "Final proof/open coordination and five-second queue cap: optimized qualification building; full CAPI retry compiling in a fresh worktree-local cache. Frozen append regression remains unqualified.",
+    "raw_log_sha256": {
+      "library-coordinated-proof-bounded-debug.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "library-coordinated-proof-bounded-debug.log": "1aedab423d7a916e1a817eddec1ab0c5389ac3d44ab04a4cef4ef6b0e27f269a",
+      "live-index-coordinated-proof-bounded-debug.exit": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865",
+      "live-index-coordinated-proof-bounded-debug.log": "97ada46df4c4b86da6da7d258f9d95e6bf3ea42679e11e09d4a2a3029f8941a4",
+      "live-index-coordinated-proof-debug-slow.log": "c1caf61d11c6b3e090d9cfe6fbe55d873b260acdf0b30614d1c6e94c50209ab9",
+      "live-index-coordinated-proof-debug32-window1.exit": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865",
+      "live-index-coordinated-proof-debug32-window1.log": "9f6968bc0ab1620b42d9c3a68a281e3e4378e58faf902e3c07b657f8e216aaad",
+      "live-index-coordinated-proof-debug32.log": "3259c46d1cbfacada6846cf56e58bcb7f868ad6be58cdab0a4333813437ee6db",
+      "live-index-coordinator-peer-diagnostics.log": "3bce8b9ee8d676e534b254e4f2e2ffe616d70869b7bee1fc73de1c81f376c427"
+    },
+    "scope": [
+      "cross-process admission starvation",
+      "allocator proof livelock during unverified peer index opens",
+      "recoverable full-text capacity admission",
+      "append instead of reuse in frozen 15-thread import"
+    ],
+    "sdk_sql_and_concurrency": {
+      "library_sha256": "672601589911548e052f2e6cb35118f40ef7caa78b6d003579caa4dc6ea61056",
+      "log_sha256": "4726734f216174c911b8460b23b65d6b05c8c35ee667b3b4ab0bd1d949a7e441",
+      "optimize": "debug",
+      "passed": 75
+    }
+  },
   "limitations": [
     "The live-certificate and short-polling prototypes fail per-worker progress requirements and are not release-qualified.",
     "Warm certificate publication adds measurable latency even when measured operations perform no allocator proof walks.",
@@ -25598,6 +25779,8 @@
     "large-graph-protected.log": "a871d1ead35cd7741ef3ae32d7ffd714de4eb4de2d44a001db0eedaa23b21e42",
     "library-jitter.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
     "library-jitter.log": "1aedab423d7a916e1a817eddec1ab0c5389ac3d44ab04a4cef4ef6b0e27f269a",
+    "library-owner-queue.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+    "library-owner-queue.log": "1aedab423d7a916e1a817eddec1ab0c5389ac3d44ab04a4cef4ef6b0e27f269a",
     "library-protected.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
     "library-protected.log": "1aedab423d7a916e1a817eddec1ab0c5389ac3d44ab04a4cef4ef6b0e27f269a",
     "library-queued.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
@@ -25647,6 +25830,8 @@
     "sdk-protected.log": "1e08322288782f0e3274561464b53ca13783aee8b68daa2b7d7ec44def71deb6",
     "smoke-jitter.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
     "smoke-jitter.log": "8f88d36aedef34749f6a7451bdbc011a2ddf660a06ddfb0ac68dd8d8606ea32b",
+    "smoke-owner-queue.exit": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865",
+    "smoke-owner-queue.log": "e78f19af9b755e0d9b7cf5ea919bb3c8576211448c4277f093b523abf7402062",
     "smoke-protected.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
     "smoke-protected.log": "e0fab1255205a2a3442130d7d2f223742979368b736a49e57cba8bacec37e8fa",
     "smoke-queued.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
@@ -25679,6 +25864,8 @@
     "warm-jitter-libraries.json": "153ae5494482d750d892d95ee01cb4babec95badb8bf046d869eb0026d19e485",
     "warm-jitter-summary.json": "a32cf61450994952b77564bb49a7dcd7147e9fa48fb9279c8d30effb06e436db",
     "warm-jitter.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+    "warm-owner-queue-driver.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "warm-owner-queue-skipped.json": "95cdeb56a837e07e1cfd5dc6f88a92e3736413c879eb82c55e47f1235cac910b",
     "warm-queued-driver.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "warm-queued-libraries.json": "26cbbe5243f5e00f48b10283cfa8280a9b91ea6b4299de7580855a7351f0d46e",
     "warm-queued-skipped.json": "eb5aeb1759a6c79aea89127ac6645f9961e0885f9bedbc07d8a172aa980d6c66"

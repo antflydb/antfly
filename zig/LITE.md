@@ -1183,9 +1183,25 @@ changed state retains the full-proof path. Allocator-only cleanup also retains
 that path so sealing does not perpetuate retirement work. Clean-close certificates
 remain compatible with older runtimes. This adds metadata hashing and catalog writes,
 without another checkpoint publication or durability barrier per transaction.
-Contended path leases use short randomized retries, capped at four milliseconds,
-to give other processes more chances between repeated peer publications. The
-configured busy timeout still bounds contention waiting.
+Contended path leases join a cancelable kernel lock wait using a bounded,
+owner-scoped executor. Missing read-only sidecars and executor exhaustion retain
+short randomized retries, capped at four milliseconds. The configured busy
+timeout bounds contention waiting; an expired deadline still permits an immediate
+uncontended acquisition after a successful detached proof.
+
+A persistent `.aflite-maintenance-<path-hash>.lock` sidecar coordinates background
+turns across processes. Unverified index-runtime opens and detached proof admission
+also participate, so opening another writer cannot continually invalidate the tip
+being proved. This coordination does not retain the path-writer lease during a
+graph walk or provider computation. Foreground publication still revalidates the
+inode, checkpoint and immutable index inputs. Background path-lease waits are
+capped at five seconds per acquisition. Like other coordination inodes, the sidecar
+must remain in place while any process may have the database open.
+
+Full-text catch-up treats `CapacityUnavailable` and `CapacityObservationStale` as
+recoverable admission failures, with bounded backoff and persisted progress after
+successful retry. These changes require a rebuilt native library; they do not
+change SDK request schemas or the public C ABI.
 
 Small records in multi-key transactions share immutable record pages. A tagged
 reference identifies a physical page and a validated record offset; large

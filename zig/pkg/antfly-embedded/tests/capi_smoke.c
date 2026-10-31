@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #if defined(__unix__) || defined(__APPLE__)
+#include <dirent.h>
 #include <signal.h>
 #include <unistd.h>
 #endif
@@ -187,6 +188,16 @@ static int run_signal_lifetime_smoke(void) {
      * owns the entire directory, so it is now safe to remove the guard. */
     snprintf(first_path, sizeof(first_path), "%s/.aflite-lease-publication.lock", directory);
     remove(first_path);
+    DIR *entries = opendir(directory);
+    if (entries) {
+        struct dirent *entry;
+        while ((entry = readdir(entries)) != NULL) {
+            if (strncmp(entry->d_name, ".aflite-maintenance-", 20) != 0) continue;
+            snprintf(first_path, sizeof(first_path), "%s/%s", directory, entry->d_name);
+            remove(first_path);
+        }
+        closedir(entries);
+    }
     if (rmdir(directory) != 0) {
         fprintf(stderr, "signal smoke directory cleanup failed: %s\n", strerror(errno));
         failed = 1;

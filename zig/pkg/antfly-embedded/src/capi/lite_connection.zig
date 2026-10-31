@@ -148,7 +148,10 @@ pub const PreparedPublication = struct {
         }
         const live_file = &root.owned_lite_backend.?.native_docstore.?.file;
         try live_file.inheritAllocatorVerification(&self.snapshot_root.owned_lite_backend.?.native_docstore.?.file);
-        if (!live_file.free_pages_verified) return error.EnrichmentWaitCanceled;
+        if (!live_file.free_pages_verified) {
+            self.owner.publication_stats.allocator_refusals +|= 1;
+            return error.EnrichmentWaitCanceled;
+        }
         return database;
     }
 
@@ -644,6 +647,10 @@ pub const Owner = struct {
     artifact_marker_sweep: @FieldType(NativeStore, "artifact_marker_sweep") = .{},
     reader_coordinator: *native.ReaderCoordinator = undefined,
     maintenance_pending: bool = false,
+    // Protected by the path gate. Nested work on this owner shares its turn;
+    // other processes cannot open unverified index runtimes during its proof.
+    maintenance_turn_lease: ?std.Io.File = null,
+    maintenance_turn_references: usize = 0,
     // Replay can move the checkpoint on every turn. Give physical storage a
     // fresh capture between such turns instead of always servicing a stale
     // pre-replay snapshot that reclamation must correctly refuse.
@@ -674,6 +681,9 @@ pub const Owner = struct {
         replay_attempts: u64 = 0,
         replay_refused: u64 = 0,
         maintenance_errors: u64 = 0,
+        maintenance_queue_timeouts: u64 = 0,
+        allocator_refusals: u64 = 0,
+        index_input_refusals: u64 = 0,
         // Detached graph-walk totals, including foreground and maintenance.
         // These survive runtime refresh and exclude lease/queue wait time.
         allocator_proof_walks: u64 = 0,
@@ -740,9 +750,16 @@ pub const Owner = struct {
         // advance the header. The probe is borrowed only by synchronous open.
         var certified: ?native.NativeFile = null;
         defer if (certified) |*file| file.close();
+        var retained_turn = false;
+        defer if (retained_turn) self.releaseMaintenanceTurnAssumeLocked();
         if (self.options.profile == .native and self.options.open_mode == .writer) {
             certified = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
-            if (try certified.?.inheritAllocatorCertificate()) options.allocator_verification_owner = &certified.?;
+            if (try certified.?.inheritAllocatorCertificate()) {
+                options.allocator_verification_owner = &certified.?;
+            } else if (certified.?.header.indexed_reclamation) {
+                retained_turn = try self.retainMaintenanceTurnAssumeLocked();
+                if (!retained_turn) return error.FileBusy;
+            }
         }
         const replacement = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, self.current);
         errdefer h.closeHandle(replacement);
@@ -883,8 +900,16 @@ pub const Owner = struct {
         const io = h.handleLockIo();
         if (native.lockWriterPathWithIo(alloc, io, self.path)) |held| return held else |err| {
             if (err != error.WouldBlock and err != error.FileBusy) return err;
-            const budget = if (h.builtin.is_test) self.test_maintenance_wait_ns orelse std.time.ns_per_s else std.time.ns_per_s;
+            // A full foreground queue can exceed one second while each caller
+            // remains inside its normal admission budget. Give publications
+            // the same default window, while bounding close-time gate waits.
+            const default_budget = 5 * std.time.ns_per_s;
+            const budget = if (h.builtin.is_test) self.test_maintenance_wait_ns orelse default_budget else default_budget;
             var held = native.waitPathLockWithIo(alloc, self.path_lock_io.io(), self.path, true, std.Io.Clock.awake.now(io).nanoseconds + budget) catch |wait_err| switch (wait_err) {
+                error.FileBusy => {
+                    self.publication_stats.maintenance_queue_timeouts +|= 1;
+                    return wait_err;
+                },
                 error.FileNotFound, error.ConcurrencyUnavailable => return err,
                 else => return wait_err,
             };
@@ -968,7 +993,10 @@ pub const Owner = struct {
         // allowing primary transactions to read the rebased checkpoint and
         // persist that completed progress. Otherwise replay repeats its own
         // output forever without advancing its durable watermark.
-        if (scope == .index) if (root.maintenance_publication) |p| if (p.index_inputs_changed) return error.EnrichmentWaitCanceled;
+        if (scope == .index) if (root.maintenance_publication) |p| if (p.index_inputs_changed) {
+            self.publication_stats.index_input_refusals +|= 1;
+            return error.EnrichmentWaitCanceled;
+        };
         if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
         var lease = (if (scope == .reclamation) native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) else self.acquireMaintenancePathLeaseAssumeLocked()) catch |err| switch (err) {
             error.FileBusy, error.WouldBlock => return error.EnrichmentWaitCanceled,
@@ -995,7 +1023,10 @@ pub const Owner = struct {
             if (file.activeCheckpoint().index_catalog_root_page != latest.activeCheckpoint().index_catalog_root_page) {
                 if (!try publication.indexInputsUnchanged(file, &latest)) {
                     publication.index_inputs_changed = true;
-                    if (scope == .index) return error.EnrichmentWaitCanceled;
+                    if (scope == .index) {
+                        self.publication_stats.index_input_refusals +|= 1;
+                        return error.EnrichmentWaitCanceled;
+                    }
                 }
             }
             try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(latest.header);
@@ -1004,7 +1035,10 @@ pub const Owner = struct {
         }
         // A changed tip invalidates a detached proof. Retry outside the gate
         // instead of falling back to a whole-file scan in this publication.
-        if ((scope == .primary or scope == .index) and !file.free_pages_verified) return error.EnrichmentWaitCanceled;
+        if ((scope == .primary or scope == .index) and !file.free_pages_verified) {
+            self.publication_stats.allocator_refusals +|= 1;
+            return error.EnrichmentWaitCanceled;
+        }
         root.maintenance_writer_lease = lease;
         root.maintenance_writer_references = 1;
     }
@@ -1153,11 +1187,65 @@ pub const Owner = struct {
         try store.file.inheritAllocatorVerification(&maintenance.file);
     }
 
+    fn acquireMaintenanceTurnGuard(self: *Owner) !?std.Io.File {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(self.path, &digest, .{});
+        const name = try std.fmt.allocPrint(alloc, ".aflite-maintenance-{s}.lock", .{std.fmt.bytesToHex(digest, .lower)});
+        defer alloc.free(name);
+        const path = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(self.path) orelse ".", name });
+        defer alloc.free(path);
+        // Keep the coordination inode in place across turns and closes: unlink
+        // could give concurrent owners different locks. Process death releases
+        // the lease automatically, without a stale persistent leader record.
+        return std.Io.Dir.cwd().createFile(h.handleLockIo(), path, .{
+            .read = true,
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.WouldBlock, error.FileBusy => null,
+            else => return err,
+        };
+    }
+
+    fn retainMaintenanceTurnAssumeLocked(self: *Owner) !bool {
+        if (self.maintenance_turn_references == 0)
+            self.maintenance_turn_lease = (try self.acquireMaintenanceTurnGuard()) orelse return false;
+        self.maintenance_turn_references += 1;
+        return true;
+    }
+
+    fn releaseMaintenanceTurnAssumeLocked(self: *Owner) void {
+        std.debug.assert(self.maintenance_turn_references != 0);
+        self.maintenance_turn_references -= 1;
+        if (self.maintenance_turn_references == 0) {
+            self.maintenance_turn_lease.?.close(h.handleLockIo());
+            self.maintenance_turn_lease = null;
+        }
+    }
+
     /// Captures one table under the connection fence. The pinned runtime owns
     /// all provider/catalog state while computation runs outside that fence.
-    /// Native writer admission below revalidates inode and checkpoint for every
-    /// short publication, including staged artifacts and index segments.
+    /// Every short publication revalidates its inode and checkpoint.
     fn maintenanceTurn(self: *Owner) !bool {
+        if (self.stopping.load(.acquire)) return false;
+        // Independent background snapshots must not repeatedly invalidate each
+        // other's index inputs between data publication and replay progress.
+        // This lease coordinates background turns only; foreground callers
+        // continue using their short path-writer leases during computation.
+        const turn_io = h.handleLockIo();
+        self.gate.mutex.lockUncancelable(turn_io);
+        const retained = self.retainMaintenanceTurnAssumeLocked() catch |err| {
+            self.gate.mutex.unlock(turn_io);
+            return err;
+        };
+        self.gate.mutex.unlock(turn_io);
+        if (!retained) return true;
+        defer {
+            self.gate.mutex.lockUncancelable(turn_io);
+            self.releaseMaintenanceTurnAssumeLocked();
+            self.gate.mutex.unlock(turn_io);
+        }
         if (self.options.profile == .native and self.maintenance_storage_pending) {
             // A physical maintenance error must remain observable without
             // preventing subsequent replay turns from making progress.
@@ -1569,6 +1657,8 @@ pub const Owner = struct {
     /// the graph walk runs with both publication locks released.
     fn verifyAllocatorAssumeLocked(self: *Owner, lease: *?native.PathWriterLock, connection: ?*Connection) !void {
         const io = h.handleLockIo();
+        if (!try self.retainMaintenanceTurnAssumeLocked()) return error.FileBusy;
+        defer self.releaseMaintenanceTurnAssumeLocked();
         const foreground = try self.refresh();
         const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
         if (needsOutcomeReconciliation(foreground)) return error.OutcomeUnknown;
@@ -1839,6 +1929,10 @@ pub const Connection = struct {
                 root = try self.owner.refresh();
             }
             if (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) {
+                // Keep foreign unverified opens from publishing index leases
+                // between the detached proof and reacquiring the writer lease.
+                if (!try self.owner.retainMaintenanceTurnAssumeLocked()) return error.FileBusy;
+                defer self.owner.releaseMaintenanceTurnAssumeLocked();
                 try self.owner.verifyAllocatorAssumeLocked(lease, self);
                 if (lease.* == null) lease.* = try self.acquirePathLeaseAssumeLocked();
                 root = try self.owner.refresh();
@@ -2064,7 +2158,12 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
             if (attempt) |held| {
                 var lease = held;
                 defer lease.close();
-                _ = try owner.refresh();
+                if (owner.refresh()) |_| {} else |err| switch (err) {
+                    // A peer proving an unverified tip owns index opening.
+                    // As with a busy path lease, initialize this runtime lazily.
+                    error.FileBusy, error.WouldBlock => {},
+                    else => return err,
+                }
             } else |err| switch (err) {
                 error.WouldBlock, error.FileBusy => {},
                 else => return err,
@@ -3594,6 +3693,84 @@ test "capi native allocator proof maintenance capture joins the bounded lease qu
     held.close();
     try std.testing.expectError(error.FileBusy, turn);
     try std.testing.expect(owner.path_lock_io.worker_threads.load(.acquire) != null);
+}
+
+test "issue1015 issue1431 native background turns coordinate across independent owners" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("background-turn-owner", 1000, .batch);
+    defer fixture.deinit();
+    const owner = fixture.connection.owner;
+    const Probe = struct {
+        captures: usize = 0,
+        fn capture(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.captures += 1;
+        }
+    };
+    var probe: Probe = .{};
+    owner.test_before_maintenance_capture = .{ .ptr = &probe, .notify = Probe.capture };
+    defer owner.test_before_maintenance_capture = null;
+    const peer = (try owner.acquireMaintenanceTurnGuard()).?;
+    const deferred = owner.maintenanceTurn();
+    peer.close(h.handleLockIo());
+    try std.testing.expect(try deferred);
+    try std.testing.expectEqual(@as(usize, 0), probe.captures);
+    _ = try owner.maintenanceTurn();
+    try std.testing.expectEqual(@as(usize, 1), probe.captures);
+}
+
+test "issue1015 issue1431 unverified peer opens yield to a detached proof turn" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("proof-turn-peer-open", 1000, .batch);
+    defer fixture.deinit();
+    const owner = fixture.connection.owner;
+    const io = h.handleLockIo();
+    {
+        // Startup maintenance may already have sealed the fixture. Publish an
+        // uncertified raw tip so this exercises proof admission, rather than
+        // the deliberately permitted certified-peer fast path.
+        var lease = try native.lockWriterPathWithIo(alloc, io, fixture.path);
+        defer lease.close();
+        var foreign = try native.NativeFile.openWithIo(alloc, io, fixture.path, .{ .externally_locked = true, .no_sync = true });
+        defer foreign.close();
+        try foreign.putCatalogRecord("uncertified-peer-tip", "changed");
+        try std.testing.expect(!try foreign.inheritAllocatorCertificate());
+    }
+    owner.gate.mutex.lockUncancelable(io);
+    const retained = owner.retainMaintenanceTurnAssumeLocked();
+    owner.gate.mutex.unlock(io);
+    try std.testing.expect(try retained);
+    var turn_held = true;
+    defer if (turn_held) {
+        owner.gate.mutex.lockUncancelable(io);
+        owner.releaseMaintenanceTurnAssumeLocked();
+        owner.gate.mutex.unlock(io);
+    };
+    // A different durability policy creates an independent owner on the same
+    // path. Opening succeeds lazily without publishing its index leases.
+    const peer = try open(fixture.path, .{ .profile = .native, .no_sync = false, .busy_timeout_ms = 1000 }, false);
+    const peer_id = api.publishHandle(peer) catch |err| {
+        h.closeHandle(peer);
+        return err;
+    };
+    defer api.antfly_db_close(peer_id);
+    const peer_owner = peer.lite_connection.?.owner;
+    try std.testing.expect(peer_owner != owner);
+    peer_owner.stopping.store(true, .release);
+    peer_owner.wake.set(io);
+    peer_owner.worker.?.join();
+    peer_owner.worker = null;
+    peer_owner.stopping.store(false, .release);
+    peer_owner.verification_cancel.requested.store(false, .release);
+    try std.testing.expect(peer_owner.current == null);
+    owner.gate.mutex.lockUncancelable(io);
+    owner.releaseMaintenanceTurnAssumeLocked();
+    owner.gate.mutex.unlock(io);
+    turn_held = false;
+    const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("after-proof-turn"), .value = .fromSlice("{}"), .is_delete = false }};
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(peer_id, &writes, writes.len, null, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 1), peer_owner.publication_stats.allocator_proof_walks);
+    try std.testing.expectEqual(@as(usize, 0), peer_owner.maintenance_turn_references);
 }
 
 test "capi native allocator proof live commits carry a checked peer certificate" {

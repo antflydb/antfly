@@ -360,6 +360,17 @@ the lock task and timer; the global debug executor cannot run concurrent tasks.
 Sidecar creation retains its inode fence. Qualification records CPU cost and
 progress for every writer rather than accepting aggregate throughput alone.
 
+A persistent, path-hashed maintenance sidecar serializes detached background
+turns across processes. Opening an uncertified revision-4 runtime and admitting
+its allocator proof also retain this turn, preventing peer index-lease opens
+from continually invalidating the captured tip. Nested work shares the turn
+within an owner; certified foreground callers retain their ordinary path-lease
+admission. Graph walks and provider computation still release the path-writer
+lease. Background publications join its queue for at most five seconds per
+acquisition, so a full round of foreground writers need not starve replay while
+close-time gate waits remain bounded. The coordination inode is never unlinked
+while an owner can still hold it.
+
 Opening an immutable artifact publishes an inode-local lease alias. These
 metadata-only commits have their own allocation policy. Mixed groups retain
 ordinary authored-write validation and batching. An unbounded owner with an
