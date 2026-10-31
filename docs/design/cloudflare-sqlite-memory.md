@@ -637,3 +637,22 @@ previous advisory-hint switch, closing an omission without relaxing any gate.
 The local performance ranges and their regressions are recorded in
 [the native design](serverless-metadata-recovery.md). No cloud resources were
 created, and the hosted gate and recovered memory error remain unqualified.
+
+
+### Detached immutable point lifetime verification
+
+The point-dependency continuation fixture now performs the same guarded workerd
+lifetime exercise on an immutable artifact GET. The reader has zero reserved
+native workspace while the GET is blocked and another job can complete. Its
+30-second logical timeout retains the point permit and caller background lifetime
+until physical settlement. An injected late `SQLITE_NOMEM` is retained with its
+matching lifecycle identity. Writer SQL/KV access remains forbidden. An older
+WASM module lacks the capability export and retains ordinary serial I/O.
+
+Final validation passes 537 Node tests, 54 workerd checks (53 standard plus mail),
+198 shared object-store checks with two live-provider skips, and 32 focused
+native checks. All 49 final local performance cases drain background work before
+collecting counters and pass with no recovered resource failures. This confirms
+accounting/error propagation for tested paths; it does not reproduce, identify
+or fix the historical hosted allocator failure. No new cloud resources were
+created. The hosted gate and historical memory error remain unresolved.

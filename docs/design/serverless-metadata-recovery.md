@@ -510,3 +510,45 @@ hosted gate pass or resolution of the live memory error is claimed.
 
 The next implementation and qualification protocol are described in
 [Bounded serving dependencies](serverless-serving-dependencies.md).
+
+
+### Bounded serving dependencies: implementation and local outcome
+
+The five opt-in features are implemented in [the serving design](serverless-serving-dependencies.md): request-owned immutable point continuations, complete immutable preparation reuse, replay-cost checkpoint scheduling, explicit version-14 small-leaf co-location, and overlapping expired warm-writer refresh/preparation. All five remain disabled by default. Shared native object-store code and immutable formats apply across providers; the scheduling integration is presently Cloudflare-specific. No new live S3/GCS performance qualification is implied.
+
+Validation passes **537 Node tests, 54 actual-workerd checks** (53 standard plus mail), **198 shared object-store tests** (two live-provider skips), and **32 focused native tests**. Native tests prove owned reuse/allocation-failure cleanup and removal of repeated tree/body reads; a one-document version-14 leaf removes the extra leaf GET after root admission. The guarded workerd point test demonstrates zero reserved reader bytes while immutable I/O is blocked, another job completing, and permit/lifetime/error retention through timeout. Old modules retain serial I/O without receiving unsupported envelope fields.
+
+Final native production source is `535f44c3ad`; subsequent native changes are test-only. Full, compact and observation SHA-256 values are respectively:
+
+- `73e468fea9bc855087f4d8775f284679ffcf4142c1d026f48c4cbc492c329872`
+- `fdcac2d36c0dcb7d6e8e7b888d3927b46564773000d1fb5a2b51a0c6caf31557`
+- `ff2b8af4395990a5d9d55ef040bcdca564d3cb2944c1c1edd93eb8c791bf9ab0`
+
+The final matrix uses clean measured integration source `a013e4c532`. Its local previous-candidate reference is `54ad367ce6`, not the separately approved official hosted control `c44896ac8c`. Each case checks exact bodies, visibility and retained counts, with the original memory/I/O/certificate limits. Final counter collection drains physical/background lifetimes and preserves recovered failures. All results are closed-loop local workerd/R2-binding experiments, not provider SLOs or a gate pass.
+
+| Warm-setup local p95, ms | 64 docs read | 64 docs write | 512 docs read | 512 docs write |
+| --- | ---: | ---: | ---: | ---: |
+| Previous candidate | 414–430 | 220–232 | 887–975 | 366–427 |
+| Current, five flags off | 446–459 | 229–265 | 907–1,924 | 395–1,452 |
+| Point continuations | 435–472 | 212–253 | 890–893 | 392–408 |
+| Replay-cost scheduling | 418–498 | 207–270 | 875–881 | 361–375 |
+| Immutable preparation reuse | 417–445 | 213–228 | 869–870 | 374–932 |
+| Inline leaf | 432–444 | 266–2,263 | 879–969 | 350–372 |
+| Writer overlap | 427–527 | 225–255 | 895–966 | 375–421 |
+| All five | 450–488 | 239–248 | 888–983 | 366–385 |
+
+All **45 final cases** passed: **4,320 reads / 1,440 writes**, four tenants, two corpus sizes and both execution orders. This includes the old-module compatibility case and distinct hot-read, idle-recovery and full-delay profiles. These profiles must not be merged into one absolute latency range.
+
+In the 512-document full-delay confirmation, flags-off read/write p95 is **917–966 / 691 ms**; all five is **883–950 / 672–676 ms**. The forward read comparison regresses and the reverse improves. In hot-read comparisons, reuse read p95 is **414–963 ms** versus **409–480 ms** off; write p95 is **222–3,007 ms** versus **255–894 ms** off. This is not a repeatable application improvement.
+
+The original 31-second idle pairs recreated writer actors: phase traces show serial cold refresh/preparation, so their **419–429 ms** overlap-profile write p95 versus **438–658 ms** off cannot establish the intended warm-overlap mechanism. A separate benchmark extension (`54109a4e4d`) keeps actors alive using data-only lab RPCs while real authority expires. It asserts stable instance IDs and acquired warm state; it does not adjust clocks, certificates, authority or capacities. Its outcome is recorded separately below.
+
+The four warm-expired cases also pass (**384 reads / 128 writes**). Flags-off write p95 is **328 / 334 ms** forward/reverse; overlap is **268 / 274 ms**, an approximately **18% reduction in both orders**. Read p95 is **423 / 473 ms** off versus **411 / 427 ms** on. Each candidate refresh overlaps **66–173 ms** of native preparation, and no finalizer starts before refresh ends. The serial controls have zero such overlap. These are local, real-time-expiry measurements in verified warm actors, not a general 18% SLO promise. Across the final main and warm-expired matrices, **49 correct cases cover 4,704 reads / 1,568 writes**.
+
+Writer overlap is therefore the only new switch with a targeted, mechanistically confirmed application gain in both orders. A next hosted experiment should isolate that switch against the same current implementation, include idle warm writers and cold reconstruction separately, preserve independent telemetry coverage, and retain the original gate control as a separate qualification comparison. The combined profile is not selected for general rollout.
+
+Both orders are retained. A 512-document flags-off forward outlier must not be used to claim a twofold gain when the reverse comparison does not reproduce it. The small-leaf reverse write outlier includes one observed local binding PUT around 2.1 seconds, with no protocol rebuild/retry; it remains in the result. Hot-cache hits are real, but the four-entry pool is shared with one-shot preparation and the workload includes twelve concurrent lookup identities; within-request continuation replay can also count a hit. These results do not establish a larger cross-request cache hit rate.
+
+The first prototype found and corrected three integration issues before final measurement: point I/O sharing metadata proof lanes and disabling native read-state reuse; the new facts-root version receiving lower immutable-hint priority than the previous format; and a BigInt metric silently omitting reuse diagnostics. Interrupted matrices, original failures and partial cases remain exploratory and explicitly preserved. No gate, resource limit or freshness threshold was relaxed.
+
+No new cloud resources were created. Existing account authentication was verified read-only. The local evidence does not justify promoting the combined profile to a hosted qualification candidate. Placement remains a separate hosted experiment because fetch placement cannot establish RPC or Durable Object location; the collector now retains bounded recognized placement headers. The historical hosted `SQLITE_NOMEM`, complete live diagnostic reconciliation, hour-long paired trials and physical cold samples remain open.

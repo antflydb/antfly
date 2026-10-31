@@ -164,3 +164,27 @@ Placement for the RPC path.
 Final counter collection also drains all tenants’ checkpoint and physical writer
 lifetimes. Recovered background failures remain in the fixture history and
 invalidate the case; this wait is outside measured request latencies.
+
+
+### Verified warm-expiry profile and results
+
+`--idle-keepalive` preserves writer instances through the requested idle period
+using data-only lab readiness RPCs. The fixture asserts identical instance IDs,
+acquired state and no recovery before measurement. It advances neither clock nor
+certificate and performs no maintenance or storage reads from those readiness
+methods. Without keepalives, workerd can reconstruct an idle actor, so an elapsed
+31-second gap alone does not demonstrate the warm-overlap path.
+
+All 49 final local cases pass exact-body, visibility, count and resource-history
+checks (4,704 reads / 1,568 writes). In the verified warm-expired writer profile,
+overlap reduces write p95 **328→268 ms** forward and **334→274 ms** reverse, about
+18% in both orders. Traces verify simultaneous refresh/preparation and finalization
+after both phases. This supports an isolated hosted overlap experiment; it does
+not establish a broad application 2× improvement. The other switches and their
+combination have mixed p95 results and remain experimental. Full tables,
+regressions, source/module identities and evidence are in
+[metadata recovery](serverless-metadata-recovery.md#bounded-serving-dependencies-implementation-and-local-outcome).
+
+Validation: 537 Node, 54 workerd, 198 shared object-store (two live-provider skips)
+and 32 focused native tests pass. All five switches remain off by default.
+No new Cloudflare resources were deployed for these experiments.

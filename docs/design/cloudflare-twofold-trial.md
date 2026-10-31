@@ -207,3 +207,28 @@ timeout and releases the WASM slot during blocked journal I/O. This does not
 resolve the historical live `SQLITE_NOMEM`. No new hosted experiment or cloud
 resource was created. Read target, complete live coverage, three hour-long
 trials and physical cold samples remain required for qualification.
+
+
+### Subsequent bounded-serving local experiments
+
+The five new serving switches are implemented and remain disabled by default.
+All 49 final local workerd/R2-binding cases pass (4,704 reads / 1,568 writes),
+including both orders, two corpus sizes, old-module fallback, hot reads, full-delay
+setup and separately verified warm-expired writers. These are not new hosted
+trials. The local reference `54ad367ce6` is a previous candidate, not the approved
+official control `c44896ac8c`.
+
+Verified warm writer overlap reduces local write p95 **328→268 ms** forward and
+**334→274 ms** reverse, approximately 18% in both orders. Traces show overlap
+and finalization after refresh. Other switches have mixed gains/regressions;
+there is no new overall twofold application result. An isolated hosted overlap
+experiment is supported by this targeted result; a combined-profile rollout is
+not. The final main source is `a013e4c532`, benchmark-only keepalive source
+`54109a4e4d`, and native production source `535f44c3ad`.
+
+See [the complete local results](serverless-metadata-recovery.md#bounded-serving-dependencies-implementation-and-local-outcome)
+and [the serving invariants](serverless-serving-dependencies.md). The historical
+hosted results and failures above remain unchanged. No new cloud resources or
+credentials were created; existing account authentication was checked read-only.
+The original hosted gate, whole-window coverage and live `SQLITE_NOMEM` remain
+open. Injected-error tests establish lifetime/error retention, not the live cause.
