@@ -355,6 +355,8 @@ joins the operating system's lock queue. A concurrent timer enforces the
 original deadline. Timeout and cancellation join the lock task before closing
 its descriptor, including when cancellation races a kernel grant. The first
 attempt still permits an uncontended acquisition after a slow allocator proof.
+Each shared storage owner supplies a lazy executor capped at two workers for
+the lock task and timer; the global debug executor cannot run concurrent tasks.
 Sidecar creation retains its inode fence. Qualification records CPU cost and
 progress for every writer rather than accepting aggregate throughput alone.
 
