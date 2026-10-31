@@ -89,7 +89,10 @@ original request deadline, execute as individual read-only callbacks and capture
 only committed state. The warm path skips journal rediscovery only when the
 owner contract is active, state is acquired and not recovering, and the existing
 25-second refresh guard is satisfied. Cold/recovering/expired paths run normal
-native recovery; clocks and certificates are never extended in JavaScript.
+native recovery. At most four pre-callback recovery continuations share the
+original request deadline and the existing 254-operation / 8 MiB read-admission
+allowance. Draining I/O, resource errors and callback failures are not retried.
+Clocks and certificates are never extended in JavaScript.
 
 Native durable commit completion installs the accepted metadata root/WAL HEAD
 in the owner before the ACK promise resolves. Thus a later captured cut includes
@@ -99,7 +102,12 @@ A read overlapping a write can linearize at its captured committed cut. No
 uncommitted preparation is installed as a visible result. Ambiguous failures
 must recover before another owner cut is admitted.
 
-Captured read leases are bound to the submitting request's monotonic anchor.
+Each fresh owner read keeps the submitting request's original wall/monotonic
+30-second bound, including an empty namespace or a WAL header too large for the
+small reusable JS lease envelope. Current-head native pin/collector protection
+still applies; the owner does not reuse these views across requests. When a
+compact reusable read lease is present, it is additionally bound to that original
+monotonic anchor.
 The original wall/monotonic and GC bounds are checked before kernel admission,
 before execution and before returning, including native cache hits that perform
 no storage I/O. No request context, live session, native pointer or I/O promise

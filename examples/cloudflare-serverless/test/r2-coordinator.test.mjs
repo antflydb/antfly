@@ -368,3 +368,11 @@ test('resident owner recovers a generic metadata commit whose durable acknowledg
  await assert.rejects(store.transaction(tx=>tx.put('value',2)));assert.equal(lose,false,'fault must follow the actual durable journal-slot PUT');assert.equal(store.acquired,false);
  assert.equal(await store.ownerRead(tx=>tx.get('value')),2);
 });
+test('resident recovery continuations keep one admission budget and never replay callbacks or resource failures',async()=>{
+ const store=storeFor(new Bucket());store.ownerServing=true;const deadline=Date.now()+30000;let attempts=0,callbacks=0,budget;
+ store.enqueue=async item=>{attempts++;assert.equal(item.deadlineMs,deadline);budget??=item.ioBudget;assert.equal(item.ioBudget,budget);assert.equal(item.ioBudget.operations,770+(attempts-1)*10);assert.equal(item.ioBudget.bytes,24*1024*1024+(attempts-1)*100);item.ioBudget.operations+=10;item.ioBudget.bytes+=100;if(attempts<3){store.recovering=true;throw Error('CoordinatorRecovering');}store.recovering=false;return item.run({get:async()=>7,getMany:async()=>[],snapshot:()=>({})});};
+ assert.equal(await store.ownerRead(async tx=>{callbacks++;return tx.get('value');},{deadlineMs:deadline,traceId:'test'}),7);
+ assert.equal(callbacks,1);assert.equal(attempts,3);
+ for(const failure of ['SQLITE_NOMEM','CoordinatorRecovering']){attempts=0;store.enqueue=async()=>{attempts++;store.recovering=failure==='SQLITE_NOMEM';throw Error(failure);};await assert.rejects(store.ownerRead(()=>1),new RegExp(failure));assert.equal(attempts,1);}
+ attempts=0;store.enqueue=async()=>{attempts++;store.recovering=true;throw Error('CoordinatorRecovering');};await assert.rejects(store.ownerRead(()=>1),/CoordinatorRecovering/);assert.equal(attempts,4);store.ioDrain=Promise.resolve();attempts=0;await assert.rejects(store.ownerRead(()=>1),/CoordinatorRecovering/);assert.equal(attempts,1);
+});

@@ -321,9 +321,18 @@ export class R2CoordinatorStore {
       if(!failure&&outcome!=="ok")throw Error("DeadlineExceeded");
     }
   }
-  ownerRead(run,{deadlineMs=this.clock()+30000,traceId}={}){
-    if(!this.ownerServing)return Promise.reject(Error("ResidentServingOwnerRequired"));
-    return this.enqueue({kind:"owner_read",priority:"interactive",deadlineMs,traceId,run:tx=>run({get:tx.get,getMany:tx.getMany,snapshot:tx.snapshot,put:()=>{throw Error("OwnerReadWriteForbidden");},delete:()=>{throw Error("OwnerReadWriteForbidden");}})});
+  async ownerRead(run,{deadlineMs=this.clock()+30000,traceId}={}){
+    if(!this.ownerServing)throw Error("ResidentServingOwnerRequired");
+    const reservedOperations=1024-254,reservedBytes=24*1024*1024,ioBudget={operations:reservedOperations,bytes:reservedBytes};
+    for(let attempt=0;attempt<4;attempt++)try{
+      return await this.enqueue({kind:"owner_read",priority:"interactive",deadlineMs,traceId,ioBudget,run:tx=>run({get:tx.get,getMany:tx.getMany,snapshot:tx.snapshot,put:()=>{throw Error("OwnerReadWriteForbidden");},delete:()=>{throw Error("OwnerReadWriteForbidden");}})});
+    }catch(error){
+      // Only native recovery that stopped BEFORE the callback can continue.
+      // A draining/resource failure or a callback's error is never replayed.
+      if(error?.message!=="CoordinatorRecovering"||!this.recovering||this.ioDrain||this.clock()>=deadlineMs)throw error;
+      try{this.onMetrics?.({event:"antfly.owner_read_recovery",trace_id:traceId,attempt:attempt+1,operations:ioBudget.operations-reservedOperations,transferred_bytes:ioBudget.bytes-reservedBytes});}catch{}
+    }
+    throw Error("CoordinatorRecovering");
   }
   commitWal(commit,{deadlineMs=Infinity,traceId,nativePlan=false,ioBudget}={}){
     return this.enqueue({kind:"commit_wal",commit,deadlineMs,traceId,nativePlan,ioBudget,priority:"interactive"});
