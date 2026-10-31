@@ -97,16 +97,11 @@ pub const FailureGroup = struct {
     hint: []const u8,
 };
 
-/// Error name to report for one repair issue: the source generation error
-/// when there is one, otherwise the last repair error.
+/// A repair attempt records the current failure in last_error. Before any
+/// repair attempt, fall back to the original generation failure.
 pub fn issueErrorCode(issue: anytype) []const u8 {
-    if (issue.generation_error.len != 0) {
-        // A later repair attempt that failed transiently is the more current
-        // signal for what to do next.
-        if (issue.last_error.len != 0 and isTransientName(issue.last_error)) return issue.last_error;
-        return issue.generation_error;
-    }
     if (issue.last_error.len != 0) return issue.last_error;
+    if (issue.generation_error.len != 0) return issue.generation_error;
     return @tagName(issue.reason);
 }
 
@@ -172,4 +167,26 @@ test "repair failure hints group by error code" {
     try std.testing.expect(groups[1].transient);
     try std.testing.expectEqualStrings(transient_hint, groups[1].hint);
     try std.testing.expectEqualStrings("fix the index enrichment config", groups[2].hint);
+}
+
+test "repair failure summary reports the latest permanent repair error" {
+    const issues = [_]struct {
+        generation_error: []const u8,
+        last_error: []const u8,
+        attempts: u64 = 1,
+        generation_attempts: u64 = 1,
+        reason: enum { enrichment_failed } = .enrichment_failed,
+    }{
+        .{ .generation_error = "ModelNotFound", .last_error = "InvalidEmbeddingResponse" },
+        .{ .generation_error = "EmbedRateLimited", .last_error = "source_document_missing" },
+        .{ .generation_error = "ModelNotFound", .last_error = "" },
+    };
+    const groups = try groupIssuesAlloc(std.testing.allocator, &issues);
+    defer std.testing.allocator.free(groups);
+    try std.testing.expectEqual(@as(usize, 3), groups.len);
+    try std.testing.expectEqualStrings("InvalidEmbeddingResponse", groups[0].error_code);
+    try std.testing.expectEqualStrings(hint("InvalidEmbeddingResponse"), groups[0].hint);
+    try std.testing.expect(!groups[1].transient);
+    try std.testing.expectEqualStrings("source_document_missing", groups[1].error_code);
+    try std.testing.expectEqualStrings("ModelNotFound", groups[2].error_code);
 }

@@ -16725,7 +16725,16 @@ pub const DB = struct {
         options: types.ArtifactRepairRunOptions,
         lease_authority: IndexRepairLeaseAuthority,
     ) anyerror!types.ArtifactRepairResult { // explicit: re-enters the artifact repair dispatch
-        var result = try self.repairIndexGenerationIssuesWithRequest(alloc, req, options, lease_authority);
+        // Operator continuations carry an artifact-ledger cursor. Generation
+        // repair has no local cursor and must retain its own request validation.
+        var generation_req = req;
+        if (req.operator_initiated and req.control == null) {
+            generation_req.cursor = null;
+            // A local artifact continuation has already dispatched rebuild.
+            // Keep force on fresh shards, whose local cursor is null.
+            if (req.cursor != null and req.cursor.?.len != 0) generation_req.force = false;
+        }
+        var result = try self.repairIndexGenerationIssuesWithRequest(alloc, generation_req, options, lease_authority);
         errdefer result.deinit(alloc);
         if (req.control != null) return result;
         // Automatic, structural (index creation catch-up) and durable-owner
@@ -16737,14 +16746,15 @@ pub const DB = struct {
             .target = .artifact,
             .index_name = index_name,
             .limit = if (req.limit == 0) @as(u32, 100) else req.limit,
+            .cursor = req.cursor,
             .operator_initiated = true,
         }, options, .acquire);
         defer enrichment.deinit(alloc);
-        mergeIndexEnrichmentRepairResult(&result, enrichment);
+        try mergeIndexEnrichmentRepairResult(alloc, &result, enrichment);
         return result;
     }
 
-    fn mergeIndexEnrichmentRepairResult(result: *types.ArtifactRepairResult, enrichment: types.ArtifactRepairResult) void {
+    fn mergeIndexEnrichmentRepairResult(alloc: Allocator, result: *types.ArtifactRepairResult, enrichment: types.ArtifactRepairResult) !void {
         result.scanned +|= enrichment.scanned;
         result.reprocessed +|= enrichment.reprocessed;
         result.repaired +|= enrichment.repaired;
@@ -16753,8 +16763,10 @@ pub const DB = struct {
         result.unsupported +|= enrichment.unsupported;
         result.unresolved +|= enrichment.unresolved;
         result.in_progress +|= enrichment.in_progress;
-        // The index target has no cursor, so remaining artifact pages are
-        // reported as remaining debt; running repair again continues them.
+        // Keep scanning after failed documents instead of restarting at the
+        // first page. The table layer wraps this local cursor with its group.
+        result.has_more = enrichment.has_more;
+        if (enrichment.next_cursor) |cursor| result.next_cursor = try alloc.dupe(u8, cursor);
         if (enrichment.debt_remaining or enrichment.has_more) result.debt_remaining = true;
     }
 
@@ -95629,6 +95641,53 @@ test "db index repair issues surface permanently failed enrichment documents" {
     var other = try db.listArtifactRepairIssuesPage(alloc, .{ .target = .index, .index_name = "missing" });
     defer other.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), other.issues.len);
+}
+
+test "db index repair continues past a failed enrichment page" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var gated = GateDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), parkedEnrichmentFailureTestOptions(&gated));
+    defer db.close();
+    try parkEnrichmentFailureForTest(&db);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"second parked document\"}" }},
+        .sync_level = .write,
+    });
+    const sequence = db.core.nextEnrichmentSequence();
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(sequence));
+    sleepNs(550 * std.time.ns_per_ms);
+    try db.runEnrichmentUntil(sequence);
+
+    var first = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .index_name = "dv_a",
+        .limit = 1,
+        .operator_initiated = true,
+    });
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), first.failed);
+    try std.testing.expect(first.has_more);
+    try std.testing.expect(first.next_cursor != null);
+
+    // The first issue remains failed. Continuing must reach the other one.
+    gated.allowAll();
+    var second = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .index_name = "dv_a",
+        .limit = 1,
+        .cursor = first.next_cursor,
+        .operator_initiated = true,
+    });
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), second.repaired);
+    try std.testing.expect(!second.has_more);
+    var remaining = try db.listArtifactRepairIssuesPage(alloc, .{ .index_name = "dv_a" });
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), remaining.issues.len);
 }
 
 test "db index repair and rebuild retry permanently failed enrichment documents" {
