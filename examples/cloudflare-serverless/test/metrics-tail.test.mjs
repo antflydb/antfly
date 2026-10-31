@@ -115,3 +115,8 @@ test('lease and writer phase diagnostics retain only fixed labels',()=>{
  const safe=sanitizeTailEvent({logs:[{message:[JSON.stringify(value),JSON.stringify(trace)]}]});assert.equal(JSON.parse(safe.logs[0].message[0]).physical.read_admission_fallback_reason,'ReadSnapshotNeedsPin');assert.equal(JSON.parse(safe.logs[1].message[0]).spans.length,5);assert.ok(JSON.parse(safe.logs[1].message[0]).spans.every(s=>s.name));
  value.physical.read_admission_fallback_reason='private arbitrary payload';assert.ok(!JSON.stringify(sanitizeTailEvent({logs:[{message:[JSON.stringify(value)]}]})).includes('private arbitrary payload'));
 });
+
+test('point dependency lifecycle and immutable reuse counters remain diagnostic evidence',()=>{
+ const value=sanitizeTailEvent({outcome:'ok',logs:[{message:[JSON.stringify({event:'antfly.point_dependency',point_dependency_gets:1,point_dependency_reserved_bytes:4096,io_draining:true,io_lifecycle_id:'01234567-0123-4567-89ab-0123456789ab'})]}]});
+ assert.ok(JSON.stringify(value).includes('antfly.point_dependency'));assert.ok(JSON.stringify(value).includes('point_dependency_gets'));
+});

@@ -89,6 +89,7 @@ export class R2CoordinatorStore {
     const authority=certified?structuredClone(this.rootOptions()):{};
     const transport=this.cache.wrap(instrumentTransport(this.rawTransport,physical),`coordinator/${this.namespace}`);
     const result=await this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{...authority,action:certified?"checkpoint_hint":"checkpoint",owner:this.owner,state,checkpoint_commits:this.checkpointCommits}},{transport,fairKey:this.namespace,priority:"maintenance",deadlineMs:Math.min(this.clock()+10000,deadlineMs),maxOperations:32,maxTransferBytes:1024*1024,onMetrics:sample=>{try{this.onMetrics?.({event:"antfly.checkpoint_hint",...sample,physical_r2:physical});}catch{}}});
+    if(result.checkpointed&&this.state?.revision===state.revision)this.replayBytes=0;
     return{done:result.checkpointed,revision:state.revision};
   }
   async native(coordinate) {
@@ -383,6 +384,7 @@ export class R2CoordinatorStore {
         const commitStarted=performance.now();
         const committed=await this.trace.span("wal_commit",()=>this.native({action:"commit_wal",wal_commit:item.commit}));
         commitMs=performance.now()-commitStarted;
+        if(this.idleCheckpoint?.replayCost)this.replayBytes=Math.min(64*1024,(this.replayBytes??0)+utf8.encode(JSON.stringify(item.commit)).byteLength);
         this.state=committed.state;this.rows.clear();this.rowBytes=0;this.rowRevision=this.state.revision;
         item.result=committed;return completed;
       }
@@ -446,6 +448,7 @@ export class R2CoordinatorStore {
         const committed = await this.native({action: "commit", commands: [...overlay].map(([key,value]) => ({kind: value === undefined ? "delete" : "put", key, value: value === undefined ? null : encode(value)}))});
         commitMs=performance.now()-commitStarted;
         this.state = committed.state;
+        if(this.idleCheckpoint?.replayCost)this.replayBytes=Math.min(64*1024,(this.replayBytes??0)+[...overlay].reduce((sum,[key,value])=>sum+utf8.encode(key).byteLength+(value?.byteLength??0),0));
         for(const [key,value]of overlay)this.remember(key,value);
         this.rowRevision=this.state.revision;
       }

@@ -71,7 +71,7 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
       const reportChildError=error=>{if(!(error instanceof ObjectStoreError)||error.status>=6){childErrorReported=true;onTransportError(error,"get");}};
       pending = Promise.resolve().then(() => batch ? executePutBatch(handler, request, body, check, batchConcurrency) : readBatch ? executeGetBatch(handler,request,check,batchConcurrency,reportChildError) : handler(request, body)).then(
         value => ({ status: 0, value }),
-        error => { if (!childErrorReported && (!(error instanceof ObjectStoreError) || error.status >= 6)) onTransportError(error, request.op); return { status: error instanceof ObjectStoreError ? error.status : /10058/.test(String(error)) ? 6 : 7, value: {} }; },
+        error => { if (!childErrorReported && (!(error instanceof ObjectStoreError) || (error.status >= 6 && error.status !== 10))) onTransportError(error, request.op); return { status: error instanceof ObjectStoreError ? error.status : /10058/.test(String(error)) ? 6 : 7, value: {} }; },
       );
       wasm.asyncify_start_unwind(stackDescriptor);
       return 0;
@@ -144,6 +144,7 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
     let ioLifecycleId, requestPtr = 0, protocolError = false, outcome = "error", failureCode = null, waitMs = 0, clockRefreshes = 0, clockRegressionMs = 0;
     const started = performance.now();
     const readStateHitsBefore=Number(wasm.antfly_host_read_state_cache_hits?.()??0),readStateExtensionsBefore=Number(wasm.antfly_host_read_state_cache_extensions?.()??0);
+    const preparedReadHitsBefore=Number(wasm.antfly_host_prepared_read_cache_hits?.()??0);
     const manifestCacheHitsBefore=Number(wasm.antfly_host_manifest_cache_hits?.()??0);
     try {
       // A different I/O context can remain a few milliseconds behind even
@@ -241,6 +242,7 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
         read_state_cache_hits: Number(wasm.antfly_host_read_state_cache_hits?.() ?? 0)-readStateHitsBefore,
         read_state_cache_extensions: Number(wasm.antfly_host_read_state_cache_extensions?.() ?? 0)-readStateExtensionsBefore,
         prepared_read_cache_bytes: wasm.antfly_host_prepared_read_cache_bytes?.() ?? 0,
+        prepared_read_cache_hits: Number(wasm.antfly_host_prepared_read_cache_hits?.() ?? 0)-preparedReadHitsBefore,
         decoded_manifest_cache_bytes: wasm.antfly_host_manifest_cache_bytes?.() ?? 0,
         working_set_rejected_growth_bytes: wasm.antfly_host_rejected_growth_bytes?.() ?? null,
         working_set_backing_failure_bytes: wasm.antfly_host_backing_failure_bytes?.() ?? null,
@@ -249,5 +251,5 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
       try { requestMetrics(metrics); } catch {}
     }
   }
-  return { request, usable: () => !poisoned && !invalidClock, memoryBytes: () => wasm.memory.buffer.byteLength, draining: () => draining };
+  return { request, readDependencyABI: wasm.antfly_host_read_dependency_abi?.()??0, usable: () => !poisoned && !invalidClock, memoryBytes: () => wasm.memory.buffer.byteLength, draining: () => draining };
 }

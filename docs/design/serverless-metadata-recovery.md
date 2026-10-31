@@ -506,3 +506,7 @@ Credentials are excluded. Guarded `make gc` was attempted after native artifacts
 were copied; it skipped cleanup because a native build was active or process
 inspection unavailable. Its guard was not bypassed. No new cloud resources,
 hosted gate pass or resolution of the live memory error is claimed.
+
+
+The next implementation and qualification protocol are described in
+[Bounded serving dependencies](serverless-serving-dependencies.md).

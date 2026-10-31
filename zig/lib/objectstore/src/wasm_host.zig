@@ -76,6 +76,7 @@ pub const Host = struct {
             6 => return error.ObjectStoreRateLimited,
             8 => return error.ObjectIoBudgetExceeded,
             9 => return error.DeadlineExceeded,
+            10 => return error.ImmutableReadDependency,
             else => return error.ObjectStoreTransportFailed,
         }
     }

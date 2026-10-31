@@ -13,6 +13,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {reserveIoBranch} from "./io-branch.mjs";
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import {immutableReadWave} from "../../zig/lib/objectstore/wasm/immutable-read-wave.mjs";
 import {readAheadBudgetFor} from "../../zig/lib/objectstore/wasm/read-ahead.mjs";
 import {edgeCacheForEnv} from "./edge-immutable-cache.mjs";
@@ -58,6 +74,7 @@ export class R2CommitCoordinator extends DurableObject {
     this.env = env;
     const instanceId=crypto.randomUUID(),owner=actorOwner(ctx.id.toString(),env.WORKER_VERSION?.id,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION);
     this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{readBatch:env.NATIVE_METADATA_READ_BATCH!=="false",owner,inlineReadSet:env.INLINE_METADATA_ROOTS==="true"?inlineReadSet(env.ANTFLY_INCARNATION):undefined,remoteCache:edgeCacheForEnv(env,{background:promise=>ctx.waitUntil(promise)}),kernel:metadataKernel,readKernel:readObservationKernel(),cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics(),actor_instance_id:instanceId}));}});
+    if(env.REPLAY_COST_CHECKPOINTS==="true"&&this.store.idleCheckpoint)this.store.idleCheckpoint.replayCost=()=>({bytes:this.store.replayBytes??0,waves:Math.ceil(Math.min(64,Math.max(0,(this.store.state?.revision??0)-this.store.idleCheckpoint.last))/4)});
     this.serviceStore = Object.create(this.store);
     this.serviceStore.transaction = run => this.transaction(run);
     this.maintenanceStore=Object.create(this.store);this.maintenanceStore.transaction=run=>this.transaction(run,{priority:"maintenance"});
@@ -306,13 +323,18 @@ export class R2CommitCoordinator extends DurableObject {
   }
   placementProbe(){return placementStorageProbe(this.env,"writer",this.ctx.id.jurisdiction??null);}
   async commitNativeWritePlan(inputs,deadline,{trace,compactWal,walWorkingBytes}) {
-    const started=performance.now();
+    const started=performance.now();let refreshing;
     try{
     await trace.span("writer_authority",()=>this.ensureAuthority());
     if(!isObjectStoreAuthority(this.authority.descriptor.mode))throw Error("CoordinatorMigrationRequired");
     const ioBudget={operations:0,bytes:0},physical={};
-    const refresh=()=>trace.span("write_refresh",()=>this.transaction(async()=>{},{deadlineMs:deadline,traceId:trace.id,ioBudget}));
-    if(!this.store.state||this.store.recovering||this.store.needsWriteRefresh())await refresh();
+    const refresh=(budget=ioBudget)=>trace.span("write_refresh",()=>this.transaction(async()=>{},{deadlineMs:deadline,traceId:trace.id,ioBudget:budget}));
+    let preparationState;
+    if(this.env.NATIVE_WRITE_OVERLAP==="true"&&this.store.state&&!this.store.recovering&&this.store.needsWriteRefresh()){
+      preparationState=structuredClone(this.store.state);
+      const branch=reserveIoBranch(ioBudget);
+      refreshing=refresh(branch.budget).finally(()=>branch.join());refreshing.catch(()=>{});
+    }else if(!this.store.state||this.store.recovering||this.store.needsWriteRefresh())await refresh();
     const transport=this.store.dataCache.wrap(edgeCacheForEnv(this.env,{background:promise=>this.ctx.waitUntil(promise),budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical)),this.env.ANTFLY_INCARNATION,{preserveProtected:this.env.FOREGROUND_CACHE_POLICY==="true"});
     let prepared,prepareAttempts=0,finalizeAttempts=0;
     for(let attempt=0;attempt<3;attempt++){
@@ -321,7 +343,7 @@ export class R2CommitCoordinator extends DurableObject {
       let wave,permit;
       if(!prepared)try{
         prepareAttempts++;
-        const request={op:"mutate",...(this.env.WAL_DEFERRED_INDEXES==="true"?{wal_deferred_indexes:true}:{}),...(this.env.WAL_PACKED_PAGES==="true"?{wal_packed_pages:true}:{}),...(this.env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(this.env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}),namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",working_set_bytes:walWorkingBytes,native_write_plan:{...(this.store.rootBackend!=="journal"?{metadata_backend:this.store.rootBackend}:{}),state:structuredClone(this.store.state),metadata_namespace:this.store.namespace,reservation_id:crypto.randomUUID()},mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))};
+        const request={op:"mutate",...(this.env.WAL_DEFERRED_INDEXES==="true"?{wal_deferred_indexes:true}:{}),...(this.env.WAL_PACKED_PAGES==="true"?{wal_packed_pages:true}:{}),...(this.env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(this.env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}),namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",working_set_bytes:walWorkingBytes,native_write_plan:{...(this.store.rootBackend!=="journal"?{metadata_backend:this.store.rootBackend}:{}),state:structuredClone(attempt===0&&preparationState?preparationState:this.store.state),metadata_namespace:this.store.namespace,reservation_id:crypto.randomUUID()},mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))};
         const options=()=>({transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-ioBudget.operations,maxTransferBytes:32*1024*1024-ioBudget.bytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{ioBudget.operations+=sample.operations;ioBudget.bytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,native_write_plan:true,...sample,physical}));}});
         if(this.env.NATIVE_WRITE_READ_AHEAD==="true")permit=readAheadBudgetFor(buildKernel,Math.min(4,buildKernel.slots.length)).tryAcquire(this.env.ANTFLY_INCARNATION);
         if(permit){
@@ -331,8 +353,9 @@ export class R2CommitCoordinator extends DurableObject {
         }
         prepared=await trace.span("native_wal_plan",()=>buildKernel.request(request,{...options(),transport:wave?.transport??transport}));
       }
-      catch(error){if(error?.message!=="FileNotFound")throw error;await refresh();continue;}
+      catch(error){if(error?.message!=="FileNotFound")throw error;if(refreshing)await refreshing;await refresh();continue;}
       finally{wave?.close();permit?.();}
+      if(refreshing)await refreshing;
       if(!prepared.__write_plan||!Array.isArray(prepared.results)||prepared.results.length!==inputs.length)throw Error("NativeWritePlanRequired");
       // Authority refreshes do not invalidate immutable preparation. The native
       // finalizer rechecks WAL/head/GC dependencies against the refreshed root;
@@ -346,7 +369,7 @@ export class R2CommitCoordinator extends DurableObject {
       return prepared.results.map((item,i)=>({...item,...(this.env.METADATA_COMMIT_HINTS==="true"?{__metadata_hint:this.store.exportRootHint()}:{}),__publication:i===0?committed.publication:{...committed.publication,enqueue:false}}));
     }
     throw Error("WalCommitContended");
-    }finally{trace.emit(this.env.LOG_METRICS==="true");}
+    }finally{if(refreshing)await Promise.allSettled([refreshing]);trace.emit(this.env.LOG_METRICS==="true");}
   }
   pruneEmbeddingCheckpointMetadata(namespace, today) {
     if (namespace !== this.env.ANTFLY_INCARNATION || !Number.isSafeInteger(today) || today < 0) throw new Error("InvalidEmbeddingCheckpointSweep");

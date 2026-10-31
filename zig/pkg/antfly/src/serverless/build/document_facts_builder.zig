@@ -280,6 +280,7 @@ pub fn publishAlloc(
         return builder.cloneArtifactRefAlloc(alloc, source_ref.?);
     var source = if (rebuild) facts.Root{ .domain = pages.domain, .policy_fingerprint = policy_hash } else previous.?;
     source.packed_records = source.packed_records or (pages.artifacts.point_read_blocks and pages.artifacts.canonical_point_bodies);
+    source.inline_leaf_format = source.inline_leaf_format or (source.packed_records and pages.artifacts.inline_fact_leaves);
     var cache = tree.Cache{ .alloc = alloc, .underlying = pages.store() };
     defer cache.deinit();
     var pending = PendingBodies{ .alloc = alloc, .pages = pages };
@@ -895,6 +896,48 @@ test "serverless document facts packed point blocks need one physical body read 
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Probe.run, .{ pages, root, docs[127].doc_id, body });
     const encoded = try artifacts.getAlloc(source.artifact_id);
     defer a.free(encoded);
+    encoded[encoded.len - 1] ^= 1;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, facts.Root.decode(encoded));
+}
+
+test "serverless document facts inline leaf removes a point dependency with explicit version and checksum" {
+    const a = std.testing.allocator;
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    var impl = try @import("../artifacts/object_store.zig").ObjectStore.initWithClient(a, memory.client(), "artifacts", "inline-leaf");
+    var artifacts = impl.artifactStore();
+    defer artifacts.deinit();
+    artifacts.canonical_point_bodies = true;
+    artifacts.point_read_blocks = true;
+    artifacts.inline_fact_leaves = true;
+    var reads: u64 = 4 * 1024 * 1024;
+    var writes: u64 = reads;
+    var pages = page_store.PageStore{ .domain = page_store.PageStore.namespaceDomain("inline-leaf"), .attempt = @splat(1), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const body = "{\"text\":\"inline\"}";
+    const docs = [_]materializer.Document{.{ .doc_id = @constCast("one"), .body = @constCast(body), .last_lsn = 1, .last_timestamp_ns = 1 }};
+    const source = try publishAlloc(a, &pages, null, &docs, null, .{}, "{}", 1);
+    defer freeRef(a, source);
+    try std.testing.expectEqual(@as(u32, 14), source.metadata_version);
+    var cache: page_store.PackReadCache = .{ .allocator = a };
+    defer cache.deinit();
+    pages.pack_cache = &cache;
+    const root = try facts.loadRoot(a, &pages, source);
+    try std.testing.expect(root.inline_leaf_format and root.directory_len != 0 and root.page.?.height == 0);
+    memory.resetOperationCount();
+    var cursor = try tree.Cursor.init(a, pages.store(), root.page, "one", null);
+    defer cursor.deinit();
+    const record = (try cursor.next()).?;
+    const restored = try facts.readRecordBodyAlloc(a, &pages, record);
+    defer a.free(restored);
+    try std.testing.expectEqualStrings(body, restored);
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
+    const encoded = try a.alloc(u8, facts.Root.packed_header_bytes + root.directory_len);
+    defer a.free(encoded);
+    @memcpy(encoded[0..facts.Root.packed_header_bytes], &root.encodePackedHeader());
+    @memcpy(encoded[facts.Root.packed_header_bytes..], cache.directory.?.bytes);
+    @memcpy(encoded[0..8], "AFDFACTD");
+    try std.testing.expectError(error.InvalidDocumentFactsRoot, facts.Root.decode(encoded));
+    @memcpy(encoded[0..8], "AFDFACTE");
     encoded[encoded.len - 1] ^= 1;
     try std.testing.expectError(error.ArtifactIntegrityMismatch, facts.Root.decode(encoded));
 }

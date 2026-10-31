@@ -13,6 +13,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {ReadDependencies} from "../../zig/lib/objectstore/wasm/read-dependencies.mjs";
+import {readAheadBudgetFor} from "../../zig/lib/objectstore/wasm/read-ahead.mjs";
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import {takeRpcData} from "./rpc-data.mjs";
 import {NativeReadPlans,withNativeReadPlan,withNativeReadPlanPermit,withNativeReadPreparation} from "./native-read-plan.mjs";
 import {PublicationReadHints} from "./publication-read-hints.mjs";
@@ -58,6 +75,39 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     };
     const deferred=[];if(env.FUSED_READS==="true"&&input.op==="lookup")requestOptions={...requestOptions,deferMetrics:emit=>deferred.push(emit)};
     try{
+      if(!readAdmission&&env.NATIVE_POINT_CONTINUATIONS==="true"&&env.COORDINATOR_BACKEND==="r2"&&input.op==="lookup"&&!input.cursor&&requestBackground&&kernel.slots?.length){
+        const deadlineMs=Date.now()+30000;
+        const fresh=prepareReadAdmission(env,input,trace,readViews?.get(env),{background:requestBackground,deadlineMs});fresh.catch(()=>{});
+        let admission;
+        const budget=readAheadBudgetFor(kernel,Math.min(4,kernel.slots.length));let ticket;
+        let release,draining=false,preparedToken,preparedHost,preparedSpent=0,usage={operations:0,transferred_bytes:0};
+        const dependencies=new ReadDependencies({deadlineMs,signal,onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.point_dependency",trace_id:trace.id,...sample}));}});
+        try{
+          const acquire=async()=>{
+            ticket=budget.acquire(env.ANTFLY_INCARNATION,{concurrent:true});
+            let timer,abort;try{release=await Promise.race([ticket.ready,new Promise((_,reject)=>{abort=()=>reject(Error("DeadlineExceeded"));timer=setTimeout(abort,Math.max(0,deadlineMs-Date.now()));signal?.addEventListener("abort",abort,{once:true});if(signal?.aborted)abort();})]);}finally{clearTimeout(timer);signal?.removeEventListener("abort",abort);}
+            release.start();
+          };
+          const executePhase=async(preparing)=>{const token=Array.from(crypto.getRandomValues(new Uint8Array(16)));for(let step=0;step<=64;step++){
+            dependencies.check();dependencies.operations=usage.operations;dependencies.transferred=usage.transferred_bytes;
+            const execute=host=>{if(preparing)preparedHost=host.poolIdentity;return run(env,input,signal,collection,host,trace,preparing?{nativePreparation:{hint:nativeReadPlans.get(env),ticket:token,spentBytes:usage.transferred_bytes},deadlineMs}:{...admission,deadlineMs:dependencies.deadlineMs,...(preparedToken?{nativeResume:{ticket:preparedToken,hostIdentity:preparedHost,spentBytes:preparedSpent}}:{})},{...requestOptions,readDependencies:dependencies,dependenciesPreparation:preparing,readHint:nativeReadPlans.get(env),onNativeMetrics:sample=>{usage.operations+=sample.operations;usage.transferred_bytes+=sample.transferred_bytes;requestOptions.onNativeMetrics?.(sample);}});};
+            const options={signal,deadlineMs:dependencies.deadlineMs,fairKey:env.ANTFLY_INCARNATION,...(!preparing&&preparedHost?{preferredHostIdentity:preparedHost}:{}),...(env.NATIVE_READ_AFFINITY==="true"?{affinityKey:env.ANTFLY_INCARNATION}:{}),onStage:sample=>trace.stage(sample)};
+            const value=pointReadLanes&&env.DIRECT_READS==="true"?await withPointReadLane(kernel,execute,options):await kernel.withHost(execute,options);
+            if(value.__read_dependency!==true){if(preparing&&value.__read_prepared){preparedToken=token;preparedSpent=value.__read_spent_bytes??0;}return value;}
+            dependencies.operations=usage.operations;dependencies.transferred=usage.transferred_bytes;
+            await trace.span("point_dependency_io",()=>dependencies.load());
+            usage.operations=dependencies.operations;usage.transferred_bytes=dependencies.transferred;
+          }
+          throw Error("ObjectIoBudgetExceeded");};
+          if(nativeReadPlans.get(env)){await acquire();await executePhase(true);dependencies.clear();release();release=null;}
+          admission=await fresh;dependencies.deadlineMs=Math.min(deadlineMs,admission.deadlineMs??Infinity);
+          if(!admission.view)return await launch(admission);
+          await acquire();return await executePhase(false);
+        }catch(error){
+          if(error.ioSettled&&release){draining=true;const id=crypto.randomUUID();if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.point_dependency",trace_id:trace.id,io_draining:true,io_lifecycle_id:id}));const task=error.ioSettled.then(()=>{},failure=>{if(env.LOG_METRICS==="true")console.error("Antfly detached point I/O failed",String(failure));}).finally(()=>{dependencies.clear();release();if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.io_settled",io_lifecycle_id:id}));});requestBackground(task);}
+          throw error;
+        }finally{if(!draining){dependencies.clear();if(release)release();else ticket?.cancel();}await Promise.allSettled([fresh]);}
+      }
       if(!readAdmission&&env.NATIVE_READ_PLAN==="true"&&env.COORDINATOR_BACKEND==="r2"&&input.op==="lookup"&&!input.cursor){
         const deadlineMs=Date.now()+30000,hint=nativeReadPlans.get(env);
         if(env.NATIVE_READ_DETACHED==="true"){
@@ -130,7 +180,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
   let lane = actorMutation?null:lanes[role];
   let recycleAtBytes = 24 * 1024 * 1024;
   let physical;
-  let preparedPublication,abortPublication,publicationStarted,emitOperationMetrics,nativeMetrics,operationSucceeded=false,publicationFinalized=false;
+  let preparedPublication,abortPublication,publicationStarted,emitOperationMetrics,nativeMetrics,operationSucceeded=false,publicationFinalized=false,readYielded=false;
   try {
     const configuredRecycle = Number(env.WASM_RECYCLE_BYTES ?? recycleAtBytes);
     if (!Number.isSafeInteger(configuredRecycle) || configuredRecycle < 4 * 1024 * 1024 || configuredRecycle > recycleAtBytes) throw new Error("InvalidHostedRecycleBudget");
@@ -176,6 +226,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     let transport = cache.wrap(withCommitCoordinator(edgeCacheForEnv(env,{background:requestBackground,budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({ database: env.DATABASE }, {maxPutBytes}),physical)),
       env.COORDINATOR_BACKEND==="r2"&&["publish","compact"].includes(input.op)?preparedPublication??publicationCoordinator({objectCall:coordinator.objectCall,publicationCall:(request,body,expected)=>rpc("publicationCall",request,body,expected,readHints?.forHead(request,body))},publicationView):coordinator, collection), env.ANTFLY_INCARNATION, env.DATABASE,cachePolicy);
     if(readHints)transport=readHints.wrap(transport);
+    if(requestOptions.readDependencies)transport=requestOptions.readDependencies.wrap(transport,{enabled:lane.readDependencyABI===1});
     if(env.COORDINATOR_BACKEND==="r2"&&!readAdmission?.legacy&&!readAdmission?.nativePlan&&!readAdmission?.nativePreparation&&["lookup","list","count","search","status","latest"].includes(input.op))transport=withReadView(transport,coordinator,env.ANTFLY_INCARNATION,{initial:readAdmission?.view,admittedAt:readAdmission?.started,retainImmutable,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}});
     if(readAdmission?.nativePlan)transport=withNativeReadPlan(transport,coordinator,env.ANTFLY_INCARNATION,{fresh:readAdmission.nativePlan.fresh,retainImmutable,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}});
     if(readAdmission?.nativePreparation)transport=withNativeReadPreparation(transport);
@@ -191,6 +242,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       ...(readAdmission?.nativeResume?{native_read_plan_mode:true,native_read_resume:readAdmission.nativeResume.ticket,native_read_spent_bytes:readAdmission.nativeResume.spentBytes}:{}),
       ...(input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"?{publication_continuations:true,publication_batch_probe:true,publication_continuation_force:env.PUBLICATION_CONTINUATION_FORCE==="true",publication_units:Number(env.PUBLICATION_UNITS??128),...(env.PUBLICATION_ADAPTIVE_SLICES==="true"?{publication_adaptive_slices:true,publication_max_units:publicationView?.posting_limit??4096}:{}),...(env.PUBLICATION_PREPARED_SLICES==="true"?{publication_prepared_slices:true}:{})}:{}),
       ...(env.INLINE_POINT_BODIES === "true"?{inline_point_bodies:true}:{}),
+      ...(env.INLINE_FACTS_LEAVES === "true"?{inline_fact_leaves:true}:{}),
       ...(env.POINT_READ_BLOCKS === "true"?{point_read_blocks:true}:{}),
       ...(env.WAL_DEFERRED_INDEXES === "true"?{wal_deferred_indexes:true}:{}),
       ...(env.WAL_PACKED_PAGES === "true"?{wal_packed_pages:true}:{}),
@@ -210,24 +262,25 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       return {json: await env.AI.run(env.EMBEDDING_MODEL, {text: request.texts}, {gateway: {id: env.AI_GATEWAY}})};
     };
     if(actorMutation){try{return await trace.span("writer_rpc",()=>takeRpcData(stub.mutateBatch({...input,...settings,__trace_id:trace.id})));}catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"mutateBatch"))throw error;return await run({...env,COORDINATOR_RPC_FALLBACK:"true"},input,signal,collection);}}
-    const {wal_deferred_indexes:ignoredDeferred,point_read_blocks:ignoredPointBlocks,wal_packed_pages:ignoredWalPacked,bounded_manifest_reads:ignoredBounded,native_write_read_ahead:ignoredReadAhead,inline_point_bodies:ignoredInline,canonical_point_bodies:ignoredCanonical,native_read_plan_mode:ignoredReadMode,native_read_state:ignoredReadState,wal_document_index:ignoredDocumentIndex,native_read_plan:ignoredReadPlan,native_read_prepare:ignoredReadPrepare,native_read_resume:ignoredReadResume,native_read_spent_bytes:ignoredReadSpent,native_write_plan:ignoredWritePlan,publication_continuations:ignoredContinuation,publication_batch_probe:ignoredPublicationProbe,publication_batch_version:ignoredBatchVersion,publication_continuation_force:ignoredForce,publication_units:ignoredUnits,publication_adaptive_slices:ignoredAdaptive,publication_max_units:ignoredMaximum,publication_prepared_slices:ignoredPrepared,compaction_probe_only:ignoredProbe,...nativeInput}=input;
+    const {wal_deferred_indexes:ignoredDeferred,point_read_blocks:ignoredPointBlocks,inline_fact_leaves:ignoredInlineLeaves,wal_packed_pages:ignoredWalPacked,bounded_manifest_reads:ignoredBounded,native_write_read_ahead:ignoredReadAhead,inline_point_bodies:ignoredInline,canonical_point_bodies:ignoredCanonical,native_read_plan_mode:ignoredReadMode,native_read_state:ignoredReadState,wal_document_index:ignoredDocumentIndex,native_read_plan:ignoredReadPlan,native_read_prepare:ignoredReadPrepare,native_read_resume:ignoredReadResume,native_read_spent_bytes:ignoredReadSpent,native_read_yield:ignoredReadYield,native_read_reuse:ignoredReadReuse,native_write_plan:ignoredWritePlan,publication_continuations:ignoredContinuation,publication_batch_probe:ignoredPublicationProbe,publication_batch_version:ignoredBatchVersion,publication_continuation_force:ignoredForce,publication_units:ignoredUnits,publication_adaptive_slices:ignoredAdaptive,publication_max_units:ignoredMaximum,publication_prepared_slices:ignoredPrepared,compaction_probe_only:ignoredProbe,...nativeInput}=input;
     const plannedCompact=env.NATIVE_COMPACTION_PLAN==="true"&&env.COORDINATOR_BACKEND==="r2"&&input.op==="compact"&&input.operation_id===undefined&&env.BATCHED_PUBLICATION!=="false";
     const plannedPublication=input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true";
     const compactDeadline=Date.now()+30000;let probeOperations=0,probeBytes=0,probeMetrics,batchRecords,batchVersion,preparedSlice=false;
-    const priorReadUsage=readAdmission?.nativeResume?.usage;
+    const priorReadUsage=readAdmission?.nativeResume?.usage??(requestOptions.readDependencies?{operations:requestOptions.readDependencies.operations,transferred_bytes:requestOptions.readDependencies.transferred,elapsed_ms:0,io_wait_ms:0,working_set_peak_bytes:0}:null);
     if(priorReadUsage&&(!Number.isSafeInteger(priorReadUsage.operations)||!Number.isSafeInteger(priorReadUsage.transferred_bytes)||priorReadUsage.operations>=1024||priorReadUsage.transferred_bytes>=32*1024*1024))throw Error("ObjectIoBudgetExceeded");
-    const executeNative=probe=>lane.request({ ...nativeInput, ...settings,...(plannedPublication&&preparedPublication?{publication_continuations:preparedPublication.format===3,publication_batch_probe:false,publication_lease:preparedPublication.lease,...(batchRecords!==undefined?{publication_records:Math.min(batchRecords,publicationView.budget),publication_batch_version:batchVersion}:{})}:{}),...(plannedCompact?{compaction_probe_only:probe,publication_lease:preparedPublication?.lease??null}:{}), bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,background:requestBackground,onIoSettled:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify(sample));},...(priorReadUsage?{maxOperations:1024-priorReadUsage.operations,maxTransferBytes:32*1024*1024-priorReadUsage.transferred_bytes}:{}),...(readAdmission?.nativePlan?{deadlineMs:readAdmission.nativePlan.deadlineMs}:readAdmission?.deadlineMs?{deadlineMs:readAdmission.deadlineMs}:{}),...(plannedCompact||plannedPublication?{deadlineMs:compactDeadline,maxOperations:1024-probeOperations,maxTransferBytes:32*1024*1024-probeBytes}:{}),...(input.exact_scan?{deadlineMs:Date.now()+5000}:{}),
+    const executeNative=probe=>lane.request({ ...nativeInput, ...settings,...(env.IMMUTABLE_PREPARED_REUSE==="true"&&lane.readDependencyABI===1?{native_read_reuse:true}:{}),...(requestOptions.readDependencies?{...(lane.readDependencyABI===1?{native_read_yield:true}:{}),native_read_state:false,native_read_plan_mode:true,native_read_plan:readAdmission?.nativeResume?null:requestOptions.readHint}:{}),...(plannedPublication&&preparedPublication?{publication_continuations:preparedPublication.format===3,publication_batch_probe:false,publication_lease:preparedPublication.lease,...(batchRecords!==undefined?{publication_records:Math.min(batchRecords,publicationView.budget),publication_batch_version:batchVersion}:{})}:{}),...(plannedCompact?{compaction_probe_only:probe,publication_lease:preparedPublication?.lease??null}:{}), bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,background:requestBackground,onIoSettled:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify(sample));},...(priorReadUsage?{maxOperations:1024-priorReadUsage.operations,maxTransferBytes:32*1024*1024-priorReadUsage.transferred_bytes}:{}),...(readAdmission?.nativePlan?{deadlineMs:readAdmission.nativePlan.deadlineMs}:readAdmission?.deadlineMs?{deadlineMs:readAdmission.deadlineMs}:{}),...(plannedCompact||plannedPublication?{deadlineMs:compactDeadline,maxOperations:1024-probeOperations,maxTransferBytes:32*1024*1024-probeBytes}:{}),...(input.exact_scan?{deadlineMs:Date.now()+5000}:{}),
       onMetrics: metrics => {
         if(probeMetrics)metrics={...metrics,operations:metrics.operations+probeMetrics.operations,transferred_bytes:metrics.transferred_bytes+probeMetrics.transferred_bytes,elapsed_ms:metrics.elapsed_ms+probeMetrics.elapsed_ms,io_wait_ms:metrics.io_wait_ms+probeMetrics.io_wait_ms,working_set_peak_bytes:Math.max(metrics.working_set_peak_bytes,probeMetrics.working_set_peak_bytes)};
         requestOptions.onNativeMetrics?.(metrics);
         if(priorReadUsage)metrics={...metrics,operations:metrics.operations+priorReadUsage.operations,transferred_bytes:metrics.transferred_bytes+priorReadUsage.transferred_bytes,elapsed_ms:metrics.elapsed_ms+priorReadUsage.elapsed_ms,io_wait_ms:metrics.io_wait_ms+priorReadUsage.io_wait_ms,working_set_peak_bytes:Math.max(metrics.working_set_peak_bytes,priorReadUsage.working_set_peak_bytes),native_read_preparation_operations:priorReadUsage.operations};
         nativeMetrics=metrics;
-        emitOperationMetrics=()=>{if (env.LOG_METRICS === "true") console.log(JSON.stringify({event: readAdmission?.nativePreparation?"antfly.read_preparation":"antfly.operation", trace_id:trace.id, op: input.op, exact_scan:input.exact_scan===true, role, ...metrics, operation_outcome:operationSucceeded?"ok":"error", operation_elapsed_ms:performance.now()-runtimeStarted, physical,
+        emitOperationMetrics=()=>{if (env.LOG_METRICS === "true") console.log(JSON.stringify({event: readAdmission?.nativePreparation||readYielded?"antfly.read_preparation":"antfly.operation", trace_id:trace.id, op: input.op, exact_scan:input.exact_scan===true, role, ...metrics, operation_outcome:operationSucceeded?"ok":"error", operation_elapsed_ms:performance.now()-runtimeStarted, physical,
           ...resources(),cache_retained_bytes: cache.retainedBytes(), wasm_linear_total_bytes: kernel?kernel.memoryBytes(): Object.values(lanes).reduce((sum, instance) => sum + (instance?.memoryBytes() ?? 0), 0)}));};
       } });
     let result;
     try{
       result=await executeNative(plannedCompact);
+      if(result.__read_dependency===true){readYielded=true;return result;}
       if(plannedPublication&&result.__publication_slice===true){preparedSlice=true;throw Error("PublicationNeedsPreparedSlice");}
       if(plannedPublication&&result.__publication_batch_records!==undefined){
         batchRecords=result.__publication_batch_records;batchVersion=result.__publication_batch_version;
@@ -247,7 +300,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     if(preparedPublication){const batch=preparedPublication.batch(),head=batch.writes.find(([key])=>key===`antfly/progress/${env.ANTFLY_INCARNATION}/HEAD`),hints=head?readHints?.forHead({op:"put",key:head[0]},head[1].body):undefined;
       if(input.op==="compact"&&input.operation_id!==undefined)await rpc("finalizeCompaction",input.operation_id,batch,result,hints);
       else await rpc("finalizePublication",batch,input.op==="publish"?{posting_quantum:result.posting_quantum,records:result.consumed_records??0,elapsed_ms:performance.now()-publicationStarted,native_elapsed_ms:nativeMetrics?.elapsed_ms,native_io_wait_ms:nativeMetrics?.io_wait_ms,operations:nativeMetrics?.operations,transferred_bytes:nativeMetrics?.transferred_bytes,working_set_peak_bytes:nativeMetrics?.working_set_peak_bytes}:undefined,hints);publicationFinalized=true;}
-    if(readAdmission?.nativePlan||readAdmission?.nativeResume){nativeReadPlans.remember(env,result.__read_plan);const{__read_plan:ignoredPlan,...publicResult}=result;result=publicResult;}
+    if(!requestOptions.dependenciesPreparation&&(readAdmission?.nativePlan||readAdmission?.nativeResume||requestOptions.readDependencies)){nativeReadPlans.remember(env,result.__read_plan);const{__read_plan:ignoredPlan,...publicResult}=result;result=publicResult;}
     if(input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"&&result.job_id&&env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.publication_progress",trace_id:trace.id,job_id:result.job_id,checkpoint_sha256:result.checkpoint_sha256,receipt_sha256:result.receipt_sha256,posting_quantum:result.posting_quantum,phase:result.phase,offset:result.offset??0,published:result.published,wal_end_lsn:result.wal_end_lsn}));
     const accepted=readAdmission?.nativePlan?await readAdmission.nativePlan.fresh:readAdmission;accepted?.confirm?.(result.visibility);
     operationSucceeded=true;return result;

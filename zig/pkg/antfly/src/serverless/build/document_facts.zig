@@ -281,6 +281,7 @@ pub const Root = struct {
     inline_records: bool = false,
     canonical_records: bool = false,
     packed_records: bool = false,
+    inline_leaf_format: bool = false,
     domain: [32]u8,
     policy_fingerprint: [32]u8,
     wal_end_lsn: u64 = 0,
@@ -298,6 +299,7 @@ pub const Root = struct {
     pub const max_encoded_bytes = packed_header_bytes + 4096;
     pub const metadata_version = 12;
     pub const packed_metadata_version = 13;
+    pub const inline_leaf_metadata_version = 14;
     pub fn eql(a: Root, b: Root) bool {
         if (!std.mem.eql(u8, &a.encode(), &b.encode())) return false;
         const left = [_]?tree.Ref{a.page} ++ a.pending_pages ++ [_]?tree.Ref{a.audit_page};
@@ -307,7 +309,7 @@ pub const Root = struct {
     }
     pub fn encode(self: Root) [encoded_bytes]u8 {
         var out = @as([encoded_bytes]u8, @splat(0));
-        @memcpy(out[0..8], if (self.packed_records) "AFDFACTD" else if (self.canonical_records) "AFDFACTC" else if (self.inline_records) "AFDFACTB" else "AFDFACTA");
+        @memcpy(out[0..8], if (self.inline_leaf_format) "AFDFACTE" else if (self.packed_records) "AFDFACTD" else if (self.canonical_records) "AFDFACTC" else if (self.inline_records) "AFDFACTB" else "AFDFACTA");
         @memcpy(out[16..48], &self.domain);
         @memcpy(out[48..80], &self.policy_fingerprint);
         std.mem.writeInt(u64, out[80..88], self.wal_end_lsn, .little);
@@ -339,19 +341,21 @@ pub const Root = struct {
         return out;
     }
     pub fn decode(bytes: []const u8) !Root {
-        const packed_format = bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "AFDFACTD");
+        const leaf_format = bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "AFDFACTE");
+        const packed_format = leaf_format or (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "AFDFACTD"));
         const header_size: usize = if (packed_format) packed_header_bytes else encoded_bytes;
         const legacy = bytes.len == 512 and (std.mem.eql(u8, bytes[0..8], "AFDFACT3") or std.mem.eql(u8, bytes[0..8], "AFDFACT4"));
-        if (!legacy and (bytes.len < header_size or bytes.len > max_encoded_bytes or (!std.mem.eql(u8, bytes[0..8], "AFDFACT4") and !std.mem.eql(u8, bytes[0..8], "AFDFACT5") and !std.mem.eql(u8, bytes[0..8], "AFDFACT6") and !std.mem.eql(u8, bytes[0..8], "AFDFACT7") and !std.mem.eql(u8, bytes[0..8], "AFDFACT8") and !std.mem.eql(u8, bytes[0..8], "AFDFACT9") and !std.mem.eql(u8, bytes[0..8], "AFDFACTA") and !std.mem.eql(u8, bytes[0..8], "AFDFACTB") and !std.mem.eql(u8, bytes[0..8], "AFDFACTC") and !std.mem.eql(u8, bytes[0..8], "AFDFACTD")))) return error.InvalidDocumentFactsRoot;
+        if (!legacy and (bytes.len < header_size or bytes.len > max_encoded_bytes or (!std.mem.eql(u8, bytes[0..8], "AFDFACT4") and !std.mem.eql(u8, bytes[0..8], "AFDFACT5") and !std.mem.eql(u8, bytes[0..8], "AFDFACT6") and !std.mem.eql(u8, bytes[0..8], "AFDFACT7") and !std.mem.eql(u8, bytes[0..8], "AFDFACT8") and !std.mem.eql(u8, bytes[0..8], "AFDFACT9") and !std.mem.eql(u8, bytes[0..8], "AFDFACTA") and !std.mem.eql(u8, bytes[0..8], "AFDFACTB") and !std.mem.eql(u8, bytes[0..8], "AFDFACTC") and !std.mem.eql(u8, bytes[0..8], "AFDFACTD") and !leaf_format))) return error.InvalidDocumentFactsRoot;
         const directory_len: usize = if (packed_format) std.mem.readInt(u32, bytes[816..820], .little) else 0;
         if (!legacy and (directory_len > 4096 or bytes.len != header_size + directory_len)) return error.InvalidDocumentFactsRoot;
         if (bytes[8] > (if (legacy) @as(u8, 31) else 63) or !std.mem.allEqual(u8, bytes[9..16], 0) or
             !std.mem.allEqual(u8, bytes[if (legacy) @as(usize, 472) else @as(usize, 536)..if (legacy) @as(usize, 512) else encoded_bytes], 0)) return error.InvalidDocumentFactsRoot;
         if (packed_format and !std.mem.allEqual(u8, bytes[820..packed_header_bytes], 0)) return error.InvalidDocumentFactsRoot;
         var root = Root{
-            .inline_records = std.mem.eql(u8, bytes[0..8], "AFDFACTB") or std.mem.eql(u8, bytes[0..8], "AFDFACTC") or std.mem.eql(u8, bytes[0..8], "AFDFACTD"),
-            .canonical_records = std.mem.eql(u8, bytes[0..8], "AFDFACTC") or std.mem.eql(u8, bytes[0..8], "AFDFACTD"),
-            .packed_records = std.mem.eql(u8, bytes[0..8], "AFDFACTD"),
+            .inline_leaf_format = leaf_format,
+            .inline_records = leaf_format or std.mem.eql(u8, bytes[0..8], "AFDFACTB") or std.mem.eql(u8, bytes[0..8], "AFDFACTC") or std.mem.eql(u8, bytes[0..8], "AFDFACTD"),
+            .canonical_records = leaf_format or std.mem.eql(u8, bytes[0..8], "AFDFACTC") or std.mem.eql(u8, bytes[0..8], "AFDFACTD"),
+            .packed_records = packed_format or std.mem.eql(u8, bytes[0..8], "AFDFACTD"),
             .domain = bytes[16..48].*,
             .policy_fingerprint = bytes[48..80].*,
             .wal_end_lsn = std.mem.readInt(u64, bytes[80..88], .little),
@@ -386,7 +390,7 @@ pub const Root = struct {
         }
         if (directory_len != 0) {
             const page = root.page orelse return error.InvalidDocumentFactsRoot;
-            if (page.height == 0 or page.bytes != directory_len) return error.InvalidDocumentFactsRoot;
+            if ((!leaf_format and page.height == 0) or page.bytes != directory_len) return error.InvalidDocumentFactsRoot;
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes[header_size..], &digest, .{});
             if (!std.mem.eql(u8, &digest, &page.digest)) return error.ArtifactIntegrityMismatch;
@@ -976,7 +980,7 @@ pub fn readStoredBodyAlloc(alloc: Allocator, pages: *page_store.PageStore, ref: 
 /// Validate immutable identity and format without fetching the root body.
 /// An overlay-only lookup may skip base I/O, never its declared source checks.
 pub fn validateRootSource(source: refs.ArtifactRef) !artifacts.UploadScope {
-    if (source.kind != .document_facts or !((source.metadata_version == Root.packed_metadata_version and source.byte_len >= Root.packed_header_bytes and source.byte_len <= Root.max_encoded_bytes) or ((source.metadata_version == 3 or source.metadata_version == 4) and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == 6 or source.metadata_version == 7 or source.metadata_version == 8 or source.metadata_version == 9 or (source.metadata_version == 10 or source.metadata_version == 11 or source.metadata_version == Root.metadata_version)) and source.byte_len == Root.encoded_bytes)))
+    if (source.kind != .document_facts or !(((source.metadata_version == Root.packed_metadata_version or source.metadata_version == Root.inline_leaf_metadata_version) and source.byte_len >= Root.packed_header_bytes and source.byte_len <= Root.max_encoded_bytes) or ((source.metadata_version == 3 or source.metadata_version == 4) and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == 6 or source.metadata_version == 7 or source.metadata_version == 8 or source.metadata_version == 9 or (source.metadata_version == 10 or source.metadata_version == 11 or source.metadata_version == Root.metadata_version)) and source.byte_len == Root.encoded_bytes)))
         return error.InvalidDocumentFactsRoot;
     try artifacts.validateSha256ArtifactIdentity(source.artifact_id, source.checksum);
     return (try artifacts.uploadScopeFromArtifactId(source.artifact_id)) orelse return error.InvalidDocumentFactsRoot;
@@ -1004,6 +1008,7 @@ pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.Art
         11 => "AFDFACTB",
         12 => "AFDFACTC",
         13 => "AFDFACTD",
+        14 => "AFDFACTE",
         else => return error.InvalidDocumentFactsRoot,
     };
     if (!std.mem.eql(u8, bytes[0..8], magic)) return error.InvalidDocumentFactsRoot;
@@ -1030,7 +1035,7 @@ pub fn publishRoot(alloc: Allocator, pages: *page_store.PageStore, root: Root) !
     published.directory_len = 0;
     var directory: ?tree.Page = null;
     defer if (directory) |*page| page.deinit(alloc);
-    if (root.packed_records) if (root.page) |ref| if (ref.height != 0 and ref.bytes <= 4096) {
+    if (root.packed_records) if (root.page) |ref| if ((root.inline_leaf_format or ref.height != 0) and ref.bytes <= 4096) {
         directory = try tree.readPage(alloc, pages.store(), ref);
         published.directory_len = @intCast(directory.?.bytes.len);
     };
@@ -1044,7 +1049,7 @@ pub fn publishRoot(alloc: Allocator, pages: *page_store.PageStore, root: Root) !
     const id = try body.identity(root.domain);
     const owned_id = try alloc.dupe(u8, &id);
     errdefer alloc.free(owned_id);
-    return .{ .kind = .document_facts, .artifact_id = owned_id, .checksum = try alloc.dupe(u8, id[7..71]), .byte_len = bytes.len, .metadata_version = if (root.packed_records) Root.packed_metadata_version else if (root.canonical_records) Root.metadata_version else if (root.inline_records) 11 else 10 };
+    return .{ .kind = .document_facts, .artifact_id = owned_id, .checksum = try alloc.dupe(u8, id[7..71]), .byte_len = bytes.len, .metadata_version = if (root.inline_leaf_format) Root.inline_leaf_metadata_version else if (root.packed_records) Root.packed_metadata_version else if (root.canonical_records) Root.metadata_version else if (root.inline_records) 11 else 10 };
 }
 
 pub fn retainRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.ArtifactRef, retained: *std.StringHashMapUnmanaged(void)) !void {

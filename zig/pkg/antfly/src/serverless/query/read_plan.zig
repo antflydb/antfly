@@ -38,6 +38,9 @@ pub const Plan = struct {
     }
 
     pub fn prepare(self: Plan, a: A, namespace: []const u8, id: []const u8, pages: *PageStore) !Prepared {
+        return self.prepareCached(a, namespace, id, pages, null);
+    }
+    pub fn prepareCached(self: Plan, a: A, namespace: []const u8, id: []const u8, pages: *PageStore, retained: ?*PreparedCache) !Prepared {
         if (self.format != 1 or !std.mem.eql(u8, &self.domain, &PageStore.namespaceDomain(namespace)) or
             self.source.kind != .document_facts or self.source.byte_len > facts.Root.max_encoded_bytes or
             self.source.artifact_id.len > 256 or self.source.checksum.len != 64) return error.InvalidNativeReadPlan;
@@ -53,6 +56,7 @@ pub const Plan = struct {
         }
         const root = try facts.loadRoot(a, pages, self.source);
         if (!std.mem.eql(u8, &root.domain, &self.domain)) return error.InvalidNativeReadPlan;
+        if (retained) |reusable| if (try reusable.get(a, namespace, id, root)) |prepared| return prepared;
         var cache = tree.Cache{ .alloc = a, .underlying = pages.store() };
         defer cache.deinit();
         var cursor = try tree.Cursor.init(a, cache.store(), root.page, id, null);
@@ -106,7 +110,8 @@ pub const Prepared = struct {
 pub const PreparedCache = struct {
     pub const max_entries = 4;
     pub const max_bytes = 256 * 1024;
-    const Entry = struct { token: [16]u8, domain: [32]u8, prepared: Prepared };
+    const Entry = struct { token: [16]u8, domain: [32]u8, prepared: Prepared, reusable: bool = false };
+    hits: u64 = 0,
     entries: [max_entries]?Entry = @splat(null),
     next: usize = 0,
     bytes: usize = 0,
@@ -144,9 +149,36 @@ pub const PreparedCache = struct {
         self.next = (self.next + 1) % max_entries;
         return true;
     }
+    /// Same bounded allocation pool as one-shot preparation. A copied semantic
+    /// root selects immutable bytes; fresh live authority and overlay still win.
+    pub fn get(self: *PreparedCache, a: A, namespace: []const u8, id: []const u8, root: facts.Root) !?Prepared {
+        for (self.entries) |slot| if (slot) |entry| {
+            if (!entry.reusable or !std.mem.eql(u8, &entry.domain, &PageStore.namespaceDomain(namespace)) or !std.mem.eql(u8, entry.prepared.id, id) or !entry.prepared.root.eql(root)) continue;
+            var copy = entry.prepared;
+            copy.id = try a.dupe(u8, entry.prepared.id);
+            errdefer a.free(copy.id);
+            copy.body = if (entry.prepared.body) |body| try a.dupe(u8, body) else null;
+            self.hits += 1;
+            return copy;
+        };
+        return null;
+    }
+    pub fn remember(self: *PreparedCache, a: A, namespace: []const u8, value: Prepared) !bool {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&PageStore.namespaceDomain(namespace));
+        hash.update(&value.root.encode());
+        hash.update(value.id);
+        const digest = hash.finalResult();
+        const token: [16]u8 = digest[0..16].*;
+        if (!try self.put(a, namespace, token, value)) return false;
+        for (&self.entries) |*slot| if (slot.*) |*entry| {
+            if (std.mem.eql(u8, &entry.token, &token)) entry.reusable = true;
+        };
+        return true;
+    }
     pub fn take(self: *PreparedCache, namespace: []const u8, id: []const u8, token: [16]u8) ?Prepared {
         for (&self.entries) |*slot| if (slot.*) |entry| {
-            if (!std.mem.eql(u8, &entry.token, &token) or !std.mem.eql(u8, &entry.domain, &PageStore.namespaceDomain(namespace)) or !std.mem.eql(u8, entry.prepared.id, id)) continue;
+            if (entry.reusable or !std.mem.eql(u8, &entry.token, &token) or !std.mem.eql(u8, &entry.domain, &PageStore.namespaceDomain(namespace)) or !std.mem.eql(u8, entry.prepared.id, id)) continue;
             slot.* = null;
             self.bytes -= size(entry.prepared);
             return entry.prepared;
@@ -213,4 +245,31 @@ test "serverless native read plan cache owns bytes and bounds tickets by namespa
     try std.testing.expectEqual(null, cache.take("docs", "a", @splat(0)));
     cache.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+}
+
+test "serverless native read plan immutable reuse owns bytes and binds exact semantic roots" {
+    const a = std.testing.allocator;
+    var cache: PreparedCache = .{};
+    defer cache.deinit(a);
+    var body = [_]u8{'v'};
+    const value: Prepared = .{ .id = @constCast("one"), .fact = null, .root = .{ .domain = PageStore.namespaceDomain("docs"), .policy_fingerprint = @splat(0) }, .body = &body };
+    try std.testing.expect(try cache.remember(a, "docs", value));
+    body[0] = 'x';
+    for (0..2) |_| {
+        var copy = (try cache.get(a, "docs", "one", value.root)).?;
+        defer copy.deinit(a);
+        try std.testing.expectEqualStrings("v", copy.body.?);
+        copy.body.?[0] = 'z';
+    }
+    var other = value.root;
+    other.wal_end_lsn = 1;
+    try std.testing.expectEqual(null, try cache.get(a, "docs", "one", other));
+    try std.testing.expectEqual(null, try cache.get(a, "other", "one", value.root));
+    try std.testing.expectEqual(null, try cache.get(a, "docs", "two", value.root));
+    try std.testing.expect(try cache.put(a, "docs", @splat(1), value));
+    var ticket = cache.take("docs", "one", @splat(1)).?;
+    ticket.deinit(a);
+    var again = (try cache.get(a, "docs", "one", value.root)).?;
+    again.deinit(a);
+    try std.testing.expect(cache.bytes <= PreparedCache.max_bytes);
 }

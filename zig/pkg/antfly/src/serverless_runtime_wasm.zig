@@ -44,6 +44,10 @@ fn prepareServingScope(bucket: []const u8, prefix: []const u8) void {
     }
 }
 
+export fn antfly_host_read_dependency_abi() u32 {
+    return 1;
+}
+
 export fn antfly_host_manifest_cache_hits() u64 {
     return decoded_manifests.hits;
 }
@@ -52,6 +56,9 @@ export fn antfly_host_manifest_cache_bytes() usize {
 }
 export fn antfly_host_prepared_read_cache_bytes() usize {
     return prepared_reads.bytes;
+}
+export fn antfly_host_prepared_read_cache_hits() u64 {
+    return prepared_reads.hits;
 }
 export fn antfly_host_read_state_cache_bytes() usize {
     return read_states.bytes;
@@ -139,8 +146,9 @@ const host_io_vtable: std.Io.VTable = blk: {
 };
 const host_io: std.Io = .{ .userdata = null, .vtable = &host_io_vtable };
 pub fn requestAdditional(raw: []const u8) ![]u8 {
-    const envelope = try std.json.parseFromSlice(struct { working_set_bytes: usize = 20 * 1024 * 1024 }, wasm_allocator, raw, .{ .ignore_unknown_fields = true });
+    const envelope = try std.json.parseFromSlice(struct { working_set_bytes: usize = 20 * 1024 * 1024, op: []const u8 = "", native_read_yield: bool = false }, wasm_allocator, raw, .{ .ignore_unknown_fields = true });
     defer envelope.deinit();
+    if (envelope.value.native_read_yield and !std.mem.eql(u8, envelope.value.op, "lookup")) return error.InvalidNativeReadPlan;
     const maximum = envelope.value.working_set_bytes;
     if (maximum < 4096 or maximum > 20 * 1024 * 1024) return error.InvalidHostedWorkingSetBudget;
     var working = try @import("serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(wasm_allocator, .{ .max_working_set_bytes = maximum });
@@ -153,6 +161,7 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
         backing_failure = working.largest_backing_failure;
     }
     const result = executeAdditional(working.allocator(), raw) catch |err| {
+        if (err == error.ImmutableReadDependency and envelope.value.native_read_yield) return wasm_allocator.dupe(u8, "{\"__read_dependency\":true}");
         if (err == error.OutOfMemory and working.limit_exceeded) return error.HostedWorkingSetBudgetExceeded;
         return err;
     };
@@ -169,6 +178,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         inline_point_bodies: bool = false,
         canonical_point_bodies: bool = false,
         point_read_blocks: bool = false,
+        inline_fact_leaves: bool = false,
         wal_packed_pages: bool = false,
         wal_deferred_indexes: bool = false,
         bounded_manifest_reads: bool = false,
@@ -178,6 +188,8 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         native_read_state: bool = false,
         wal_document_index: bool = false,
         native_read_prepare: ?[16]u8 = null,
+        native_read_reuse: bool = false,
+        native_read_yield: bool = false,
         native_read_resume: ?[16]u8 = null,
         native_read_spent_bytes: u64 = 0,
         native_read_plan: ?@import("serverless/query/read_plan.zig").Plan = null,
@@ -277,6 +289,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     artifacts.inline_point_bodies = req.inline_point_bodies;
     artifacts.canonical_point_bodies = req.canonical_point_bodies;
     artifacts.point_read_blocks = req.point_read_blocks;
+    artifacts.inline_fact_leaves = req.inline_fact_leaves;
     defer artifacts.deinit();
     const manifest_prefix = try std.fmt.allocPrint(a, "{s}/manifests", .{req.prefix});
     defer a.free(manifest_prefix);
@@ -554,11 +567,14 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
                     .remaining_read_bytes = &read_allowance,
                     .remaining_write_bytes = &no_writes,
                 };
-                prepared_read = plan.prepare(a, req.namespace, req.doc_id, &pages) catch |err| switch (err) {
+                prepared_read = plan.prepareCached(a, req.namespace, req.doc_id, &pages, if (req.native_read_reuse) &prepared_reads else null) catch |err| switch (err) {
                     error.FileNotFound => null, // stale immutable hint, never authority
                     else => return err,
                 };
             }
+            if (req.native_read_reuse) if (prepared_read) |value| {
+                _ = try prepared_reads.remember(wasm_allocator, req.namespace, value);
+            };
             if (req.native_read_prepare) |ticket| {
                 const retained = if (prepared_read) |value| try prepared_reads.put(wasm_allocator, req.namespace, ticket, value) else false;
                 return std.json.Stringify.valueAlloc(a, .{ .__read_prepared = retained, .__read_spent_bytes = max_read_bytes - read_allowance }, .{});
