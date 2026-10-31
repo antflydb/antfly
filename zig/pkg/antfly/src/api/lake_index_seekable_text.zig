@@ -2281,7 +2281,11 @@ test "external lake admitted directories evict independently of the corpus heap 
     var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
     defer cache.deinit();
     cache.decoded.max_entries = 1;
-    var memory: local.sql_memory_budget = .{ .backing = a, .limit = 16 * 1024 };
+    // Twelve live Owner shells (plus their duplicated artifact/checksum
+    // strings) now cost ~1.4KB each; keep enough headroom above that fixed
+    // per-source cost that the loop admits all twelve while still proving
+    // the directory payload itself is excluded from this budget.
+    var memory: local.sql_memory_budget = .{ .backing = a, .limit = 20 * 1024 };
     const capability: Read = .{ .store = store, .cache = .{ .cache = &cache, .scope = @splat(3), .context = .{ .io = std.testing.io } }, .context = .{ .io = std.testing.io }, .cancellation = .none };
     var first: ?Owner.DirectoryPin = null;
     defer if (first) |*pin| pin.release();
