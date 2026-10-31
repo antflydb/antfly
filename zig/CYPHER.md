@@ -5051,3 +5051,33 @@ The existing public and retained-owner sparse-planning campaigns enforce
 one-anchor equality seeks for `9007199254740994`, including alongside unrelated
 sparse domains; these checks prevent a conservative conversion rule from
 silently replacing a valid index seek with a primary scan.
+
+Predicate/visibility count qualification (`56e4ac1dd4`, `445d7655e1`):
+
+- All 533 core tests pass in ReleaseFast. The focused Debug count suite passes
+  ten cases; portable retained counts pass in Debug and ReleaseFast, including
+  wide predicate counts at 1 MiB and post-write reserved records with filtering.
+  Projection, scan callback, graph callback and runtime error-identity gates
+  pass. Final native CLI builds pass all 71 steps; all five retained-query tests
+  and thirteen transport tests pass with zero leaks.
+- Both authenticated document/relational count campaigns pass at 1 MiB and
+  4 MiB for direct counts, constant predicates, scalar predicates and inline
+  constraints. Effective-filter readers pass at 8 MiB, including true boolean
+  property values, physical-budget exhaustion and a fully hidden population
+  with a failing scalar predicate. The DOUBLE equality/index regression and
+  affected SQL/property and visibility campaigns pass on the final executable.
+  Replicated-owner queries and both producer-postimage variants also pass.
+  Direct wide-property count peaks remain 13,912 bytes (document) and 11,862
+  bytes (relational), with 32 physical anchors and the correct count of 16.
+- A separate 4,096-row fixture measures five authenticated count samples per
+  principal and storage mode. For the filtered reader (2,048 visible rows),
+  document peak statement memory falls from 36,046 to 12,092 bytes; relational
+  peak falls from 37,528 to 13,004 bytes. Relational median latency falls from
+  114.86 to 66.59 ms, about 42% in this fixture. Document timing is essentially
+  flat (92.43 versus 94.93 ms); this measurement does not claim a document
+  latency improvement. Unfiltered medians are 68.33/66.12 ms (document) and
+  73.53/71.49 ms (relational), before/after respectively. These are local
+  fixture measurements, not general throughput guarantees.
+
+`origin/main` was fetched before these changes and was already included through
+`f91c9c0e46`; no additional merge or generated API changes were required.
