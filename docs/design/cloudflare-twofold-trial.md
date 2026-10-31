@@ -138,3 +138,34 @@ postmortem captures, lifecycle failures and cleanup inventories. Manifest SHA-25
 Credential files are excluded; the pre-cleanup scan found no disposable token
 values in 335 report/source/log files. Original local and historical hosted
 closures remain separate and unchanged.
+
+
+## Local follow-up before another deployment
+
+Shared native changes now bound speculative windows to the WASM transport,
+repair checkpoints from fresh native certificates without changing strict GC,
+avoid obsolete facts roots for fresh WAL points, and accept optional physical
+commit locations only after native frame/floor/owner/end validation. The final
+60-case component matrix passes 240 observations; 32-entry recovery at 100 ms
+binding delay falls from 1,225–1,327 ms / 37 GETs to about 310 ms / four GETs.
+
+All twelve local app cases pass correctness, but they do not establish another
+twofold gain. At 512 documents/tenant and 100 ms delay, read p95 ranges are
+939–1,000 ms control, 992–1,655 ms current and 902–934 ms with opt-in hints.
+The smaller workload has hint regressions. These are local closed-loop cases,
+not the hosted gate; no new profile is promoted on their basis.
+
+Bounded pipelined evidence retrieval completes the historical eight-source
+replay within five minutes, but still fails six source reconciliations. A
+separate explicitly synthetic complete fixture passes all eight sources in
+7m44s under the unchanged ten-minute budget. Positive both-plane preflight,
+retained failed startup attempts and explicit RPC data-group disposal are now
+implemented for the next rehearsal. They have not been proven to fix live
+export startup or the historical `SQLITE_NOMEM`.
+
+[The native design](serverless-metadata-recovery.md) contains the full performance
+ranges, invariants and final module hashes; [the memory investigation](cloudflare-sqlite-memory.md)
+separates throughput, startup evidence and allocator qualification. No additional
+Cloudflare resources were created for this follow-up. The hosted read target,
+complete live coverage, three hour-long trials and physical cold samples remain
+unqualified; another deployment should follow a justified candidate selection.

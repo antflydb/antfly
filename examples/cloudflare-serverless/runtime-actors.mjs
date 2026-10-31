@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {takeRpcData} from "./rpc-data.mjs";
 import {placementStorageProbe} from "./placement-probe.mjs";
 import {readerKernel,buildKernel,sharedCache,kernelMetrics} from "./kernels.mjs";
 import {CriticalPath} from "./trace.mjs";
@@ -77,8 +78,8 @@ class RuntimeActor extends DurableObject {
  perform(input,collection,signal,trace,readAdmission){
   const env=this.runtimeEnv,stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION);
   if(input.op==="collect")return collect(env,(request,token)=>this.runtime.run(env,request,signal,token,undefined,trace),input.job_id);
-  if(input.op==="collect_metadata")return stub.collectMetadata(input.job_id,{scheduled:input.scheduled});
-  if(input.op==="migrate_coordinator")return stub.migrateFromSqlite();
+  if(input.op==="collect_metadata")return takeRpcData(stub.collectMetadata(input.job_id,{scheduled:input.scheduled}));
+  if(input.op==="migrate_coordinator")return takeRpcData(stub.migrateFromSqlite());
   return this.runtime.run(env,input,signal,collection,undefined,trace,readAdmission);
  }
 }

@@ -591,3 +591,28 @@ both-plane evidence, cancellation and resource-failure rejection. The hosted
 memory error remains unresolved until a new complete live capture covers the
 original workload without recovered resource failures. No cloud resources were
 created for these local experiments.
+
+
+RPC result ownership also covers maintenance admission/completion, metadata
+collection/migration, mail session/directory/message/attachment/outbox DTOs and
+both auth-service forwarding layers. HTTP fetch and streamed responses keep their
+existing ownership contract. A regression checks the actual pipelined RPC promise
+and result together, without a manual disposal step hiding a missing release.
+
+Window reconciliation now reports an unexpected HTTP invocation only for an
+actual canonical attempt absent from the ledger. Missing ledger attempts still
+fail with `ObserverPhysicalAttemptMissing`, including unacknowledged transports;
+no reconciliation acceptance criterion is relaxed. Tests assert both directions.
+The original historical report remains unchanged, including its older labels.
+
+Final validation passes 515 Node tests and 24 actual-workerd tests: one RPC
+ownership test, one advisory-cursor test, five observer tests, all sixteen native
+R2 tests and the mail integration. The mail run exercises auth, mailbox isolation,
+native search, attachments and restart without the prior RPC-disposal warning.
+The expected invalid-password warning remains part of that test. The native R2
+suite also exercises a full 60-second collector grace period. The shared native
+object-store suite remains 192 passed / two live-provider skips, with 38 focused
+native checks passing. Guarded cache GC was attempted when disk space became low
+and skipped because a native build was active or process inspection unavailable;
+the guard was not bypassed. Final modules, native test binary, logs and control
+source had already been frozen outside build caches.

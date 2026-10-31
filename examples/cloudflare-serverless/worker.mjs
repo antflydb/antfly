@@ -65,7 +65,7 @@ async function background(env,input){
  if(env.COORDINATOR_BACKEND==="r2"&&env.BUILDERS)return takeRpcData(env.BUILDERS.getByName(runtimeName(env.ANTFLY_INCARNATION,0)).execute(input));
  if(input.op==="collect")return collect(env,(request,token)=>run(env,request,undefined,token),input.job_id);
  const stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION);
- return input.op==="collect_metadata"?stub.collectMetadata(input.job_id,{scheduled:input.scheduled}):stub.migrateFromSqlite();
+ return input.op==="collect_metadata"?takeRpcData(stub.collectMetadata(input.job_id,{scheduled:input.scheduled})):takeRpcData(stub.migrateFromSqlite());
 }
 
 async function readJson(request,reservation) {
@@ -91,21 +91,21 @@ async function enqueue(env, kind = "publish", job_id, delaySeconds = 0, admissio
   if (!env.MAINTENANCE) return false;
   const stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION);
   if(kind==="publish"&&env.COORDINATOR_BACKEND==="r2"){
-    try{admission??=job_id?{id:job_id,enqueue:true}:await stub.requestPublication(force);}catch(error){if(!unsupportedRpc(error,"requestPublication"))throw error;}
+    try{admission??=job_id?{id:job_id,enqueue:true}:await takeRpcData(stub.requestPublication(force));}catch(error){if(!unsupportedRpc(error,"requestPublication"))throw error;}
     if(admission&&!admission.enqueue)return true;
   }
   let ticket;
   if(env.COORDINATOR_BACKEND==="r2"&&managedMaintenance.has(kind)){
-    try{ticket=continuation?await stub.advanceMaintenance(kind,continuation,job_id):await stub.requestMaintenance(kind,job_id);}catch(error){if(!unsupportedRpc(error,continuation?"advanceMaintenance":"requestMaintenance"))throw error;}
+    try{ticket=continuation?await takeRpcData(stub.advanceMaintenance(kind,continuation,job_id)):await takeRpcData(stub.requestMaintenance(kind,job_id));}catch(error){if(!unsupportedRpc(error,continuation?"advanceMaintenance":"requestMaintenance"))throw error;}
     if(ticket&&!ticket.enqueue)return true;
   }
   try{await env.MAINTENANCE.send({incarnation:env.ANTFLY_INCARNATION,...(env.ANTFLY_TENANT?{tenant:env.ANTFLY_TENANT}:{}),...(ticket?{maintenance:{id:ticket.id,step:ticket.step}}:{}),...(kind==="publish"?(admission?{kind,publication_id:admission.id}:{}):{kind,job_id})},{delaySeconds});}
-  catch(error){if(admission)await stub.abandonPublication(admission.id).catch(()=>{});if(ticket)await stub.abandonMaintenance(kind,ticket).catch(()=>{});throw error;}
+  catch(error){if(admission)await takeRpcData(stub.abandonPublication(admission.id)).catch(()=>{});if(ticket)await takeRpcData(stub.abandonMaintenance(kind,ticket)).catch(()=>{});throw error;}
   return true;
 }
 async function continueMaintenance(env,message,kind,result){
  if(result.has_more){if(!await enqueue(env,kind,result.job_id,result.delay_seconds??0,undefined,false,message.body.maintenance))throw new Error("maintenance queue is not configured");}
- else if(message.body.maintenance)await env.COMMITS.getByName(env.ANTFLY_INCARNATION).finishMaintenance(kind,message.body.maintenance);
+ else if(message.body.maintenance)await takeRpcData(env.COMMITS.getByName(env.ANTFLY_INCARNATION).finishMaintenance(kind,message.body.maintenance));
 }
 export default {
   maintenanceDispatch: "queue",
@@ -135,7 +135,7 @@ export default {
       if (args.op === "prune_checkpoints") return Response.json(await pruneEmbeddingCheckpoints(env));
       if(args.op==="compact_status"){
         if(env.COORDINATOR_BACKEND!=="r2")throw Error("CompactionReceiptsRequireR2");
-        return Response.json(await env.COMMITS.getByName(env.ANTFLY_INCARNATION).compactionStatus(args.operation_id),env.WORKER_VERSION?{headers:{"X-Antfly-Version":env.WORKER_VERSION.id}}:undefined);
+        return Response.json(await takeRpcData(env.COMMITS.getByName(env.ANTFLY_INCARNATION).compactionStatus(args.operation_id)),env.WORKER_VERSION?{headers:{"X-Antfly-Version":env.WORKER_VERSION.id}}:undefined);
       }
       if(args.op==="compact"&&args.operation_id!==undefined&&env.COORDINATOR_BACKEND!=="r2")throw Error("CompactionReceiptsRequireR2");
       if (args.op === "collect_metadata" || args.op === "migrate_coordinator") {
@@ -193,7 +193,7 @@ export default {
           await scheduledTenant({scheduledTime:message.body.scheduled_time},env);
           message.ack();continue;
         }
-        if(message.body.maintenance&&!await env.COMMITS.getByName(env.ANTFLY_INCARNATION).validMaintenance(message.body.kind,message.body.maintenance,message.body.job_id)){message.ack();continue;}
+        if(message.body.maintenance&&!await takeRpcData(env.COMMITS.getByName(env.ANTFLY_INCARNATION).validMaintenance(message.body.kind,message.body.maintenance,message.body.job_id))){message.ack();continue;}
         if (["collect_metadata", "migrate_coordinator"].includes(message.body.kind)) {
           if (message.body.kind === "collect_metadata" && !message.body.job_id) {message.ack();continue;}
           const result = await background(env,{op:message.body.kind,job_id:message.body.job_id});
@@ -215,13 +215,13 @@ export default {
           message.ack(); continue;
         }
         let publication=message.body.publication_id;const stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION);
-        if(publication){try{if(!await stub.validPublication(publication)){message.ack();continue;}}catch(error){if(!unsupportedRpc(error,"validPublication"))throw error;publication=undefined;}}
+        if(publication){try{if(!await takeRpcData(stub.validPublication(publication))){message.ack();continue;}}catch(error){if(!unsupportedRpc(error,"validPublication"))throw error;publication=undefined;}}
         const trace=new CriticalPath({id:publication,scope:"publication"});trace.publicationId=publication;
         let result;try{result = await run(env, { op: "publish" },undefined,undefined,trace);}finally{trace.emit(env.LOG_METRICS==="true");}
         publishing = false;
         if (result.has_more) {
           if (!await enqueue(env,"publish",publication)) throw new Error("maintenance queue is not configured");
-        } else if (publication && (await stub.finishPublication(publication,result.wal_end_lsn)).has_more) {
+        } else if (publication && (await takeRpcData(stub.finishPublication(publication,result.wal_end_lsn))).has_more) {
           if(!await enqueue(env,"publish",publication))throw new Error("maintenance queue is not configured");
         } else if (env.EMBEDDING_MODEL) {
           const enriched = await run(env, {op: "enrich"});
@@ -234,7 +234,7 @@ export default {
       } catch (error) {
         console.error("Antfly publication deferred", String(error));
         if (publishing && publicationFailureReducesBudget(error)) {
-          await env.COMMITS.getByName(env.ANTFLY_INCARNATION).lowerPublicationBudget(Number(env.PUBLICATION_RECORDS ?? 16));
+          await takeRpcData(env.COMMITS.getByName(env.ANTFLY_INCARNATION).lowerPublicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)));
         }
         message.retry({ delaySeconds: 10 });
       }
@@ -253,7 +253,7 @@ export default {
 
 async function scheduledTenant(controller,env){
     if (env.COORDINATOR_MIGRATION_REQUIRED === "true") {
-      const status = await env.COMMITS.getByName(env.ANTFLY_INCARNATION).migrationStatus();
+      const status = await takeRpcData(env.COMMITS.getByName(env.ANTFLY_INCARNATION).migrationStatus());
       if (!["none", "active"].includes(status.phase)) await enqueue(env, "migrate_coordinator");
       if (status.phase !== "active") return;
     }

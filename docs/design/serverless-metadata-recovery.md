@@ -309,9 +309,10 @@ correct without it. The actual-workerd test forbids writer SQL/KV, verifies priv
 field removal and native acceptance, then recreates all isolates and verifies a
 correct cold read with no retained cursor.
 
-The final native 32-entry cold/expired metadata-only experiment at 100 ms storage
-delay reduces 37 GETs to four and about 1,220–1,319 ms to 306–307 ms. An advanced
-checkpoint is unchanged at about 307 ms. These are component dependency-depth
+The final 60-case native matrix verifies all 240 alternating observations. At
+32 entries of lag / 100 ms storage delay, cold/expired recovery reduces 37 GETs
+to four and 1,225–1,327 ms to about 310 ms. An advanced checkpoint is unchanged
+at about 308 ms. These are component dependency-depth
 measurements, not an app or hosted SLO. S3/GCS clients can use the same native
 proof protocol with serial transport fallback; no new live-provider performance
 result is claimed.
@@ -321,7 +322,7 @@ unresolved document actually needs it. Fresh WAL updates, tombstones and resumed
 point plans avoid the obsolete base root; base-backed misses still validate it.
 Source format, identity, domain, visibility and pin checks remain. Alternating
 100 ms binding-delay tests save one GET for fresh updates/deletes (about
-1,112 → 1,012 ms); stable and absent documents retain their required reads.
+1,118 → 1,014–1,025 ms); stable and absent documents retain their required reads.
 This does not by itself halve end-to-end read latency.
 
 Native implementation is `66263e40d9`; final full/compact/observe module hashes are
@@ -332,3 +333,37 @@ Frozen final copies are in `dist/qualification/next-serving-final/modules` under
 the Cloudflare example. The shared object-store suite passes 192 tests with two
 live-provider cases skipped; 38 focused native checks pass. Full application
 comparisons remain separate from these component results.
+
+
+### Full app comparison of this increment
+
+Twelve actual-workerd cases compare the frozen previous candidate `e8591354d3`
+with JavaScript `318428f4b5` and native `66263e40d9`, in both orders with unchanged
+capacities. Four tenants × 64 or 512 documents, eight concurrent rounds/case,
+1,152 fenced measured reads and 384 writes all pass exact-body/count/visibility
+checks. This is a closed-loop local dependency experiment, not the original
+hosted offered workload or cold-isolate gate.
+
+| Workload / p95 | Previous candidate | Current | Current + advisory hints |
+| --- | ---: | ---: | ---: |
+| 64 documents, 50 ms binding delay, read | 466–476 ms | 457–475 ms | 490–585 ms |
+| 64 documents, 50 ms binding delay, write | 223–647 ms | 238–309 ms | 261–947 ms |
+| 512 documents, 100 ms binding delay, read | 939–1,000 ms | 992–1,655 ms | 902–934 ms |
+| 512 documents, 100 ms binding delay, write | 705–779 ms | 720–980 ms | 699–754 ms |
+
+These results do **not** establish another twofold application improvement.
+Advisory hints remain opt-in. The first-order large current case regresses;
+its slow reads include 940–969 ms point-kernel queue waits followed by 0–1 ms
+cache-hit native execution. Other requests spend 825 ms in native I/O. This is
+different from the selected hosted zero-queue traces. Split pre-I/O observation
+continuations and reusable immutable point preparation remain possible follow-ups
+where those request-specific phases justify them, not measured improvements here.
+
+Two cases start the measured counter interval with one existing writer I/O
+operation; all final role counters are zero and recorded resource-code arrays
+are empty. Counters are diagnostic snapshots, not complete live resource evidence.
+The later maintenance/mail RPC ownership completion is integration-tested
+separately and is not attributed to these frozen app timings. Reports, bundles,
+module copies and the 60-case metadata matrix are preserved under the example's
+`dist/qualification/next-*`; `dist/next-final-app-results.json` summarizes the app
+cases. Historical failed/prototype reports remain separate.

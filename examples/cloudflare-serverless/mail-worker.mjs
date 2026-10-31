@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {takeRpcData} from "./rpc-data.mjs";
 import { boundedBytes, digest, address, uuid, objectPrefix } from "./mail-core.mjs";
 const publicMessage = (value) =>
   value
@@ -63,7 +64,7 @@ export default {
     };
     const reply = (body, status = 200) => withCookies(response(body, status));
     try {
-      const result = await env.AUTH_SERVICE.session([...request.headers]);
+      const result = await takeRpcData(env.AUTH_SERVICE.session([...request.headers]));
       cookies = result.cookies;
       const session = result.session;
       if (!session) return reply({ error: "SignInRequired" }, 401);
@@ -74,16 +75,16 @@ export default {
       if (url.pathname === "/api/me" && request.method === "GET") return reply(session);
       if (url.pathname === "/mail/messages" && request.method === "GET")
         return reply(
-          publicPage(await stub.list(mailbox.id, url.searchParams.get("cursor") ?? ""))
+          publicPage(await takeRpcData(stub.list(mailbox.id, url.searchParams.get("cursor") ?? "")))
         );
       if (url.pathname === "/mail/search" && request.method === "GET")
-        return reply(publicPage(await stub.search(mailbox.id, url.searchParams.get("q"))));
+        return reply(publicPage(await takeRpcData(stub.search(mailbox.id, url.searchParams.get("q")))));
       const match = /^\/mail\/messages\/([a-f0-9-]{36})(?:\/attachments\/(\d{1,2}))?$/.exec(
         url.pathname
       );
       if (match && request.method === "GET") {
         if (match[2]) {
-          const part = await stub.attachment(mailbox.id, match[1], Number(match[2]));
+          const part = await takeRpcData(stub.attachment(mailbox.id, match[1], Number(match[2])));
           if (!part) return reply({ error: "NotFound" }, 404);
           return withCookies(
             new Response(part.bytes, {
@@ -98,11 +99,11 @@ export default {
             })
           );
         }
-        const message = await stub.message(mailbox.id, match[1]);
+        const message = await takeRpcData(stub.message(mailbox.id, match[1]));
         return message ? reply(publicMessage(message)) : reply({ error: "NotFound" }, 404);
       }
       if (url.pathname === "/mail/outbox" && request.method === "GET")
-        return reply(await stub.outboundList(mailbox.id, url.searchParams.get("cursor") ?? ""));
+        return reply(await takeRpcData(stub.outboundList(mailbox.id, url.searchParams.get("cursor") ?? "")));
       if (url.pathname === "/mail/outbox" && request.method === "POST") {
         const body = JSON.parse(
           new TextDecoder().decode(await boundedBytes(request.body, 600 * 1024))
@@ -114,7 +115,7 @@ export default {
           return reply({ error: "InvalidOutgoingMail" }, 400);
         const mail = { to: body.to, subject: body.subject, text: body.text, from: mailbox.address };
         if (body.reply_to) {
-          const prior = await stub.message(mailbox.id, body.reply_to);
+          const prior = await takeRpcData(stub.message(mailbox.id, body.reply_to));
           if (!prior) return reply({ error: "NotFound" }, 404);
           mail.to = prior.from;
           if (
@@ -123,13 +124,13 @@ export default {
           )
             mail.headers = { "In-Reply-To": prior.message_id, References: prior.message_id };
         }
-        const queued = await stub.enqueue(mailbox.id, body.id, mail);
+        const queued = await takeRpcData(stub.enqueue(mailbox.id, body.id, mail));
         await hint(env, mailbox.id, "send", body.id);
         return reply({ id: queued.id, state: queued.state }, 202);
       }
       const outbox = /^\/mail\/outbox\/([a-f0-9-]{36})$/.exec(url.pathname);
       if (outbox && request.method === "GET") {
-        const row = await stub.outbound(mailbox.id, outbox[1]);
+        const row = await takeRpcData(stub.outbound(mailbox.id, outbox[1]));
         return row ? reply(row) : reply({ error: "NotFound" }, 404);
       }
       return reply({ error: "NotFound" }, 404);
@@ -147,7 +148,7 @@ export default {
   async email(message, env) {
     const to = address(message.to),
       from = message.from === "" ? "" : address(message.from),
-      mailbox = await env.AUTH_SERVICE.recipient(to);
+      mailbox = await takeRpcData(env.AUTH_SERVICE.recipient(to));
     if (!mailbox) {
       message.setReject("Unknown recipient");
       return;
@@ -166,7 +167,7 @@ export default {
       onlyIf: { etagDoesNotMatch: "*" },
       httpMetadata: { contentType: "message/rfc822" },
     });
-    await actor(env, mailbox.id).receive(mailbox.id, { id, sha256: checksum, key, to, from });
+    await takeRpcData(actor(env, mailbox.id).receive(mailbox.id, { id, sha256: checksum, key, to, from }));
     await hint(env, mailbox.id, "ingest", id);
   },
   async queue(batch, env) {
@@ -184,10 +185,10 @@ export default {
         const stub = actor(env, body.mailbox),
           result =
             body.kind === "ingest"
-              ? await stub.ingest(body.mailbox, body.id)
+              ? await takeRpcData(stub.ingest(body.mailbox, body.id))
               : body.kind === "send"
-                ? await stub.dispatch(body.mailbox, body.id)
-                : await stub.publish(body.mailbox);
+                ? await takeRpcData(stub.dispatch(body.mailbox, body.id))
+                : await takeRpcData(stub.publish(body.mailbox));
         if (result.done === false) await hint(env, body.mailbox, "publish");
         message.ack();
       } catch {
@@ -197,9 +198,9 @@ export default {
   },
   async scheduled(_controller, env) {
     const failures = [];
-    for (const mailbox of await env.AUTH_SERVICE.mailboxes()) {
+    for (const mailbox of await takeRpcData(env.AUTH_SERVICE.mailboxes())) {
       try {
-        const pending = await actor(env, mailbox).pending(mailbox);
+        const pending = await takeRpcData(actor(env, mailbox).pending(mailbox));
         for (const id of pending.inbound) await hint(env, mailbox, "ingest", id);
         for (const id of pending.outbound) await hint(env, mailbox, "send", id);
         if (pending.publish) await hint(env, mailbox, "publish");

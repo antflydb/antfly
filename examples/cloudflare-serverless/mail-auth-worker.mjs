@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {takeRpcData} from "./rpc-data.mjs";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import {
   createWorkersAuth,
@@ -169,13 +170,13 @@ export default class AuthService extends WorkerEntrypoint {
     return this.actor().fetch(request);
   }
   session(headers) {
-    return this.actor().session(headers);
+    return takeRpcData(this.actor().session(headers));
   }
   recipient(to) {
-    return this.actor().recipient(to);
+    return takeRpcData(this.actor().recipient(to));
   }
   mailboxes() {
-    return this.actor().mailboxes();
+    return takeRpcData(this.actor().mailboxes());
   }
   async queue(batch) {
     for (const message of batch.messages) {
@@ -184,7 +185,7 @@ export default class AuthService extends WorkerEntrypoint {
         continue;
       }
       try {
-        await this.actor().dispatch(message.body.id);
+        await takeRpcData(this.actor().dispatch(message.body.id));
         message.ack();
       } catch {
         message.retry({ delaySeconds: 60 });
@@ -192,7 +193,7 @@ export default class AuthService extends WorkerEntrypoint {
     }
   }
   async scheduled() {
-    for (const id of await this.actor().retryAuthMail())
+    for (const id of await takeRpcData(this.actor().retryAuthMail()))
       await this.env.AUTH_MAIL_QUEUE.send({ kind: "auth-mail", id });
   }
 }

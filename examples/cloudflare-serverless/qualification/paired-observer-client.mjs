@@ -78,7 +78,7 @@ async function reconcileWindowCatalogs(first,second,scope){
   from=to+1;
  }
  if(from!==second.timeframe.to+1)failures.push('ObserverWindowScopeInvalid');
- if(scope.ledger){const l=scope.ledger;if(l.schema!==1||l.overflow||!Array.isArray(l.attempts))failures.push('ObserverLedgerIncomplete');else{const ids=new Set();for(const a of l.attempts){const id=attemptIdentity(a.id);if(!id||ids.has(id)||a.finished_at==null||!attempts.has(id))failures.push('ObserverPhysicalAttemptMissing');ids.add(id);if(a.status>=200&&a.status<300&&a.version_id!==scope.version)failures.push('ObserverResponseVersionMismatch');}if(attempts.size!==ids.size||[...attempts.keys()].some(k=>!ids.has(k)))failures.push('ObserverUnexpectedHttpInvocation');}}
+ if(scope.ledger){const l=scope.ledger;if(l.schema!==1||l.overflow||!Array.isArray(l.attempts))failures.push('ObserverLedgerIncomplete');else{const ids=new Set();for(const a of l.attempts){const id=attemptIdentity(a.id);if(!id||ids.has(id)||a.finished_at==null||!attempts.has(id))failures.push('ObserverPhysicalAttemptMissing');ids.add(id);if(a.status>=200&&a.status<300&&a.version_id!==scope.version)failures.push('ObserverResponseVersionMismatch');}if([...attempts.keys()].some(k=>!ids.has(k)))failures.push('ObserverUnexpectedHttpInvocation');}}
  return{schema:2,qualification:false,evidence_layout:'window-v1',source:scope.source,timeframe:second.timeframe,terminals,native_terminals:native,physical_attempts:scope.ledger?.attempts?.length??null,outcomes,resource_failures:resources,windows,complete:failures.length===0,failures:[...new Set(failures)]};
 }
 
