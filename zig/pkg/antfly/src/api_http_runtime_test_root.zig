@@ -96,6 +96,8 @@ test {
     _ = @import("api/sql_memory_owner.zig");
     _ = @import("api/lake_artifact_ranges.zig");
     _ = @import("api/lake_index_text_statistics.zig");
+    _ = @import("api/lake_index_page_mutations.zig");
+    _ = @import("api/lake_index_text_directory.zig");
     _ = @import("api/lake_index_seekable_text.zig");
     _ = @import("api/lake_index_text_opening_pack.zig");
 }
