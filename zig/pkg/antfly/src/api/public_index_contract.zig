@@ -115,6 +115,8 @@ pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
             std.mem.eql(u8, field, "source_artifact_name") or
             std.mem.eql(u8, field, "template") or
             std.mem.eql(u8, field, "distance_metric") or
+            std.mem.eql(u8, field, "algorithm") or
+            std.mem.eql(u8, field, "leann") or
             std.mem.eql(u8, field, "mem_only") or
             std.mem.eql(u8, field, "embedder") or
             std.mem.eql(u8, field, "summarizer") or
@@ -438,8 +440,11 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
         else if (std.mem.eql(u8, field, "embedder") or
             std.mem.eql(u8, field, "summarizer") or
             std.mem.eql(u8, field, "chunker") or
-            std.mem.eql(u8, field, "execution"))
+            std.mem.eql(u8, field, "execution") or
+            std.mem.eql(u8, field, "leann"))
             value == .object
+        else if (std.mem.eql(u8, field, "algorithm"))
+            value == .string and (std.mem.eql(u8, value.string, "hbc") or std.mem.eql(u8, value.string, "leann"))
         else
             isString(value),
         .graph => if (std.mem.eql(u8, field, "max_edges_per_document"))

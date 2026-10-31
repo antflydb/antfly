@@ -7192,6 +7192,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.filesystem_capacity.",
             "storage.generation_publication.",
             "storage.hbc_adapter.",
+            "storage.leann_store.",
             "storage.hierarchy_navigation.",
             "storage.index_manager_vopr.",
             "storage.internal_keys.",

@@ -2,12 +2,14 @@
 
 ## Status
 
-`lib/vectorindex/src/leann.zig` implements LEANN
-([arXiv:2506.08276](https://arxiv.org/abs/2506.08276)) as a standalone index
-in `antfly_vector_index` (exported as `vectorindex.leann`). It has unit tests
-and a benchmark. It is **not yet selectable** as a table index: HBC remains
-the only dense `embeddings` implementation. [Integration](#integration-plan)
-lists the work needed to change that.
+Dense `embeddings` indexes accept `algorithm: "leann"` (default `"hbc"`)
+with optional `leann` tuning (`max_degree`, `quantizer`, `search_ef`,
+`bound_scale`, `batch_size`). The algorithm is in
+`lib/vectorindex/src/leann.zig`; the table integration is described in
+[Table integration](#table-integration). Not yet supported for LEANN indexes:
+shard splits, remote dense storage, native index backups (backups use the
+logical path), and re-embedding from text instead of stored embeddings
+([Remaining work](#remaining-work)).
 
 ## Overview
 
@@ -273,29 +275,79 @@ Guidance:
   CPU it suits batch or offline retrieval. The paper reports ~2.5 s on an
   RTX 4090 with Contriever.
 
-## Integration plan
+## Table integration
 
-1. **API.** Add `algorithm: hbc | leann` (default `hbc`) to
-   `EmbeddingsIndexConfig` in `specs/openapi/antfly/indexes.yaml`, plus an
-   optional `leann` block (`max_degree`, `pq_subspaces`, `rerank_ratio`,
-   `batch_size`). Reject `leann` with `external: true` or `sources`, since the
-   server must be able to re-embed a document from its field or template.
-   Run `make generate`.
-2. **EmbeddingSource.** Implement recompute as: node id → document key →
-   render the index's field/template → embedder batch call. Put a bounded
-   hot-embedding cache in front, and give it a per-query deadline and
-   cancellation, since a slow embedder now sits on the read path.
-3. **Storage.** Persist `serialize()` output as an index generation file next
-   to HBC's, with the node-id → key map in the index namespace. Inserts and
-   deletes go through the existing derived-replay path; the graph is
-   rewritten at checkpoint.
-4. **Build and ownership.** Build from the enrichment stream, then drop the
-   vectors. Only the Raft leader builds or rebuilds (on the delete-fraction
-   threshold), then publishes the generation; replicas load it rather than
-   rebuilding, so results stay identical across replicas.
-5. **Query path.** Route `embeddings` searches on a `leann` index to
-   `Index.search`, map ids to keys, and feed the existing fusion and filter
-   code. Pre-filters need a filter hook in the traversal (not yet in the
-   module).
-6. **Splits.** A shard split rebuilds both children from re-embedded
-   documents, or recomputes the PQ codes and graph from the parent's text.
+```json
+{"type": "embeddings", "field": "body", "embedder": {...},
+ "algorithm": "leann", "leann": {"quantizer": "rabitq", "max_degree": 30}}
+```
+
+- **Config.** `specs/openapi/antfly/indexes.yaml` adds `DenseIndexAlgorithm`
+  and `LeannIndexConfig`. `public_index_contract.zig` admits the fields, and
+  `translateEmbeddingsIndexConfigJsonWithOptions` (managed_embedder.zig)
+  validates them and writes normalized `"algorithm":"leann","leann":{...}`
+  into the internal config, so the config hash covers every knob. A `leann`
+  block without `algorithm: "leann"`, or LEANN on a sparse index, is rejected.
+- **Where it plugs in.** A LEANN index is still a `dense_vector` index: the
+  producers, derived replay, vector-id mapping, query planning, post-filters,
+  hydration and paging are shared with HBC. The index manager opens the HBC
+  adapter as usual and attaches a `LeannStore`
+  (`pkg/antfly-embedded/src/storage/leann_store.zig`). The adapter then
+  routes every write, delete, search, metadata lookup, `stats` and `sync`
+  to LEANN, and the HBC tree underneath stays empty. HBC's native posting
+  sidecar and WAL are not enabled for LEANN indexes.
+- **LeannStore.** Maps the manager's u64 vector ids and metadata keys to
+  LEANN node ids. The first 256 vectors are served by exact search, then the
+  graph is built from them and the buffered vectors are dropped. Upserts and
+  deletes are idempotent, so replay after a crash is safe. Searches answer
+  HBC's `SearchRequest` with HBC's `SearchResults`, applying `filter_ids`,
+  `exclude_ids`, the key predicate, the metadata prefix and distance limits
+  to an over-fetched candidate list. Exact distances come from HBC's
+  external vector loader (the stored embedding artifact, or the document
+  field for direct-field indexes). Deleted or missing candidates are pushed
+  to the far end of the metric rather than failing a search.
+- **Persistence.** `sync` (called from `IndexManager.syncAll`, before the
+  applied sequence is recorded) writes `leann.store` atomically with a CRC:
+  the key map, the exact buffer, and the serialized graph. When at least
+  20% of graph nodes are deleted, `sync` first rebuilds the graph from the
+  live nodes' stored vectors. Rebuilds are deterministic (seeded levels,
+  node order), so replicas that apply the same writes converge.
+- **Guards.** `pruneDenseSplitRange` and `handoffDenseFrom` fail with
+  `error.UnsupportedLeannSplit` before moving any state.
+  `nativeBackupSupportsImmutableCheckpoint` returns false, so backups take
+  the logical path and restore rebuilds from stored embeddings. Remote dense
+  storage fails with `error.UnsupportedLeannStorage`.
+- **Tests.** `leann_store.zig` (buffer, build, filters, idempotent writes,
+  persistence, rebuild, corrupt file) and the index-manager test
+  `leann dense index applies writes, searches, deletes, and reopens`.
+
+### Storage today
+
+LEANN replaces HBC's index files (quantized tree, posting lists, and the
+full-precision rerank vectors HBC keeps) with a graph plus codes. The
+embedding artifacts Antfly persists for every dense index remain, and LEANN
+reads them for exact distances. So a LEANN index cuts index storage, not yet
+the artifact storage. Dropping artifacts needs re-embedding from text,
+below.
+
+## Remaining work
+
+1. **Re-embed instead of reading artifacts.** Plumb the table's dense
+   embedder into the index manager and implement the vector loader as:
+   vector id → document → render the index's field/template → embedder
+   batch call, with a bounded hot-embedding cache, a per-query deadline and
+   cancellation. Then stop persisting artifacts for LEANN indexes. On CPU,
+   the measured cost (below) makes this practical only for batch retrieval
+   or with a GPU embedder.
+2. **Splits.** Rebuild both children from the parent's stored vectors (or
+   re-embedded text) during handoff.
+3. **Remote storage and native backups.** Store `leann.store` through the
+   dense storage abstraction and include it in native checkpoints.
+4. **Filter-aware traversal.** Filters are applied after an over-fetched
+   search today; very selective filters would be better served by passing
+   them into the graph walk.
+5. **Leader-built rebuilds.** Rebuilds are replica-local and deterministic
+   today. Large rebuilds could move to the Raft leader and ship the result,
+   as `CLAUDE.md` requires for background mutation work.
+6. **E2E coverage.** Add a Python e2e test that creates an
+   `algorithm: "leann"` index over HTTP and queries it.

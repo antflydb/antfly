@@ -60,6 +60,7 @@ const vector_block_store_mod = @import("../../vector_block_store.zig");
 const native_read_scratch_pool = @import("../../native_read_scratch_pool.zig");
 const posting_segment_store_mod = @import("../../posting_segment_store.zig");
 const vector_block_mod = @import("antfly_vectorindex").vector_block;
+const leann_store_mod = @import("../../leann_store.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
@@ -8676,7 +8677,12 @@ pub const IndexManager = struct {
         return switch (kind) {
             .full_text => self.text_main_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveTextMainStorage()),
             .dense_vector => if (self.denseIndex(name)) |entry|
-                if (entry.index.experimentalPostingWalAuthoritative())
+                if (entry.index.leann != null)
+                    // The LEANN file is not part of HBC's native checkpoint;
+                    // backups use the logical path and restore rebuilds from
+                    // stored embeddings.
+                    false
+                else if (entry.index.experimentalPostingWalAuthoritative())
                     // Native postings are the projection authority. Shared
                     // vector blocks are optional acceleration and therefore
                     // must not make an otherwise complete backup unsupported.
@@ -16686,7 +16692,16 @@ pub const IndexManager = struct {
         return handoffs;
     }
 
+    /// LEANN indexes cannot be split yet: their graph is not partitioned by
+    /// key range. Fail the split before any state moves.
+    fn rejectLeannSplit(self: *IndexManager) !void {
+        for (self.dense_indexes.items) |*entry| {
+            if (entry.index.leann != null) return error.UnsupportedLeannSplit;
+        }
+    }
+
     pub fn handoffDenseFrom(self: *IndexManager, src: *IndexManager, dest_store: *docstore_mod.DocStore, split_key: []const u8, collect_skip_doc_keys: bool) ![]DenseSplitHandoff {
+        try src.rejectLeannSplit();
         const dense_split_batch_size = 1024;
         var handoffs = try self.alloc.alloc(DenseSplitHandoff, self.dense_indexes.items.len);
         errdefer {
@@ -17281,6 +17296,7 @@ pub const IndexManager = struct {
     }
 
     pub fn pruneDenseSplitRange(self: *IndexManager, store: *docstore_mod.DocStore, split_key: []const u8) !void {
+        try self.rejectLeannSplit();
         for (self.dense_indexes.items) |*entry| {
             var members = try entry.index.collectSplitMembers(split_key);
             defer members.deinit(self.alloc);
@@ -22951,9 +22967,27 @@ pub const IndexManager = struct {
                 index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
                 configureDensePostingProjectionBuild(index, vector_loader_context);
                 self.attachVectorBlockResidencyPolicy(index);
-                if (index.experimentalPostingWalAuthoritative() or
+                if (dense_cfg.leann) |leann_opts| {
+                    // LEANN keeps its graph in a file beside the (empty) HBC
+                    // root; remote dense storage is not supported yet.
+                    if (self.effectiveDenseStorage() != null) return error.UnsupportedLeannStorage;
+                    const leann_store = try leann_store_mod.LeannStore.open(self.alloc, self.checkpointIo(), path, .{
+                        .dims = dense_cfg.dims,
+                        .metric = dense_cfg.metric,
+                        .max_degree = leann_opts.max_degree,
+                        .quantizer = leann_opts.quantizer,
+                        .search_ef = leann_opts.search_ef,
+                        .bound_scale = leann_opts.bound_scale,
+                        .batch_size = leann_opts.batch_size,
+                    });
+                    index.attachLeann(leann_store) catch |err| {
+                        leann_store.deinit();
+                        return err;
+                    };
+                }
+                if (dense_cfg.leann == null and (index.experimentalPostingWalAuthoritative() or
                     (densePostingSidecarEnabled() and
-                        (native_physical_v2 or configured_native_posting_store_supported)))
+                        (native_physical_v2 or configured_native_posting_store_supported))))
                 {
                     var posting_sequence: u64 = 0;
                     if (index.experimentalPostingWalAuthoritative()) {
@@ -23021,8 +23055,8 @@ pub const IndexManager = struct {
                     native_physical_v2,
                     authorize_dense_native_candidate,
                 );
-                if (index.experimentalPostingWalAuthoritative() or
-                    (densePostingWalMutationStoreEnabled() and native_mutation_store_permitted))
+                if (dense_cfg.leann == null and (index.experimentalPostingWalAuthoritative() or
+                    (densePostingWalMutationStoreEnabled() and native_mutation_store_permitted)))
                 {
                     try index.enableNativePostingMutationStore();
                 }
@@ -23071,7 +23105,8 @@ pub const IndexManager = struct {
                 index_open = false;
                 errdefer self.freeDenseIndexEntry(&entry);
 
-                if (allow_backfill and entry.index.metadata.active_count == 0) {
+                const dense_empty = if (entry.index.leann != null) entry.index.stats().active_count == 0 else entry.index.metadata.active_count == 0;
+                if (allow_backfill and dense_empty) {
                     const backfill_started_ns = nowNs();
                     _ = try self.backfillDenseIndex(store, &entry);
                     backfill_ns += elapsedSince(backfill_started_ns);
@@ -33573,6 +33608,8 @@ const DenseConfig = struct {
     flat_exact_min_postings: usize = 1024,
     flat_centroid_block_size: usize = 8192,
     flat_centroid_probe_count: usize = 0,
+    /// Set for `algorithm: leann`; HBC knobs above are then unused.
+    leann: ?LeannDenseOptions = null,
 
     pub fn deinit(self: *const DenseConfig, alloc: Allocator) void {
         alloc.free(self.field_name);
@@ -34320,6 +34357,50 @@ fn parseEmbeddingSemanticProducerAlloc(alloc: Allocator, raw: []const u8) !?[]u8
     return try alloc.dupe(u8, value.string);
 }
 
+const LeannDenseOptions = struct {
+    max_degree: u32 = 30,
+    quantizer: @import("antfly_vectorindex").leann.Quantizer = .rabitq,
+    search_ef: u32 = 0,
+    bound_scale: f32 = 1.0,
+    batch_size: u32 = 0,
+};
+
+/// Reads the internal `algorithm` / `leann` fields written by the managed
+/// config translator. Returns null for HBC (the default).
+fn parseLeannDenseOptions(root: std.json.ObjectMap) !?LeannDenseOptions {
+    const algorithm = root.get("algorithm") orelse return null;
+    if (algorithm != .string) return error.InvalidIndexConfig;
+    if (std.mem.eql(u8, algorithm.string, "hbc")) return null;
+    if (!std.mem.eql(u8, algorithm.string, "leann")) return error.InvalidIndexConfig;
+    var out = LeannDenseOptions{};
+    const value = root.get("leann") orelse return out;
+    if (value != .object) return error.InvalidIndexConfig;
+    const Int = struct {
+        fn get(object: std.json.ObjectMap, key: []const u8, min: i64, max: i64) !?u32 {
+            const v = object.get(key) orelse return null;
+            if (v != .integer or v.integer < min or v.integer > max) return error.InvalidIndexConfig;
+            return @intCast(v.integer);
+        }
+    };
+    if (try Int.get(value.object, "max_degree", 4, 128)) |v| out.max_degree = v;
+    if (try Int.get(value.object, "search_ef", 0, 4096)) |v| out.search_ef = v;
+    if (try Int.get(value.object, "batch_size", 0, 1024)) |v| out.batch_size = v;
+    if (value.object.get("quantizer")) |v| {
+        if (v != .string) return error.InvalidIndexConfig;
+        out.quantizer = std.meta.stringToEnum(@import("antfly_vectorindex").leann.Quantizer, v.string) orelse return error.InvalidIndexConfig;
+    }
+    if (value.object.get("bound_scale")) |v| {
+        const f: f64 = switch (v) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| f,
+            else => return error.InvalidIndexConfig,
+        };
+        if (!(f >= 0 and f <= 8)) return error.InvalidIndexConfig;
+        out.bound_scale = @floatCast(f);
+    }
+    return out;
+}
+
 fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
@@ -34347,6 +34428,7 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
         else
             null,
         .embedding_names = embedding_names,
+        .leann = try parseLeannDenseOptions(root.object),
         .external = if (root.object.get("external")) |value|
             switch (value) {
                 .bool => value.bool,
@@ -50781,4 +50863,112 @@ test "logical query nullable ordering projection upgrades only exact affected wi
     try std.testing.expect(reopened.textIndexEntry(config.name) == null);
     try std.testing.expectEqualStrings("TextProjectionUpgradeRequired", reopened.loadFailure(config.name).?);
     try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionUpgradeRequired"));
+}
+
+test "leann dense index applies writes, searches, deletes, and reopens" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    const dims = 8;
+    const n = 300;
+    const config_json = "{\"field\":\"embedding\",\"dims\":8,\"metric\":\"l2_squared\",\"algorithm\":\"leann\",\"leann\":{\"max_degree\":16,\"quantizer\":\"rabitq\",\"search_ef\":0,\"bound_scale\":1,\"batch_size\":0}}";
+
+    // Clustered vectors stored in each document's `embedding` field, which is
+    // where the direct-field loader reads exact vectors from.
+    var prng = std.Random.DefaultPrng.init(17);
+    const rand = prng.random();
+    var vectors: [n][dims]f32 = undefined;
+    for (&vectors, 0..) |*v, i| {
+        const c: f32 = @floatFromInt(i % 6);
+        for (v, 0..) |*x, j| x.* = c * 3 + @as(f32, @floatFromInt(j % 2)) + rand.floatNorm(f32) * 0.3;
+    }
+    var keys: [n][]u8 = undefined;
+    for (&keys, 0..) |*k, i| k.* = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i});
+    defer for (keys) |k| alloc.free(k);
+    for (keys, vectors) |doc_key, v| {
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+        defer alloc.free(stored_key);
+        var body: std.Io.Writer.Allocating = .init(alloc);
+        defer body.deinit();
+        try body.writer.writeAll("{\"embedding\":[");
+        for (v, 0..) |x, j| {
+            if (j > 0) try body.writer.writeByte(',');
+            try body.writer.print("{d}", .{x});
+        }
+        try body.writer.writeAll("]}");
+        try store.put(stored_key, body.written());
+    }
+
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_idx", .kind = .dense_vector, .config_json = config_json }});
+
+        var writes: [n]mapper.DenseEmbeddingWrite = undefined;
+        for (&writes, 0..) |*w, i| w.* = .{ .index_name = @constCast("leann_idx"), .doc_key = keys[i], .vector = &vectors[i], .artifact_key = null };
+        var start: usize = 0;
+        while (start < n) : (start += 100) try manager.applyDenseEmbeddingWritesByName(&store, "leann_idx", writes[start..@min(start + 100, n)]);
+
+        const entry = manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
+        try std.testing.expect(entry.index.leann != null);
+        try std.testing.expect(entry.index.leann.?.index != null); // past the build threshold
+        try std.testing.expectEqual(@as(u64, n), entry.index.stats().active_count);
+
+        for ([_]usize{ 7, 123, 299 }) |i| {
+            var results = try entry.index.searchWithRequest(.{ .query = &vectors[i], .k = 5 });
+            defer results.deinit();
+            var best = results.items.items[0];
+            for (results.items.items) |item| if (item.distance < best.distance) {
+                best = item;
+            };
+            const doc = try manager.lookupDenseDocKey(&store, "leann_idx", best.vector_id);
+            defer if (doc) |d| alloc.free(d);
+            try std.testing.expectEqualStrings(keys[i], doc.?);
+        }
+
+        try manager.deleteDenseBatchByName(&store, "leann_idx", &.{keys[123]});
+        try std.testing.expectEqual(@as(u64, n - 1), entry.index.stats().active_count);
+        {
+            var results = try entry.index.searchWithRequest(.{ .query = &vectors[123], .k = 5 });
+            defer results.deinit();
+            for (results.items.items) |item| {
+                const doc = try manager.lookupDenseDocKey(&store, "leann_idx", item.vector_id);
+                defer if (doc) |d| alloc.free(d);
+                if (doc) |d| try std.testing.expect(!std.mem.eql(u8, d, keys[123]));
+            }
+        }
+
+        try std.testing.expectError(error.UnsupportedLeannSplit, manager.pruneDenseSplitRange(&store, "doc:0150"));
+        try std.testing.expect(!manager.nativeBackupSupportsImmutableCheckpoint("leann_idx", .dense_vector));
+        try manager.syncAll(true);
+    }
+
+    // Reopen: the graph and key map come back from the LEANN file.
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_idx", .kind = .dense_vector, .config_json = config_json }});
+        const entry = manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
+        try std.testing.expectEqual(@as(u64, n - 1), entry.index.stats().active_count);
+        var results = try entry.index.searchWithRequest(.{ .query = &vectors[7], .k = 3 });
+        defer results.deinit();
+        var best = results.items.items[0];
+        for (results.items.items) |item| if (item.distance < best.distance) {
+            best = item;
+        };
+        const doc = try manager.lookupDenseDocKey(&store, "leann_idx", best.vector_id);
+        defer if (doc) |d| alloc.free(d);
+        try std.testing.expectEqualStrings(keys[7], doc.?);
+    }
 }
