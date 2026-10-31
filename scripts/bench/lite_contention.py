@@ -236,6 +236,7 @@ def seed(
 
 def native_worker(config, index, ready, start, results, finish=None):
     announced = False
+    completed_workload = None
     try:
         af = sdk(config["library"])
         with af.open(
@@ -267,6 +268,15 @@ def native_worker(config, index, ready, start, results, finish=None):
                     busy.append(time.perf_counter_ns() - began_call)
                 sequence += 1
             ended = time.monotonic()
+            # Preserve measured progress if a later diagnostic or close fails.
+            # The terminal result remains an error and cannot pass qualification.
+            completed_workload = {
+                "started": began,
+                "ended": ended,
+                "successful_calls": len(success),
+                "busy_calls": len(busy),
+                "last_write": last_write,
+            }
             # Diagnostics can acquire admission and run proofs. Wait until every
             # timed call has finished before allowing these reads.
             if finish is not None:
@@ -340,6 +350,7 @@ def native_worker(config, index, ready, start, results, finish=None):
             "index": index,
             "status": "error",
             "diagnostic": traceback.format_exc(),
+            "completed_workload": completed_workload,
         }
         if not announced:
             ready.put(failure)
@@ -396,11 +407,12 @@ def aggregate(workers: list[dict]) -> dict:
     )
     if proof_elapsed <= 0:
         raise RuntimeError("invalid proof-observation interval")
+    starved = sum(not row["success_latency_ns"] for row in workers)
     result = {
-        "status": "ok" if successful else "no_progress",
-        "workers_without_success": sum(
-            not row["success_latency_ns"] for row in workers
+        "status": (
+            "no_progress" if not successful else "starved_workers" if starved else "ok"
         ),
+        "workers_without_success": starved,
         "per_worker_background_publication_deltas": [
             row.get("background_publication_deltas", {}) for row in workers
         ],
@@ -421,6 +433,9 @@ def aggregate(workers: list[dict]) -> dict:
         ),
         "per_worker_successful_calls": [
             len(row["success_latency_ns"]) for row in workers
+        ],
+        "per_worker_proof_walks": [
+            row["proofs"]["allocator_proof_walks"] for row in workers
         ],
     }
     for name, values in (("success", successful), ("busy", busy)):
@@ -607,7 +622,7 @@ def native_cases(args):
                 results.close()
             row["worker_lifetime_seconds"] = time.monotonic() - worker_started
             row["file_bytes"] = database.stat().st_size
-            if row["status"] in ("ok", "no_progress"):
+            if row["status"] in ("ok", "no_progress", "starved_workers"):
                 expected = [
                     worker["last_write"]
                     for worker in workers
@@ -638,7 +653,7 @@ def native_cases(args):
                 except subprocess.TimeoutExpired:
                     row.update(status="verification_watchdog_timeout", censored=True)
             yield row
-            if row["status"] != "ok":
+            if row["status"] not in ("ok", "no_progress", "starved_workers"):
                 return
 
 

@@ -529,6 +529,7 @@ pub const storage_db_transaction_recovery_contract = @import("storage/db/transac
 pub const storage_db_transform = @import("storage/db/transform.zig");
 pub const storage_db_typed_doc_values_coverage = @import("storage/db/typed_doc_values_coverage.zig");
 pub const storage_db_types = @import("storage/db/types.zig");
+pub const storage_db_repair_failure = @import("storage/db/repair_failure.zig");
 pub const storage_dense_work_admission = @import("storage/dense_work_admission.zig");
 pub const storage_docstore = @import("storage/docstore.zig");
 pub const storage_generation_publication = @import("storage/generation_publication.zig");
