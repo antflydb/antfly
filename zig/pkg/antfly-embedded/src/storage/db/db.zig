@@ -16696,10 +16696,13 @@ pub const DB = struct {
                         result.in_progress += 1;
                     } else {
                         const readable = issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue.*);
+                        // A readable asset may be an old payload or a manifest
+                        // recording terminal OCR failures. Only a successful
+                        // publication's completion fence proves this repair.
                         const completed = if (!readable)
                             false
                         else if (issue.reason == .enrichment_failed)
-                            (try self.completeArtifactRepairIssueIfCurrent(alloc, issue.*, issue_revision, completion_key, completion_snapshot.epoch, false)) == .completed
+                            (try self.completeArtifactRepairIssueIfCurrent(alloc, issue.*, issue_revision, completion_key, completion_snapshot.epoch, true)) == .completed
                         else
                             try self.clearArtifactRepairIssueIfCurrent(alloc, issue.*, issue_revision);
                         if (completed) {
@@ -95775,6 +95778,81 @@ test "db index repair summary deduplicates source documents across artifacts" {
     var summary = (try db.indexEnrichmentFailureSummary(alloc, "dv_a")).?;
     defer summary.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), summary.count);
+}
+
+test "db managed index repair keeps failed OCR manifests as debt" {
+    for ([_]types.IndexKind{ .full_text, .graph }) |kind| {
+        const alloc = std.testing.allocator;
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtime_workers = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "consumer", .kind = kind, .config_json = if (kind == .full_text) "{\"field\":\"body\"}" else "{}" });
+        try db.addEnrichment(.{
+            .name = "document_units",
+            .kind = .asset,
+            .field = "url",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+        });
+        const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units");
+        defer alloc.free(artifact_key);
+        try db.core.store.put(artifact_key,
+            \\{"manifest_version":1,"generation":1,"artifact_id":"failed-image","source_url":"data:image/png;base64,AA==","source_fingerprint":"fingerprint","content_type":"image/png","route_type":"image","unit_count":1,"chunk_count":0,"ocr_failed_count":1,"ocr_failure_details":[{"error_message":"ocr_text failed: ResourceLimitExceeded"}]}
+        );
+        const issue = types.ArtifactRepairIssue{
+            .artifact_kind = .asset,
+            .index_name = "consumer",
+            .doc_key = "doc:a",
+            .artifact_name = "document_units",
+            .sequence = 5,
+            .reason = .enrichment_failed,
+            .generation_error = "ResourceLimitExceeded",
+        };
+        try db.recordArtifactRepairIssue(alloc, issue);
+        const completion_key = try db.artifactRepairCompletionKeyForIssueAlloc(alloc, issue);
+        defer alloc.free(completion_key);
+        var completion = try db.artifactRepairCompletionSnapshot(alloc, completion_key);
+        completion.queued_sequence = 5;
+        completion.queued_job_id = 42;
+        var encoded: [artifact_repair_completion_state_len]u8 = undefined;
+        encodeArtifactRepairCompletionState(&encoded, completion);
+        try db.core.store.put(completion_key, &encoded);
+        try enrichment_state.saveAppliedSequence(db.core.store, enrichment_runtime_mod.scope_name, 5);
+        var result = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
+            .target = .artifact,
+            .index_name = "consumer",
+            .operator_initiated = true,
+            .repair_job_id = 42,
+        }, .{ .defer_durable_index_repair_execution = true });
+        defer result.deinit(alloc);
+        try std.testing.expect(result.debt_remaining);
+        try std.testing.expectEqual(@as(u64, 1), result.failed);
+        try std.testing.expectEqual(@as(u64, 0), result.repaired);
+        var remaining = try db.listArtifactRepairIssuesPage(alloc, .{ .index_name = "consumer" });
+        defer remaining.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), remaining.issues.len);
+        try std.testing.expectEqualStrings("ResourceLimitExceeded", remaining.issues[0].generation_error);
+
+        // A subsequent successful producer publication can retire the same debt.
+        try db.core.store.put(artifact_key,
+            \\{"manifest_version":1,"generation":2,"artifact_id":"empty-but-successful","source_url":"data:text/plain;base64,","source_fingerprint":"new-fingerprint","content_type":"text/plain","route_type":"text","unit_count":0,"chunk_count":0,"ocr_failed_count":0}
+        );
+        completion.completed_sequence = issue.sequence;
+        encodeArtifactRepairCompletionState(&encoded, completion);
+        try db.core.store.put(completion_key, &encoded);
+        var completed = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
+            .target = .artifact,
+            .index_name = "consumer",
+            .operator_initiated = true,
+            .repair_job_id = 42,
+        }, .{ .defer_durable_index_repair_execution = true });
+        defer completed.deinit(alloc);
+        try std.testing.expect(!completed.debt_remaining);
+        try std.testing.expectEqual(@as(u64, 1), completed.repaired);
+    }
 }
 
 test "db managed index repair queues providers outside the request guard and survives reopen" {
