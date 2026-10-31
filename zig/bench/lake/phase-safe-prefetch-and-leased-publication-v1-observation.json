@@ -1,0 +1,292 @@
+{
+  "version": 1,
+  "created_utc": "2026-10-30T18:34:03.442758+00:00",
+  "qualified_source_commit": "5506d75a0d43e30a1bf43e7068bdfc58a7a9bff4",
+  "implementation_commit": "f8f08c5da0b9c460e923e3e329e72ecbb311247b",
+  "main_commit": "9986c8a10750eea05d20d5c966f38cd76f7f0ee8",
+  "runtime_abi": 77,
+  "native_reader_protocol": 97,
+  "source_sha256": {
+    "zig/REMOTE_TABLE_SERVING.md": "078e615e7ca4ca987fb3e99703daf1fd99db25e08968f99cd5ea266d6607437a",
+    "zig/pkg/antfly-embedded/src/runtime_failure_abi.zig": "425f78c3bcf2aeddced5ef40eac70a176e2760f942624af8676529dfc6fa0a4f",
+    "zig/pkg/antfly-embedded/src/section/source_column.zig": "ece59eb78760bcc99efeab442ff2f45d05df48f0a475070e1dd7efb67e0b3a49",
+    "zig/pkg/antfly-embedded/src/segment_source.zig": "49e8340fd425dee763d75c56ea8557d8532d5b2293046c91204b1afbb3f772ad",
+    "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_admission.zig": "40ee2d6b7c45682f73b4aa5c6bd9362673dfc6c43fae69add03192387903726e",
+    "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_cursor.zig": "db4c119734e1d2a496e8fd038dc7a0f71ce8bb659fdc43e9f48dd95f45b0ea16",
+    "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_rowgroup.zig": "a1924ce0c4fc82668f39410e5c6bad8dbaf37218a4602075b86c9cffe7e99a42",
+    "zig/pkg/antfly-embedded/src/sql/spill.zig": "2d198546246dabf64ec4ba19d3e5260c153d509693f537267dd04b0fe97d5d90",
+    "zig/pkg/antfly/src/api/lake_index_aggregate_artifact.zig": "bb2e6ee1dfe98f4c3cb1f784abe62c6c45992bc4ed563eee1f3c021da9369417",
+    "zig/pkg/antfly/src/api/lake_index_cover_columns.zig": "d03e9d90f1d22a5aa73c48152b0d71d58ef620aff85b73801f3e0fd8362ab764",
+    "zig/pkg/antfly/src/api/lake_index_ordered_rows.zig": "5b53f3c2f7f0e77e3a6a0843c008aaef0d618aa50de237776784381c792dcd0c",
+    "zig/pkg/antfly/src/api/lake_index_pack_proof.zig": "31a77b35131ecc79a446abaf9ef04a77fff7815bdefb6535a975ba260f13f9bc",
+    "zig/pkg/antfly/src/api/lake_index_seekable_text.zig": "0559c6152ed9e3eb6856ceb76ee354786fa86ce1a6a5373837b4171dbec484ca",
+    "zig/pkg/antfly/src/api/lake_index_sort_stream.zig": "3bcfd14ed6df08b74b198a5ba21f32ee1727d3c527894bd7af959816afd67f79",
+    "zig/pkg/antfly/src/api_http_runtime_test_root.zig": "f2526c47ab1e931bbabf6e6c0141663518015c9f5119e85220c7df2c441b1597",
+    "zig/pkg/antfly/src/lake_integration_test_root.zig": "027e811228d9d01bb05e5d6e16f6201014d7f4210463a70e34bdd34da5467ab8"
+  },
+  "publication_probe": {
+    "identity": {
+      "source_commit": "5506d75a0d43e30a1bf43e7068bdfc58a7a9bff4",
+      "binary_sha256": "09e445d34ad595c17c1990e07a9d4bb4295789c1c1ef3a44213db2e1fc90ea66",
+      "source_sha256": "3bcfd14ed6df08b74b198a5ba21f32ee1727d3c527894bd7af959816afd67f79",
+      "build_mode": "Debug",
+      "samples": 6,
+      "rows": 1024,
+      "unique_payload_bytes": 2048
+    },
+    "control": "Previous owning Sort.next drain with per-row free-all arena; same final binary and sort implementation as the candidate.",
+    "candidate": "Production Records adapter over Sort.nextLeased, holding each record until advance.",
+    "measurement": "Debug native, thread CPU clock. Setup/add outside measurement; first finish/advance and complete drain included. Every row key and every payload byte checked independently in both variants.",
+    "fixture": "1024 distinct 20-byte keys and distinct 2048-byte strings; each payload carries its expected ordinal. Reverse input order, ascending output.",
+    "qualification": "Six alternating pairs per budget after one warmup per variant. Task-owned builds/native tests/cleanup did not overlap timing. Other host activity, including unrelated compilation, was uncontrolled. Both budgets perform spill I/O; neither is labeled a purely resident benchmark. Requested allocation is cumulative during the drain, not live RSS or peak memory. This is not an HTTP, cloud, archive or whole-publication throughput result.",
+    "summaries": [
+      {
+        "sort_budget_bytes": 8388608,
+        "before_median_cpu_ns": 13266083.5,
+        "after_median_cpu_ns": 12192646.0,
+        "cpu_speedup": 1.0880397495342684,
+        "before_allocated_bytes": 8882218,
+        "after_allocated_bytes": 3307562,
+        "allocation_reduction": 0.6276198129791455,
+        "candidate_slower_samples": 1,
+        "read_bytes": 2660697,
+        "written_bytes": 2122963
+      },
+      {
+        "sort_budget_bytes": 65536,
+        "before_median_cpu_ns": 17424708.5,
+        "after_median_cpu_ns": 17185458.0,
+        "cpu_speedup": 1.0139216830881086,
+        "before_allocated_bytes": 9328010,
+        "after_allocated_bytes": 4283196,
+        "allocation_reduction": 0.540824248687555,
+        "candidate_slower_samples": 1,
+        "read_bytes": 4376197,
+        "written_bytes": 2350179
+      }
+    ],
+    "samples": [
+      {
+        "sample": 0,
+        "memory": 8388608,
+        "before_cpu_ns": 13391417,
+        "after_cpu_ns": 11697250,
+        "before_allocated": 8882218,
+        "after_allocated": 3307562,
+        "before_read": 2660697,
+        "after_read": 2660697,
+        "before_write": 2122963,
+        "after_write": 2122963
+      },
+      {
+        "sample": 1,
+        "memory": 8388608,
+        "before_cpu_ns": 12594125,
+        "after_cpu_ns": 12986250,
+        "before_allocated": 8882218,
+        "after_allocated": 3307562,
+        "before_read": 2660697,
+        "after_read": 2660697,
+        "before_write": 2122963,
+        "after_write": 2122963
+      },
+      {
+        "sample": 2,
+        "memory": 8388608,
+        "before_cpu_ns": 13395084,
+        "after_cpu_ns": 11750167,
+        "before_allocated": 8882218,
+        "after_allocated": 3307562,
+        "before_read": 2660697,
+        "after_read": 2660697,
+        "before_write": 2122963,
+        "after_write": 2122963
+      },
+      {
+        "sample": 3,
+        "memory": 8388608,
+        "before_cpu_ns": 13296500,
+        "after_cpu_ns": 12713416,
+        "before_allocated": 8882218,
+        "after_allocated": 3307562,
+        "before_read": 2660697,
+        "after_read": 2660697,
+        "before_write": 2122963,
+        "after_write": 2122963
+      },
+      {
+        "sample": 4,
+        "memory": 8388608,
+        "before_cpu_ns": 13235667,
+        "after_cpu_ns": 11819042,
+        "before_allocated": 8882218,
+        "after_allocated": 3307562,
+        "before_read": 2660697,
+        "after_read": 2660697,
+        "before_write": 2122963,
+        "after_write": 2122963
+      },
+      {
+        "sample": 5,
+        "memory": 8388608,
+        "before_cpu_ns": 13183875,
+        "after_cpu_ns": 12566250,
+        "before_allocated": 8882218,
+        "after_allocated": 3307562,
+        "before_read": 2660697,
+        "after_read": 2660697,
+        "before_write": 2122963,
+        "after_write": 2122963
+      },
+      {
+        "sample": 0,
+        "memory": 65536,
+        "before_cpu_ns": 18504542,
+        "after_cpu_ns": 17196875,
+        "before_allocated": 9328010,
+        "after_allocated": 4283196,
+        "before_read": 4376197,
+        "after_read": 4376197,
+        "before_write": 2350179,
+        "after_write": 2350179
+      },
+      {
+        "sample": 1,
+        "memory": 65536,
+        "before_cpu_ns": 16990542,
+        "after_cpu_ns": 16806125,
+        "before_allocated": 9328010,
+        "after_allocated": 4283196,
+        "before_read": 4376197,
+        "after_read": 4376197,
+        "before_write": 2350179,
+        "after_write": 2350179
+      },
+      {
+        "sample": 2,
+        "memory": 65536,
+        "before_cpu_ns": 17722250,
+        "after_cpu_ns": 17174041,
+        "before_allocated": 9328010,
+        "after_allocated": 4283196,
+        "before_read": 4376197,
+        "after_read": 4376197,
+        "before_write": 2350179,
+        "after_write": 2350179
+      },
+      {
+        "sample": 3,
+        "memory": 65536,
+        "before_cpu_ns": 17312375,
+        "after_cpu_ns": 16568792,
+        "before_allocated": 9328010,
+        "after_allocated": 4283196,
+        "before_read": 4376197,
+        "after_read": 4376197,
+        "before_write": 2350179,
+        "after_write": 2350179
+      },
+      {
+        "sample": 4,
+        "memory": 65536,
+        "before_cpu_ns": 17537042,
+        "after_cpu_ns": 17448375,
+        "before_allocated": 9328010,
+        "after_allocated": 4283196,
+        "before_read": 4376197,
+        "after_read": 4376197,
+        "before_write": 2350179,
+        "after_write": 2350179
+      },
+      {
+        "sample": 5,
+        "memory": 65536,
+        "before_cpu_ns": 16907042,
+        "after_cpu_ns": 17204500,
+        "before_allocated": 9328010,
+        "after_allocated": 4283196,
+        "before_read": 4376197,
+        "after_read": 4376197,
+        "before_write": 2350179,
+        "after_write": 2350179
+      }
+    ],
+    "log_sha256": "aa344c6d1a928e8c41f63840cbd7784a8e8bf8856ea65b0a1f572c9c6dbf56b6"
+  },
+  "regressions": {
+    "speculative_progress": "Controlled one/two-column CPU/I/O/input saturation gates. Optional work declines while foreign CPU work is still gated; required reads complete under the same limits. Deadline safeguard and complete reservation cleanup checked.",
+    "warm_text_prefetch": {
+      "pages": 3,
+      "control_extra_hints": 2,
+      "candidate_extra_hints": 0,
+      "new_demand_reads": 0,
+      "new_decodes": 0,
+      "partial_resident_decline_hints": 1
+    },
+    "artifact_equivalence": "Owning and leased covering publishers produce identical pack/directory content addresses for resident and spilled typed inputs, including nested JSON, SQL null and integers above 2^53."
+  },
+  "validation": {
+    "native_merged_log": "/private/tmp/lake-phase-leases-native-merged.log",
+    "shared_passed": 25,
+    "api_passed": 31,
+    "native_failures": 0,
+    "native_skipped": 0,
+    "native_leaks": 0,
+    "test_only_followup_checks": 3,
+    "executed_benchmark_checks": 1,
+    "e2e": {
+      "passed": 50,
+      "failed": 0,
+      "skipped": 0,
+      "elapsed_seconds": 375.7,
+      "command": "ANTFLY_E2E_FULL_LAKE=1 ANTFLY_BIN=<frozen executable> TZ=UTC python -B -m pytest zig/e2e/antfly/test_lake_archive_qualification.py zig/e2e/antfly/test_iceberg_sql.py -n2 -q"
+    },
+    "apache_boundary_sources": 2338,
+    "license_headers": "pass",
+    "zig_format": "pass",
+    "whitespace": "pass",
+    "cli_build": "pass",
+    "cache_cleanup": {
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed_seconds": 0.17,
+      "log": "/private/tmp/lake-phase-leases-gc.log",
+      "output": "scripts/cache_gc.sh\nNative build active or process inspection unavailable; skipping cache cleanup."
+    },
+    "logs": {
+      "native-merged": {
+        "path": ".benchmark-results/lake/phase-leases-v1/lake-phase-leases-native-merged.log",
+        "sha256": "50a7611f8d6884d5c3896f16a0a3bf7a5ab82785962f46eb9777345cae72ac12"
+      },
+      "bench-build": {
+        "path": ".benchmark-results/lake/phase-leases-v1/lake-phase-leases-bench-build.log",
+        "sha256": "5f17665bb804818295a77bc491ee429f7390286408a946203d288697e6fb9eb2"
+      },
+      "e2e": {
+        "path": ".benchmark-results/lake/phase-leases-v1/lake-phase-leases-e2e.log",
+        "sha256": "57c92757dfd48f15136963ffa7c7f6b206471d9a3c56e97f52331cf88dff36ec"
+      },
+      "boundary-final": {
+        "path": ".benchmark-results/lake/phase-leases-v1/lake-phase-leases-boundary-final.log",
+        "sha256": "7e4ba1f23af654d069895a7e2e2b38c036733977bdef495db27821c80b312e10"
+      },
+      "license-final": {
+        "path": ".benchmark-results/lake/phase-leases-v1/lake-phase-leases-license-final.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "gc": {
+        "path": ".benchmark-results/lake/phase-leases-v1/lake-phase-leases-gc.log",
+        "sha256": "51e465e7f247aef97fb055b3c91ada18531ebdc648fb962d410d6baee52d1d3f"
+      }
+    }
+  },
+  "limitations": [
+    "Real-provider retention qualification remains deferred.",
+    "The external 142577-row HN fixture is unavailable on this machine; no archive-specific performance claim."
+  ],
+  "candidate_executable": {
+    "path": ".benchmark-results/lake/phase-leases-v1/after/antfly",
+    "sha256": "6c03d86f83c245df81f268173e65bfe7b48626871a4e2390b5fd8626e7e68a2a",
+    "source_commit": "5506d75a0d43e30a1bf43e7068bdfc58a7a9bff4"
+  }
+}

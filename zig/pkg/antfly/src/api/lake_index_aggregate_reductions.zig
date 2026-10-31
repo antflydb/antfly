@@ -99,10 +99,10 @@ pub fn lookup(a: A, storage: tree.Store, root: ?tree.Ref, group: []const u8, row
     return record.View.init(try a.dupe(u8, found.value), layout);
 }
 pub const Metrics = struct { leaf_rows: u64 = 0, child_summaries: u64 = 0 };
-pub fn repair(a: A, manager: *local.sql_spill.Manager, storage: tree.Store, rows: ?tree.Ref, prior: ?tree.Ref, dirty: *const Dirty, row_count: u64, layout: *const record.Layout, phase: ?*const @import("../serverless/artifacts/store.zig").IoPhase) !?tree.Ref {
-    return repairMeasured(a, manager, storage, rows, prior, dirty, row_count, layout, phase, null);
+pub fn repair(a: A, manager: *local.sql_spill.Manager, storage: tree.Store, rows: ?tree.Ref, prior: ?tree.Ref, dirty: *const Dirty, row_count: u64, layout: *const record.Layout) !?tree.Ref {
+    return repairMeasured(a, manager, storage, rows, prior, dirty, row_count, layout, null);
 }
-pub fn repairMeasured(a: A, manager: *local.sql_spill.Manager, storage: tree.Store, rows: ?tree.Ref, prior: ?tree.Ref, dirty: *const Dirty, row_count: u64, layout: *const record.Layout, phase: ?*const @import("../serverless/artifacts/store.zig").IoPhase, metrics: ?*Metrics) !?tree.Ref {
+pub fn repairMeasured(a: A, manager: *local.sql_spill.Manager, storage: tree.Store, rows: ?tree.Ref, prior: ?tree.Ref, dirty: *const Dirty, row_count: u64, layout: *const record.Layout, metrics: ?*Metrics) !?tree.Ref {
     const projection = try Projection.init(a, layout);
     defer projection.deinit(a);
     if (prior == null) return buildFresh(a, manager, storage, rows, row_count, layout, &projection, metrics);
@@ -120,7 +120,6 @@ pub fn repairMeasured(a: A, manager: *local.sql_spill.Manager, storage: tree.Sto
     while (level <= levels(row_count)) : (level += 1) {
         var changes = Mutations.init(a, manager, cached);
         defer changes.deinit();
-        changes.private_pages.phase = phase;
         var parents: Dirty = .empty;
         // Preserve leaf locality across working sets larger than the cache.
         // Only borrowed keys enter this workspace-accounted level directory.
@@ -290,7 +289,7 @@ test "external lake exact reduction trees refresh a bounded leaf and retain prio
         try touch(a, &dirty, group, i);
     }
     const before_rows = try rows.finish();
-    const before = try repair(a, &manager, memory.store(), before_rows, null, &dirty, count, &layout, null);
+    const before = try repair(a, &manager, memory.store(), before_rows, null, &dirty, count, &layout);
     clear(a, &dirty);
     try touch(a, &dirty, group, 7);
     var update = Mutations.init(a, &manager, memory.store());
@@ -304,7 +303,7 @@ test "external lake exact reduction trees refresh a bounded leaf and retain prio
     try update.addRecord(&row_key, try record.encodeWithLayout(out, .{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = "g" })}, .aggregates = &.{}, .typed_states = &.{changed}, .ordinal = 7 }, layout));
     const after_rows = try update.finish(before_rows);
     var metrics: Metrics = .{};
-    const after = try repairMeasured(a, &manager, memory.store(), after_rows, before, &dirty, count, &layout, null, &metrics);
+    const after = try repairMeasured(a, &manager, memory.store(), after_rows, before, &dirty, count, &layout, &metrics);
     try std.testing.expectEqual(@as(u64, 64), metrics.leaf_rows);
     try std.testing.expectEqual(@as(u64, 5), metrics.child_summaries);
     const previous = try lookup(out, memory.store(), before, group, count, &layout);
@@ -363,11 +362,11 @@ fn repairLocalityScenario(count: usize) !void {
     const root = try rows.finish();
     const before_reads = memory.reads;
     const input_pages = memory.pages.count();
-    const reduced = try repair(a, &manager, memory.store(), root, null, &dirty, count, &layout, null);
+    const reduced = try repair(a, &manager, memory.store(), root, null, &dirty, count, &layout);
     try std.testing.expectEqual(@as(usize, input_pages), memory.reads - before_reads);
     try std.testing.expectEqual(@as(u64, @intCast(count)) * (@as(u64, levels(count)) + 1), reduced.?.records);
     const before_repair = memory.reads;
-    _ = try repair(a, &manager, memory.store(), root, reduced, &dirty, count, &layout, null);
+    _ = try repair(a, &manager, memory.store(), root, reduced, &dirty, count, &layout);
     try std.testing.expect(memory.reads - before_repair <= input_pages + 16);
     const repair_reads = memory.reads - before_repair;
     var changed_rows: tree.SortedBuilder = .{ .alloc = a, .store = memory.store(), .target_bytes = 4096 };
@@ -385,10 +384,10 @@ fn repairLocalityScenario(count: usize) !void {
     }
     const changed_root = try changed_rows.finish();
     const before_change = memory.reads;
-    const changed = try repair(a, &manager, memory.store(), changed_root, reduced, &dirty, count, &layout, null);
+    const changed = try repair(a, &manager, memory.store(), changed_root, reduced, &dirty, count, &layout);
     const changed_reads = memory.reads - before_change;
     try std.testing.expect(changed_reads <= input_pages * 2 + 32);
-    const expected = try repair(a, &manager, memory.store(), changed_root, null, &dirty, count, &layout, null);
+    const expected = try repair(a, &manager, memory.store(), changed_root, null, &dirty, count, &layout);
     try std.testing.expect(try tree.equivalent(a, memory.store(), expected, changed, .{}));
     const first_group = &[_]u8{ 0, 0, 0, 2, 0, 0 };
     const previous = try lookup(out, memory.store(), reduced, first_group, count, &layout);

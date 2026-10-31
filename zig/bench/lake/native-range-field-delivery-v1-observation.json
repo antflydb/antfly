@@ -1,0 +1,4261 @@
+{
+  "schema_version": 1,
+  "observation": "native-range-field-delivery-v1",
+  "qualification": "Sequential Zig 0.17.0 Debug observations on a shared host. No task build, E2E or cache cleanup overlaps measured queries. Earlier runs observed unrelated worktree compilations. Restarts retain persistent/OS caches and readiness warming. No isolated causal, Release, empty-cache, real-cloud or archive-scale latency claim.",
+  "reviewed_binary": {
+    "source_commit": "8bc363e89a5c6776ebbcc6e8be216cfa6fb390d4",
+    "source_tree": "a2a2e8c7fd6d57c745c74c02550aaec31d4c4a98",
+    "source_clean": true,
+    "binary_sha256": "b11f29c4c08102f1745cf4f5ce0642f743f9645de1256094ceed8e2ff81971a6",
+    "zig_version": "0.17.0",
+    "build_mode": "Debug",
+    "merged_main": "8106b9cb720c3b8496a5fecda82a900dafa6168e",
+    "build_invocation_base": "36d95e7cefd5b6accd344c66614451b34ea51f5d",
+    "build_invocation_source_clean": false,
+    "compiled_source_sha256": {
+      "zig/pkg/antfly/src/api/lake_index_cover_columns.zig": "fa097f38de38ef8c6afbebccee01747a464f78dd5fdb300b3c204a2f99fb35e5",
+      "zig/pkg/antfly/src/api/lake_index_ordered_rows.zig": "dc15725218d77006bb4bf7dab7da21d59302a2f8892930371d23c5158f050c10",
+      "zig/pkg/antfly/src/api/lake_index_sql_rows.zig": "a8497b25645a172642f4fc44811757e597d85e180cab0d342428139cda424024",
+      "zig/pkg/antfly/src/api/lake_index_aggregate_artifact.zig": "a18401cbc3774d41e25fdcb959aae2710b0008f514fb4952e68a6b3b4a36b04e",
+      "zig/pkg/antfly/src/api/lake_index_decoded_metadata.zig": "dbcc708b7ba9cf2241b92cc80643689cc0c7ef68541ccb99860067ad8fe9f75e",
+      "zig/pkg/antfly/src/api/lake_index_gc.zig": "a9199a2a06d911d00d1bcc6c6ecd86babe76731d9ee9c85f396c4fdd03fffa79",
+      "zig/pkg/antfly/src/api/lake_index_gc_progress.zig": "43cd3c29b52cb169f2962111d2774c7cf5ee6e7a5c60a83500970ee049daf9c4"
+    },
+    "native_reader_protocol": 90,
+    "ordered_metadata_versions": [
+      11,
+      12
+    ]
+  },
+  "initial_candidate": {
+    "source_commit": "ac0febca03e75754fb4fd96571389b2c77f5a19e",
+    "source_tree": "c1071228cd425c6aae8a60fb9d438957820095bb",
+    "source_clean_at_build": true,
+    "binary_sha256": "b6193f9b0d5495d9f22a2089fafeaf4589f67b77eb67fb86bdf59df95bf1eb04",
+    "zig_version": "0.17.0",
+    "build_mode": "Debug",
+    "merged_main": "a507489e93d87f70da320c45ae708e340f872fd0",
+    "compiled_source_sha256": {
+      "zig/pkg/antfly/src/api/lake_artifact_ranges.zig": "2a01538e7fa7c0c6113e44e57ea60ba98cc0eca25bb7f06c82598a0340fc8dd2",
+      "zig/pkg/antfly/src/api/lake_index_page_ranges.zig": "235bcc28119b11997d9ccccf8e06aa91834183aa44f20fe3894e625391bd7852",
+      "zig/pkg/antfly/src/api/lake_index_cover_columns.zig": "f5185482182039131e568efd71a0d3733baf12754e3c8059a028417bddbd699b",
+      "zig/pkg/antfly/src/api/lake_index_decoded_metadata.zig": "f7062db913c5fcbdb2aeff4ac664f81ae021b507adba5556e9c5deba1e801a99",
+      "zig/pkg/antfly/src/api/lake_index_source_projection.zig": "43783c02d01178fa28179e7f5b6594a2e6445f15016b0c4d324cf64c611a979c",
+      "zig/pkg/antfly/src/api/lake_index_text_query.zig": "d17444117b6b9ba2023fcb641881477cc8b76e547ce6fabf16e5c00cd3690426",
+      "zig/pkg/antfly/src/api/lake_index_sql_rows.zig": "a8497b25645a172642f4fc44811757e597d85e180cab0d342428139cda424024"
+    },
+    "production_prefix_sha256": {
+      "zig/pkg/antfly/src/api/lake_artifact_ranges.zig": "2a01538e7fa7c0c6113e44e57ea60ba98cc0eca25bb7f06c82598a0340fc8dd2",
+      "zig/pkg/antfly/src/api/lake_index_page_ranges.zig": "3929396a76d32b5d47ce620e822c912478de56eded0a5f0c1ecb0de97724d79f",
+      "zig/pkg/antfly/src/api/lake_index_cover_columns.zig": "efd1b12ce71a3b672c72f0d618ba3107c1aec9ae22ed91385edd25eda6156bc3",
+      "zig/pkg/antfly/src/api/lake_index_decoded_metadata.zig": "3cf92e85a1f3e9a0e49d09085ff9af627ff28b0c92756ef8166e237fd876236d",
+      "zig/pkg/antfly/src/api/lake_index_source_projection.zig": "385f278b1fa3a1091621536a397bec21eec4f9d4aca4d25999a0c570364b58d3",
+      "zig/pkg/antfly/src/api/lake_index_text_query.zig": "1f3d55c5a4088750ce2a2aec85418465c443ab8324b02ad95b89e6a34389ccf9",
+      "zig/pkg/antfly/src/api/lake_index_sql_rows.zig": "edd6a8ea9b88452481d379110660bcfc647ab67d1c122f03622ef0541165a1ec"
+    },
+    "qualification": "CLI completed in the full native build. Subsequent changes correct only native test fixtures and assertions; production declarations before the first test match exactly."
+  },
+  "final_binary": {
+    "source_commit": "4fa6ccbd8bf3c5ae8d1a4c906a97e6d883f2929b",
+    "source_tree": "6906ade82466558739db16d3f8ebe49d3c10e232",
+    "source_clean_at_build": true,
+    "binary_sha256": "8fe0bb607a9a7d8baec28cf10dfb253678e986f81129afbd7b66d8f52ff89b37",
+    "zig_version": "0.17.0",
+    "build_mode": "Debug",
+    "merged_main": "a507489e93d87f70da320c45ae708e340f872fd0",
+    "compiled_source_sha256": {
+      "zig/pkg/antfly/src/api/lake_artifact_ranges.zig": "2a01538e7fa7c0c6113e44e57ea60ba98cc0eca25bb7f06c82598a0340fc8dd2",
+      "zig/pkg/antfly/src/api/lake_index_page_ranges.zig": "235bcc28119b11997d9ccccf8e06aa91834183aa44f20fe3894e625391bd7852",
+      "zig/pkg/antfly/src/api/lake_index_cover_columns.zig": "63dbf0f384437ba0ac7cabd4a792ec4bbe4dfbdc5b292d4f91e7fac95f5bc478",
+      "zig/pkg/antfly/src/api/lake_index_decoded_metadata.zig": "10c45132e31bdd7e91ebec8446fe4a3d2942172e5a8142e4f8baf9a7b540a03d",
+      "zig/pkg/antfly/src/api/lake_index_source_projection.zig": "4377de84030a2244791348dc91dde5e740541035fba640809d0b7427149dda6f",
+      "zig/pkg/antfly/src/api/lake_index_text_query.zig": "d17444117b6b9ba2023fcb641881477cc8b76e547ce6fabf16e5c00cd3690426",
+      "zig/pkg/antfly/src/api/lake_index_sql_rows.zig": "a8497b25645a172642f4fc44811757e597d85e180cab0d342428139cda424024"
+    },
+    "production_prefix_sha256": {
+      "zig/pkg/antfly/src/api/lake_artifact_ranges.zig": "2a01538e7fa7c0c6113e44e57ea60ba98cc0eca25bb7f06c82598a0340fc8dd2",
+      "zig/pkg/antfly/src/api/lake_index_page_ranges.zig": "3929396a76d32b5d47ce620e822c912478de56eded0a5f0c1ecb0de97724d79f",
+      "zig/pkg/antfly/src/api/lake_index_cover_columns.zig": "27f4db0a66615517dc3ecf32e6a13bf3956362265886a628264db0b3cb3daac5",
+      "zig/pkg/antfly/src/api/lake_index_decoded_metadata.zig": "8e5a5b781bc490ca44b57794a884f2ad443afb412be09436eee5df4fee57ce97",
+      "zig/pkg/antfly/src/api/lake_index_source_projection.zig": "385f278b1fa3a1091621536a397bec21eec4f9d4aca4d25999a0c570364b58d3",
+      "zig/pkg/antfly/src/api/lake_index_text_query.zig": "1f3d55c5a4088750ce2a2aec85418465c443ab8324b02ad95b89e6a34389ccf9",
+      "zig/pkg/antfly/src/api/lake_index_sql_rows.zig": "edd6a8ea9b88452481d379110660bcfc647ab67d1c122f03622ef0541165a1ec"
+    },
+    "qualification": "CLI and affected full frontier owner built from this clean source snapshot; other relevant native suites passed before the lease-only refinement."
+  },
+  "same_main_control": {
+    "source_commit": "f67134b93c3bb55b3092524422154629b29c2eb5",
+    "build_configuration_commit": "4fa6ccbd8bf3c5ae8d1a4c906a97e6d883f2929b",
+    "build_configuration_dirty": true,
+    "source_override_files": [
+      "zig/pkg/antfly/src/api/lake_artifact_ranges.zig",
+      "zig/pkg/antfly/src/api/lake_index_cover_columns.zig",
+      "zig/pkg/antfly/src/api/lake_index_decoded_metadata.zig",
+      "zig/pkg/antfly/src/api/lake_index_page_ranges.zig",
+      "zig/pkg/antfly/src/api/lake_index_source_projection.zig",
+      "zig/pkg/antfly/src/api/lake_index_text_query.zig"
+    ],
+    "compiled_override_sha256": {
+      "zig/pkg/antfly/src/api/lake_index_cover_columns.zig": "fa097f38de38ef8c6afbebccee01747a464f78dd5fdb300b3c204a2f99fb35e5",
+      "zig/pkg/antfly/src/api/lake_index_decoded_metadata.zig": "dbcc708b7ba9cf2241b92cc80643689cc0c7ef68541ccb99860067ad8fe9f75e",
+      "zig/pkg/antfly/src/api/lake_index_page_ranges.zig": "f8ff0c9386f75a094c7eeb5f3995c28ad0cdae7a120081014635bafa695793d2",
+      "zig/pkg/antfly/src/api/lake_index_source_projection.zig": "e467362bae4f6f39a0294c617b2a3980fcc6f0c0e0822d5696eb2b0d5abfc4b4",
+      "zig/pkg/antfly/src/api/lake_index_text_query.zig": "00ba7d5e18ff4b65fa9df1ca20967b12acbf901d8d12f422bd939a4033dc081e"
+    },
+    "binary_sha256": "43037ee10254a0632d12c882baff4be92773848958d4a0f66ec1008d824f511b",
+    "merged_main": "a507489e93d87f70da320c45ae708e340f872fd0",
+    "zig_version": "0.17.0",
+    "build_mode": "Debug",
+    "qualification": "Same merged main as final, before the range/field refinements; production Zig changes relative to this commit were temporarily restored, then the original checkout and final installed executable were restored. Build/version metadata uses the current checkout with a dirty flag."
+  },
+  "fixture": {
+    "rows": 256,
+    "result_rows": 256,
+    "scalar_columns": 10,
+    "broad_projection_columns": 10,
+    "narrow_projection_columns": 2,
+    "source_mode": "native stored-source columns without a relational cover index",
+    "cover_mode": "text source storage disabled; relational ID index includes other scalar fields",
+    "runner": "zig/bench/lake/delivery_tiles.py"
+  },
+  "native_structural_checks": {
+    "covering_ranges": {
+      "adjacent_required_stripes": 3,
+      "sequential_pack_range_requests": 3,
+      "measured_coalesced_pack_range_requests": 1,
+      "measured_max_range_bytes": 1689,
+      "unused_wide_pack_value_excluded": true,
+      "directory_fetch_separate": true,
+      "decoded_warm_provider_requests_with_raw_and_physical_residency_disabled": 0,
+      "max_logical_units_per_wave": 16,
+      "cover_max_range_bytes": 4194304,
+      "cover_max_gap_bytes": 0,
+      "navigation_max_range_bytes": 1048576,
+      "navigation_max_gap_bytes": 16384,
+      "corruption_gap_admission_duplicates_and_allocation_failures_checked": true
+    },
+    "field_major": {
+      "rows": 256,
+      "fields": 8,
+      "cursor_capacity": 4,
+      "checkpoint_tile_rows": 64,
+      "tiled_column_opens": 32,
+      "field_major_column_opens": 8,
+      "tiled_chunk_decodes": 32,
+      "field_major_chunk_decodes": 8,
+      "legacy_whole_row_decodes": 0,
+      "exact_integer_values_and_rank_preserved": true,
+      "identity_cancellation_and_allocation_failures_checked": true
+    }
+  },
+  "exact_comparisons": {
+    "paired_pages": 78,
+    "responses": 156,
+    "complete_hits_including_sources_scores_sort_keys_and_totals_equal": true,
+    "work_fields_equal": [
+      "candidate_count",
+      "ordered_scanned_count",
+      "cursor_rejected_count",
+      "selected_count"
+    ]
+  },
+  "comparisons": [
+    {
+      "comparison": "initial",
+      "case": "source",
+      "cache_mode": "process_restarted",
+      "before_median_ns": 73431042,
+      "after_median_ns": 75180166
+    },
+    {
+      "comparison": "initial",
+      "case": "source",
+      "cache_mode": "warm",
+      "before_median_ns": 62630750,
+      "after_median_ns": 62311542
+    },
+    {
+      "comparison": "initial",
+      "case": "cover",
+      "cache_mode": "process_restarted",
+      "before_median_ns": 88251292,
+      "after_median_ns": 93474542
+    },
+    {
+      "comparison": "initial",
+      "case": "cover",
+      "cache_mode": "warm",
+      "before_median_ns": 72505458,
+      "after_median_ns": 76235458
+    },
+    {
+      "comparison": "initial",
+      "case": "source-narrow",
+      "cache_mode": "process_restarted",
+      "before_median_ns": 58404416,
+      "after_median_ns": 58408583
+    },
+    {
+      "comparison": "initial",
+      "case": "source-narrow",
+      "cache_mode": "warm",
+      "before_median_ns": 48209708,
+      "after_median_ns": 47814708
+    },
+    {
+      "comparison": "initial",
+      "case": "cover-narrow",
+      "cache_mode": "process_restarted",
+      "before_median_ns": 83067291,
+      "after_median_ns": 81059583
+    },
+    {
+      "comparison": "initial",
+      "case": "cover-narrow",
+      "cache_mode": "warm",
+      "before_median_ns": 70666541,
+      "after_median_ns": 67465625
+    },
+    {
+      "comparison": "final_vs_reviewed",
+      "case": "source",
+      "cache_mode": "process_restarted",
+      "before_median_ns": 67835417,
+      "after_median_ns": 70409125
+    },
+    {
+      "comparison": "final_vs_reviewed",
+      "case": "source",
+      "cache_mode": "warm",
+      "before_median_ns": 57532666,
+      "after_median_ns": 58857125
+    },
+    {
+      "comparison": "final_vs_reviewed",
+      "case": "cover",
+      "cache_mode": "process_restarted",
+      "before_median_ns": 88136542,
+      "after_median_ns": 107739125
+    },
+    {
+      "comparison": "final_vs_reviewed",
+      "case": "cover",
+      "cache_mode": "warm",
+      "before_median_ns": 71933792,
+      "after_median_ns": 87511917
+    },
+    {
+      "comparison": "final_vs_reviewed",
+      "case": "source-narrow",
+      "cache_mode": "process_restarted",
+      "before_median_ns": 61515042,
+      "after_median_ns": 71601417
+    },
+    {
+      "comparison": "final_vs_reviewed",
+      "case": "source-narrow",
+      "cache_mode": "warm",
+      "before_median_ns": 50596666,
+      "after_median_ns": 58946042
+    },
+    {
+      "comparison": "final_vs_reviewed",
+      "case": "cover-narrow",
+      "cache_mode": "process_restarted",
+      "before_median_ns": 81454583,
+      "after_median_ns": 83888500
+    },
+    {
+      "comparison": "final_vs_reviewed",
+      "case": "cover-narrow",
+      "cache_mode": "warm",
+      "before_median_ns": 68283291,
+      "after_median_ns": 68861583
+    },
+    {
+      "comparison": "same_main",
+      "case": "source",
+      "cache_mode": "process_restarted",
+      "before_median_ns": 82155792,
+      "after_median_ns": 82551792
+    },
+    {
+      "comparison": "same_main",
+      "case": "source",
+      "cache_mode": "warm",
+      "before_median_ns": 69492833,
+      "after_median_ns": 68632292
+    },
+    {
+      "comparison": "same_main",
+      "case": "cover",
+      "cache_mode": "process_restarted",
+      "before_median_ns": 100601291,
+      "after_median_ns": 101394750
+    },
+    {
+      "comparison": "same_main",
+      "case": "cover",
+      "cache_mode": "warm",
+      "before_median_ns": 83365750,
+      "after_median_ns": 84527666
+    },
+    {
+      "comparison": "same_main",
+      "case": "source-narrow",
+      "cache_mode": "process_restarted",
+      "before_median_ns": 68418000,
+      "after_median_ns": 68804084
+    },
+    {
+      "comparison": "same_main",
+      "case": "source-narrow",
+      "cache_mode": "warm",
+      "before_median_ns": 55584792,
+      "after_median_ns": 55498125
+    },
+    {
+      "comparison": "same_main",
+      "case": "cover-narrow",
+      "cache_mode": "process_restarted",
+      "before_median_ns": 90203167,
+      "after_median_ns": 92189917
+    },
+    {
+      "comparison": "same_main",
+      "case": "cover-narrow",
+      "cache_mode": "warm",
+      "before_median_ns": 75404917,
+      "after_median_ns": 75854875
+    },
+    {
+      "comparison": "initial_reversed_cover_diagnostic",
+      "case": "cover",
+      "cache_mode": "process_restarted",
+      "before_median_ns": 93114667,
+      "after_median_ns": 94307042
+    },
+    {
+      "comparison": "initial_reversed_cover_diagnostic",
+      "case": "cover",
+      "cache_mode": "warm",
+      "before_median_ns": 76796459,
+      "after_median_ns": 79529125
+    }
+  ],
+  "reports": {
+    "after-cover": {
+      "source_commit": "ac0febca03e75754fb4fd96571389b2c77f5a19e",
+      "binary_sha256": "b6193f9b0d5495d9f22a2089fafeaf4589f67b77eb67fb86bdf59df95bf1eb04",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 93474542,
+        "warm": 76235458
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "097f7a67870d55de295f636c3291a147b834d202dc36168596e0a60c1a44102c",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 98635333,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20272,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 76948166,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18362,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 91922291,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18080,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 76235458,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17950,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 93474542,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18954,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 75948833,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18102,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "after-cover-narrow": {
+      "source_commit": "ac0febca03e75754fb4fd96571389b2c77f5a19e",
+      "binary_sha256": "b6193f9b0d5495d9f22a2089fafeaf4589f67b77eb67fb86bdf59df95bf1eb04",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": true,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 81059583,
+        "warm": 67465625
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "a0a7e644503cde1d4ce0660df8cc1bc4271e2c9f966ebf5cdb2d08ab048d131f",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 81355583,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19823,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 67465625,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18826,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 81059583,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18431,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 67982833,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18018,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 80515917,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19305,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 65447375,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 17513,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "after-cover-repeat": {
+      "source_commit": "ac0febca03e75754fb4fd96571389b2c77f5a19e",
+      "binary_sha256": "b6193f9b0d5495d9f22a2089fafeaf4589f67b77eb67fb86bdf59df95bf1eb04",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 94307042,
+        "warm": 79529125
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "bee4ecc6f51f9b660c399d4fb3252ccce3731877d67b8519c045614bd1e65051",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 92913417,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19511,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 79529125,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18923,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 94307042,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19387,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 81366083,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19251,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 94385542,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19404,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 78987042,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19118,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "after-source": {
+      "source_commit": "ac0febca03e75754fb4fd96571389b2c77f5a19e",
+      "binary_sha256": "b6193f9b0d5495d9f22a2089fafeaf4589f67b77eb67fb86bdf59df95bf1eb04",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "source",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 75180166,
+        "warm": 62311542
+      },
+      "definition_sha256": "d2d4dd5cb71568c8114c69916db196819e4f0233596e8017956e98916b5c8503",
+      "raw_report_sha256": "9e3455022d75de7be63107f5464cd5cc304d02302ab51c60dfc6a804890e3fe2",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 76741958,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19484,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 62311542,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18878,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 75180166,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19179,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 62249292,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18732,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 73708458,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19334,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 62479292,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18974,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "after-source-narrow": {
+      "source_commit": "ac0febca03e75754fb4fd96571389b2c77f5a19e",
+      "binary_sha256": "b6193f9b0d5495d9f22a2089fafeaf4589f67b77eb67fb86bdf59df95bf1eb04",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "source",
+      "narrow": true,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 58408583,
+        "warm": 47814708
+      },
+      "definition_sha256": "d2d4dd5cb71568c8114c69916db196819e4f0233596e8017956e98916b5c8503",
+      "raw_report_sha256": "607eee12c78d2d92477f7881e01ccb4e5268ffa13c332fa2318fa158041dad43",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 58090250,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 17606,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 47425125,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 17482,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 61609250,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 17528,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 47814708,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 17634,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 58408583,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 17579,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 49717667,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 17979,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "before-cover": {
+      "source_commit": "8bc363e89a5c6776ebbcc6e8be216cfa6fb390d4",
+      "binary_sha256": "b11f29c4c08102f1745cf4f5ce0642f743f9645de1256094ceed8e2ff81971a6",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 88251292,
+        "warm": 72505458
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "7cfe56a6d4c4390fe087490cffe6a26b06ee8a483df4aa4d5c219c941e779824",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 91077750,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19917,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 72372041,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18032,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 88251292,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18389,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 72511708,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17647,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 84989250,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17616,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 72505458,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17969,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "before-cover-narrow": {
+      "source_commit": "8bc363e89a5c6776ebbcc6e8be216cfa6fb390d4",
+      "binary_sha256": "b11f29c4c08102f1745cf4f5ce0642f743f9645de1256094ceed8e2ff81971a6",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": true,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 83067291,
+        "warm": 70666541
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "3f4bb0646afb8a81953c9d32babccb501b458897138a46c9f6d8538672e49230",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 83067291,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19150,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 71168667,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18940,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 83688584,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19331,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 70666541,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18828,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 82779750,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19327,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 70058666,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18922,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "before-cover-repeat": {
+      "source_commit": "8bc363e89a5c6776ebbcc6e8be216cfa6fb390d4",
+      "binary_sha256": "b11f29c4c08102f1745cf4f5ce0642f743f9645de1256094ceed8e2ff81971a6",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 93114667,
+        "warm": 76796459
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "803e471e4c99a1e4f700f8531e379ca1a5c2e493c4357fde02b57c00744aba55",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 178141333,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 35219,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 76796459,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18911,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 93114667,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19007,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 77852666,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18753,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 90631625,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19186,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 75900416,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18782,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "before-source": {
+      "source_commit": "8bc363e89a5c6776ebbcc6e8be216cfa6fb390d4",
+      "binary_sha256": "b11f29c4c08102f1745cf4f5ce0642f743f9645de1256094ceed8e2ff81971a6",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "source",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 73431042,
+        "warm": 62630750
+      },
+      "definition_sha256": "d2d4dd5cb71568c8114c69916db196819e4f0233596e8017956e98916b5c8503",
+      "raw_report_sha256": "2c5113143cefd2fadd88739bf3f9f50a9d403d2fb1fbadd8c255565f67e815fa",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 75544000,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18516,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 63271417,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18303,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 73431042,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18507,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 62630750,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18374,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 73354666,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18809,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 62414916,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18625,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "before-source-narrow": {
+      "source_commit": "8bc363e89a5c6776ebbcc6e8be216cfa6fb390d4",
+      "binary_sha256": "b11f29c4c08102f1745cf4f5ce0642f743f9645de1256094ceed8e2ff81971a6",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "source",
+      "narrow": true,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 58404416,
+        "warm": 48209708
+      },
+      "definition_sha256": "d2d4dd5cb71568c8114c69916db196819e4f0233596e8017956e98916b5c8503",
+      "raw_report_sha256": "db82be5259c0f01e37dd2c2172a949245826a882143a93add5401d6222ec25bf",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 58404416,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18192,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 48951417,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 17975,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 60115708,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 17618,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 47705083,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 17845,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 58064250,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18125,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 48209708,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 17507,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "control-cover": {
+      "source_commit": "f67134b93c3bb55b3092524422154629b29c2eb5",
+      "binary_sha256": "43037ee10254a0632d12c882baff4be92773848958d4a0f66ec1008d824f511b",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 100601291,
+        "warm": 83365750
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "657b19896aef5b95daf2868322894354a15756a1d65be01a0e68d2188c34d8df",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 100601291,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20658,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 84987292,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20131,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 103313042,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20705,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 83365750,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20081,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 99360166,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20830,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 83207833,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19915,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "control-cover-narrow": {
+      "source_commit": "f67134b93c3bb55b3092524422154629b29c2eb5",
+      "binary_sha256": "43037ee10254a0632d12c882baff4be92773848958d4a0f66ec1008d824f511b",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": true,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 90203167,
+        "warm": 75404917
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "cbb46473a8c98fc652905d3305c34fc669de76926728a1868252ccbb6ca97123",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 88944333,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 20618,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 75404917,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 20099,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 92979666,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 20352,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 74698000,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19784,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 90203167,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 20555,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 75780666,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19913,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "control-source": {
+      "source_commit": "f67134b93c3bb55b3092524422154629b29c2eb5",
+      "binary_sha256": "43037ee10254a0632d12c882baff4be92773848958d4a0f66ec1008d824f511b",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "source",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 82155792,
+        "warm": 69492833
+      },
+      "definition_sha256": "d2d4dd5cb71568c8114c69916db196819e4f0233596e8017956e98916b5c8503",
+      "raw_report_sha256": "ddfea112c64122c51857cace3dc1833bde3fdf5c240818ebdc81668fe37c4709",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 83838750,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20509,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 69506750,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19916,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 82155792,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20427,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 66768375,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20017,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 81577083,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20938,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 69492833,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20694,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "control-source-narrow": {
+      "source_commit": "f67134b93c3bb55b3092524422154629b29c2eb5",
+      "binary_sha256": "43037ee10254a0632d12c882baff4be92773848958d4a0f66ec1008d824f511b",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "source",
+      "narrow": true,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 68418000,
+        "warm": 55584792
+      },
+      "definition_sha256": "d2d4dd5cb71568c8114c69916db196819e4f0233596e8017956e98916b5c8503",
+      "raw_report_sha256": "afb0c9d21cd022003492be6110c9115dca9b088826bff2522aa56e8349abfd22",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 68418000,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 20007,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 55584792,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19609,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 69291708,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19876,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 55953000,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19564,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 68000042,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 20140,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 55282625,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19480,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "final-cover": {
+      "source_commit": "4fa6ccbd8bf3c5ae8d1a4c906a97e6d883f2929b",
+      "binary_sha256": "8fe0bb607a9a7d8baec28cf10dfb253678e986f81129afbd7b66d8f52ff89b37",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 107739125,
+        "warm": 87511917
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "5e6ce8413994a178367f3a2f4f2ec111135cac26deab45cdb23ea1c7b9256fd3",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 111178375,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 22023,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 87511917,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 21785,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 107739125,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 22259,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 87634833,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 21793,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 105582709,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 22361,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 87299042,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 21678,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "final-cover-narrow": {
+      "source_commit": "4fa6ccbd8bf3c5ae8d1a4c906a97e6d883f2929b",
+      "binary_sha256": "8fe0bb607a9a7d8baec28cf10dfb253678e986f81129afbd7b66d8f52ff89b37",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": true,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 83888500,
+        "warm": 68861583
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "8d6e153d773dac152a6a45c3a0de63d043c8782594806910ed8d80d6caa9e0f6",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 82230750,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19049,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 68971750,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18509,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 84924792,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19364,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 68790292,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18254,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 83888500,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19334,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 68861583,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18606,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "final-source": {
+      "source_commit": "4fa6ccbd8bf3c5ae8d1a4c906a97e6d883f2929b",
+      "binary_sha256": "8fe0bb607a9a7d8baec28cf10dfb253678e986f81129afbd7b66d8f52ff89b37",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "source",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 70409125,
+        "warm": 58857125
+      },
+      "definition_sha256": "d2d4dd5cb71568c8114c69916db196819e4f0233596e8017956e98916b5c8503",
+      "raw_report_sha256": "71c2bcf366df75a8ffe61a999329afb931771354a9c943c648e1fc37402c8ad5",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 70409125,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17837,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 57203500,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17112,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 70565416,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18009,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 59115916,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17966,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 68975416,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17949,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 58857125,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18017,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "final-source-narrow": {
+      "source_commit": "4fa6ccbd8bf3c5ae8d1a4c906a97e6d883f2929b",
+      "binary_sha256": "8fe0bb607a9a7d8baec28cf10dfb253678e986f81129afbd7b66d8f52ff89b37",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "source",
+      "narrow": true,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 71601417,
+        "warm": 58946042
+      },
+      "definition_sha256": "d2d4dd5cb71568c8114c69916db196819e4f0233596e8017956e98916b5c8503",
+      "raw_report_sha256": "56f39da469eec9ca065c37cf4a553606debd69f44d3f2e3cb5019631af6a160c",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 71601417,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 21456,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 56318458,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 20695,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 73926625,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 21572,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 59054583,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 21035,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 70966125,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 21618,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 58946042,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 21040,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "matched-cover": {
+      "source_commit": "4fa6ccbd8bf3c5ae8d1a4c906a97e6d883f2929b",
+      "binary_sha256": "8fe0bb607a9a7d8baec28cf10dfb253678e986f81129afbd7b66d8f52ff89b37",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 101394750,
+        "warm": 84527666
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "6eb5761ca16d187cc00fb7e7c6b06813be2e8d25060fd1b0a8496be78d2c0cee",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 100138167,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 21000,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 84284417,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19939,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 102795916,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20388,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 85102667,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20553,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 101394750,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 21148,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 84527666,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20527,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "matched-cover-narrow": {
+      "source_commit": "4fa6ccbd8bf3c5ae8d1a4c906a97e6d883f2929b",
+      "binary_sha256": "8fe0bb607a9a7d8baec28cf10dfb253678e986f81129afbd7b66d8f52ff89b37",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": true,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 92189917,
+        "warm": 75854875
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "d9e3cceaedbb980ad20ba9776af52046c1d34e7c6796acf12764b3fdb5238670",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 92367834,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 21025,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 76058125,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 20366,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 92189917,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 20547,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 74950291,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 20147,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 90755125,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 20855,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 75854875,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 20367,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "matched-source": {
+      "source_commit": "4fa6ccbd8bf3c5ae8d1a4c906a97e6d883f2929b",
+      "binary_sha256": "8fe0bb607a9a7d8baec28cf10dfb253678e986f81129afbd7b66d8f52ff89b37",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "source",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 82551792,
+        "warm": 68632292
+      },
+      "definition_sha256": "d2d4dd5cb71568c8114c69916db196819e4f0233596e8017956e98916b5c8503",
+      "raw_report_sha256": "c5c7b4e8b19c5718bdd7fd61d017dd6892dbabec10eb5497702079f5db6100ae",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 80188166,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20545,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 68632292,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20293,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 83741708,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20885,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 67548708,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20016,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 82551792,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20814,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 68901333,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 20400,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "matched-source-narrow": {
+      "source_commit": "4fa6ccbd8bf3c5ae8d1a4c906a97e6d883f2929b",
+      "binary_sha256": "8fe0bb607a9a7d8baec28cf10dfb253678e986f81129afbd7b66d8f52ff89b37",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "source",
+      "narrow": true,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 68804084,
+        "warm": 55498125
+      },
+      "definition_sha256": "d2d4dd5cb71568c8114c69916db196819e4f0233596e8017956e98916b5c8503",
+      "raw_report_sha256": "691924f1bf7947da8b8450a94da4c2b91250158581f6d22a697f27f65b2b14bb",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 68804084,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19982,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 55498125,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19635,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 70837208,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19873,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 55669083,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19455,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 68531208,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19947,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 55317000,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19306,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "reference-cover": {
+      "source_commit": "8bc363e89a5c6776ebbcc6e8be216cfa6fb390d4",
+      "binary_sha256": "b11f29c4c08102f1745cf4f5ce0642f743f9645de1256094ceed8e2ff81971a6",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 88136542,
+        "warm": 71933792
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "b97b1827ee4d8ace85782447e7f49a49099ddeaf05788d9aab70f1690277c121",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 86462417,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18550,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 72814709,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17873,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 89541667,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19823,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 71933792,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 18063,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 88136542,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 19188,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 71686709,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17975,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "reference-cover-narrow": {
+      "source_commit": "8bc363e89a5c6776ebbcc6e8be216cfa6fb390d4",
+      "binary_sha256": "b11f29c4c08102f1745cf4f5ce0642f743f9645de1256094ceed8e2ff81971a6",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "cover",
+      "narrow": true,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 81454583,
+        "warm": 68283291
+      },
+      "definition_sha256": "860efcc213a29eae4f2cfe44db07a8c2147be2f6c4b80aed7f520d2ed38d2553",
+      "raw_report_sha256": "cbada9396b560d9f50c9549418e562617453738b6a6e2fbd33757d67bf86fccd",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 81454583,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18938,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 68283291,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18511,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 84608542,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 19127,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 68586959,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18687,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 81095917,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18820,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 67977375,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18128,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "reference-source": {
+      "source_commit": "8bc363e89a5c6776ebbcc6e8be216cfa6fb390d4",
+      "binary_sha256": "b11f29c4c08102f1745cf4f5ce0642f743f9645de1256094ceed8e2ff81971a6",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "source",
+      "narrow": false,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket",
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 67835417,
+        "warm": 57532666
+      },
+      "definition_sha256": "d2d4dd5cb71568c8114c69916db196819e4f0233596e8017956e98916b5c8503",
+      "raw_report_sha256": "a3f2e26856a01ae266658345dc2e2a2b0faa2151080af5350a68822e36ed6cd1",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 67352334,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17584,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 57532666,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17050,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 69126083,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17527,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 58551083,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17651,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 67835417,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17856,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 57162959,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "c8ef72e5c5c72d49d8d637ee6d05bf35813412bc0db853b878155e695803befa",
+          "collector_total_us": 17142,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    },
+    "reference-source-narrow": {
+      "source_commit": "8bc363e89a5c6776ebbcc6e8be216cfa6fb390d4",
+      "binary_sha256": "b11f29c4c08102f1745cf4f5ce0642f743f9645de1256094ceed8e2ff81971a6",
+      "runner_sha256": "120d48a8a9bee57678b885282c8bf57e83f81c69de0e559d0e0202113c42a16b",
+      "parquet_sha256": "6646010fe0887bc76aed3967dfbc419eb936aed94073018a284319b90cd6fcb1",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "case": "source",
+      "narrow": true,
+      "rows": 256,
+      "query": {
+        "full_text_search": {
+          "match": "quasar",
+          "field": "body"
+        },
+        "fields": [
+          "id",
+          "bucket"
+        ],
+        "order_by": [
+          {
+            "field": "id",
+            "desc": false
+          }
+        ],
+        "limit": 256,
+        "profile": true
+      },
+      "cache_contract": "Restarts retain OS and persistent caches and readiness warming; no empty-cache claim.",
+      "summary": {
+        "process_restarted": 61515042,
+        "warm": 50596666
+      },
+      "definition_sha256": "d2d4dd5cb71568c8114c69916db196819e4f0233596e8017956e98916b5c8503",
+      "raw_report_sha256": "951bfc4bd13e018ccee86411c687d4d90e98e0ef7d41cfe6bfd1819ebf383fce",
+      "samples": [
+        {
+          "sample": 0,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 61368000,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18558,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 0,
+          "cache_mode": "warm",
+          "elapsed_ns": 50964333,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18507,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 63486292,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18358,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 1,
+          "cache_mode": "warm",
+          "elapsed_ns": 50596666,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18179,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "process_restarted",
+          "elapsed_ns": 61515042,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18350,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        },
+        {
+          "sample": 2,
+          "cache_mode": "warm",
+          "elapsed_ns": 50529417,
+          "total": {
+            "value": 256,
+            "relation": "exact"
+          },
+          "complete_hits_count": 256,
+          "complete_hits_sha256": "12f1f0a62a2efd6bdba65b818cbc2ed6e19984904363b18da249df271a6f5c23",
+          "collector_total_us": 18442,
+          "work": {
+            "candidate_count": 256,
+            "ordered_scanned_count": 0,
+            "cursor_rejected_count": 0,
+            "selected_count": 256
+          }
+        }
+      ]
+    }
+  },
+  "interpretation": "The reductions in provider request count and repeated chunk work are proven by production-code native tests. Same-main whole-query medians are close (about -1.2% to +1.4% warm); no additional large end-to-end latency gain is qualified. Earlier pre-main-reference slower observations remain recorded. A duplicate decoded-residency probe was replaced with retained leases before final qualification.",
+  "validation": {
+    "native_passed": 368,
+    "native_skipped": 1,
+    "native_failed": 0,
+    "native_leaked": 0,
+    "final_frontier_owner_passed": 111,
+    "embedded_frontier_passed": 30,
+    "other_validated_suites": {
+      "embedded_filtered_topk": 91,
+      "server_filtered_topk": 35,
+      "graph_navigation": 101
+    },
+    "production_cli_build": true,
+    "benchmark_tooling_tests": 19,
+    "real_file_e2e_status": "passed",
+    "merged_main": "a507489e93d87f70da320c45ae708e340f872fd0",
+    "final_runner_sha256": "9f27b2f70d2d1c72b1c7c8312a1da572c68b4f70c64b44d5e9d5229666dbb93c",
+    "real_file_e2e_passed": 36,
+    "real_file_e2e_skipped": 0,
+    "real_file_e2e_seconds": 286.39,
+    "apache_boundary_source_files": 2555,
+    "license_check": true,
+    "formatting_check": true
+  },
+  "notes": [
+    "Control source commit f67134b93c contains the same main integration and the reviewed branch before these refinements; it was built in the existing worktree cache using reversible committed-source overrides. All source files and the final installed executable were restored afterward. The control build metadata retains the current Git revision with a dirty flag.",
+    "All report samples and slower controls are retained. Superseded local executables were removed after measurements to preserve storage headroom; executable metadata and result reports remain.",
+    "Real-provider qualification remains deferred; these comparisons use local filesystem-backed Parquet.",
+    "The checked-in delivery runner adds only E402 lint annotations after measurement. Historical report runner hashes identify the exact measured script; execution behavior is unchanged."
+  ]
+}

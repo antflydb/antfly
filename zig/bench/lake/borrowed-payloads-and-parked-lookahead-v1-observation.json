@@ -1,0 +1,200 @@
+{
+  "version": 1,
+  "created_utc": "2026-10-30T17:22:42.223056+00:00",
+  "qualification": "Six alternating control/candidate ReleaseSafe production-code pairs with a complete independent vector oracle, balanced allocation ownership and a 64-KiB bounded-memory negative control. Task-owned builds, native tests, E2E and cleanup did not overlap timing; other host activity is uncontrolled.",
+  "main_commit": "b2f6226fbdc4baa7387fe2ca601833f5a48c6f1e",
+  "control_commit": "945f7db284763fd441c8f6b05d75390c3bafbdb6",
+  "candidate_runtime_commit": "3196cec646e6259407e5d993f06c4d450fe96ea2",
+  "runtime_abi": 76,
+  "native_reader_protocol": 97,
+  "candidate_executable": {
+    "path": ".benchmark-results/lake/borrowed-payloads-v1/after/antfly",
+    "sha256": "92a2556ffcd5d745cdca420606e6029069618c89afb9f4afb7529180fd9f3dc5"
+  },
+  "source_sha256": {
+    "zig/REMOTE_TABLE_SERVING.md": "db8a74db7a4903170edaa120588b43232913aab4314f176b748c4bbf56cb3439",
+    "zig/bench/lake/borrowed_payload_probe.zig": "6d263f227ac4d9de4475056deda27ef6ed0fcf7d4f4408ab3346cd2ffec13cec",
+    "zig/pkg/antfly-embedded/src/runtime_failure_abi.zig": "1a3ec248b2957f96e69a0eabe11ead2be161b6123aa447739b5221fe81336450",
+    "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_cursor.zig": "cc0fa5e11f9f9e1dde5c5e59a7eff9563b1faa390c1b29958db38c5a7b6fb697",
+    "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_page.zig": "ad715f3b7285b5056db0944a602a9218cd75f7c03bdecdd721068a70071ae775",
+    "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_rowgroup.zig": "a322bba7bc5fdba540690913f4f21162c5adc680fa59f42ae0fb292cfdac3a10",
+    "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_selected.zig": "aee3bc9ac6f9300dee340a0cf3b16e2d43644cd68bacb4932a0e7d008ba4829d",
+    "zig/pkg/antfly-embedded/src/serverless/query/lake_stream.zig": "e2931c4030f86bd3082b9055391469d6e83a3f81789fa3d933f912f15931cc5e",
+    "zig/pkg/antfly-embedded/src/sql/parallel_scheduler.zig": "351f4694725fa30444ad12c22690b6a384062d5be5f500f65bac7cad0e94590d"
+  },
+  "control_parquet_page_sha256": "6a366ff12ded853acb4af591c844373b2a1c6d80d07dc08fb51ffa3a59ed1ca4",
+  "candidate_parquet_page_sha256": "ad715f3b7285b5056db0944a602a9218cd75f7c03bdecdd721068a70071ae775",
+  "probe_binary_sha256": "703c391a91e5961a79b1e52e569ac218ac45ecd5ecbaf44ecda0b24d0aa43475",
+  "borrowed_payload_probe": {
+    "rows_per_page": 8192,
+    "iterations_per_sample": 1024,
+    "summary": {
+      "before": {
+        "elapsed_ns": 13105666.5,
+        "allocated_bytes": 134217728.0
+      },
+      "after": {
+        "elapsed_ns": 6631729.0,
+        "allocated_bytes": 67108864.0
+      }
+    },
+    "speedup": 1.9762065820240846,
+    "samples": [
+      {
+        "sample": 0,
+        "variant": "before",
+        "iterations": 1024,
+        "rows": 8192,
+        "elapsed_ns": 35009625,
+        "allocated_bytes": 134217728
+      },
+      {
+        "sample": 0,
+        "variant": "after",
+        "iterations": 1024,
+        "rows": 8192,
+        "elapsed_ns": 11583750,
+        "allocated_bytes": 67108864
+      },
+      {
+        "sample": 1,
+        "variant": "after",
+        "iterations": 1024,
+        "rows": 8192,
+        "elapsed_ns": 9603667,
+        "allocated_bytes": 67108864
+      },
+      {
+        "sample": 1,
+        "variant": "before",
+        "iterations": 1024,
+        "rows": 8192,
+        "elapsed_ns": 15957209,
+        "allocated_bytes": 134217728
+      },
+      {
+        "sample": 2,
+        "variant": "before",
+        "iterations": 1024,
+        "rows": 8192,
+        "elapsed_ns": 13652083,
+        "allocated_bytes": 134217728
+      },
+      {
+        "sample": 2,
+        "variant": "after",
+        "iterations": 1024,
+        "rows": 8192,
+        "elapsed_ns": 6606875,
+        "allocated_bytes": 67108864
+      },
+      {
+        "sample": 3,
+        "variant": "after",
+        "iterations": 1024,
+        "rows": 8192,
+        "elapsed_ns": 6583084,
+        "allocated_bytes": 67108864
+      },
+      {
+        "sample": 3,
+        "variant": "before",
+        "iterations": 1024,
+        "rows": 8192,
+        "elapsed_ns": 12143083,
+        "allocated_bytes": 134217728
+      },
+      {
+        "sample": 4,
+        "variant": "before",
+        "iterations": 1024,
+        "rows": 8192,
+        "elapsed_ns": 12258208,
+        "allocated_bytes": 134217728
+      },
+      {
+        "sample": 4,
+        "variant": "after",
+        "iterations": 1024,
+        "rows": 8192,
+        "elapsed_ns": 6656583,
+        "allocated_bytes": 67108864
+      },
+      {
+        "sample": 5,
+        "variant": "after",
+        "iterations": 1024,
+        "rows": 8192,
+        "elapsed_ns": 6566625,
+        "allocated_bytes": 67108864
+      },
+      {
+        "sample": 5,
+        "variant": "before",
+        "iterations": 1024,
+        "rows": 8192,
+        "elapsed_ns": 12559250,
+        "allocated_bytes": 134217728
+      }
+    ],
+    "oracles": [
+      "Complete vector matches independent negative row ordinal before timing; timed iterations sample an expected value.",
+      "All tracked allocation is freed after each sample.",
+      "A 64-KiB fixed allocator rejects the control and admits the candidate final 8192-i64 vector.",
+      "The native budget test independently reports 65,536 retained bytes and 65,536 peak bytes in the decoder allocator. Input lease memory is accounted separately."
+    ]
+  },
+  "lookahead_qualification": {
+    "method": "Controlled native provider gates, with one- and two-column speculative cursors using the shared scheduler.",
+    "checks": [
+      "Blocked provider reads occupy I/O slots and no CPU slot.",
+      "An unrelated CPU task completes while lookahead is blocked.",
+      "A saturated CPU or I/O lane drops optional work without an inline speculative fetch/decode.",
+      "A required cursor still completes under the same saturation.",
+      "Cancellation joins workers and refunds all input, pull, I/O and CPU reservations.",
+      "Optional coordinators leave half the pull descriptor and retained-byte allowance for required operators."
+    ],
+    "latency_claim": null
+  },
+  "validation": {
+    "focused_native": {
+      "shared_passed": 158,
+      "api_passed": 17,
+      "failed": 0,
+      "skipped": 0,
+      "leaked": 0
+    },
+    "standalone_scheduler": {
+      "passed": 12,
+      "failed": 0
+    },
+    "e2e": {
+      "status": "passed",
+      "passed": 50,
+      "failed": 0,
+      "skipped": 0,
+      "elapsed_seconds": 365.78,
+      "binary_sha256": "92a2556ffcd5d745cdca420606e6029069618c89afb9f4afb7529180fd9f3dc5",
+      "suites": [
+        "zig/e2e/antfly/test_lake_archive_qualification.py",
+        "zig/e2e/antfly/test_iceberg_sql.py"
+      ],
+      "command": "PYTHONUNBUFFERED=1 ANTFLY_E2E_FULL_LAKE=1 ANTFLY_BIN=/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/borrowed-payloads-v1/after/antfly TZ=UTC zig/e2e/antfly/.venv/bin/python -B -m pytest zig/e2e/antfly/test_lake_archive_qualification.py zig/e2e/antfly/test_iceberg_sql.py -n2 -q"
+    },
+    "apache_boundary_source_files": 2338,
+    "license_headers": "passed",
+    "zig_format": "passed",
+    "whitespace": "passed",
+    "e2e_log_sha256": "42112681abb2c8262209d5916c6500e6d7eee518866f0675ecb6e1670bbb8576",
+    "gc_log_sha256": "51e465e7f247aef97fb055b3c91ada18531ebdc648fb962d410d6baee52d1d3f"
+  },
+  "limitations": [
+    "This is an uncompressed PLAIN i64 decoder kernel, not an HTTP, archive, empty-cache or cloud throughput measurement.",
+    "Compressed payloads still require owned decompression; retained projection framing explicitly owns its payload.",
+    "The fetched input is outside the decoder fixed-buffer oracle and remains charged by its lease owner.",
+    "Scheduler improvement is established by admission/progress tests, not a provider-latency percentage.",
+    "Earlier benchmark observations retain their original source and executable identities.",
+    "Real-provider cloud retention qualification remains deferred."
+  ],
+  "qualified_utc": "2026-10-30T17:28:40.135362+00:00"
+}

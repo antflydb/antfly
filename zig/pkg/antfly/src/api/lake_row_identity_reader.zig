@@ -451,7 +451,7 @@ const Owner = struct {
         }
         try @import("../serverless/artifacts/store.zig").chargeReadBudget(&self.reads, amount);
     }
-    fn decodedPage(raw: *anyopaque, a: A, ref: @import("../serverless/graph_segment/page_tree.zig").Ref) !@import("../serverless/graph_segment/page_tree.zig").Page {
+    fn decodedPage(raw: *anyopaque, a: A, ref: @import("../serverless/graph_segment/page_tree.zig").Ref) !@import("../serverless/graph_segment/page_tree.zig").NavigationPage {
         var lane: ReadLane = undefined;
         lane.init(@ptrCast(@alignCast(raw)), a, null);
         defer lane.deinit();
@@ -680,17 +680,17 @@ const ReadLane = struct {
         const lease: local.serverless_query_lake_decoded_cache.Lease = .{ .cache = @ptrCast(@alignCast(owner)), .item = @ptrCast(@alignCast(item)) };
         lease.release();
     }
-    fn leasedPage(lease: local.serverless_query_lake_decoded_cache.Lease) @import("../serverless/graph_segment/page_tree.zig").Page {
+    fn leasedPage(lease: local.serverless_query_lake_decoded_cache.Lease) @import("../serverless/graph_segment/page_tree.zig").NavigationPage {
         const value: *const DecodedPage = @ptrCast(@alignCast(lease.item.payload.extension));
         var page = value.page;
         page.lease = .{ .owner = lease.cache, .item = lease.item, .release = releaseDecoded };
         return page;
     }
-    fn readMany(raw: *anyopaque, a: A, refs: []const @import("../serverless/graph_segment/page_tree.zig").Ref, output: []@import("../serverless/graph_segment/page_tree.zig").Page) !void {
+    fn readMany(raw: *anyopaque, a: A, refs: []const @import("../serverless/graph_segment/page_tree.zig").Ref, output: []@import("../serverless/graph_segment/page_tree.zig").NavigationPage) !void {
         const self: *ReadLane = @ptrCast(@alignCast(raw));
         const tree = @import("../serverless/graph_segment/page_tree.zig");
         if (refs.len != output.len or refs.len > tree.max_read_batch) return error.InvalidLogicalRowIdentity;
-        var ready: [tree.max_read_batch]?tree.Page = @splat(null);
+        var ready: [tree.max_read_batch]?tree.NavigationPage = @splat(null);
         defer for (&ready) |*page| if (page.*) |*value| value.deinit(a);
         var missing: [tree.max_read_batch]tree.Ref = undefined;
         var positions: [tree.max_read_batch]usize = undefined;
@@ -733,7 +733,7 @@ const ReadLane = struct {
                 source.decoded_page = .{ .ptr = lane, .read = decodedPage };
             }
             defer for (lanes[0..count]) |*lane| lane.deinit();
-            var pages_: [tree.max_read_batch]tree.Page = undefined;
+            var pages_: [tree.max_read_batch]tree.NavigationPage = undefined;
             try @import("../serverless/graph_segment/page_store.zig").readBatch(self.owner.cached.context.io.?, a, stores_[0..count], missing[0..count], pages_[0..count]);
             for (positions[0..count], pages_[0..count]) |i, page| ready[i] = page;
         }
@@ -778,8 +778,8 @@ const ReadLane = struct {
         hash.final(&key);
         return key;
     }
-    const DecodedPage = struct { page: @import("../serverless/graph_segment/page_tree.zig").Page };
-    fn decodedPage(raw: *anyopaque, a: A, ref: @import("../serverless/graph_segment/page_tree.zig").Ref) !@import("../serverless/graph_segment/page_tree.zig").Page {
+    const DecodedPage = struct { page: @import("../serverless/graph_segment/page_tree.zig").NavigationPage };
+    fn decodedPage(raw: *anyopaque, a: A, ref: @import("../serverless/graph_segment/page_tree.zig").Ref) !@import("../serverless/graph_segment/page_tree.zig").NavigationPage {
         const lane: *ReadLane = @ptrCast(@alignCast(raw));
         const self = lane.owner;
         const tree = @import("../serverless/graph_segment/page_tree.zig");
@@ -796,7 +796,7 @@ const ReadLane = struct {
                     if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
                     return err;
                 };
-                value.* = .{ .page = tree.readPage(out, self_.lane.pages.store(), self_.ref) catch |err| {
+                value.* = .{ .page = tree.readNavigationPage(out, self_.lane.pages.store(), self_.ref) catch |err| {
                     if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
                     return err;
                 } };
@@ -818,12 +818,12 @@ const ReadLane = struct {
                 page.lease = .{ .owner = lease.cache, .item = lease.item, .release = Loader.release };
                 return page;
             }
-            return tree.readPage(a, lane.pages.store(), ref);
+            return tree.readNavigationPage(a, lane.pages.store(), ref);
         }
         const lease = cache.acquire(key, cache.max_loading_bytes, self.cached.context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
             if (err != error.SqlMemoryLimitExceeded) return self.failed(err);
             try self.cached.context.ensureActive();
-            return tree.readPage(a, lane.pages.store(), ref) catch |failure| return self.failed(failure);
+            return tree.readNavigationPage(a, lane.pages.store(), ref) catch |failure| return self.failed(failure);
         };
         errdefer lease.release();
         try self.cached.context.ensureActive();
@@ -1198,7 +1198,7 @@ test "external lake public tie row cursors seek both directions and release fail
         lane.init(&owner, a, &allowance);
         defer lane.deinit();
         try std.testing.expect(lane.cache.underlying.read_many != null);
-        var output: [1]@import("../serverless/graph_segment/page_tree.zig").Page = undefined;
+        var output: [1]@import("../serverless/graph_segment/page_tree.zig").NavigationPage = undefined;
         const before = owner.reads;
         try std.testing.expectError(error.QueryCandidateBudgetExceeded, ReadLane.readMany(&lane, a, &.{root.current.by_id.?}, &output));
         try std.testing.expectEqual(before, owner.reads);

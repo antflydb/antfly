@@ -98,14 +98,14 @@ pub fn create(root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.
     return self;
 }
 fn finish(self: *Self, sort: *local.sql_spill.Sort) !void {
-    var window = std.heap.ArenaAllocator.init(self.budget.allocator());
-    defer window.deinit();
     self.file = try self.manager.create();
     var previous: ?Id = null;
-    while (true) {
-        _ = window.reset(.free_all);
-        const row = (try sort.next(window.allocator())) orelse break;
-        const bytes = row.keys[0].value.string;
+    while (try sort.nextLeased()) |lease| {
+        defer lease.release();
+        if (lease.keyWidth() != 1) return error.InvalidNativeLakeTextCorpus;
+        const key = try lease.keyCell(0);
+        if (key.sql_null or key.value != .string) return error.InvalidNativeLakeTextCorpus;
+        const bytes = key.value.string;
         if (bytes.len != 32) return error.InvalidNativeLakeTextCorpus;
         const id = bytes[0..32].*;
         if (previous != null and std.mem.eql(u8, &id, &previous.?)) continue;

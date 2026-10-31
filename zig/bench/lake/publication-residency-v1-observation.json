@@ -1,0 +1,676 @@
+{
+  "version": 1,
+  "created_utc": "2026-10-31T00:59:06.640527+00:00",
+  "qualified_runtime_source_commit": "a6985c62686d5510b2b02d770c1bf2d2144b5e90",
+  "main_commit": "5a7e547b7adb51e5c7c666680a1695b7755b0adf",
+  "main_merge_commit": "4a4fab225292d058033ac208ecf2682427041f90",
+  "main_qualification": "The merged main update changes only GitHub documentation approval workflow files. git diff --quiet a6985c62686d5510b2b02d770c1bf2d2144b5e90 HEAD -- zig passed immediately after merge; runtime artifacts remain valid.",
+  "runtime_abi": 80,
+  "native_reader_protocol": 97,
+  "persisted_formats": "unchanged",
+  "source_sha256": {
+    "zig/REMOTE_TABLE_SERVING.md": "c1e3ce7325c0d55bc5be586027012ddb1f3feced1ca76e3d5a261ab27ccbdd5a",
+    "zig/lib/platform/src/allocator_reclamation.zig": "57af56f91b155af5eaa8a120adf6579198ffd487d811838cf3396b5bc5f3c7de",
+    "zig/pkg/antfly-embedded/src/runtime_failure_abi.zig": "f1abf1e00a8c5b95f7b7e35cd4a3ccef5fe2c7aee1faf53c61784196dec06e09",
+    "zig/pkg/antfly-embedded/src/sql/memory_budget.zig": "98041bf1e703fa1b97569b2ff657e5ebb5218f7d017af993ebbb97ae981e0bd8",
+    "zig/pkg/antfly-embedded/src/sql/spill.zig": "095b1304d8072bb9dc2a68e217757542c9bd88ff8f1449a78c2efff907d4736c",
+    "zig/pkg/antfly/src/api/lake_index_coordinator.zig": "7c2888e8b3d46dbcf4080739b13a2f324165f3c435a572736e5afeab818899df",
+    "zig/pkg/antfly/src/api/lake_index_native_files.zig": "27ccab1044b5d4b8c5aeae30e33680a19d8dd4895dad9c91cf3116bfdd5e5af8",
+    "zig/pkg/antfly/src/api/lake_index_native_text.zig": "3f20efc0f1156e2c38eeb87ac8936991d1eebbf33fd0b0d2c77c8f3176cdd4a1",
+    "zig/pkg/antfly/src/api/lake_index_publication_builders.zig": "4da4ba5c53c61ed07b65bfbe4506564a3096f8b48c8c27696ed26e2db631211e",
+    "zig/pkg/antfly/src/api/lake_index_seekable_text.zig": "74d60bfbb29b380f71fcf08ea8fbea44ff826a64d117c3e7e5abb17211c34736",
+    "zig/pkg/antfly/src/api/lake_index_sort_stream.zig": "008395e13add9afa2754dfcc29714090fbbfb86962270e6978e5961284423344",
+    "zig/pkg/antfly/src/api_http_runtime_test_root.zig": "ad9261e69ccec8650b14092335aaede490168aa0eaed9a1423b12d1f6d29eac1",
+    "zig/pkg/antfly/src/serverless/build/builder.zig": "29740b65d39d71e9e25e3d9cb84ad3c0398d4928b326b1df059fb1892b2fb3b4",
+    "zig/pkg/antfly/src/serverless/build/lake_build_limits.zig": "ee15dcd5aaa4534fa0cb745d005b43494f9a5b69e98d91ab8a762176ba63ac31",
+    "zig/pkg/antfly/src/serverless/build/lake_replay.zig": "74be3968f13022ad29cf8b9dc1e84de3b3ad73c43d664914b45f4e0828bfdd65",
+    "zig/pkg/antfly/src/serverless/build/lake_sidecar_algebraic.zig": "cc776bb373a97dd202a5886f221a3f273c53f0f4188bb721184e4aee0860d28f",
+    "zig/pkg/antfly/src/serverless/build/lake_sidecar_graph.zig": "23b28f3bd2462a984a8564251ec8adf67094a2cca48d0192a0af01826e4cbe44",
+    "zig/pkg/antfly/src/serverless/build/lake_sidecar_sparse.zig": "3bc9d5940378542638ea3e1176d348f61a601686bb54b3e0bea0274ceaf1dbba",
+    "zig/pkg/antfly/src/serverless/build/lake_sidecar_text.zig": "674facd64b3dcefb1abb9248dc581a7c2b1f3a49afe21904b8f557cefb432b68",
+    "zig/pkg/antfly/src/serverless/build/lake_sidecar_vector.zig": "fb50488e1b705c90723267a6922dfacb035d9c913fc524d9eebf900fda526413",
+    "zig/pkg/antfly/src/serverless/build/retention.zig": "9a5298cab0e387af894ad30458b0619f971b90682e74126592ce038619fbb1e7",
+    "zig/pkg/antfly/src/serverless/enrichment/media_checkpoint.zig": "ae60674fa09a313d109e3f5851e7dea6bff7568f213c676ab31ef4332076bf9c",
+    "zig/pkg/antfly/src/serverless/enrichment/worker.zig": "3b502813d86a626a7979c62bca229288992284841441b82c0596e4b86a5b12b3"
+  },
+  "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+  "fix": "WorkingSetAllocator delegates to a shared platform refundable synchronized Quota. Statement, host and quota owners share stable round-robin residency hooks; original admission paths/caps and limit-error classification remain enforced. Reclamation preflights before locking and acquires known free paths without waiting. Pinned borrowers remain valid; nested quotas/hosts, busy owners, opaque arena backings, actual backing OOM and coordinator cancellation/error/recovery are covered.",
+  "policy_probe": {
+    "before": {
+      "adaptive": false,
+      "hooks": 0
+    },
+    "after": {
+      "adaptive": true,
+      "hooks": 1
+    },
+    "method": "Identical public WorkingSetAllocator and LockedAllocator path using byte-identical wrapper source snapshots; native PayloadReader verifies adaptive registration. New permanent regression also imports the real wrapper directly. Single-threaded page-allocator native probe passes; full WASM bundle not built.",
+    "source_snapshot_sha256": "ee15dcd5aaa4534fa0cb745d005b43494f9a5b69e98d91ab8a762176ba63ac31",
+    "argv_sha256": {
+      ".benchmark-results/lake/publication-residency-v1/publication-cache-command.json": "70feb0a6360b0c14dcab5a2e4f57751b14a73282707619fb2a2f02118931dbda",
+      ".benchmark-results/lake/publication-residency-v1/single-thread-command.json": "51e3e5127aec8d91e7408067bb25f307ef1f1577b7e4312aeaaf8f18e876e608"
+    }
+  },
+  "native_publication_drain": {
+    "identity": {
+      "source_commit": "a6985c62686d5510b2b02d770c1bf2d2144b5e90",
+      "source_binary": "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/zig/.zig-cache/o/6977ad14808fc4dbe186b3c5408de5ef/lake-api-tests",
+      "binary": "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/publication-residency-v1/after/lake-api-tests",
+      "sha256": "f07c94ef0f706543081d00f011c7db5a25d5ff34d7f26cabb83fe10ad3d8d6d0",
+      "bytes": 117701104
+    },
+    "fixture": "8192 rows; eight 128-byte ordinal/column-tagged strings. 64-row physical cohorts interleave ascending ranks. Every sorted key and all values checked.",
+    "chain": "WorkingSetAllocator -> platform Quota -> SMP backing; outer LockedAllocator, same as publication construction.",
+    "sort_workspace_bytes": 4096,
+    "post_finish_headroom_bytes": 33554432,
+    "limit_bytes": 33594433,
+    "warmups": [
+      {
+        "publication": false,
+        "codec": ".none",
+        "fixed": true,
+        "rows": 8192,
+        "payload_reads": 8192,
+        "drain_read_bytes": 221748402,
+        "total_read_bytes": 232339014,
+        "written_bytes": 20378112,
+        "cpu_ns": 543712375,
+        "budget_peak": 403053,
+        "budget_limit": 33594433
+      },
+      {
+        "publication": false,
+        "codec": ".none",
+        "fixed": false,
+        "rows": 8192,
+        "payload_reads": 512,
+        "drain_read_bytes": 14191794,
+        "total_read_bytes": 24782406,
+        "written_bytes": 20378112,
+        "cpu_ns": 97137208,
+        "budget_peak": 13829101,
+        "budget_limit": 33594433
+      },
+      {
+        "publication": false,
+        "codec": ".snappy",
+        "fixed": true,
+        "rows": 8192,
+        "payload_reads": 8192,
+        "drain_read_bytes": 70618654,
+        "total_read_bytes": 81209266,
+        "written_bytes": 12043408,
+        "cpu_ns": 971616250,
+        "budget_peak": 403053,
+        "budget_limit": 33594433
+      },
+      {
+        "publication": false,
+        "codec": ".snappy",
+        "fixed": false,
+        "rows": 8192,
+        "payload_reads": 512,
+        "drain_read_bytes": 5166118,
+        "total_read_bytes": 15756730,
+        "written_bytes": 12043408,
+        "cpu_ns": 124881750,
+        "budget_peak": 13829101,
+        "budget_limit": 33594433
+      },
+      {
+        "publication": true,
+        "codec": ".none",
+        "fixed": true,
+        "rows": 8192,
+        "payload_reads": 8192,
+        "drain_read_bytes": 221748402,
+        "total_read_bytes": 232339014,
+        "written_bytes": 20378112,
+        "cpu_ns": 488949375,
+        "budget_peak": 403053,
+        "budget_limit": 33594433
+      },
+      {
+        "publication": true,
+        "codec": ".none",
+        "fixed": false,
+        "rows": 8192,
+        "payload_reads": 512,
+        "drain_read_bytes": 14191794,
+        "total_read_bytes": 24782406,
+        "written_bytes": 20378112,
+        "cpu_ns": 85790584,
+        "budget_peak": 13829101,
+        "budget_limit": 33594433
+      },
+      {
+        "publication": true,
+        "codec": ".snappy",
+        "fixed": true,
+        "rows": 8192,
+        "payload_reads": 8192,
+        "drain_read_bytes": 70618654,
+        "total_read_bytes": 81209266,
+        "written_bytes": 12043408,
+        "cpu_ns": 950197959,
+        "budget_peak": 403053,
+        "budget_limit": 33594433
+      },
+      {
+        "publication": true,
+        "codec": ".snappy",
+        "fixed": false,
+        "rows": 8192,
+        "payload_reads": 512,
+        "drain_read_bytes": 5166118,
+        "total_read_bytes": 15756730,
+        "written_bytes": 12043408,
+        "cpu_ns": 111517209,
+        "budget_peak": 13829101,
+        "budget_limit": 33594433
+      }
+    ],
+    "samples": [
+      {
+        "sample": 0,
+        "fixed": {
+          "publication": true,
+          "codec": ".snappy",
+          "fixed": true,
+          "rows": 8192,
+          "payload_reads": 8192,
+          "drain_read_bytes": 70618654,
+          "total_read_bytes": 81209266,
+          "written_bytes": 12043408,
+          "cpu_ns": 956317000,
+          "budget_peak": 403053,
+          "budget_limit": 33594433
+        },
+        "adaptive": {
+          "publication": true,
+          "codec": ".snappy",
+          "fixed": false,
+          "rows": 8192,
+          "payload_reads": 512,
+          "drain_read_bytes": 5166118,
+          "total_read_bytes": 15756730,
+          "written_bytes": 12043408,
+          "cpu_ns": 110953500,
+          "budget_peak": 13829101,
+          "budget_limit": 33594433
+        },
+        "speedup": 8.619079163793842
+      },
+      {
+        "sample": 1,
+        "fixed": {
+          "publication": true,
+          "codec": ".snappy",
+          "fixed": true,
+          "rows": 8192,
+          "payload_reads": 8192,
+          "drain_read_bytes": 70618654,
+          "total_read_bytes": 81209266,
+          "written_bytes": 12043408,
+          "cpu_ns": 954467834,
+          "budget_peak": 403053,
+          "budget_limit": 33594433
+        },
+        "adaptive": {
+          "publication": true,
+          "codec": ".snappy",
+          "fixed": false,
+          "rows": 8192,
+          "payload_reads": 512,
+          "drain_read_bytes": 5166118,
+          "total_read_bytes": 15756730,
+          "written_bytes": 12043408,
+          "cpu_ns": 112491416,
+          "budget_peak": 13829101,
+          "budget_limit": 33594433
+        },
+        "speedup": 8.484805933992332
+      },
+      {
+        "sample": 2,
+        "fixed": {
+          "publication": true,
+          "codec": ".snappy",
+          "fixed": true,
+          "rows": 8192,
+          "payload_reads": 8192,
+          "drain_read_bytes": 70618654,
+          "total_read_bytes": 81209266,
+          "written_bytes": 12043408,
+          "cpu_ns": 958202792,
+          "budget_peak": 403053,
+          "budget_limit": 33594433
+        },
+        "adaptive": {
+          "publication": true,
+          "codec": ".snappy",
+          "fixed": false,
+          "rows": 8192,
+          "payload_reads": 512,
+          "drain_read_bytes": 5166118,
+          "total_read_bytes": 15756730,
+          "written_bytes": 12043408,
+          "cpu_ns": 114954250,
+          "budget_peak": 13829101,
+          "budget_limit": 33594433
+        },
+        "speedup": 8.33551427633167
+      },
+      {
+        "sample": 3,
+        "fixed": {
+          "publication": true,
+          "codec": ".snappy",
+          "fixed": true,
+          "rows": 8192,
+          "payload_reads": 8192,
+          "drain_read_bytes": 70618654,
+          "total_read_bytes": 81209266,
+          "written_bytes": 12043408,
+          "cpu_ns": 953174459,
+          "budget_peak": 403053,
+          "budget_limit": 33594433
+        },
+        "adaptive": {
+          "publication": true,
+          "codec": ".snappy",
+          "fixed": false,
+          "rows": 8192,
+          "payload_reads": 512,
+          "drain_read_bytes": 5166118,
+          "total_read_bytes": 15756730,
+          "written_bytes": 12043408,
+          "cpu_ns": 111932208,
+          "budget_peak": 13829101,
+          "budget_limit": 33594433
+        },
+        "speedup": 8.515640636696812
+      },
+      {
+        "sample": 4,
+        "fixed": {
+          "publication": true,
+          "codec": ".snappy",
+          "fixed": true,
+          "rows": 8192,
+          "payload_reads": 8192,
+          "drain_read_bytes": 70618654,
+          "total_read_bytes": 81209266,
+          "written_bytes": 12043408,
+          "cpu_ns": 952216875,
+          "budget_peak": 403053,
+          "budget_limit": 33594433
+        },
+        "adaptive": {
+          "publication": true,
+          "codec": ".snappy",
+          "fixed": false,
+          "rows": 8192,
+          "payload_reads": 512,
+          "drain_read_bytes": 5166118,
+          "total_read_bytes": 15756730,
+          "written_bytes": 12043408,
+          "cpu_ns": 112119125,
+          "budget_peak": 13829101,
+          "budget_limit": 33594433
+        },
+        "speedup": 8.492903195596648
+      },
+      {
+        "sample": 5,
+        "fixed": {
+          "publication": true,
+          "codec": ".snappy",
+          "fixed": true,
+          "rows": 8192,
+          "payload_reads": 8192,
+          "drain_read_bytes": 70618654,
+          "total_read_bytes": 81209266,
+          "written_bytes": 12043408,
+          "cpu_ns": 954979375,
+          "budget_peak": 403053,
+          "budget_limit": 33594433
+        },
+        "adaptive": {
+          "publication": true,
+          "codec": ".snappy",
+          "fixed": false,
+          "rows": 8192,
+          "payload_reads": 512,
+          "drain_read_bytes": 5166118,
+          "total_read_bytes": 15756730,
+          "written_bytes": 12043408,
+          "cpu_ns": 112449750,
+          "budget_peak": 13829101,
+          "budget_limit": 33594433
+        },
+        "speedup": 8.492498871718256
+      }
+    ],
+    "median_fixed_thread_cpu_ms": 954.7236045,
+    "median_adaptive_thread_cpu_ms": 112.2844375,
+    "median_speedup": 8.502724204322616,
+    "slower_candidate_samples": 0,
+    "limitations": "Same frozen Debug binary, fixed four-root/64KiB versus adaptive policy; six alternating Snappy pairs after codec/owner warmups. Setup/add and Sort.finish excluded; first page, full drain and independent oracles included. More spare RAM used within the same limit. Task-owned builds, E2E and cleanup finished before timing; other host activity uncontrolled. Not peak RSS, cloud or whole-publication throughput."
+  },
+  "real_coordinator_publication": {
+    "before_binary": {
+      "source_commit": "b872ea60c53bc47f6b426a681a5ded366e476123",
+      "binary": "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/host-allocator-v1/after/antfly",
+      "sha256": "3e6927f26cd07fd9a9f530bd9b533808f01e9cdbdaa365abfdd6e5a50ec48389",
+      "bytes": 802975784
+    },
+    "after_binary": {
+      "source_commit": "a6985c62686d5510b2b02d770c1bf2d2144b5e90",
+      "binary": "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/publication-residency-v1/after/antfly",
+      "sha256": "c3006a4bada5558bc3df766d397eccc8bb642577db3208f8a432586027d60bac",
+      "bytes": 802995496
+    },
+    "fixture_sha256": "194b160808291f9ebe801d412db14ad8ae06dd6d210082aa0bd1e322c36203d7",
+    "fixture": "8192 real Parquet rows; id, interleaved sort_key and eight 128-byte string columns. One ordered covering index, fresh server storage per sample.",
+    "samples": [
+      {
+        "sample": 0,
+        "order": [
+          "before",
+          "after"
+        ],
+        "before_ns": 6099259750,
+        "after_ns": 5351632750,
+        "speedup": 1.1397007296511519,
+        "verified_result_sha256": "6d65ce8dade3126d12e616db6dfee12dc7b9c6e1ff239efba479f98bea963cd5"
+      },
+      {
+        "sample": 1,
+        "order": [
+          "after",
+          "before"
+        ],
+        "before_ns": 6202426500,
+        "after_ns": 5335568625,
+        "speedup": 1.1624677585324845,
+        "verified_result_sha256": "6d65ce8dade3126d12e616db6dfee12dc7b9c6e1ff239efba479f98bea963cd5"
+      },
+      {
+        "sample": 2,
+        "order": [
+          "before",
+          "after"
+        ],
+        "before_ns": 6084983000,
+        "after_ns": 5390460000,
+        "speedup": 1.1288429929913217,
+        "verified_result_sha256": "6d65ce8dade3126d12e616db6dfee12dc7b9c6e1ff239efba479f98bea963cd5"
+      },
+      {
+        "sample": 3,
+        "order": [
+          "after",
+          "before"
+        ],
+        "before_ns": 6223619166,
+        "after_ns": 5544250375,
+        "speedup": 1.1225357343281959,
+        "verified_result_sha256": "6d65ce8dade3126d12e616db6dfee12dc7b9c6e1ff239efba479f98bea963cd5"
+      },
+      {
+        "sample": 4,
+        "order": [
+          "before",
+          "after"
+        ],
+        "before_ns": 6050872833,
+        "after_ns": 5410128042,
+        "speedup": 1.1184343117252973,
+        "verified_result_sha256": "6d65ce8dade3126d12e616db6dfee12dc7b9c6e1ff239efba479f98bea963cd5"
+      },
+      {
+        "sample": 5,
+        "order": [
+          "after",
+          "before"
+        ],
+        "before_ns": 6277020625,
+        "after_ns": 5843071500,
+        "speedup": 1.0742672967462403,
+        "verified_result_sha256": "6d65ce8dade3126d12e616db6dfee12dc7b9c6e1ff239efba479f98bea963cd5"
+      }
+    ],
+    "median_before_ms": 6150.843125,
+    "median_after_ms": 5400.294021,
+    "median_speedup": 1.1389830074216991,
+    "slower_candidate_samples": 0,
+    "limits": "Same default build quota and configuration in both binaries.",
+    "limitations": "Wall time from table creation through first queryable index revision, with 25ms readiness polling. Server startup, fixture encoding/import and complete SQL result validation excluded. All rows/columns checked in 64-row ordered SQL pages after publication. Real local Parquet/FsStore with retained OS caches. No cloud or peak RSS claim; other host activity uncontrolled.",
+    "commands": [
+      [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "zig/bench/lake/publication_residency.py",
+        "before-0",
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/host-allocator-v1/after/antfly",
+        "b872ea60c53bc47f6b426a681a5ded366e476123",
+        "8192"
+      ],
+      [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "zig/bench/lake/publication_residency.py",
+        "after-0",
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/publication-residency-v1/after/antfly",
+        "a6985c62686d5510b2b02d770c1bf2d2144b5e90",
+        "8192"
+      ],
+      [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "zig/bench/lake/publication_residency.py",
+        "after-1",
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/publication-residency-v1/after/antfly",
+        "a6985c62686d5510b2b02d770c1bf2d2144b5e90",
+        "8192"
+      ],
+      [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "zig/bench/lake/publication_residency.py",
+        "before-1",
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/host-allocator-v1/after/antfly",
+        "b872ea60c53bc47f6b426a681a5ded366e476123",
+        "8192"
+      ],
+      [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "zig/bench/lake/publication_residency.py",
+        "before-2",
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/host-allocator-v1/after/antfly",
+        "b872ea60c53bc47f6b426a681a5ded366e476123",
+        "8192"
+      ],
+      [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "zig/bench/lake/publication_residency.py",
+        "after-2",
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/publication-residency-v1/after/antfly",
+        "a6985c62686d5510b2b02d770c1bf2d2144b5e90",
+        "8192"
+      ],
+      [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "zig/bench/lake/publication_residency.py",
+        "after-3",
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/publication-residency-v1/after/antfly",
+        "a6985c62686d5510b2b02d770c1bf2d2144b5e90",
+        "8192"
+      ],
+      [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "zig/bench/lake/publication_residency.py",
+        "before-3",
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/host-allocator-v1/after/antfly",
+        "b872ea60c53bc47f6b426a681a5ded366e476123",
+        "8192"
+      ],
+      [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "zig/bench/lake/publication_residency.py",
+        "before-4",
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/host-allocator-v1/after/antfly",
+        "b872ea60c53bc47f6b426a681a5ded366e476123",
+        "8192"
+      ],
+      [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "zig/bench/lake/publication_residency.py",
+        "after-4",
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/publication-residency-v1/after/antfly",
+        "a6985c62686d5510b2b02d770c1bf2d2144b5e90",
+        "8192"
+      ],
+      [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "zig/bench/lake/publication_residency.py",
+        "after-5",
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/publication-residency-v1/after/antfly",
+        "a6985c62686d5510b2b02d770c1bf2d2144b5e90",
+        "8192"
+      ],
+      [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "zig/bench/lake/publication_residency.py",
+        "before-5",
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/host-allocator-v1/after/antfly",
+        "b872ea60c53bc47f6b426a681a5ded366e476123",
+        "8192"
+      ]
+    ],
+    "parquet_sha256": "194b160808291f9ebe801d412db14ad8ae06dd6d210082aa0bd1e322c36203d7",
+    "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+    "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+    "verified_result_sha256": "6d65ce8dade3126d12e616db6dfee12dc7b9c6e1ff239efba479f98bea963cd5",
+    "build_mode": "Debug native for both frozen executables.",
+    "median_latency_reduction_percent": 12.20237760494014
+  },
+  "validation": {
+    "native_shared": 351,
+    "native_api": 92,
+    "failures": 0,
+    "skips": 0,
+    "leaks": 0,
+    "real_parquet_iceberg_e2e": 50,
+    "e2e_seconds": 393.86,
+    "apache_boundary_sources": 2345,
+    "license": "pass",
+    "formatting": "pass",
+    "ruff": "pass",
+    "whitespace": "pass",
+    "cleanup": "scripts/cache_gc.sh\nNative build active or process inspection unavailable; skipping cache cleanup.",
+    "benchmark_command": "ANTFLY_LAKE_PUBLICATION_CACHE_BENCH=1 .benchmark-results/lake/publication-residency-v1/after/lake-api-tests --suite-filter 'external lake leased publication adaptive spill cache reduces wide drain reads within unchanged admission'",
+    "e2e_command": {
+      "argv": [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "-m",
+        "pytest",
+        "zig/e2e/antfly/test_lake_archive_qualification.py",
+        "zig/e2e/antfly/test_iceberg_sql.py",
+        "-n2",
+        "-q"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "ANTFLY_E2E_FULL_LAKE": "1",
+        "ANTFLY_BIN": "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/publication-residency-v1/after/antfly",
+        "TZ": "UTC"
+      }
+    },
+    "deferred": "Real-provider retention qualification remains deferred. External 142577-row HN fixture unavailable; no archive-specific claim.",
+    "native_build_command": {
+      "cwd": "zig",
+      "env": {
+        "ZIG_GLOBAL_CACHE_DIR": ".zig-cache/global"
+      },
+      "argv": [
+        "/Users/ajroetker/bin/zig",
+        "build",
+        "lake-api-test",
+        "-Dtest-filter=highlight",
+        "-Dtest-filter=SQL adaptive payload cache",
+        "-Dtest-filter=SQL shared",
+        "-Dtest-filter=SQL memory",
+        "-Dtest-filter=SQL monotonic",
+        "-Dtest-filter=SQL nested",
+        "-Dtest-filter=SQL native",
+        "-Dtest-filter=SQL compact delivery",
+        "-Dtest-filter=storage.resource_manager.test.",
+        "-Dtest-filter=external lake metadata navigation",
+        "-Dtest-filter=external lake dynamic exact keys",
+        "-Dtest-filter=external lake bounded window profiles",
+        "-Dtest-filter=external lake Parquet",
+        "-Dtest-filter=external lake leased publication",
+        "-Dtest-filter=external lake warm tie pagination",
+        "-Dtest-filter=external lake ordered",
+        "-Dtest-filter=external lake aggregate persistent state admits",
+        "-Dtest-filter=external lake publication quota",
+        "-Dtest-filter=external lake native coordinator",
+        "-Dtest-filter=lake build working-set",
+        "--summary",
+        "all"
+      ]
+    },
+    "cli_build_command": {
+      "cwd": "zig",
+      "env": {
+        "ZIG_GLOBAL_CACHE_DIR": ".zig-cache/global"
+      },
+      "argv": [
+        "e2e/antfly/.venv/bin/python",
+        "-B",
+        "tools/run_bounded_zig_build.py",
+        "--zig",
+        "/Users/ajroetker/bin/zig",
+        "--",
+        "build",
+        "antfly"
+      ]
+    }
+  },
+  "raw_log_sha256": {
+    ".benchmark-results/lake/publication-residency-v1/lake-publication-quota-native.log": "39d5ced31f4d342c8dfcb12eefa6c7bdd3a19f962788e31b896da9b30815bd8d",
+    ".benchmark-results/lake/publication-residency-v1/lake-publication-quota-cli.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    ".benchmark-results/lake/publication-residency-v1/lake-publication-quota-e2e.log": "7a2ee122f7e83d80ee9bf6561b9199401aa590a9818dbe4cc519bc95c14cf231",
+    ".benchmark-results/lake/publication-residency-v1/lake-publication-quota-benchmark.log": "a3f7893154a958e1aa3e622c0bf3a91d30455e037f39124afd96c9f6dcf01437",
+    ".benchmark-results/lake/publication-residency-v1/lake-publication-quota-boundary.log": "e8e2e9d69065a56d79e7977bc4e56e44b1f95a02aabc80401b951c1cc2cca38b",
+    ".benchmark-results/lake/publication-residency-v1/lake-publication-quota-license.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    ".benchmark-results/lake/publication-residency-v1/lake-publication-quota-cleanup.log": "51e465e7f247aef97fb055b3c91ada18531ebdc648fb962d410d6baee52d1d3f",
+    ".benchmark-results/lake/publication-residency-v1/publication-cache.log": "ae6860f63254f36d0fef2197b75050e475b73e212449ab374ce02720730cce75",
+    ".benchmark-results/lake/publication-residency-v1/single-thread-publication.log": "0a600fad0eefcde49bdaa5bd523d69a3debb9a028b92ccde044a33172562a0b2"
+  },
+  "coordinator_report_sha256": {
+    ".benchmark-results/lake/publication-residency-v1/before-0/report.json": "daf77b7e80adc234174ce7c5093f89a7a90717a901981c3425121cf7a0cfa3f8",
+    ".benchmark-results/lake/publication-residency-v1/after-0/report.json": "1a03ccdb0bc7f7491f2c01a770f30f4ea628e5f754300e4cd2396c8d307d0599",
+    ".benchmark-results/lake/publication-residency-v1/before-1/report.json": "5d69ef0f8d788c011b5be80eadc462b142ff2d99a0200d79b3b0752c3c497974",
+    ".benchmark-results/lake/publication-residency-v1/after-1/report.json": "2c2801ad324689146c0e10c275f44e0d9bc3e7d14bf96fc3e2f2aa377511e681",
+    ".benchmark-results/lake/publication-residency-v1/before-2/report.json": "23e6fdfff63cd921b42554671f015b4ad4be0286647c7b79f18a0404551f06ab",
+    ".benchmark-results/lake/publication-residency-v1/after-2/report.json": "446c35820f8c7784a862e68550335bb74d50d350d39e99b4288081280c4e681f",
+    ".benchmark-results/lake/publication-residency-v1/before-3/report.json": "c28dfbbdd750e40986064b5353d0e1776f170dabaf69cd75ccc7daecf322b82a",
+    ".benchmark-results/lake/publication-residency-v1/after-3/report.json": "116fb0cdeed385b1894d79a12201ec5241c2273fe0820acfdc0c7fb6c32286a7",
+    ".benchmark-results/lake/publication-residency-v1/before-4/report.json": "30123a69ec232b5c21bff2064dd3bdb4563908c96c70ea657d044cdaf5fb688f",
+    ".benchmark-results/lake/publication-residency-v1/after-4/report.json": "31cfb4990fe9de391ef8e30f11fecf58646d55cad76fba9f0a2ac36f0a5660c0",
+    ".benchmark-results/lake/publication-residency-v1/before-5/report.json": "ccbf481e5f63078d46c038bac88d8a21d7cef36de7f8c78dcd6b5340f36030b6",
+    ".benchmark-results/lake/publication-residency-v1/after-5/report.json": "cdad1a8d994defe93248045fd449fcebc557e3ca2793694b26e2b85bc77fe3d4"
+  }
+}

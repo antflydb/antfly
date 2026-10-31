@@ -564,12 +564,13 @@ test "external lake native ordered indexes spill real Parquet and seek exact exp
         defer covered_reader.deinit();
         const entries = try covered_reader.nextEntries(ca, 64);
         const cover = entries[0].cover orelse return error.TestUnexpectedResult;
-        const payload = try @import("lake_index_aggregate_artifact.zig").readArtifact(ca, store, cover.block, .none, null);
-        const block = try spill.decodeColumnarBlockInArena(ca, payload, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+        var loaded = try readTestCover(a, store, root, entries[0]);
+        defer loaded.deinit();
+        const block = loaded.block;
         try std.testing.expectEqual(@as(usize, 1), root.cover.len);
         try std.testing.expectEqualStrings("amount", root.cover[0]);
         try std.testing.expectEqual(target, (try block.cell(cover.row, 0)).value.integer);
-        try std.testing.expectEqualStrings(entries[0].key, (try block.keyCell(cover.row, 0)).value.string);
+        // readTestCover validates the physical coordinate and full-key witness.
     }
     const incremental = try buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, declarations);
     try std.testing.expectEqual(declarations.len, incremental.len);
@@ -677,8 +678,9 @@ test "external lake dense ordered refresh checkpoints durable deltas and resumes
     var new_count: usize = 0;
     for (try reader.nextEntries(ca, 100)) |entry| {
         const cover = entry.cover.?;
-        const payload = try @import("lake_index_aggregate_artifact.zig").readArtifact(ca, store, cover.block, .none, null);
-        const block = try spill.decodeColumnarBlockInArena(ca, payload, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+        var loaded = try readTestCover(a, store, root, entry);
+        defer loaded.deinit();
+        const block = loaded.block;
         if ((try block.cell(cover.row, 0)).value.integer < 100) old_count += 1 else new_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 4), old_count);
@@ -967,8 +969,9 @@ test "external lake ordered sparse publication preserves covering rows across au
             const ref = entry.ref;
             try std.testing.expect(navigation.delta.by_id.contains(ref.external.file_id));
             const cover = entry.cover.?;
-            const payload = try @import("lake_index_aggregate_artifact.zig").readArtifact(ca, store, cover.block, .none, null);
-            const block = try spill.decodeColumnarBlockInArena(ca, payload, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+            var loaded = try readTestCover(a, store, root, entry);
+            defer loaded.deinit();
+            const block = loaded.block;
             if ((try block.cell(cover.row, 0)).value.integer >= 100) fresh += 1;
             rows += 1;
         };
@@ -1033,4 +1036,14 @@ test "external lake ordered batches preserve covering nulls dictionaries JSON de
     }
     try std.testing.expectEqual(@as(usize, 4), count);
     try std.testing.expect(manager.written_bytes > 0);
+}
+
+fn readTestCover(a: A, store: stores.ArtifactStore, root: ordered.Root, entry: ordered.Reader.Entry) !@import("lake_index_cover_columns.zig").Loaded {
+    const columns = @import("lake_index_cover_columns.zig");
+    const cover = entry.cover.?;
+    var reads: u64 = 16 * 1024 * 1024;
+    var loaded = try columns.load(a, store, cover.block, cover.striped, &.{0}, root.cover.len, .none, null, 16 * 1024 * 1024, &reads, null);
+    errdefer loaded.deinit();
+    try loaded.verify(root.domain, cover.row, entry.key[entry.key.len - 16 ..][0..16].*, columns.witness(root.domain, entry.key));
+    return loaded;
 }
