@@ -1,9 +1,9 @@
 # DB subsystems
 
-`DB` in `db.zig` holds about 120 fields and 1,600 members. Most fields belong
+`DB` in `db.zig` held about 120 fields and 1,600 members. Most fields belonged
 to one area, such as graph indexes, TTL cleanup or entity resolution, and only
-that area's methods touch them. This document describes how `DB` is being split
-into subsystem structs that own that state, and where each field goes.
+that area's methods touched them. This document describes how `DB` is split into
+subsystem structs that own that state, and where each field went.
 
 ## Layout
 
@@ -21,12 +21,13 @@ DB              core: identity, backends, runtime wiring, status
 │  ├─ relational column maintenance, rewrite caches
 │  ├─ algebraic HLL maintenance lane
 │  └─ repair    repair intents and scheduler, leases, shadow rebuilds, activation
-├─ enrichment   enrichment, resolution and promotion runtimes, artifact scheduling
 ├─ documents    authority backfill and repair, group sources, bulk ingest
 ├─ query        schema identity, retained query cut, warming, row policy
+├─ enrichment   runtime, artifact production, resolution, promotion
 ├─ recovery     transactions, publication, portable activation, restore, source pins
-├─ ttl          TTL cleanup runtime
-└─ maintenance  quarantine, independent maintenance, run-until-idle tracking
+├─ ttl          TTL cleanup context and runtime
+└─ maintenance  quarantine retries, independent maintenance, local source
+                recovery, run-until-idle diagnostics
 ```
 
 Call sites read as the path to the state they act on:
@@ -37,6 +38,8 @@ db.indexes.sparse.restartCompaction("drop", name);
 _ = try db.indexes.repair.advanceIntent(alloc, repair_id, .{});
 _ = try db.documents.advanceAuthorityBackfillPage();
 var cut = try db.query.openCut(request, cancellation);
+try db.enrichment.addEnrichment(cfg);
+_ = try db.recovery.runSourcePinCleanupStep();
 ```
 
 ## Pattern
@@ -116,37 +119,31 @@ Rules:
 
 ## Field map
 
-Moved fields show their new path. The rest show where they will go.
+Each field's path within its subsystem. `DB` keeps only the core fields.
 
 | Subsystem | DB fields |
 |---|---|
 | `DB` (core) | `alloc`, `runtime_alloc`, `core`, `root_incarnation`, `async_context`, `backend_runtime`, `backend_owner_id`, `open_mode`, `primary_backend`, `primary_lsm_storage`, `physical_root_mode`, `index_backends`, `generation_read_lease`, `closed`, `stable_address`, `local_execution`, `executor`, `owned_backend_runtime`, `owned_resource_manager`, `capacity_source`, `secret_store`, `remote_content`, `start_index_workers`, `start_independent_maintenance`, `resolver_workers_enabled`, `source_vector_storage`, `status_owner_epoch`, `status_publication_mutex`, `status_publication_revision` |
-| `indexes` (moved) | `generation_replace_mutex`, `split_shadow` (was `shadow`) |
-| `indexes.text` (moved) | `merge_owner`, `merge_runtime` |
-| `indexes.sparse` (moved) | `compaction_owner`, `compaction_runtime` |
-| `indexes.graph` (moved) | `replacement.mutex`, `replacement.manager`, `replacement.catalog_generation`, `replacement.progress`, `cleanup_owner`, `metrics.owner`, `metrics.runtime`, `metrics.idle_maintenance`, `metrics.idle_planned_options`, `metrics.idle_auto_options`, `metrics.idle_degree_canary_options` |
-| `indexes.relational` (moved) | `rewrite_program_cache`, `rewrite_tail_cache`, `columns_building`, `columns_rebuild_requested`, `column_maintenance` |
-| `indexes.algebraic` (moved) | `hll_owner_id` |
-| `indexes.repair` (moved) | `clock`, `cleanup_owner_id`, `mutex`, `active`, `shadow_hook` |
-| `enrichment` | `enrichment_owner`, `enrichment_append_context`, `enrichment_runtime`, `artifact_repair_metadata_due_ns`, `artifact_repair_metadata_pending`, `artifact_footprint_pending`, `artifact_producer_baseline_pending`, `artifact_producer_scheduler`, `embedding_activity`, `managed_admission` |
-| `enrichment.resolution` | `resolution_append_context`, `resolution_owner`, `resolution_runtime`, `resolution_candidate_source`, `resolution_embedder` |
-| `enrichment.promotion` | `promotion_owner_bundle`, `promotion_runtime`, `entity_sink`, `promotion_owner`, `entity_sink_missing_policy` |
-| `documents` (moved) | `authority.backfill_active`, `authority.backfill_requested`, `authority.backfill_mutex`, `authority.backfill_restart`, `authority.repairs`, `authority.repairs_yield_sweep`, `group_sources.owner`, `group_sources.borrowed_state`, `bulk_ingest.session`, `bulk_ingest.identity` |
-| `query` (moved) | `schema.identity`, `schema.resolver_mutex`, `schema.resolver_epoch`, `schema.resolver_digest`, `cut.value_scope`, `cut.lease`, `cut.remote_lease`, `warming`, `row_policy.authority_secret`, `row_policy.authority_issuer`, `row_policy.table_name` |
-| `recovery` | `transaction_recovery_identity_context`, `transaction_recovery_local_context`, `transaction_owner`, `transaction_runtime`, `publication_recovery`, `snapshot_publication_mutex`, `portable_runtime_activation_attempts`, `portable_runtime_activation_mutex`, `portable_activation_recovery`, `restore_decoder_cache`, `graph_restore_parse_cache`, `graph_restore_parse_count_for_test`, `source_pin_cleanup` |
-| `ttl` | `ttl_owner`, `ttl_cleanup_context`, `ttl_runtime` |
-| `maintenance` | `quarantine_recovery`, `independent_maintenance`, `local_source_completion_audit_pending`, `local_source_recovery_pending`, `run_until_idle_no_progress_timeout_ns`, `last_run_until_idle_no_progress` |
+| `indexes` | `generation_replace_mutex`, `split_shadow` (was `shadow`) |
+| `indexes.text` | `merge_owner`, `merge_runtime` |
+| `indexes.sparse` | `compaction_owner`, `compaction_runtime` |
+| `indexes.graph` | `replacement.mutex`, `replacement.manager`, `replacement.catalog_generation`, `replacement.progress`, `cleanup_owner`, `metrics.owner`, `metrics.runtime`, `metrics.idle_maintenance`, `metrics.idle_planned_options`, `metrics.idle_auto_options`, `metrics.idle_degree_canary_options` |
+| `indexes.relational` | `rewrite_program_cache`, `rewrite_tail_cache`, `columns_building`, `columns_rebuild_requested`, `column_maintenance` |
+| `indexes.algebraic` | `hll_owner_id` |
+| `indexes.repair` | `clock`, `cleanup_owner_id`, `mutex`, `active`, `shadow_hook` |
+| `enrichment` | `owner`, `append_context`, `runtime`, `embedding_activity`, `managed_admission`, `artifacts.repair_metadata_due_ns`, `artifacts.repair_metadata_pending`, `artifacts.footprint_pending`, `artifacts.producer_baseline_pending`, `artifacts.producer_scheduler`, `resolution.append_context`, `resolution.owner`, `resolution.runtime`, `resolution.candidate_source`, `resolution.embedder`, `promotion.owner_bundle`, `promotion.runtime`, `promotion.entity_sink`, `promotion.owner`, `promotion.entity_sink_missing_policy` |
+| `documents` | `authority.backfill_active`, `authority.backfill_requested`, `authority.backfill_mutex`, `authority.backfill_restart`, `authority.repairs`, `authority.repairs_yield_sweep`, `group_sources.owner`, `group_sources.borrowed_state`, `bulk_ingest.session`, `bulk_ingest.identity` |
+| `query` | `schema.identity`, `schema.resolver_mutex`, `schema.resolver_epoch`, `schema.resolver_digest`, `cut.value_scope`, `cut.lease`, `cut.remote_lease`, `warming`, `row_policy.authority_secret`, `row_policy.authority_issuer`, `row_policy.table_name` |
+| `recovery` | `transactions.identity_context`, `transactions.local_context`, `transactions.owner`, `transactions.runtime`, `publication.owner`, `publication.snapshot_mutex`, `portable_activation.attempts`, `portable_activation.mutex`, `portable_activation.owner`, `restore.decoder_cache`, `restore.graph_parse_cache`, `restore.graph_parse_count_for_test`, `source_pin_cleanup` |
+| `ttl` | `owner`, `cleanup_context`, `runtime` |
+| `maintenance` | `quarantine`, `independent`, `local_source.completion_audit_pending`, `local_source.recovery_pending`, `run_until_idle.no_progress_timeout_ns`, `run_until_idle.last_no_progress` |
 
-## Migration order
+## What stays on `DB`
 
-Move self-contained areas first; they need no changes to `DB.open` beyond
-dropping fields that now have defaults.
-
-1. `indexes` with every index kind, `documents` and `query` (done).
-2. `ttl` and `maintenance`.
-3. `enrichment` with `resolution` and `promotion`, which share append contexts
-   and must move together.
-4. `recovery`.
+`DB` keeps its core fields and the methods that span subsystems: `open` and
+teardown, the write and read paths, search, status, and the `runUntilIdle`
+family that drives every subsystem's background work. Splitting those further
+is a separate change from moving state.
 
 Some methods stay on `DB` even though their state moved:
 
@@ -158,7 +155,10 @@ Some methods stay on `DB` even though their state moved:
 - Search and query-time graph metric methods (`searchLockedWithExecutionContextImpl`,
   `executeGraphMetricQueries`, `applyGraphMetricRerank`) stay on `DB` until the
   search path moves into `query`.
-- `runUntilIdle` and its variants drive every subsystem, including group sources.
+- `runUntilIdle` and its variants, `runMaintenanceUntilWithEnrichmentCompletion`,
+  and the index catalog operations that pause enrichment
+  (`installIndexWhileEnrichmentQuiesced`, `deleteIndexWhileEnrichmentQuiesced`)
+  coordinate several subsystems.
 
 `AsyncContext` mirrors several runtime pointers (for example
 `async_context.sparse_compaction_runtime`) for background workers that only
@@ -168,7 +168,10 @@ subsystem.
 `local_mutation.zig`'s prepared-batch view mirrors `DB` field paths so shared
 code can read either owner through `ownerField`. When a moved field is read
 that way, the view carries the same subsystem path (it now has an `indexes`
-field that carries the text and sparse runtimes from the async context, the
-repair cleanup owner, the relational rewrite caches, the split shadow and the
-active repair set, and a `documents` field that carries the bulk ingest identity
-scratch).
+field with the text and sparse runtimes, the repair cleanup owner, the
+relational rewrite caches, the split shadow and the active repair set; a
+`documents` field with the bulk ingest identity scratch; an `enrichment` field
+with the enrichment, resolution and promotion runtimes and embedding activity; a
+`recovery` field with the transaction recovery contexts and restore caches; a
+`ttl` field with the cleanup context; and a `maintenance` field with the last
+no-progress diagnostic).

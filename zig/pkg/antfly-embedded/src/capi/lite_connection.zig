@@ -353,10 +353,10 @@ pub const PreparedPublication = struct {
             defer alloc.free(live.owner_id);
             if (live.epoch != expected.epoch or live.expires_at_ms <= @max(now_ms, database.backend_runtime.clock().nowRealtimeMs()) or !std.mem.eql(u8, live.owner_id, expected.owner_id)) return error.EnrichmentLeaseFenceLost;
         }
-        if (database.enrichment_runtime == null) try database.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+        if (database.enrichment.runtime == null) try database.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true });
         const held = try alloc.create(HeldStore);
         held.* = .{ .publication = self, .path_lease = lease, .database = database };
-        return .{ .store = database.enrichment_runtime.?.store, .ptr = held, .release = HeldStore.release, .guard_key = HeldStore.guardKey };
+        return .{ .store = database.enrichment.runtime.?.store, .ptr = held, .release = HeldStore.release, .guard_key = HeldStore.guardKey };
     }
 
     fn heartbeat(ptr: *anyopaque, fence: WriteFence, now_ms: u64, ttl_ms: u64) !bool {
@@ -866,7 +866,7 @@ pub const Owner = struct {
         }
         for (indexes) |index| if (index.catch_up_required) return true;
         const state = h.db_mod.enrichment_state;
-        if (database.enrichment_runtime) |runtime| {
+        if (database.enrichment.runtime) |runtime| {
             const stats = runtime.stats();
             // Durable retry/notification targets also need reconciliation.
             // The runtime may know a newer target than this view's cached
@@ -881,11 +881,11 @@ pub const Owner = struct {
         // Foreground native views need not own these runtimes, so inspect the
         // two durable watermarks instead of constructing providers on idle polls.
         if (database.core.index_manager.resolvers.items.len != 0) {
-            if (database.resolution_runtime) |runtime| {
+            if (database.enrichment.resolution.runtime) |runtime| {
                 const stats = runtime.stats();
                 if (stats.applied_sequence < @max(target, stats.target_sequence)) return true;
             } else if (try state.loadAppliedSequence(alloc, database.core.store, "resolution") < target) return true;
-            if (database.promotion_runtime) |runtime| {
+            if (database.enrichment.promotion.runtime) |runtime| {
                 const stats = runtime.stats();
                 if (stats.applied_sequence < @max(target, stats.target_sequence)) return true;
             } else if (try state.loadAppliedSequence(alloc, database.core.store, "promotion") < target) return true;
@@ -1242,7 +1242,7 @@ pub const Owner = struct {
                 const delay = if (ttl_more) config.page_interval_ms else config.interval_ms;
                 schedule.next_ttl_ns = now + @as(i96, @max(1, delay)) * std.time.ns_per_ms;
             }
-            if (database.ttl_runtime) |ttl| {
+            if (database.ttl.runtime) |ttl| {
                 const before = ttl.stats();
                 defer recordTtlTurn(&schedule.ttl, before, ttl.stats());
                 ttl.runOnce() catch |err| {
@@ -1303,13 +1303,13 @@ pub const Owner = struct {
         defer if (source_read) |*read| read.abort();
         var catalog = if (run_database) try PublicationCatalog.capture(turn_alloc, root, database) else null;
         defer if (catalog) |*proof| proof.deinit();
-        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (catalog) |*proof| proof else null, .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
+        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (catalog) |*proof| proof else null, .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment.runtime) |runtime| runtime.config.relational_base_rows else false };
         root.maintenance_references += 1;
         root.maintenance_owner = self;
         root.maintenance_publication = &publication;
         const store = root.owned_lite_backend.?.native_docstore.?;
         const foreground_header = foreground.owned_lite_backend.?.native_docstore.?.file.header;
-        if (run_database) if (database.enrichment_runtime) |runtime| {
+        if (run_database) if (database.enrichment.runtime) |runtime| {
             if (self.embedding_memo == null) self.embedding_memo = memo_mod.QueryEmbeddingCache.init(alloc, io, .{ .max_bytes = embedding_memo_bytes, .ttl_ns = std.time.ns_per_min });
             runtime.dense_result_cache = .{ .ptr = self, .lookup = lookupEmbedding, .remember = rememberEmbedding };
             runtime.generated_publication = .{ .ptr = &publication, .commit = PreparedPublication.commit, .heartbeat = PreparedPublication.heartbeat, .acquire_store = PreparedPublication.acquireStore };
@@ -1339,7 +1339,7 @@ pub const Owner = struct {
             maintenance_error = err;
             break :blk true;
         } else projected;
-        if (run_database) if (database.enrichment_runtime) |runtime| {
+        if (run_database) if (database.enrichment.runtime) |runtime| {
             runtime.dense_result_cache = null;
             runtime.generated_publication = null;
         };

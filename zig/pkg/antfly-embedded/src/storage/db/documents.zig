@@ -491,8 +491,8 @@ pub const Documents = struct {
         // inside the replacement fence so no borrowed runtime can be freed.
         // Yield during reconfiguration rather than blocking the scheduler;
         // durable group queues retain every pending command for the next turn.
-        if (!db.enrichment_owner.replacement_mutex.tryLock()) return false;
-        defer db.enrichment_owner.replacement_mutex.unlock();
+        if (!db.enrichment.owner.replacement_mutex.tryLock()) return false;
+        defer db.enrichment.owner.replacement_mutex.unlock();
         return self.runGroupSourceSliceLocked(state);
     }
 
@@ -550,7 +550,7 @@ pub const Documents = struct {
         // Group publication appends private producer rows. Independent resident
         // owners need the same downstream wake as an enrichments-level wait;
         // connection-owned Lite observes the durable sequence on its next turn.
-        if (db.enrichment_runtime) |runtime| runtime.notifySequence(db.core.nextDerivedSequence());
+        if (db.enrichment.runtime) |runtime| runtime.notifySequence(db.core.nextDerivedSequence());
     }
 
     fn localGroupSourceFanIn(ptr: *anyopaque, a: Allocator, definition: @import("group_source_worker.zig").Definition, partition: @import("group_source_index.zig").Partition, ordinal: i64) !@import("group_source_worker.zig").FanIn {
@@ -607,7 +607,7 @@ pub const Documents = struct {
         // provide completion; replicated owners always require durable proofs.
         if (try db.maintenanceRequiresOrderedApply()) return false;
         if (sequence == 0) return true;
-        const runtime = db.enrichment_runtime orelse return false;
+        const runtime = db.enrichment.runtime orelse return false;
         const status = runtime.stats();
         if (status.applied_sequence < sequence or status.worker_failed) return false;
         const check = runtime.failure_pending_fn orelse return status.fatal_error_count == 0;
@@ -699,7 +699,7 @@ pub const Documents = struct {
                     last_error: []const u8,
                     asset_backend: bool,
                 };
-                const replay: ?Replay = if (db.enrichment_runtime) |runtime| status: {
+                const replay: ?Replay = if (db.enrichment.runtime) |runtime| status: {
                     const replay_stats = runtime.stats();
                     break :status .{ .target = replay_stats.target_sequence, .applied = replay_stats.applied_sequence, .worker_started = replay_stats.worker_started, .worker_failed = replay_stats.worker_failed, .lease_owned = replay_stats.lease_owned, .retrying = replay_stats.retrying, .consecutive_retries = replay_stats.consecutive_retry_count, .fatal_errors = replay_stats.fatal_error_count, .last_error = try owned.dupe(u8, replay_stats.last_error_code.slice()), .asset_backend = runtime.config.asset_producer != null };
                 } else null;
@@ -788,8 +788,8 @@ pub const Documents = struct {
                 // Wake the owner without waiting for a global cursor that
                 // may be blocked on an independent, later request. The
                 // durable source debt above is the completion authority.
-                if (db.enrichment_runtime) |runtime| runtime.notifySequence(producer_sequence);
-            } else try db.runEnrichmentUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?);
+                if (db.enrichment.runtime) |runtime| runtime.notifySequence(producer_sequence);
+            } else try db.enrichment.runUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?);
             try wait.check();
             try io.sleep(.fromMilliseconds(5), .awake);
         }

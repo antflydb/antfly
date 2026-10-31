@@ -312,7 +312,7 @@ pub const GraphIndexes = struct {
                     var owner = db.acquireReplicationMutationShared();
                     defer if (owner) |*lease| lease.release();
                     try db.enforceReplicationWriteGate();
-                    var activity = try db.acquireResolverCatalogActivity(true);
+                    var activity = try db.enrichment.acquireResolverCatalogActivity(true);
                     defer activity.deinit();
                     try db.lockApplyForPortableRuntime();
                     defer db.core.unlockApply();
@@ -338,7 +338,7 @@ pub const GraphIndexes = struct {
                         job.retry_after_ns = 0;
                         try db.core.index_manager.failGraphReplacement(db.core.store, job);
                     }
-                    if (db.resolution_runtime) |runtime| runtime.notifyBackfill();
+                    if (db.enrichment.resolution.runtime) |runtime| runtime.notifyBackfill();
                 }
                 self.clearReplacementManager();
                 return self.hasPendingReplacements();
@@ -376,7 +376,7 @@ pub const GraphIndexes = struct {
         defer if (owner) |*lease| lease.release();
         try db.enforceReplicationWriteGate();
 
-        var activity = try db.acquireResolverCatalogActivity(true);
+        var activity = try db.enrichment.acquireResolverCatalogActivity(true);
         defer activity.deinit();
         const cancelled = blk: {
             try db.lockApplyForPortableRuntime();
@@ -390,7 +390,7 @@ pub const GraphIndexes = struct {
         // submit while retaining apply/replay admission needed by that cleanup.
         if (cancelled) {
             db.scheduleGeneratedArtifactCleanup();
-            if (db.resolution_runtime) |runtime| runtime.notifyBackfill();
+            if (db.enrichment.resolution.runtime) |runtime| runtime.notifyBackfill();
         }
         return cancelled;
     }
@@ -403,12 +403,12 @@ pub const GraphIndexes = struct {
         const created = blk: {
             db_mod.lockAtomicWithBackoff(&db.async_context.enrichment_lifecycle_mutex);
             defer db.async_context.enrichment_lifecycle_mutex.unlock();
-            if (db.enrichment_runtime != null) break :blk false;
+            if (db.enrichment.runtime != null) break :blk false;
             var config: db_mod.enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
-            try db.initOptionalEnrichmentRuntime(&config);
+            try db.enrichment.initRuntime(&config);
             break :blk true;
         };
-        if (created) try db.restartEnrichmentAfterStructuralMutation("graph replacement replay", "");
+        if (created) try db.enrichment.restartAfterStructuralMutation("graph replacement replay", "");
     }
 
     pub fn advanceReplacementOnce(self: *GraphIndexes, deadline: ?u64, saved: db_mod.index_manager_mod.GraphReplacementBuild, bounded_replay: bool) !bool {
@@ -457,7 +457,7 @@ pub const GraphIndexes = struct {
                 DB.GeneratedEnrichmentReplayPageResult{ .complete = true }
             else blk: {
                 try self.ensureReplacementEnrichmentRuntime();
-                break :blk try db.appendGeneratedEnrichmentsFromStoredDocsPage(a, producers, true, producer_resume, 32, .{
+                break :blk try db.enrichment.appendGeneratedEnrichmentsFromStoredDocsPage(a, producers, true, producer_resume, 32, .{
                     .deadline_ns = @min(deadline orelse std.math.maxInt(u64), self.replacementWorkNow() +| 100 * std.time.ns_per_ms),
                 });
             };
@@ -476,7 +476,7 @@ pub const GraphIndexes = struct {
             return true;
         }
         if (job.producer_replay_target > 0) {
-            const runtime = db.enrichment_runtime orelse return error.EnrichmentRuntimeUnavailable;
+            const runtime = db.enrichment.runtime orelse return error.EnrichmentRuntimeUnavailable;
             runtime.notifySequence(job.producer_replay_target);
             if (runtime.stats().applied_sequence < job.producer_replay_target) return true;
         }
@@ -660,7 +660,7 @@ pub const GraphIndexes = struct {
         // scheduler does, rather than turning the observation into a write.
         if (db_mod.monotonicTimeNs() >= deadline or !try db.indexes.graph.canRunLocalEndpointCleanup()) return;
         try db.enforceReplicationWriteGate();
-        if (db.enrichment_runtime) |runtime| {
+        if (db.enrichment.runtime) |runtime| {
             if (!db.local_execution.optional_runtime_workers_enabled and !runtime.isStarted() and producer_target > runtime.stats().applied_sequence) {
                 // The enrichment guard uses its own real-time clock; the API
                 // wait deadline is monotonic. Convert the remaining duration.
@@ -674,8 +674,8 @@ pub const GraphIndexes = struct {
         }
         if (db_mod.monotonicTimeNs() >= deadline) return;
         if (db.hasConfiguredResolvers()) {
-            if (db.resolution_runtime == null) try db.initResolutionRuntime();
-            const resolution = db.resolution_runtime.?;
+            if (db.enrichment.resolution.runtime == null) try db.enrichment.initResolutionRuntime();
+            const resolution = db.enrichment.resolution.runtime.?;
             resolution.notifySequence(db.core.nextDerivedSequence());
             if ((!db.local_execution.optional_runtime_workers_enabled or !db.resolver_workers_enabled) and !resolution.worker_started.load(.acquire)) try resolution.catchUpOnce(deadline);
         }

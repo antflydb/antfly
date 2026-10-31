@@ -255,9 +255,9 @@ test "ordered artifact inventory reconstruction orders bounded pages and resumes
     var db = try db_mod.DB.open(alloc, path, options);
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
-    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"document_extraction\"}" });
-    try db.addEnrichment(.{ .name = "unit-chunks", .kind = .chunk, .field = "body", .source_artifact_name = "units", .chunk_size = 4 });
+    try db.enrichment.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
+    try db.enrichment.addEnrichment(.{ .name = "units", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"document_extraction\"}" });
+    try db.enrichment.addEnrichment(.{ .name = "unit-chunks", .kind = .chunk, .field = "body", .source_artifact_name = "units", .chunk_size = 4 });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
     try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     var expected = chunks.Builder.init();

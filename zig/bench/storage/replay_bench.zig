@@ -397,7 +397,7 @@ fn runCatchupBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config) !Cat
     if (pending_before.enrichment.target_sequence > pending_before.enrichment.applied_sequence) {
         summary.driven_enrichment_target = pending_before.enrichment.target_sequence;
         const enrichment_started = nowNs();
-        try db.runEnrichmentUntil(pending_before.enrichment.target_sequence);
+        try db.enrichment.runUntil(pending_before.enrichment.target_sequence);
         summary.enrichment_ns = elapsedSince(enrichment_started);
     }
     const replay_after_enrichment = try snapshotReplayStats(alloc, &db);

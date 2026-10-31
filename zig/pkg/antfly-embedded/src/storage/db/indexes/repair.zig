@@ -1970,7 +1970,7 @@ pub const RepairIndexes = struct {
                 try hook.before_retry(hook.ptr, db, repair_id);
             }
         }
-        const retry = try db.retryQuarantinedIndexLoadTarget(.{
+        const retry = try db.maintenance.retryQuarantinedIndexLoadTarget(.{
             .name = entry.intent.index_name,
             .token = claim.?.token,
             .authority = .{ .repair_claim = entry.intent.repair_id },
@@ -2242,7 +2242,7 @@ pub const RepairIndexes = struct {
             return result;
         }
 
-        if (effective_options.source_replay_only and entry.intent.source_replay_state == .pending and db.enrichment_runtime == null) {
+        if (effective_options.source_replay_only and entry.intent.source_replay_state == .pending and db.enrichment.runtime == null) {
             // An unconstructed optional driver is not evidence that source
             // discovery is complete. Retain its durable cursor for a live owner.
             result.deferred = true;
@@ -2263,7 +2263,7 @@ pub const RepairIndexes = struct {
                 for (artifact_names) |name| alloc.free(name);
                 alloc.free(artifact_names);
             }
-            var page = try db.appendGeneratedEnrichmentsFromStoredDocsPage(
+            var page = try db.enrichment.appendGeneratedEnrichmentsFromStoredDocsPage(
                 alloc,
                 artifact_names,
                 true,
@@ -2448,7 +2448,7 @@ pub const RepairIndexes = struct {
             // evidence of damaged artifacts. A certified partial generation
             // must continue through its canonical worker even when provider
             // failures or new writes keep source coverage incomplete.
-            try db.ensureManagedAdmissionCanonicalWorker(alloc, entry.intent);
+            try db.enrichment.ensureManagedAdmissionCanonicalWorker(alloc, entry.intent);
             if (!try self.deferUntilTargetOrAudit(
                 alloc,
                 repair_id,
@@ -2471,7 +2471,7 @@ pub const RepairIndexes = struct {
             // below that fence can snapshot a later artifact value and then
             // replay the earlier delete which produced it, permanently
             // removing deterministic chunk identities from the candidate.
-            if (db.enrichment_runtime) |runtime| {
+            if (db.enrichment.runtime) |runtime| {
                 const enrichment = runtime.stats();
                 if (enrichment.enabled and enrichment.applied_sequence < entry.intent.target_sequence) {
                     // The source-discovery owner has durably queued all work;
@@ -2668,7 +2668,7 @@ pub const RepairIndexes = struct {
             }
             if (err == error.RepairSourceCoverageIncomplete and
                 entry.intent.kind == .dense_vector and
-                db.enrichment_runtime != null and
+                db.enrichment.runtime != null and
                 (current_trigger == .operator_generation_rebuild or
                     current_trigger == .storage_format_migration or
                     current_trigger == .artifact_coverage_mismatch or
@@ -2684,7 +2684,7 @@ pub const RepairIndexes = struct {
                 }
                 var queued_refs: usize = 0;
                 for (artifact_names) |artifact_name| {
-                    queued_refs +|= db.reprocessGeneratedEnrichmentFromStoredDocs(alloc, artifact_name) catch |reprocess_err| blk: {
+                    queued_refs +|= db.enrichment.reprocessGeneratedEnrichmentFromStoredDocs(alloc, artifact_name) catch |reprocess_err| blk: {
                         std.log.warn(
                             "dense repair source recovery deferred index={s} artifact={s} err={s}",
                             .{ entry.intent.index_name, artifact_name, @errorName(reprocess_err) },
@@ -2694,7 +2694,7 @@ pub const RepairIndexes = struct {
                 }
                 if (queued_refs != 0) {
                     const recovery_target = db.core.nextDerivedSequence();
-                    const runtime = db.enrichment_runtime.?;
+                    const runtime = db.enrichment.runtime.?;
                     if (runtime.isStarted()) {
                         runtime.notifySequence(recovery_target);
                         runtime.waitForApplied(recovery_target) catch |drain_err| {
@@ -3133,8 +3133,8 @@ pub const RepairIndexes = struct {
             .index_manager = &shadow_manager,
             .apply_mutex = db.async_context.apply_mutex,
             .dense_bulk_session_scope = .external,
-            .resolution_runtime = db.resolution_runtime,
-            .promotion_runtime = db.promotion_runtime,
+            .resolution_runtime = db.enrichment.resolution.runtime,
+            .promotion_runtime = db.enrichment.promotion.runtime,
             .repair_options = effective_options,
             .repair_issue_counter = &repair_issue_counter,
         };

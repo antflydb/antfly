@@ -1920,7 +1920,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     sparse_pending.deinit(alloc);
                 }
                 try collectPendingDocumentUnitSparseChunkEmbeddings(alloc, db, &entry, &sparse_pending);
-                const runtime = S.ownerField(db, "enrichment_runtime").*;
+                const runtime = S.ownerField(db, "enrichment").runtime;
                 const dense_embedder = if (runtime) |rt| rt.config.dense_embedder else null;
                 const sparse_embedder = if (runtime) |rt| rt.config.sparse_embedder else null;
 
@@ -5682,7 +5682,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             chunk_view: *const DocumentExtractionChunkView,
             out: *std.ArrayListUnmanaged(PendingDocumentUnitDenseChunkEmbedding),
         ) !void {
-            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return;
+            const runtime = S.ownerField(db, "enrichment").runtime orelse return;
             if (runtime.config.dense_embedder == null) return;
             for (chunk_view.dense_embeddings) |embed_entry| {
                 if (embed_entry.consumer_indexes.len == 0) continue;
@@ -5713,7 +5713,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             chunk_view: *const DocumentExtractionChunkView,
             out: *std.ArrayListUnmanaged(PendingDocumentUnitSparseChunkEmbedding),
         ) !void {
-            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return;
+            const runtime = S.ownerField(db, "enrichment").runtime orelse return;
             if (runtime.config.sparse_embedder == null) return;
             for (chunk_view.sparse_embeddings) |embed_entry| {
                 if (embed_entry.consumer_indexes.len == 0) continue;
@@ -6013,7 +6013,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             const value = if (producer_cfg.type == .copy) source_text.? else blk: {
-                const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingAssetProducer;
+                const runtime = S.ownerField(db, "enrichment").runtime orelse return error.MissingAssetProducer;
                 const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
                 break :blk try producer.produce(alloc, .{
                     .producer_type = producer_cfg.type,
@@ -6220,7 +6220,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return;
                 }
             };
-            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingDenseEmbedder;
+            const runtime = S.ownerField(db, "enrichment").runtime orelse return error.MissingDenseEmbedder;
             const dense_embedder = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
 
             const embedding_name = requestEmbeddingName(request);
@@ -6460,7 +6460,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
-            const extraction_resource_manager = if (S.ownerField(db, "enrichment_runtime").*) |runtime|
+            const extraction_resource_manager = if (S.ownerField(db, "enrichment").runtime) |runtime|
                 runtime.config.resource_manager orelse runtime.index_manager.resource_manager
             else
                 S.ownerField(db, "core").*.index_manager.resource_manager;
@@ -6542,7 +6542,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return;
             };
             defer extraction.deinit(document_extraction_alloc);
-            if (S.ownerField(db, "enrichment_runtime").*) |runtime| {
+            if (S.ownerField(db, "enrichment").runtime) |runtime| {
                 enrichment_runtime_mod.completeDocumentExtractionGeneratedTextForRequestWithMemory(
                     if (document_execution) |execution| &execution.runtime else runtime,
                     document_extraction_alloc,
@@ -6901,7 +6901,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return;
                 }
             };
-            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingSparseEmbedder;
+            const runtime = S.ownerField(db, "enrichment").runtime orelse return error.MissingSparseEmbedder;
             const sparse_embedder = runtime.config.sparse_embedder orelse return error.MissingSparseEmbedder;
 
             const embedding_name = requestEmbeddingName(request);
@@ -8139,7 +8139,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             chunk_view: *const DocumentExtractionChunkView,
             chunk_key: []const u8,
         ) !bool {
-            const runtime = S.ownerField(db, "enrichment_runtime").*;
+            const runtime = S.ownerField(db, "enrichment").runtime;
             for (chunk_view.dense_embeddings) |entry| {
                 if (entry.consumer_indexes.len == 0 or runtime == null or runtime.?.config.dense_embedder == null) continue;
                 const artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, entry.name);
@@ -8766,7 +8766,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (items.items.len == 0) return;
             defer clearPrecomputeAssetProducerBatchItems(alloc, items);
 
-            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingAssetProducer;
+            const runtime = S.ownerField(db, "enrichment").runtime orelse return error.MissingAssetProducer;
             const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
             const requests = try alloc.alloc(asset_producer_mod.Request, items.items.len);
             defer alloc.free(requests);

@@ -214,7 +214,7 @@ fn primaryDocCount(self: *DB, alloc: Allocator) engine.Outcome(u64) {
 }
 
 fn getEnrichment(self: *DB, alloc: Allocator, kind: types.EnrichmentKind, name: []const u8) engine.Outcome(?types.EnrichmentConfig) {
-    return .{ .value = self.getEnrichment(alloc, kind, name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.getEnrichment(alloc, kind, name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runLsmMaintenanceStep(self: *DB) engine.Outcome(bool) {
@@ -250,27 +250,27 @@ fn relationalIndexBuildStatus(self: *DB, name: []const u8) engine.Outcome(DB.Rel
 }
 
 fn reconfigureEnrichmentRuntime(self: *DB, cfg: @import("db/enrichment/enrichment_runtime.zig").Config) engine.Outcome(void) {
-    return .{ .value = self.reconfigureEnrichmentRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.reconfigureRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn reconfigureEnrichmentRuntimePaused(self: *DB, cfg: @import("db/enrichment/enrichment_runtime.zig").Config) engine.Outcome(void) {
-    return .{ .value = self.reconfigureEnrichmentRuntimePaused(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.reconfigureRuntimePaused(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn resumeEnrichmentRuntimeAfterReconfigure(self: *DB, operation: []const u8, index_name: []const u8) engine.Outcome(void) {
-    return .{ .value = self.resumeEnrichmentRuntimeAfterReconfigure(operation, index_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.resumeRuntimeAfterReconfigure(operation, index_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn ensureTransactionRecoveryRuntime(self: *DB, cfg: @import("db/maintenance/transaction_runtime.zig").Config) engine.Outcome(void) {
-    return .{ .value = self.ensureTransactionRecoveryRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.recovery.ensureTransactionRecoveryRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn activateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
-    return .{ .value = self.activateResolverReplayRuntimes() catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.activateResolverReplayRuntimes() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn deactivateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
-    self.deactivateResolverReplayRuntimes();
+    self.enrichment.deactivateResolverReplayRuntimes();
     return .{ .value = {} };
 }
 
@@ -400,7 +400,7 @@ fn openQueryCut(self: *DB, request: @import("db/native_query_cut.zig").Request, 
 }
 
 fn runSourcePinCleanupStep(self: *DB) engine.Outcome(bool) {
-    return .{ .value = self.runSourcePinCleanupStep() catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.recovery.runSourcePinCleanupStep() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runLsmMaintenanceStepBestEffort(self: *DB) engine.Outcome(bool) {
@@ -460,7 +460,7 @@ fn reconcileArtifactDeleteIndex(self: *DB, name: []const u8, context: @import("d
 }
 
 fn reconcileArtifactAddEnrichment(self: *DB, cfg: types.EnrichmentConfig, context: @import("db/artifact_reconcile_intent.zig").Context) engine.Outcome(void) {
-    return .{ .value = self.reconcileArtifactAddEnrichment(cfg, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.reconcileArtifactAddEnrichment(cfg, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn artifactInventoryCommand(self: *DB, alloc: std.mem.Allocator) engine.Outcome(@import("db/artifact_inventory.zig").Command) {
@@ -471,7 +471,7 @@ fn advanceDocumentAuthorityBackfillPage(self: *DB) engine.Outcome(bool) {
     return .{ .value = self.documents.advanceAuthorityBackfillPage() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 fn advanceArtifactFootprintPage(self: *DB) engine.Outcome(bool) {
-    return .{ .value = self.advanceArtifactFootprintPage() catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.advanceArtifactFootprintPage() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runGraphMetricServiceMaintenanceJsonAlloc(self: *DB, alloc: std.mem.Allocator, body: []const u8) engine.Outcome([]u8) {
@@ -495,23 +495,23 @@ fn scanVisit(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const 
 }
 
 fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: *@import("db/enrichment/enrichment_runtime.zig").Config) engine.Outcome(?DB.DetachedEnrichmentRuntime) {
-    return .{ .value = self.createDetachedEnrichmentRuntime(enrichment_cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.createDetachedRuntime(enrichment_cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn initResolutionRuntime(self: *DB) engine.Outcome(void) {
-    return .{ .value = self.initResolutionRuntime() catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.initResolutionRuntime() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn initPromotionRuntime(self: *DB) engine.Outcome(void) {
-    return .{ .value = self.initPromotionRuntime() catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.initPromotionRuntime() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn initOptionalTtlRuntime(self: *DB, cfg: @import("db/maintenance/ttl_runtime.zig").Config) engine.Outcome(void) {
-    return .{ .value = self.initOptionalTtlRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.ttl.initRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn initOptionalTransactionRuntime(self: *DB, cfg: @import("db/maintenance/transaction_runtime.zig").Config) engine.Outcome(void) {
-    return .{ .value = self.initOptionalTransactionRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.recovery.initTransactionRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn initOptionalTextMergeRuntime(self: *DB, cfg: @import("db/maintenance/text_merge_runtime.zig").Config) engine.Outcome(void) {
@@ -547,11 +547,11 @@ fn rehydrateSchemaJson(self: *DB, schema_json: []const u8) engine.Outcome(bool) 
 }
 
 fn removeResolverWithoutDrain(self: *DB, name: []const u8) engine.Outcome(bool) {
-    return .{ .value = self.removeResolverWithoutDrain(name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.removeResolverWithoutDrain(name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) engine.Outcome(bool) {
-    return .{ .value = self.deleteEnrichment(kind, name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.deleteEnrichment(kind, name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn startVectorMigration(self: *DB, request: db.vector_migration.contract.Request) engine.Outcome(void) {
@@ -690,7 +690,7 @@ fn rebuildRelationalColumns(self: *DB) engine.Outcome(bool) {
 }
 
 fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: std.mem.Allocator) engine.Outcome(usize) {
-    return .{ .value = self.replayGeneratedEnrichmentsFromStoredDocs(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.replayGeneratedEnrichmentsFromStoredDocs(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn advanceGraphReplacement(self: *DB) engine.Outcome(bool) {
@@ -852,7 +852,7 @@ fn vectorMigrationStatus(self: *DB, alloc: std.mem.Allocator) engine.Outcome(?[]
 }
 
 fn admitTransactionRecovery(self: *DB) engine.Outcome(?db.MutationBarrier.SharedLease) {
-    return .{ .value = self.admitTransactionRecovery() catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.recovery.admitTransactionRecovery() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runPrimaryLsmMaintenanceStep(self: *DB) engine.Outcome(bool) {
@@ -1104,11 +1104,11 @@ fn getEdges(self: *DB, alloc: std.mem.Allocator, index_name: []const u8, key: []
 }
 
 fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) engine.Outcome(void) {
-    return .{ .value = self.addEnrichment(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.addEnrichment(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) engine.Outcome(@import("db/catalog/index_manager.zig").IndexManager.EnrichmentUpsertResult) {
-    return .{ .value = self.upsertEnrichment(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.upsertEnrichment(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn listDerivedReplayDebt(self: *DB, alloc: std.mem.Allocator) engine.Outcome([]db.DerivedReplayDebtStatus) {
@@ -1271,7 +1271,7 @@ fn setQueryVisibilityHook(self: *DB, hook: ?db.QueryVisibilityHook) engine.Outco
 }
 
 fn setCoordinatedTtl(self: *DB, port: ?db.coordinated_ttl.Port) engine.Outcome(void) {
-    return .{ .value = self.setCoordinatedTtl(port) };
+    return .{ .value = self.ttl.setCoordinated(port) };
 }
 
 fn beginTeardown(self: *DB) engine.Outcome(void) {
@@ -1359,15 +1359,15 @@ fn clearOrderedApplyReceipt(self: *DB) engine.Outcome(void) {
 }
 
 fn setResolutionCandidateSource(self: *DB, src: ?@import("db/resolution_runtime.zig").CandidateSource) engine.Outcome(void) {
-    return .{ .value = self.setResolutionCandidateSource(src) };
+    return .{ .value = self.enrichment.setResolutionCandidateSource(src) };
 }
 
 fn setEntitySink(self: *DB, sink: ?@import("db/promotion_runtime.zig").EntitySink) engine.Outcome(void) {
-    return .{ .value = self.setEntitySink(sink) };
+    return .{ .value = self.enrichment.setEntitySink(sink) };
 }
 
 fn setPromotionOwner(self: *DB, owner: ?@import("db/promotion_runtime.zig").PromotionOwner) engine.Outcome(void) {
-    return .{ .value = self.setPromotionOwner(owner) };
+    return .{ .value = self.enrichment.setPromotionOwner(owner) };
 }
 
 fn advanceGeneratedArtifactCleanupPage(self: *DB, index_name: ?[]const u8) engine.Outcome(DB.GeneratedArtifactCleanupAdvanceResult) {
@@ -1463,7 +1463,7 @@ fn listIndexes(self: *DB, alloc: std.mem.Allocator) engine.Outcome([]types.Index
 }
 
 fn listEnrichments(self: *DB, alloc: std.mem.Allocator) engine.Outcome([]types.EnrichmentConfig) {
-    return .{ .value = self.listEnrichments(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.listEnrichments(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn listResolvers(self: *DB, alloc: std.mem.Allocator) engine.Outcome([]@import("db/catalog/index_manager.zig").ResolverConfig) {
@@ -1471,7 +1471,7 @@ fn listResolvers(self: *DB, alloc: std.mem.Allocator) engine.Outcome([]@import("
 }
 
 fn curateResolverJsonAlloc(self: *DB, alloc: std.mem.Allocator, name: []const u8, request_json: []const u8) engine.Outcome([]u8) {
-    return .{ .value = self.curateResolverJsonAlloc(alloc, name, request_json) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.curateResolverJsonAlloc(alloc, name, request_json) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn resolverCurationJsonAlloc(self: *DB, alloc: std.mem.Allocator, name: []const u8) engine.Outcome([]u8) {
@@ -1483,15 +1483,15 @@ fn resolverReviewsJsonAlloc(self: *DB, alloc: std.mem.Allocator, request_json: [
 }
 
 fn listResolverIdentities(self: *DB, alloc: std.mem.Allocator) engine.Outcome([]@import("db/catalog/resolver_catalog.zig").ResolverConfig) {
-    return .{ .value = self.listResolverIdentities(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.listResolverIdentities(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn listResolverStaticDescriptors(self: *DB, alloc: std.mem.Allocator) engine.Outcome([]@import("db/catalog/resolver_catalog.zig").ResolverConfig) {
-    return .{ .value = self.listResolverStaticDescriptors(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.listResolverStaticDescriptors(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn consumeResolverMetadataDrop(self: *DB, alloc: std.mem.Allocator, identity: @import("db/resolver_curation.zig").MetadataIdentity) engine.Outcome(void) {
-    return .{ .value = self.consumeResolverMetadataDrop(alloc, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.consumeResolverMetadataDrop(alloc, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn resolverReplayObservation(self: *DB, alloc: std.mem.Allocator) engine.Outcome(@import("db/types.zig").ResolverReplayObservation) {
@@ -1503,7 +1503,7 @@ fn pendingWorkStats(self: *DB) engine.Outcome(@import("db/core.zig").PendingWork
 }
 
 fn runArtifactRepairMetadataMaintenanceUntilIdle(self: *DB) engine.Outcome(void) {
-    return .{ .value = self.runArtifactRepairMetadataMaintenanceUntilIdle() catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn publishVectorBlockBasesOnline(self: *DB, options: @import("db/catalog/index_manager.zig").IndexManager.OnlineVectorBlockPublicationOptions) engine.Outcome(usize) {
@@ -1515,7 +1515,7 @@ fn nativeVectorProjectionMaintenanceNeeded(self: *DB) engine.Outcome(bool) {
 }
 
 fn reprocessGeneratedEnrichmentFromStoredDocsWithProgress(self: *DB, alloc: std.mem.Allocator, artifact_name: ?[]const u8) engine.Outcome(DB.GeneratedEnrichmentReplayAppendResult) {
-    return .{ .value = self.reprocessGeneratedEnrichmentFromStoredDocsWithProgress(alloc, artifact_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.enrichment.reprocessGeneratedEnrichmentFromStoredDocsWithProgress(alloc, artifact_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn overlayRuntimeStatusBestEffort(self: *DB, stats_alloc: std.mem.Allocator, runtime_stats: *types.DBStats) engine.Outcome(bool) {

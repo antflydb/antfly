@@ -240,7 +240,7 @@ pub fn closeHandle(handle: *Handle) void {
     const io_lifetime_lease = handle.io_lifetime_lease;
     defer if (io_lifetime_lease) @import("io_lifetime.zig").release();
     if (handle.lite_connection == null and handle.parent_id == null and handle.db_live) {
-        handle.db.deactivateResolverReplayRuntimes();
+        handle.db.enrichment.deactivateResolverReplayRuntimes();
         // Each worker can resolve/open another table while joining. Select
         // under the catalog mutex and restart after every join; never retain
         // an iterator across a callback that can grow the table map.
@@ -253,7 +253,7 @@ pub fn closeHandle(handle: *Handle) void {
                 break;
             };
             handle.embedded_table_open_mutex.unlock(handleLockIo());
-            if (pending) |database| database.deactivateResolverReplayRuntimes() else break;
+            if (pending) |database| database.enrichment.deactivateResolverReplayRuntimes() else break;
         }
     }
     invalidateQueryProducer(handle);

@@ -1047,8 +1047,8 @@ test "external lake native reuse avoids capture and invalidates writes metadata 
     {
         // Full capture cannot proceed while this lock is held. Reuse must not
         // drain maintenance, pause workers or build a filesystem generation.
-        try std.testing.expect(db.snapshot_publication_mutex.tryLock());
-        defer db.snapshot_publication_mutex.unlock();
+        try std.testing.expect(db.recovery.publication.snapshot_mutex.tryLock());
+        defer db.recovery.publication.snapshot_mutex.unlock();
         var frozen = try db.query.openCut(second, .none);
         defer frozen.close();
         const bytes = (try frozen.get(a, "doc")).?;

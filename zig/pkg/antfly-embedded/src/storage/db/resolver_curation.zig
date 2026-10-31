@@ -469,7 +469,7 @@ pub fn mutate(db: anytype, a: std.mem.Allocator, name: []const u8, request_json:
                 next.merge_state_version = if (next.merges.len == 0) 2 else 1;
             }
             try next.validate();
-            _ = try db.upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true });
+            _ = try db.enrichment.upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true });
         }
         return std.json.Stringify.valueAlloc(a, .{
             .resolver = name,
@@ -497,7 +497,7 @@ pub fn publishPlan(db: anytype, a: std.mem.Allocator, cfg: catalog.ResolverConfi
             next.merge_state_version = if (next.merges.len == 0) 2 else 1;
         }
         try next.validate();
-        _ = try db.upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true });
+        _ = try db.enrichment.upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true });
     }
     return std.json.Stringify.valueAlloc(a, .{ .resolver = cfg.name, .changed = edit.changed, .absorbed = edit.absorbed, .revision = next.curation_revision, .accepted = true, .replay_sequence = db.core.store.lastReplaySequence(0), .replay_sequence_kind = "source_journal", .applied = try applied(db, next), .progress = db.pendingWorkStats() }, .{});
 }
@@ -986,8 +986,8 @@ pub fn consumeMetadataDrop(db: anytype, alloc: std.mem.Allocator, identity: Meta
         else => return err,
     };
     if (old) |bytes| if ((std.fmt.parseInt(u64, bytes, 10) catch 0) >= identity.revision) return;
-    _ = try db.removeResolverWithoutDrain(identity.name);
-    _ = try db.dropRetiredResolverIdentity(identity.name);
+    _ = try db.enrichment.removeResolverWithoutDrain(identity.name);
+    _ = try db.enrichment.dropRetiredResolverIdentity(identity.name);
     const version = @max(db.core.index_manager.minimum_reader_version.load(.acquire), catalog.curation_reader_version);
     try db.core.store.putBatch(&.{ .{ .key = marker, .value = try std.fmt.allocPrint(a, "{d}", .{identity.revision}) }, .{ .key = catalog.minimum_reader_key, .value = try catalog.readerVersionBytes(version) } }, &.{});
     db.core.index_manager.minimum_reader_version.store(version, .release);
@@ -1107,7 +1107,7 @@ test "resolver curation durable drop fence cannot delete a reactivated fresh ide
     try consumeMetadataDrop(&db, a, identity);
     try db.addResolver(cfg);
     try consumeMetadataDrop(&db, a, identity);
-    const retained = try db.listResolverIdentities(a);
+    const retained = try db.enrichment.listResolverIdentities(a);
     defer {
         for (retained) |*item| item.deinit(a);
         a.free(retained);

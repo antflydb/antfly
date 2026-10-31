@@ -33,7 +33,6 @@ pub const RelationalIndexes = struct {
         return parent.dbPtr();
     }
 
-
     pub fn runColumnMaintenancePass(self: *RelationalIndexes) !usize {
         const db = self.dbPtr();
         if (comptime db_mod.storage_engine.enabled) return db_mod.storage_engine.call("runRelationalColumnMaintenancePass", .{db});
@@ -68,7 +67,7 @@ pub const RelationalIndexes = struct {
     fn rebuildColumnsWithPolicy(self: *RelationalIndexes, adaptive: bool) !bool {
         const db = self.dbPtr();
         if (db_mod.openModeRequiresReadOnlyBackends(db.open_mode)) return false;
-        if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+        if (db.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
         var view = db.core.acquireSchemaView() orelse return false;
         defer view.release();
         if (view.storageMode() != .relational) return false;

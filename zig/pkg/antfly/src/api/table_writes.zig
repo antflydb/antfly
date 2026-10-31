@@ -2322,11 +2322,11 @@ pub const ProvisionedTableWriteCache = struct {
 
         fn detachRuntimeHooks(self: *Entry) void {
             if (comptime control_only_storage_sources) return;
-            self.db.setCoordinatedTtl(null);
+            self.db.ttl.setCoordinated(null);
             self.db.setQueryVisibilityHook(null);
-            self.db.setResolutionCandidateSource(null);
-            self.db.setEntitySink(null);
-            self.db.setPromotionOwner(null);
+            self.db.enrichment.setResolutionCandidateSource(null);
+            self.db.enrichment.setEntitySink(null);
+            self.db.enrichment.setPromotionOwner(null);
             self.runtime_hook_state.ttl_binding.set(0, null);
             self.runtime_hook_state.leadership_source = null;
         }
@@ -2511,17 +2511,17 @@ pub const ProvisionedTableWriteCache = struct {
         // Every managed owner, including adopted startup/restore owners, must
         // bind signed policy proofs to its stable cache-entry table identity.
         db.local_execution.row_policy_table_name = table_name;
-        db.setResolutionCandidateSource(self.resolution_candidate_source);
-        db.setEntitySink(self.entity_sink);
+        db.enrichment.setResolutionCandidateSource(self.resolution_candidate_source);
+        db.enrichment.setEntitySink(self.entity_sink);
         if (owner_state) |state| {
             state.group_id = group_id;
             state.leadership_source = self.promotion_leadership_source;
             state.ttl_binding.set(group_id, self.coordinated_ttl);
-            db.setCoordinatedTtl(state.ttl_binding.port());
-            db.setPromotionOwner(state.owner());
+            db.ttl.setCoordinated(state.ttl_binding.port());
+            db.enrichment.setPromotionOwner(state.owner());
         } else {
-            db.setCoordinatedTtl(null);
-            db.setPromotionOwner(null);
+            db.ttl.setCoordinated(null);
+            db.enrichment.setPromotionOwner(null);
         }
     }
 
@@ -3266,7 +3266,7 @@ pub const ProvisionedTableWriteCache = struct {
             .bulk_ingest_session_open = start_bulk_session,
         };
         self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.runtime_hook_state);
-        try owned_entry.db.activateResolverReplayRuntimes();
+        try owned_entry.db.enrichment.activateResolverReplayRuntimes();
         try self.entries.append(self.alloc, owned_entry);
         // Artifact-issue mutations invalidate their compact status summary in
         // the same primary-store batch. Rebuild it on the stable, long-lived
@@ -3637,7 +3637,7 @@ pub const ProvisionedTableWriteCache = struct {
             .bulk_ingest_session_open = start_bulk_session,
         };
         self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.runtime_hook_state);
-        try owned_entry.db.activateResolverReplayRuntimes();
+        try owned_entry.db.enrichment.activateResolverReplayRuntimes();
         prepared.schema_json = null;
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
         try self.entries.append(self.alloc, owned_entry);
@@ -3696,7 +3696,7 @@ pub const ProvisionedTableWriteCache = struct {
             .allow_active_generation_adoption = true,
         };
         self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.runtime_hook_state);
-        try owned_entry.db.activateResolverReplayRuntimes();
+        try owned_entry.db.enrichment.activateResolverReplayRuntimes();
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
 
         try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
@@ -7674,11 +7674,11 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         owner_state: *ProvisionedTableWriteCache.RuntimeHookState,
     ) void {
-        db.setResolutionCandidateSource(self.resolution_candidate_source);
-        db.setEntitySink(self.entity_sink);
+        db.enrichment.setResolutionCandidateSource(self.resolution_candidate_source);
+        db.enrichment.setEntitySink(self.entity_sink);
         owner_state.group_id = group_id;
         owner_state.leadership_source = self.promotion_leadership_source;
-        db.setPromotionOwner(owner_state.owner());
+        db.enrichment.setPromotionOwner(owner_state.owner());
         // Cold repair owners must report the same durable pending/clear edges
         // as resident writers. DB.close() clears this hook with a callback
         // barrier before table_name leaves the caller's scope.
@@ -19227,7 +19227,7 @@ pub const ProvisionedTableWriteSource = struct {
                 else
                     try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, reconcile_options);
                 if (enrichment_reconfigured) {
-                    try cached.db.resumeEnrichmentRuntimeAfterReconfigure("structural reconciliation", target_index_name orelse "*");
+                    try cached.db.enrichment.resumeRuntimeAfterReconfigure("structural reconciliation", target_index_name orelse "*");
                     lockAtomic(&self.local_db_mutex);
                     ProvisionedTableWriteCache.publishEntryManagedConfig(cached.entry.?, indexes_json);
                     self.local_db_mutex.unlock();
@@ -22693,7 +22693,7 @@ pub const ProvisionedTableWriteSource = struct {
                 local_write_test_hooks.runTestBeforeBatchExecutionHook();
                 try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
                 if (apply_req.transaction != null) {
-                    try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
+                    try cached.db.recovery.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
                     if (raft_entry) |entry|
                         try applyReplicatedTransactionMutationAtRaftEntry(alloc, cached.db, table_name, group_id, apply_req, entry)
                     else
@@ -22758,7 +22758,7 @@ pub const ProvisionedTableWriteSource = struct {
                 local_write_test_hooks.runTestBeforeBatchExecutionHook();
                 try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
                 if (apply_req.transaction != null) {
-                    try db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
+                    try db.recovery.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
                     if (raft_entry) |entry|
                         try applyReplicatedTransactionMutationAtRaftEntry(alloc, &db, table_name, group_id, apply_req, entry)
                     else
@@ -26659,7 +26659,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
         try ensurePreDecisionContextActive(context);
         if (req.transaction != null) {
-            try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
+            try cached.db.recovery.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
             try ensurePreDecisionContextActive(context);
             try applyReplicatedTransactionMutationWithCancellation(alloc, cached.db, table_name, group_id, req, context.cancellation);
         } else try cached.db.batchReplicatedApply(req);
@@ -28157,7 +28157,7 @@ fn applyIndexCreateToCachedDb(
         remote_content,
     );
     var enrichment_resumed = false;
-    defer if (!enrichment_resumed) db.resumeEnrichmentRuntimeAfterReconfigure("failed managed index activation", index_name) catch |err| {
+    defer if (!enrichment_resumed) db.enrichment.resumeRuntimeAfterReconfigure("failed managed index activation", index_name) catch |err| {
         std.log.warn("failed to resume enrichment after managed index activation error index={s} err={s}", .{ index_name, @errorName(err) });
     };
     _ = try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, db, indexes_json, index_name, .{
@@ -28167,7 +28167,7 @@ fn applyIndexCreateToCachedDb(
             .source_table = source_table,
         },
     });
-    try db.resumeEnrichmentRuntimeAfterReconfigure("managed index activation", index_name);
+    try db.enrichment.resumeRuntimeAfterReconfigure("managed index activation", index_name);
     enrichment_resumed = true;
 }
 
@@ -28181,7 +28181,7 @@ fn reconcileDbArtifactEnrichmentsFromIndexesJson(
     defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
     indexes_api.sortArtifactEnrichmentsByDependency(enrichments);
     for (enrichments) |cfg| {
-        _ = try db.upsertEnrichment(cfg);
+        _ = try db.enrichment.upsertEnrichment(cfg);
     }
 }
 
@@ -28207,7 +28207,7 @@ fn putArtifactEnrichmentInDb(
 ) !void {
     var parsed = try parseArtifactEnrichmentConfig(alloc, artifact_name, enrichment_json);
     defer parsed.deinit();
-    _ = try db.upsertEnrichment(parsed.value);
+    _ = try db.enrichment.upsertEnrichment(parsed.value);
 }
 
 const deleteArtifactEnrichmentFromDbByName = @import("antfly_local_sources").api_local_table_writes.deleteArtifactEnrichmentFromDbByName;
@@ -28774,8 +28774,8 @@ fn catchUpManagedIndexCreate(
         if (try db.completedManagedDenseGenerationIsServiceable(alloc, index_name)) {
             return .complete;
         }
-        if (db.enrichment_runtime != null) {
-            const appended = try db.reprocessGeneratedEnrichmentFromStoredDocsWithProgress(
+        if (db.enrichment.runtime != null) {
+            const appended = try db.enrichment.reprocessGeneratedEnrichmentFromStoredDocsWithProgress(
                 alloc,
                 managedIndexEmbeddingArtifactName(db, index_name),
             );
@@ -28960,7 +28960,7 @@ fn seedManagedIndexReplayFromStoredDocsIfNeeded(
     }
     if (managedIndexReplayDebtRequired(replay_debt, index_name)) return false;
     if (!try managedIndexCoverageIncomplete(alloc, db, index_name)) return false;
-    _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+    _ = try db.enrichment.replayGeneratedEnrichmentsFromStoredDocs(alloc);
     return true;
 }
 
@@ -31220,7 +31220,7 @@ fn catchUpManagedDb(
     if (runs_broad_debt and repair_metadata_rebuild_pending) {
         progress_ctx.phase = .artifact_rebuild;
         try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
-        try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+        try db.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle();
         repaired_artifact_metadata = true;
         made_progress = true;
         try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
@@ -40267,7 +40267,7 @@ fn implementationTests() type {
             var forged_scope = scope;
             forged_scope.source_artifact_digest = @splat(4);
             try std.testing.expectError(error.RestoreStagingScopeChanged, source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "a", .end = "z" }, forged_scope));
-            const enrichments = try owner.db.listEnrichments(alloc);
+            const enrichments = try owner.db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             try std.testing.expectEqual(@as(usize, 0), enrichments.len);
             const source_path = try std.fs.path.join(alloc, &.{ root, "source" });
@@ -40422,7 +40422,7 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(u64, 1), (try writer.db.orderedApplyReceipt()).?.index);
             // Unit tests explicitly drive the same maintenance pass; the borrowed-I/O
             // regression separately proves its production scheduler advances it.
-            try writer.db.runArtifactRepairMetadataMaintenanceUntilIdle();
+            try writer.db.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle();
             _ = try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", merge, .{ .term = 1, .index = 2 });
             try std.testing.expectEqual(@as(u64, 2), (try writer.db.orderedApplyReceipt()).?.index);
             try std.testing.expectEqualStrings("", writer.db.getRange().end);
@@ -42560,13 +42560,13 @@ fn implementationTests() type {
             defer db.close();
 
             try std.testing.expect(!db.start_index_workers);
-            const enrichment_runtime = db.enrichment_runtime orelse return error.MissingStartupEnrichmentRuntime;
+            const enrichment_runtime = db.enrichment.runtime orelse return error.MissingStartupEnrichmentRuntime;
             try std.testing.expectEqual(@as(u32, 1), enrichment_runtime.config.inline_retry_max_attempts);
             try std.testing.expectEqual(std.math.maxInt(u32), enrichment_runtime.config.worker_retry_max_attempts);
             try std.testing.expect(!enrichment_runtime.stats().worker_started);
             try std.testing.expect(!db.local_execution.optional_runtime_workers_enabled);
-            try std.testing.expect(db.ttl_runtime == null);
-            try std.testing.expect(db.transaction_runtime == null);
+            try std.testing.expect(db.ttl.runtime == null);
+            try std.testing.expect(db.recovery.transactions.runtime == null);
             try std.testing.expect(db.indexes.text.merge_runtime == null);
         }
 
@@ -43068,7 +43068,7 @@ fn implementationTests() type {
                 true,
             ) == null);
 
-            const enrichment = db.enrichment_runtime orelse return error.MissingStartupEnrichmentRuntime;
+            const enrichment = db.enrichment.runtime orelse return error.MissingStartupEnrichmentRuntime;
             const stats = enrichment.stats();
             try std.testing.expect(stats.applied_sequence < stats.target_sequence);
         }
@@ -43247,7 +43247,7 @@ fn implementationTests() type {
             var db = try db_mod.DB.open(alloc, path, .{});
             defer db.close();
 
-            _ = try db.upsertEnrichment(.{
+            _ = try db.enrichment.upsertEnrichment(.{
                 .name = "body_chunks_v1",
                 .kind = .chunk,
                 .field = "body",
@@ -43257,7 +43257,7 @@ fn implementationTests() type {
             var bound = BoundTableWriteSource.init("docs", &db);
             _ = try bound.source().deleteArtifactEnrichment(alloc, "docs", "body_chunks_v1");
 
-            const remaining = try db.listEnrichments(alloc);
+            const remaining = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, remaining);
             for (remaining) |cfg| {
                 try std.testing.expect(!std.mem.eql(u8, cfg.name, "body_chunks_v1"));
@@ -43368,7 +43368,7 @@ fn implementationTests() type {
             var db = try db_mod.DB.open(alloc, path, .{});
             defer db.close();
 
-            try db.addEnrichment(.{
+            try db.enrichment.addEnrichment(.{
                 .name = "document_units_v1",
                 .kind = .asset,
                 .field = "url",
@@ -49491,7 +49491,7 @@ fn implementationTests() type {
                 .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }},
                 .sync_level = .write,
             });
-            try std.testing.expect(write_cache.entries.items[0].db.enrichment_runtime == null);
+            try std.testing.expect(write_cache.entries.items[0].db.enrichment.runtime == null);
             const resident_db = &write_cache.entries.items[0].db;
             var repair_clock = @import("antfly_platform").clock.ManualClock{};
             repair_clock.setRealtimeNs(backend_runtime.ptr().clock().nowRealtimeNs());
@@ -49504,8 +49504,8 @@ fn implementationTests() type {
                     if (observations == 0) {
                         // The replacement producer is installed, but must not begin
                         // source work before the requested catalog admission exists.
-                        try std.testing.expect(db.enrichment_runtime != null);
-                        try std.testing.expect(!db.enrichment_runtime.?.isStarted());
+                        try std.testing.expect(db.enrichment.runtime != null);
+                        try std.testing.expect(!db.enrichment.runtime.?.isStarted());
                     }
                     observations += 1;
                 }
@@ -49555,9 +49555,9 @@ fn implementationTests() type {
                 reconcile_outcome,
             );
             try std.testing.expect(AdmissionBoundary.observations > 0);
-            try std.testing.expect(resident_db.enrichment_runtime.?.isStarted());
+            try std.testing.expect(resident_db.enrichment.runtime.?.isStarted());
             try std.testing.expect(resident_db == &write_cache.entries.items[0].db);
-            try std.testing.expect(write_cache.entries.items[0].db.enrichment_runtime != null);
+            try std.testing.expect(write_cache.entries.items[0].db.enrichment.runtime != null);
 
             const requests_before_write = FakeEmbeddingProvider.request_count.load(.monotonic);
             _ = try source.source().batch(alloc, "docs", .{
@@ -50720,7 +50720,7 @@ fn implementationTests() type {
                     .catalog_open => {
                         var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
                         defer cached.deinit(alloc);
-                        try std.testing.expect(cached.db.quarantineRetryWorkerStartedAtCurrentAddressForTest());
+                        try std.testing.expect(cached.db.maintenance.quarantineRetryWorkerStartedAtCurrentAddressForTest());
                     },
                     .prepared_open => {
                         var opened: ?db_mod.DB = try db_mod.DB.open(alloc, path, .{});
@@ -50736,14 +50736,14 @@ fn implementationTests() type {
                             &prepared,
                         );
                         defer cached.deinit(alloc);
-                        try std.testing.expect(cached.db.quarantineRetryWorkerStartedAtCurrentAddressForTest());
+                        try std.testing.expect(cached.db.maintenance.quarantineRetryWorkerStartedAtCurrentAddressForTest());
                     },
                     .seeded_create => {
                         var opened: ?db_mod.DB = try db_mod.DB.open(alloc, path, .{});
                         defer if (opened) |*db| db.close();
                         try write_cache.seedCreatedDbLocked(&opened, 7001, 0, "docs", "{}", "{}");
                         try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
-                        try std.testing.expect(write_cache.entries.items[0].db.quarantineRetryWorkerStartedAtCurrentAddressForTest());
+                        try std.testing.expect(write_cache.entries.items[0].db.maintenance.quarantineRetryWorkerStartedAtCurrentAddressForTest());
                     },
                 }
             }
@@ -56775,8 +56775,8 @@ fn implementationTests() type {
             write_cache.setPromotionLeadershipSource(leadership.source());
 
             var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
-            try std.testing.expect(cached.db.promotion_runtime != null);
-            cached.db.promotion_runtime.?.notifySequence(1);
+            try std.testing.expect(cached.db.enrichment.promotion.runtime != null);
+            cached.db.enrichment.promotion.runtime.?.notifySequence(1);
             cached.deinit(alloc);
 
             write_cache.deinit();
@@ -56875,7 +56875,7 @@ fn implementationTests() type {
                 }
             };
             var sink_token: u8 = 0;
-            reopened.setEntitySink(.{ .ptr = &sink_token, .vtable = &.{ .upsert = Sink.upsert } });
+            reopened.enrichment.setEntitySink(.{ .ptr = &sink_token, .vtable = &.{ .upsert = Sink.upsert } });
             const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &reopened, false, .isolated, .all_debt, .{});
             try std.testing.expect(result.had_debt);
             try std.testing.expect(result.made_progress);
@@ -56925,7 +56925,7 @@ fn implementationTests() type {
                     defer db.core.unlockApply();
                     _ = try db.core.upsertResolver(cfg);
                 }
-                db.setEntitySink(.{ .ptr = &sink_token, .vtable = &.{ .upsert = Sink.upsert } });
+                db.enrichment.setEntitySink(.{ .ptr = &sink_token, .vtable = &.{ .upsert = Sink.upsert } });
                 try db.runUntilIdle();
                 const settled = db.pendingWorkStats();
                 watermark = settled.resolution.applied_sequence;
@@ -59015,7 +59015,7 @@ fn implementationTests() type {
             try std.testing.expect(cached_db.core.schema != null);
             try std.testing.expectEqual(@as(u32, 1), cached_db.core.schema.?.version);
             try std.testing.expect(cached_db.core.index_manager.textIndex("full_text_index_v1") != null);
-            var enrichment = (try cached_db.getEnrichment(alloc, .asset, "document_units_v1")) orelse return error.TestUnexpectedResult;
+            var enrichment = (try cached_db.enrichment.getEnrichment(alloc, .asset, "document_units_v1")) orelse return error.TestUnexpectedResult;
             defer enrichment.deinit(alloc);
             try std.testing.expectEqualStrings("title", enrichment.field);
         }
@@ -59505,7 +59505,7 @@ fn implementationTests() type {
                         open_mode,
                     );
                     defer stale_owner.deinit(alloc);
-                    try std.testing.expect(stale_owner.db.enrichment_runtime == null);
+                    try std.testing.expect(stale_owner.db.enrichment.runtime == null);
                     // Reproduce the production failure precisely: metadata publication
                     // advanced independently while the resident runtime stayed stale.
                     // A fingerprint match alone must never let create skip installation.
@@ -59530,7 +59530,7 @@ fn implementationTests() type {
                 try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(entry, managed_indexes_json));
                 try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body") != null);
                 try std.testing.expect(entry.db.core.index_manager.denseIndex("artifact_vectors") != null);
-                const runtime = entry.db.enrichment_runtime orelse return error.MissingDbEnrichmentRuntime;
+                const runtime = entry.db.enrichment.runtime orelse return error.MissingDbEnrichmentRuntime;
                 try std.testing.expectEqual(open_mode != .startup_catch_up, runtime.stats().worker_started);
 
                 _ = try source.source().batch(alloc, "docs", .{

@@ -192,7 +192,7 @@ test "storage.hot_standby resolution handoff fence rejects completion after dura
     defer alloc.free(marker_key);
     var pause = PauseBeforePublish{ .io = std.testing.io };
     var probe = WriteProbe{
-        .ctx = db.resolution_append_context.?,
+        .ctx = db.enrichment.resolution.append_context.?,
         .resolution_key = resolution_key,
         .pause = &pause,
     };
@@ -3044,11 +3044,11 @@ test "storage.hot_standby db standby role suppresses mutating background runtime
 
     try std.testing.expect(!db.start_index_workers);
     try std.testing.expect(!db.executor.hasWorkers());
-    try std.testing.expect(db.enrichment_runtime == null);
-    try std.testing.expect(db.resolution_runtime == null);
-    try std.testing.expect(db.promotion_runtime == null);
-    try std.testing.expect(db.ttl_runtime == null);
-    try std.testing.expect(db.transaction_runtime == null);
+    try std.testing.expect(db.enrichment.runtime == null);
+    try std.testing.expect(db.enrichment.resolution.runtime == null);
+    try std.testing.expect(db.enrichment.promotion.runtime == null);
+    try std.testing.expect(db.ttl.runtime == null);
+    try std.testing.expect(db.recovery.transactions.runtime == null);
     try std.testing.expect(db.indexes.text.merge_runtime == null);
     try std.testing.expect(db.indexes.sparse.compaction_runtime == null);
 }
@@ -3219,7 +3219,7 @@ test "db graph ttl HA replicates direct expiration and document relational withd
             try std.testing.expectError(error.OutOfMemory, expireDirectGraphTtlCandidateContext(&ttl, candidate));
             try std.testing.expectEqual(before_lsn, stream.lastLsn());
             try std.testing.expect(primary.async_context.primary_replication_append_pending.load(.acquire));
-            try std.testing.expectError(error.ReplicationPublisherUnavailable, primary.addEnrichment(.{ .name = "blocked", .kind = .asset, .field = "title", .content_type = "text/plain" }));
+            try std.testing.expectError(error.ReplicationPublisherUnavailable, primary.enrichment.addEnrichment(.{ .name = "blocked", .kind = .asset, .field = "title", .content_type = "text/plain" }));
             try std.testing.expectError(error.ReplicationPublisherUnavailable, appendDerivedBatchRecordContext(&ttl.batch, .{ .changed_artifact_keys = &.{candidate.artifact_key} }));
             stream.alloc = stream_alloc;
             try primary.batch(.{ .writes = &.{.{ .key = "doc:z", .value = "{\"title\":\"later\"}" }}, .sync_level = .full_index });
@@ -3470,8 +3470,8 @@ test "db graph ttl HA retirement preserves different replay progress" {
         var replica = try DB.open(alloc, replica_tmp.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
         defer replica.close();
         for ([_]*DB{ &primary, &replica }) |db| {
-            try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
-            try db.addEnrichment(.{ .name = "relations_v2", .kind = .asset, .field = "relations", .content_type = "application/json" });
+            try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+            try db.enrichment.addEnrichment(.{ .name = "relations_v2", .kind = .asset, .field = "relations", .content_type = "application/json" });
             try db.addIndex(.{ .name = "g", .kind = .graph, .coverage_generation = 7, .config_json = "{\"ttl\":{\"duration\":\"1h\"},\"max_edges_per_document\":2,\"sources\":[{\"artifact\":\"relations_v1\"},{\"artifact\":\"relations_v2\"}]}" });
             try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }}, .sync_level = .full_index });
         }

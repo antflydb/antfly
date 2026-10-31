@@ -85,7 +85,7 @@ pub const Indexes = struct {
             .range_end = shadow_end,
         };
         self.split_shadow = shadow;
-        if (db.transaction_recovery_local_context) |ctx| {
+        if (db.recovery.transactions.local_context) |ctx| {
             ctx.split_shadow = self.split_shadow;
         }
     }
@@ -104,7 +104,7 @@ pub const Indexes = struct {
         const db = self.dbPtr();
         try db_mod.waitForSplitShadowDrainLocked(db, false);
         const shadow = self.split_shadow orelse return;
-        if (db.transaction_recovery_local_context) |ctx| {
+        if (db.recovery.transactions.local_context) |ctx| {
             ctx.split_shadow = null;
         }
         shadow.manager.deinit();

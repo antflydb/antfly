@@ -210,9 +210,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .artifact_cleanup_maybe = resources.artifact_cleanup_maybe,
                 .executor = S.ownerField(self, "executor").*,
                 .io = S.ownerField(self, "backend_runtime").*.io(),
-                .enrichment_runtime = S.ownerField(self, "enrichment_runtime").*,
-                .resolution_runtime = S.ownerField(self, "resolution_runtime").*,
-                .promotion_runtime = S.ownerField(self, "promotion_runtime").*,
+                .enrichment_runtime = S.ownerField(self, "enrichment").runtime,
+                .resolution_runtime = S.ownerField(self, "enrichment").resolution.runtime,
+                .promotion_runtime = S.ownerField(self, "enrichment").promotion.runtime,
                 .async_context = S.ownerField(self, "async_context").*,
                 .relational_base_rows = relationalColumns(self) != null,
                 .table_catalog = &S.ownerField(self, "core").*.table_catalog,
@@ -3252,7 +3252,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.wait_sync_ns, wait_sync_start_ns);
             if (append_derived_replay) {
-                if (S.ownerField(self, "enrichment_runtime").*) |runtime| {
+                if (S.ownerField(self, "enrichment").runtime) |runtime| {
                     const notify_enrichment_start_ns = monotonicTimeNs();
                     runtime.notifySequence(sequence);
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.notify_enrichment_ns, notify_enrichment_start_ns);
@@ -3700,7 +3700,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn markPrecomputedEnrichmentAppliedForSync(self: anytype, sync_level: types.SyncLevel, sequence: u64) !void {
             if (sync_level != .enrichments or sequence == 0) return;
-            const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
+            const runtime = S.ownerField(self, "enrichment").runtime orelse return;
             const runtime_stats = runtime.stats();
             // A contiguous sequence may still retain a producer that requires
             // committed graph state. Only the replay lane proves no work remains.
@@ -3770,8 +3770,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn notifyResolverReplayRuntimesForced(self: anytype, sequence: u64) void {
-            if (S.ownerField(self, "resolution_runtime").*) |runtime| runtime.notifySequence(sequence);
-            if (S.ownerField(self, "promotion_runtime").*) |runtime| runtime.notifySequence(sequence);
+            if (S.ownerField(self, "enrichment").resolution.runtime) |runtime| runtime.notifySequence(sequence);
+            if (S.ownerField(self, "enrichment").promotion.runtime) |runtime| runtime.notifySequence(sequence);
         }
 
         pub fn pendingRowPolicyReceipt(self: anytype) !?row_policy_bundle_mod.Receipt {
@@ -4246,7 +4246,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Recovery and the serving wrapper share the same ticket/mutex owner.
             // The context is updated under the primary apply fence during split setup
             // and teardown; a copied wrapper must not capture stale split ownership.
-            if (S.ownerField(self, "transaction_recovery_local_context").*) |ctx| return ctx.split_shadow;
+            if (S.ownerField(self, "recovery").transactions.local_context) |ctx| return ctx.split_shadow;
             return S.ownerField(self, "indexes").split_shadow;
         }
 

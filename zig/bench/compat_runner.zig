@@ -197,7 +197,7 @@ fn loadEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, case_dir: []const u
         const name = item.object.get("name") orelse return error.InvalidCompatCase;
         const kind = item.object.get("kind") orelse return error.InvalidCompatCase;
         const field = item.object.get("field") orelse return error.InvalidCompatCase;
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = name.string,
             .kind = parseEnrichmentKind(kind.string),
             .field = field.string,
@@ -993,7 +993,7 @@ fn waitForSearchResult(
 fn waitForDerivedWork(db: *db_mod.DB) !void {
     var sequence = db.core.change_journal.lastSequence();
     if (sequence == 0) return;
-    if (db.enrichment_runtime) |runtime| {
+    if (db.enrichment.runtime) |runtime| {
         try runtime.waitForApplied(sequence);
         sequence = db.core.change_journal.lastSequence();
         if (sequence == 0) return;

@@ -139,7 +139,7 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
             try std.testing.expectError(error.RaftApplyWriterUnavailable, server_test_adapter.applyOrdered(&database, merge, .{ .term = 1, .index = 2 }));
             try std.testing.expectEqual(@as(u64, 1), (try database.orderedApplyReceipt()).?.index);
             database.startResidentBackgroundWorkersIfNeeded();
-            if (database.independent_maintenance.future == null) return error.GraphMaintenanceWorkerMissing;
+            if (database.maintenance.independent.future == null) return error.GraphMaintenanceWorkerMissing;
             const graph = &database.core.index_manager.graphIndex("g").?.index;
             for (0..100) |_| {
                 if (!graph.ownershipTransitionPending()) break;
@@ -359,17 +359,17 @@ test "db identity namespace reassignment refreshes transaction recovery hook con
         .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
     });
 
-    const identity_ctx = db.transaction_recovery_identity_context orelse return error.TestExpectedEqual;
-    const local_ctx = db.transaction_recovery_local_context orelse return error.TestExpectedEqual;
+    const identity_ctx = db.recovery.transactions.identity_context orelse return error.TestExpectedEqual;
+    const local_ctx = db.recovery.transactions.local_context orelse return error.TestExpectedEqual;
     try std.testing.expect(identity_ctx.identity_namespace.eql(old_namespace));
-    try std.testing.expect(server_recovery.test_support.runtimeConfig(db.transaction_runtime.?).resolution_extra_hooks.build != null);
+    try std.testing.expect(server_recovery.test_support.runtimeConfig(db.recovery.transactions.runtime.?).resolution_extra_hooks.build != null);
     try std.testing.expectEqual(
         @intFromPtr(identity_ctx),
-        @intFromPtr(server_recovery.test_support.runtimeConfig(db.transaction_runtime.?).resolution_extra_hooks.ctx.?),
+        @intFromPtr(server_recovery.test_support.runtimeConfig(db.recovery.transactions.runtime.?).resolution_extra_hooks.ctx.?),
     );
     try std.testing.expectEqual(
         @intFromPtr(local_ctx),
-        @intFromPtr(server_recovery.test_support.runtimeConfig(db.transaction_runtime.?).local_resolution_ctx.?),
+        @intFromPtr(server_recovery.test_support.runtimeConfig(db.recovery.transactions.runtime.?).local_resolution_ctx.?),
     );
     try std.testing.expect(local_ctx.execution != null);
     try std.testing.expect(local_ctx.execution.?.core == db.core);
@@ -484,9 +484,9 @@ test "db replicated merge imports graph source asset and rebuilds ttl contender"
     const index: types.IndexConfig = .{ .name = "relations_graph", .kind = .graph, .config_json =
         \\{"ttl":{"duration":"1h"},"sources":[{"artifact":"relations_v1"}]}
     };
-    try donor.addEnrichment(enrichment);
+    try donor.enrichment.addEnrichment(enrichment);
     try donor.addIndex(index);
-    try receiver.addEnrichment(enrichment);
+    try receiver.enrichment.addEnrichment(enrichment);
     try receiver.addIndex(index);
     try donor.batch(.{ .writes = &.{.{ .key = "doc:a", .value =
         \\{"title":"owner","relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":2}}
@@ -551,9 +551,9 @@ test "db replicated merge keeps expired graph source suppressed until asset chan
     const index: types.IndexConfig = .{ .name = "relations_graph", .kind = .graph, .config_json =
         \\{"ttl":{"duration":"1h"},"sources":[{"artifact":"relations_v1"}]}
     };
-    try donor.addEnrichment(enrichment);
+    try donor.enrichment.addEnrichment(enrichment);
     try donor.addIndex(index);
-    try receiver.addEnrichment(enrichment);
+    try receiver.enrichment.addEnrichment(enrichment);
     try receiver.addIndex(index);
     const original =
         \\{"title":"owner","relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":2}}
@@ -1290,8 +1290,8 @@ test "db transaction recovery runtime resolves participants and unblocks cleanup
         .transaction_recovery = server_recovery.borrowedConfig(&server_recovery_config_3),
     });
     defer db.close();
-    try std.testing.expect(db.transaction_recovery_identity_context != null);
-    try std.testing.expect(server_recovery.test_support.runtimeConfig(db.transaction_runtime.?).resolution_extra_hooks.build != null);
+    try std.testing.expect(db.recovery.transactions.identity_context != null);
+    try std.testing.expect(server_recovery.test_support.runtimeConfig(db.recovery.transactions.runtime.?).resolution_extra_hooks.build != null);
 
     var cleared = false;
     var attempts: usize = 0;
@@ -1460,7 +1460,7 @@ test "db transaction recovery shares serving visibility and invalidates query ca
     });
     defer db.close();
     try engine.test_support.prepareTransactionRecoveryOwner(engine.test_support.dbPointer(&db));
-    const recovery = db.transaction_recovery_local_context.?.execution.?;
+    const recovery = db.recovery.transactions.local_context.?.execution.?;
     try std.testing.expect(&db.core.identity_visibility == &recovery.core.identity_visibility);
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }} });
     try std.testing.expect(try engine.test_support.allDocsVisibleSummaryFast(engine.test_support.dbPointer(&db), null));
@@ -1474,7 +1474,7 @@ test "db transaction recovery shares serving visibility and invalidates query ca
 
     const txn_id = try db.beginTransaction(1_000);
     try db.writeTransaction(txn_id, .{ .deletes = &.{"doc:a"} });
-    const config = server_recovery.test_support.runtimeConfig(db.transaction_runtime.?);
+    const config = server_recovery.test_support.runtimeConfig(db.recovery.transactions.runtime.?);
     try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
     const stored = try db.get(alloc, "doc:a");
     if (stored) |value| alloc.free(value);
@@ -1512,23 +1512,23 @@ test "db transaction recovery borrows replacement enrichment only during resolut
     defer db.close();
     try db.addIndex(.{ .name = "ft_recovery", .kind = .full_text, .config_json = "{}" });
     try engine.test_support.prepareTransactionRecoveryOwner(engine.test_support.dbPointer(&db));
-    const recovery = db.transaction_recovery_local_context.?.execution.?;
-    try std.testing.expectEqual(db.enrichment_runtime, recovery.async_context.enrichment_runtime);
-    const original = db.enrichment_runtime.?;
+    const recovery = db.recovery.transactions.local_context.?.execution.?;
+    try std.testing.expectEqual(db.enrichment.runtime, recovery.async_context.enrichment_runtime);
+    const original = db.enrichment.runtime.?;
     var replacement = embedder_mod.DeterministicDenseEmbedder{};
-    try db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = replacement.interface() });
-    try std.testing.expect(db.enrichment_runtime.? != original);
-    try std.testing.expectEqual(db.enrichment_runtime, recovery.async_context.enrichment_runtime);
-    const config = server_recovery.test_support.runtimeConfig(db.transaction_runtime.?);
+    try db.enrichment.reconfigureRuntimePaused(.{ .dense_embedder = replacement.interface() });
+    try std.testing.expect(db.enrichment.runtime.? != original);
+    try std.testing.expectEqual(db.enrichment.runtime, recovery.async_context.enrichment_runtime);
+    const config = server_recovery.test_support.runtimeConfig(db.recovery.transactions.runtime.?);
     const txn_id = try db.beginTransaction(1_000);
     try db.writeTransaction(txn_id, .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"recovered\"}" }},
     });
     try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
-    try std.testing.expectEqual(db.enrichment_runtime, recovery.async_context.enrichment_runtime);
+    try std.testing.expectEqual(db.enrichment.runtime, recovery.async_context.enrichment_runtime);
     const sequence = db.core.nextDerivedSequence();
     try std.testing.expect(sequence > 0);
-    try std.testing.expectEqual(sequence, db.enrichment_runtime.?.stats().target_sequence);
+    try std.testing.expectEqual(sequence, db.enrichment.runtime.?.stats().target_sequence);
     try db.waitForCurrentSyncLevel(.full_text);
     var result = try db.search(alloc, .{
         .index_name = "ft_recovery",
@@ -1539,12 +1539,12 @@ test "db transaction recovery borrows replacement enrichment only during resolut
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
 
     // Removing the producer must also leave no dangling pointer behind.
-    try db.reconfigureEnrichmentRuntimePaused(.{});
-    try std.testing.expect(db.enrichment_runtime == null);
+    try db.enrichment.reconfigureRuntimePaused(.{});
+    try std.testing.expect(db.enrichment.runtime == null);
     const deleted = try db.beginTransaction(3_000);
     try db.writeTransaction(deleted, .{ .deletes = &.{"doc:a"} });
     try config.resolve_local_fn.?(config.local_resolution_ctx.?, deleted, .committed, 4_000);
-    try std.testing.expectEqual(db.enrichment_runtime, recovery.async_context.enrichment_runtime);
+    try std.testing.expectEqual(db.enrichment.runtime, recovery.async_context.enrichment_runtime);
 }
 
 test "db transaction recovery provider guard survives failed enrichment replacement" {
@@ -1566,11 +1566,11 @@ test "db transaction recovery provider guard survives failed enrichment replacem
     });
     defer db.close();
     try engine.test_support.prepareTransactionRecoveryOwner(engine.test_support.dbPointer(&db));
-    const original = db.enrichment_runtime.?;
-    const recovery = db.transaction_recovery_local_context.?;
+    const original = db.enrichment.runtime.?;
+    const recovery = db.recovery.transactions.local_context.?;
     const Fault = struct {
         fn afterDetached(target: *DB) !void {
-            const context = target.transaction_recovery_local_context.?;
+            const context = target.recovery.transactions.local_context.?;
             if (context.provider_mutex.tryLock()) {
                 context.provider_mutex.unlock(target.backend_runtime.io().?);
                 return error.TestMissingRecoveryProviderGuard;
@@ -1581,20 +1581,20 @@ test "db transaction recovery provider guard survives failed enrichment replacem
     engine.test_support.enrichmentReconfigureHook.* = Fault.afterDetached;
     defer engine.test_support.enrichmentReconfigureHook.* = null;
     var replacement = embedder_mod.DeterministicDenseEmbedder{};
-    try std.testing.expectError(error.TestReplacementInterrupted, db.reconfigureEnrichmentRuntimePaused(.{
+    try std.testing.expectError(error.TestReplacementInterrupted, db.enrichment.reconfigureRuntimePaused(.{
         .dense_embedder = replacement.interface(),
     }));
-    try std.testing.expectEqual(original, db.enrichment_runtime.?);
+    try std.testing.expectEqual(original, db.enrichment.runtime.?);
     try std.testing.expect(recovery.provider_mutex.tryLock());
     recovery.provider_mutex.unlock(db.backend_runtime.io().?);
-    try std.testing.expectEqual(db.enrichment_runtime, recovery.execution.?.async_context.enrichment_runtime);
-    const config = server_recovery.test_support.runtimeConfig(db.transaction_runtime.?);
+    try std.testing.expectEqual(db.enrichment.runtime, recovery.execution.?.async_context.enrichment_runtime);
+    const config = server_recovery.test_support.runtimeConfig(db.recovery.transactions.runtime.?);
     const txn_id = try db.beginTransaction(1_000);
     try db.writeTransaction(txn_id, .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"after failure\"}" }},
     });
     try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
-    try std.testing.expectEqual(db.enrichment_runtime, recovery.execution.?.async_context.enrichment_runtime);
+    try std.testing.expectEqual(db.enrichment.runtime, recovery.execution.?.async_context.enrichment_runtime);
     try std.testing.expect(recovery.provider_mutex.tryLock());
     recovery.provider_mutex.unlock(db.backend_runtime.io().?);
 }
@@ -1618,7 +1618,7 @@ test "db transaction recovery borrowed execution observes split shadow lifetime"
     });
     defer db.close();
     try engine.test_support.prepareTransactionRecoveryOwner(engine.test_support.dbPointer(&db));
-    const recovery_ctx = db.transaction_recovery_local_context orelse
+    const recovery_ctx = db.recovery.transactions.local_context orelse
         return error.TransactionRecoveryOwnerUnbound;
     try std.testing.expect(recovery_ctx.execution != null);
     var recovery_execution = engine.test_support.transactionRecoveryExecution(&db);
@@ -2398,7 +2398,7 @@ test "db ordered artifact inventory producer baseline resumes and includes behin
         }
         // Without a dispatcher, local maintenance must not mutate replicated
         // progress. Discovery is read-only even when it reaches a page end.
-        try std.testing.expect(!try db.advanceArtifactProducerBaselinePage());
+        try std.testing.expect(!try db.enrichment.advanceArtifactProducerBaselinePage());
         const Capture = struct {
             command: ?[]u8 = null,
             refuse: bool = true,
@@ -2416,11 +2416,11 @@ test "db ordered artifact inventory producer baseline resumes and includes behin
         defer if (capture.command) |bytes| alloc.free(bytes);
         db.local_execution.artifact_publication_dispatcher = .{ .ptr = &capture, .enqueue = Capture.enqueue };
         defer db.local_execution.artifact_publication_dispatcher = null;
-        try std.testing.expectError(error.ResourceBudgetExceeded, db.advanceArtifactProducerBaselinePage());
+        try std.testing.expectError(error.ResourceBudgetExceeded, db.enrichment.advanceArtifactProducerBaselinePage());
         capture.refuse = false;
         // Enqueue owns the serialized page after preparation releases its
         // snapshot/arena. It must still report incomplete until ordered apply.
-        try std.testing.expect(!try db.advanceArtifactProducerBaselinePage());
+        try std.testing.expect(!try db.enrichment.advanceArtifactProducerBaselinePage());
         try std.testing.expect(capture.command != null);
         {
             var read = try db.core.store.beginReadTxn();
@@ -2556,7 +2556,7 @@ test "db ordered artifact inventory producer baseline resumes and includes behin
         try txn.commit();
     }
     try std.testing.expectError(error.ArtifactCatalogCorrupt, baseline.prepareRaft(alloc, reopened.core.store));
-    try std.testing.expectError(error.ArtifactCatalogCorrupt, reopened.advanceArtifactProducerBaselinePage());
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, reopened.enrichment.advanceArtifactProducerBaselinePage());
 }
 
 test "db ordered artifact inventory upload backpressure advances apply without false completion" {
@@ -2623,7 +2623,7 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
     var db = try DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .content_type = "application/json" });
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"relations\"}]}" });
     try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"seed\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     var catalog = try db.artifactInventoryCommand(alloc);
@@ -2718,8 +2718,8 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
     var db = try DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
-    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .source_artifact_name = "relations", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
+    try db.enrichment.addEnrichment(.{ .name = "copy", .kind = .asset, .source_artifact_name = "relations", .content_type = "application/json" });
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"relations\"}]}" });
     try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"seed\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     var catalog = try db.artifactInventoryCommand(alloc);
@@ -2890,8 +2890,8 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
         var db = try DB.open(alloc, path, options);
         defer db.close();
         try db.setSchemaJson(alloc, "{}");
-        try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .content_type = "application/json" });
-        try db.addEnrichment(.{ .name = "other_relations", .kind = .asset, .field = "body", .content_type = "application/json" });
+        try db.enrichment.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .content_type = "application/json" });
+        try db.enrichment.addEnrichment(.{ .name = "other_relations", .kind = .asset, .field = "body", .content_type = "application/json" });
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"relations\"},{\"artifact\":\"other_relations\"}]}" });
         try server_test_adapter.applyOrdered(&db, .{ .writes = &.{ .{ .key = "doc", .value = "{}" }, .{ .key = "neighbor", .value = "{}" } }, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
         {
@@ -3360,9 +3360,9 @@ test "db ordered artifact inventory chunk publication authenticates complete set
         var db = try DB.open(alloc, path, options);
         defer db.close();
         try db.setSchemaJson(alloc, "{}");
-        try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 20 });
+        try db.enrichment.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 20 });
         try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
-        try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .source_artifact_name = "chunks" });
+        try db.enrichment.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .source_artifact_name = "chunks" });
         try db.addIndex(.{ .name = "sparse", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
         try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
         var old = chunks.Builder.init();
@@ -3519,8 +3519,8 @@ test "db ordered artifact inventory asset publication authenticates output and p
         var db = try DB.open(alloc, path, options);
         defer db.close();
         try db.setSchemaJson(alloc, "{}");
-        try db.addEnrichment(.{ .name = "first", .kind = .asset, .field = "body", .content_type = "text/plain" });
-        try db.addEnrichment(.{ .name = "second", .kind = .asset, .field = "body", .content_type = "text/plain" });
+        try db.enrichment.addEnrichment(.{ .name = "first", .kind = .asset, .field = "body", .content_type = "text/plain" });
+        try db.enrichment.addEnrichment(.{ .name = "second", .kind = .asset, .field = "body", .content_type = "text/plain" });
         try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"first\"},{\"artifact\":\"second\"}]}" });
         try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
         var catalog = try db.artifactInventoryCommand(alloc);
@@ -3898,7 +3898,7 @@ test "db ordered artifact inventory stale publications commit rejection without 
         }
         try std.testing.expectEqual(@as(u16, 14), catalog.binding.effect_protocol);
         try std.testing.expect((try @import("antfly_local_sources").storage_db_artifact_producer_baseline.prepareRaft(alloc, db.core.store)) == null);
-        try std.testing.expect(try db.advanceArtifactProducerBaselinePage());
+        try std.testing.expect(try db.enrichment.advanceArtifactProducerBaselinePage());
         stale_source = .{ .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "model", .producer_generation = 1, .producer_artifact_name = "model", .sources = (&source)[0..1], .mutations = &effects, .publication_digest = @splat(0) };
         stale_source.publication_digest = stale_source.digest();
         // A legitimate input commit wins after provider preparation/proposal.
@@ -4091,7 +4091,7 @@ test "db transaction recovery observes admission replacement after execution bin
     var gate: Gate = .{};
     // Rebinding occurs after recovery has retained its execution capabilities.
     db.local_execution.replication_write_gate = .{ .borrowed = .{ .ptr = &gate, .check_fn = Gate.check } };
-    const context = db.transaction_runtime.?.local.?.config;
+    const context = db.recovery.transactions.runtime.?.local.?.config;
     try std.testing.expectError(error.TestRecoveryAdmissionClosed, context.resolve_local_fn.?(context.local_resolution_ctx.?, txn_id, .committed, 2_000));
     try std.testing.expectEqual(@as(usize, 1), gate.calls);
     var intents = try db.core.collectTransactionIntentBatch(alloc, txn_id);

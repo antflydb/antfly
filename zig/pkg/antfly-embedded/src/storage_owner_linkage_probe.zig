@@ -94,9 +94,9 @@ fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8, io
     try exerciseForeignScan(alloc, db);
     try exerciseReplicatedBatch(alloc, db);
     try db.sync(true);
-    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try db.enrichment.reconfigureRuntimePaused(.{});
     var runtime_options: db_mod.OpenOptions = .{ .enrichment = .{} };
-    if (try db.createDetachedEnrichmentRuntime(&runtime_options.enrichment.?)) |_| return error.SharedStorageInvalidBatchAccepted;
+    if (try db.enrichment.createDetachedRuntime(&runtime_options.enrichment.?)) |_| return error.SharedStorageInvalidBatchAccepted;
     const ReplayArgs = std.meta.ArgsTuple(@typeInfo(@FieldType(engine.VTable, "applyDerivedBatchToIndexAsync")).pointer.child);
     const replay_args: ReplayArgs = .{ db.async_context, .{}, .{ .name = "vector", .kind = .dense_vector }, .{} };
     if (try engine.call("applyDerivedBatchToIndexAsync", replay_args)) return error.SharedStorageInvalidBatchAccepted;
@@ -241,7 +241,7 @@ fn exerciseBorrowedRuntime(alloc: std.mem.Allocator, root: []const u8, io: std.I
     defer alloc.free(value);
     var options: db_mod.OpenOptions = .{ .enrichment = .{ .enable_without_producers = true } };
     try db.initOptionalRuntimes(&options);
-    const enrichment = db.enrichment_runtime orelse return error.SharedStorageReadBackFailed;
+    const enrichment = db.enrichment.runtime orelse return error.SharedStorageReadBackFailed;
     try enrichment.reloadDurableState();
     try enrichment.catchUpUntil(0);
     try enrichment.waitForAppliedWithVisibilityDeadline(0, .{}, null);

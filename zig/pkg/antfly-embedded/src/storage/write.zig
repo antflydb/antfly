@@ -614,7 +614,7 @@ pub fn reconfigureManagedDbEnrichmentRuntime(
     defer enrichments.deinit(db.runtime_alloc);
     // An empty replacement is meaningful: dropping the last managed producer
     // must retire the old provider instead of leaving an unused runtime alive.
-    try db.reconfigureEnrichmentRuntime(enrichments.takeConfig());
+    try db.enrichment.reconfigureRuntime(enrichments.takeConfig());
 }
 
 pub fn managedIndexBackends(
@@ -1083,8 +1083,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
     // than through DB.addIndex(), so managed enrichment replay must be re-armed
     // here for pre-existing documents after an index is added.
     if ((mode == .default or mode == .default_async) and summary.indexes_added > 0) {
-        if (db.enrichment_runtime != null) {
-            _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+        if (db.enrichment.runtime != null) {
+            _ = try db.enrichment.replayGeneratedEnrichmentsFromStoredDocs(alloc);
         }
     }
     return db;
@@ -1692,7 +1692,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
             // the next current-catalog acquisition upgrades it to JSON.
             if (!std.mem.eql(u8, value, "1") and backend_runtime != null) {
                 try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, value, backend_runtime, antfly_provider, null, null, table_name, secret_store, remote_content);
-                try db.resumeEnrichmentRuntimeAfterReconfigure("historical owner reopen", "*");
+                try db.enrichment.resumeRuntimeAfterReconfigure("historical owner reopen", "*");
                 if (installed) |state| state.publish(value);
             }
             return false;
@@ -1708,7 +1708,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
     // exact child install Raft entry. A cold owner must reopen on its durable
     // old schema and index catalog while the child-source fence is active.
     if (schema_json.len > 0) {
-        const pinned = try db.childGenerationSourcePinsSchemaJson(schema_json);
+        const pinned = try db.recovery.childGenerationSourcePinsSchemaJson(schema_json);
         if (pinned) return true;
     }
     // Catch-up may request an owner using an older Raft entry's pinned
@@ -1748,7 +1748,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
         _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{
             .drain_resolver_backfill = false,
         });
-        if (replace) try db.resumeEnrichmentRuntimeAfterReconfigure("owner configuration", "*");
+        if (replace) try db.enrichment.resumeRuntimeAfterReconfigure("owner configuration", "*");
         if (!installed_matches) try persistOwnerCatalogContract(alloc, db, indexes_json);
         if (installed) |state| state.publish(indexes_json);
     }
@@ -1905,7 +1905,7 @@ pub fn reconcileStorageKernelOwnerDb(
     installed: ?*OwnerManagedConfig,
 ) !StorageKernelReconcileResult {
     if (comptime storage_engine.enabled) return storage_engine.call("writeReconcileStorageKernelOwnerDb", .{ alloc, db, table_name, schema_json, indexes_json, target_index_name, advance_index_repair, backend_runtime, antfly_provider, installed });
-    if (schema_json.len > 0 and try db.childGenerationSourcePinsSchemaJson(schema_json))
+    if (schema_json.len > 0 and try db.recovery.childGenerationSourcePinsSchemaJson(schema_json))
         return .{ .state = .busy };
     if (try db.childGenerationSourceDefersOwnerCatalog())
         return .{ .state = .busy };
@@ -1931,7 +1931,7 @@ pub fn reconcileStorageKernelOwnerDb(
         else
             try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, options);
     } else metadata_table_provisioner.IndexReconcileSummary{};
-    if (replace) try db.resumeEnrichmentRuntimeAfterReconfigure("owner reconciliation", target_index_name orelse "*");
+    if (replace) try db.enrichment.resumeRuntimeAfterReconfigure("owner reconciliation", target_index_name orelse "*");
     if (indexes_json.len > 0 and !installed_matches) try persistOwnerCatalogContract(alloc, db, indexes_json);
     if (indexes_json.len > 0) if (installed) |state| state.publish(indexes_json);
 
@@ -2242,7 +2242,7 @@ pub fn reconfigureManagedDbEnrichmentRuntimePaused(
         remote_content,
     );
     defer enrichments.deinit(db.runtime_alloc);
-    try db.reconfigureEnrichmentRuntimePaused(enrichments.takeConfig());
+    try db.enrichment.reconfigureRuntimePaused(enrichments.takeConfig());
 }
 
 pub const PortableCohortSource = struct {

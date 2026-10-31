@@ -395,7 +395,7 @@ test "ordered artifact inventory authored vectors close provider scope without r
         var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 }, .online_source_authority = .native, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
         defer db.close();
         try db.setSchemaJson(alloc, "{}");
-        try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .expected_dims = if (dense) 2 else 0 });
+        try db.enrichment.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .expected_dims = if (dense) 2 else 0 });
         try db.addIndex(.{ .name = "vector", .kind = if (dense) .dense_vector else .sparse_vector, .config_json = if (dense) "{\"field\":\"dense\",\"dims\":2,\"embedding_name\":\"model\"}" else "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
         var catalog = try db.artifactInventoryCommand(alloc);
         defer catalog.catalogs.deinit(alloc);
@@ -528,7 +528,7 @@ test "ordered artifact inventory document stream closure requires current output
                 \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"},"dense":{"type":"embedding"}},"additionalProperties":false}}}}
             );
         } else try db.setSchemaJson(alloc, "{}");
-        try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .expected_dims = if (dense) 2 else 0 });
+        try db.enrichment.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .expected_dims = if (dense) 2 else 0 });
         try db.addIndex(.{ .name = "vector", .kind = if (dense) .dense_vector else .sparse_vector, .config_json = if (dense) "{\"field\":\"dense\",\"dims\":2,\"embedding_name\":\"model\"}" else "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
         try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
         var catalog = try db.artifactInventoryCommand(alloc);

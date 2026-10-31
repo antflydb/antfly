@@ -781,8 +781,8 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
     var db_open = true;
     defer if (db_open) db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .producer_json = "{\"type\":\"document_extraction\"}" });
-    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .source_artifact_name = "units", .chunk_size = 4 });
+    try db.enrichment.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .producer_json = "{\"type\":\"document_extraction\"}" });
+    try db.enrichment.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .source_artifact_name = "units", .chunk_size = 4 });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
     try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"url\":\"input\"}" }}, .timestamp_ns = 1 }, .{ .term = 1, .index = 1 });
     var ordered = try db.artifactInventoryCommand(alloc);
@@ -1953,8 +1953,8 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         var dispatched = CaptureDispatch{};
         defer if (dispatched.encoded) |bytes| alloc.free(bytes);
         db.local_execution.artifact_publication_dispatcher = .{ .ptr = &dispatched, .enqueue = CaptureDispatch.enqueue };
-        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
-        const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+        try db.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true });
+        const runtime = db.enrichment.runtime orelse return error.TestUnexpectedResult;
         const before_worker = blk: {
             var reader = try db.core.store.beginReadTxn();
             defer reader.abort();

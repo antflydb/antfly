@@ -876,7 +876,7 @@ test "capi lite AddIndexJSON restores the enrichment catalog when admission reje
     }) != .ok);
 
     {
-        const enrichments = try asHandle(handle).?.db.listEnrichments(alloc);
+        const enrichments = try asHandle(handle).?.db.enrichment.listEnrichments(alloc);
         defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
         try std.testing.expectEqual(@as(usize, 1), enrichments.len);
         try std.testing.expectEqualStrings("document_chunks_v1", enrichments[0].name);
@@ -4916,7 +4916,7 @@ test "capi SQL detached maintenance publishes through native storage admission" 
             .kind = .dense_vector,
             .config_json = "{\"field\":\"embedding\",\"dims\":3,\"publication_policy\":\"progressive\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense\"}}",
         });
-        try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = .{
+        try guard.handle.db.enrichment.reconfigureRuntimePaused(.{ .dense_embedder = .{
             .ptr = &deterministic,
             .dense_embed_fn = embedder.DeterministicDenseEmbedder.embedDense,
             .dense_embed_with_context_fn = struct {
@@ -5023,8 +5023,8 @@ test "capi SQL background embedding releases the file gate and fences stale resu
                 .kind = .dense_vector,
                 .config_json = "{\"field\":\"embedding\",\"dims\":3,\"publication_policy\":\"progressive\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense\"}}",
             });
-            try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface() });
-            captured_runtime = guard.handle.db.enrichment_runtime.?;
+            try guard.handle.db.enrichment.reconfigureRuntimePaused(.{ .dense_embedder = gate.interface() });
+            captured_runtime = guard.handle.db.enrichment.runtime.?;
             captured_database = &guard.handle.db;
             try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\"}" }}, .sync_level = .write });
             connection.maintenance_pending = true;
@@ -5134,7 +5134,7 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             // A completed result survives unrelated commits, while an updated
             // source fails its live transactional digest/incarnation guard.
             try std.testing.expect((completed == null) == source_changed);
-            try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface() });
+            try guard.handle.db.enrichment.reconfigureRuntimePaused(.{ .dense_embedder = gate.interface() });
             connection.maintenance_pending = true;
         }
         try std.testing.expectEqual(@as(usize, 1), gate.calls.load(.monotonic));
@@ -5896,7 +5896,7 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
                     self.publication_error = err;
                     return;
                 };
-                const runtime = root.db.resolution_runtime.?;
+                const runtime = root.db.enrichment.resolution.runtime.?;
                 const resolved = runtime.write_fn(runtime.write_ctx, .{ .inputs = .{}, .batch = .{}, .artifact_writes = &.{.{ .key = "__antfly_test_resolver_artifact", .value = "resolver" }}, .target_hints = &.{} }) catch |err| {
                     std.debug.print("detached resolver append failed: {s}\n", .{@errorName(err)});
                     self.publication_error = err;
@@ -6048,8 +6048,8 @@ test "capi SQL resolver input read sets fence negative reads and range phantoms"
     defer antfly_db_close(handle);
     const guard = public.enterHandle(handle, .exclusive).?;
     defer guard.leave();
-    try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
-    const runtime = guard.handle.db.resolution_runtime.?;
+    try guard.handle.db.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = guard.handle.db.enrichment.resolution.runtime.?;
     try @import("antfly_local_sources").storage_db_resolution_runtime.testReplayReadTracking(runtime.store_handle.store);
 }
 
@@ -6107,7 +6107,7 @@ test "capi SQL resolver publication fences captured inputs and resolver generati
                 errdefer second_txn.abort();
                 try second_txn.put(second, "{\"entities\":[{\"id\":\"e0\",\"label\":\"Person\",\"text\":\"Old Name\"}]}");
                 try second_txn.commit();
-                const runtime = guard.handle.db.resolution_runtime.?;
+                const runtime = guard.handle.db.enrichment.resolution.runtime.?;
                 var borrowed = runtime.store_handle.store;
                 var adapter: resolution.DbArtifactStore(@TypeOf(borrowed)) = .{ .store = &borrowed, .index_manager = guard.handle.db.core.index_manager };
                 const configs = try guard.handle.db.core.listResolvers(alloc);
@@ -6157,7 +6157,7 @@ test "capi SQL resolver publication fences captured inputs and resolver generati
                         try txn.commit();
                     }
                 }
-                const runtime = root.db.resolution_runtime.?;
+                const runtime = root.db.enrichment.resolution.runtime.?;
                 var borrowed = runtime.store_handle.store;
                 var adapter: resolution.DbArtifactStore(@TypeOf(borrowed)) = .{ .store = &borrowed, .index_manager = root.db.core.index_manager };
                 const a = std.heap.c_allocator;
@@ -6579,7 +6579,7 @@ fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool, cursor: ?[
         try database.addIndex(.{ .name = "kg", .kind = .graph, .config_json =
             \\{"source":{"artifact":"extraction","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"about"},"artifact":{"name":"extraction","kind":"asset","source":{"type":"field","value":"payload"},"content_type":"application/json"},"edge_types":[{"name":"about"}]}
         });
-        _ = try database.upsertResolverWithResultOptions(.{
+        _ = try database.enrichment.upsertResolverWithResultOptions(.{
             .name = "concepts",
             .table = "default",
             .source_artifact = "extraction",
@@ -6595,7 +6595,7 @@ fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool, cursor: ?[
         // before resolver replay. Durable work must not depend on a wake flag.
         for (0..8) |_| {
             const target = database.core.nextDerivedSequence();
-            try database.runEnrichmentUntil(target);
+            try database.enrichment.runUntil(target);
             if (database.core.nextDerivedSequence() == target) break;
         }
         const stats = database.pendingWorkStats();
@@ -6617,12 +6617,12 @@ fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool, cursor: ?[
             // A durable backfill can be admitted without appending replay
             // records. Equal watermarks must not make the owner skip it.
             try database.core.store.putBatch(&.{.{ .key = key, .value = "" }}, &.{});
-            if (database.resolution_runtime) |runtime| runtime.notifyBackfill();
+            if (database.enrichment.resolution.runtime) |runtime| runtime.notifyBackfill();
             try std.testing.expect(database.pendingWorkStats().resolution.catch_up_required);
         }
         if (notified_tail) {
             const target = database.core.nextDerivedSequence() + 1;
-            database.enrichment_runtime.?.notifySequence(target);
+            database.enrichment.runtime.?.notifySequence(target);
             try db_mod.enrichment_state.saveRuntimeStatus(database.core.store, "generated", .{ .target_sequence = target });
         }
         if (ttl_failure) {
@@ -6676,7 +6676,7 @@ fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool, cursor: ?[
         try std.testing.expectError(error.NotFound, probe.get(key));
     }
     if (ttl_failure) {
-        var ttl = guard.handle.db.ttl_runtime.?.stats();
+        var ttl = guard.handle.db.ttl.runtime.?.stats();
         owner.overlayTtlStats(&guard.handle.db, &ttl);
         try std.testing.expect(ttl.error_count > 0);
         try std.testing.expect(owner.publication_stats.maintenance_errors > 0);
@@ -6710,7 +6710,7 @@ test "capi native resolver maintenance retries transient inference and survives 
         fn notify(ptr: *anyopaque, root: *shared.Handle) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!root.db_live) return;
-            const runtime = root.db.enrichment_runtime orelse return;
+            const runtime = root.db.enrichment.runtime orelse return;
             runtime.config.asset_producer = .{ .ptr = self, .vtable = &.{ .produce = produce, .produce_with_context = produceBounded, .foreground_bounded = true, .invocation_memory_for_requests = memory } };
             runtime.config.inline_retry_max_attempts = 1;
         }
@@ -7191,7 +7191,7 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
         try guard.handle.db.addIndex(.{ .name = "idle_graph", .kind = .graph, .config_json =
             \\{"source":{"artifact":"extraction","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"about"},"artifact":{"name":"extraction","kind":"asset","source":{"type":"field","value":"payload"},"content_type":"application/json"},"edge_types":[{"name":"about"}]}
         });
-        _ = try guard.handle.db.upsertResolverWithResultOptions(.{
+        _ = try guard.handle.db.enrichment.upsertResolverWithResultOptions(.{
             .name = "concepts",
             .table = "default",
             .source_artifact = "extraction",
@@ -7436,8 +7436,8 @@ test "capi lite inference producer retry is visible in graph replacement status"
     const guard = public.enterHandle(handle, .exclusive).?;
     defer guard.leave();
     const database = guard.handle.database();
-    try database.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
-    const runtime = database.enrichment_runtime.?;
+    try database.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = database.enrichment.runtime.?;
     runtime.applied_sequence = 1;
     runtime.last_error_code = db_mod.types.RuntimeErrorName.init("ResourceTemporarilyUnavailable");
     runtime.retrying = true;

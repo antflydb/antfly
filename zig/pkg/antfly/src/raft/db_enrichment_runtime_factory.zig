@@ -81,7 +81,7 @@ pub const OpenDbRuntimeFactory = struct {
         db.* = try db_mod.DB.open(self.alloc, path, open_options);
         errdefer db.close();
 
-        if (db.enrichment_runtime == null) {
+        if (db.enrichment.runtime == null) {
             db.close();
             return error.MissingDbEnrichmentRuntime;
         }
@@ -275,7 +275,7 @@ test "open db runtime factory preserves lease fencing across owner takeover" {
         },
         .sync_level = .full_index,
     });
-    try db_a.enrichment_runtime.?.waitForApplied(1);
+    try db_a.enrichment.runtime.?.waitForApplied(1);
 
     const stats_a = try db_a.stats(std.testing.allocator);
     defer db_types.freeDBStats(std.testing.allocator, stats_a);
@@ -294,7 +294,7 @@ test "open db runtime factory preserves lease fencing across owner takeover" {
         },
         .sync_level = .full_index,
     });
-    try db_b.enrichment_runtime.?.waitForApplied(2);
+    try db_b.enrichment.runtime.?.waitForApplied(2);
     const stats_b = try db_b.stats(std.testing.allocator);
     defer db_types.freeDBStats(std.testing.allocator, stats_b);
     try std.testing.expect(stats_b.enrichment.has_lease);

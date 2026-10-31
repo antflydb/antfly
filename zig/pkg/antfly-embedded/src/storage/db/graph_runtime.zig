@@ -151,12 +151,12 @@ test "db graph runtime repeated split defers behind cleanup without advancing it
     const index = &db.core.index_manager.graphIndex("g").?.index;
     try std.testing.expectEqual(@as(u64, 2), (try index.stats(a)).edge_count);
     // The normal metadata scheduler also services graph-only indexes.
-    try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+    try db.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle();
     try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, second, .{ .term = 1, .index = 2 });
     try std.testing.expectEqualStrings("h", db.getRange().end);
     try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
     try std.testing.expectEqual(@as(u64, 1), (try index.stats(a)).edge_count);
-    try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+    try db.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle();
     try std.testing.expectEqual(@as(u64, 1), index.edge_count);
 }
 

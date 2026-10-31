@@ -493,7 +493,7 @@ pub const EnrichmentEnsureSummary = struct {
 pub fn ensureEnrichments(db: *db_mod.DB, desired: []const db_mod.types.EnrichmentConfig) !EnrichmentEnsureSummary {
     var summary: EnrichmentEnsureSummary = .{};
     for (desired) |cfg| {
-        switch (try db.upsertEnrichment(cfg)) {
+        switch (try db.enrichment.upsertEnrichment(cfg)) {
             .added => summary.added += 1,
             .updated => summary.updated += 1,
             .unchanged => {},
@@ -526,7 +526,7 @@ pub fn dedupeDesiredEnrichments(
 }
 
 pub fn removeMissingEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired: []const db_mod.types.EnrichmentConfig) !usize {
-    const existing = try db.listEnrichments(alloc);
+    const existing = try db.enrichment.listEnrichments(alloc);
     defer db_mod.types.freeEnrichmentConfigs(alloc, existing);
 
     var removed: usize = 0;
@@ -537,7 +537,7 @@ pub fn removeMissingEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desire
         if (findEnrichmentByName(desired, cfg.name)) |desired_cfg| {
             if (try enrichmentConfigsEqual(alloc, cfg, desired_cfg)) continue;
         }
-        if (db.deleteEnrichment(cfg.kind, cfg.name)) |deleted| {
+        if (db.enrichment.deleteEnrichment(cfg.kind, cfg.name)) |deleted| {
             if (deleted) removed += 1;
         } else |err| switch (err) {
             error.EnrichmentInUse => continue,
@@ -548,7 +548,7 @@ pub fn removeMissingEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desire
 }
 
 pub fn removeAbsentEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired: []const db_mod.types.EnrichmentConfig) !usize {
-    const existing = try db.listEnrichments(alloc);
+    const existing = try db.enrichment.listEnrichments(alloc);
     defer db_mod.types.freeEnrichmentConfigs(alloc, existing);
 
     var removed: usize = 0;
@@ -561,7 +561,7 @@ pub fn removeAbsentEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired
         // that config still needs a whole-table update; only catalog absence is
         // globally safe cleanup.
         if (findEnrichmentByName(desired, cfg.name) != null) continue;
-        if (db.deleteEnrichment(cfg.kind, cfg.name)) |deleted| {
+        if (db.enrichment.deleteEnrichment(cfg.kind, cfg.name)) |deleted| {
             if (deleted) removed += 1;
         } else |err| switch (err) {
             error.EnrichmentInUse => continue,
@@ -643,7 +643,7 @@ pub fn ensureResolversWithOptions(
     var validation_profiles: std.StringHashMapUnmanaged(void) = .empty;
     for (identity_state.identities) |identity| if (identity.projection_only) return error.ResolverNamespaceCurationRequired;
 
-    const before = try db.listResolverStaticDescriptors(alloc);
+    const before = try db.enrichment.listResolverStaticDescriptors(alloc);
     defer {
         for (before) |*cfg| cfg.deinit(alloc);
         alloc.free(before);
@@ -651,7 +651,7 @@ pub fn ensureResolversWithOptions(
     var generations: std.StringHashMapUnmanaged(u64) = .empty;
     defer generations.deinit(alloc);
     for (before) |cfg| try generations.put(alloc, cfg.name, cfg.namespace_generation);
-    for (identity_state.identities) |identity| if (identity.dropped) try db.consumeResolverMetadataDrop(curation_arena.allocator(), identity);
+    for (identity_state.identities) |identity| if (identity.dropped) try db.enrichment.consumeResolverMetadataDrop(curation_arena.allocator(), identity);
     var summary: ResolverReconcileSummary = .{};
     for (desired.items) |cfg| {
         var next = cfg;
@@ -659,7 +659,7 @@ pub fn ensureResolversWithOptions(
             next = try curation.overlayMetadataCached(curation_arena.allocator(), cfg, identity, &validation_profiles);
             break;
         };
-        const result = try db.upsertResolverWithResultOptions(next, .{
+        const result = try db.enrichment.upsertResolverWithResultOptions(next, .{
             .migrate_namespace = next.namespace_generation > (generations.get(next.name) orelse 0),
             .drain_backfill = options.drain_backfill,
         });
@@ -670,7 +670,7 @@ pub fn ensureResolversWithOptions(
         }
     }
 
-    const existing = try db.listResolverStaticDescriptors(alloc);
+    const existing = try db.enrichment.listResolverStaticDescriptors(alloc);
     defer {
         for (existing) |*cfg| cfg.deinit(alloc);
         alloc.free(existing);
@@ -681,12 +681,12 @@ pub fn ensureResolversWithOptions(
         const removed = if (options.drain_backfill)
             try db.removeResolver(cfg.name)
         else
-            try db.removeResolverWithoutDrain(cfg.name);
+            try db.enrichment.removeResolverWithoutDrain(cfg.name);
         if (removed) summary.removed += 1;
     }
     // Runtime edits of retired identities remain durable without reactivating
     // their extraction/promotion contracts.
-    const identities = try db.listResolverStaticDescriptors(alloc);
+    const identities = try db.enrichment.listResolverStaticDescriptors(alloc);
     defer {
         for (identities) |*cfg| cfg.deinit(alloc);
         alloc.free(identities);
@@ -696,7 +696,7 @@ pub fn ensureResolversWithOptions(
         for (identities) |cfg| {
             if (!cfg.retired or !std.mem.eql(u8, cfg.name, identity.name)) continue;
             const next = try curation.overlayMetadataCached(curation_arena.allocator(), cfg, identity, &validation_profiles);
-            _ = try db.upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .migrate_namespace = next.namespace_generation > cfg.namespace_generation });
+            _ = try db.enrichment.upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .migrate_namespace = next.namespace_generation > cfg.namespace_generation });
             break;
         }
     }

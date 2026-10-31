@@ -816,7 +816,7 @@ test "ordered artifact inventory document worker fairly resumes nonempty childre
     var db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "text", .chunk_size = 4 });
+    try db.enrichment.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "text", .chunk_size = 4 });
     var ordered = try db.artifactInventoryCommand(alloc);
     defer ordered.catalogs.deinit(alloc);
     ordered.binding.effect_protocol = 15;

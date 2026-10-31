@@ -865,7 +865,7 @@ pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     txn.abort();
     live = false;
     const observation = (try database.core.index_manager.resolverNamespaceObservation(a, work.table, work.key_template)) orelse {
-        try database.completeResolverProjectionWork(row.key);
+        try database.enrichment.completeResolverProjectionWork(row.key);
         return true;
     };
     const cfg: h.db_mod.ResolverConfig = .{ .name = "projection_work", .table = work.table, .key_template = work.key_template, .source_artifact = "source", .resolution_artifact = "resolved", .namespace_curation_table_id = observation.namespace_curation_table_id, .namespace_curation_generation = observation.namespace_curation_generation, .namespace_curation_missing = observation.namespace_curation_missing };
@@ -880,7 +880,7 @@ pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
         defer if (root.maintenance_publication) |publication| {
             publication.resolver_dependency = null;
         };
-        try database.completeResolverProjectionWork(row.key);
+        try database.enrichment.completeResolverProjectionWork(row.key);
         return true;
     };
     if (!desired.missing and !try advanceSourceQueryPins(root, database, a, cfg.table, cfg.key_template)) {
@@ -901,7 +901,7 @@ pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     defer if (root.maintenance_publication) |publication| {
         publication.resolver_dependency = null;
     };
-    _ = try database.publishResolverNamespaceProjectionWork(cfg.table, desired.table_id, namespace, .{ .key = row.key });
+    _ = try database.enrichment.publishResolverNamespaceProjectionWork(cfg.table, desired.table_id, namespace, .{ .key = row.key });
     return true;
 }
 fn legacyPullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
@@ -923,7 +923,7 @@ fn legacyPullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
         defer if (root.maintenance_publication) |publication| {
             publication.resolver_dependency = null;
         };
-        _ = try database.publishResolverNamespaceProjection(cfg.table, desired.table_id, namespace);
+        _ = try database.enrichment.publishResolverNamespaceProjection(cfg.table, desired.table_id, namespace);
         return true;
     }
     return false;
@@ -1018,7 +1018,7 @@ pub const QuerySession = struct {
         const a = scratch.allocator();
         const indexes = try database.listIndexes(a);
         defer h.db_mod.types.freeIndexConfigs(a, indexes);
-        const enrichments = try database.listEnrichments(a);
+        const enrichments = try database.enrichment.listEnrichments(a);
         defer h.db_mod.types.freeEnrichmentConfigs(a, enrichments);
         result.digest = try resolver.fingerprint(a, .{ database.core.identity_namespace, try database.getSchemaJson(a), indexes, enrichments });
         if (!result.matchesEpoch(database)) return error.Busy;
@@ -1374,7 +1374,7 @@ test "capi resolver curation prepared adoption fences a source config edit" {
     const prepared = try prepareAdoption(a, db, try consumers(root, a, "entities", "concept/a", null));
     try std.testing.expectEqual(@as(usize, 1), prepared.namespaces.len);
     cfg.min_confidence = 0.5;
-    _ = try root.db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
+    _ = try root.db.enrichment.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
     var txn = try db.core.store.beginWriteTxn();
     defer txn.abort();
     var bridge: Bridge = .{ .txn = &txn };
@@ -1402,7 +1402,7 @@ test "capi resolver curation indexed static profiles exclude seventeen thousand 
         for (static, 0..) |*alias, j| alias.* = .{ .key = try std.fmt.allocPrint(a, "concept/noise-{d}-{d}", .{ i, j }), .target = try std.fmt.allocPrint(a, "concept/target-{d}-{d}", .{ i, j }) };
         if (i == 0) static[0] = .{ .key = "concept/seed", .target = "concept/bridge" };
         if (i == 1) static[0] = .{ .key = "concept/bridge", .target = "concept/end" };
-        _ = try root.db.upsertResolverWithResultOptions(.{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .source_artifact = try std.fmt.allocPrint(a, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(a, "out-{d}", .{i}), .key_template = "concept/{{_key}}", .aliases = static, .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
+        _ = try root.db.enrichment.upsertResolverWithResultOptions(.{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .source_artifact = try std.fmt.allocPrint(a, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(a, "out-{d}", .{i}), .key_template = "concept/{{_key}}", .aliases = static, .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
     }
     var out: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&out);
@@ -1588,7 +1588,7 @@ test "capi resolver curation warm proposal creation skips all consumer bindings 
     try tables.create(root, "entities", "{}", false);
     const db = try tables.get(root, "entities");
     for (0..100) |i| {
-        _ = try root.db.upsertResolverWithResultOptions(.{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = try std.fmt.allocPrint(a, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(a, "resolved-{d}", .{i}), .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
+        _ = try root.db.enrichment.upsertResolverWithResultOptions(.{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = try std.fmt.allocPrint(a, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(a, "resolved-{d}", .{i}), .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
     }
     // First proposal folds cold policy; every following proposal is membership-only.
     _ = try proposals(root, a, .create, "entities", "", "{\"action\":\"merge\",\"key\":\"entity/a\",\"into\":\"entity/b\"}", .{});
@@ -1607,10 +1607,10 @@ test "capi resolver curation warm proposal creation skips all consumer bindings 
         var bridge: Bridge = .{ .txn = &read };
         try std.testing.expectError(error.ResolverCurationConflict, checkScopeHeads(a, bridge.store(a, prefix), selected));
     }
-    _ = try root.db.upsertResolverWithResultOptions(.{ .name = "late", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "late-kg", .resolution_artifact = "late-resolved", .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
+    _ = try root.db.enrichment.upsertResolverWithResultOptions(.{ .name = "late", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "late-kg", .resolution_artifact = "late-resolved", .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
     try std.testing.expectError(error.ResolverCurationConflict, checkDirectoryEpoch(root, observed));
     // Mixed warm/cold membership folds just the newly enrolled namespace.
-    _ = try root.db.upsertResolverWithResultOptions(.{ .name = "cold", .table = "entities", .key_template = "{{_key}}", .source_artifact = "cold-kg", .resolution_artifact = "cold-resolved", .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
+    _ = try root.db.enrichment.upsertResolverWithResultOptions(.{ .name = "cold", .table = "entities", .key_template = "{{_key}}", .source_artifact = "cold-kg", .resolution_artifact = "cold-resolved", .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
     const cold_visits = test_admission_binding_visits.load(.monotonic);
     const mixed = try consumersForAdmission(root, a, "entities", "entity/a", &observed, db);
     try std.testing.expectEqual(@as(usize, 2), mixed.len);
@@ -1706,7 +1706,7 @@ test "capi resolver curation query uses persisted profile nodes under leased cac
     negatives[0] = "concept/query-admission-0";
     const suppress = try json(a, .{ .keys = negatives, .texts = &.{" BLOCKED TEXT "}, .min_text_chars = @as(u32, 3) });
     const cfg: h.db_mod.ResolverConfig = .{ .name = "query-admission", .table = "entities", .source_artifact = "kg", .resolution_artifact = "out", .key_template = "concept/{{_entity.text}}", .aliases = profile_aliases, .suppress_json = suppress, .promote = false };
-    _ = try root.db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
+    _ = try root.db.enrichment.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
     var out: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&out);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/native"), .fromSlice("{\"into\":\"concept/native-root\"}"), &out));

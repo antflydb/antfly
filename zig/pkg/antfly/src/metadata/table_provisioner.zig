@@ -1789,7 +1789,7 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 0), summary.indexes_removed);
             try std.testing.expectEqual(@as(usize, 2), summary.enrichments_removed);
 
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             try std.testing.expectEqual(@as(usize, 2), enrichments.len);
             try std.testing.expect(findEnrichment(enrichments, .asset, "keep_units") != null);
@@ -2048,7 +2048,7 @@ fn implementationTests() type {
                 indexes[0].coverage_generation,
             );
 
-            const enrichments = try db.listEnrichments(std.testing.allocator);
+            const enrichments = try db.enrichment.listEnrichments(std.testing.allocator);
             defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, enrichments);
             try std.testing.expectEqual(@as(usize, 1), enrichments.len);
             try std.testing.expectEqualStrings("memory_embed", enrichments[0].name);
@@ -2310,7 +2310,7 @@ fn implementationTests() type {
             defer alloc.free(db_path);
             var db = try db_mod.DB.open(alloc, db_path, .{});
             defer db.close();
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             try std.testing.expectEqual(@as(usize, 2), enrichments.len);
             try std.testing.expectEqualStrings("document_units_v1", enrichments[0].name);
@@ -2455,7 +2455,7 @@ fn implementationTests() type {
             var db = try db_mod.DB.open(alloc, db_path, .{});
             defer db.close();
 
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             const cfg = findEnrichment(enrichments, .chunk, "document_chunks_v1") orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(u32, 256), cfg.chunk_size);
@@ -2528,7 +2528,7 @@ fn implementationTests() type {
             var db = try db_mod.DB.open(alloc, db_path, .{});
             defer db.close();
 
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             try std.testing.expectEqual(@as(usize, 1), enrichments.len);
             try std.testing.expectEqual(.chunk, enrichments[0].kind);
@@ -2577,7 +2577,7 @@ fn implementationTests() type {
             var db = try db_mod.DB.open(alloc, db_path, .{});
             defer db.close();
 
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             try std.testing.expectEqual(@as(usize, 2), enrichments.len);
             try std.testing.expect(findEnrichment(enrichments, .asset, "document_units_v1") != null);
@@ -2641,7 +2641,7 @@ fn implementationTests() type {
             var db = try db_mod.DB.open(alloc, db_path, .{});
             defer db.close();
 
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             try std.testing.expectEqual(@as(usize, 1), enrichments.len);
             try std.testing.expect(findEnrichment(enrichments, .chunk, "document_chunks_v1") != null);
@@ -2760,7 +2760,7 @@ fn implementationTests() type {
             var db = try db_mod.DB.open(alloc, db_path, .{});
             defer db.close();
 
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             try std.testing.expectEqual(@as(usize, 2), enrichments.len);
             try std.testing.expect(findEnrichment(enrichments, .asset, "document_units_v2") != null);

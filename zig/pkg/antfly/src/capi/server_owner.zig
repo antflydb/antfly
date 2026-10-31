@@ -3559,7 +3559,7 @@ pub fn storageOwnerOpen(
     handle.db.local_execution.row_policy_authority_secret = owned_policy_secret;
     handle.db.local_execution.row_policy_authority_issuer = owned_policy_issuer;
     handle.db.local_execution.row_policy_table_name = owned_table_name;
-    if (runtime_hooks) |hooks| handle.db.setCoordinatedTtl(hooks.coordinatedTtlPort());
+    if (runtime_hooks) |hooks| handle.db.ttl.setCoordinated(hooks.coordinatedTtlPort());
     if (request.target_observer.notify != null) handle.db.setQueryVisibilityHook(.{
         .ptr = handle,
         .on_change = storageOwnerTargetAdvanced,
@@ -3589,7 +3589,7 @@ pub fn storageOwnerOpen(
     // resident caches so relational builds, retirement and durable outboxes
     // make progress. Hidden restore owners must remain unpublished/quiescent.
     if (restore_bootstrap == null) {
-        handle.db.activateResolverReplayRuntimes() catch |err| {
+        handle.db.enrichment.activateResolverReplayRuntimes() catch |err| {
             return storageOwnerStatusFromError(err);
         };
         handle.db.startResidentBackgroundWorkersIfNeeded();
@@ -4202,7 +4202,7 @@ pub fn storageOwnerWaitForSync(
         if (target.captured == 0) {
             std.mem.writeInt(u128, &target.root_incarnation_le, root, .little);
             target.sequence = handle.db.core.nextDerivedSequence();
-            const timeout_ms = if (handle.db.enrichment_runtime) |runtime| runtime.syncWaitTimeoutMs() else 5 * std.time.ms_per_min;
+            const timeout_ms = if (handle.db.enrichment.runtime) |runtime| runtime.syncWaitTimeoutMs() else 5 * std.time.ms_per_min;
             target.deadline_ns = antfly.platform_time.monotonicNs() +| (std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64));
             target.captured = 1;
         } else if ((target.captured != 1 and target.captured != 2) or std.mem.readInt(u128, &target.root_incarnation_le, .little) != root) return storageOwnerStatusFromError(error.StorageKernelOwnerStaleDescriptor);

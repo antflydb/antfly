@@ -611,7 +611,7 @@ fn ColumnBuilder(comptime DBType: type) type {
 
         fn checkpoint(ptr: ?*anyopaque, key: []const u8) !store_mod.DocStore.ScanAction {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
-            if (self.db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+            if (self.db.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
             const owner_limit = if (@import("builtin").is_test) test_owner_limit orelse 1024 else 1024;
             if (self.owners >= owner_limit or (self.owners != 0 and platform_time.monotonicNs() >= self.deadline_ns)) {
                 self.continuation = (try keys.decodeStoredDocumentRowKeyAlloc(self.alloc, key)).?;
@@ -655,7 +655,7 @@ fn ColumnBuilder(comptime DBType: type) type {
             var view = (try self.db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
             defer view.release();
             try validateOrdinalPages(ordinal_pages, rows.len, view.tableSchema().relational_columns.len);
-            var block = Block{ .alloc = scratch, .scope = &scope, .generation = self.generation, .index = range.block, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stop = &self.db.independent_maintenance.stopping };
+            var block = Block{ .alloc = scratch, .scope = &scope, .generation = self.generation, .index = range.block, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stop = &self.db.maintenance.independent.stopping };
             defer block.deinit();
             var dirty = try read.openCursor();
             defer dirty.close();
@@ -1145,7 +1145,7 @@ fn stageCleanup(db: anytype, alloc: alloc_type, read: *store_mod.DocStore.Txn, f
     while (entry) |first| {
         if (!std.mem.startsWith(u8, first.key, dirty_prefix)) break;
         if (to.len != 0 and std.mem.order(u8, first.key[dirty_prefix.len..], to) != .lt) break;
-        if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+        if (db.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
@@ -1202,7 +1202,7 @@ fn drainCleanupWithLimit(db: anytype, alloc: alloc_type, generation: u64, namesp
     var locked = true;
     defer if (locked) db.core.unlockApplyShared();
     if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-    if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+    if (db.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     const token = read.get(cleanup_key) catch |err| switch (err) {
@@ -1221,7 +1221,7 @@ fn drainCleanupWithLimit(db: anytype, alloc: alloc_type, generation: u64, namesp
             locked = true;
         }
         if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-        if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+        if (db.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
         var txn = try db.core.store.beginWriteTxn();
         var live = true;
         defer if (live) txn.abort();
@@ -2001,7 +2001,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     const cleanup = try stageCleanup(db, alloc, &read, range.start, builder.continuation orelse range.end, manifest_bytes, token, namespace);
     defer cleanup.deinit(alloc);
     if (comptime @import("builtin").is_test) if (test_before_publish) |hook| try hook.run(hook.context);
-    if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+    if (db.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
     db.core.lockApplyShared();
     locked = true;
     if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
@@ -2218,7 +2218,7 @@ fn pruneRange(db: anytype, alloc: alloc_type, lower: []const u8, upper: []const 
         }
         fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
-            if (self.db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+            if (self.db.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
             const scratch = self.arena.allocator();
             if (self.deletes.items.len != 0 and self.bytes +| key.len +| value.len > maintenance_bytes) {
                 self.exhausted = false;

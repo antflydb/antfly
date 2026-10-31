@@ -32844,14 +32844,14 @@ test "ordered artifact inventory embedding fallback reads selected chunk generat
     var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "anchor", .kind = .asset, .field = "body", .content_type = "text/plain" });
+    try db.enrichment.addEnrichment(.{ .name = "anchor", .kind = .asset, .field = "body", .content_type = "text/plain" });
     const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "chunks", 0);
     defer alloc.free(member);
     const tail = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "chunks", 1);
     defer alloc.free(tail);
     try db.core.store.putBatch(&.{ .{ .key = member, .value = "{\"body\":\"old\"}" }, .{ .key = tail, .value = "{\"body\":\"old tail\"}" } }, &.{});
-    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
-    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try db.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = db.enrichment.runtime orelse return error.TestUnexpectedResult;
     const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .dense_embedding, .index_name = "embedding", .doc_key = "doc", .source_field = "body" };
     try std.testing.expectEqual(enrichment_artifact_codec.hashEmbeddingSource("old", ""), (try chunkArtifactSourceHash(runtime, member, "body", "")).?);
     var namespace: ordered_publication.Namespace = undefined;
@@ -36180,8 +36180,8 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
     var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false, .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue } });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .producer_json = "{\"type\":\"document_extraction\"}" });
-    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .source_artifact_name = "units", .chunk_size = 4 });
+    try db.enrichment.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .producer_json = "{\"type\":\"document_extraction\"}" });
+    try db.enrichment.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .source_artifact_name = "units", .chunk_size = 4 });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
     try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"url\":\"input\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     var catalog = try db.artifactInventoryCommand(alloc);
@@ -36199,8 +36199,8 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
     const payload = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, unit_fingerprint, "input", "text/plain", .{ .range_id = "units-0" });
     defer alloc.free(payload);
     try Harness.parent(&db, unit_key, payload, 4);
-    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
-    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try db.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = db.enrichment.runtime orelse return error.TestUnexpectedResult;
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
     var plan = try db.core.index_manager.acquireWritePlanSnapshot();
     defer plan.release();
@@ -36311,7 +36311,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
     var db = try db_mod.DB.open(alloc, path, options);
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
+    try db.enrichment.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
     try server_test_adapter.applyOrdered(&db, .{ .writes = &.{ .{ .key = "doc", .value = "{\"body\":\"hello world\"}" }, .{ .key = "unreconciled", .value = "{\"body\":\"pending\"}" } }, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     const manifest_key = try inventory.keyAlloc(alloc, "doc", "chunks");
@@ -36335,8 +36335,8 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
     var previous: ?progress.DocumentClosure = null;
     defer if (previous) |*value| value.deinit();
     {
-        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
-        const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+        try db.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true });
+        const runtime = db.enrichment.runtime orelse return error.TestUnexpectedResult;
         try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
         var plan = try db.core.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
@@ -36486,7 +36486,7 @@ test "ordered artifact inventory authored document callbacks bypass providers an
         var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 }, .online_source_authority = .native, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false, .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue } });
         defer db.close();
         try db.setSchemaJson(alloc, "{}");
-        try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .expected_dims = if (dense) 2 else 0 });
+        try db.enrichment.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .expected_dims = if (dense) 2 else 0 });
         try db.addIndex(.{ .name = "vector", .kind = if (dense) .dense_vector else .sparse_vector, .config_json = if (dense) "{\"field\":\"dense\",\"dims\":2,\"embedding_name\":\"model\"}" else "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
         var catalog = try db.artifactInventoryCommand(alloc);
         defer catalog.catalogs.deinit(alloc);
@@ -36512,8 +36512,8 @@ test "ordered artifact inventory authored document callbacks bypass providers an
         var ingress = try @import("../artifact_authored_acceptance.zig").Prepared.init(alloc, db.root_incarnation, writes[2..], &writes);
         defer ingress.deinit();
         try db.core.store.putBatchWithReplayAndParticipant(null, &writes, &.{}, null, .{}, ingress.participant());
-        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .dense_embedder = .{ .ptr = &harness, .dense_embed_fn = Harness.dense }, .sparse_embedder = .{ .ptr = &harness, .sparse_embed_fn = Harness.sparse } });
-        const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+        try db.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true, .dense_embedder = .{ .ptr = &harness, .dense_embed_fn = Harness.dense }, .sparse_embedder = .{ .ptr = &harness, .sparse_embed_fn = Harness.sparse } });
+        const runtime = db.enrichment.runtime orelse return error.TestUnexpectedResult;
         var pin = try db.core.index_manager.acquireWritePlanSnapshot();
         defer pin.release();
         var request = pin.plan().generated_templates[0];
@@ -36615,8 +36615,8 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
     });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 100 });
-    try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .source_artifact_name = "chunks", .expected_dims = if (dense) 2 else 0 });
+    try db.enrichment.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 100 });
+    try db.enrichment.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .source_artifact_name = "chunks", .expected_dims = if (dense) 2 else 0 });
     try db.addIndex(.{ .name = "sparse", .kind = if (dense) .dense_vector else .sparse_vector, .config_json = if (dense) "{\"field\":\"dense\",\"dims\":2,\"embedding_name\":\"model\"}" else "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
     try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello world\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     const manifest_key = try inventory.keyAlloc(alloc, "doc", "chunks");
@@ -36634,8 +36634,8 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
     try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
-    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
-    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try db.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = db.enrichment.runtime orelse return error.TestUnexpectedResult;
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
     var plan = try db.core.index_manager.acquireWritePlanSnapshot();
     defer plan.release();
@@ -37153,8 +37153,8 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
     });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "body", .content_type = if (graph) "application/json" else "text/plain", .producer_json = if (generated) "{\"type\":\"generator\",\"config\":{\"provider\":\"ollama\",\"model\":\"fixture\"}}" else "" });
-    try db.addEnrichment(.{ .name = "downstream", .kind = .asset, .source_artifact_name = "copy", .content_type = "text/plain" });
+    try db.enrichment.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "body", .content_type = if (graph) "application/json" else "text/plain", .producer_json = if (generated) "{\"type\":\"generator\",\"config\":{\"provider\":\"ollama\",\"model\":\"fixture\"}}" else "" });
+    try db.enrichment.addEnrichment(.{ .name = "downstream", .kind = .asset, .source_artifact_name = "copy", .content_type = "text/plain" });
     if (graph) try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"copy\"}]}" });
     const asset_body = if (graph) "{\"type\":\"mentions\",\"target\":\"other\"}" else "hello";
     const document = try std.json.Stringify.valueAlloc(alloc, .{ .body = asset_body }, .{});
@@ -37167,12 +37167,12 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
     try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
-    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .asset_producer = if (generated) .{ .ptr = &harness, .vtable = &.{
+    try db.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true, .asset_producer = if (generated) .{ .ptr = &harness, .vtable = &.{
         .produce = Harness.produce,
         .can_produce_batch = Harness.canBatch,
         .invocation_memory_for_requests = testInvocationMemoryForRequests,
     } } else null });
-    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    const runtime = db.enrichment.runtime orelse return error.TestUnexpectedResult;
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
     var plan = try db.core.index_manager.acquireWritePlanSnapshot();
     defer plan.release();
@@ -37649,7 +37649,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
     // enrichment hint for the owning source document and, because the
     // context samples reverse edges (direction `both`), for the same-table
     // target document.
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "conceptualize_v1",
         .kind = .asset,
         .field = "name",
@@ -39875,7 +39875,7 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
     defer if (open) db.close();
     harness.db = &db;
     try db.setSchemaJson(a, "{}");
-    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
+    try db.enrichment.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
     try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"source\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     const scope = try manifests.keyAlloc(a, "doc", "chunks");
@@ -39907,8 +39907,8 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
     };
     defer enrichment_types.freeGeneratedRequest(a, request);
     {
-        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
-        const runtime = db.enrichment_runtime.?;
+        try db.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
+        const runtime = db.enrichment.runtime.?;
         try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
         var token = try Harness.capture(runtime, request, scope);
         defer token.deinit();
@@ -39948,8 +39948,8 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
     open = true;
     harness.db = &db;
     harness.remaining = null;
-    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
-    const runtime = db.enrichment_runtime.?;
+    try db.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
+    const runtime = db.enrichment.runtime.?;
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
     {
         var token = try Harness.capture(runtime, request, scope);
@@ -40227,8 +40227,8 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     defer db.close();
     harness.db = &db;
     try db.setSchemaJson(a, "{}");
-    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
-    try db.addEnrichment(.{ .name = "model", .kind = .embedding, .source_artifact_name = "chunks", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}" });
+    try db.enrichment.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
+    try db.enrichment.addEnrichment(.{ .name = "model", .kind = .embedding, .source_artifact_name = "chunks", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}" });
     try db.addIndex(.{ .name = "vectors", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}" });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
     try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"source\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
@@ -40291,8 +40291,8 @@ test "model aware media ordered vector windows are searchable with exact clocks 
         break :blk try enrichment_types.cloneGeneratedRequest(a, value);
     };
     defer enrichment_types.freeGeneratedRequest(a, vector_request);
-    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
-    const runtime = db.enrichment_runtime.?;
+    try db.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
+    const runtime = db.enrichment.runtime.?;
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
     const member = try internal_keys.chunkArtifactKeyAlloc(a, "doc", "chunks", 0);
     defer a.free(member);
@@ -40604,8 +40604,8 @@ test "model aware media terminal scalar output acknowledges failure without mode
     defer db.close();
     harness.db = &db;
     try db.setSchemaJson(a, "{}");
-    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunker_json = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"model\",\"dimensions\":2},\"outputs\":{\"boundary_model\":\"embedding\",\"targets\":[{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"model\",\"dimensions\":2}]}}" });
-    try db.addEnrichment(.{ .name = "model", .kind = .embedding, .source_artifact_name = "chunks", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}" });
+    try db.enrichment.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunker_json = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"model\",\"dimensions\":2},\"outputs\":{\"boundary_model\":\"embedding\",\"targets\":[{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"model\",\"dimensions\":2}]}}" });
+    try db.enrichment.addEnrichment(.{ .name = "model", .kind = .embedding, .source_artifact_name = "chunks", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}" });
     try db.addIndex(.{ .name = "vectors", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}" });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
     try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"source\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
@@ -40672,8 +40672,8 @@ test "model aware media terminal scalar output acknowledges failure without mode
         break :blk try enrichment_types.cloneGeneratedRequest(a, value);
     };
     defer enrichment_types.freeGeneratedRequest(a, vector_request);
-    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
-    const runtime = db.enrichment_runtime.?;
+    try db.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
+    const runtime = db.enrichment.runtime.?;
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
     const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Provider.page) = null });
     runtime.config.chunk_provider = .{ .ptr = &marker, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Provider.page) };

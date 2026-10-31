@@ -90,10 +90,10 @@ const document_collectors = @import("document_collectors.zig");
 const materialized_sources = @import("materialized_sources.zig");
 const graph_restore_materialization = @import("graph_restore_materialization.zig");
 const status_projection = @import("status_projection.zig");
-const result_collectors = @import("result_collectors.zig");
-const independent_maintenance = @import("independent_maintenance.zig");
-const portable_activation_recovery = @import("portable_activation_recovery.zig");
-const quarantine_recovery = @import("quarantine_recovery.zig");
+pub const result_collectors = @import("result_collectors.zig");
+pub const independent_maintenance = @import("independent_maintenance.zig");
+pub const portable_activation_recovery = @import("portable_activation_recovery.zig");
+pub const quarantine_recovery = @import("quarantine_recovery.zig");
 const document_child_range_manifest = @import("document_child_range_manifest.zig");
 const document_child_range_effects = @import("document_child_range_effects.zig");
 const document_child_range_outbox = @import("document_child_range_outbox.zig");
@@ -139,7 +139,7 @@ const graph_state_name = @import("graph_state_name.zig");
 const native_backup = @import("native_backup.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const snapshot_admission_mod = @import("snapshot_admission.zig");
-const db_core = @import("core.zig");
+pub const db_core = @import("core.zig");
 pub const internal_keys = @import("../internal_keys.zig");
 const hierarchy_navigation = @import("../hierarchy_navigation.zig");
 pub const doc_identity = @import("doc_identity.zig");
@@ -147,13 +147,13 @@ const document_content_hash = @import("document_content_hash.zig");
 const range_cardinality = @import("range_cardinality.zig");
 const replay_batcher_mod = @import("batcher.zig");
 pub const DocIdentityNamespace = doc_identity.Namespace;
-const doc_set = @import("doc_set.zig");
+pub const doc_set = @import("doc_set.zig");
 const shard_mod = @import("../shard.zig");
 pub const index_manager_mod = @import("catalog/index_manager.zig");
 const resolver_catalog_mod = @import("catalog/resolver_catalog.zig");
-const resolution_runtime_mod = @import("resolution_runtime.zig");
+pub const resolution_runtime_mod = @import("resolution_runtime.zig");
 const resolution_handoff = @import("resolution_handoff.zig");
-const promotion_runtime_mod = @import("promotion_runtime.zig");
+pub const promotion_runtime_mod = @import("promotion_runtime.zig");
 const resolver_lib = @import("antfly_resolver");
 const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
@@ -192,7 +192,7 @@ const replication_mutation_barrier_mod = @import("antfly_runtime_abi").mutation_
 const replication_record_mod = @import("replication_record.zig");
 
 const replay_stream_mod = @import("derived/replay_stream.zig");
-const derived_types = @import("derived/derived_types.zig");
+pub const derived_types = @import("derived/derived_types.zig");
 pub const derived_worker = @import("derived/derived_worker.zig");
 pub const derived_executor_mod = @import("derived/derived_executor.zig");
 pub const background_runtime_mod = @import("../background_runtime.zig");
@@ -204,15 +204,15 @@ const sparse_mod = if (builtin.os.tag == .freestanding)
 else
     @import("../../sparse/sparse.zig");
 const vectorindex_mod = @import("antfly_vectorindex");
-const embedder_mod = @import("enrichment/embedder.zig");
-const asset_producer_mod = @import("enrichment/asset_producer.zig");
+pub const embedder_mod = @import("enrichment/embedder.zig");
+pub const asset_producer_mod = @import("enrichment/asset_producer.zig");
 const inference_work = @import("antfly_inference_work");
 const document_extraction_mod = @import("enrichment/document_extraction.zig");
 const runtime_failure_abi = @import("runtime_failure_abi");
 const document_extraction_client = execution_resources.document_extraction_client;
 const document_unit_fingerprint = @import("enrichment/document_unit_fingerprint.zig");
 const portable_backup = @import("../portable_backup.zig");
-const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+pub const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("enrichment/chunker_stub.zig")
 else
     @import("enrichment/chunker.zig");
@@ -222,7 +222,7 @@ pub const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
 const enrichment_lease_mod = @import("enrichment/enrichment_lease.zig");
 const enrichment_worker = @import("enrichment/enrichment_worker.zig");
 const enrichment_lease = @import("enrichment/enrichment_lease.zig");
-const enrichment_state = @import("enrichment/enrichment_state.zig");
+pub const enrichment_state = @import("enrichment/enrichment_state.zig");
 pub const enrichment_types = @import("enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
@@ -333,7 +333,7 @@ const relational_index_jobs = @import("relational_index_jobs.zig");
 const relational_constraint_jobs = @import("relational_constraint_jobs.zig");
 const relational_index_gc = @import("relational_index_gc.zig");
 const SchemaCacheAdmission = @import("schema_cache_admission.zig").Admission;
-const public_table_schema = @import("../../schema/mod.zig");
+pub const public_table_schema = @import("../../schema/mod.zig");
 pub const ttl_mod = @import("../ttl.zig");
 pub const transactions_mod = @import("../transactions.zig");
 pub const lease_mod = @import("lease.zig");
@@ -394,9 +394,9 @@ const search_mod = @import("../../search/search.zig");
 const index_mod = @import("../../index.zig");
 const introducer_mod = @import("../../introducer.zig");
 const db_query_metrics = @import("query_metrics.zig");
-const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
+pub const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
 pub const coordinated_ttl = @import("../coordinated_ttl.zig");
-const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
+pub const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 pub const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 pub const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
 pub const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
@@ -418,11 +418,11 @@ const RowPolicyOutputCheckpoint = struct {
     upstream: types.CancellationToken,
     lease: *const row_policy_gate_mod.Gate.Lease,
 
-    fn token(self: *const @This()) types.CancellationToken {
+    pub fn token(self: *const @This()) types.CancellationToken {
         return .{ .ptr = self, .check_fn = check };
     }
 
-    fn check(ptr: *const anyopaque) anyerror!void {
+    pub fn check(ptr: *const anyopaque) anyerror!void {
         const self: *const @This() = @ptrCast(@alignCast(ptr));
         try self.upstream.check();
         try self.lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -467,7 +467,7 @@ const QueryCaptureProfile = struct {
     pub fn init(enabled: bool, phase: []const u8) @This() {
         return .{ .enabled = enabled, .phase = phase, .started_ns = if (enabled) monotonicTimeNs() else 0 };
     }
-    fn finish(self: *const @This()) void {
+    pub fn finish(self: *const @This()) void {
         if (self.enabled) std.log.info("QUERY_CAPTURE phase={s} elapsed_us={d}", .{ self.phase, (monotonicTimeNs() -| self.started_ns) / std.time.ns_per_us });
     }
     pub fn next(self: *@This(), phase: []const u8) void {
@@ -520,7 +520,7 @@ test "document extraction templated inline source size is rejected before persis
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .template = "{{url}}",
@@ -559,7 +559,7 @@ pub const SchemaBeforeIndexLoad = struct {
 
 /// Default for `OpenOptions.run_until_idle_no_progress_timeout_ms` /
 /// `DB.run_until_idle_no_progress_timeout_ns`. See `checkTargetAdvanceNoProgress`.
-const default_run_until_idle_no_progress_timeout_ns: u64 = 60 * std.time.ns_per_s;
+pub const default_run_until_idle_no_progress_timeout_ns: u64 = 60 * std.time.ns_per_s;
 
 pub const ArtifactPublicationDispatcher = @import("artifact_publication.zig").Dispatcher;
 pub const OpenOptions = struct {
@@ -1026,7 +1026,7 @@ const ProfiledApplyLock = struct {
     }
 };
 
-const EnrichmentAppendContext = struct {
+pub const EnrichmentAppendContext = struct {
     alloc: Allocator,
     root_incarnation: u128 = 0,
     read_only: bool = false,
@@ -1117,7 +1117,7 @@ pub const ReplayApplyContextBatch = struct {
     dense_window_sequence: u64 = 0,
 };
 
-const TtlCleanupContext = execution_resources.TtlCleanupContext;
+pub const TtlCleanupContext = execution_resources.TtlCleanupContext;
 
 /// Synchronous local mutation receiver. It borrows resources and owns only
 /// invocation scratch; DB ownership and resident scheduling are not exposed.
@@ -1126,11 +1126,11 @@ const LocalMutationExecution = local_mutation.Execution;
 /// Stable borrowed execution capabilities. The public DB wrapper is movable;
 /// recovery retains this bounded resource view and the shared mutation owner,
 /// never a copy of the wrapper or its private caches and synchronization state.
-const LocalExecutionContext = local_mutation.Context;
+pub const LocalExecutionContext = local_mutation.Context;
 
-const TransactionRecoveryLocalContext = local_mutation.TransactionRecoveryLocalContext;
+pub const TransactionRecoveryLocalContext = local_mutation.TransactionRecoveryLocalContext;
 
-const TransactionRecoveryContexts = struct {
+pub const TransactionRecoveryContexts = struct {
     identity: db_core.TransactionRecoveryIdentityContext,
     local: TransactionRecoveryLocalContext = .{},
     pub fn release(self: *@This()) void {
@@ -1758,7 +1758,7 @@ var split_replay_artifact_nonce: u64 = 0;
 var repair_shadow_nonce = AtomicU64.init(0);
 var portable_import_stage_nonce = AtomicU64.init(0);
 var test_fail_portable_index_activation = false;
-var test_fail_portable_promotion_runtime_start = false;
+pub var test_fail_portable_promotion_runtime_start = false;
 var test_fail_portable_import_publish_after_batch = false;
 var test_fail_portable_import_rollback = false;
 var test_fail_portable_import_committed_sync = false;
@@ -2721,14 +2721,14 @@ test "stale multi-source vector replay writes are source fenced" {
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "dense_source_v1",
         .kind = .embedding,
         .field = "body",
         .expected_dims = 2,
         .producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"dense-test\",\"dimensions\":2}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "sparse_source_v1",
         .kind = .embedding,
         .field = "body",
@@ -2953,7 +2953,7 @@ pub const ShadowState = execution_resources.ShadowState;
 /// durable page commits makes recovery linear in the artifact size during a
 /// normal run; after a crash the current artifact is parsed once again and
 /// resumes directly at its ordinal cursor.
-const GraphRestoreParseCache = execution_resources.GraphRestoreParseCache;
+pub const GraphRestoreParseCache = execution_resources.GraphRestoreParseCache;
 
 /// Mutable admission and publication state shared by foreground mutations and
 /// recovery. This owner has one lifetime and one set of locks; a borrowed
@@ -3119,6 +3119,10 @@ pub const RelationalIndexes = @import("indexes/relational.zig").RelationalIndexe
 pub const AlgebraicIndexes = @import("indexes/algebraic.zig").AlgebraicIndexes;
 pub const RepairIndexes = @import("indexes/repair.zig").RepairIndexes;
 pub const Query = @import("query/state.zig").Query;
+pub const Enrichment = @import("enrichment/state.zig").Enrichment;
+pub const Recovery = @import("recovery.zig").Recovery;
+pub const Ttl = @import("ttl.zig").Ttl;
+pub const Maintenance = @import("maintenance/state.zig").Maintenance;
 pub const DB = struct {
     /// Content-only proof for this physical owner and immutable catalog cut.
     /// Native heads, grants and live logical bindings are validated separately.
@@ -3132,7 +3136,6 @@ pub const DB = struct {
     };
     /// Shared local mutation state outlives foreground and recovery execution.
     local_execution: *LocalExecutionState,
-    restore_decoder_cache: @import("../restore_decoder_cache.zig").Cache = .{},
     source_vector_storage: ?*lsm_backend_mod.NativeStorage = null,
     closed: bool = false,
     stable_address: bool = false,
@@ -3154,10 +3157,6 @@ pub const DB = struct {
     status_owner_epoch: u64 = 0,
     status_publication_mutex: std.atomic.Mutex = .unlocked,
     status_publication_revision: u64 = 0,
-    /// Owner-scoped recovery keeps remote acknowledgement off the open/read
-    /// path. The startup barrier orders crash-left obligations before new WAL
-    /// records; steady-state mutations then wait on independent LSN watermarks.
-    publication_recovery: @import("publication_recovery_owner.zig").Owner,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     capacity_source: ?types.RepairCapacitySource,
@@ -3167,76 +3166,29 @@ pub const DB = struct {
     resolver_workers_enabled: bool,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
-    enrichment_owner: EnrichmentOwner = .{},
-    /// Borrowed views for existing local consumers. The bundle owns destruction;
-    /// replacement publishes these views while holding the lifecycle fence.
-    enrichment_append_context: ?*EnrichmentAppendContext,
-    enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
-    resolution_append_context: ?*EnrichmentAppendContext = null,
-    resolution_owner: @import("local_runtime_owner.zig").Bundle(EnrichmentAppendContext, resolution_runtime_mod.ResolutionRuntime) = .{},
-    promotion_owner_bundle: @import("local_runtime_owner.zig").RuntimeOwner(promotion_runtime_mod.PromotionRuntime) = .{},
-    ttl_owner: @import("local_runtime_owner.zig").Bundle(TtlCleanupContext, ttl_runtime_mod.TtlRuntime) = .{},
     // Runtime/context pointer fields below are borrowed views of these owners.
-    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
-    resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
-    resolution_embedder: ?embedder_mod.DenseEmbedder = null,
-    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
-    entity_sink: ?promotion_runtime_mod.EntitySink = null,
-    promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
-    entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
-    source_pin_cleanup: @import("source_pin_cleanup_owner.zig").Owner = .{},
-    ttl_cleanup_context: ?*TtlCleanupContext,
-    ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
-    transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
-    transaction_recovery_local_context: ?*TransactionRecoveryLocalContext,
-    transaction_owner: @import("local_runtime_owner.zig").OwningBundle(TransactionRecoveryContexts, transaction_runtime_mod.Runtime, TransactionRecoveryContexts.release) = .{},
-    transaction_runtime: ?*transaction_runtime_mod.Runtime,
-    portable_runtime_activation_attempts: AtomicU64 = AtomicU64.init(0),
     // Serializes the stop/load/start lifecycle without coupling worker joins
     // to the apply lock. Public and background retries may race otherwise.
-    portable_runtime_activation_mutex: std.atomic.Mutex = .unlocked,
     // The retry worker is owner-scoped and short-lived: it exits after recovery
     // instead of retaining an OS thread per DB. The runtime owner provides the
     // close-safe lifetime fence and bounded process-wide concurrency.
-    portable_activation_recovery: portable_activation_recovery.Owner = .{},
     // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
     // Started after the DB reaches its final address; exits once all
     // quarantined indexes recover or the DB closes.
-    quarantine_recovery: quarantine_recovery.Owner = .{},
-    independent_maintenance: independent_maintenance.Owner = .{},
     documents: Documents = .{},
     query: Query = .{},
-    artifact_repair_metadata_due_ns: u64 = 0,
-    artifact_repair_metadata_pending: bool = true,
-    artifact_footprint_pending: std.atomic.Value(bool) = .init(true),
-    artifact_producer_baseline_pending: std.atomic.Value(bool) = .init(true),
-    artifact_producer_scheduler: @import("artifact_producer_scheduler.zig").Scheduler = .{},
-    local_source_completion_audit_pending: bool = true,
-    local_source_recovery_pending: bool = false,
-    /// Bounded no-progress guard for `runUntilIdle` (see `OpenOptions.
-    /// run_until_idle_no_progress_timeout_ms` and `ReplayDrainOptions.
-    /// no_progress_timeout_ns`); 0 disables it. Copied into `ReplayDrainOptions`
-    /// only by `runUntilIdle`, so a busy but progressing background replay is
-    /// never subject to it.
-    run_until_idle_no_progress_timeout_ns: u64 = default_run_until_idle_no_progress_timeout_ns,
-    /// Most recent `error.RunUntilIdleNoProgress` diagnostic, retained past the
-    /// error return for callers (tests, capi JSON status) that want the exact
-    /// stuck index and its indexed/expected counters without re-parsing a log
-    /// line. Overwritten on each new occurrence; freed at `deinitWrapperState`.
-    last_run_until_idle_no_progress: ?NoProgressDiagnostic = null,
+    enrichment: Enrichment = .{},
+    recovery: Recovery = .{},
+    ttl: Ttl = .{},
+    maintenance: Maintenance = .{},
     // Status snapshots are reconstructed from durable state on every poll, so
     // volatile worker observations need an independently owned cache. Keeping
     // it on the resident DB (rather than inside a returned DBStats value) lets
     // a contended lifecycle sample retain the last exact-incarnation activity
     // without turning that retained sample into a fresh cross-node heartbeat.
-    embedding_activity: @import("embedding_activity_cache.zig").Owner = .{},
     // Managed admission is a durable outbox. Requested/completed generations
     // prevent a drain from erasing work committed while its marker snapshot is
     // in flight; the mutex makes concurrent drainers a single-flight loop.
-    managed_admission: @import("managed_admission_owner.zig").Owner = .{},
-    snapshot_publication_mutex: std.atomic.Mutex = .unlocked,
-    graph_restore_parse_cache: ?GraphRestoreParseCache = null,
-    graph_restore_parse_count_for_test: usize = 0,
 
     const IndexRepairDiscoveryObservationTestHook = struct {
         ptr: *anyopaque,
@@ -3301,7 +3253,7 @@ pub const DB = struct {
     /// requests with lock contention.
     pub const lockApplyForPortableRuntime = local_mutation.lockApplyForPortableRuntime;
 
-    fn lockApplySharedForPortableRuntime(self: *DB) !void {
+    pub fn lockApplySharedForPortableRuntime(self: *DB) !void {
         try self.enforcePortableRuntimeGate();
         lockApplyShared(self);
         errdefer self.core.unlockApplyShared();
@@ -3643,7 +3595,7 @@ pub const DB = struct {
         return .{ .generation = progress.id.generation, .slot = progress.id.slot, .state = progress.state, .rows_scanned = progress.rows_scanned, .failure = progress.failure };
     }
 
-    fn mirrorReplicationReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
+    pub fn mirrorReplicationReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
         var ctx = self.batchContext();
         mirrorReplicationReplayPayloadBestEffortContext(&ctx, payload);
     }
@@ -3700,7 +3652,7 @@ pub const DB = struct {
     }
 
     pub fn scheduleDurableReplicationOutboxRecovery(self: *DB) void {
-        self.publication_recovery.schedule(self.publicationOutboxRecoveryPort());
+        self.recovery.publication.owner.schedule(self.publicationOutboxRecoveryPort());
     }
     fn outboxRecoveryEligible(ptr: *anyopaque) bool {
         const self: *DB = @ptrCast(@alignCast(ptr));
@@ -3730,7 +3682,7 @@ pub const DB = struct {
     }
     fn outboxRecoveryDelay(ptr: *anyopaque, failure_streak: u32) u64 {
         const self: *DB = @ptrCast(@alignCast(ptr));
-        return portableActivationRetryDelayNs(self.core.path, @as(u64, @truncate(self.root_incarnation)) ^ self.publication_recovery.owner_id, failure_streak);
+        return portableActivationRetryDelayNs(self.core.path, @as(u64, @truncate(self.root_incarnation)) ^ self.recovery.publication.owner.owner_id, failure_streak);
     }
     fn outboxRecoveryReport(ptr: *anyopaque, failure: @import("publication_outbox_recovery.zig").Driver.Failure, err: anyerror, failures: u32, delay_ns: u64) void {
         const self: *DB = @ptrCast(@alignCast(ptr));
@@ -4054,14 +4006,12 @@ pub const DB = struct {
                 .backend_runtime = backend_runtime,
                 .backend_owner_id = backend_owner_id,
                 .status_owner_epoch = @import("publication.zig").allocateOwnerEpoch(),
-                .publication_recovery = publication_recovery,
                 .owned_backend_runtime = owned_backend_runtime,
                 .owned_resource_manager = owned_resource_manager,
                 .capacity_source = opts.capacity_source orelse opts.resource_manager.?.capacitySource(),
                 .executor = executor,
                 .start_index_workers = start_index_workers,
                 .start_independent_maintenance = opts.start_independent_maintenance,
-                .run_until_idle_no_progress_timeout_ns = @as(u64, opts.run_until_idle_no_progress_timeout_ms) *| std.time.ns_per_ms,
                 .indexes = .{
                     .graph = .{ .metrics = .{
                         .idle_maintenance = opts.graph_metric_idle_maintenance,
@@ -4077,18 +4027,21 @@ pub const DB = struct {
                 .resolver_workers_enabled = opts.start_resolver_workers,
                 .secret_store = opts.secret_store,
                 .remote_content = opts.remote_content,
-                .enrichment_append_context = null,
-                .enrichment_runtime = null,
-                .resolution_candidate_source = opts.resolution_candidate_source,
-                .resolution_embedder = opts.resolution_embedder,
-                .entity_sink = opts.entity_sink,
-                .promotion_owner = opts.promotion_owner,
-                .entity_sink_missing_policy = opts.entity_sink_missing_policy,
-                .ttl_cleanup_context = null,
-                .ttl_runtime = null,
-                .transaction_recovery_identity_context = null,
-                .transaction_recovery_local_context = null,
-                .transaction_runtime = null,
+                .enrichment = .{
+                    .resolution = .{
+                        .candidate_source = opts.resolution_candidate_source,
+                        .embedder = opts.resolution_embedder,
+                    },
+                    .promotion = .{
+                        .entity_sink = opts.entity_sink,
+                        .owner = opts.promotion_owner,
+                        .entity_sink_missing_policy = opts.entity_sink_missing_policy,
+                    },
+                },
+                .recovery = .{ .publication = .{ .owner = publication_recovery } },
+                .maintenance = .{ .run_until_idle = .{
+                    .no_progress_timeout_ns = @as(u64, opts.run_until_idle_no_progress_timeout_ms) *| std.time.ns_per_ms,
+                } },
             };
             core_owner_transferred = true;
             backend_owner_transferred = true;
@@ -4134,11 +4087,11 @@ pub const DB = struct {
             }
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
                 if (comptime builtin.os.tag != .freestanding) {
-                    try db.resumePreparedSourcePin();
+                    try db.recovery.resumePreparedSourcePin();
                     try @import("source_pin.zig").reconcileReleased(&db);
                 }
             } else {
-                db.source_pin_cleanup.epoch.store(0, .release);
+                db.recovery.source_pin_cleanup.epoch.store(0, .release);
             }
             const table_storage_started_ns = monotonicTimeNs();
             try db.initializeTableStorage(opts.table_storage);
@@ -4173,7 +4126,7 @@ pub const DB = struct {
                     std.log.debug("owner open retains newer durable schema path={s} durable_version={d} descriptor_version={d}", .{
                         path, db.core.schema.?.version, prepared_schema.runtime_schema.version,
                     });
-                } else if (try childGenerationSourcePinsSchema(db.core, prepared_schema.runtime_schema.version)) {
+                } else if (try Recovery.childGenerationSourcePinsSchema(db.core, prepared_schema.runtime_schema.version)) {
                     // Parent ACKs precede the metadata child descriptor cut.
                     // A cold owner may reopen in that interval, but the
                     // descriptor cannot install an FK generation. Keep the
@@ -4233,7 +4186,7 @@ pub const DB = struct {
             defer docstore_mod.DocStore.freeResults(alloc, managed_admissions);
             try db.core.index_manager.replaceManagedAdmissionSnapshot(managed_admissions);
             if (managed_admissions.len != 0 and !openModeRequiresReadOnlyBackends(opts.open_mode)) {
-                db.requestManagedAdmissionMaterialization();
+                db.enrichment.requestManagedAdmissionMaterialization();
             }
 
             if (opts.primary_only_readonly and opts.open_mode != .query_readonly) return error.UnsupportedOperation;
@@ -5028,7 +4981,7 @@ pub const DB = struct {
         self.core.store.payload_recovery_required.store(true, .release);
     }
 
-    fn enforceVectorMigrationConfigurationGate(self: *const DB) !void {
+    pub fn enforceVectorMigrationConfigurationGate(self: *const DB) !void {
         if (self.local_execution.vector_migration_active.load(.acquire)) return error.VectorMigrationActive;
     }
 
@@ -5140,7 +5093,7 @@ pub const DB = struct {
         return source.tryStatsSnapshot() orelse error.StorageBusy;
     }
 
-    fn refreshSourceVectorOwnershipScopes(self: *DB) !void {
+    pub fn refreshSourceVectorOwnershipScopes(self: *DB) !void {
         const source = self.local_execution.source_vectors.load(.acquire) orelse return;
         const configs = try self.core.listIndexes(self.alloc);
         defer types.freeIndexConfigs(self.alloc, configs);
@@ -5178,7 +5131,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("close", .{self}) catch unreachable;
         if (self.closed) return;
         self.closed = true;
-        self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse std.Options.debug_io);
+        self.recovery.restore.decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse std.Options.debug_io);
         self.indexes.relational.rewrite_program_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
         self.indexes.relational.rewrite_tail_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
         self.deinitWrapperState(true);
@@ -5206,10 +5159,10 @@ pub const DB = struct {
         self.stable_address = true;
         // TTL callbacks retain only stable context, never this movable wrapper.
         // The resident probe observes their atomic outbox notification.
-        if (self.local_execution.replication_async_effect_mirror != null) self.publication_recovery.watch(self.publicationOutboxRecoveryPort());
+        if (self.local_execution.replication_async_effect_mirror != null) self.recovery.publication.owner.watch(self.publicationOutboxRecoveryPort());
         self.scheduleDurableReplicationOutboxRecovery();
-        self.startArtifactRepairMetadataWorkerIfNeeded();
-        self.startQuarantineRetryWorkerIfNeeded();
+        self.enrichment.startArtifactRepairMetadataWorkerIfNeeded();
+        self.maintenance.startQuarantineRetryWorkerIfNeeded();
         self.indexes.graph.startEndpointCleanupWorker();
         if (self.local_execution.optional_runtime_workers_enabled)
             self.documents.group_sources.owner.start(.{ .ptr = self, .runtime = self.backend_runtime, .run = Documents.runLocalGroupSourceSlice });
@@ -5232,31 +5185,8 @@ pub const DB = struct {
     /// durable-expected counters when the bounded stall fired.
     pub const NoProgressDiagnostic = execution_resources.NoProgressDiagnostic;
 
-    fn setLastRunUntilIdleNoProgressDiagnostic(
-        self: *DB,
-        index_name: []const u8,
-        indexed: u64,
-        expected: u64,
-        stuck_ns: u64,
-    ) !void {
-        const owned_name = try self.alloc.dupe(u8, index_name);
-        if (self.last_run_until_idle_no_progress) |*previous| previous.deinit(self.alloc);
-        self.last_run_until_idle_no_progress = .{
-            .index_name = owned_name,
-            .indexed = indexed,
-            .expected = expected,
-            .stuck_ns = stuck_ns,
-        };
-    }
-
-    /// Read-only view of the most recent no-progress diagnostic, if any.
-    /// Valid until the next `runUntilIdle` call or `DB.close`.
-    pub fn lastRunUntilIdleNoProgressDiagnostic(self: *const DB) ?NoProgressDiagnostic {
-        return self.last_run_until_idle_no_progress;
-    }
-
     fn resumeGeneratedReplayFromJournalIfNeeded(self: *DB) !void {
-        const runtime = self.enrichment_runtime orelse return;
+        const runtime = self.enrichment.runtime orelse return;
         if (!self.core.hasGeneratedEnrichmentTargets()) return;
 
         const target_sequence = self.core.nextEnrichmentSequence();
@@ -5335,7 +5265,7 @@ pub const DB = struct {
             defer lease.release();
             if (comptime builtin.os.tag != .freestanding) self.indexes.repair.replayPendingVisibility(lease.hook);
         }
-        if (self.enrichment_runtime) |runtime| {
+        if (self.enrichment.runtime) |runtime| {
             runtime.setStatusHook(if (hook == null) null else .{
                 .ptr = self.async_context,
                 .on_change = notifyAsyncContextVisibilityHook,
@@ -5344,19 +5274,12 @@ pub const DB = struct {
         }
     }
 
-    fn prepareTransactionRecoveryOwner(self: *DB) !void {
-        const ctx = self.transaction_recovery_local_context orelse return;
-        if (ctx.execution != null) return;
-        ctx.split_shadow = self.indexes.split_shadow;
-        ctx.execution = LocalExecutionContext.borrow(self);
-    }
-
-    fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
+    pub fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
         notifyQueryVisibilityHook(ctx, .status);
     }
 
-    fn notifyAsyncContextActivityHook(ptr: *anyopaque) void {
+    pub fn notifyAsyncContextActivityHook(ptr: *anyopaque) void {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
         notifyQueryVisibilityHook(ctx, .activity);
     }
@@ -5397,7 +5320,7 @@ pub const DB = struct {
         }
     }
 
-    fn hasQueryVisibilityHook(ctx: *AsyncContext) bool {
+    pub fn hasQueryVisibilityHook(ctx: *AsyncContext) bool {
         return ctx.visibility_observer.attached();
     }
 
@@ -5405,7 +5328,7 @@ pub const DB = struct {
         notifyQueryVisibilityEvent(ctx, .{ .change = change });
     }
 
-    fn notifyQueryVisibilityTargetAdvanced(ctx: *AsyncContext, target_sequence: u64) void {
+    pub fn notifyQueryVisibilityTargetAdvanced(ctx: *AsyncContext, target_sequence: u64) void {
         notifyQueryVisibilityTargetAdvancedScoped(ctx, target_sequence, &.{}, false);
     }
 
@@ -5432,370 +5355,26 @@ pub const DB = struct {
 
     pub const notifyQueryVisibilityEvent = local_mutation.notifyQueryVisibilityEvent;
 
-    const EnrichmentOwner = @import("enrichment_runtime_owner.zig").Owner(EnrichmentAppendContext);
+    pub const EnrichmentOwner = @import("enrichment_runtime_owner.zig").Owner(EnrichmentAppendContext);
     pub const DetachedEnrichmentRuntime = EnrichmentOwner.Bundle;
 
-    pub fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
-        if (comptime storage_engine.enabled) return storage_engine.call("createDetachedEnrichmentRuntime", .{ self, enrichment_cfg });
-        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers and !self.core.index_manager.hasGroupSources()) return null;
-        // Producer ownership moves through reconfiguration, but execution and
-        // security capabilities belong to the resident DB. Hydrate every
-        // replacement at this single construction boundary so live index DDL
-        // cannot silently fall back to default remote-content policy or an
-        // unrelated executor when it supplies only a new producer set.
-        var runtime_cfg = enrichment_cfg.*;
-        if (self.core.index_manager.hasGroupSources()) runtime_cfg.enable_without_producers = true;
-        runtime_cfg.root_incarnation = self.root_incarnation;
-        if (runtime_cfg.secret_store == null) runtime_cfg.secret_store = self.secret_store;
-        if (runtime_cfg.remote_content == null) runtime_cfg.remote_content = self.remote_content;
-        if (runtime_cfg.resource_manager == null) runtime_cfg.resource_manager = self.core.index_manager.resource_manager;
-        if (runtime_cfg.io == null) runtime_cfg.io = self.backend_runtime.inferenceIo();
-        runtime_cfg.relational_base_rows = relationalColumns(self) != null;
-
-        const resources = self.core.batchExecutionResources();
-        const context: EnrichmentAppendContext = .{
-            .alloc = self.runtime_alloc,
-            .root_incarnation = self.root_incarnation,
-            .read_only = openModeRequiresReadOnlyBackends(self.open_mode),
-            .clock = runtime_cfg.clock orelse self.backend_runtime.clock(),
-            .store = resources.store,
-            .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
-            .index_repair_checkpoint = resources.index_repair_checkpoint,
-            .shard_manager = resources.shard_manager,
-            .index_manager = resources.index_manager,
-            .apply_mutex = resources.apply_mutex,
-            .portable_runtime_activation_pending = &self.async_context.portable_runtime_activation_pending,
-            .snapshot_admission = resources.snapshot_admission,
-            .snapshot_replay_admission = resources.snapshot_replay_admission,
-            .repair_replay_mutex = resources.repair_replay_mutex,
-            .change_journal = resources.change_journal,
-            .replay_source = resources.replay_source,
-            .executor = self.executor,
-            .async_context = self.async_context,
-            .log_mutex = resources.log_mutex,
-            .replication_async_effect_mirror = self.local_execution.replication_async_effect_mirror,
-            .replication_async_batch_mirror = self.local_execution.replication_async_batch_mirror,
-            .replication_async_metadata_mirror = self.local_execution.replication_async_metadata_mirror,
-            .replication_write_gate = self.local_execution.replication_write_gate,
-            .resolution_runtime = self.resolution_runtime,
-            .promotion_runtime = self.promotion_runtime,
-            .artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher,
-        };
-        var bundle = try DetachedEnrichmentRuntime.create(self.runtime_alloc, enrichment_cfg, runtime_cfg, context, .{
-            .backend_runtime = self.backend_runtime,
-            .neighbor_acquire = acquireNeighborContextGraphSource,
-            .write = appendGeneratedBatchFromEnrichment,
-            .failure = recordEnrichmentRequestFailure,
-            .failure_pending = enrichmentRequestFailurePending,
-            .failure_range_pending = enrichmentRequestFailureRangePending,
-            .failure_lock = lockEnrichmentFailurePendingFence,
-            .failure_unlock = unlockEnrichmentFailurePendingFence,
-            .notify_ctx = self.executor,
-            .notify = notifyDerivedExecutorSequence,
-            .commit = commitArtifactUnitTurnFromEnrichment,
-        });
-        errdefer bundle.deinit(self.runtime_alloc);
-        try mergeEnrichmentTerminalFailureEnvelope(resources.store, bundle.runtime.?);
-        return bundle;
-    }
-
-    fn mergeEnrichmentTerminalFailureEnvelope(
-        store: *docstore_mod.DocStore,
-        runtime: *enrichment_runtime_mod.EnrichmentRuntime,
-    ) !void {
-        const marker_envelope = try enrichmentTerminalFailureSequenceEnvelope(store);
-        if (marker_envelope.min != 0) {
-            runtime.terminal_failure_min_sequence = if (runtime.terminal_failure_min_sequence == 0)
-                marker_envelope.min
-            else
-                @min(runtime.terminal_failure_min_sequence, marker_envelope.min);
-            runtime.terminal_failure_max_sequence = @max(runtime.terminal_failure_max_sequence, marker_envelope.max);
-        }
-    }
-
-    fn publishEnrichmentOwner(ptr: *anyopaque) void {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        self.enrichment_append_context = self.enrichment_owner.bundle.append_ctx;
-        self.enrichment_runtime = self.enrichment_owner.bundle.runtime;
-        self.async_context.enrichment_runtime = self.enrichment_owner.bundle.runtime;
-    }
-    pub fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !void {
-        self.enrichment_owner.bundle = (try self.createDetachedEnrichmentRuntime(enrichment_cfg)) orelse return;
-        publishEnrichmentOwner(self);
-    }
-
-    const EnrichmentReconfigureOptions = struct {
+    pub const EnrichmentReconfigureOptions = struct {
         start_replacement: bool = true,
     };
-
-    pub fn reconfigureEnrichmentRuntime(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("reconfigureEnrichmentRuntime", .{ self, cfg });
-        try self.reconfigureEnrichmentRuntimeWithOptions(cfg, .{});
-    }
-
-    /// Install a replacement producer set without starting it. Structural
-    /// activation uses this form to quiesce the old owner once, mutate the
-    /// index catalog, and then start the exact replacement after the durable
-    /// admission is established. Starting here would make addIndex stop the
-    /// new worker a second time and let corpus work delay control-plane DDL.
-    pub fn reconfigureEnrichmentRuntimePaused(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("reconfigureEnrichmentRuntimePaused", .{ self, cfg });
-        try self.reconfigureEnrichmentRuntimeWithOptions(cfg, .{ .start_replacement = false });
-    }
-
-    fn reconfigureEnrichmentRuntimeWithOptions(
-        self: *DB,
-        cfg: enrichment_runtime_mod.Config,
-        options: EnrichmentReconfigureOptions,
-    ) !void {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-
-        const recovery = self.transaction_recovery_local_context;
-        const recovery_io = self.backend_runtime.io();
-        if (recovery) |ctx| ctx.provider_mutex.lockUncancelable(recovery_io.?);
-        defer if (recovery) |ctx| ctx.provider_mutex.unlock(recovery_io.?);
-
-        const hook_present = hasQueryVisibilityHook(self.async_context);
-        try self.enrichment_owner.replace(.{
-            .ptr = self,
-            .alloc = self.runtime_alloc,
-            .mutex = &self.async_context.enrichment_lifecycle_mutex,
-            .desired_running = &self.async_context.enrichment_desired_running,
-            .allows_running = self.open_mode.allowsOptionalRuntimes(),
-            .status_hook = if (hook_present) .{ .ptr = self.async_context, .on_change = notifyAsyncContextVisibilityHook, .on_activity = notifyAsyncContextActivityHook } else null,
-            .create = createEnrichmentReplacement,
-            .after_create = enrichmentReplacementCreated,
-            .prepare = prepareEnrichmentReplacement,
-            .restore = restoreEnrichmentPrevious,
-            .publish = publishEnrichmentOwner,
-        }, cfg, options.start_replacement and self.local_execution.optional_runtime_workers_enabled);
-        if (!hook_present) self.setQueryVisibilityHook(null);
-    }
-    fn createEnrichmentReplacement(ptr: *anyopaque, cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        return self.createDetachedEnrichmentRuntime(cfg);
-    }
-    fn enrichmentReplacementCreated(ptr: *anyopaque) !void {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        if (builtin.is_test) if (test_enrichment_reconfigure_after_detached_hook) |hook| try hook(self);
-    }
-    fn prepareEnrichmentReplacement(ptr: *anyopaque, runtime: *enrichment_runtime_mod.EnrichmentRuntime, telemetry: ?types.EnrichmentStats) !void {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        // The previous worker has joined. Rehydrate its final durable debt;
-        // volatile telemetry never substitutes for those persisted markers.
-        try runtime.reloadDurableState();
-        if (telemetry) |previous| runtime.inheritProcessTelemetry(previous);
-        try mergeEnrichmentTerminalFailureEnvelope(self.core.batchExecutionResources().store, runtime);
-        if (self.core.hasGeneratedEnrichmentTargets()) {
-            const target = self.core.nextEnrichmentSequence();
-            if (target != 0) runtime.resumeTargetPreservingRetryDebt(target);
-        }
-    }
-    fn restoreEnrichmentPrevious(ptr: *anyopaque) !void {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        try self.restartEnrichmentAfterStructuralMutation("failed enrichment reconfiguration", "");
-    }
-
-    pub fn resumeEnrichmentRuntimeAfterReconfigure(self: *DB, operation: []const u8, index_name: []const u8) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("resumeEnrichmentRuntimeAfterReconfigure", .{ self, operation, index_name });
-        if (self.enrichment_runtime == null) return;
-        try self.restartEnrichmentAfterStructuralMutation(operation, index_name);
-    }
-
-    fn constructResolutionRuntime(alloc: Allocator, append_ctx: *EnrichmentAppendContext, self: *DB) !resolution_runtime_mod.ResolutionRuntime {
-        return try resolution_runtime_mod.ResolutionRuntime.init(
-            alloc,
-            self.core.batchExecutionResources().store,
-            self.core.replaySource(),
-            self.core.batchExecutionResources().index_manager,
-            append_ctx,
-            appendResolutionRecord,
-            self.backend_runtime,
-            self.resolution_candidate_source,
-            self.resolution_embedder,
-        );
-    }
-
-    pub fn initResolutionRuntime(self: *DB) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("initResolutionRuntime", .{self});
-        // Always constructed so catalog/status/runUntilIdle APIs can observe
-        // and drain replay. The background worker is started lazily only while
-        // the resolver catalog is non-empty.
-        const resources = self.core.batchExecutionResources();
-        const context_value: EnrichmentAppendContext = .{
-            .cache_source = self.resolution_candidate_source,
-            .alloc = self.runtime_alloc,
-            .root_incarnation = self.root_incarnation,
-            .artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher,
-            .store = resources.store,
-            .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
-            .index_repair_checkpoint = resources.index_repair_checkpoint,
-            .shard_manager = resources.shard_manager,
-            .index_manager = resources.index_manager,
-            .apply_mutex = resources.apply_mutex,
-            .portable_runtime_activation_pending = &self.async_context.portable_runtime_activation_pending,
-            .snapshot_admission = resources.snapshot_admission,
-            .snapshot_replay_admission = resources.snapshot_replay_admission,
-            .repair_replay_mutex = resources.repair_replay_mutex,
-            .change_journal = resources.change_journal,
-            .replay_source = resources.replay_source,
-            .executor = self.executor,
-            .async_context = self.async_context,
-            .log_mutex = resources.log_mutex,
-            .replication_async_effect_mirror = self.local_execution.replication_async_effect_mirror,
-            .replication_async_batch_mirror = self.local_execution.replication_async_batch_mirror,
-            .replication_async_metadata_mirror = self.local_execution.replication_async_metadata_mirror,
-            .replication_write_gate = self.local_execution.replication_write_gate,
-        };
-
-        self.resolution_owner = try @TypeOf(self.resolution_owner).create(self.runtime_alloc, context_value, .{self}, constructResolutionRuntime);
-        const append_ctx = self.resolution_owner.context.?;
-        const runtime = self.resolution_owner.runtime.?;
-        runtime.ordered_writer = .{ .ptr = append_ctx, .process = processOrderedResolutions };
-        append_ctx.resolution_runtime = runtime;
-        self.resolution_append_context = append_ctx;
-        self.resolution_runtime = runtime;
-        self.async_context.resolution_runtime = runtime;
-        if (self.enrichment_append_context) |ctx| ctx.resolution_runtime = runtime;
-    }
-
-    pub fn initPromotionRuntime(self: *DB) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("initPromotionRuntime", .{self});
-        // Always constructed (like the resolution runtime) so synchronous
-        // drains and status APIs remain available. The background worker is
-        // started lazily only while resolver replay can produce promotion work.
-        self.promotion_owner_bundle = try @TypeOf(self.promotion_owner_bundle).create(self.runtime_alloc, .{
-            self.runtime_alloc,
-            self.core.batchExecutionResources().store,
-            self.core.replaySource(),
-            self.backend_runtime,
-            self.promotion_owner,
-            // Cross-shard entity sink when the serving layer injected one (via
-            // OpenOptions or setEntitySink); null follows the configured missing-sink policy.
-            self.entity_sink,
-            self.entity_sink_missing_policy,
-        });
-        const runtime = self.promotion_owner_bundle.runtime.?;
-        runtime.catalog = self.core.index_manager;
-        self.promotion_runtime = runtime;
-        self.async_context.promotion_runtime = runtime;
-        // Patch the resolution stage's append context so journaling a resolution
-        // artifact (tagged with the promotion hint) wakes the promoter.
-        if (self.resolution_append_context) |ctx| ctx.promotion_runtime = runtime;
-    }
-
-    fn constructTtlRuntime(alloc: Allocator, ttl_ctx: *TtlCleanupContext, self: *DB, cfg: ttl_runtime_mod.Config) !ttl_runtime_mod.TtlRuntime {
-        return try ttl_runtime_mod.TtlRuntime.init(
-            alloc,
-            self.core.batchExecutionResources().store,
-            ttl_ctx,
-            deleteExpiredDocumentsFromCandidates,
-            &self.async_context.text_merge_deferred,
-            self.backend_runtime,
-            cfg,
-        );
-    }
-
-    pub fn initOptionalTtlRuntime(self: *DB, cfg: ttl_runtime_mod.Config) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("initOptionalTtlRuntime", .{ self, cfg });
-        const batch_resources = self.core.batchExecutionResources();
-        var context_value: TtlCleanupContext = .{
-            .batch = .{
-                .alloc = self.runtime_alloc,
-                .io = self.backend_runtime.io(),
-                .store = batch_resources.store,
-                .applied_sequence_checkpoint_path = batch_resources.applied_sequence_checkpoint_path,
-                .shard_manager = batch_resources.shard_manager,
-                .change_journal = batch_resources.change_journal,
-                .replay_source = batch_resources.replay_source,
-                .index_manager = batch_resources.index_manager,
-                .apply_mutex = batch_resources.apply_mutex,
-                .portable_runtime_activation_pending = &self.async_context.portable_runtime_activation_pending,
-                .snapshot_admission = batch_resources.snapshot_admission,
-                .snapshot_replay_admission = batch_resources.snapshot_replay_admission,
-                .log_mutex = batch_resources.log_mutex,
-                .identity_namespace = batch_resources.identity_namespace,
-                .executor = self.executor,
-                .enrichment_runtime = self.enrichment_runtime,
-                .resolution_runtime = self.resolution_runtime,
-                .promotion_runtime = self.promotion_runtime,
-                .relational_base_rows = relationalColumns(self) != null,
-                .table_catalog = &self.core.table_catalog,
-                .replication_async_effect_mirror = self.local_execution.replication_async_effect_mirror,
-                .replication_async_batch_mirror = self.local_execution.replication_async_batch_mirror,
-                .replication_async_metadata_mirror = self.local_execution.replication_async_metadata_mirror,
-                .replication_write_gate = self.local_execution.replication_write_gate,
-            },
-            .grace_period_ns = cfg.grace_period_ns,
-            .clock = cfg.clock,
-            .schema_registry = self.core.schema_registry,
-        };
-        context_value.batch.identity_visibility = &self.core.identity_visibility;
-        self.ttl_owner = try @TypeOf(self.ttl_owner).create(self.runtime_alloc, context_value, .{ self, cfg }, constructTtlRuntime);
-        const ttl_ctx = self.ttl_owner.context.?;
-        const runtime = self.ttl_owner.runtime.?;
-        runtime.setGraphExpireFn(expireGraphTtlCandidates);
-        self.ttl_cleanup_context = ttl_ctx;
-        self.ttl_runtime = runtime;
-    }
-
-    /// The context must outlive the managed DB. This only swaps the callback;
-    /// teardown drains TTL workers before releasing the owning service.
-    pub fn setCoordinatedTtl(self: *DB, port: ?coordinated_ttl.Port) void {
-        if (comptime storage_engine.enabled) return storage_engine.call("setCoordinatedTtl", .{ self, port }) catch @panic("incompatible storage owner");
-        const context = self.ttl_cleanup_context orelse return;
-        const io = self.backend_runtime.io() orelse std.Options.debug_io;
-        context.hook_mutex.lockUncancelable(io);
-        defer context.hook_mutex.unlock(io);
-        context.coordinated_port = port;
-    }
-
-    fn constructTransactionRuntime(alloc: Allocator, contexts: *TransactionRecoveryContexts, self: *DB, cfg: transaction_runtime_mod.Config) !transaction_runtime_mod.Runtime {
-        var effective_cfg = cfg;
-        effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(&contexts.identity);
-        effective_cfg.local_resolution_ctx = &contexts.local;
-        effective_cfg.resolve_local_fn = resolveRecoveredLocalTransaction;
-        return try transaction_runtime_mod.Runtime.init(
-            alloc,
-            self.core.batchExecutionResources().store,
-            self.backend_runtime,
-            effective_cfg,
-        );
-    }
-
-    pub fn initOptionalTransactionRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("initOptionalTransactionRuntime", .{ self, cfg });
-        var contexts: TransactionRecoveryContexts = .{
-            .identity = try db_core.TransactionRecoveryIdentityContext.init(
-                self.runtime_alloc,
-                self.core.store,
-                self.core.identity_namespace,
-                relationalColumns(self),
-                if (self.core.schema) |schema| schema.version else 0,
-            ),
-        };
-        errdefer contexts.release();
-        contexts.identity.resource_manager = self.core.index_manager.resource_manager;
-        contexts.identity.io = self.backend_runtime.io() orelse std.Options.debug_io;
-        self.transaction_owner = try @TypeOf(self.transaction_owner).create(self.runtime_alloc, contexts, .{ self, cfg }, constructTransactionRuntime);
-        self.transaction_recovery_identity_context = &self.transaction_owner.context.?.identity;
-        self.transaction_recovery_local_context = &self.transaction_owner.context.?.local;
-        self.transaction_runtime = self.transaction_owner.runtime.?;
-    }
 
     pub fn initOptionalRuntimes(self: *DB, opts: *OpenOptions) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("initOptionalRuntimes", .{ self, opts });
         // Created before enrichment so the enrichment append context can notify
         // it when extraction artifacts land.
-        try self.initResolutionRuntime();
+        try self.enrichment.initResolutionRuntime();
         // Created after the resolution runtime so it can patch the resolution
         // append context to wake the promoter when resolution artifacts land.
-        try self.initPromotionRuntime();
+        try self.enrichment.initPromotionRuntime();
         if (opts.enrichment) |*enrichment_cfg| {
             if (enrichment_cfg.secret_store == null) enrichment_cfg.secret_store = opts.secret_store;
             if (enrichment_cfg.remote_content == null) enrichment_cfg.remote_content = opts.remote_content;
             if (enrichment_cfg.resource_manager == null) enrichment_cfg.resource_manager = opts.resource_manager;
-            try self.initOptionalEnrichmentRuntime(enrichment_cfg);
+            try self.enrichment.initRuntime(enrichment_cfg);
             // Providers adopted by a runtime were cleared by the move boundary;
             // provider-only configurations that do not require a runtime remain
             // here and must be released before clearing the open option.
@@ -5803,11 +5382,11 @@ pub const DB = struct {
             opts.enrichment = null;
         }
         if (opts.ttl_cleanup.enabled) {
-            try self.initOptionalTtlRuntime(opts.ttl_cleanup);
-            self.setCoordinatedTtl(opts.coordinated_ttl);
+            try self.ttl.initRuntime(opts.ttl_cleanup);
+            self.ttl.setCoordinated(opts.coordinated_ttl);
         }
         if (opts.transaction_recovery.enabled) {
-            try self.initOptionalTransactionRuntime(opts.transaction_recovery);
+            try self.recovery.initTransactionRuntime(opts.transaction_recovery);
         }
         try self.indexes.text.initMergeRuntime(opts.text_merge);
         try self.indexes.sparse.initCompactionRuntime(opts.sparse_compaction);
@@ -5816,14 +5395,14 @@ pub const DB = struct {
 
     pub fn startOptionalRuntimes(self: *DB) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("startOptionalRuntimes", .{self});
-        try self.startResolverReplayRuntimesIfConfigured();
-        if (self.enrichment_runtime) |runtime| {
+        try self.enrichment.startResolverReplayRuntimesIfConfigured();
+        if (self.enrichment.runtime) |runtime| {
             try runtime.start();
             self.async_context.enrichment_desired_running.store(true, .release);
         }
-        if (self.ttl_runtime) |runtime| try runtime.start();
-        if (self.transaction_runtime) |runtime| {
-            try self.prepareTransactionRecoveryOwner();
+        if (self.ttl.runtime) |runtime| try runtime.start();
+        if (self.recovery.transactions.runtime) |runtime| {
+            try self.recovery.prepareTransactionRecoveryOwner();
             try runtime.start();
         }
         if (self.indexes.text.merge_runtime) |runtime| try runtime.start();
@@ -5837,34 +5416,20 @@ pub const DB = struct {
     pub fn beginTeardown(self: *DB) void {
         if (comptime storage_engine.enabled) return storage_engine.call("beginTeardown", .{self}) catch @panic("incompatible storage owner");
         self.indexes.graph.cleanup_owner.stopping.store(true, .release);
-        if (self.enrichment_runtime) |runtime| runtime.beginTeardown();
-        if (self.transaction_runtime) |runtime| runtime.beginTeardown();
+        if (self.enrichment.runtime) |runtime| runtime.beginTeardown();
+        if (self.recovery.transactions.runtime) |runtime| runtime.beginTeardown();
         if (self.indexes.graph.metrics.runtime) |runtime| runtime.beginTeardown();
-    }
-
-    pub fn ensureTransactionRecoveryRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("ensureTransactionRecoveryRuntime", .{ self, cfg });
-        if (!cfg.enabled or self.transaction_runtime != null) return;
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        if (self.transaction_runtime != null) return;
-        try self.initOptionalTransactionRuntime(cfg);
-        if (self.local_execution.optional_runtime_workers_enabled) {
-            const runtime = self.transaction_runtime.?;
-            try self.prepareTransactionRecoveryOwner();
-            try runtime.start();
-        }
     }
 
     pub const hasConfiguredResolvers = local_mutation.hasConfiguredResolvers;
 
     fn resolverReplayNeedsDrain(self: *DB) bool {
         if (self.hasConfiguredResolvers()) return true;
-        if (self.resolution_runtime) |runtime| {
+        if (self.enrichment.resolution.runtime) |runtime| {
             const replay_stats = runtime.stats();
             if (replay_stats.catch_up_required or replay_stats.blocked) return true;
         }
-        if (self.promotion_runtime) |runtime| {
+        if (self.enrichment.promotion.runtime) |runtime| {
             const replay_stats = runtime.stats();
             if (replay_stats.catch_up_required or replay_stats.blocked) return true;
         }
@@ -5875,83 +5440,33 @@ pub const DB = struct {
 
     pub const notifyResolverReplayRuntimesForced = local_mutation.notifyResolverReplayRuntimesForced;
 
-    fn startResolverReplayRuntimesIfConfigured(self: *DB) !void {
-        if (!self.hasConfiguredResolvers()) return;
-        try self.startResolverReplayRuntimes();
-    }
-
-    /// Activate only after the serving owner installs candidate/sink hooks.
-    pub fn activateResolverReplayRuntimes(self: *DB) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("activateResolverReplayRuntimes", .{self});
-        self.resolver_workers_enabled = true;
-        if (self.local_execution.optional_runtime_workers_enabled) try self.startResolverReplayRuntimesIfConfigured();
-    }
-
-    /// Join callbacks that borrow a serving owner's cross-table catalog before
-    /// that owner destroys any namespace or shared inference provider.
-    pub fn deactivateResolverReplayRuntimes(self: *DB) void {
-        if (comptime storage_engine.enabled) return storage_engine.call("deactivateResolverReplayRuntimes", .{self}) catch @panic("incompatible storage owner");
-        self.resolver_workers_enabled = false;
-        self.stopResolverReplayRuntimes();
-    }
-
-    fn startResolverReplayRuntimes(self: *DB) !void {
-        if (!self.resolver_workers_enabled or !self.local_execution.optional_runtime_workers_enabled) return;
-        var resolution_started = false;
-        errdefer if (resolution_started) if (self.resolution_runtime) |runtime| runtime.stop();
-        if (self.resolution_runtime) |runtime| {
-            try runtime.start();
-            resolution_started = true;
-        }
-        if (builtin.is_test and test_fail_portable_promotion_runtime_start) {
-            test_fail_portable_promotion_runtime_start = false;
-            return error.InjectedPortablePromotionRuntimeStartFailure;
-        }
-        if (self.promotion_runtime) |runtime| try runtime.start();
-    }
-
-    fn stopResolverReplayRuntimes(self: *DB) void {
-        if (self.resolution_runtime) |runtime| runtime.stop();
-        if (self.promotion_runtime) |runtime| runtime.stop();
-    }
-
-    fn stopResolverReplayRuntimesIfUnconfigured(self: *DB) void {
-        if (self.hasConfiguredResolvers()) return;
-        if (self.resolution_runtime) |runtime| runtime.stop();
-        if (self.promotion_runtime) |runtime| runtime.stop();
-    }
-
     pub const clearLiveDocSetCache = local_mutation.clearLiveDocSetCache;
 
     pub const clearNonVisibleDocSetCache = local_mutation.clearNonVisibleDocSetCache;
 
-    fn clearEmbeddingActivityCache(self: *DB) void {
-        self.embedding_activity.clear(self.alloc);
-    }
-
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
-        if (self.last_run_until_idle_no_progress) |*diagnostic| diagnostic.deinit(self.alloc);
-        self.last_run_until_idle_no_progress = null;
+        if (self.maintenance.run_until_idle.last_no_progress) |*diagnostic| diagnostic.deinit(self.alloc);
+        self.maintenance.run_until_idle.last_no_progress = null;
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
         self.query.warming.stop(self.backend_runtime);
         self.local_execution.schema_reconcile.stop();
-        self.stopArtifactRepairMetadataWorker();
+        self.enrichment.stopArtifactRepairMetadataWorker();
         self.indexes.graph.clearReplacementManager();
-        self.artifact_producer_scheduler.deinit(self.alloc);
-        self.stopPortableActivationRetryWorker();
-        self.stopQuarantineRetryWorker();
+        self.enrichment.artifacts.producer_scheduler.deinit(self.alloc);
+        self.recovery.stopPortableActivationRetryWorker();
+        self.maintenance.stopQuarantineRetryWorker();
         self.documents.group_sources.owner.stop(self.backend_runtime.io());
         self.indexes.graph.stopEndpointCleanupWorker();
-        self.transaction_owner.deinitRuntime(self.runtime_alloc);
-        self.transaction_runtime = null;
+        self.recovery.transactions.owner.deinitRuntime(self.runtime_alloc);
+        self.recovery.transactions.runtime = null;
         self.local_execution.source_publication.stop(self.backend_runtime.io() orelse std.Options.debug_io);
         self.local_execution.merge_artifact_layout.clear();
         self.local_execution.online_merge_reader.retire(self.backend_runtime.io() orelse std.Options.debug_io, null);
-        self.transaction_owner.deinitContext(self.runtime_alloc);
-        self.transaction_recovery_local_context = null;
-        self.transaction_recovery_identity_context = null;
+        self.recovery.transactions.owner.deinitContext(self.runtime_alloc);
+        self.recovery.transactions.local_context = null;
+        self.recovery.transactions.identity_context = null;
         // Close may flush/coalesce derived watermarks while workers are
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
@@ -5964,35 +5479,35 @@ pub const DB = struct {
             self.backend_runtime.durable_jobs.closeOwner(self.indexes.algebraic.hll_owner_id);
             self.indexes.algebraic.hll_owner_id = 0;
         }
-        self.publication_recovery.deinit();
+        self.recovery.publication.owner.deinit();
         self.backend_runtime.durable_jobs.closeOwner(self.indexes.repair.cleanup_owner_id);
         self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
         self.clearLiveDocSetCache();
         self.clearNonVisibleDocSetCache();
-        self.clearEmbeddingActivityCache();
-        self.embedding_activity.deinit(self.alloc);
-        if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
-        self.graph_restore_parse_cache = null;
+        self.enrichment.clearEmbeddingActivityCache();
+        self.enrichment.embedding_activity.deinit(self.alloc);
+        if (self.recovery.restore.graph_parse_cache) |*cache| cache.deinit(self.alloc);
+        self.recovery.restore.graph_parse_cache = null;
         self.documents.bulk_ingest.identity.deinit(self.alloc);
         self.clearActiveIndexRepairsLocked();
         self.indexes.repair.active.deinit(self.alloc);
         self.indexes.closeSplitShadowLocked() catch {};
-        self.ttl_owner.deinit(self.runtime_alloc);
-        self.ttl_runtime = null;
-        self.ttl_cleanup_context = null;
-        self.enrichment_owner.deinit(self.runtime_alloc);
-        publishEnrichmentOwner(self);
-        self.resolution_owner.deinitRuntime(self.runtime_alloc);
-        self.resolution_runtime = null;
+        self.ttl.owner.deinit(self.runtime_alloc);
+        self.ttl.runtime = null;
+        self.ttl.cleanup_context = null;
+        self.enrichment.owner.deinit(self.runtime_alloc);
+        Enrichment.publishOwner(self);
+        self.enrichment.resolution.owner.deinitRuntime(self.runtime_alloc);
+        self.enrichment.resolution.runtime = null;
         self.async_context.resolution_runtime = null;
         // After the resolution runtime (its final catch-up may journal
         // resolution artifacts that notify the promoter) but before the
         // resolution append context the promoter is wired into is destroyed.
-        self.promotion_owner_bundle.deinit(self.runtime_alloc);
-        self.promotion_runtime = null;
+        self.enrichment.promotion.owner_bundle.deinit(self.runtime_alloc);
+        self.enrichment.promotion.runtime = null;
         self.async_context.promotion_runtime = null;
-        self.resolution_owner.deinitContext(self.runtime_alloc);
-        self.resolution_append_context = null;
+        self.enrichment.resolution.owner.deinitContext(self.runtime_alloc);
+        self.enrichment.resolution.append_context = null;
         // Derived full-text publishers may be asleep in merge backpressure
         // admission. Close that admission before joining their executor: the
         // merge runtime is the owner of the wakeup predicate, so joining the
@@ -6071,15 +5586,6 @@ pub const DB = struct {
         self.runtime_alloc.destroy(self.local_execution);
         self.* = undefined;
         self.closed = true;
-    }
-
-    /// Admit an external recovery pass without exposing write-gate policy.
-    pub fn admitTransactionRecovery(self: *DB) !?MutationBarrier.SharedLease {
-        if (comptime storage_engine.enabled) return storage_engine.call("admitTransactionRecovery", .{self});
-        var lease = self.acquireReplicationMutationShared();
-        errdefer if (lease) |*held| held.release();
-        try self.enforceReplicationWriteGate();
-        return lease;
     }
 
     pub fn recoverFinalizedTransactionIntents(self: *DB, now_ns: u64) !u64 {
@@ -6190,7 +5696,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("lsmMaintenanceScore", .{self}) catch @panic("incompatible storage owner");
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
-        return @max(@intFromBool(self.source_pin_cleanup.epoch.load(.acquire) != 0), @max(
+        return @max(@intFromBool(self.recovery.source_pin_cleanup.epoch.load(.acquire) != 0), @max(
             self.core.primary_store_owner.lsmMaintenanceScore(),
             self.core.index_manager.lsmMaintenanceScore(),
         ));
@@ -6198,7 +5704,7 @@ pub const DB = struct {
 
     pub fn lsmMaintenanceDebtHint(self: *DB) u64 {
         if (comptime storage_engine.enabled) return storage_engine.call("lsmMaintenanceDebtHint", .{self}) catch @panic("incompatible storage owner");
-        return @max(@intFromBool(self.source_pin_cleanup.epoch.load(.acquire) != 0), @max(
+        return @max(@intFromBool(self.recovery.source_pin_cleanup.epoch.load(.acquire) != 0), @max(
             self.core.primary_store_owner.lsmMaintenanceDebtHint(),
             self.core.index_manager.lsmMaintenanceDebtHint(),
         ));
@@ -6215,8 +5721,8 @@ pub const DB = struct {
         if (self.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
-        if (self.source_pin_cleanup.epoch.load(.acquire) != 0) {
-            const candidate = self.source_pin_cleanup.next_ns.load(.acquire) -| monotonicTimeNs();
+        if (self.recovery.source_pin_cleanup.epoch.load(.acquire) != 0) {
+            const candidate = self.recovery.source_pin_cleanup.next_ns.load(.acquire) -| monotonicTimeNs();
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
         return delay_ns;
@@ -6515,7 +6021,7 @@ pub const DB = struct {
 
     fn runLsmMaintenanceStepAdmitted(self: *DB, snapshot_replay: *const snapshot_admission_mod.SnapshotAdmission.MutationLease) !bool {
         std.debug.assert(snapshot_replay.active and snapshot_replay.admission == self.core.snapshot_replay_admission);
-        if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStep()) return true;
+        if (self.recovery.source_pin_cleanup.takeTurn() and try self.recovery.runSourcePinCleanupStep()) return true;
         if (try self.core.index_manager.runLsmObsoleteReclaimDue()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -6527,7 +6033,7 @@ pub const DB = struct {
         if (primary_score == 0 and index_score == 0) {
             self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
             self.core.index_manager.refreshLsmMaintenanceDebtHint();
-            return try self.runSourcePinCleanupStep();
+            return try self.recovery.runSourcePinCleanupStep();
         }
         if (primary_score >= index_score) {
             return try self.core.primary_store_owner.runLsmMaintenanceStep();
@@ -6541,7 +6047,7 @@ pub const DB = struct {
         defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
-        if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStep()) return true;
+        if (self.recovery.source_pin_cleanup.takeTurn() and try self.recovery.runSourcePinCleanupStep()) return true;
         if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -6556,35 +6062,11 @@ pub const DB = struct {
         if (primary_score > 0) {
             self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         }
-        return try self.runSourcePinCleanupStep();
-    }
-
-    /// Source-pin deletion shares the LSM maintenance lane; it never creates a
-    /// dedicated thread or monopolizes compaction while the corpus is large.
-    pub fn runSourcePinCleanupStep(self: *DB) !bool {
-        if (comptime storage_engine.enabled) return storage_engine.call("runSourcePinCleanupStep", .{self});
-        if (openModeRequiresReadOnlyBackends(self.open_mode) or !self.source_pin_cleanup.due(monotonicTimeNs())) return false;
-        const units_before = self.source_pin_cleanup.work_units.load(.acquire);
-        const work = @import("source_pin.zig").reconcileReleasedWithBudget(self, .{}) catch |err| {
-            const progressed = self.source_pin_cleanup.work_units.load(.acquire) != units_before;
-            self.recordSourcePinCleanupFailureWithProgress(err, progressed);
-            return progressed;
-        };
-        const progressed = work.completed_units != 0;
-        self.source_pin_cleanup.succeeded(progressed, monotonicTimeNs());
-        return progressed;
-    }
-
-    pub fn recordSourcePinCleanupFailure(self: *DB, err: anyerror) void {
-        self.recordSourcePinCleanupFailureWithProgress(err, false);
-    }
-
-    fn recordSourcePinCleanupFailureWithProgress(self: *DB, err: anyerror, progressed: bool) void {
-        self.source_pin_cleanup.failed(err, progressed, monotonicTimeNs(), self.core.path);
+        return try self.recovery.runSourcePinCleanupStep();
     }
 
     pub fn sourcePinCleanupStatus(self: *DB) @import("source_pin_cleanup_owner.zig").Status {
-        return self.source_pin_cleanup.status();
+        return self.recovery.source_pin_cleanup.status();
     }
 
     pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
@@ -7321,7 +6803,7 @@ pub const DB = struct {
         public_schema_json: ?[]const u8,
         applied_lsn_marker: ?u64,
     ) anyerror!void {
-        var prepared_recovery = if (self.transaction_recovery_identity_context != null)
+        var prepared_recovery = if (self.recovery.transactions.identity_context != null)
             try db_core.PreparedRecoveryRelationalState.init(
                 self.runtime_alloc,
                 if (table_schema.storage_mode == .relational) table_schema.relational_columns else null,
@@ -7361,7 +6843,7 @@ pub const DB = struct {
         var schema_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(schema_json, &schema_digest, .{});
         if (!std.mem.eql(u8, &schema_digest, &published.schema_json_digest)) return error.InvalidGenerationPublication;
-        var prepared_recovery = if (self.transaction_recovery_identity_context != null)
+        var prepared_recovery = if (self.recovery.transactions.identity_context != null)
             try db_core.PreparedRecoveryRelationalState.init(self.runtime_alloc, if (table_schema.storage_mode == .relational) table_schema.relational_columns else null, table_schema.version)
         else
             null;
@@ -7450,7 +6932,7 @@ pub const DB = struct {
     /// Older retries remain allocation-free and do not decode their payloads.
     pub fn recoverReplicatedBatchCut(self: *DB, sequence: u64) !bool {
         if (sequence != try self.replicationAppliedSequence()) return false;
-        try self.resumePreparedSourcePin();
+        try self.recovery.resumePreparedSourcePin();
         if (try self.restoreStagingStatus(self.alloc)) |stored| {
             var progress = stored;
             defer progress.deinit();
@@ -7648,7 +7130,7 @@ pub const DB = struct {
             }
             try self.waitForSyncLevel(child_batch.sync_level, sequence, sync_targets);
         }
-        if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+        if (self.enrichment.runtime) |runtime| runtime.notifySequence(sequence);
         self.notifyResolverReplayRuntimes(sequence);
         return sequence;
     }
@@ -7990,103 +7472,17 @@ pub const DB = struct {
 
     pub const thinReplayInputsHaveDerivedWork = local_mutation.thinReplayInputsHaveDerivedWork;
 
-    /// Inject (or clear) the cross-shard entity-resolution candidate source on
-    /// an already-open DB. The serving layer (managed write cache) calls this
-    /// right after a DB is opened, since managed DBs open lazily and cannot
-    /// thread the source through `OpenOptions`. No-op when this DB has no
-    /// resolution runtime (e.g. read-only / status opens).
-    /// The embedder must outlive all resolution work. Call under the owner fence
-    /// when replacing a managed enrichment runtime.
-    pub fn setResolutionEmbedder(self: *DB, embedder: ?embedder_mod.DenseEmbedder) void {
-        if (self.resolution_runtime) |runtime| {
-            while (!runtime.catch_up_mutex.tryLock()) std.atomic.spinLoopHint();
-            defer runtime.catch_up_mutex.unlock();
-            runtime.embedder = embedder;
-        }
-        self.resolution_embedder = embedder;
-    }
-
-    pub fn setResolutionCandidateSource(self: *DB, src: ?resolution_runtime_mod.CandidateSource) void {
-        if (comptime storage_engine.enabled) return storage_engine.call("setResolutionCandidateSource", .{ self, src }) catch @panic("incompatible storage owner");
-        self.resolution_candidate_source = src;
-        if (self.resolution_append_context) |context| context.cache_source = src;
-        if (self.resolution_runtime) |runtime| runtime.setCandidateSource(src);
-    }
-
-    /// Inject (or clear) the cross-shard entity sink on an already-open DB. The
-    /// serving layer (managed write cache) calls this right after a DB is opened,
-    /// since managed DBs open lazily and cannot thread the sink through
-    /// `OpenOptions`. No-op when this DB has no promotion runtime.
-    pub fn setEntitySink(self: *DB, sink: ?promotion_runtime_mod.EntitySink) void {
-        if (comptime storage_engine.enabled) return storage_engine.call("setEntitySink", .{ self, sink }) catch @panic("incompatible storage owner");
-        self.entity_sink = sink;
-        if (self.promotion_runtime) |runtime| runtime.setSink(sink);
-    }
-
-    /// Inject (or clear) the source-shard promotion owner on an already-open DB.
-    /// Serving-layer managed DBs use this to keep follower raft apply from
-    /// turning replay into public entity-table writes.
-    pub fn setPromotionOwner(self: *DB, owner: ?promotion_runtime_mod.PromotionOwner) void {
-        if (comptime storage_engine.enabled) return storage_engine.call("setPromotionOwner", .{ self, owner }) catch @panic("incompatible storage owner");
-        self.promotion_owner = owner;
-        if (self.promotion_runtime) |runtime| runtime.setOwner(owner);
-    }
-
     pub const failIfIdentityOrdinalExhaustedForNewUpserts = local_mutation.failIfIdentityOrdinalExhaustedForNewUpserts;
 
     pub const clearBulkIngestIdentityAllNewLocked = local_mutation.clearBulkIngestIdentityAllNewLocked;
 
     pub const clearActiveIndexRepairsLocked = local_mutation.clearActiveIndexRepairsLocked;
 
-    var test_enrichment_restart_failures_remaining: std.atomic.Value(u32) = .init(0);
-    var test_enrichment_reconfigure_after_detached_hook: ?*const fn (*DB) anyerror!void = null;
+    pub var test_enrichment_restart_failures_remaining: std.atomic.Value(u32) = .init(0);
+    pub var test_enrichment_reconfigure_after_detached_hook: ?*const fn (*DB) anyerror!void = null;
 
-    fn startEnrichmentRuntimeForLifecycle(runtime: *enrichment_runtime_mod.EnrichmentRuntime) !void {
-        if (builtin.is_test) {
-            var remaining = test_enrichment_restart_failures_remaining.load(.acquire);
-            while (remaining != 0) {
-                if (test_enrichment_restart_failures_remaining.cmpxchgWeak(
-                    remaining,
-                    remaining - 1,
-                    .acq_rel,
-                    .acquire,
-                )) |actual| {
-                    remaining = actual;
-                    continue;
-                }
-                return error.TestTransientEnrichmentRestart;
-            }
-        }
-        try runtime.start();
-    }
-
-    fn scheduleEnrichmentRestartContext(ctx: *AsyncContext, lane: background_runtime_mod.DurableJobLane, owner_id: u64) void {
-        ctx.enrichment_restart_owner.schedule(.{ .ptr = ctx, .lane = lane, .owner_id = owner_id, .io = ctx.io, .closing = &ctx.background_closing, .wanted = enrichmentRestartWanted, .attempt = attemptEnrichmentRestart, .name = "enrichment", .unavailable = error.EnrichmentRuntimeUnavailable });
-    }
-    fn enrichmentRestartWanted(ptr: *anyopaque) bool {
-        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-        return ctx.enrichment_desired_running.load(.acquire);
-    }
-    fn attemptEnrichmentRestart(ptr: *anyopaque) !bool {
-        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-        lockAtomicWithBackoff(&ctx.enrichment_lifecycle_mutex);
-        const runtime = ctx.enrichment_runtime;
-        const should_start = runtime != null and ctx.enrichment_desired_running.load(.acquire) and !ctx.background_closing.load(.acquire) and !runtime.?.isStarted();
-        const start_error: ?anyerror = if (should_start) blk: {
-            startEnrichmentRuntimeForLifecycle(runtime.?) catch |err| break :blk err;
-            break :blk null;
-        } else null;
-        const started = runtime == null or runtime.?.isStarted();
-        ctx.enrichment_lifecycle_mutex.unlock();
-        if (started) {
-            notifyQueryVisibilityHook(ctx, .status);
-            return true;
-        }
-        if (start_error) |err| return err;
-        return false;
-    }
     const MaintenanceRuntimeKind = enum { text_merge, sparse_compaction };
-    fn restartWanted(_: *anyopaque) bool {
+    pub fn restartWanted(_: *anyopaque) bool {
         return true;
     }
     pub fn scheduleMaintenanceRestartContext(ctx: *AsyncContext, lane: background_runtime_mod.DurableJobLane, owner_id: u64, kind: MaintenanceRuntimeKind) void {
@@ -8098,16 +7494,6 @@ pub const DB = struct {
             .text_merge => TextIndexes.attemptMergeRestart,
             .sparse_compaction => SparseIndexes.attemptCompactionRestart,
         }, .name = @tagName(kind) });
-    }
-
-    fn quiesceEnrichmentForStructuralMutation(self: *DB) bool {
-        const desired = self.async_context.enrichment_desired_running.swap(false, .acq_rel);
-        lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
-        defer self.async_context.enrichment_lifecycle_mutex.unlock();
-        const runtime = self.async_context.enrichment_runtime orelse return desired;
-        const started = runtime.isStarted();
-        if (started) runtime.stop();
-        return desired or started;
     }
 
     const IndexStructuralMutationGuard = struct {
@@ -8220,12 +7606,12 @@ pub const DB = struct {
         return .{ .db = self };
     }
 
-    const QuarantineIndexPublicationFence = struct {
+    pub const QuarantineIndexPublicationFence = struct {
         db: *DB,
         structural_guard: ?IndexStructuralMutationGuard = null,
         apply_locked: bool = false,
 
-        fn iface(self: *@This()) index_manager_mod.IndexManager.CatalogPublicationFence {
+        pub fn iface(self: *@This()) index_manager_mod.IndexManager.CatalogPublicationFence {
             return .{
                 .ptr = self,
                 .lock_fn = lockOpaque,
@@ -9011,7 +8397,7 @@ pub const DB = struct {
         artifact_name: []const u8,
         wait_for_completion: bool,
     ) !bool {
-        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse
+        var cfg = (try self.enrichment.getEnrichment(alloc, .asset, artifact_name)) orelse
             return self.reprocessEmbeddingArtifactIssue(alloc, .{
                 .artifact_kind = .embedding,
                 .doc_key = doc_key,
@@ -9062,7 +8448,7 @@ pub const DB = struct {
         issue: types.ArtifactRepairIssue,
         wait_for_completion: bool,
     ) !bool {
-        var cfg = (try self.getEnrichment(alloc, .embedding, issue.artifact_name)) orelse return false;
+        var cfg = (try self.enrichment.getEnrichment(alloc, .embedding, issue.artifact_name)) orelse return false;
         defer cfg.deinit(alloc);
 
         const source_doc_key = if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key;
@@ -9086,7 +8472,7 @@ pub const DB = struct {
         alloc: Allocator,
         issue: types.ArtifactRepairIssue,
     ) !bool {
-        var cfg = (try self.getEnrichment(alloc, .chunk, issue.artifact_name)) orelse return false;
+        var cfg = (try self.enrichment.getEnrichment(alloc, .chunk, issue.artifact_name)) orelse return false;
         defer cfg.deinit(alloc);
 
         const source_doc_key = if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key;
@@ -9595,21 +8981,6 @@ pub const DB = struct {
         return true;
     }
 
-    fn enrichmentFailureCoverageMarkerKeyAlloc(
-        self: *DB,
-        alloc: Allocator,
-        issue: types.ArtifactRepairIssue,
-    ) !?[]u8 {
-        if (issue.reason != .enrichment_failed or issue.index_name.len == 0) return null;
-        if (self.core.index_manager.denseIndex(issue.index_name) == null and
-            self.core.index_manager.sparseIndex(issue.index_name) == null)
-        {
-            return null;
-        }
-        const generation = self.core.index_manager.coverageGenerationForIndex(issue.index_name) orelse return null;
-        return try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, issue.index_name, generation, issue.doc_key);
-    }
-
     fn repairCoverageMarkerComplete(self: *DB, alloc: Allocator, marker_key: []const u8) !bool {
         const raw_outcome = self.core.store.get(alloc, marker_key) catch |err| switch (err) {
             error.NotFound => return false,
@@ -9630,7 +9001,7 @@ pub const DB = struct {
         expected_epoch: u64,
         require_completed_fence: bool,
     ) !ArtifactRepairCompletionDisposition {
-        const coverage_marker_key = try self.enrichmentFailureCoverageMarkerKeyAlloc(alloc, issue);
+        const coverage_marker_key = try self.enrichment.failureCoverageMarkerKeyAlloc(alloc, issue);
         defer if (coverage_marker_key) |key| alloc.free(key);
 
         lockAtomicWithBackoff(&self.async_context.artifact_repair_issue_mutex);
@@ -9706,7 +9077,7 @@ pub const DB = struct {
         return true;
     }
 
-    fn rebuildArtifactRepairSummaryIfMissing(self: *DB, alloc: Allocator) !bool {
+    pub fn rebuildArtifactRepairSummaryIfMissing(self: *DB, alloc: Allocator) !bool {
         // Issue writers publish the ledger mutation and summary invalidation in
         // one store batch under this mutex. Hold the same fence for each bounded
         // rebuild quantum so a writer cannot commit a dirty marker after our
@@ -10029,7 +9400,7 @@ pub const DB = struct {
         return true;
     }
 
-    fn rebuildArtifactRepairKindIndexIfMissing(self: *DB, alloc: Allocator) !bool {
+    pub fn rebuildArtifactRepairKindIndexIfMissing(self: *DB, alloc: Allocator) !bool {
         if (try self.artifactRepairKindIndexReady(alloc)) return false;
 
         const prefix = try internal_keys.artifactRepairIssueRootPrefixAlloc(alloc);
@@ -10557,7 +9928,7 @@ pub const DB = struct {
     fn assetArtifactNowReadable(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !bool {
         const doc_key = if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key;
         if (doc_key.len == 0 or issue.artifact_name.len == 0) return false;
-        var cfg = (try self.getEnrichment(alloc, .asset, issue.artifact_name)) orelse return false;
+        var cfg = (try self.enrichment.getEnrichment(alloc, .asset, issue.artifact_name)) orelse return false;
         defer cfg.deinit(alloc);
         var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
         defer producer_cfg.deinit(alloc);
@@ -10822,39 +10193,6 @@ pub const DB = struct {
                 counts.produced.? +| counts.skipped.? != total) return false;
         }
         return true;
-    }
-
-    /// Atomic managed admission normally defers the canonical derived worker
-    /// until shadow activation. The canonical generation can nevertheless
-    /// become independently serviceable while enrichment drains its durable
-    /// requests. Before retiring that admission intent, attach the ordinary
-    /// worker at the durable publication cursor so future writes continue to
-    /// advance the generation. Intent removal is deliberately ordered after
-    /// this fallible operation: a failed attachment remains durable repair
-    /// debt and is retried by the same single owner.
-    pub fn ensureManagedAdmissionCanonicalWorker(
-        self: *DB,
-        alloc: Allocator,
-        intent: index_repair_state.IndexRepairIntent,
-    ) !void {
-        if (!self.start_index_workers or self.executor.appliedSequence(intent.index_name) != null) return;
-
-        const configs = try self.core.listIndexes(alloc);
-        defer types.freeIndexConfigs(alloc, configs);
-        const cfg = for (configs) |candidate| {
-            if (std.mem.eql(u8, candidate.name, intent.index_name)) break candidate;
-        } else return error.IndexNotFound;
-        if (cfg.kind != intent.kind or types.indexConfigHash(cfg) != intent.config_hash) {
-            return error.IndexConfigMismatch;
-        }
-
-        const applied = try self.core.loadAppliedSequence(alloc, intent.index_name);
-        try self.executor.addWorker(intent.index_name, .{
-            .name = intent.index_name,
-            .kind = intent.kind,
-        }, applied);
-        const current_target = self.core.nextDerivedSequence();
-        if (current_target > applied) self.executor.notifyIndexes(current_target, &.{intent.index_name});
     }
 
     /// Progressive managed admission publishes only the canonical active
@@ -11572,12 +10910,8 @@ pub const DB = struct {
         );
     }
 
-    fn requestManagedAdmissionMaterialization(self: *DB) void {
-        self.managed_admission.request();
-    }
-
     pub fn managedAdmissionMaterializationPending(self: *const DB) bool {
-        return self.managed_admission.pending();
+        return self.enrichment.managed_admission.pending();
     }
 
     /// Drain every generation observed while a pass is in flight. A marker
@@ -11592,7 +10926,7 @@ pub const DB = struct {
 
     /// The caller already owns index structural serialization.
     fn drainManagedIndexAdmissionsUnderStructuralGuard(self: *DB, alloc: Allocator) !void {
-        try self.managed_admission.drain(alloc, .{ .ptr = self, .pass = managedAdmissionPass });
+        try self.enrichment.managed_admission.drain(alloc, .{ .ptr = self, .pass = managedAdmissionPass });
     }
 
     fn managedAdmissionPass(ptr: *anyopaque, alloc: Allocator) !void {
@@ -12503,7 +11837,7 @@ pub const DB = struct {
 
     pub fn retireServiceableInitialBuild(self: *DB, alloc: Allocator, repair_id: u128, intent: index_repair_state.IndexRepairIntent) !bool {
         if (!try self.managedAdmissionGenerationIsServiceable(alloc, intent)) return false;
-        try self.ensureManagedAdmissionCanonicalWorker(alloc, intent);
+        try self.enrichment.ensureManagedAdmissionCanonicalWorker(alloc, intent);
         if (intent.kind == .full_text) {
             const text = self.core.textIndexEntry(intent.index_name) orelse return error.IndexNotFound;
             try self.core.index_manager.rebuildState(.full_text, text.rebuild_root_path, text.config).clearWithIo(self.core.index_manager.checkpointIo());
@@ -12859,7 +12193,7 @@ pub const DB = struct {
                 error.ArtifactRepairRequired => {},
                 else => return err,
             };
-            try self.runArtifactRepairMetadataMaintenanceUntilIdle();
+            try self.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle();
         }
         return result;
     }
@@ -13069,14 +12403,14 @@ pub const DB = struct {
                 var current = try self.indexes.repair.loadEntryById(alloc, repair_id);
                 defer current.deinit(alloc);
                 if (try self.managedAdmissionGenerationIsServiceable(alloc, current.intent)) {
-                    try self.ensureManagedAdmissionCanonicalWorker(alloc, current.intent);
+                    try self.enrichment.ensureManagedAdmissionCanonicalWorker(alloc, current.intent);
                     try self.indexes.repair.removeIntentAndPin(alloc, repair_id);
                     result.repaired += 1;
                     result.indexes_degraded_after = 0;
                     return result;
                 }
                 if (try self.managedAdmissionGenerationIsQueryable(alloc, current.intent)) {
-                    try self.ensureManagedAdmissionCanonicalWorker(alloc, current.intent);
+                    try self.enrichment.ensureManagedAdmissionCanonicalWorker(alloc, current.intent);
                     result.in_progress += 1;
                     result.unresolved += 1;
                     result.debt_remaining = true;
@@ -13127,7 +12461,7 @@ pub const DB = struct {
                     // exact quarantined incarnation. If its identity changes,
                     // defer so the next pass re-audits the new policy instead
                     // of carrying stale authorization into reconstruction.
-                    const retry_result = try self.retryQuarantinedIndexLoadTarget(.{
+                    const retry_result = try self.maintenance.retryQuarantinedIndexLoadTarget(.{
                         .name = cfg.name,
                         .token = failure.token,
                     }, true);
@@ -13415,8 +12749,8 @@ pub const DB = struct {
         req: types.DocumentArtifactTableReprocessRequest,
     ) !types.DocumentArtifactTableReprocessResult {
         if (comptime storage_engine.enabled) return storage_engine.call("reprocessDocumentArtifactRange", .{ self, alloc, artifact_name, req });
-        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse
-            (try self.getEnrichment(alloc, .embedding, artifact_name)) orelse return error.NotFound;
+        var cfg = (try self.enrichment.getEnrichment(alloc, .asset, artifact_name)) orelse
+            (try self.enrichment.getEnrichment(alloc, .embedding, artifact_name)) orelse return error.NotFound;
         defer cfg.deinit(alloc);
 
         var effective_req = req;
@@ -14991,8 +14325,8 @@ pub const DB = struct {
         const output_cancellation = checkpoint.token();
         if (!handle.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         try validateSnapshotId(id);
-        try lockAtomicWithCancellation(&self.snapshot_publication_mutex, cancellation);
-        defer self.snapshot_publication_mutex.unlock();
+        try lockAtomicWithCancellation(&self.recovery.publication.snapshot_mutex, cancellation);
+        defer self.recovery.publication.snapshot_mutex.unlock();
         const seal = @import("native_backup_seal.zig");
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         var pin_lock = try seal.StoreLock.acquire(self.alloc, io, self.core.path, cancellation);
@@ -15042,8 +14376,8 @@ pub const DB = struct {
             certificate.output.* = null;
         };
         if (!handle.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
-        try lockAtomicWithCancellation(&self.snapshot_publication_mutex, cancellation);
-        defer self.snapshot_publication_mutex.unlock();
+        try lockAtomicWithCancellation(&self.recovery.publication.snapshot_mutex, cancellation);
+        defer self.recovery.publication.snapshot_mutex.unlock();
         const seal = @import("native_backup_seal.zig");
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         var pin_lock = try seal.StoreLock.acquire(self.alloc, io, self.core.path, cancellation);
@@ -15109,8 +14443,8 @@ pub const DB = struct {
     /// cleanup, and a delayed seal can never recreate an acknowledged release.
     pub fn releaseBackupCohort(self: *DB, handle: @import("native_backup_seal.zig").Handle) !void {
         if (!handle.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
-        lockAtomicWithBackoff(&self.snapshot_publication_mutex);
-        defer self.snapshot_publication_mutex.unlock();
+        lockAtomicWithBackoff(&self.recovery.publication.snapshot_mutex);
+        defer self.recovery.publication.snapshot_mutex.unlock();
         const seal = @import("native_backup_seal.zig");
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         try seal.reclaim(self.alloc, io, self.core.path, .{ .release = handle }, .none);
@@ -15120,8 +14454,8 @@ pub const DB = struct {
     /// or delivery is delayed. Caller authority is the exact cohort fence.
     pub fn cancelBackupCohort(self: *DB, fence: @import("relational_integrity_topology.zig").Fence) !void {
         if (fence.role != .backup_snapshot or !fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
-        lockAtomicWithBackoff(&self.snapshot_publication_mutex);
-        defer self.snapshot_publication_mutex.unlock();
+        lockAtomicWithBackoff(&self.recovery.publication.snapshot_mutex);
+        defer self.recovery.publication.snapshot_mutex.unlock();
         const seal = @import("native_backup_seal.zig");
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         try seal.reclaim(self.alloc, io, self.core.path, .{ .cancel = fence }, .none);
@@ -15257,7 +14591,7 @@ pub const DB = struct {
             }
         };
     }
-    fn warmNativeCheckpoint(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
+    pub fn warmNativeCheckpoint(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
         const self: *DB = @ptrCast(@alignCast(raw));
         const cut = @import("native_query_cut.zig");
         const repository = self.backend_runtime.query_cut_repository orelse return true;
@@ -15387,8 +14721,8 @@ pub const DB = struct {
         // Serialize only snapshot construction/publication. Normal writes can
         // resume before native manifest hashing, while same-ID captures cannot
         // race the fresh-directory check or atomic rename.
-        try lockAtomicWithCancellation(&self.snapshot_publication_mutex, cancellation);
-        defer self.snapshot_publication_mutex.unlock();
+        try lockAtomicWithCancellation(&self.recovery.publication.snapshot_mutex, cancellation);
+        defer self.recovery.publication.snapshot_mutex.unlock();
         profile.next("staging");
         try ensureSnapshotActive(cancellation);
         try validateSnapshotId(id);
@@ -17569,7 +16903,7 @@ pub const DB = struct {
         }
         if (std.mem.eql(u8, phase, "replay_enrichments")) {
             if (self.core.hasGeneratedEnrichmentTargets()) {
-                const runtime = self.enrichment_runtime orelse return error.RestoreRepairRequiresEnrichmentRuntime;
+                const runtime = self.enrichment.runtime orelse return error.RestoreRepairRequiresEnrichmentRuntime;
                 std.log.info("restore runtime repair replay generated enrichments path={s}", .{self.core.path});
                 // A restored enrichment checkpoint can be equal to the first
                 // destination replay sequence even when the destination has
@@ -17583,7 +16917,7 @@ pub const DB = struct {
                     };
                 };
                 try runtime.resumeFrom(0, self.core.nextDerivedSequence());
-                const generated_refs = try self.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+                const generated_refs = try self.enrichment.replayGeneratedEnrichmentsFromStoredDocs(alloc);
                 // Restore opens with optional workers disabled and drains them
                 // synchronously. Starting a background worker here races the
                 // foreground catch-up in the next phase over index mutation.
@@ -17967,8 +17301,8 @@ pub const DB = struct {
         const keys = try self.core.store.scanPrefixKeysPage(alloc, &user_prefix, cursor, scan_page_size);
         defer freeOwnedKeySlice(alloc, keys);
         if (keys.len == 0) {
-            if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
-            self.graph_restore_parse_cache = null;
+            if (self.recovery.restore.graph_parse_cache) |*cache| cache.deinit(self.alloc);
+            self.recovery.restore.graph_parse_cache = null;
             return .{ .complete = true };
         }
 
@@ -18004,7 +17338,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         var schedule_replication_recovery_on_exit = false;
         defer if (schedule_replication_recovery_on_exit) self.scheduleDurableReplicationOutboxRecovery();
-        var prepared_recovery = if (self.transaction_recovery_identity_context != null)
+        var prepared_recovery = if (self.recovery.transactions.identity_context != null)
             try db_core.PreparedRecoveryRelationalState.init(
                 self.runtime_alloc,
                 if (table_schema.storage_mode == .relational) table_schema.relational_columns else null,
@@ -18105,9 +17439,9 @@ pub const DB = struct {
         const enabled = relationalColumns(self) != null;
         self.async_context.relational_base_rows = enabled;
         self.core.index_manager.setRelationalBaseRows(enabled);
-        if (self.ttl_cleanup_context) |ctx| ctx.batch.relational_base_rows = enabled;
-        if (self.enrichment_runtime) |runtime| runtime.setRelationalBaseRows(enabled);
-        if (self.transaction_recovery_identity_context) |ctx| try ctx.updateRelationalColumns(
+        if (self.ttl.cleanup_context) |ctx| ctx.batch.relational_base_rows = enabled;
+        if (self.enrichment.runtime) |runtime| runtime.setRelationalBaseRows(enabled);
+        if (self.recovery.transactions.identity_context) |ctx| try ctx.updateRelationalColumns(
             relationalColumns(self),
             if (self.core.schema) |schema| schema.version else 0,
         );
@@ -18117,9 +17451,9 @@ pub const DB = struct {
         const enabled = relationalColumns(self) != null;
         self.async_context.relational_base_rows = enabled;
         self.core.index_manager.setRelationalBaseRows(enabled);
-        if (self.ttl_cleanup_context) |ctx| ctx.batch.relational_base_rows = enabled;
-        if (self.enrichment_runtime) |runtime| runtime.setRelationalBaseRows(enabled);
-        if (self.transaction_recovery_identity_context) |ctx| {
+        if (self.ttl.cleanup_context) |ctx| ctx.batch.relational_base_rows = enabled;
+        if (self.enrichment.runtime) |runtime| runtime.setRelationalBaseRows(enabled);
+        if (self.recovery.transactions.identity_context) |ctx| {
             ctx.installPreparedRelationalState(prepared orelse unreachable);
         }
     }
@@ -18253,7 +17587,7 @@ pub const DB = struct {
         };
         var prepared_schema = try self.core.prepareSchemaMetadata(runtime_schema, &writes);
         defer prepared_schema.deinit();
-        var prepared_recovery = if (self.transaction_recovery_identity_context != null)
+        var prepared_recovery = if (self.recovery.transactions.identity_context != null)
             try db_core.PreparedRecoveryRelationalState.init(
                 self.runtime_alloc,
                 if (runtime_schema.storage_mode == .relational) runtime_schema.relational_columns else null,
@@ -18437,7 +17771,7 @@ pub const DB = struct {
         }
         var prepared = try self.core.prepareSchemaMetadataPublishedChild(runtime_schema, writes[0..write_count]);
         defer prepared.deinit();
-        var prepared_recovery = if (self.transaction_recovery_identity_context != null)
+        var prepared_recovery = if (self.recovery.transactions.identity_context != null)
             try db_core.PreparedRecoveryRelationalState.init(self.runtime_alloc, runtime_schema.relational_columns, runtime_schema.version)
         else
             null;
@@ -18715,7 +18049,7 @@ pub const DB = struct {
         defer parsed_schema.deinit(self.alloc);
         const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(self.alloc, parsed_schema);
         defer schema_mod.freeSchema(self.alloc, runtime_schema);
-        var prepared_recovery = if (self.transaction_recovery_identity_context != null)
+        var prepared_recovery = if (self.recovery.transactions.identity_context != null)
             try db_core.PreparedRecoveryRelationalState.init(
                 self.runtime_alloc,
                 if (runtime_schema.storage_mode == .relational) runtime_schema.relational_columns else null,
@@ -20168,7 +19502,7 @@ pub const DB = struct {
         return .{ .fence = fence, .drained = !try manager.hasTopologySensitiveTransactions() };
     }
 
-    fn childGenerationSourceFence(core: *db_core.DBCore) !bool {
+    pub fn childGenerationSourceFence(core: *db_core.DBCore) !bool {
         var read = try core.store.beginProbeTxn();
         defer read.abort();
         const fence = (try @import("relational_integrity_topology.zig").current(&read)) orelse return false;
@@ -20180,26 +19514,6 @@ pub const DB = struct {
         std.crypto.hash.Blake3.hash(encoded_catalog, &digest, .{});
         if (!std.mem.eql(u8, &digest, &fence.catalog_digest)) return error.IntegrityCatalogChanged;
         return true;
-    }
-
-    fn childGenerationSourcePinsSchema(core: *db_core.DBCore, candidate_version: u32) !bool {
-        if (!try childGenerationSourceFence(core)) return false;
-        const durable = core.schema orelse return error.IntegrityCatalogChanged;
-        if (candidate_version <= durable.version) return false;
-        if (candidate_version != (std.math.add(u32, durable.version, 1) catch return error.GenerationAdmissionChanged))
-            return error.GenerationAdmissionChanged;
-        return true;
-    }
-
-    /// The metadata successor is visible before its exact Raft schema install.
-    /// Callers configuring a reopened owner must retain its old schema and
-    /// indexes while the verified child-source fence remains active.
-    pub fn childGenerationSourcePinsSchemaJson(self: *DB, schema_json: []const u8) !bool {
-        var parsed = try public_table_schema.parseValidatedTableSchema(self.alloc, schema_json);
-        defer parsed.deinit(self.alloc);
-        self.core.lockApplyShared();
-        defer self.core.unlockApplyShared();
-        return childGenerationSourcePinsSchema(self.core, parsed.version);
     }
 
     /// A cold current-catalog owner may reopen after the exact child schema
@@ -20621,29 +19935,9 @@ pub const DB = struct {
         return self.deleteIndexForReconciliation(name, context);
     }
     pub fn reconcileArtifactDeleteResolver(self: *DB, name: []const u8, context: @import("artifact_reconcile_intent.zig").Context) !bool {
-        const removed = try self.removeResolverForReconciliation(name, context);
-        if (removed) self.stopResolverReplayRuntimesIfUnconfigured();
+        const removed = try self.enrichment.removeResolverForReconciliation(name, context);
+        if (removed) self.enrichment.stopResolverReplayRuntimesIfUnconfigured();
         return removed;
-    }
-    pub fn reconcileArtifactDeleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8, context: @import("artifact_reconcile_intent.zig").Context) !bool {
-        return self.deleteEnrichmentForReconciliation(kind, name, context);
-    }
-    pub fn reconcileArtifactAddEnrichment(self: *DB, cfg: types.EnrichmentConfig, context: @import("artifact_reconcile_intent.zig").Context) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("reconcileArtifactAddEnrichment", .{ self, cfg, context });
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        // Exact committed reconciliation provenance authorizes standby
-        // materialization; no public/local configuration bypass is exposed.
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        {
-            var probe = try self.core.store.beginProbeTxn();
-            defer probe.abort();
-            try self.requireOnlineArtifactCatalogMutableWithContextLocked(&probe, context);
-        }
-        try self.enforceVectorMigrationConfigurationGate();
-        _ = try self.core.upsertEnrichment(cfg);
     }
 
     pub const artifactMaterializationsReady = local_mutation.artifactMaterializationsReady;
@@ -21458,7 +20752,7 @@ pub const DB = struct {
         // Index projection alone cannot advance resolver/promotion targets:
         // otherwise the last publication waits forever for another base write.
         notifyResolverReplayRuntimesForCatalog(batch_ctx.index_manager, batch_ctx.resolution_runtime, batch_ctx.promotion_runtime, sequence);
-        if (command.producer_kind == .resolver) if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+        if (command.producer_kind == .resolver) if (self.enrichment.runtime) |runtime| runtime.notifySequence(sequence);
         if (self.executor.hasWorkers()) self.executor.forceSequence(sequence) else {
             prepared_value.batch.sequence = sequence;
             try self.lockApplyForPortableRuntime();
@@ -21520,25 +20814,6 @@ pub const DB = struct {
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
         return try @import("online_source.zig").status(&txn, scope);
-    }
-
-    /// Writer-open recovery runs before any optional worker or catalog replay.
-    /// A durable prepared admission cannot be hidden by its applied watermark.
-    fn resumePreparedSourcePin(self: *DB) !void {
-        const pending = blk: {
-            var read = try self.core.store.beginReadTxn();
-            defer read.abort();
-            break :blk try @import("../source_pin_state.zig").load(&read);
-        };
-        if (pending) |prepared| {
-            var namespace: [24]u8 = undefined;
-            doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
-            if (!std.mem.eql(u8, &prepared.namespace, &namespace)) return;
-            const scope = try @import("online_source_contract.zig").Scope.decode(&prepared.scope_bytes);
-            try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
-            try @import("source_pin.zig").ensureAssumeApply(self, scope);
-        }
     }
 
     pub fn prepareOnlineSourcePublication(self: *DB, scope: @import("online_source_contract.zig").Scope, cancellation: types.CancellationToken) !@import("../source_snapshot.zig").Certificate {
@@ -21859,15 +21134,15 @@ pub const DB = struct {
                             if (!previous.value.destination.eql(command.fence)) return error.IntegrityHandoffDestinationResetRequired;
                         }
                     }
-                    const enrichment = self.enrichmentStatsWithSupervisorState(.{ .enabled = true });
+                    const enrichment = self.enrichment.statsWithSupervisorState(.{ .enabled = true });
                     const has_producers = enrichment.enabled or self.core.hasGeneratedEnrichmentTargets() or self.core.index_manager.enrichments.items.len != 0 or self.hasConfiguredResolvers();
                     if (replication_lsn == null and has_producers) {
                         const target = self.currentMaintenanceTargetSequence();
                         if (enrichment.retrying or enrichment.worker_failed or enrichment.stalled or
                             ((enrichment.enabled or self.core.hasGeneratedEnrichmentTargets() or self.core.index_manager.enrichments.items.len != 0) and enrichment.applied_sequence < @max(target, enrichment.target_sequence))) return error.IntegrityTopologyBusy;
                         if (self.hasConfiguredResolvers()) {
-                            const resolution = self.resolutionStageStats();
-                            const promotion = self.promotionStageStats();
+                            const resolution = self.enrichment.resolutionStageStats();
+                            const promotion = self.enrichment.promotionStageStats();
                             if (!resolution.enabled or !promotion.enabled or resolution.blocked or promotion.blocked or resolution.applied_sequence < target or promotion.applied_sequence < target) return error.IntegrityTopologyBusy;
                         }
                         // An old participant commit could enqueue a new
@@ -22401,7 +21676,7 @@ pub const DB = struct {
             if (try self.findAlgebraicShortestPath(alloc, index_name, source, target, options.edge_types, options.direction, options.weight_mode, options.max_depth, options.min_weight, options.max_weight)) |path| return path;
         }
         const entry = self.core.index_manager.graphIndex(index_name) orelse {
-            try self.failIfIndexQuarantined(index_name);
+            try self.maintenance.failIfIndexQuarantined(index_name);
             return error.IndexNotFound;
         };
         return paths_mod.findShortestPath(alloc, &entry.index, source, target, options);
@@ -22451,7 +21726,7 @@ pub const DB = struct {
         try self.indexes.graph.requireEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.index_manager.graphIndex(index_name) orelse {
-            try self.failIfIndexQuarantined(index_name);
+            try self.maintenance.failIfIndexQuarantined(index_name);
             return error.IndexNotFound;
         };
         return paths_mod.findKShortestPaths(alloc, &entry.index, source, target, k, options);
@@ -22471,7 +21746,7 @@ pub const DB = struct {
         max_weight: ?f64,
     ) !?paths_mod.Path {
         const entry = self.core.index_manager.graphIndex(index_name) orelse {
-            try self.failIfIndexQuarantined(index_name);
+            try self.maintenance.failIfIndexQuarantined(index_name);
             return error.IndexNotFound;
         };
         const params = graph_query_mod.QueryParams{
@@ -22958,14 +22233,14 @@ pub const DB = struct {
         return self.requireOnlineArtifactCatalogMutableWithContextLocked(txn, null);
     }
 
-    fn requireArtifactReconcileUnfenced(self: *DB, txn: anytype, context: ?@import("artifact_reconcile_intent.zig").Context) !void {
+    pub fn requireArtifactReconcileUnfenced(self: *DB, txn: anytype, context: ?@import("artifact_reconcile_intent.zig").Context) !void {
         if (context) |value| {
             try @import("artifact_reconcile_intent.zig").requireContext(self.alloc, txn, value);
             if (try @import("relational_integrity_topology.zig").current(txn) != null) return error.IntegrityTopologyBusy;
         } else try @import("relational_integrity_topology.zig").requireUnfenced(txn);
     }
 
-    fn requireOnlineArtifactCatalogMutableWithContextLocked(self: *DB, txn: anytype, context: ?@import("artifact_reconcile_intent.zig").Context) !void {
+    pub fn requireOnlineArtifactCatalogMutableWithContextLocked(self: *DB, txn: anytype, context: ?@import("artifact_reconcile_intent.zig").Context) !void {
         var namespace: [24]u8 = undefined;
         doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
         return @import("artifact_catalog_mutability.zig").requireMutable(self.alloc, txn, namespace, context);
@@ -23045,7 +22320,7 @@ pub const DB = struct {
         // activity admission; never drain a corpus while holding activation.
         for (self.core.index_manager.resolvers.items) |resolver| {
             if (!std.mem.eql(u8, resolver.replacement_index, cfg.name)) continue;
-            const resolution_stats = self.resolutionStageStats();
+            const resolution_stats = self.enrichment.resolutionStageStats();
             if (resolution_stats.catch_up_required or resolution_stats.blocked) return error.Busy;
             var probe = try self.core.store.beginProbeTxn();
             defer probe.abort();
@@ -23135,33 +22410,6 @@ pub const DB = struct {
         };
     }
 
-    pub fn restartEnrichmentAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) !void {
-        // Manual hosts drive enrichment while holding their publication lease.
-        // Catalog changes must preserve the worker policy chosen at open.
-        if (!self.local_execution.optional_runtime_workers_enabled) return;
-        self.async_context.enrichment_desired_running.store(true, .release);
-        lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
-        const runtime = self.async_context.enrichment_runtime orelse {
-            self.async_context.enrichment_lifecycle_mutex.unlock();
-            return;
-        };
-        const start_result = if (!runtime.isStarted()) startEnrichmentRuntimeForLifecycle(runtime) else {};
-        self.async_context.enrichment_lifecycle_mutex.unlock();
-        start_result catch |err| {
-            // The durable restart supervisor owns recovery from this point;
-            // preserve the diagnostic without classifying a retryable outage
-            // as an unrecoverable process failure.
-            std.log.warn("failed to restart enrichment runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
-            scheduleEnrichmentRestartContext(
-                self.async_context,
-                self.backend_runtime.durable_jobs,
-                self.indexes.repair.cleanup_owner_id,
-            );
-            notifyQueryVisibilityHook(self.async_context, .status);
-            return err;
-        };
-    }
-
     fn finalizeCompletedIndexAdmission(self: *DB, index_name: []const u8) !void {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -23219,7 +22467,7 @@ pub const DB = struct {
         // Admission remains fail-closed until the durable repair marker is
         // materialized, so this is degraded-but-recoverable state.
         std.log.warn("index catalog admission committed with pending activation index={s} err={s}", .{ cfg.name, @errorName(activation_err) });
-        self.requestManagedAdmissionMaterialization();
+        self.enrichment.requestManagedAdmissionMaterialization();
         self.drainManagedIndexAdmissionsUnderStructuralGuard(self.alloc) catch |materialize_err| {
             // The primary-store marker remains authoritative and startup will
             // retry projection into the repair scheduler.
@@ -23259,17 +22507,17 @@ pub const DB = struct {
                     }});
                 }
             }
-            if (self.enrichment_runtime != null and !installed.managed_admission_pending) {
+            if (self.enrichment.runtime != null and !installed.managed_admission_pending) {
                 // Ordinary embedded admission retains its synchronous
                 // readiness contract. Managed admission persists a repair
                 // intent below; that owner pages source-document replay after
                 // the write-capability barrier is released, so DDL remains
                 // O(groups) rather than O(corpus).
-                const refs = try self.replayGeneratedEnrichmentsFromStoredDocs(self.alloc);
+                const refs = try self.enrichment.replayGeneratedEnrichmentsFromStoredDocs(self.alloc);
                 if (refs == 0) {
                     const target_sequence = self.core.nextDerivedSequence();
                     try self.core.saveAppliedSequence(cfg.name, target_sequence);
-                    try self.markEnrichmentAppliedIfNoPendingThrough(target_sequence);
+                    try self.enrichment.markAppliedIfNoPendingThrough(target_sequence);
                 }
             }
         }
@@ -23279,7 +22527,7 @@ pub const DB = struct {
             // releasing structural ownership. For generated indexes the same
             // intent owns resumable source replay and advances its producer
             // fence page by page before shadow construction can begin.
-            self.requestManagedAdmissionMaterialization();
+            self.enrichment.requestManagedAdmissionMaterialization();
             // Drain the complete outbox, not only this index. A prior admission
             // may have committed before a transient checkpoint failure.
             try self.drainManagedIndexAdmissionsUnderStructuralGuard(self.alloc);
@@ -23297,7 +22545,7 @@ pub const DB = struct {
         if (self.start_index_workers and !defer_worker_to_managed_repair) {
             try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, worker_applied);
         }
-        if (restart_enrichment) try self.restartEnrichmentAfterStructuralMutation("index creation", cfg.name);
+        if (restart_enrichment) try self.enrichment.restartAfterStructuralMutation("index creation", cfg.name);
         if (self.start_index_workers and !defer_worker_to_managed_repair) {
             const current_target = self.core.nextDerivedSequence();
             if (current_target > worker_applied) self.executor.notifyIndexes(current_target, &.{cfg.name});
@@ -23333,10 +22581,10 @@ pub const DB = struct {
         // admission into an unbounded corpus scan. Metadata reconciliation can
         // retry after the conflicting generation's tombstone is retired.
         try self.rejectConflictingRetiredIndexCleanupForAdmission(cfg);
-        const restart_enrichment = self.quiesceEnrichmentForStructuralMutation();
+        const restart_enrichment = self.enrichment.quiesceForStructuralMutation();
         var enrichment_restarted = false;
         errdefer if (restart_enrichment and !enrichment_restarted) {
-            self.restartEnrichmentAfterStructuralMutation("failed index creation", cfg.name) catch |restart_err| {
+            self.enrichment.restartAfterStructuralMutation("failed index creation", cfg.name) catch |restart_err| {
                 std.log.err("failed to restore enrichment runtime after index creation error index={s} err={s}", .{ cfg.name, @errorName(restart_err) });
             };
         };
@@ -23346,23 +22594,23 @@ pub const DB = struct {
             if (replacement_committed) self.executor.removeWorker(replaces.?) else self.executor.resumeWorker(replaces.?);
         };
         const installed = install: {
-            var activity: ?ResolverCatalogActivity = if (replaces != null) try self.acquireResolverCatalogActivity(true) else null;
+            var activity: ?ResolverCatalogActivity = if (replaces != null) try self.enrichment.acquireResolverCatalogActivity(true) else null;
             defer if (activity) |*lease| lease.deinit();
             break :install try self.installIndexForReconciliation(cfg, admission_mode, context, replaces, prepared);
         };
         replacement_committed = true;
         if (replaces != null) {
             self.scheduleGeneratedArtifactCleanup();
-            if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
+            if (self.enrichment.resolution.runtime) |runtime| runtime.notifyBackfill();
         }
         if (installed.post_commit_error) |activation_err| {
-            if (restart_enrichment) self.restartEnrichmentAfterStructuralMutation("pending index activation", cfg.name) catch {};
+            if (restart_enrichment) self.enrichment.restartAfterStructuralMutation("pending index activation", cfg.name) catch {};
             enrichment_restarted = true;
             return try self.recoverCommittedIndexAdmission(cfg, activation_err);
         }
 
         const repair_id = self.completeInstalledIndexAdmission(cfg, installed, restart_enrichment) catch |activation_err| {
-            if (restart_enrichment) self.restartEnrichmentAfterStructuralMutation("pending index activation", cfg.name) catch {};
+            if (restart_enrichment) self.enrichment.restartAfterStructuralMutation("pending index activation", cfg.name) catch {};
             enrichment_restarted = true;
             return try self.recoverCommittedIndexAdmission(cfg, activation_err);
         };
@@ -23378,7 +22626,7 @@ pub const DB = struct {
         activation_attempts: u32 = 0,
         entry: ?index_manager_mod.IndexManager.DetachedIndex = null,
 
-        fn finish(candidate: *@This(), db: *DB, cfg: types.IndexConfig) !void {
+        pub fn finish(candidate: *@This(), db: *DB, cfg: types.IndexConfig) !void {
             // New writes are briefly fenced here; construction and earlier
             // catch-up rounds ran through the ordinary maintenance owner.
             const target = db.core.nextDerivedSequence();
@@ -23437,7 +22685,7 @@ pub const DB = struct {
         defer if (owner) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
         const generation = blk: {
-            var activity = try self.acquireResolverCatalogActivity(true);
+            var activity = try self.enrichment.acquireResolverCatalogActivity(true);
             defer activity.deinit();
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
@@ -23452,17 +22700,17 @@ pub const DB = struct {
             var declaration = try std.json.parseFromSlice(std.json.Value, self.alloc, cfg.config_json, .{});
             defer declaration.deinit();
             if (declaration.value == .object and declaration.value.object.contains("resolvers")) {
-                if (self.resolution_runtime == null) try self.initResolutionRuntime();
-                if (self.promotion_runtime == null) try self.initPromotionRuntime();
+                if (self.enrichment.resolution.runtime == null) try self.enrichment.initResolutionRuntime();
+                if (self.enrichment.promotion.runtime == null) try self.enrichment.initPromotionRuntime();
             }
             var stored = try self.core.index_manager.prepareGraphReplacementConfig(self.core.store, old, cfg, self.core.nextDerivedSequence());
             defer stored.deinit(self.core.index_manager.alloc);
             break :blk stored.coverage_generation;
         };
-        try self.startResolverReplayRuntimesIfConfigured();
-        if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
-        self.startArtifactRepairMetadataWorkerIfNeeded();
-        self.independent_maintenance.notify();
+        try self.enrichment.startResolverReplayRuntimesIfConfigured();
+        if (self.enrichment.resolution.runtime) |runtime| runtime.notifyBackfill();
+        self.enrichment.startArtifactRepairMetadataWorkerIfNeeded();
+        self.maintenance.independent.notify();
         return generation;
     }
 
@@ -23543,43 +22791,7 @@ pub const DB = struct {
         if (!installed.managed_admission_pending) return error.InvalidManagedIndexAdmission;
     }
 
-    pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("addEnrichment", .{ self, cfg });
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        {
-            var probe = try self.core.store.beginProbeTxn();
-            defer probe.abort();
-            try self.requireOnlineArtifactCatalogMutableLocked(&probe);
-        }
-        try self.enforceVectorMigrationConfigurationGate();
-        try self.enforceReplicationWriteGate();
-        try self.core.addEnrichment(cfg);
-    }
-
-    pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
-        if (comptime storage_engine.enabled) return storage_engine.call("upsertEnrichment", .{ self, cfg });
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        {
-            var probe = try self.core.store.beginProbeTxn();
-            defer probe.abort();
-            try self.requireOnlineArtifactCatalogMutableLocked(&probe);
-        }
-        try self.enforceVectorMigrationConfigurationGate();
-        try self.enforceReplicationWriteGate();
-        return try self.core.upsertEnrichment(cfg);
-    }
-
-    const ResolverCatalogActivity = struct {
+    pub const ResolverCatalogActivity = struct {
         resolution: ?*std.atomic.Mutex,
         promotion: ?*std.atomic.Mutex,
 
@@ -23589,34 +22801,13 @@ pub const DB = struct {
         }
     };
 
-    pub fn acquireResolverCatalogActivity(self: *DB, wait: bool) !ResolverCatalogActivity {
-        const resolution = if (self.resolution_runtime) |runtime| &runtime.catch_up_mutex else null;
-        const promotion = if (self.promotion_runtime) |runtime| &runtime.catch_up_mutex else null;
-        // Schema calls must not wait indefinitely for model inference/replay.
-        var attempts: usize = 0;
-        while (true) : (attempts += 1) {
-            if (resolution == null or resolution.?.tryLock()) {
-                if (promotion == null or promotion.?.tryLock())
-                    return .{ .resolution = resolution, .promotion = promotion };
-                if (resolution) |mutex| mutex.unlock();
-            }
-            // Managed refresh/apply callers hold a group activity. They must
-            // release it so a worker already inside a Raft callback can finish.
-            if (!wait) return error.WriterLocked;
-            if (attempts >= 100) return error.Busy;
-            const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse
-                return error.BackendRuntimeIoUnavailable;
-            try io.sleep(.fromMilliseconds(1), .awake);
-        }
-    }
-
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
         {
-            var activity = try self.acquireResolverCatalogActivity(true);
+            var activity = try self.enrichment.acquireResolverCatalogActivity(true);
             defer activity.deinit();
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
@@ -23626,10 +22817,10 @@ pub const DB = struct {
                 try self.requireOnlineArtifactCatalogMutableLocked(&probe);
             }
             try self.core.addResolver(cfg);
-            if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
+            if (self.enrichment.resolution.runtime) |runtime| runtime.notifyBackfill();
         }
-        try self.startResolverReplayRuntimes();
-        try self.backfillResolverCorpus();
+        try self.enrichment.startResolverReplayRuntimes();
+        try self.enrichment.backfillResolverCorpus();
     }
 
     pub const ResolverUpsertOptions = struct {
@@ -23646,116 +22837,6 @@ pub const DB = struct {
         migrate_namespace: bool = false,
     };
 
-    /// Add or replace a resolver. Inserts and material config changes re-resolve
-    /// the existing corpus so the new resolver/scorer behavior applies to
-    /// documents already ingested (the extraction artifacts did not change, so
-    /// the incremental hint would not fire on its own).
-    pub fn upsertResolverWithResultOptions(
-        self: *DB,
-        cfg: index_manager_mod.ResolverConfig,
-        options: ResolverUpsertOptions,
-    ) !index_manager_mod.IndexManager.ResolverUpsertResult {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
-        const upsert_result = blk: {
-            try cfg.validate();
-            // An unchanged catalog observation does not mutate resolver state.
-            // Do not wait for distributed callbacks, rewrite the catalog, or
-            // retire a serving owner just because replay is currently active.
-            if (!options.migrate_namespace and self.core.index_manager.resolverConfigMatches(cfg)) break :blk .updated_no_backfill;
-            var activity = try self.acquireResolverCatalogActivity(options.drain_backfill or options.wait_for_activity);
-            defer activity.deinit();
-            try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
-            {
-                var probe = try self.core.store.beginProbeTxn();
-                defer probe.abort();
-                try self.requireOnlineArtifactCatalogMutableLocked(&probe);
-            }
-            const result = if (options.migrate_namespace)
-                try self.core.index_manager.upsertResolverWithNamespaceMigration(self.core.store, cfg, true)
-            else
-                try self.core.upsertResolver(cfg);
-            if (result != .updated_no_backfill) {
-                if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
-            }
-            break :blk result;
-        };
-        switch (upsert_result) {
-            .inserted, .updated_backfill_required => {
-                try self.startResolverReplayRuntimes();
-                if (options.drain_backfill) {
-                    try self.backfillResolverCorpus();
-                }
-            },
-            .updated_no_backfill => {
-                try self.startResolverReplayRuntimesIfConfigured();
-                if (options.drain_backfill and self.resolution_runtime != null) {
-                    const runtime = self.resolution_runtime.?;
-                    if (try runtime.hasReresolveBacklog()) {
-                        try self.backfillResolverCorpus();
-                    } else {
-                        // The worker may have cleared the enqueue cursor while
-                        // the resulting replay and downstream work is pending.
-                        try self.runUntilIdle();
-                    }
-                }
-            },
-        }
-        return upsert_result;
-    }
-
-    pub fn completeResolverProjectionWork(self: *DB, key: []const u8) !void {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
-        var activity = try self.acquireResolverCatalogActivity(true);
-        defer activity.deinit();
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        var probe = try self.core.store.beginProbeTxn();
-        defer probe.abort();
-        try self.requireOnlineArtifactCatalogMutableLocked(&probe);
-        try self.core.index_manager.completeResolverProjectionWork(self.core.store, key);
-    }
-
-    pub fn publishResolverNamespaceProjection(self: *DB, table: []const u8, table_id: u64, namespace: @import("resolver_namespace.zig").Namespace) !bool {
-        return self.publishResolverNamespaceProjectionWork(table, table_id, namespace, null);
-    }
-    pub fn publishResolverNamespaceProjectionWork(self: *DB, table: []const u8, table_id: u64, namespace: @import("resolver_namespace.zig").Namespace, completion: ?@import("../lite/resolver_consumers.zig").Completion) !bool {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
-        const changed = blk: {
-            var activity = try self.acquireResolverCatalogActivity(true);
-            defer activity.deinit();
-            try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
-            var probe = try self.core.store.beginProbeTxn();
-            defer probe.abort();
-            try self.requireOnlineArtifactCatalogMutableLocked(&probe);
-            break :blk try self.core.index_manager.publishResolverNamespaceProjectionWork(self.core.store, table, table_id, namespace, completion);
-        };
-        if (changed) {
-            if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
-            try self.startResolverReplayRuntimes();
-        }
-        return changed;
-    }
-
-    pub fn upsertResolverWithResult(self: *DB, cfg: index_manager_mod.ResolverConfig) !index_manager_mod.IndexManager.ResolverUpsertResult {
-        return try self.upsertResolverWithResultOptions(cfg, .{});
-    }
-
-    pub fn curateResolverJsonAlloc(self: *DB, alloc: Allocator, name: []const u8, request_json: []const u8) ![]u8 {
-        if (comptime storage_engine.enabled) return storage_engine.call("curateResolverJsonAlloc", .{ self, alloc, name, request_json });
-        return @import("resolver_curation.zig").mutate(self, alloc, name, request_json);
-    }
-
     pub fn resolverCurationJsonAlloc(self: *DB, alloc: Allocator, name: []const u8) ![]u8 {
         if (comptime storage_engine.enabled) return storage_engine.call("resolverCurationJsonAlloc", .{ self, alloc, name });
         return @import("resolver_curation.zig").list(self, alloc, name);
@@ -23766,58 +22847,16 @@ pub const DB = struct {
         return @import("resolver_curation.zig").reviewOperation(self, alloc, request_json);
     }
 
-    pub fn listResolverStaticDescriptors(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
-        if (comptime storage_engine.enabled) return storage_engine.call("listResolverStaticDescriptors", .{ self, alloc });
-        return self.core.index_manager.listResolverStaticDescriptors(alloc);
-    }
-
-    pub fn listResolverIdentities(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
-        if (comptime storage_engine.enabled) return storage_engine.call("listResolverIdentities", .{ self, alloc });
-        return self.core.index_manager.listResolverIdentities(alloc);
-    }
-
-    pub fn consumeResolverMetadataDrop(self: *DB, alloc: Allocator, identity: @import("resolver_curation.zig").MetadataIdentity) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("consumeResolverMetadataDrop", .{ self, alloc, identity });
-        return @import("resolver_curation.zig").consumeMetadataDrop(self, alloc, identity);
-    }
-
     pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
-        _ = try self.upsertResolverWithResult(cfg);
-    }
-
-    pub fn drainResolverBackfill(self: *DB) !void {
-        try self.startResolverReplayRuntimesIfConfigured();
-        try self.backfillResolverCorpus();
-    }
-
-    fn backfillResolverCorpus(self: *DB) !void {
-        if (!self.hasConfiguredResolvers()) return;
-        if (self.resolution_runtime) |runtime| {
-            try runtime.requestReresolveBacklog();
-            while (true) {
-                var tick = try runtime.runReresolveBacklogWindow();
-                const queued = tick.queued;
-                const complete = tick.complete;
-                tick.deinit(self.runtime_alloc);
-                // Drive the enqueued extraction artifacts through resolution,
-                // promotion, and graph materialization before queuing more.
-                if (queued > 0) try self.runUntilIdle();
-                if (complete) break;
-            }
-            // A background window may have enqueued the final records, so this
-            // caller's last window can report complete with zero queued work.
-            // Synchronous backfill promises applied output, not just an empty
-            // corpus cursor; drain the shared replay target before returning.
-            try self.runUntilIdle();
-        }
+        _ = try self.enrichment.upsertResolverWithResult(cfg);
     }
 
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         try self.enforceReplicationWriteGate();
         while (true) {
-            try self.retireResolverReplayBeforeCatalogRemoval();
-            return self.removeResolverWithoutDrain(name) catch |err| {
+            try self.enrichment.retireResolverReplayBeforeCatalogRemoval();
+            return self.enrichment.removeResolverWithoutDrain(name) catch |err| {
                 if (err != error.WriterLocked) return err;
                 if (self.backend_runtime.controlIo() orelse self.backend_runtime.io()) |io|
                     try io.sleep(.fromMilliseconds(1), .awake);
@@ -23826,104 +22865,7 @@ pub const DB = struct {
         }
     }
 
-    pub fn dropRetiredResolverIdentity(self: *DB, name: []const u8) !bool {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
-        var activity = try self.acquireResolverCatalogActivity(true);
-        defer activity.deinit();
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        var probe = try self.core.store.beginProbeTxn();
-        defer probe.abort();
-        try self.requireOnlineArtifactCatalogMutableLocked(&probe);
-        return try self.core.index_manager.dropRetiredResolverIdentity(self.core.store, name);
-    }
-
-    pub fn restoreResolverIdentityWithoutDrain(self: *DB, name: []const u8, cfg: ?index_manager_mod.ResolverConfig) !void {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
-        var activity = try self.acquireResolverCatalogActivity(true);
-        defer activity.deinit();
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        var probe = try self.core.store.beginProbeTxn();
-        defer probe.abort();
-        try self.requireOnlineArtifactCatalogMutableLocked(&probe);
-        if (cfg) |previous| {
-            try self.core.index_manager.restoreResolverIdentity(self.core.store, previous);
-        } else {
-            _ = try self.core.index_manager.removeResolver(self.core.store, name);
-        }
-        if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
-    }
-
-    pub fn removeResolverWithoutDrain(self: *DB, name: []const u8) !bool {
-        if (comptime storage_engine.enabled) return storage_engine.call("removeResolverWithoutDrain", .{ self, name });
-        return self.removeResolverForReconciliation(name, null);
-    }
-
-    fn removeResolverForReconciliation(self: *DB, name: []const u8, context: ?@import("artifact_reconcile_intent.zig").Context) !bool {
-        if (context) |authority| return self.removeResolverReconciliationPage(name, authority);
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        if (context == null) try self.enforceReplicationWriteGate();
-        {
-            var activity = try self.acquireResolverCatalogActivity(false);
-            defer activity.deinit();
-            {
-                self.core.index_manager.catalog_mutex.lockShared();
-                defer self.core.index_manager.catalog_mutex.unlockShared();
-                try self.core.index_manager.requireResolverNotReplacing(name);
-            }
-            // No resolver can be removed while an old decision or promotion is
-            // in flight. Wake the existing owner and retry on a later refresh.
-            const promotion_ready = if (self.promotion_runtime) |runtime|
-                runtime.retirementReadinessLocked() != .pending
-            else blk: {
-                const persisted = self.promotionStageStats();
-                break :blk !persisted.catch_up_required and !persisted.blocked;
-            };
-            if (self.resolutionStageStats().catch_up_required or !promotion_ready)
-                return error.WriterLocked;
-            try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
-            {
-                var probe = try self.core.store.beginProbeTxn();
-                defer probe.abort();
-                try self.requireOnlineArtifactCatalogMutableWithContextLocked(&probe, context);
-            }
-            const cfg = (try self.resolverConfigByNameAlloc(name)) orelse return false;
-            defer {
-                var owned = cfg;
-                owned.deinit(self.alloc);
-            }
-            if (try self.retireResolverArtifactsLocked(cfg)) |sequence| {
-                notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
-                self.executor.notifySequence(sequence);
-                self.notifyResolverReplayRuntimesForced(sequence);
-                return error.WriterLocked;
-            }
-            // Graph replay still needs the resolver contract to interpret
-            // retirement records, including records whose artifact is absent.
-            // Its persisted/live watermark also makes this safe after reopen.
-            for (self.core.index_manager.graph_indexes.items) |entry| {
-                const applied = try self.managedIndexAppliedSequence(self.alloc, entry.config.name);
-                const target = try self.managedIndexReplayTargetSequence(self.alloc, entry.config.name, .graph, applied);
-                if (applied < target)
-                    return error.WriterLocked;
-            }
-            if (!try self.core.removeResolver(name)) return false;
-        }
-        self.stopResolverReplayRuntimesIfUnconfigured();
-        return true;
-    }
-
-    fn resolverConfigByNameAlloc(self: *DB, name: []const u8) !?index_manager_mod.ResolverConfig {
+    pub fn resolverConfigByNameAlloc(self: *DB, name: []const u8) !?index_manager_mod.ResolverConfig {
         const resolvers = try self.core.listResolvers(self.alloc);
         defer {
             for (resolvers) |*cfg| cfg.deinit(self.alloc);
@@ -23937,177 +22879,7 @@ pub const DB = struct {
         return null;
     }
 
-    fn removeResolverReconciliationPage(self: *DB, name: []const u8, context: @import("artifact_reconcile_intent.zig").Context) !bool {
-        const intent = @import("artifact_reconcile_intent.zig");
-        var activity = try self.acquireResolverCatalogActivity(false);
-        defer activity.deinit();
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        {
-            var read = try self.core.store.beginReadTxn();
-            defer read.abort();
-            try self.requireOnlineArtifactCatalogMutableWithContextLocked(&read, context);
-            try self.requireArtifactReconcileUnfenced(&read, context);
-        }
-        // Graph indexes were detached by preceding reconciliation steps.
-        // catch_up_mutex covers resolver/promotion jobs through publication;
-        // holding both activity locks drains any prior callback. Between
-        // pages, the durable intent rejects producer and handoff publication
-        // under the apply mutex, so nothing can appear behind this cursor.
-        // Final config removal uses these same locks before stopping workers.
-        if (self.core.graphIndexes().len != 0) return error.ArtifactCatalogDrift;
-        const config = (try self.resolverConfigByNameAlloc(name)) orelse return false;
-        defer {
-            var owned = config;
-            owned.deinit(self.alloc);
-        }
-        const raw = try self.core.getStoreValue(self.alloc, intent.resolver_cursor_key);
-        defer if (raw) |bytes| self.alloc.free(bytes);
-        var parsed = if (raw) |bytes| std.json.parseFromSlice(intent.ResolverCursor, self.alloc, bytes, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.ArtifactCatalogCorrupt,
-        } else null;
-        defer if (parsed) |*value| value.deinit();
-        const prior: ?intent.ResolverCursor = if (parsed) |value| if (std.mem.eql(u8, value.value.name, name) and std.mem.eql(u8, &value.value.token, &context.token)) value.value else null else null;
-        if (prior != null and prior.?.complete) return self.core.removeResolver(name);
-        const prefix = [_]u8{internal_keys.user_namespace};
-        const keys = try self.core.store.scanPrefixKeysPage(self.alloc, &prefix, if (prior) |value| value.after else null, 128);
-        defer {
-            for (keys) |key| self.alloc.free(key);
-            self.alloc.free(keys);
-        }
-        var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer {
-            for (deletes.items) |key| self.alloc.free(@constCast(key));
-            deletes.deinit(self.alloc);
-        }
-        for (keys) |key| {
-            const resolution = (try internal_keys.parseResolutionArtifactKeyAlloc(self.alloc, key)) orelse continue;
-            defer {
-                self.alloc.free(resolution.doc_key);
-                self.alloc.free(resolution.artifact_name);
-            }
-            if (!std.mem.eql(u8, resolution.artifact_name, config.resolution_artifact)) continue;
-            try deletes.append(self.alloc, try self.alloc.dupe(u8, key));
-            try appendResolutionHandoffDeleteKey(self.alloc, &deletes, key);
-        }
-        const cursor = try std.json.Stringify.valueAlloc(self.alloc, intent.ResolverCursor{ .token = context.token, .name = name, .after = if (keys.len == 0) "" else keys[keys.len - 1], .complete = keys.len == 0 }, .{});
-        defer self.alloc.free(cursor);
-        try self.core.store.putBatch(&.{.{ .key = intent.resolver_cursor_key, .value = cursor }}, deletes.items);
-        return false;
-    }
-
-    fn retireResolverArtifactsLocked(self: *DB, cfg: index_manager_mod.ResolverConfig) !?u64 {
-        var deletes = std.ArrayListUnmanaged([]const u8).empty;
-        defer {
-            for (deletes.items) |key| self.alloc.free(@constCast(key));
-            deletes.deinit(self.alloc);
-        }
-        var changed = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (changed.items) |key| self.alloc.free(key);
-            changed.deinit(self.alloc);
-        }
-
-        const marker_prefix = try internal_keys.assetArtifactSourceIndexPrefixAlloc(self.alloc, cfg.source_artifact);
-        defer self.alloc.free(marker_prefix);
-        const markers = try self.core.store.scanPrefix(self.alloc, marker_prefix);
-        defer docstore_mod.DocStore.freeResults(self.alloc, markers);
-
-        for (markers) |marker| {
-            const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(self.alloc, marker.value)) orelse continue;
-            defer {
-                self.alloc.free(parsed.doc_key);
-                self.alloc.free(parsed.artifact_name);
-            }
-            if (!std.mem.eql(u8, parsed.artifact_name, cfg.source_artifact)) continue;
-
-            const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(self.alloc, parsed.doc_key, cfg.resolution_artifact);
-            var resolution_key_owned = true;
-            errdefer if (resolution_key_owned) self.alloc.free(resolution_key);
-            const exists = if (self.core.store.get(self.alloc, resolution_key)) |raw| exists: {
-                self.alloc.free(raw);
-                break :exists true;
-            } else |err| switch (err) {
-                error.NotFound => false,
-                else => return err,
-            };
-            if (exists and !containsDeleteKey(deletes.items, resolution_key)) {
-                try deletes.append(self.alloc, resolution_key);
-                resolution_key_owned = false;
-                try appendUniqueOwnedKey(self.alloc, &changed, resolution_key);
-                try appendResolutionHandoffDeleteKey(self.alloc, &deletes, resolution_key);
-            } else {
-                self.alloc.free(resolution_key);
-                resolution_key_owned = false;
-            }
-
-            try self.collectResolverMentionArtifactsForDocLocked(cfg, parsed.doc_key, &deletes, &changed);
-        }
-
-        const root_lower = [_]u8{internal_keys.user_namespace};
-        const root_upper = [_]u8{internal_keys.user_namespace + 1};
-        const resolution_rows = try self.core.store.scanRange(self.alloc, root_lower[0..], root_upper[0..]);
-        defer docstore_mod.DocStore.freeResults(self.alloc, resolution_rows);
-        for (resolution_rows) |row| {
-            const parsed = (try internal_keys.parseResolutionArtifactKeyAlloc(self.alloc, row.key)) orelse continue;
-            defer {
-                self.alloc.free(parsed.doc_key);
-                self.alloc.free(parsed.artifact_name);
-            }
-            if (!std.mem.eql(u8, parsed.artifact_name, cfg.resolution_artifact)) continue;
-            if (!containsDeleteKey(deletes.items, row.key)) {
-                try deletes.append(self.alloc, try self.alloc.dupe(u8, row.key));
-                try appendUniqueOwnedKey(self.alloc, &changed, row.key);
-                try appendResolutionHandoffDeleteKey(self.alloc, &deletes, row.key);
-            }
-            try self.collectResolverMentionArtifactsForDocLocked(cfg, parsed.doc_key, &deletes, &changed);
-        }
-
-        if (deletes.items.len == 0 and changed.items.len == 0) return null;
-
-        const sequence = self.core.reserveDerivedAppendSequence();
-        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
-            .sequence = sequence,
-            .changed_artifact_keys = changed.items,
-        }, sequence);
-        defer self.alloc.free(replay_payload);
-
-        var backlog_admission = try self.executor.admitBacklogBytes(@intCast(replay_payload.len));
-        defer backlog_admission.cancel();
-        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), &.{}, deletes.items, .{
-            .sequence = sequence,
-            .payload = replay_payload,
-        });
-        self.mirrorReplicationReplayPayloadBestEffort(replay_payload);
-        self.executor.commitBacklogAdmission(sequence, &backlog_admission);
-        return sequence;
-    }
-
-    fn collectResolverMentionArtifactsForDocLocked(
-        self: *DB,
-        cfg: index_manager_mod.ResolverConfig,
-        doc_key: []const u8,
-        deletes: *std.ArrayListUnmanaged([]const u8),
-        changed: *std.ArrayListUnmanaged([]u8),
-    ) !void {
-        for (self.core.graphIndexes()) |graph_entry| {
-            for (graph_entry.artifact_sources) |source| {
-                if (source.mention_edge_type.len == 0) continue;
-                if (!std.mem.eql(u8, source.artifact_name, cfg.source_artifact)) continue;
-
-                const state_name = try mentionGraphStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
-                defer self.alloc.free(state_name);
-                try self.collectGraphStateForDeleteLocked(doc_key, graph_entry.config.name, state_name, graph_entry.config.coverage_generation, deletes, changed);
-
-                const mention_state_name = try mentionArtifactStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
-                defer self.alloc.free(mention_state_name);
-                try self.collectGraphStateForDeleteLocked(doc_key, graph_entry.config.name, mention_state_name, graph_entry.config.coverage_generation, deletes, changed);
-            }
-        }
-    }
-
-    fn collectGraphStateForDeleteLocked(
+    pub fn collectGraphStateForDeleteLocked(
         self: *DB,
         doc_key: []const u8,
         index_name: []const u8,
@@ -24147,19 +22919,11 @@ pub const DB = struct {
         }
     }
 
-    fn retireResolverReplayBeforeCatalogRemoval(self: *DB) !void {
-        try self.runUntilIdle();
-        const resolution_stats = self.resolutionStageStats();
-        if (resolution_stats.catch_up_required or resolution_stats.blocked) return error.ResolverReplayPending;
-        const promotion_stats = self.promotionStageStats();
-        if (promotion_stats.catch_up_required or promotion_stats.blocked) return error.ResolverReplayPending;
-    }
-
     /// The review queue: review-band mentions awaiting human curation. Empty
     /// when no resolution runtime is active. Caller owns the result
     /// (`resolution_runtime_mod.freePendingReviews`).
     pub fn listPendingReviews(self: *DB, alloc: Allocator) ![]resolution_runtime_mod.PendingReview {
-        const runtime = self.resolution_runtime orelse return try alloc.alloc(resolution_runtime_mod.PendingReview, 0);
+        const runtime = self.enrichment.resolution.runtime orelse return try alloc.alloc(resolution_runtime_mod.PendingReview, 0);
         return try runtime.pendingReviews(alloc);
     }
 
@@ -24877,20 +23641,6 @@ pub const DB = struct {
         try self.core.bestEffortForceCompactTextIndexes();
     }
 
-    pub fn getEnrichment(self: *DB, alloc: Allocator, kind: types.EnrichmentKind, name: []const u8) !?types.EnrichmentConfig {
-        if (comptime storage_engine.enabled) return storage_engine.call("getEnrichment", .{ self, alloc, kind, name });
-        try self.lockApplySharedForPortableRuntime();
-        defer self.core.unlockApplyShared();
-        return try self.core.getEnrichment(alloc, kind, name);
-    }
-
-    pub fn listEnrichments(self: *DB, alloc: Allocator) ![]types.EnrichmentConfig {
-        if (comptime storage_engine.enabled) return storage_engine.call("listEnrichments", .{ self, alloc });
-        try self.lockApplySharedForPortableRuntime();
-        defer self.core.unlockApplyShared();
-        return try self.core.listEnrichments(alloc);
-    }
-
     /// Run only this resolver's configured text extractor, without scheduling
     /// enrichments or publishing a synthetic document. Producer invocation
     /// retains the runtime's memory plan, cancellation and transport controls.
@@ -24912,7 +23662,7 @@ pub const DB = struct {
     /// Capture everything needed for inference before releasing the database gate.
     pub fn resolverQueryPlanAlloc(self: *DB, alloc: Allocator, cfg: index_manager_mod.ResolverConfig) !ResolverQueryPlan {
         if (cfg.source_artifact_kind == .chunk) return error.InvalidArgument;
-        const enrichments = try self.listEnrichments(alloc);
+        const enrichments = try self.enrichment.listEnrichments(alloc);
         defer {
             for (enrichments) |*enrichment| enrichment.deinit(alloc);
             alloc.free(enrichments);
@@ -24927,16 +23677,6 @@ pub const DB = struct {
             return .{ .config_json = json, .content_type = try alloc.dupe(u8, enrichment.content_type) };
         }
         return error.InvalidArgument;
-    }
-
-    pub fn extractResolverQueryAlloc(self: *DB, alloc: Allocator, cfg: index_manager_mod.ResolverConfig, text: []const u8, producer_override: ?asset_producer_mod.Producer) ![]u8 {
-        var plan = try self.resolverQueryPlanAlloc(alloc, cfg);
-        defer plan.deinit(alloc);
-        const producer = producer_override orelse if (self.enrichment_runtime) |runtime|
-            if (runtime.config.asset_producer) |configured| configured.withInvocationContext(.{ .io = runtime.config.io, .cancellation = runtime.config.cancellation }) else return error.SqlFeatureNotSupported
-        else
-            return error.SqlFeatureNotSupported;
-        return plan.produce(alloc, text, producer);
     }
 
     pub fn listResolvers(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
@@ -24956,7 +23696,7 @@ pub const DB = struct {
         return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, null);
     }
 
-    fn resolveDocSetForIdsNoLockAtGenerationAlloc(
+    pub fn resolveDocSetForIdsNoLockAtGenerationAlloc(
         self: *DB,
         alloc: Allocator,
         doc_ids: []const []const u8,
@@ -25010,7 +23750,7 @@ pub const DB = struct {
         return try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, set, null);
     }
 
-    fn docIdsForResolvedDocSetNoLockAtGenerationAlloc(
+    pub fn docIdsForResolvedDocSetNoLockAtGenerationAlloc(
         self: *DB,
         alloc: Allocator,
         set: *const doc_set.ResolvedDocSet,
@@ -25035,97 +23775,6 @@ pub const DB = struct {
                 return try docIdsForOrdinalsAtGenerationTxnAlloc(alloc, &txn, ordinals.items, generation);
             },
         }
-    }
-
-    pub fn extractEnrichments(self: *DB, alloc: Allocator, writes: []const types.BatchWrite) !types.ExtractEnrichmentsResult {
-        try self.lockApplySharedForPortableRuntime();
-        defer self.core.unlockApplyShared();
-
-        var collector: result_collectors.Extraction = .{ .alloc = alloc };
-        defer collector.deinit();
-        for (writes) |write| {
-            var extracted = try mapper.extractWrite(alloc, write.key, write.value);
-            defer extracted.deinit(alloc);
-            try augmentExtractedWriteWithGraphFieldEdges(self, alloc, write.key, write.value, &extracted);
-            try collector.append(write.key, extracted);
-        }
-        return collector.finish();
-    }
-
-    pub fn computeEnrichments(self: *DB, alloc: Allocator, writes: []const types.BatchWrite) !types.ComputeEnrichmentsResult {
-        try self.lockApplySharedForPortableRuntime();
-        defer self.core.unlockApplyShared();
-
-        var collector: result_collectors.Enrichments = .{ .alloc = alloc };
-        defer collector.deinit();
-
-        for (writes) |write| {
-            var extracted = try mapper.extractWrite(alloc, write.key, write.value);
-            defer extracted.deinit(alloc);
-            try augmentExtractedWriteWithGraphFieldEdges(self, alloc, write.key, write.value, &extracted);
-            const cleaned = extracted.cleaned_value orelse continue;
-
-            var explicit_dense = std.ArrayListUnmanaged(types.EnrichmentDenseEmbeddingWrite).empty;
-            defer {
-                for (explicit_dense.items) |*embedding| embedding.deinit(alloc);
-                explicit_dense.deinit(alloc);
-            }
-            for (extracted.dense_embeddings) |embedding| {
-                try appendClonedExplicitDenseEmbedding(
-                    alloc,
-                    &explicit_dense,
-                    embedding.index_name,
-                    embedding.doc_key,
-                    embedding.vector,
-                );
-            }
-            var explicit_sparse = std.ArrayListUnmanaged(types.EnrichmentSparseEmbeddingWrite).empty;
-            defer {
-                for (explicit_sparse.items) |*embedding| embedding.deinit(alloc);
-                explicit_sparse.deinit(alloc);
-            }
-            for (extracted.sparse_embeddings) |embedding| {
-                try appendClonedExplicitSparseEmbedding(
-                    alloc,
-                    &explicit_sparse,
-                    embedding.index_name,
-                    embedding.doc_key,
-                    embedding.indices,
-                    embedding.values,
-                );
-            }
-
-            const generated = try self.core.planGeneratedEnrichments(
-                alloc,
-                write.key,
-                cleaned,
-                explicit_dense.items,
-                explicit_sparse.items,
-            );
-            defer enrichment_types.deinitGeneratedRequests(alloc, generated);
-
-            var chunk_cache = std.ArrayListUnmanaged(ChunkCacheEntry).empty;
-            defer {
-                for (chunk_cache.items) |entry| {
-                    alloc.free(entry.key);
-                    chunker_mod.freeChunks(alloc, entry.chunks);
-                }
-                chunk_cache.deinit(alloc);
-            }
-
-            for (generated) |request| {
-                switch (request.kind) {
-                    .chunk_text => try computeChunkRequest(alloc, self, cleaned, request, &collector.artifacts, &collector.documents, &chunk_cache),
-                    .dense_embedding => computeDenseRequest(alloc, self, cleaned, request, &collector.artifacts, &collector.dense, &chunk_cache) catch |err| switch (err) {
-                        error.MissingDenseEmbedder => try appendUniqueOwnedKey(alloc, &collector.failed, write.key),
-                        else => return err,
-                    },
-                    else => {},
-                }
-            }
-        }
-
-        return try collector.finish();
     }
 
     fn deleteIndexWhileEnrichmentQuiesced(self: *DB, name: []const u8) !bool {
@@ -25208,7 +23857,7 @@ pub const DB = struct {
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         if (context == null) try self.enforceReplicationWriteGate();
-        var resolver_activity = try self.acquireResolverCatalogActivity(context == null);
+        var resolver_activity = try self.enrichment.acquireResolverCatalogActivity(context == null);
         defer resolver_activity.deinit();
         var structural_guard = self.beginIndexStructuralMutation("index deletion", name);
         defer structural_guard.deinit();
@@ -25220,9 +23869,9 @@ pub const DB = struct {
             try self.requireArtifactReconcileUnfenced(&probe, context);
         }
         try self.enforceVectorMigrationConfigurationGate();
-        const restart_enrichment = self.quiesceEnrichmentForStructuralMutation();
+        const restart_enrichment = self.enrichment.quiesceForStructuralMutation();
         const removed = self.deleteIndexWhileQuiescedForReconciliation(name, context) catch |delete_err| {
-            if (restart_enrichment) self.restartEnrichmentAfterStructuralMutation("failed index deletion", name) catch |restart_err| {
+            if (restart_enrichment) self.enrichment.restartAfterStructuralMutation("failed index deletion", name) catch |restart_err| {
                 std.log.err("failed to restore enrichment runtime after index deletion error index={s} err={s}", .{ name, @errorName(restart_err) });
             };
             return delete_err;
@@ -25230,12 +23879,12 @@ pub const DB = struct {
         if (removed) {
             self.indexes.graph.clearReplacementManager();
             self.scheduleGeneratedArtifactCleanup();
-            if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
+            if (self.enrichment.resolution.runtime) |runtime| runtime.notifyBackfill();
         }
         // Catalog absence is the committed API result. A runtime restart is a
         // supervised availability fault, not a reason to report that the
         // durable deletion failed.
-        if (restart_enrichment) self.restartEnrichmentAfterStructuralMutation("index deletion", name) catch |restart_err| {
+        if (restart_enrichment) self.enrichment.restartAfterStructuralMutation("index deletion", name) catch |restart_err| {
             std.log.err("failed to restart enrichment runtime after committed index deletion index={s} err={s}", .{ name, @errorName(restart_err) });
         };
         return removed;
@@ -25314,35 +23963,14 @@ pub const DB = struct {
         try ensureReplayFloor(self.core.store, max_applied + 1);
     }
 
-    pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
-        if (comptime storage_engine.enabled) return storage_engine.call("deleteEnrichment", .{ self, kind, name });
-        return self.deleteEnrichmentForReconciliation(kind, name, null);
-    }
-
-    fn deleteEnrichmentForReconciliation(self: *DB, kind: types.EnrichmentKind, name: []const u8, context: ?@import("artifact_reconcile_intent.zig").Context) !bool {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        if (context == null) try self.enforceReplicationWriteGate();
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        {
-            var probe = try self.core.store.beginProbeTxn();
-            defer probe.abort();
-            try self.requireOnlineArtifactCatalogMutableWithContextLocked(&probe, context);
-        }
-        try self.enforceVectorMigrationConfigurationGate();
-        return try self.core.deleteEnrichment(kind, name);
-    }
-
     pub fn resolverReplayObservation(self: *DB, alloc: Allocator) !types.ResolverReplayObservation {
         if (comptime storage_engine.enabled) return storage_engine.call("resolverReplayObservation", .{ self, alloc });
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
         var result: types.ResolverReplayObservation = .{
             .backfill_pending = try resolution_runtime_mod.hasDurableReresolveBacklog(self.core.store),
-            .resolution = self.resolutionStageStats(),
-            .promotion = self.promotionStageStats(),
+            .resolution = self.enrichment.resolutionStageStats(),
+            .promotion = self.enrichment.promotionStageStats(),
         };
         if (self.core.nextDerivedSequence() == 0) {
             const count = try @import("range_cardinality.zig").loadOrProveEmpty(alloc, self.core.store);
@@ -25362,12 +23990,12 @@ pub const DB = struct {
             .portable_import_publication_in_progress = self.core.store.portableImportPublicationInProgress(),
             .portable_import_recovery_required = self.core.store.portableImportRecoveryRequired(),
             .portable_runtime_activation_pending = self.async_context.portable_runtime_activation_pending.load(.acquire),
-            .portable_runtime_activation_attempts = self.portable_runtime_activation_attempts.load(.monotonic),
-            .enrichment = self.enrichmentStatsWithSupervisorState(.{}),
-            .resolution = self.resolutionStageStats(),
-            .promotion = self.promotionStageStats(),
-            .resolution_worker_started = if (self.resolution_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
-            .promotion_worker_started = if (self.promotion_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
+            .portable_runtime_activation_attempts = self.recovery.portable_activation.attempts.load(.monotonic),
+            .enrichment = self.enrichment.statsWithSupervisorState(.{}),
+            .resolution = self.enrichment.resolutionStageStats(),
+            .promotion = self.enrichment.promotionStageStats(),
+            .resolution_worker_started = if (self.enrichment.resolution.runtime) |runtime| runtime.worker_started.load(.acquire) else false,
+            .promotion_worker_started = if (self.enrichment.promotion.runtime) |runtime| runtime.worker_started.load(.acquire) else false,
             .text_merge = if (self.indexes.text.merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
             .repair_metadata_rebuild_pending = self.artifactRepairMetadataRebuildPending(),
             .graph_metric = self.core.index_manager.graphMetricPlannedWorkStats() catch .{},
@@ -25381,7 +24009,7 @@ pub const DB = struct {
         return !kind_index_ready;
     }
 
-    fn persistedReplayStageStats(self: *DB, scope_name: []const u8, force_enabled: bool) !types.ReplayStageStats {
+    pub fn persistedReplayStageStats(self: *DB, scope_name: []const u8, force_enabled: bool) !types.ReplayStageStats {
         const resources = self.core.batchExecutionResources();
         const applied = try enrichment_state.loadAppliedSequence(self.alloc, resources.store, scope_name);
         const target = @max(applied, self.core.nextDerivedSequence());
@@ -25391,33 +24019,6 @@ pub const DB = struct {
             .applied_sequence = applied,
             .catch_up_required = applied < target,
         };
-    }
-
-    fn resolutionStageStats(self: *DB) types.ReplayStageStats {
-        if (!self.hasConfiguredResolvers()) return .{};
-        if (self.resolution_runtime) |runtime| return runtime.stats();
-        return self.persistedResolutionStageStats() catch .{
-            .enabled = true,
-            .catch_up_required = true,
-            .blocked = true,
-            .blocked_reason = "resolver_recovery_state_unavailable",
-        };
-    }
-
-    fn persistedResolutionStageStats(self: *DB) !types.ReplayStageStats {
-        var persisted_stage = try self.persistedReplayStageStats(resolution_runtime_mod.scope_name, false);
-        const resources = self.core.batchExecutionResources();
-        if (try resolution_runtime_mod.hasDurableReresolveBacklog(resources.store)) {
-            persisted_stage.enabled = true;
-            persisted_stage.catch_up_required = true;
-        }
-        return persisted_stage;
-    }
-
-    fn promotionStageStats(self: *DB) types.ReplayStageStats {
-        if (!self.hasConfiguredResolvers()) return .{};
-        if (self.promotion_runtime) |runtime| return runtime.stats();
-        return self.persistedReplayStageStats(promotion_runtime_mod.scope_name, false) catch .{};
     }
 
     fn resolverReplayDiagnosticsLocked(self: *DB, alloc: Allocator) !types.ResolverReplayDiagnostics {
@@ -25461,43 +24062,15 @@ pub const DB = struct {
         return .{
             .reresolve_pending = try resolution_runtime_mod.hasDurableReresolveBacklog(self.core.store),
             .resolver_count = @intCast(catalog.len),
-            .resolution_runtime_present = self.resolution_runtime != null,
-            .resolution_worker_started = if (self.resolution_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
-            .promotion_runtime_present = self.promotion_runtime != null,
-            .promotion_worker_started = if (self.promotion_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
+            .resolution_runtime_present = self.enrichment.resolution.runtime != null,
+            .resolution_worker_started = if (self.enrichment.resolution.runtime) |runtime| runtime.worker_started.load(.acquire) else false,
+            .promotion_runtime_present = self.enrichment.promotion.runtime != null,
+            .promotion_worker_started = if (self.enrichment.promotion.runtime) |runtime| runtime.worker_started.load(.acquire) else false,
             .resolvers = resolvers[0..initialized],
         };
     }
 
-    fn persistedEnrichmentStats(self: *DB) !types.EnrichmentStats {
-        if (!self.core.hasGeneratedEnrichmentTargets() and self.core.index_manager.enrichments.items.len == 0) return .{};
-        const resources = self.core.batchExecutionResources();
-        const checkpoint = try enrichment_state.loadProjectionCheckpoint(self.alloc, resources.store, enrichment_runtime_mod.scope_name);
-        const applied = checkpoint.applied_sequence;
-        const status = try enrichment_state.loadRuntimeStatus(self.alloc, resources.store, enrichment_runtime_mod.scope_name);
-        const target = @max(applied, status.target_sequence);
-        return .{
-            .enabled = target > 0 or status.error_count > 0 or status.retrying or status.worker_failed,
-            .target_sequence = target,
-            .applied_sequence = applied,
-            .projection_checkpoint_status = enrichment_state.projectionStatusName(checkpoint.status),
-            .projection_checkpoint_applied_sequence = checkpoint.applied_sequence,
-            .projection_checkpoint_generation = checkpoint.generation,
-            .projection_checkpoint_config_hash = checkpoint.config_hash,
-            .checkpoint_replay_tail_sequence_count = target -| checkpoint.applied_sequence,
-            .last_error_code = status.last_error_code,
-            .error_count = status.error_count,
-            .retryable_error_count = status.retryable_error_count,
-            .fatal_error_count = status.fatal_error_count,
-            .output_counts = status.output_counts,
-            .consecutive_retry_count = status.consecutive_retry_count,
-            .next_retry_at_ms = status.next_retry_at_ms,
-            .retrying = status.retrying,
-            .worker_failed = status.worker_failed,
-        };
-    }
-
-    const ReplayDrainOptions = struct {
+    pub const ReplayDrainOptions = struct {
         truncate_replay: bool = true,
         /// Empty selects all indexes; foreground curation selects its graph.
         index_names: []const []const u8 = &.{},
@@ -25590,11 +24163,11 @@ pub const DB = struct {
 
         const recheck_interval_ns: u64 = 250 * std.time.ns_per_ms;
 
-        fn token(self: *TargetAdvanceStallGuard) types.CancellationToken {
+        pub fn token(self: *TargetAdvanceStallGuard) types.CancellationToken {
             return .{ .ptr = self, .check_fn = check };
         }
 
-        fn check(ptr: *const anyopaque) anyerror!void {
+        pub fn check(ptr: *const anyopaque) anyerror!void {
             const self: *TargetAdvanceStallGuard = @ptrCast(@alignCast(@constCast(ptr)));
             const now_ns = monotonicTimeNs();
             if (now_ns -| self.last_check_ns.load(.monotonic) < recheck_interval_ns) return;
@@ -25667,101 +24240,9 @@ pub const DB = struct {
         try self.executor.waitForIndexesWithVisibilityWait(sequence, index_names, wait);
     }
 
-    pub fn runEnrichmentUntil(self: *DB, sequence: u64) !void {
-        try self.runEnrichmentUntilWithCancellation(sequence, .none);
-    }
-
-    fn runEnrichmentUntilWithCancellation(self: *DB, sequence: u64, cancellation: types.CancellationToken) !void {
-        try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, null);
-    }
-
-    pub fn runEnrichmentUntilWithVisibilityDeadline(
-        self: *DB,
-        sequence: u64,
-        cancellation: types.CancellationToken,
-        deadline_ns: ?u64,
-    ) !void {
-        if (sequence == 0) return;
-        if (self.enrichment_runtime) |runtime| {
-            if (!self.local_execution.optional_runtime_workers_enabled) {
-                if (deadline_ns == null and cancellation.ptr == null) {
-                    // Explicit maintenance/drain callers historically execute
-                    // custom providers inline. They are not request waiters and
-                    // retain that source-compatible behavior; API visibility
-                    // always supplies the shared finite deadline below.
-                    try runtime.catchUpUntil(sequence);
-                    return;
-                }
-                // Foreground ownership is still a post-commit visibility
-                // barrier. Honor the borrowed request token and the runtime's
-                // hard wait deadline, but never reinterpret cancellation as a
-                // rollback of the durable primary mutation.
-                try runtime.catchUpUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
-                return;
-            }
-            runtime.notifySequence(sequence);
-            try runtime.waitForAppliedWithVisibilityDeadline(sequence, cancellation, deadline_ns);
-        }
-    }
-
-    /// Unlike `runEnrichmentUntilWithVisibilityDeadline`, never substitutes
-    /// the request-visibility default (`sync_wait_timeout_ms`, 5 minutes)
-    /// when no deadline is supplied, even when `optional_runtime_workers_enabled`
-    /// -- worker-mode's `waitForAppliedWithVisibilityDeadline` only passively
-    /// waits for a separate background worker to make progress and bounds
-    /// that wait unconditionally when `deadline_ns` is null. `runUntilIdle`
-    /// (Lite's synchronous ingest drain, in particular) never supplies a
-    /// deadline and must run the foreground catch-up pass itself until the
-    /// full enrichment backlog clears, however long that legitimately takes,
-    /// not silently truncate at 5 minutes and surface a slow-but-progressing
-    /// drain as a hard failure. Scoped to `runUntilIdle`'s own drain call
-    /// (via `ReplayDrainOptions.unbounded_enrichment_wait`) rather than
-    /// `runEnrichmentUntilWithVisibilityDeadline` generally: other callers
-    /// (plain `runEnrichmentUntil`, `runMaintenanceUntil`, request-visibility
-    /// barriers) still rely on the passive bounded wait deferring to that
-    /// background worker, and forcing them through inline foreground
-    /// execution instead changed observable enrichment-worker ownership
-    /// behavior (see the `TestLiteHostedPauseResumeGeneratedEnrichment`
-    /// regression this scoping fixes).
-    fn runEnrichmentUntilForDrainUnbounded(self: *DB, sequence: u64) !void {
-        if (sequence == 0) return;
-        const runtime = self.enrichment_runtime orelse return;
-        runtime.notifySequence(sequence);
-        try runtime.catchUpUntilForDrain(sequence);
-    }
-
-    fn runEnrichmentUntilForDrain(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
-        while (true) {
-            const outcome = if (options.unbounded_enrichment_wait and options.cancellation.ptr == null)
-                self.runEnrichmentUntilForDrainUnbounded(sequence)
-            else
-                self.runEnrichmentUntilWithCancellation(sequence, options.cancellation);
-            outcome catch |err| switch (err) {
-                error.EnrichmentRetryInProgress => {
-                    if (!options.wait_for_enrichment_retries) return err;
-                    const io = self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
-                    try io.sleep(.fromMilliseconds(25), .awake);
-                    continue;
-                },
-                else => return err,
-            };
-            return;
-        }
-    }
-
     pub const markPrecomputedEnrichmentAppliedForSync = local_mutation.markPrecomputedEnrichmentAppliedForSync;
 
     pub const noPendingEnrichmentReplayThrough = local_mutation.noPendingEnrichmentReplayThrough;
-
-    fn markEnrichmentAppliedIfNoPendingThrough(self: *DB, sequence: u64) !void {
-        if (sequence == 0) return;
-        const runtime = self.enrichment_runtime orelse return;
-        const runtime_stats = runtime.stats();
-        if (runtime_stats.applied_sequence >= sequence) return;
-        if (try self.noPendingEnrichmentReplayThrough(runtime_stats.applied_sequence, sequence)) {
-            try runtime.markAppliedThrough(sequence);
-        }
-    }
 
     fn runMaintenanceUntilWithOptions(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets, options: ReplayDrainOptions) !void {
         _ = try self.indexes.graph.drainStandaloneEndpointCleanup();
@@ -25776,14 +24257,14 @@ pub const DB = struct {
             // later artifacts exist and make those artifacts unreplayable.
             // Drain the producer boundary first, then every consumer observes
             // the complete revision and can advance from durable evidence.
-            try self.runEnrichmentUntilForDrain(stable_target, options);
+            try self.enrichment.runUntilForDrain(stable_target, options);
             try self.runDerivedUntilWithOptions(stable_target, options);
             if (options.no_progress_timeout_ns != 0) try self.checkTargetAdvanceNoProgress(options.no_progress_timeout_ns);
 
             const next_target = self.core.nextDerivedSequence();
             if (options.bounded_replay or next_target <= stable_target) {
                 try waitForManagedIndexesApplied(self, sequence, sync_targets.all_indexes);
-                _ = try self.runArtifactRepairMetadataMaintenancePass();
+                _ = try self.enrichment.runArtifactRepairMetadataMaintenancePass();
                 return;
             }
             stable_target = next_target;
@@ -25808,7 +24289,7 @@ pub const DB = struct {
             "runUntilIdle no-progress timeout index={s} indexed={d} expected_docs={d} stuck_ms={d}",
             .{ stuck.index_name, stuck.record.indexed, stuck.record.expected, (now_ns -| stuck.record.first_stuck_ns) / std.time.ns_per_ms },
         );
-        try self.setLastRunUntilIdleNoProgressDiagnostic(
+        try self.maintenance.setLastRunUntilIdleNoProgressDiagnostic(
             stuck.index_name,
             stuck.record.indexed,
             stuck.record.expected,
@@ -25849,8 +24330,8 @@ pub const DB = struct {
         var stable_target = sequence;
         while (true) {
             if (completion == .successful_requests) {
-                try self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
-            } else if (self.enrichment_runtime) |runtime| {
+                try self.enrichment.runUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
+            } else if (self.enrichment.runtime) |runtime| {
                 // A retained read captures committed primary and generated
                 // publications. It must not run providers or wait for future
                 // request retries before reading already-visible documents.
@@ -25863,7 +24344,7 @@ pub const DB = struct {
             const next_target = self.core.nextDerivedSequence();
             if (completion == .published_cut or next_target <= stable_target) {
                 try waitForManagedIndexesApplied(self, sequence, sync_targets.all_indexes);
-                _ = try self.runArtifactRepairMetadataMaintenancePass();
+                _ = try self.enrichment.runArtifactRepairMetadataMaintenancePass();
                 return;
             }
             stable_target = next_target;
@@ -25874,7 +24355,7 @@ pub const DB = struct {
         if (index_names.len == 0) return;
         var stable_target = sequence;
         while (true) {
-            try self.runEnrichmentUntil(stable_target);
+            try self.enrichment.runUntil(stable_target);
             try self.runDerivedUntilTargets(stable_target, index_names);
 
             const next_target = self.core.nextDerivedSequence();
@@ -25948,7 +24429,7 @@ pub const DB = struct {
         if (self.executor.hasWorkers()) {
             notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, sync_level, sequence, sync_targets);
         }
-        if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+        if (self.enrichment.runtime) |runtime| runtime.notifySequence(sequence);
         self.notifyResolverReplayRuntimes(sequence);
         try self.waitForSyncLevelWithPublicationCut(sync_level, sequence, sync_targets, cancellation, false, publication_cut);
         if (sync_level == .full_index and self.indexes.text.merge_runtime == null) {
@@ -26020,8 +24501,8 @@ pub const DB = struct {
     /// The existing transactional guard checks source digests, incarnations,
     /// and exact lease tenure before any artifact or replay record is committed.
     pub fn publishPreparedGeneratedBatch(self: *DB, derived_batch: enrichment_runtime_mod.GeneratedRecordBatch, promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion, deletes: []const []const u8, guards: []const enrichment_runtime_mod.GeneratedSourceGuard, fence: ?enrichment_runtime_mod.GeneratedWriteFence) !enrichment_runtime_mod.GeneratedRecordCommit {
-        if (self.enrichment_append_context == null) try self.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
-        return appendGeneratedBatchFromEnrichment(self.enrichment_append_context orelse return error.EnrichmentWaitCanceled, derived_batch, promotions, deletes, guards, fence);
+        if (self.enrichment.append_context == null) try self.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true });
+        return appendGeneratedBatchFromEnrichment(self.enrichment.append_context orelse return error.EnrichmentWaitCanceled, derived_batch, promotions, deletes, guards, fence);
     }
 
     pub fn derivedAsyncAppendDerivedBatchRecord(self: *DB, derived_batch: derived_types.DerivedBatch) !u64 {
@@ -26033,16 +24514,16 @@ pub const DB = struct {
 
     fn currentMaintenanceTargetSequence(self: *DB) u64 {
         var target_sequence = self.core.nextDerivedSequence();
-        if (self.enrichment_runtime) |runtime| {
+        if (self.enrichment.runtime) |runtime| {
             target_sequence = @max(target_sequence, runtime.stats().target_sequence);
         }
         return target_sequence;
     }
 
     fn resolverReplayBlockedAfterRunnableDrain(self: *DB) bool {
-        const resolution_stats = self.resolutionStageStats();
+        const resolution_stats = self.enrichment.resolutionStageStats();
         if (resolution_stats.catch_up_required and !resolution_stats.blocked) return false;
-        const promotion_stats = self.promotionStageStats();
+        const promotion_stats = self.enrichment.promotionStageStats();
         return promotion_stats.blocked;
     }
 
@@ -26050,14 +24531,14 @@ pub const DB = struct {
         var rounds: usize = 0;
         while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
             const starting_sequence = self.core.nextDerivedSequence();
-            const starting_resolution_applied = if (self.resolution_runtime) |runtime| runtime.stats().applied_sequence else 0;
-            const starting_promotion_applied = if (self.promotion_runtime) |runtime| runtime.stats().applied_sequence else 0;
+            const starting_resolution_applied = if (self.enrichment.resolution.runtime) |runtime| runtime.stats().applied_sequence else 0;
+            const starting_promotion_applied = if (self.enrichment.promotion.runtime) |runtime| runtime.stats().applied_sequence else 0;
             try self.runMaintenanceUntilWithOptions(self.currentMaintenanceTargetSequence(), .{}, options);
             const drained_sequence = self.core.nextDerivedSequence();
 
             const drain_resolver_replay = self.resolverReplayNeedsDrain();
             if (drain_resolver_replay) {
-                if (self.resolution_runtime) |runtime| {
+                if (self.enrichment.resolution.runtime) |runtime| {
                     // nextDerivedSequence() is the highest committed sequence,
                     // not the next append sequence. Include that record when
                     // recovering a missed runtime notification.
@@ -26065,7 +24546,7 @@ pub const DB = struct {
                     try runtime.catchUp();
                 }
 
-                if (self.promotion_runtime) |runtime| {
+                if (self.enrichment.promotion.runtime) |runtime| {
                     const latest = self.core.nextDerivedSequence();
                     if (latest > 0) runtime.notifySequence(latest);
                     try runtime.catchUp();
@@ -26082,132 +24563,17 @@ pub const DB = struct {
                 if (self.resolverReplayBlockedAfterRunnableDrain()) return;
             }
 
-            const resolution_advanced = if (self.resolution_runtime) |runtime|
+            const resolution_advanced = if (self.enrichment.resolution.runtime) |runtime|
                 runtime.stats().applied_sequence > starting_resolution_applied
             else
                 false;
-            const promotion_advanced = if (self.promotion_runtime) |runtime|
+            const promotion_advanced = if (self.enrichment.promotion.runtime) |runtime|
                 runtime.stats().applied_sequence > starting_promotion_applied
             else
                 false;
             if (options.bounded_replay or (self.core.nextDerivedSequence() <= starting_sequence and !resolution_advanced and !promotion_advanced)) return;
         }
         return error.RunUntilIdleDidNotConverge;
-    }
-
-    /// Re-attempts opening quarantined indexes (artifacts that failed to
-    /// load at open time). `force` ignores per-index backoff — used by tests
-    /// and operator-triggered recovery. Runs the same detached-open path as
-    /// the initial load, so a recovered full-text/sparse/graph index resumes
-    /// its persisted rebuild state and catches up before registering.
-    pub fn retryQuarantinedIndexLoads(self: *DB, force: bool) !index_manager_mod.IndexManager.QuarantineRetryResult {
-        var publication_fence = QuarantineIndexPublicationFence{ .db = self };
-        const execution_limit = if (force)
-            self.core.index_manager.failedIndexLoadSummary().total
-        else
-            @as(usize, 8);
-        return try self.core.index_manager.retryFailedIndexLoads(
-            self.core.store,
-            monotonicTimeNs(),
-            force,
-            null,
-            execution_limit,
-            publication_fence.iface(),
-        );
-    }
-
-    /// Retry exactly one quarantined index. Ignoring backoff is orthogonal to
-    /// scope: targeted rollback and operator repair must never inspect, clone,
-    /// open, or publish unrelated failed indexes.
-    pub fn retryQuarantinedIndexLoad(
-        self: *DB,
-        index_name: []const u8,
-        force: bool,
-    ) !index_manager_mod.IndexManager.QuarantineRetryResult {
-        const failure = self.core.index_manager.failedIndexLoadSnapshot(index_name) orelse
-            return .{
-                .remaining = self.core.index_manager.failedIndexLoadSummary().total,
-                .target_outcome = .absent,
-            };
-        return try self.retryQuarantinedIndexLoadTarget(.{
-            .name = index_name,
-            .token = failure.token,
-        }, force);
-    }
-
-    pub fn retryQuarantinedIndexLoadTarget(
-        self: *DB,
-        target: index_manager_mod.IndexManager.FailedIndexLoadRetryTarget,
-        force: bool,
-    ) !index_manager_mod.IndexManager.QuarantineRetryResult {
-        var publication_fence = QuarantineIndexPublicationFence{ .db = self };
-        return try self.core.index_manager.retryFailedIndexLoads(
-            self.core.store,
-            monotonicTimeNs(),
-            force,
-            target,
-            1,
-            publication_fence.iface(),
-        );
-    }
-
-    /// Retries a top-level portable catalog activation that failed after the
-    /// durable generation commit. The restore loader rolls partial runtime
-    /// state back on error. Recovery is single-flight: callers never queue a
-    /// second full catalog reload behind one already in progress.
-    pub fn retryPortableRuntimeActivationIfNeeded(self: *DB) !bool {
-        if (!self.async_context.portable_runtime_activation_pending.load(.acquire)) return false;
-        if (!self.portable_runtime_activation_mutex.tryLock()) return error.PortableRuntimeActivationPending;
-        defer self.portable_runtime_activation_mutex.unlock();
-        if (!self.async_context.portable_runtime_activation_pending.load(.acquire)) return false;
-
-        _ = self.portable_runtime_activation_attempts.fetchAdd(1, .monotonic);
-        self.loadPortableRuntimeAfterPublication() catch |err| {
-            self.async_context.portable_runtime_activation_pending.store(true, .release);
-            return err;
-        };
-        self.async_context.portable_runtime_activation_pending.store(false, .release);
-        // Session cleanup intentionally leaves maintenance deferred while the
-        // catalog is degraded. Release that deferral only after the restored
-        // runtime is fully usable.
-        resumeDeferredBackgroundMaintenanceIfIdle(self.async_context);
-        self.startQuarantineRetryWorkerIfNeeded();
-        std.log.info("portable runtime activation recovered path={s}", .{self.core.path});
-        return true;
-    }
-
-    fn runArtifactRepairMetadataMaintenancePass(self: *DB) !bool {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
-        // The mark owns immutable primary/ANN/source leases. Scan before
-        // taking apply; only setup, planning, and publication need that fence.
-        if (self.local_execution.source_vectors.load(.acquire)) |source| try source.advanceMarkingSnapshot();
-        return self.runArtifactRepairMetadataMaintenanceAfterScan();
-    }
-
-    fn runArtifactRepairMetadataMaintenanceAfterScan(self: *DB) !bool {
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-
-        var more = try self.core.index_manager.runGraphOwnershipCleanupStep();
-        more = (try self.rebuildArtifactRepairSummaryIfMissing(self.alloc)) or more;
-        more = (try self.rebuildArtifactRepairKindIndexIfMissing(self.alloc)) or more;
-        if (self.local_execution.source_vectors.load(.acquire)) |source| {
-            const step_bytes = source.backgroundCollectionStepBytes();
-            if (step_bytes != 0) {
-                try self.refreshSourceVectorOwnershipScopes();
-                const prior_generation = source.currentGeneration();
-                if (try source.collectBackgroundStepDeferredMark(&self.core.store.runtime_store, step_bytes)) {
-                    if (source.currentGeneration() != prior_generation) try self.core.index_manager.refreshSourcePayloadGeneration();
-                }
-                if (source.collectionPending()) more = true;
-            }
-        }
-        return more;
-    }
-
-    pub fn runArtifactRepairMetadataMaintenanceUntilIdle(self: *DB) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("runArtifactRepairMetadataMaintenanceUntilIdle", .{self});
-        while (try self.runArtifactRepairMetadataMaintenancePass()) {}
     }
 
     const portable_activation_retry_base_ns = portable_activation_recovery.Owner.portable_activation_retry_base_ns;
@@ -26223,33 +24589,11 @@ pub const DB = struct {
         return platform_time.awakeNs(io);
     }
 
-    /// Start only after the DB has reached its final address. DB.open returns
-    /// by value, so cache owners invoke this after installing that value in a
-    /// stable heap entry rather than letting an async task capture the open
-    /// function's temporary stack address.
-    pub fn startArtifactRepairMetadataWorkerIfNeeded(self: *DB) void {
-        if (!self.start_independent_maintenance) return;
-        if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
-        // Ordinary unit tests drive maintenance explicitly. Borrowed runtimes
-        // schedule the production owner deterministically, including VOPR's
-        // test-artifact runner; disabling it strands durable graph cleanup.
-        if (comptime builtin.is_test) {
-            if (!self.backend_runtime.usesBorrowedIo()) return;
-        }
-        if (!self.start_index_workers) return;
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
-        self.independent_maintenance.start(self.independentMaintenancePort());
-    }
-
-    fn stopArtifactRepairMetadataWorker(self: *DB) void {
-        self.independent_maintenance.stop(self.backend_runtime);
-    }
-
     fn artifactRepairMetadataWorkerStep(self: *DB) ?u64 {
-        return self.independent_maintenance.step(self.independentMaintenancePort());
+        return self.maintenance.independent.step(self.independentMaintenancePort());
     }
 
-    fn independentMaintenancePort(self: *DB) independent_maintenance.Owner.Port {
+    pub fn independentMaintenancePort(self: *DB) independent_maintenance.Owner.Port {
         return .{ .ptr = self, .runtime = self.backend_runtime, .now = producerMaintenanceNow, .ready = independentMaintenanceReady, .run = independentMaintenanceRun, .failed = independentMaintenanceFailed, .activity = independentMaintenanceActivity };
     }
     fn independentMaintenanceReady(ptr: *anyopaque) bool {
@@ -26262,9 +24606,9 @@ pub const DB = struct {
         switch (work) {
             .upload => return self.advanceArtifactUploadRecoveryWithTrigger(.maintenance),
             .authority => return self.documents.advanceAuthorityBackfillPage(),
-            .baseline => return self.advanceArtifactProducerBaselinePage(),
-            .producer => return self.advanceArtifactProducerWorkPage(),
-            .footprint => return self.advanceArtifactFootprintPage(),
+            .baseline => return self.enrichment.advanceArtifactProducerBaselinePage(),
+            .producer => return self.enrichment.advanceArtifactProducerWorkPage(),
+            .footprint => return self.enrichment.advanceArtifactFootprintPage(),
             .repair => {
                 const pending = self.indexes.graph.advanceReplacement() catch self.indexes.graph.hasPendingReplacements();
                 try self.runArtifactRepairMaintenanceTurn();
@@ -26298,7 +24642,7 @@ pub const DB = struct {
                 // Paused, terminal and future-dated native work uses idle audit;
                 // runnable pages retain the active cadence without busy polling.
                 const runnable = recovery.wake == .immediate;
-                self.local_source_recovery_pending = if (owns_generations) runnable else recovery.attempted != 0 and recovery.remaining != 0;
+                self.maintenance.local_source.recovery_pending = if (owns_generations) runnable else recovery.attempted != 0 and recovery.remaining != 0;
                 return pending or (if (owns_generations) runnable else recovery.remaining != 0);
             },
             .column => {
@@ -26313,14 +24657,14 @@ pub const DB = struct {
     }
     fn independentSourceRecoveryCancelled(ptr: *anyopaque) bool {
         const self: *DB = @ptrCast(@alignCast(ptr));
-        return self.independent_maintenance.stopping.load(.acquire) or
+        return self.maintenance.independent.stopping.load(.acquire) or
             !replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate);
     }
     fn independentMaintenanceFailed(ptr: *anyopaque, work: independent_maintenance.Owner.Work) void {
         const self: *DB = @ptrCast(@alignCast(ptr));
         switch (work) {
-            .baseline => self.artifact_producer_baseline_pending.store(false, .release),
-            .footprint => self.artifact_footprint_pending.store(false, .release),
+            .baseline => self.enrichment.artifacts.producer_baseline_pending.store(false, .release),
+            .footprint => self.enrichment.artifacts.footprint_pending.store(false, .release),
             else => unreachable,
         }
     }
@@ -26328,33 +24672,13 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ptr));
         const source = self.local_execution.source_vectors.load(.acquire);
         return .{
-            .artifacts = (replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate) and (self.local_source_recovery_pending or self.documents.authority.backfill_active.load(.acquire) or self.documents.authority.backfill_requested.load(.acquire) or self.documents.authority.repairs.pending.load(.acquire))) or self.indexes.graph.hasPendingReplacements() or self.artifact_repair_metadata_pending or self.artifact_footprint_pending.load(.acquire) or self.artifact_producer_baseline_pending.load(.acquire) or (if (source) |value| value.collectionPending() else false),
-            .producers = self.artifact_producer_scheduler.active(self.independentMaintenanceNowNs()),
+            .artifacts = (replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate) and (self.maintenance.local_source.recovery_pending or self.documents.authority.backfill_active.load(.acquire) or self.documents.authority.backfill_requested.load(.acquire) or self.documents.authority.repairs.pending.load(.acquire))) or self.indexes.graph.hasPendingReplacements() or self.enrichment.artifacts.repair_metadata_pending or self.enrichment.artifacts.footprint_pending.load(.acquire) or self.enrichment.artifacts.producer_baseline_pending.load(.acquire) or (if (source) |value| value.collectionPending() else false),
+            .producers = self.enrichment.artifacts.producer_scheduler.active(self.independentMaintenanceNowNs()),
             .indexes = self.local_execution.relational_index_maintenance_sweep.isPending() and platform_time.monotonicNs() >= self.local_execution.relational_index_retry_after_ns.load(.acquire),
             .columns = self.indexes.relational.column_maintenance.pending.load(.acquire) and !self.indexes.relational.column_maintenance.backing_off.load(.acquire),
             .scan_pause_ns = if (source) |value| value.activeScanPauseNs() else null,
             .background_checkpoint = if (source) |value| value.background_checkpoint else false,
         };
-    }
-
-    /// One bounded physical-key page, never under the DB apply lock. Both
-    /// discovery and the ordinary maintenance scheduler advance the same
-    /// durable cursor, so large old roots do not require repeated client calls.
-    pub fn advanceArtifactFootprintPage(self: *DB) !bool {
-        if (comptime storage_engine.enabled) return storage_engine.call("advanceArtifactFootprintPage", .{self});
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return true;
-        var budget = if (self.core.index_manager.resource_manager) |manager|
-            resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, self.alloc, 1)
-        else
-            null;
-        defer if (budget) |*value| value.deinit();
-        const scratch = if (budget) |*value| value.allocator() else self.alloc;
-        const complete = @import("../artifact_footprint.zig").reconcilePage(scratch, self.core.store) catch |err| {
-            if (err == error.OutOfMemory) if (budget) |*value| if (value.denied()) return error.ResourceBudgetExceeded;
-            return err;
-        };
-        self.artifact_footprint_pending.store(!complete, .release);
-        return complete;
     }
 
     /// Discover bounded durable upload facts without payload reads. Release
@@ -26384,31 +24708,9 @@ pub const DB = struct {
         });
     }
 
-    /// Append root-producer requests using the existing durable replay journal.
-    /// The cursor is only a fairness hint: acceptance and sealing remain ordered
-    /// operations, and restart can safely rediscover every unscheduled row.
-    pub fn advanceArtifactProducerWorkPage(self: *DB) !bool {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
-        return self.artifact_producer_scheduler.advance(.{ .ptr = self, .now = producerMaintenanceNow, .page = advanceArtifactProducerBudgetedPage });
-    }
-
-    fn producerMaintenanceNow(ptr: *anyopaque) u64 {
+    pub fn producerMaintenanceNow(ptr: *anyopaque) u64 {
         const self: *DB = @ptrCast(@alignCast(ptr));
         return self.independentMaintenanceNowNs();
-    }
-
-    fn advanceArtifactProducerBudgetedPage(ptr: *anyopaque) !bool {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        var budget = if (self.core.index_manager.resource_manager) |manager|
-            resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, self.alloc, 1)
-        else
-            null;
-        defer if (budget) |*value| value.deinit();
-        const scratch = if (budget) |*value| value.allocator() else self.alloc;
-        return self.advanceArtifactProducerWorkPageWithAllocator(scratch) catch |err| {
-            if (err == error.OutOfMemory) if (budget) |*value| if (value.denied()) return error.ResourceBudgetExceeded;
-            return err;
-        };
     }
 
     fn refreshArtifactProjections(self: *DB, scratch: Allocator, document: []const u8, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, limits: @import("artifact_completion_progress.zig").Limits) !void {
@@ -26447,7 +24749,7 @@ pub const DB = struct {
         }
     }
 
-    fn enqueueArtifactCompletion(self: *DB, scratch: Allocator, document: []const u8, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot) !void {
+    pub fn enqueueArtifactCompletion(self: *DB, scratch: Allocator, document: []const u8, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot) !void {
         const dispatcher = self.local_execution.artifact_publication_dispatcher orelse return;
         try self.refreshArtifactProjections(scratch, document, plan, .{});
         var encoded: ?[]u8 = null;
@@ -26536,126 +24838,6 @@ pub const DB = struct {
         return true;
     }
 
-    fn advanceArtifactProducerWorkPageWithAllocator(self: *DB, scratch: Allocator) !bool {
-        const has_ordered_authority = blk: {
-            var read = try self.core.store.beginReadTxn();
-            defer read.abort();
-            break :blk try @import("artifact_publication.zig").authority(&read) != null;
-        };
-        if (!has_ordered_authority) {
-            if (self.local_source_completion_audit_pending) {
-                _ = try self.ensureGeneratedCoverageRecoveryIntents(scratch);
-                self.local_source_completion_audit_pending = false;
-            }
-            return false;
-        }
-        var plan = try self.core.index_manager.acquireWritePlanSnapshot();
-        defer plan.release();
-        const readiness_progress = try @import("artifact_producer_readiness.zig").advance(scratch, self.core.store, self.root_incarnation, plan.plan());
-        const obligations = @import("artifact_producer_obligations.zig");
-        var page = blk: {
-            var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
-            defer read.abort();
-            const authority = (try @import("artifact_publication.zig").authority(&read)) orelse return false;
-            // Protocol-14 owners have no required-stream work registry.
-            const state = (try obligations.load(&read)) orelse {
-                var ordered = (try @import("artifact_inventory.zig").load(scratch, &read)) orelse return error.ArtifactCatalogDrift;
-                defer ordered.deinit();
-                if (ordered.value.command.binding.effect_protocol >= 15) return error.ArtifactCatalogCorrupt;
-                const pending = try @import("artifact_producer_readiness.zig").pending(scratch, self.core.store, self.root_incarnation);
-                self.artifact_producer_scheduler.completeReadinessPage(self.alloc, pending, readiness_progress, self.independentMaintenanceNowNs());
-                return readiness_progress;
-            };
-            try state.requireAuthority(authority);
-            if (state.sealed_attempt != null) return false;
-            const catalogs = try @import("artifact_inventory.zig").catalogs(&read);
-            if (!plan.plan().matchesArtifactInventory(catalogs) or !std.mem.eql(u8, &catalogs.digest(), &authority.catalog_digest)) return error.ArtifactCatalogDrift;
-            const cursor = self.artifact_producer_scheduler.cursorForAuthority(self.alloc, authority);
-            break :blk try obligations.scanWork(scratch, &read, authority, cursor);
-        };
-        defer page.deinit();
-        const dispatch = @import("artifact_producer_dispatch.zig");
-        const retry = @import("artifact_producer_retry.zig");
-        const retry_now = self.independentMaintenanceNowNs();
-        self.artifact_producer_scheduler.observeAuthority(page.authority);
-        const retry_real_now: u64 = @intCast(@max(0, std.Io.Timestamp.now(self.core.index_manager.checkpointIo(), .real).toNanoseconds()));
-        // Persisted wall time selects retries only. It prevents cold-owner
-        // churn from restarting the grace period forever; runtime deadlines
-        // still use the owner's awake clock and cannot discharge any work.
-        if (self.artifact_producer_scheduler.needsRetryDelay()) {
-            var read = try self.core.store.beginReadTxn();
-            defer read.abort();
-            self.artifact_producer_scheduler.setRetryDelay(retry_now, try obligations.retryDelay(&read, page.authority, retry_real_now, retry.interval_ns));
-        }
-        if (self.artifact_producer_scheduler.needsRetryRound(retry_now, page.items.len != 0, plan.plan().generated_templates.len != 0)) {
-            try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
-            var txn = try self.core.store.beginWriteTxn();
-            errdefer txn.abort();
-            const round = try obligations.beginRetryRoundAt(&txn, page.authority, retry_real_now);
-            try txn.commit();
-            self.artifact_producer_scheduler.startRound(page.authority, round);
-        }
-        var refs: dispatch.Buffer = undefined;
-        const deadline = platform_time.monotonicNs() +| @import("artifact_producer_scheduler.zig").Scheduler.quantum_ns;
-        var processed: usize = 0;
-        var more_dispatch = false;
-        for (page.items) |item| {
-            if (processed != 0 and platform_time.monotonicNs() >= deadline) break;
-            // Allocate the next fairness cursor before committing, so allocation
-            // failure cannot strand an admitted request behind a stale cursor.
-            const next = try self.alloc.dupe(u8, item.document);
-            errdefer self.alloc.free(next);
-            // Native verification is local, resumable evidence, not discharge.
-            // It also runs for catalogs with no generated provider templates.
-            const native_progress = try @import("artifact_native_stream.zig").advance(scratch, self.core.store, self.root_incarnation, item.document, plan.plan());
-            more_dispatch = more_dispatch or native_progress == .progress;
-            if (native_progress == .closed) {
-                _ = try self.advanceArtifactUnitReceiptPage(scratch, item.document, plan.plan());
-                try self.enqueueArtifactCompletion(scratch, item.document, plan.plan());
-            }
-            if (!item.dispatch_complete and plan.plan().generated_templates.len != 0) {
-                const requests = try dispatch.prepare(plan.plan().generated_templates, item.next_template, item.document, &refs);
-                var ctx = self.batchContext();
-                _ = try appendDerivedBatchRecordContextWithWork(&ctx, .{ .generated_enrichment_refs = requests.items }, false, .{
-                    .authority = page.authority,
-                    .item = item,
-                    .plan_generation = plan.generation(),
-                    .page = requests.progress,
-                });
-                more_dispatch = more_dispatch or !requests.progress.complete;
-            }
-            if (self.artifact_producer_scheduler.retryPage(item, plan.plan().generated_templates.len != 0)) |round| {
-                const requests = blk: {
-                    var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
-                    defer read.abort();
-                    break :blk try retry.prepare(scratch, &read, self.root_incarnation, plan.plan(), round.first_template, item.document, &refs);
-                };
-                const required: RequiredProducerDispatch = .{ .authority = page.authority, .item = item, .plan_generation = plan.generation(), .page = requests.progress, .retry_round = round.number };
-                if (requests.items.len != 0) {
-                    var ctx = self.batchContext();
-                    _ = try appendDerivedBatchRecordContextWithWork(&ctx, .{ .generated_enrichment_refs = requests.items }, false, required);
-                } else {
-                    // No empty replay record for an already accepted page.
-                    // This advances scheduling only, not completion credit.
-                    try self.lockApplyForPortableRuntime();
-                    defer self.core.unlockApply();
-                    if (self.core.index_manager.writePlanGeneration() != required.plan_generation) return error.EnrichmentSourceChanged;
-                    var txn = try self.core.store.beginWriteTxn();
-                    errdefer txn.abort();
-                    if (!try obligations.stageRetry(scratch, &txn, page.authority, item, round.number, null, requests.progress)) return error.EnrichmentSourceChanged;
-                    try txn.commit();
-                }
-                self.artifact_producer_scheduler.noteRetryProgress(requests.progress.complete);
-            }
-            self.artifact_producer_scheduler.commitCursor(self.alloc, page.authority, next);
-            processed += 1;
-        }
-        const readiness_pending = try @import("artifact_producer_readiness.zig").pending(scratch, self.core.store, self.root_incarnation);
-        self.artifact_producer_scheduler.completeWorkPage(self.alloc, processed == page.items.len and page.at_end, more_dispatch, .{ .pending = readiness_pending, .progressed = readiness_progress }, self.independentMaintenanceNowNs());
-        return processed != 0 or readiness_progress;
-    }
-
     /// Persist scoped jobs and their document wakeup atomically. The thin
     /// journal is only a wakeup: exact child/unit/generation identities remain
     /// in the root-local outbox until receipt-checked retirement.
@@ -26690,7 +24872,7 @@ pub const DB = struct {
         const wake: enrichment_types.GeneratedEnrichmentRef = .{ .kind = parent.kind, .index_name = parent.index_name, .artifact_name = parent.artifact_name, .embedding_name = parent.embedding_name, .doc_key = admission.page.document };
         const sequence = try appendDerivedBatchRecordContextWithAdmissions(&ctx, .{ .generated_enrichment_refs = (&wake)[0..1] }, false, null, .{ .admission = admission, .root = self.root_incarnation, .plan_generation = plan.generation() });
         self.executor.notifySequence(sequence);
-        if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+        if (self.enrichment.runtime) |runtime| runtime.notifySequence(sequence);
         return sequence;
     }
 
@@ -26762,84 +24944,12 @@ pub const DB = struct {
         try writer.commit();
     }
 
-    pub fn advanceArtifactProducerBaselinePage(self: *DB) !bool {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return true;
-        var budget = if (self.core.index_manager.resource_manager) |manager|
-            resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, self.alloc, 1)
-        else
-            null;
-        defer if (budget) |*value| value.deinit();
-        const scratch = if (budget) |*value| value.allocator() else self.alloc;
-        return self.advanceArtifactProducerBaselinePageWithAllocator(scratch) catch |err| {
-            if (err == error.OutOfMemory) if (budget) |*value| if (value.denied()) return error.ResourceBudgetExceeded;
-            return err;
-        };
-    }
-
-    fn advanceArtifactProducerBaselinePageWithAllocator(self: *DB, scratch: Allocator) !bool {
-        const publication_mode = blk: {
-            var read = try self.core.store.beginReadTxn();
-            defer read.abort();
-            if (try @import("artifact_publication.zig").authority(&read) == null) {
-                self.artifact_producer_baseline_pending.store(false, .release);
-                return true;
-            }
-            const owner = (try @import("../source_authority.zig").publicationOwner(&read)) orelse return error.ArtifactCatalogDrift;
-            break :blk owner.mode;
-        };
-        const retired_work = try @import("artifact_producer_obligations.zig").collectObsoleteWorkPage(scratch, self.core.store);
-        const retired_proofs = try @import("artifact_producer_provenance.zig").collectObsoletePage(scratch, self.core.store);
-        const retired_checkpoints = try @import("artifact_stream_checkpoint.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_streams = try @import("artifact_stream_progress.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_completions = try @import("artifact_completion_progress.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_native = try @import("artifact_native_stream.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_inventories = try @import("artifact_chunk_inventory_progress.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_units = try @import("artifact_unit_progress.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_unit_jobs = try @import("artifact_unit_jobs.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const retired_authored = try @import("artifact_authored_acceptance.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
-        const swept_authored = try @import("artifact_authored_acceptance.zig").collectCurrentPage(scratch, self.core.store, self.root_incarnation);
-        const retired = retired_work and retired_proofs and retired_checkpoints and retired_streams and retired_completions and retired_native and retired_inventories and retired_units and retired_unit_jobs and retired_authored and swept_authored;
-        if (publication_mode == .ordered) {
-            var prepared = (try @import("artifact_producer_baseline.zig").prepareRaft(scratch, self.core.store)) orelse {
-                var validation = (try @import("artifact_producer_validation.zig").prepareRaft(scratch, self.core.store)) orelse {
-                    self.artifact_producer_baseline_pending.store(!retired, .release);
-                    return retired;
-                };
-                defer validation.deinit();
-                const dispatcher = self.local_execution.artifact_publication_dispatcher orelse {
-                    self.artifact_producer_baseline_pending.store(!retired, .release);
-                    return false;
-                };
-                const encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(scratch, validation.command);
-                defer scratch.free(encoded);
-                try dispatcher.enqueue(dispatcher.ptr, validation.command.namespace, encoded);
-                self.artifact_producer_baseline_pending.store(true, .release);
-                return false;
-            };
-            defer prepared.deinit();
-            const dispatcher = self.local_execution.artifact_publication_dispatcher orelse {
-                self.artifact_producer_baseline_pending.store(!retired, .release);
-                return false;
-            };
-            const encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(scratch, prepared.command);
-            defer scratch.free(encoded);
-            try dispatcher.enqueue(dispatcher.ptr, prepared.command.namespace, encoded);
-            // Queue admission is not a baseline certificate. The next pass
-            // observes only progress installed by the replicated transaction.
-            self.artifact_producer_baseline_pending.store(true, .release);
-            return false;
-        }
-        const complete = try @import("artifact_producer_baseline.zig").page(scratch, self.core.store);
-        self.artifact_producer_baseline_pending.store(!complete or !retired, .release);
-        return complete and retired;
-    }
-
     /// Fair bounded dispatch on the existing std.Io maintenance scheduler.
     /// Never scan every catalog entry or finish an entire index in one turn.
     pub fn runRelationalIndexMaintenancePass(self: *DB) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runRelationalIndexMaintenancePass", .{self});
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
-        if (self.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+        if (self.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
         const started = platform_time.monotonicNs();
         if (started < self.local_execution.relational_index_retry_after_ns.load(.acquire)) return false;
         const sweep = &self.local_execution.relational_index_maintenance_sweep;
@@ -26892,7 +25002,7 @@ pub const DB = struct {
             try ensureSnapshotActive(cancellation);
             const now = platform_time.monotonicNs();
             if (deadline_ns) |deadline| if (now >= deadline) return error.DeadlineExceeded;
-            if (self.run_until_idle_no_progress_timeout_ns != 0 and now -| last_progress >= self.run_until_idle_no_progress_timeout_ns) return error.RunUntilIdleNoProgress;
+            if (self.maintenance.run_until_idle.no_progress_timeout_ns != 0 and now -| last_progress >= self.maintenance.run_until_idle.no_progress_timeout_ns) return error.RunUntilIdleNoProgress;
             if (try self.runRelationalIndexMaintenancePass()) {
                 last_progress = platform_time.monotonicNs();
             } else if (sweep.isPending()) {
@@ -26926,22 +25036,17 @@ pub const DB = struct {
         }
     }
 
-    fn portableActivationRecoveryPort(self: *DB) portable_activation_recovery.Owner.Port {
+    pub fn portableActivationRecoveryPort(self: *DB) portable_activation_recovery.Owner.Port {
         return .{
             .ptr = self,
             .path = self.core.path,
             .runtime = self.backend_runtime,
             .owner_id = self.backend_owner_id,
             .pending = &self.async_context.portable_runtime_activation_pending,
-            .retry = retryPortableActivationFromOwner,
+            .retry = Recovery.retryPortableActivationFromOwner,
             .before_start = if (builtin.is_test) portableActivationBeforeStartForTest else null,
             .refuse_launch = if (builtin.is_test) portableActivationRefuseLaunchForTest else null,
         };
-    }
-
-    fn retryPortableActivationFromOwner(ptr: *anyopaque) !bool {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        return self.retryPortableRuntimeActivationIfNeeded();
     }
 
     fn portableActivationBeforeStartForTest(ptr: *anyopaque) void {
@@ -26958,83 +25063,26 @@ pub const DB = struct {
         return test_fail_portable_activation_retry_fallback_submit.swap(false, .acq_rel);
     }
 
-    fn startPortableActivationRetryWorkerIfNeeded(self: *DB) void {
-        self.startPortableActivationRetryWorkerIfNeededInner(false);
-    }
-
-    fn startPortableActivationRetryWorkerIfNeededInner(self: *DB, allow_test_background: bool) void {
-        if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
-        if (comptime builtin.is_test) {
-            if (!allow_test_background) return;
-        }
-        self.portable_activation_recovery.start(self.portableActivationRecoveryPort());
-    }
-
-    fn launchPortableActivationRetryWorkerLocked(self: *DB) !portable_activation_recovery.Owner.PortableActivationRetryLaunch {
-        self.portable_activation_recovery.port = self.portableActivationRecoveryPort();
-        self.portable_activation_recovery.bound = true;
-        return self.portable_activation_recovery.launchPortableActivationRetryWorkerLocked();
-    }
-
-    fn stopPortableActivationRetryWorker(self: *DB) void {
-        self.portable_activation_recovery.stop(self.portableActivationRecoveryPort());
-    }
-
     const portableActivationRetryDelayNs = portable_activation_recovery.Owner.portableActivationRetryDelayNs;
 
     fn runArtifactRepairMaintenanceTurn(self: *DB) !void {
         if (self.local_execution.source_vectors.load(.acquire)) |source| try source.checkpointMaintenance();
         const independent = if (self.local_execution.source_vectors.load(.acquire)) |source| source.independent_scan else false;
         const now = self.independentMaintenanceNowNs();
-        if (!independent or now >= self.artifact_repair_metadata_due_ns)
-            self.artifact_repair_metadata_pending = self.artifactRepairMetadataRebuildPending();
+        if (!independent or now >= self.enrichment.artifacts.repair_metadata_due_ns)
+            self.enrichment.artifacts.repair_metadata_pending = self.artifactRepairMetadataRebuildPending();
         if (independent) {
             const source = self.local_execution.source_vectors.load(.acquire).?;
             try source.advanceMarkingSnapshot();
             // Immutable scan turns bypass apply/catalog work until metadata
             // is due. State survives scheduler yields, not a pinned thread.
-            if (now >= self.artifact_repair_metadata_due_ns or !source.continueScanWithoutApply()) {
-                self.artifact_repair_metadata_due_ns = now +| artifact_repair_metadata_active_poll_ns;
-                self.artifact_repair_metadata_pending = try self.runArtifactRepairMetadataMaintenanceAfterScan();
+            if (now >= self.enrichment.artifacts.repair_metadata_due_ns or !source.continueScanWithoutApply()) {
+                self.enrichment.artifacts.repair_metadata_due_ns = now +| artifact_repair_metadata_active_poll_ns;
+                self.enrichment.artifacts.repair_metadata_pending = try self.enrichment.runArtifactRepairMetadataMaintenanceAfterScan();
             }
         } else {
-            self.artifact_repair_metadata_pending = try self.runArtifactRepairMetadataMaintenancePass();
+            self.enrichment.artifacts.repair_metadata_pending = try self.enrichment.runArtifactRepairMetadataMaintenancePass();
         }
-    }
-
-    /// Start only after the DB has reached its final address. The scheduler
-    /// registration retains `self` until its stop/join boundary.
-    pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
-        if (comptime !builtin.is_test and (builtin.single_threaded or builtin.os.tag == .freestanding)) return;
-        if (!builtin.is_test and (!self.local_execution.optional_runtime_workers_enabled or self.open_mode != .writer)) return;
-        if (self.open_mode == .writer and self.physical_root_mode == .filesystem_managed and self.primary_backend == .lsm and
-            self.core.identity_namespace.table_id != 0 and self.backend_runtime.query_cut_repository != null and
-            self.backend_runtime.query_cut_repository.?.vtable.warm != null and self.backend_runtime.query_cut_repository.?.limits.max_cuts > 1)
-            self.query.warming.start(.{ .ptr = self, .runtime = self.backend_runtime, .turn = warmNativeCheckpoint });
-        self.quarantine_recovery.start(.{
-            .ptr = self,
-            .runtime = self.backend_runtime,
-            .has_failures = quarantineHasFailures,
-            .retry = retryQuarantineFromOwner,
-        });
-    }
-
-    fn quarantineHasFailures(ptr: *anyopaque) bool {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        return self.core.index_manager.hasLoadFailures();
-    }
-
-    fn retryQuarantineFromOwner(ptr: *anyopaque) !usize {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        return (try self.retryQuarantinedIndexLoads(false)).remaining;
-    }
-
-    pub fn quarantineRetryWorkerStartedAtCurrentAddressForTest(self: *const DB) bool {
-        return builtin.is_test and self.quarantine_recovery.start_address_for_test == @intFromPtr(self);
-    }
-
-    fn stopQuarantineRetryWorker(self: *DB) void {
-        self.quarantine_recovery.stop(self.backend_runtime);
     }
 
     fn runRestoreRepairDrainAsync(self: *DB) !void {
@@ -27045,7 +25093,7 @@ pub const DB = struct {
         // posting, text-merge, artifact-metadata, and LSM maintenance outside
         // this barrier; those can continue in the background without hiding
         // logically restored query results.
-        if (self.enrichment_runtime) |runtime| {
+        if (self.enrichment.runtime) |runtime| {
             const before = runtime.stats();
             std.log.info("restore runtime repair enrichment drain begin path={s} applied={d} target={d} processed={d} skipped={d}", .{
                 self.core.path,
@@ -27061,7 +25109,7 @@ pub const DB = struct {
             .truncate_replay = false,
             .wait_for_enrichment_retries = true,
         });
-        if (self.enrichment_runtime) |runtime| {
+        if (self.enrichment.runtime) |runtime| {
             const after = runtime.stats();
             std.log.info("restore runtime repair enrichment drain complete path={s} applied={d} target={d} processed={d} skipped={d} errors={d}", .{
                 self.core.path,
@@ -27076,13 +25124,13 @@ pub const DB = struct {
     }
 
     fn runUntilIdleWithReplayDrainOptions(self: *DB, options: ReplayDrainOptions) !void {
-        _ = try self.retryPortableRuntimeActivationIfNeeded();
+        _ = try self.recovery.retryPortableRuntimeActivationIfNeeded();
         // Manual owners need synchronous resolver drivers both during shadow
         // construction and after a crash between activation and promotion.
         // Creating these drivers does not start background workers.
         if (!openModeRequiresReadOnlyBackends(self.open_mode) and self.hasConfiguredResolvers()) {
-            if (self.resolution_runtime == null) try self.initResolutionRuntime();
-            if (self.promotion_runtime == null) try self.initPromotionRuntime();
+            if (self.enrichment.resolution.runtime == null) try self.enrichment.initResolutionRuntime();
+            if (self.enrichment.promotion.runtime == null) try self.enrichment.initPromotionRuntime();
         }
         {
             const group_state = options.group_source_state orelse self.documents.group_sources.borrowed_state orelse &self.documents.group_sources.owner.state;
@@ -27126,7 +25174,7 @@ pub const DB = struct {
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
         try self.flushAppliedSequencesForIdle();
         try self.indexes.text.drainScheduledMerges();
-        try self.runArtifactRepairMetadataMaintenanceUntilIdle();
+        try self.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle();
         if (options.drain_relational_indexes) {
             try self.runRelationalIndexMaintenanceUntilIdle(options.cancellation, options.deadline_ns);
         } else {
@@ -27185,12 +25233,12 @@ pub const DB = struct {
     pub fn runUntilIdleWithGroupSourceState(self: *DB, state: *GroupSourceMaintenanceState) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdleWithGroupSourceState", .{ self, state });
         const started_ns = platform_time.monotonicNs();
-        const before = self.enrichmentThroughputSnapshot();
+        const before = self.enrichment.throughputSnapshot();
         defer self.logRunUntilIdleSummary(started_ns, before);
         self.runUntilIdleWithReplayDrainOptions(.{
             .wait_for_enrichment_retries = true,
             .unbounded_enrichment_wait = true,
-            .no_progress_timeout_ns = self.run_until_idle_no_progress_timeout_ns,
+            .no_progress_timeout_ns = self.maintenance.run_until_idle.no_progress_timeout_ns,
             .group_source_state = state,
         }) catch |err| {
             // Embedded callers only see the mapped C ABI code (most of these
@@ -27204,7 +25252,7 @@ pub const DB = struct {
         };
     }
 
-    const EnrichmentThroughputSnapshot = struct {
+    pub const EnrichmentThroughputSnapshot = struct {
         embed_batches: u64 = 0,
         embed_items: u64 = 0,
         embed_ns: u64 = 0,
@@ -27213,24 +25261,12 @@ pub const DB = struct {
         extract_ns: u64 = 0,
     };
 
-    fn enrichmentThroughputSnapshot(self: *DB) EnrichmentThroughputSnapshot {
-        const runtime = self.enrichment_runtime orelse return .{};
-        return .{
-            .embed_batches = runtime.embed_batches_completed,
-            .embed_items = runtime.embed_items_completed,
-            .embed_ns = runtime.total_embed_ns,
-            .extract_batches = runtime.extract_batches_completed,
-            .extract_items = runtime.extract_items_completed,
-            .extract_ns = runtime.total_extract_ns,
-        };
-    }
-
     /// One-line throughput summary so a caller (Lite's `dogfood`-style ingest
     /// drain, in particular) can see embed/extract batch counts and wall time
     /// without instrumenting its own driver loop. Deltas isolate this call's
     /// own contribution on a long-lived, repeatedly-drained runtime.
     fn logRunUntilIdleSummary(self: *DB, started_ns: u64, before: EnrichmentThroughputSnapshot) void {
-        const after = self.enrichmentThroughputSnapshot();
+        const after = self.enrichment.throughputSnapshot();
         const wall_ns = platform_time.monotonicNs() -| started_ns;
         if (after.embed_batches == before.embed_batches and after.extract_batches == before.extract_batches) return;
         std.log.info(
@@ -27285,8 +25321,8 @@ pub const DB = struct {
         try ensureSnapshotActive(cancellation);
         if (shadow) {
             if (self.hasConfiguredResolvers()) {
-                if (self.resolution_runtime == null) try self.initResolutionRuntime();
-                if (self.promotion_runtime == null) try self.initPromotionRuntime();
+                if (self.enrichment.resolution.runtime == null) try self.enrichment.initResolutionRuntime();
+                if (self.enrichment.promotion.runtime == null) try self.enrichment.initPromotionRuntime();
             }
             return self.indexes.graph.advanceReplacementForIdentityUntil(null, null, .detached);
         }
@@ -29258,7 +27294,7 @@ pub const DB = struct {
         }
     };
 
-    const GeneratedEnrichmentReplayScanOptions = struct {
+    pub const GeneratedEnrichmentReplayScanOptions = struct {
         // Source recovery must advance a physical key even when a cold read
         // consumes its soft time slice before the first visitor is called.
         min_records_before_deadline: usize = 0,
@@ -29267,7 +27303,7 @@ pub const DB = struct {
         deadline_ns: ?u64 = null,
     };
 
-    fn collectStoredGeneratedReplayBatch(
+    pub fn collectStoredGeneratedReplayBatch(
         self: *DB,
         alloc: Allocator,
         lower: []const u8,
@@ -29384,135 +27420,6 @@ pub const DB = struct {
         }
     };
 
-    pub fn appendGeneratedEnrichmentsFromStoredDocsPage(
-        self: *DB,
-        alloc: Allocator,
-        force_generated_artifact_names: []const []const u8,
-        skip_terminally_covered: bool,
-        resume_key: ?[]const u8,
-        limit: usize,
-        options: GeneratedEnrichmentReplayScanOptions,
-    ) !GeneratedEnrichmentReplayPageResult {
-        if (self.enrichment_runtime == null) return .{ .complete = true };
-        if (limit == 0) return error.InvalidArgument;
-
-        const initial_lower = if (resume_key == null) try self.core.documentRangeLowerAlloc("") else null;
-        defer if (initial_lower) |key| self.core.alloc.free(key);
-        const lower = resume_key orelse initial_lower.?;
-        var replay_batch = try self.collectStoredGeneratedReplayBatch(alloc, lower, resume_key != null, limit, options);
-        defer replay_batch.deinit(alloc);
-
-        var pending_batch = derived_types.DerivedBatch{};
-        defer derived_types.deinitDerivedBatch(self.alloc, &pending_batch);
-        try appendGeneratedEnrichments(self, &pending_batch, .{
-            .writes = replay_batch.writes,
-            .sync_level = .write,
-        }, replay_batch.extracted, force_generated_artifact_names, skip_terminally_covered);
-        var target_sequence: u64 = 0;
-        if (pending_batch.generated_enrichment_refs.len != 0) {
-            target_sequence = try appendDerivedBatchRecord(self, pending_batch);
-            self.executor.notifySequence(target_sequence);
-            if (self.enrichment_runtime) |runtime| runtime.notifySequence(target_sequence);
-            self.notifyResolverReplayRuntimes(target_sequence);
-        }
-
-        const complete = replay_batch.complete;
-        const next_resume_key = if (complete)
-            null
-        else blk: {
-            const key = replay_batch.next_lower orelse break :blk if (resume_key) |previous| try alloc.dupe(u8, previous) else null;
-            replay_batch.next_lower = null;
-            break :blk key;
-        };
-        return .{
-            .generated_ref_count = pending_batch.generated_enrichment_refs.len,
-            .target_sequence = target_sequence,
-            .documents_scanned = replay_batch.writes.len,
-            .next_resume_key = next_resume_key,
-            .complete = complete,
-        };
-    }
-
-    fn appendGeneratedEnrichmentsFromStoredDocs(
-        self: *DB,
-        alloc: Allocator,
-        force_generated_artifact_names: []const []const u8,
-        skip_terminally_covered: bool,
-    ) !GeneratedEnrichmentReplayAppendResult {
-        if (self.enrichment_runtime == null) return .{};
-
-        const chunk_size: usize = 128;
-        const initial_lower = try self.core.documentRangeLowerAlloc("");
-        defer self.core.alloc.free(initial_lower);
-        var lower = try alloc.dupe(u8, initial_lower);
-        defer alloc.free(lower);
-        var lower_exclusive = false;
-
-        var generated_ref_count: usize = 0;
-        var latest_sequence: u64 = 0;
-        while (true) {
-            var replay_batch = try self.collectStoredGeneratedReplayBatch(alloc, lower, lower_exclusive, chunk_size, .{
-                .max_records = std.math.maxInt(usize),
-                .max_bytes = std.math.maxInt(usize),
-            });
-            defer replay_batch.deinit(alloc);
-            if (replay_batch.writes.len == 0) break;
-
-            var pending_batch = derived_types.DerivedBatch{};
-            defer derived_types.deinitDerivedBatch(self.alloc, &pending_batch);
-            try appendGeneratedEnrichments(self, &pending_batch, .{
-                .writes = replay_batch.writes,
-                .sync_level = .write,
-            }, replay_batch.extracted, force_generated_artifact_names, skip_terminally_covered);
-            if (pending_batch.generated_enrichment_refs.len != 0) {
-                generated_ref_count += pending_batch.generated_enrichment_refs.len;
-                const sequence = try appendDerivedBatchRecord(self, pending_batch);
-                latest_sequence = @max(latest_sequence, sequence);
-            }
-
-            const next_lower = replay_batch.next_lower orelse break;
-            replay_batch.next_lower = null;
-            alloc.free(lower);
-            lower = next_lower;
-            lower_exclusive = true;
-        }
-        if (latest_sequence != 0) {
-            self.executor.notifySequence(latest_sequence);
-            if (self.enrichment_runtime) |runtime| runtime.notifySequence(latest_sequence);
-            self.notifyResolverReplayRuntimes(latest_sequence);
-        }
-        return .{
-            .generated_ref_count = generated_ref_count,
-            .target_sequence = latest_sequence,
-        };
-    }
-
-    pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
-        if (comptime storage_engine.enabled) return storage_engine.call("replayGeneratedEnrichmentsFromStoredDocs", .{ self, alloc });
-        return (try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{}, true)).generated_ref_count;
-    }
-
-    pub fn reprocessGeneratedEnrichmentFromStoredDocs(
-        self: *DB,
-        alloc: Allocator,
-        artifact_name: ?[]const u8,
-    ) !usize {
-        return (try self.reprocessGeneratedEnrichmentFromStoredDocsWithProgress(alloc, artifact_name)).generated_ref_count;
-    }
-
-    pub fn reprocessGeneratedEnrichmentFromStoredDocsWithProgress(
-        self: *DB,
-        alloc: Allocator,
-        artifact_name: ?[]const u8,
-    ) !GeneratedEnrichmentReplayAppendResult {
-        if (comptime storage_engine.enabled) return storage_engine.call("reprocessGeneratedEnrichmentFromStoredDocsWithProgress", .{ self, alloc, artifact_name });
-        if (artifact_name) |name| {
-            const force_artifacts = [_][]const u8{name};
-            return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &force_artifacts, false);
-        }
-        return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{}, false);
-    }
-
     fn waitForSyncLevel(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets) !void {
         try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, .none, false);
     }
@@ -29535,7 +27442,7 @@ pub const DB = struct {
     }
 
     fn waitForSyncLevelWithPublicationCut(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool, publication_cut: ?PublicationCut) !void {
-        const timeout_ms = if (self.enrichment_runtime) |runtime|
+        const timeout_ms = if (self.enrichment.runtime) |runtime|
             runtime.syncWaitTimeoutMs()
         else
             default_visibility_wait_timeout_ms;
@@ -29570,7 +27477,7 @@ pub const DB = struct {
             .propose, .write => {},
             .enrichments => {
                 if (wait_primary_enrichments)
-                    try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+                    try self.enrichment.runUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
             },
             .full_text => {
                 try self.runDerivedUntilTargetsWithVisibilityWait(sequence, sync_targets.full_text_indexes, wait);
@@ -29578,7 +27485,7 @@ pub const DB = struct {
             },
             .full_index => {
                 if (has_groups) {
-                    if (wait_primary_enrichments) try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+                    if (wait_primary_enrichments) try self.enrichment.runUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
                     // Own grouped publications have been accepted before
                     // this cut. Include them once without chasing unrelated
                     // producer scheduling or publications appended afterward.
@@ -29708,7 +27615,7 @@ pub const DB = struct {
     /// status. Revalidate only a closed repair gate: healthy observations stay
     /// allocation-free and O(1), while a gate whose durable intent was removed
     /// heals without requiring a user query to make status truthful.
-    fn observeResidentIndexAdmission(
+    pub fn observeResidentIndexAdmission(
         self: *DB,
         alloc: Allocator,
         index_name: []const u8,
@@ -30081,55 +27988,17 @@ pub const DB = struct {
         return try self.managedIndexReplayTargetSequence(alloc, cfg.name, cfg.kind, applied_sequence);
     }
 
-    fn enrichmentStatsWithSupervisorState(self: *DB, fallback: types.EnrichmentStats) types.EnrichmentStats {
-        // Status is called while the DB apply lock is held. Structural
-        // mutations hold lifecycle while stopping and joining the enrichment
-        // worker, and that worker can be waiting for apply. Never close the
-        // lifecycle -> worker join -> apply -> lifecycle cycle here.
-        const lifecycle_locked = self.async_context.enrichment_lifecycle_mutex.tryLock();
-        defer if (lifecycle_locked) self.async_context.enrichment_lifecycle_mutex.unlock();
-        var enrichment_status = if (lifecycle_locked)
-            if (self.async_context.enrichment_runtime) |runtime|
-                runtime.stats()
-            else
-                self.persistedEnrichmentStats() catch fallback
-        else
-            fallback;
-        const desired = self.async_context.enrichment_desired_running.load(.acquire);
-        // `desired` is the lock-free source of truth for whether this DB owns
-        // an enrichment producer. A retained query-only snapshot may have
-        // `enabled=false`, and lifecycle contention prevents us from replacing
-        // it with runtime.stats(). Never let that observation gap turn a live
-        // or restarting producer into a disabled one: public readiness treats
-        // enabled + retrying as transient debt and remains fail-closed until a
-        // later poll can observe the worker directly.
-        if (desired) enrichment_status.enabled = true;
-        const started = if (lifecycle_locked)
-            if (self.async_context.enrichment_runtime) |runtime| runtime.isStarted() else false
-        else
-            false;
-        if (desired and !started) {
-            // While lifecycle owns the runtime pointer, expose the persisted
-            // snapshot as a supervised transition rather than a fatal worker.
-            const supervised = !lifecycle_locked or self.async_context.enrichment_restart_owner.state.load(.acquire) != 0;
-            enrichment_status.retrying = supervised;
-            enrichment_status.worker_failed = !supervised;
-            enrichment_status.projection_checkpoint_status = if (supervised) "retrying" else "failed";
-        }
-        return enrichment_status;
-    }
-
     /// Refresh readiness-neutral worker diagnostics on a retained status
     /// snapshot. Publication lifecycle is deliberately excluded: a lock-free
     /// observation may add activity, but it cannot prove that the artifact
     /// counters in the retained snapshot crossed a completion boundary.
     pub fn overlayRuntimeStatusRuntimeBestEffort(self: *DB, runtime_stats: *types.DBStats) void {
         runtime_stats.async_indexing = self.snapshotAsyncIndexingStats();
-        runtime_stats.enrichment = self.enrichmentStatsWithSupervisorState(runtime_stats.enrichment);
-        runtime_stats.resolution = self.resolutionStageStats();
-        runtime_stats.promotion = self.promotionStageStats();
-        runtime_stats.ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
-        runtime_stats.transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
+        runtime_stats.enrichment = self.enrichment.statsWithSupervisorState(runtime_stats.enrichment);
+        runtime_stats.resolution = self.enrichment.resolutionStageStats();
+        runtime_stats.promotion = self.enrichment.promotionStageStats();
+        runtime_stats.ttl_cleanup = if (self.ttl.runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
+        runtime_stats.transaction_recovery = if (self.recovery.transactions.runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
         runtime_stats.graph_metric_runtime = self.indexes.graph.metricRuntimeStats();
 
         // Runtime-only diagnostics are optional status-plane detail and may run
@@ -30148,23 +28017,14 @@ pub const DB = struct {
                         source.failed = source.failed or runtime.indexSourceHasIsolatedFailure(item.name, source.artifact_name);
                     }
                 }
-                self.embedding_activity.observe(self.alloc, runtime_stats.indexes, runtime, now_ms);
+                self.enrichment.embedding_activity.observe(self.alloc, runtime_stats.indexes, runtime, now_ms);
                 return;
             }
-            clearEmbeddingActivityObservations(runtime_stats.indexes);
-            self.clearEmbeddingActivityCache();
+            Enrichment.clearEmbeddingActivityObservations(runtime_stats.indexes);
+            self.enrichment.clearEmbeddingActivityCache();
             return;
         }
-        self.embedding_activity.retain(self.alloc, runtime_stats.indexes, now_ms);
-    }
-
-    fn clearEmbeddingActivityObservations(indexes: []types.DBIndexStats) void {
-        for (indexes) |*item| {
-            if (item.kind != .dense_vector and item.kind != .sparse_vector) continue;
-            item.embedding_activity_observed = false;
-            item.embedding_activity_sample_fresh = false;
-            item.embedding_activity = .{};
-        }
+        self.enrichment.embedding_activity.retain(self.alloc, runtime_stats.indexes, now_ms);
     }
 
     /// Apply lifecycle facts only when the caller also owns a consistent
@@ -30491,11 +28351,11 @@ pub const DB = struct {
                 .async_indexing = self.snapshotAsyncIndexingStats(),
                 .doc_set_planning = self.snapshotDocSetPlanningStats(),
                 .visibility = self.snapshotVisibilityStats(),
-                .enrichment = self.enrichmentStatsWithSupervisorState(.{}),
-                .resolution = self.resolutionStageStats(),
-                .promotion = self.promotionStageStats(),
-                .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
-                .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
+                .enrichment = self.enrichment.statsWithSupervisorState(.{}),
+                .resolution = self.enrichment.resolutionStageStats(),
+                .promotion = self.enrichment.promotionStageStats(),
+                .ttl_cleanup = if (self.ttl.runtime) |runtime| runtime.stats() else .{},
+                .transaction_recovery = if (self.recovery.transactions.runtime) |runtime| runtime.stats() else .{},
             };
         }
         var result = self.statsLocked(alloc) catch |err| {
@@ -30575,7 +28435,7 @@ pub const DB = struct {
         // unchanged. Wake an idle worker after the new identity commits.
         self.local_execution.relational_index_maintenance_sweep.request();
         self.local_execution.relational_index_retry_after_ns.store(0, .release);
-        if (self.transaction_recovery_identity_context) |ctx| ctx.updateIdentityNamespace(namespace);
+        if (self.recovery.transactions.identity_context) |ctx| ctx.updateIdentityNamespace(namespace);
     }
 
     /// A table restore reassigns canonical document identities after native
@@ -30808,7 +28668,7 @@ pub const DB = struct {
         // active policy (or replacing one) would create an unguarded window.
         if (restored_catalog.row_policy_phase != .disabled or self.local_execution.row_policy_gate.currentPhase() != .disabled)
             return error.RowPolicyAuthenticationRequired;
-        var prepared_recovery = if (self.transaction_recovery_identity_context != null)
+        var prepared_recovery = if (self.recovery.transactions.identity_context != null)
             try db_core.PreparedRecoveryRelationalState.init(
                 self.runtime_alloc,
                 if (restored_schema) |schema| if (schema.storage_mode == .relational) schema.relational_columns else null else null,
@@ -30846,7 +28706,7 @@ pub const DB = struct {
         prepared.schema = null;
         self.core.table_catalog = prepared.table_catalog;
         self.core.identity_namespace = prepared.target_identity;
-        if (self.transaction_recovery_identity_context) |ctx| ctx.updateIdentityNamespace(prepared.target_identity);
+        if (self.recovery.transactions.identity_context) |ctx| ctx.updateIdentityNamespace(prepared.target_identity);
         self.publishRelationalRuntimeModePrepared(if (prepared.recovery) |*recovery| recovery else null);
     }
 
@@ -30861,35 +28721,35 @@ pub const DB = struct {
     /// Rebind the catalog while writes are excluded, but perform blocking
     /// worker joins and starts outside that lock. Resolver append callbacks
     /// take the apply lock, so joining under it can deadlock shutdown.
-    fn loadPortableRuntimeAfterPublication(self: *DB) !void {
+    pub fn loadPortableRuntimeAfterPublication(self: *DB) !void {
         // Reuse the live-catalog publication barrier so lock-free published
         // dense readers and every structural mutation retire before reset.
         // Acquire it before apply: its runtime drains may themselves need apply.
         var structural_guard = self.beginIndexStructuralMutation("portable runtime activation", "*");
         defer structural_guard.deinit();
-        self.stopResolverReplayRuntimes();
+        self.enrichment.stopResolverReplayRuntimes();
         {
             lockApply(self);
             defer self.core.unlockApply();
             try self.loadPortableRuntimeAfterPublicationLocked();
         }
-        try self.startResolverReplayRuntimesIfConfigured();
+        try self.enrichment.startResolverReplayRuntimesIfConfigured();
     }
 
     fn activatePortableIndexesAfterPublication(self: *DB) void {
-        lockAtomic(&self.portable_runtime_activation_mutex);
-        defer self.portable_runtime_activation_mutex.unlock();
-        _ = self.portable_runtime_activation_attempts.fetchAdd(1, .monotonic);
+        lockAtomic(&self.recovery.portable_activation.mutex);
+        defer self.recovery.portable_activation.mutex.unlock();
+        _ = self.recovery.portable_activation.attempts.fetchAdd(1, .monotonic);
         const activation_result: anyerror!void = self.loadPortableRuntimeAfterPublication();
         activation_result catch |err| {
             self.async_context.portable_runtime_activation_pending.store(true, .release);
             std.log.err("portable generation published but live index activation is degraded path={s} class={s}", .{ self.core.path, @errorName(err) });
-            self.startPortableActivationRetryWorkerIfNeeded();
+            self.recovery.startPortableActivationRetryWorkerIfNeeded();
             return;
         };
         self.async_context.portable_runtime_activation_pending.store(false, .release);
         resumeDeferredBackgroundMaintenanceIfIdle(self.async_context);
-        self.startQuarantineRetryWorkerIfNeeded();
+        self.maintenance.startQuarantineRetryWorkerIfNeeded();
     }
 
     fn refreshPortableImportedGenerationLocked(
@@ -32494,12 +30354,12 @@ pub const DB = struct {
             .columnar_maintenance = self.indexes.relational.column_maintenance.snapshot(),
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .visibility = self.snapshotVisibilityStats(),
-            .enrichment = self.enrichmentStatsWithSupervisorState(.{}),
-            .resolution = self.resolutionStageStats(),
-            .promotion = self.promotionStageStats(),
+            .enrichment = self.enrichment.statsWithSupervisorState(.{}),
+            .resolution = self.enrichment.resolutionStageStats(),
+            .promotion = self.enrichment.promotionStageStats(),
             .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
-            .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
-            .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
+            .ttl_cleanup = if (self.ttl.runtime) |runtime| runtime.stats() else .{},
+            .transaction_recovery = if (self.recovery.transactions.runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.indexes.text.merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot(),
             .graph_metric_runtime = self.indexes.graph.metricRuntimeStats(),
             .term_doc_freq_cache_hits = term_doc_freq_cache_hits,
@@ -32740,12 +30600,12 @@ pub const DB = struct {
             .columnar_maintenance = self.indexes.relational.column_maintenance.snapshot(),
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .visibility = self.snapshotVisibilityStats(),
-            .enrichment = self.enrichmentStatsWithSupervisorState(.{}),
-            .resolution = self.resolutionStageStats(),
-            .promotion = self.promotionStageStats(),
+            .enrichment = self.enrichment.statsWithSupervisorState(.{}),
+            .resolution = self.enrichment.resolutionStageStats(),
+            .promotion = self.enrichment.promotionStageStats(),
             .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
-            .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
-            .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
+            .ttl_cleanup = if (self.ttl.runtime) |runtime| runtime.stats() else .{},
+            .transaction_recovery = if (self.recovery.transactions.runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.indexes.text.merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
             .graph_metric_runtime = self.indexes.graph.metricRuntimeStats(),
             .term_doc_freq_cache_hits = blk: {
@@ -32921,8 +30781,8 @@ pub const DB = struct {
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .columnar_maintenance = self.indexes.relational.column_maintenance.snapshot(),
             .visibility = self.snapshotVisibilityStats(),
-            .resolution = self.resolutionStageStats(),
-            .promotion = self.promotionStageStats(),
+            .resolution = self.enrichment.resolutionStageStats(),
+            .promotion = self.enrichment.promotionStageStats(),
             .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
             .async_indexing = self.async_context.stats.snapshot(),
         };
@@ -34406,7 +32266,7 @@ pub const DB = struct {
         // Keep keys and scalar size proofs separate from body scratch: sorted
         // reads retire body scratch, and a small byte target can consume this
         // metadata window over several calls. Never reuse proofs across pages.
-        fn prepare(self: *@This(), documents: []const []const u8) !void {
+        pub fn prepare(self: *@This(), documents: []const []const u8) !void {
             const available = self.cached - self.next_cached;
             const common = @min(available, documents.len);
             if (common != 0) {
@@ -36600,20 +34460,8 @@ pub const DB = struct {
         index_name: ?[]const u8,
     ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        try self.failIfIndexQuarantined(index_name);
+        try self.maintenance.failIfIndexQuarantined(index_name);
         return self.core.textIndexEntry(index_name);
-    }
-
-    /// Queries that explicitly reference an index whose persisted artifacts
-    /// failed to load get a distinct error instead of IndexNotFound, so
-    /// clients can tell "broken, drop+recreate to recover" from "missing".
-    fn failIfIndexQuarantined(self: *DB, index_name: ?[]const u8) !void {
-        const name = index_name orelse return;
-        switch (self.observeResidentIndexAdmission(self.alloc, name, null)) {
-            .admitted => {},
-            .rebuilding => return error.IndexRebuilding,
-            .unavailable => return error.IndexUnavailable,
-        }
     }
 
     fn textIndexIsChunkBackedCallback(
@@ -36877,7 +34725,7 @@ pub const DB = struct {
         errdefer identity_visible.deinit(alloc);
 
         if (duration_ns == 0 or identity_visible == .all) return identity_visible;
-        const ttl_visible = try self.ttlVisibleResolvedDocSetNoLockAlloc(alloc, &identity_visible, generation, duration_ns);
+        const ttl_visible = try self.ttl.visibleResolvedDocSetNoLockAlloc(alloc, &identity_visible, generation, duration_ns);
         identity_visible.deinit(alloc);
         return ttl_visible;
     }
@@ -36897,34 +34745,6 @@ pub const DB = struct {
         errdefer result.deinit(alloc);
         try control.check();
         return result;
-    }
-
-    fn ttlVisibleResolvedDocSetNoLockAlloc(
-        self: *DB,
-        alloc: Allocator,
-        set: *const doc_set.ResolvedDocSet,
-        generation: ?u64,
-        duration_ns: u64,
-    ) !doc_set.ResolvedDocSet {
-        if (set.* == .none) return .none;
-        if (duration_ns == 0) return try doc_set.cloneAlloc(alloc, set);
-        if (set.* == .all) return .all;
-
-        const doc_ids = (try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, set, generation)) orelse
-            return .none;
-        defer freeConstDocIds(alloc, doc_ids);
-
-        const timestamps = try loadDocumentTimestampsMany(self, alloc, doc_ids);
-        defer alloc.free(timestamps);
-
-        const expiry_now = currentTimeNs();
-        var kept = std.ArrayListUnmanaged([]const u8).empty;
-        defer kept.deinit(alloc);
-        for (doc_ids, timestamps) |doc_id, ts| {
-            if (ts != 0 and ttl_mod.isExpired(ts, duration_ns, expiry_now)) continue;
-            try kept.append(alloc, doc_id);
-        }
-        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, kept.items, generation);
     }
 
     fn broadLiveDocSetCachedAlloc(self: *DB, alloc: Allocator, generation: ?u64) !doc_set.ResolvedDocSet {
@@ -37442,14 +35262,14 @@ pub const DB = struct {
         // Native vector routes use the access-path owner directly and may
         // bypass the callback lookup. An installed physical index still has
         // to satisfy its durable admission gate before it can serve.
-        try self.failIfIndexQuarantined(index_name);
+        try self.maintenance.failIfIndexQuarantined(index_name);
         const selected_path = switch (layout) {
             .dense_vector => self.core.index_manager.denseVectorAccessPath(index_name),
             .sparse_vector => self.core.index_manager.sparseVectorAccessPath(index_name),
             else => null,
         };
         const access_path = selected_path orelse {
-            try self.failIfIndexQuarantined(index_name);
+            try self.maintenance.failIfIndexQuarantined(index_name);
             return error.IndexNotFound;
         };
         var planned = (try algebraic_mod.planner.planVectorSearchTensorProgramAlloc(self.alloc, access_path.owner, layout, constrained)) orelse return error.InvalidIndexConfig;
@@ -38123,7 +35943,7 @@ pub const DB = struct {
         index_name: ?[]const u8,
     ) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        try self.failIfIndexQuarantined(index_name);
+        try self.maintenance.failIfIndexQuarantined(index_name);
         return self.core.denseIndex(index_name);
     }
 
@@ -38165,7 +35985,7 @@ pub const DB = struct {
         fn index(ctx: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
             return from(ctx).snapshot.entry;
         }
-        fn key(ctx: ?*anyopaque, _: []const u8, id: u64) anyerror!?[]u8 {
+        pub fn key(ctx: ?*anyopaque, _: []const u8, id: u64) anyerror!?[]u8 {
             return from(ctx).snapshot.lookupDocKey(id);
         }
         fn vectorId(_: ?*anyopaque, _: []const u8, _: []const u8) anyerror!?u64 {
@@ -38499,7 +36319,7 @@ pub const DB = struct {
         index_name: ?[]const u8,
     ) anyerror!?*index_manager_mod.IndexManager.SparseIndex {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        try self.failIfIndexQuarantined(index_name);
+        try self.maintenance.failIfIndexQuarantined(index_name);
         return self.core.sparseIndex(index_name);
     }
 
@@ -39400,7 +37220,7 @@ pub const DB = struct {
             self.* = undefined;
         }
 
-        fn iface(self: *GraphNodeAdmissionCache) NodeAdmission {
+        pub fn iface(self: *GraphNodeAdmissionCache) NodeAdmission {
             return .{
                 .ctx = self,
                 .external_targets = self.external_targets,
@@ -39994,7 +37814,7 @@ pub const DB = struct {
         scope: graph_query_mod.ExecutionScope,
     ) !graph_query_mod.GraphQueryResult {
         const entry = self.core.graphIndex(graph_query.index_name) orelse {
-            try self.failIfIndexQuarantined(graph_query.index_name);
+            try self.maintenance.failIfIndexQuarantined(graph_query.index_name);
             return error.IndexNotFound;
         };
         if (entry.index.supportsAlgebraicSemiringTraversal()) {
@@ -40034,7 +37854,7 @@ pub const DB = struct {
     ) !graph_query_mod.GraphQueryResult {
         try self.indexes.graph.requireEndpointCleanupReady();
         const entry = self.core.graphIndex(graph_query.index_name) orelse {
-            try self.failIfIndexQuarantined(graph_query.index_name);
+            try self.maintenance.failIfIndexQuarantined(graph_query.index_name);
             return error.IndexNotFound;
         };
 
@@ -40535,7 +38355,7 @@ fn dupeConstDocIdsAlloc(alloc: Allocator, doc_ids: []const []const u8) ![]const 
     return out;
 }
 
-fn freeConstDocIds(alloc: Allocator, doc_ids: []const []const u8) void {
+pub fn freeConstDocIds(alloc: Allocator, doc_ids: []const []const u8) void {
     for (doc_ids) |doc_id| alloc.free(@constCast(doc_id));
     alloc.free(doc_ids);
 }
@@ -40594,7 +38414,7 @@ test "owned DB open starts self-retaining workers at the stable allocation" {
 
     const db = try DB.openOwned(alloc, path, .{});
     defer db.closeOwned();
-    try std.testing.expect(db.quarantineRetryWorkerStartedAtCurrentAddressForTest());
+    try std.testing.expect(db.maintenance.quarantineRetryWorkerStartedAtCurrentAddressForTest());
 }
 
 test "resolved doc set from search hits uses complete hit ordinals" {
@@ -40703,7 +38523,7 @@ const neighbor_context_refresh_page_records: usize = 64;
 const neighbor_context_refresh_pages_per_turn: usize = 4;
 const neighbor_context_refresh_records_per_turn = neighbor_context_refresh_page_records * neighbor_context_refresh_pages_per_turn;
 
-fn acquireNeighborContextGraphSource(ptr: *anyopaque, index_name: []const u8) !enrichment_runtime_mod.NeighborContextGraphSource.Lease {
+pub fn acquireNeighborContextGraphSource(ptr: *anyopaque, index_name: []const u8) !enrichment_runtime_mod.NeighborContextGraphSource.Lease {
     const append_ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ptr));
     const ctx = append_ctx.async_context orelse return error.EnrichmentRetryInProgress;
     const lease = try ctx.alloc.create(NeighborContextGraphSourceLease);
@@ -40898,7 +38718,7 @@ const encodeThinReplayRecordPayload = local_mutation.encodeThinReplayRecordPaylo
 
 const appendArtifactSourceRevisionWritesFromReplay = local_mutation.appendArtifactSourceRevisionWritesFromReplay;
 
-const appendUniqueOwnedKey = @import("owned_keys.zig").appendUniqueOwnedKey;
+pub const appendUniqueOwnedKey = @import("owned_keys.zig").appendUniqueOwnedKey;
 
 const appendUniqueOwnedKeyIndexed = local_mutation.appendUniqueOwnedKeyIndexed;
 
@@ -40910,9 +38730,9 @@ const strippedStoredDocumentValueAlloc = local_mutation.strippedStoredDocumentVa
 
 const containsOwnedKey = local_mutation.containsOwnedKey;
 
-const containsDeleteKey = local_mutation.containsDeleteKey;
+pub const containsDeleteKey = local_mutation.containsDeleteKey;
 
-fn appendResolutionHandoffDeleteKey(
+pub fn appendResolutionHandoffDeleteKey(
     alloc: Allocator,
     deletes: *std.ArrayListUnmanaged([]const u8),
     resolution_key: []const u8,
@@ -40930,7 +38750,7 @@ const overwriteProbeLessThan = local_mutation.overwriteProbeLessThan;
 
 const extractStringField = local_mutation.extractStringField;
 
-const augmentExtractedWriteWithGraphFieldEdges = local_mutation.augmentExtractedWriteWithGraphFieldEdges;
+pub const augmentExtractedWriteWithGraphFieldEdges = local_mutation.augmentExtractedWriteWithGraphFieldEdges;
 
 pub const augmentExtractedWriteWithGraphFieldEdgesParsed = local_mutation.augmentExtractedWriteWithGraphFieldEdgesParsed;
 
@@ -42205,7 +40025,7 @@ const GraphContenderPrefixFingerprint = struct {
         hasher.update(value);
     }
 
-    fn fromStore(alloc: Allocator, store: *docstore_mod.DocStore, prefix: []const u8) !@This() {
+    pub fn fromStore(alloc: Allocator, store: *docstore_mod.DocStore, prefix: []const u8) !@This() {
         const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
         defer if (upper) |key| alloc.free(key);
         const State = struct {
@@ -42284,7 +40104,7 @@ fn appendU32Big(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: u32) 
 
 const freeOwnedConstKeySlice = execution_resources.freeOwnedConstKeySlice;
 
-fn computeChunkRequest(
+pub fn computeChunkRequest(
     alloc: Allocator,
     db: anytype,
     doc_value: []const u8,
@@ -42694,7 +40514,7 @@ const appendMaterializedChunkSourceToBatch = local_mutation.appendMaterializedCh
 
 const scanMaterializedChunkSourceStoreBatch = local_mutation.scanMaterializedChunkSourceStoreBatch;
 
-fn computeDenseRequest(
+pub fn computeDenseRequest(
     alloc: Allocator,
     db: anytype,
     doc_value: []const u8,
@@ -42728,7 +40548,7 @@ const computeSparseRequestDerived = local_mutation.computeSparseRequestDerived;
 
 const takeOwnedSlice = local_mutation.takeOwnedSlice;
 
-fn appendClonedExplicitDenseEmbedding(
+pub fn appendClonedExplicitDenseEmbedding(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(types.EnrichmentDenseEmbeddingWrite),
     index_name: []const u8,
@@ -42748,7 +40568,7 @@ fn appendClonedExplicitDenseEmbedding(
     });
 }
 
-fn appendClonedExplicitSparseEmbedding(
+pub fn appendClonedExplicitSparseEmbedding(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(types.EnrichmentSparseEmbeddingWrite),
     index_name: []const u8,
@@ -42901,7 +40721,7 @@ fn castOwnedKeysToConst(alloc: Allocator, keys: [][]u8) ![]const []const u8 {
 
 const NamedResultSet = db_query_graph.NamedResultSet;
 
-const ChunkCacheEntry = execution_resources.ChunkCacheEntry;
+pub const ChunkCacheEntry = execution_resources.ChunkCacheEntry;
 
 const GeneratedEmbeddingMemo = execution_resources.GeneratedEmbeddingMemo;
 
@@ -43120,7 +40940,7 @@ fn cloneNamedSetAsResult(alloc: Allocator, set: NamedResultSet, include_stored: 
     return try db_query_graph.cloneNamedSetAsResult(alloc, set, include_stored);
 }
 
-const currentTimeNs = local_mutation.currentTimeNs;
+pub const currentTimeNs = local_mutation.currentTimeNs;
 
 const nextArtifactRepairIssueTimestamp = local_mutation.nextArtifactRepairIssueTimestamp;
 
@@ -43177,7 +40997,7 @@ fn isExpiredDocumentKey(self: *DB, alloc: Allocator, key: []const u8) !bool {
     return ttl_mod.isExpired(ts, duration_ns, currentTimeNs());
 }
 
-fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]u64 {
+pub fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]u64 {
     const timestamps = try alloc.alloc(u64, keys.len);
     errdefer alloc.free(timestamps);
     @memset(timestamps, 0);
@@ -43908,7 +41728,7 @@ const appendOwnedConstBytes = local_mutation.appendOwnedConstBytes;
 
 const buildDerivedBatch = local_mutation.buildDerivedBatch;
 
-fn appendGeneratedEnrichments(
+pub fn appendGeneratedEnrichments(
     self: *DB,
     batch: *derived_types.DerivedBatch,
     req: types.BatchRequest,
@@ -44128,7 +41948,7 @@ const PrimaryReplicationEffect = struct {
     key: ?[]u8 = null,
     value: ?[]u8 = null,
 
-    fn prepare(ctx: *const BatchExecutionContext, writes: []const docstore_mod.KVPair, deletes: []const []const u8, replay: []const u8) !@This() {
+    pub fn prepare(ctx: *const BatchExecutionContext, writes: []const docstore_mod.KVPair, deletes: []const []const u8, replay: []const u8) !@This() {
         const mirror = ctx.replication_async_effect_mirror orelse return .{};
         if (ctx.async_context) |async_ctx| if (async_ctx.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
         try preflightReplicationMirrorSyncCommitContext(ctx, mirror);
@@ -44159,7 +41979,7 @@ const PrimaryReplicationEffect = struct {
         if (self.value) |bytes| alloc.free(bytes);
     }
 
-    fn stage(self: *const @This(), ctx: *const BatchExecutionContext, writes: *std.ArrayListUnmanaged(docstore_mod.KVPair)) !void {
+    pub fn stage(self: *const @This(), ctx: *const BatchExecutionContext, writes: *std.ArrayListUnmanaged(docstore_mod.KVPair)) !void {
         if (self.key) |key| {
             try writes.append(ctx.alloc, .{ .key = key, .value = self.value.? });
             if (ctx.async_context) |async_ctx| async_ctx.primary_replication_outbox_pending.store(true, .release);
@@ -44181,7 +42001,7 @@ const PrimaryReplicationEffect = struct {
         return .{ .mirror = mirror, .lsn = lsn };
     }
 
-    fn clear(self: *const @This(), ctx: *const BatchExecutionContext) !void {
+    pub fn clear(self: *const @This(), ctx: *const BatchExecutionContext) !void {
         const key = self.key orelse return;
         try lockApplyForPortableRuntimeContext(ctx);
         defer ctx.apply_mutex.unlockExclusive();
@@ -44509,7 +42329,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     return @intCast(keys.len);
 }
 
-fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const ttl_runtime_mod.DeleteCandidate) !u32 {
+pub fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const ttl_runtime_mod.DeleteCandidate) !u32 {
     const ctx: *TtlCleanupContext = @ptrCast(@alignCast(ctx_ptr));
     var view = if (ctx.schema_registry) |registry| registry.acquire() else null;
     defer if (view) |*pinned| pinned.release();
@@ -44607,7 +42427,7 @@ fn graphTtlOptionalStoreValue(alloc: Allocator, store: *docstore_mod.DocStore, k
     };
 }
 
-fn expireGraphTtlCandidates(ptr: *anyopaque, candidates: []const graph_edge_ttl_expiration.Due) !ttl_runtime_mod.GraphExpireCounts {
+pub fn expireGraphTtlCandidates(ptr: *anyopaque, candidates: []const graph_edge_ttl_expiration.Due) !ttl_runtime_mod.GraphExpireCounts {
     const ctx: *TtlCleanupContext = @ptrCast(@alignCast(ptr));
     var expired: ttl_runtime_mod.GraphExpireCounts = .{};
     for (candidates) |candidate| switch (candidate) {
@@ -45103,7 +42923,7 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     return true;
 }
 
-fn appendDerivedBatchRecord(self: *DB, batch: derived_types.DerivedBatch) !u64 {
+pub fn appendDerivedBatchRecord(self: *DB, batch: derived_types.DerivedBatch) !u64 {
     var ctx = self.batchContext();
     return try appendDerivedBatchRecordContext(&ctx, batch);
 }
@@ -45116,7 +42936,7 @@ fn appendDerivedBatchRecordContextWithProducerFence(ctx: *const BatchExecutionCo
     return appendDerivedBatchRecordContextWithWork(ctx, batch, producer, null);
 }
 
-const RequiredProducerDispatch = struct {
+pub const RequiredProducerDispatch = struct {
     authority: @import("artifact_publication.zig").Authority,
     item: @import("artifact_producer_obligations.zig").WorkPage.Item,
     plan_generation: u64,
@@ -45124,7 +42944,7 @@ const RequiredProducerDispatch = struct {
     retry_round: ?u64 = null,
 };
 
-fn appendDerivedBatchRecordContextWithWork(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, producer: bool, work: ?RequiredProducerDispatch) !u64 {
+pub fn appendDerivedBatchRecordContextWithWork(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, producer: bool, work: ?RequiredProducerDispatch) !u64 {
     return appendDerivedBatchRecordContextWithAdmissions(ctx, batch, producer, work, null);
 }
 
@@ -45382,7 +43202,7 @@ fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionCont
     );
 }
 
-fn encodeChangeRecordPayload(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, sequence: u64) ![]u8 {
+pub fn encodeChangeRecordPayload(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, sequence: u64) ![]u8 {
     return try encodeChangeRecordPayloadWithTargetHints(ctx, batch, sequence, null);
 }
 
@@ -46008,7 +43828,7 @@ fn asyncContextHasActiveExternalDenseBulkWork(ctx: *const AsyncContext) bool {
     return ctx.dense_admission.external_sessions.load(.acquire) != 0;
 }
 
-fn resumeDeferredBackgroundMaintenanceIfIdle(ctx: *AsyncContext) void {
+pub fn resumeDeferredBackgroundMaintenanceIfIdle(ctx: *AsyncContext) void {
     if (asyncContextHasActiveDenseBulkWork(ctx)) return;
     const deferred = ctx.text_merge_deferred.swap(false, .acq_rel);
     if (deferred) if (ctx.text_merge_runtime) |runtime| runtime.notify();
@@ -46606,7 +44426,7 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     return sequence;
 }
 
-fn commitArtifactUnitTurnFromEnrichment(ptr: *anyopaque, document: ?*const @import("artifact_unit_jobs.zig").DocumentTurn, work: ?*const @import("artifact_unit_jobs.zig").WorkTurn) !void {
+pub fn commitArtifactUnitTurnFromEnrichment(ptr: *anyopaque, document: ?*const @import("artifact_unit_jobs.zig").DocumentTurn, work: ?*const @import("artifact_unit_jobs.zig").WorkTurn) !void {
     const owner: *EnrichmentAppendContext = @ptrCast(@alignCast(ptr));
     if (owner.read_only) return error.ReadOnly;
     if (owner.root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
@@ -46765,12 +44585,12 @@ const NoopResolutionHandoffPublishHook = struct {
     fn run(_: @This()) void {}
 };
 
-fn processOrderedResolutions(ctx_ptr: *anyopaque, alloc: Allocator, resolvers: []const resolution_runtime_mod.ResolverConfig, store: resolver_lib.ArtifactStore, provider: ?resolver_lib.CandidateProvider, changed_keys: []const []const u8, candidate_source: ?resolution_runtime_mod.CandidateSource, embedder: ?embedder_mod.DenseEmbedder) !bool {
+pub fn processOrderedResolutions(ctx_ptr: *anyopaque, alloc: Allocator, resolvers: []const resolution_runtime_mod.ResolverConfig, store: resolver_lib.ArtifactStore, provider: ?resolver_lib.CandidateProvider, changed_keys: []const []const u8, candidate_source: ?resolution_runtime_mod.CandidateSource, embedder: ?embedder_mod.DenseEmbedder) !bool {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     return @import("artifact_publication_resolution.zig").process(alloc, ctx.store, ctx.artifact_publication_dispatcher, resolvers, store, provider, changed_keys, candidate_source, embedder);
 }
 
-fn appendResolutionRecord(ctx_ptr: *anyopaque, write: resolution_runtime_mod.RecordWrite) !u64 {
+pub fn appendResolutionRecord(ctx_ptr: *anyopaque, write: resolution_runtime_mod.RecordWrite) !u64 {
     return try appendResolutionRecordWithHook(ctx_ptr, write, NoopResolutionHandoffPublishHook{});
 }
 
@@ -46796,9 +44616,9 @@ fn appendResolutionRecordWithProjection(
             fn apply(ptr: *anyopaque, live: *anyopaque) anyerror!u64 {
                 const request: *@This() = @ptrCast(@alignCast(ptr));
                 const database: *DB = @ptrCast(@alignCast(live));
-                if (database.enrichment_append_context == null)
-                    try database.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
-                return appendResolutionRecordWithProjection(database.enrichment_append_context.?, request.write, request.hook, true);
+                if (database.enrichment.append_context == null)
+                    try database.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true });
+                return appendResolutionRecordWithProjection(database.enrichment.append_context.?, request.write, request.hook, true);
             }
         };
         var request: Request = .{ .write = write, .hook = before_handoff_publish };
@@ -46928,7 +44748,7 @@ fn enrichmentFailureArtifactKeyAlloc(
     };
 }
 
-fn recordEnrichmentRequestFailure(ctx_ptr: *anyopaque, failure: enrichment_runtime_mod.RequestFailure) !void {
+pub fn recordEnrichmentRequestFailure(ctx_ptr: *anyopaque, failure: enrichment_runtime_mod.RequestFailure) !void {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     const async_ctx = ctx.async_context orelse return;
     const artifact_kind: types.ArtifactRepairKind = switch (failure.kind) {
@@ -46964,7 +44784,7 @@ fn recordEnrichmentRequestFailure(ctx_ptr: *anyopaque, failure: enrichment_runti
     );
 }
 
-fn enrichmentRequestFailurePending(
+pub fn enrichmentRequestFailurePending(
     ctx_ptr: *anyopaque,
     failure: enrichment_runtime_mod.FailureIdentity,
     index_name: []const u8,
@@ -47004,7 +44824,7 @@ fn enrichmentRequestFailurePending(
     return issue.reason == .enrichment_failed and issue.sequence >= failure.sequence;
 }
 
-fn enrichmentRequestFailureRangePending(
+pub fn enrichmentRequestFailureRangePending(
     ctx_ptr: *anyopaque,
     after_sequence: u64,
     through_sequence: u64,
@@ -47178,7 +44998,7 @@ const TerminalFailureSequenceEnvelope = struct {
     entries_examined: u8 = 0,
 };
 
-fn enrichmentTerminalFailureSequenceEnvelope(store: *docstore_mod.DocStore) !TerminalFailureSequenceEnvelope {
+pub fn enrichmentTerminalFailureSequenceEnvelope(store: *docstore_mod.DocStore) !TerminalFailureSequenceEnvelope {
     const alloc = store.alloc;
     const prefix = try internal_keys.enrichmentTerminalFailureSequenceRootPrefixAlloc(alloc);
     defer alloc.free(prefix);
@@ -47256,13 +45076,13 @@ const appendEnrichmentTerminalFailureMarkerDeletesForIssue = execution_resources
 
 const appendEnrichmentTerminalFailureMarkerDeletePageForIssue = execution_resources.appendEnrichmentTerminalFailureMarkerDeletePageForIssue;
 
-fn lockEnrichmentFailurePendingFence(ctx_ptr: *anyopaque) void {
+pub fn lockEnrichmentFailurePendingFence(ctx_ptr: *anyopaque) void {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     const async_ctx = ctx.async_context orelse return;
     lockAtomicWithBackoff(&async_ctx.artifact_repair_issue_mutex);
 }
 
-fn unlockEnrichmentFailurePendingFence(ctx_ptr: *anyopaque) void {
+pub fn unlockEnrichmentFailurePendingFence(ctx_ptr: *anyopaque) void {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     const async_ctx = ctx.async_context orelse return;
     async_ctx.artifact_repair_issue_mutex.unlock();
@@ -47278,7 +45098,7 @@ fn requireArtifactProducerMutableContext(ctx: *const BatchExecutionContext) !voi
     if (try @import("artifact_publication.zig").authority(&read) != null) return error.ArtifactCatalogDrift;
 }
 
-fn appendGeneratedBatchFromEnrichment(
+pub fn appendGeneratedBatchFromEnrichment(
     ctx_ptr: *anyopaque,
     batch: derived_types.DerivedBatch,
     artifact_promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion,
@@ -47752,7 +45572,7 @@ pub fn applyDerivedBatchToIndexReplayContext(
     return true;
 }
 
-fn notifyDerivedExecutorSequence(ctx_ptr: *anyopaque, sequence: u64) void {
+pub fn notifyDerivedExecutorSequence(ctx_ptr: *anyopaque, sequence: u64) void {
     const executor: *derived_executor_mod.Executor = @ptrCast(@alignCast(ctx_ptr));
     executor.notifySequence(sequence);
 }
@@ -49070,7 +46890,7 @@ fn materializeGraphSourceArtifactRestorePage(
         .manifest_bytes = prior_manifest_bytes,
     };
 
-    const cache_matches = if (self.graph_restore_parse_cache) |cache|
+    const cache_matches = if (self.recovery.restore.graph_parse_cache) |cache|
         cache.matches(artifact_key, index_name)
     else
         false;
@@ -49087,11 +46907,11 @@ fn materializeGraphSourceArtifactRestorePage(
         );
         defer if (raw_doc) |value| alloc.free(value);
         const replacement = try GraphRestoreParseCache.init(self.alloc, artifact_key, index_name, raw, raw_doc);
-        if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
-        self.graph_restore_parse_cache = replacement;
-        if (builtin.is_test) self.graph_restore_parse_count_for_test += 1;
+        if (self.recovery.restore.graph_parse_cache) |*cache| cache.deinit(self.alloc);
+        self.recovery.restore.graph_parse_cache = replacement;
+        if (builtin.is_test) self.recovery.restore.graph_parse_count_for_test += 1;
     }
-    const cache = &self.graph_restore_parse_cache.?;
+    const cache = &self.recovery.restore.graph_parse_cache.?;
     const page = graphWritesFromArtifactParsedPageAlloc(
         alloc,
         index_name,
@@ -49267,9 +47087,9 @@ const resolverConfigForResolution = local_mutation.resolverConfigForResolution;
 
 const resolverConfigForResolutionArtifact = local_mutation.resolverConfigForResolutionArtifact;
 
-const mentionGraphStateNameAlloc = local_mutation.mentionGraphStateNameAlloc;
+pub const mentionGraphStateNameAlloc = local_mutation.mentionGraphStateNameAlloc;
 
-const mentionArtifactStateNameAlloc = local_mutation.mentionArtifactStateNameAlloc;
+pub const mentionArtifactStateNameAlloc = local_mutation.mentionArtifactStateNameAlloc;
 
 const resolutionMentionArtifactNameAlloc = local_mutation.resolutionMentionArtifactNameAlloc;
 
@@ -53922,7 +51742,7 @@ fn engineListIndexes(ptr: *anyopaque, alloc: Allocator) ![]types.IndexConfig {
 
 fn engineListEnrichments(ptr: *anyopaque, alloc: Allocator) ![]types.EnrichmentConfig {
     const self: *DB = @ptrCast(@alignCast(ptr));
-    return try self.listEnrichments(alloc);
+    return try self.enrichment.listEnrichments(alloc);
 }
 
 fn maintenanceDriverPendingWorkStats(ptr: *anyopaque) db_core.PendingWorkStats {
@@ -53937,7 +51757,7 @@ fn maintenanceDriverRunDerivedUntil(ptr: *anyopaque, sequence: u64) !void {
 
 fn maintenanceDriverRunEnrichmentUntil(ptr: *anyopaque, sequence: u64) !void {
     const self: *DB = @ptrCast(@alignCast(ptr));
-    return try self.runEnrichmentUntil(sequence);
+    return try self.enrichment.runUntil(sequence);
 }
 
 fn maintenanceDriverRunMaintenanceUntil(ptr: *anyopaque, sequence: u64) !void {
@@ -53956,7 +51776,7 @@ pub fn lockAtomic(mutex: *std.atomic.Mutex) void {
     }
 }
 
-fn resolveRecoveredLocalTransaction(
+pub fn resolveRecoveredLocalTransaction(
     ctx: *anyopaque,
     txn_id: transactions_mod.TxnId,
     status: transactions_mod.TxnStatus,
@@ -53968,7 +51788,7 @@ fn resolveRecoveredLocalTransaction(
     try local_ctx.provider_mutex.lock(io);
     defer local_ctx.provider_mutex.unlock(io);
     var mutation = execution.mutation();
-    mutation.transaction_recovery_local_context = local_ctx;
+    mutation.recovery.transactions.local_context = local_ctx;
     // Scratch state belongs only to this invocation. Shared publication and
     // admission state are owned by local_execution and are never deinitialized.
     defer mutation.deinitScratch();
@@ -54185,8 +52005,8 @@ fn waitForRawDelete(alloc: Allocator, db: *DB, key: []const u8, max_attempts: us
 }
 
 fn initStoppedTtlRuntimeForTest(db: *DB, cfg: ttl_runtime_mod.Config) !void {
-    try std.testing.expect(db.ttl_runtime == null);
-    try db.initOptionalTtlRuntime(cfg);
+    try std.testing.expect(db.ttl.runtime == null);
+    try db.ttl.initRuntime(cfg);
 }
 
 fn expectedChunkArtifactKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8, chunk_id: u32) ![]u8 {
@@ -54300,7 +52120,7 @@ test "db vector indexes combine direct document and chunk-backed artifact source
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
         .field = "body",
@@ -54313,7 +52133,7 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         .{ .name = "title_sparse_v1", .kind = .embedding, .field = "title", .vector_space = "test:mixed-sparse-v1" },
         .{ .name = "summary_sparse_v1", .kind = .embedding, .field = "summary", .vector_space = "test:mixed-sparse-v1" },
         .{ .name = "body_sparse_v1", .kind = .embedding, .field = "text", .source_artifact_name = "body_chunks_v1", .vector_space = "test:mixed-sparse-v1" },
-    }) |cfg| try db.addEnrichment(cfg);
+    }) |cfg| try db.enrichment.addEnrichment(cfg);
 
     try db.addIndex(.{
         .name = "mixed_dense",
@@ -55025,7 +52845,7 @@ const GateAssetProducer = struct {
     blocked_requests: std.atomic.Value(usize) = .init(0),
     successful_requests: std.atomic.Value(usize) = .init(0),
 
-    fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
+    pub fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
         const self: *GateAssetProducer = @ptrCast(@alignCast(ptr));
         if (self.blocked.load(.acquire)) {
             _ = self.blocked_requests.fetchAdd(1, .monotonic);
@@ -55074,7 +52894,7 @@ const SlowGatedAssetProducer = struct {
     started: std.atomic.Value(bool) = .init(false),
     finished: std.atomic.Value(bool) = .init(false),
 
-    fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
+    pub fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
         const self: *SlowGatedAssetProducer = @ptrCast(@alignCast(ptr));
         self.started.store(true, .release);
         _ = self.calls.fetchAdd(1, .monotonic);
@@ -56710,7 +54530,7 @@ test "db apply fences wait through their borrowed runtime" {
                 database.core.unlockApplyShared();
             } else {
                 // Exercise the maintenance entrypoint from the topology-churn hang.
-                _ = try database.runArtifactRepairMetadataMaintenanceAfterScan();
+                _ = try database.enrichment.runArtifactRepairMetadataMaintenanceAfterScan();
             }
             completed.* = true;
         }
@@ -56961,19 +54781,19 @@ test "background maintenance services lifecycle runs on borrowed VoprIo" {
                 backend_owner.deinit();
                 closed.* = true;
             }
-            const enrichment = database.enrichment_runtime orelse return;
+            const enrichment = database.enrichment.runtime orelse return;
             enrichment.start() catch return;
             if (!enrichment.isStarted()) return;
             enrichment.stop();
             if (enrichment.isStarted()) return;
 
-            const resolution = database.resolution_runtime orelse return;
+            const resolution = database.enrichment.resolution.runtime orelse return;
             resolution.start() catch return;
             if (!resolution.worker_started.load(.acquire)) return;
             resolution.stop();
             if (resolution.worker_started.load(.acquire)) return;
 
-            const promotion = database.promotion_runtime orelse return;
+            const promotion = database.enrichment.promotion.runtime orelse return;
             promotion.start() catch return;
             if (!promotion.worker_started.load(.acquire)) return;
             promotion.stop();
@@ -57175,16 +54995,16 @@ test "db enrichment reconfigure preserves active runtime when replacement cannot
     const original_backend_runtime = db.backend_runtime;
     defer db.backend_runtime = original_backend_runtime;
 
-    const original_runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    const original_runtime = db.enrichment.runtime orelse return error.TestUnexpectedResult;
     var manual_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
     defer manual_runtime.deinit();
 
     db.backend_runtime = manual_runtime.ptr();
     var replacement_embedder = embedder_mod.DeterministicDenseEmbedder{};
-    try std.testing.expectError(error.MissingBackendRuntimeIo, db.reconfigureEnrichmentRuntime(.{
+    try std.testing.expectError(error.MissingBackendRuntimeIo, db.enrichment.reconfigureRuntime(.{
         .dense_embedder = replacement_embedder.interface(),
     }));
-    try std.testing.expectEqual(original_runtime, db.enrichment_runtime.?);
+    try std.testing.expectEqual(original_runtime, db.enrichment.runtime.?);
 }
 
 test "db enrichment reconfigure inherits resident execution and security capabilities" {
@@ -57203,11 +55023,11 @@ test "db enrichment reconfigure inherits resident execution and security capabil
     defer db.close();
 
     var replacement_embedder = embedder_mod.DeterministicDenseEmbedder{};
-    try db.reconfigureEnrichmentRuntime(.{
+    try db.enrichment.reconfigureRuntime(.{
         .dense_embedder = replacement_embedder.interface(),
     });
 
-    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    const runtime = db.enrichment.runtime orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(&remote_content, runtime.config.remote_content.?);
     try std.testing.expectEqual(db.core.index_manager.resource_manager, runtime.config.resource_manager);
     try std.testing.expect(runtime.config.io != null);
@@ -57237,7 +55057,7 @@ test "db enrichment reconfigure refreshes durable state after old worker joins" 
     });
     try std.testing.expect(db.core.hasGeneratedEnrichmentTargets());
     try std.testing.expect(db.core.nextEnrichmentSequence() != 0);
-    const original_runtime = db.enrichment_runtime.?;
+    const original_runtime = db.enrichment.runtime.?;
     original_runtime.embed_batches_started = 2;
     original_runtime.embed_batches_completed = 2;
     original_runtime.embed_items_started = 3;
@@ -57276,8 +55096,8 @@ test "db enrichment reconfigure refreshes durable state after old worker joins" 
     defer DB.test_enrichment_reconfigure_after_detached_hook = null;
 
     var replacement_embedder = embedder_mod.DeterministicDenseEmbedder{};
-    try db.reconfigureEnrichmentRuntime(.{ .dense_embedder = replacement_embedder.interface() });
-    const replacement = db.enrichment_runtime.?;
+    try db.enrichment.reconfigureRuntime(.{ .dense_embedder = replacement_embedder.interface() });
+    const replacement = db.enrichment.runtime.?;
     try std.testing.expect(replacement != original_runtime);
     replacement.stop();
     const stats = replacement.stats();
@@ -57322,18 +55142,18 @@ test "db enrichment restart supervisor recovers transient start failures" {
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
     defer db.close();
-    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    const runtime = db.enrichment.runtime orelse return error.TestUnexpectedResult;
     try std.testing.expect(runtime.isStarted());
-    try std.testing.expect(db.quiesceEnrichmentForStructuralMutation());
+    try std.testing.expect(db.enrichment.quiesceForStructuralMutation());
     try std.testing.expect(!runtime.isStarted());
 
     DB.test_enrichment_restart_failures_remaining.store(std.math.maxInt(u32), .release);
     defer DB.test_enrichment_restart_failures_remaining.store(0, .release);
     try std.testing.expectError(
         error.TestTransientEnrichmentRestart,
-        db.restartEnrichmentAfterStructuralMutation("test", "semantic_idx"),
+        db.enrichment.restartAfterStructuralMutation("test", "semantic_idx"),
     );
-    const degraded = db.enrichmentStatsWithSupervisorState(.{});
+    const degraded = db.enrichment.statsWithSupervisorState(.{});
     try std.testing.expect(degraded.retrying);
     try std.testing.expect(!degraded.worker_failed);
     DB.test_enrichment_restart_failures_remaining.store(12, .release);
@@ -57362,7 +55182,7 @@ test "db enrichment status does not wait for lifecycle mutation" {
         .target_sequence = 41,
         .applied_sequence = 37,
     };
-    const status = db.enrichmentStatsWithSupervisorState(fallback);
+    const status = db.enrichment.statsWithSupervisorState(fallback);
     db.async_context.enrichment_lifecycle_mutex.unlock();
 
     try std.testing.expect(status.enabled);
@@ -57440,10 +55260,10 @@ test "db runtime-only status overlay preserves a resident enrichment worker" {
 
     // A stale receipt cannot survive indefinitely if the owner is wedged or
     // gone while lifecycle access remains contended.
-    lockAtomic(&db.embedding_activity.mutex);
-    const cached = db.embedding_activity.cache.getPtr("semantic") orelse return error.TestUnexpectedResult;
+    lockAtomic(&db.enrichment.embedding_activity.mutex);
+    const cached = db.enrichment.embedding_activity.cache.getPtr("semantic") orelse return error.TestUnexpectedResult;
     cached.observed_at_ms -|= types.embedding_activity_retention_ms;
-    db.embedding_activity.mutex.unlock();
+    db.enrichment.embedding_activity.mutex.unlock();
     indexes[0] = .{
         .name = "semantic",
         .kind = .dense_vector,
@@ -58380,7 +56200,7 @@ test "relational index mutations follow primary batches transactions deletes and
         try initStoppedTtlRuntimeForTest(&db, .{ .enabled = false, .grace_period_ns = 0 });
         var expired_a = [_]u8{ 'a', 0 };
         var expired_b = [_]u8{ 'b', 0 };
-        try std.testing.expectEqual(@as(u32, 2), try deleteExpiredDocumentsFromCandidates(db.ttl_cleanup_context.?, &.{
+        try std.testing.expectEqual(@as(u32, 2), try deleteExpiredDocumentsFromCandidates(db.ttl.cleanup_context.?, &.{
             .{ .key = &expired_a, .timestamp_ns = expired_at },
             .{ .key = &expired_b, .timestamp_ns = expired_at },
         }));
@@ -61554,14 +59374,14 @@ test "relational columnar maintenance survives unrelated artifact corruption and
     try db.core.store.putBatch(&.{}, &.{ready});
     const started = db.independentMaintenanceNowNs();
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
-    try std.testing.expect(db.independent_maintenance.repair_retry_after_ns > started);
+    try std.testing.expect(db.maintenance.independent.repair_retry_after_ns > started);
     try std.testing.expect(db.indexes.relational.column_maintenance.blocks_written.load(.monotonic) > 0);
-    const retry = db.independent_maintenance.repair_retry_after_ns;
+    const retry = db.maintenance.independent.repair_retry_after_ns;
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2}" }} });
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
-    try std.testing.expectEqual(retry, db.independent_maintenance.repair_retry_after_ns);
+    try std.testing.expectEqual(retry, db.maintenance.independent.repair_retry_after_ns);
     try std.testing.expect(db.indexes.relational.column_maintenance.ranges_compacted.load(.monotonic) > 0);
-    db.independent_maintenance.stopping.store(true, .release);
+    db.maintenance.independent.stopping.store(true, .release);
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() == null);
 }
 
@@ -61598,21 +59418,21 @@ test "relational columnar artifact backoff uses the owner clock through suppress
     defer alloc.free(ready);
     try db.core.store.putBatch(&.{}, &.{ready});
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
-    try std.testing.expect(db.independent_maintenance.repair_retry_after_ns > db.independentMaintenanceNowNs());
+    try std.testing.expect(db.maintenance.independent.repair_retry_after_ns > db.independentMaintenanceNowNs());
     try std.testing.expect(db.indexes.relational.column_maintenance.blocks_written.load(.monotonic) > 0);
-    const retry = db.independent_maintenance.repair_retry_after_ns;
+    const retry = db.maintenance.independent.repair_retry_after_ns;
     try std.testing.expectEqual(clock.monotonic_ns + DB.artifact_repair_metadata_poll_ns, retry);
     clock.monotonic_ns = retry - 1;
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2}" }} });
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
-    try std.testing.expectEqual(retry, db.independent_maintenance.repair_retry_after_ns);
+    try std.testing.expectEqual(retry, db.maintenance.independent.repair_retry_after_ns);
     try std.testing.expect(db.indexes.relational.column_maintenance.ranges_compacted.load(.monotonic) > 0);
     // At the exact deadline the malformed issue is retried and gets a new
     // deadline. No wall-clock sleeping or comparison across clock domains.
     clock.monotonic_ns = retry;
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
-    try std.testing.expectEqual(retry + DB.artifact_repair_metadata_poll_ns, db.independent_maintenance.repair_retry_after_ns);
-    db.independent_maintenance.stopping.store(true, .release);
+    try std.testing.expectEqual(retry + DB.artifact_repair_metadata_poll_ns, db.maintenance.independent.repair_retry_after_ns);
+    db.maintenance.independent.stopping.store(true, .release);
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() == null);
 }
 
@@ -61837,9 +59657,9 @@ test "relational columnar generations preserve scans and compact dirty ranges" {
     defer raced.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), raced.documents.len);
     try std.testing.expectEqualStrings("{\"n\":901}", raced.documents[0].json);
-    db.independent_maintenance.stopping.store(true, .release);
+    db.maintenance.independent.stopping.store(true, .release);
     try std.testing.expectError(error.Canceled, db.indexes.relational.rebuildColumns());
-    db.independent_maintenance.stopping.store(false, .release);
+    db.maintenance.independent.stopping.store(false, .release);
     try std.testing.expect(try db.indexes.relational.rebuildColumns());
 }
 
@@ -62102,7 +59922,7 @@ test "relational columnar bounded compaction splits empty ranges and resumes can
     const Cancel = struct {
         fn run(ptr: *anyopaque) anyerror!void {
             const owner: *DB = @ptrCast(@alignCast(ptr));
-            owner.independent_maintenance.stopping.store(true, .release);
+            owner.maintenance.independent.stopping.store(true, .release);
         }
     };
     // Reach the next publication boundary before injecting cancellation;
@@ -62388,8 +60208,8 @@ test "db relational ttl cleanup preserves physical mode across reopen" {
         .grace_period_ns = 0,
     };
     try initStoppedTtlRuntimeForTest(&reopened, ttl_cfg);
-    try std.testing.expect(reopened.ttl_cleanup_context.?.batch.relational_base_rows);
-    try reopened.ttl_runtime.?.runOnce();
+    try std.testing.expect(reopened.ttl.cleanup_context.?.batch.relational_base_rows);
+    try reopened.ttl.runtime.?.runOnce();
 
     try std.testing.expect((try reopened.get(alloc, "row:expired")) == null);
     const row_key = try internal_keys.relationalRowKeyAlloc(alloc, "row:expired");
@@ -63029,22 +60849,22 @@ test "portable activation retry runtime job can be restarted" {
     // A worker with no pending activation exits immediately. Exercise two full
     // runtime-owned generations to prove completion releases launch admission.
     for (0..2) |_| {
-        _ = lockAtomic(&db.portable_activation_recovery.lifecycle_mutex);
-        db.portable_activation_recovery.stopping.store(false, .release);
-        db.portable_activation_recovery.worker_running.store(true, .release);
-        const launch = db.launchPortableActivationRetryWorkerLocked() catch |err| {
-            db.portable_activation_recovery.worker_running.store(false, .release);
-            db.portable_activation_recovery.lifecycle_mutex.unlock();
+        _ = lockAtomic(&db.recovery.portable_activation.owner.lifecycle_mutex);
+        db.recovery.portable_activation.owner.stopping.store(false, .release);
+        db.recovery.portable_activation.owner.worker_running.store(true, .release);
+        const launch = db.recovery.launchPortableActivationRetryWorkerLocked() catch |err| {
+            db.recovery.portable_activation.owner.worker_running.store(false, .release);
+            db.recovery.portable_activation.owner.lifecycle_mutex.unlock();
             return err;
         };
-        db.portable_activation_recovery.lifecycle_mutex.unlock();
+        db.recovery.portable_activation.owner.lifecycle_mutex.unlock();
         try std.testing.expectEqual(portable_activation_recovery.Owner.PortableActivationRetryLaunch.backend_runtime, launch);
 
         const exit_deadline = monotonicTimeNs() + std.time.ns_per_s;
-        while (db.portable_activation_recovery.worker_running.load(.acquire) and monotonicTimeNs() < exit_deadline) {
+        while (db.recovery.portable_activation.owner.worker_running.load(.acquire) and monotonicTimeNs() < exit_deadline) {
             @import("antfly_platform").time.yieldNow();
         }
-        try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
+        try std.testing.expect(!db.recovery.portable_activation.owner.worker_running.load(.acquire));
     }
 }
 
@@ -63071,12 +60891,12 @@ test "portable activation retry stop joins the runtime worker final handshake" {
         release_final_lock: *std.atomic.Value(bool),
 
         fn run(ctx: @This()) void {
-            while (!ctx.db.portable_activation_recovery.stopping.load(.acquire)) @import("antfly_platform").time.yieldNow();
-            _ = lockAtomic(&ctx.db.portable_activation_recovery.lifecycle_mutex);
-            ctx.db.portable_activation_recovery.worker_running.store(false, .release);
+            while (!ctx.db.recovery.portable_activation.owner.stopping.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            _ = lockAtomic(&ctx.db.recovery.portable_activation.owner.lifecycle_mutex);
+            ctx.db.recovery.portable_activation.owner.worker_running.store(false, .release);
             ctx.holding_final_lock.store(true, .release);
             while (!ctx.release_final_lock.load(.acquire)) @import("antfly_platform").time.yieldNow();
-            ctx.db.portable_activation_recovery.lifecycle_mutex.unlock();
+            ctx.db.recovery.portable_activation.owner.lifecycle_mutex.unlock();
         }
     };
     const StopCtx = struct {
@@ -63084,7 +60904,7 @@ test "portable activation retry stop joins the runtime worker final handshake" {
         returned: *std.atomic.Value(bool),
 
         fn run(ctx: @This()) void {
-            ctx.db.stopPortableActivationRetryWorker();
+            ctx.db.recovery.stopPortableActivationRetryWorker();
             ctx.returned.store(true, .release);
         }
     };
@@ -63092,8 +60912,8 @@ test "portable activation retry stop joins the runtime worker final handshake" {
     var holding_final_lock = std.atomic.Value(bool).init(false);
     var release_final_lock = std.atomic.Value(bool).init(false);
     var stop_returned = std.atomic.Value(bool).init(false);
-    db.portable_activation_recovery.stopping.store(false, .release);
-    db.portable_activation_recovery.worker_running.store(true, .release);
+    db.recovery.portable_activation.owner.stopping.store(false, .release);
+    db.recovery.portable_activation.owner.worker_running.store(true, .release);
 
     var worker = try std.Thread.spawn(.{}, ExitCtx.run, .{ExitCtx{
         .db = &db,
@@ -63153,13 +60973,13 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
     defer test_release_portable_activation_retry_probe.store(true, .release);
 
     db.async_context.portable_runtime_activation_pending.store(true, .release);
-    db.startPortableActivationRetryWorkerIfNeededInner(true);
-    try std.testing.expect(db.portable_activation_recovery.next_launch_ns > 0);
+    db.recovery.startPortableActivationRetryWorkerIfNeededInner(true);
+    try std.testing.expect(db.recovery.portable_activation.owner.next_launch_ns > 0);
 
     // Rearm the injected launch failures. The claimed probe must leave these
     // untouched after close publishes the permanent stop state.
     test_fail_portable_activation_retry_fallback_submit.store(true, .release);
-    db.portable_activation_recovery.next_launch_ns = 0;
+    db.recovery.portable_activation.owner.next_launch_ns = 0;
     test_release_portable_activation_retry_probe.store(false, .release);
     test_portable_activation_retry_probe_paused.store(false, .release);
     test_pause_portable_activation_retry_probe_before_lifecycle_lock.store(true, .release);
@@ -63215,10 +61035,10 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
     };
 
     const stop_deadline = monotonicTimeNs() + std.time.ns_per_s;
-    while (!db.portable_activation_recovery.stopping.load(.acquire) and monotonicTimeNs() < stop_deadline) {
+    while (!db.recovery.portable_activation.owner.stopping.load(.acquire) and monotonicTimeNs() < stop_deadline) {
         @import("antfly_platform").time.yieldNow();
     }
-    try std.testing.expect(db.portable_activation_recovery.stopping.load(.acquire));
+    try std.testing.expect(db.recovery.portable_activation.owner.stopping.load(.acquire));
     try std.testing.expect(!close_returned.load(.acquire));
 
     test_release_portable_activation_retry_probe.store(true, .release);
@@ -63250,27 +61070,27 @@ test "portable activation retry uses owner scoped runtime" {
     defer db.close();
 
     db.async_context.portable_runtime_activation_pending.store(true, .release);
-    _ = lockAtomic(&db.portable_activation_recovery.lifecycle_mutex);
-    db.portable_activation_recovery.stopping.store(false, .release);
-    db.portable_activation_recovery.worker_running.store(true, .release);
-    const launch = db.launchPortableActivationRetryWorkerLocked() catch |err| {
-        db.portable_activation_recovery.worker_running.store(false, .release);
-        db.portable_activation_recovery.lifecycle_mutex.unlock();
+    _ = lockAtomic(&db.recovery.portable_activation.owner.lifecycle_mutex);
+    db.recovery.portable_activation.owner.stopping.store(false, .release);
+    db.recovery.portable_activation.owner.worker_running.store(true, .release);
+    const launch = db.recovery.launchPortableActivationRetryWorkerLocked() catch |err| {
+        db.recovery.portable_activation.owner.worker_running.store(false, .release);
+        db.recovery.portable_activation.owner.lifecycle_mutex.unlock();
         return err;
     };
-    db.portable_activation_recovery.lifecycle_mutex.unlock();
+    db.recovery.portable_activation.owner.lifecycle_mutex.unlock();
     try std.testing.expectEqual(portable_activation_recovery.Owner.PortableActivationRetryLaunch.backend_runtime, launch);
 
     const recovery_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while ((db.async_context.portable_runtime_activation_pending.load(.acquire) or
-        db.portable_activation_recovery.worker_running.load(.acquire)) and
+        db.recovery.portable_activation.owner.worker_running.load(.acquire)) and
         monotonicTimeNs() < recovery_deadline)
     {
         @import("antfly_platform").time.yieldNow();
     }
     try std.testing.expect(!db.async_context.portable_runtime_activation_pending.load(.acquire));
-    try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), db.portable_runtime_activation_attempts.load(.monotonic));
+    try std.testing.expect(!db.recovery.portable_activation.owner.worker_running.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), db.recovery.portable_activation.attempts.load(.monotonic));
 }
 
 test "portable activation retry automatically rearms after runtime submission fails" {
@@ -63294,23 +61114,23 @@ test "portable activation retry automatically rearms after runtime submission fa
     test_fail_portable_activation_retry_fallback_submit.store(true, .release);
     defer test_fail_portable_activation_retry_fallback_submit.store(false, .release);
 
-    db.startPortableActivationRetryWorkerIfNeededInner(true);
-    try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
-    try std.testing.expectEqual(@as(u32, 1), db.portable_activation_recovery.launch_failure_streak);
-    try std.testing.expect(db.portable_activation_recovery.next_launch_ns > 0);
+    db.recovery.startPortableActivationRetryWorkerIfNeededInner(true);
+    try std.testing.expect(!db.recovery.portable_activation.owner.worker_running.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), db.recovery.portable_activation.owner.launch_failure_streak);
+    try std.testing.expect(db.recovery.portable_activation.owner.next_launch_ns > 0);
 
     const recovery_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while ((db.async_context.portable_runtime_activation_pending.load(.acquire) or
-        db.portable_activation_recovery.worker_running.load(.acquire)) and
+        db.recovery.portable_activation.owner.worker_running.load(.acquire)) and
         monotonicTimeNs() < recovery_deadline)
     {
         sleepNs(std.time.ns_per_ms);
     }
     try std.testing.expect(!db.async_context.portable_runtime_activation_pending.load(.acquire));
-    try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
-    try std.testing.expectEqual(@as(u32, 0), db.portable_activation_recovery.launch_failure_streak);
-    try std.testing.expectEqual(@as(u64, 0), db.portable_activation_recovery.next_launch_ns);
-    try std.testing.expectEqual(@as(u64, 1), db.portable_runtime_activation_attempts.load(.monotonic));
+    try std.testing.expect(!db.recovery.portable_activation.owner.worker_running.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), db.recovery.portable_activation.owner.launch_failure_streak);
+    try std.testing.expectEqual(@as(u64, 0), db.recovery.portable_activation.owner.next_launch_ns);
+    try std.testing.expectEqual(@as(u64, 1), db.recovery.portable_activation.attempts.load(.monotonic));
 }
 
 test "db searches fail fast without joining portable activation recovery" {
@@ -63346,7 +61166,7 @@ test "db searches fail fast without joining portable activation recovery" {
         test_published_dense_catalog_lookup_hook = null;
         db.async_context.portable_runtime_activation_pending.store(false, .release);
     }
-    const attempts_before = db.portable_runtime_activation_attempts.load(.monotonic);
+    const attempts_before = db.recovery.portable_activation.attempts.load(.monotonic);
 
     try std.testing.expectError(error.PortableRuntimeActivationPending, db.search(alloc, .{
         .index_name = "dense_idx",
@@ -63355,7 +61175,7 @@ test "db searches fail fast without joining portable activation recovery" {
         .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } },
     }));
     try std.testing.expect(!lookup_hook.entered.isSet());
-    try std.testing.expectEqual(attempts_before, db.portable_runtime_activation_attempts.load(.monotonic));
+    try std.testing.expectEqual(attempts_before, db.recovery.portable_activation.attempts.load(.monotonic));
 
     try std.testing.expectError(error.PortableRuntimeActivationPending, db.searchDenseProfiled(alloc, .{
         .index_name = "dense_idx",
@@ -63364,12 +61184,12 @@ test "db searches fail fast without joining portable activation recovery" {
         .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } },
     }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 }));
     try std.testing.expect(!lookup_hook.entered.isSet());
-    try std.testing.expectEqual(attempts_before, db.portable_runtime_activation_attempts.load(.monotonic));
+    try std.testing.expectEqual(attempts_before, db.recovery.portable_activation.attempts.load(.monotonic));
 
-    try std.testing.expect(db.portable_runtime_activation_mutex.tryLock());
-    defer db.portable_runtime_activation_mutex.unlock();
-    try std.testing.expectError(error.PortableRuntimeActivationPending, db.retryPortableRuntimeActivationIfNeeded());
-    try std.testing.expectEqual(attempts_before, db.portable_runtime_activation_attempts.load(.monotonic));
+    try std.testing.expect(db.recovery.portable_activation.mutex.tryLock());
+    defer db.recovery.portable_activation.mutex.unlock();
+    try std.testing.expectError(error.PortableRuntimeActivationPending, db.recovery.retryPortableRuntimeActivationIfNeeded());
+    try std.testing.expectEqual(attempts_before, db.recovery.portable_activation.attempts.load(.monotonic));
 }
 
 test "db portable resolver activation stops partial startup before retry reload" {
@@ -63416,13 +61236,13 @@ test "db portable resolver activation stops partial startup before retry reload"
     try target.importPortableIntoEmpty(alloc, portable.items, doc_identity.default_namespace);
 
     try std.testing.expect(target.pendingWorkStats().portable_runtime_activation_pending);
-    try std.testing.expect(!target.resolution_runtime.?.worker_started.load(.acquire));
-    try std.testing.expect(!target.promotion_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!target.enrichment.resolution.runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!target.enrichment.promotion.runtime.?.worker_started.load(.acquire));
 
-    try std.testing.expect(try target.retryPortableRuntimeActivationIfNeeded());
+    try std.testing.expect(try target.recovery.retryPortableRuntimeActivationIfNeeded());
     try std.testing.expect(!target.pendingWorkStats().portable_runtime_activation_pending);
-    try std.testing.expect(target.resolution_runtime.?.worker_started.load(.acquire));
-    try std.testing.expect(target.promotion_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(target.enrichment.resolution.runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(target.enrichment.promotion.runtime.?.worker_started.load(.acquire));
 }
 
 test "db failed portable rollback fences live access until reopen recovery" {
@@ -64622,7 +62442,7 @@ test "document extraction template prompt failure is rejected before persistence
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .template = "<<<error:status=413 message=StreamTooLong>>> fallback text",
@@ -65767,12 +63587,12 @@ test "db query capture retains settled terminal repair debt without acknowledgin
     });
     defer db.close();
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "broken", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"generator\":{\"provider\":\"openai\",\"model\":\"fixture\",\"api_key\":\"fixture\"}}}" });
+    try db.enrichment.addEnrichment(.{ .name = "broken", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"generator\":{\"provider\":\"openai\",\"model\":\"fixture\",\"api_key\":\"fixture\"}}}" });
     var fixture: u8 = 0;
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
-    try db.initOptionalEnrichmentRuntime(&config);
+    try db.enrichment.initRuntime(&config);
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"broken input\"}" }}, .sync_level = .write });
-    const runtime = db.enrichment_runtime.?;
+    const runtime = db.enrichment.runtime.?;
     const sequence = db.core.nextDerivedSequence();
     try std.testing.expectError(error.EnrichmentWorkerFailed, runtime.catchUpUntilForDrain(sequence));
     try std.testing.expect(runtime.stats().applied_sequence >= sequence);
@@ -68313,12 +66133,12 @@ test "db enrichment status changes notify query visibility hook" {
     defer db.setQueryVisibilityHook(null);
 
     try std.testing.expectEqual(@as(u64, 0), hook_ctx.status_calls);
-    try db.enrichment_runtime.?.markAppliedThrough(1);
+    try db.enrichment.runtime.?.markAppliedThrough(1);
 
     try std.testing.expectEqual(@as(u64, 1), hook_ctx.status_calls);
     try std.testing.expectEqual(QueryVisibilityChange.status, hook_ctx.change.?);
 
-    try db.enrichment_runtime.?.markAppliedThrough(2);
+    try db.enrichment.runtime.?.markAppliedThrough(2);
     try std.testing.expectEqual(@as(u64, 2), hook_ctx.status_calls);
     try std.testing.expectEqual(QueryVisibilityChange.status, hook_ctx.change.?);
 }
@@ -68568,7 +66388,7 @@ test "db generated downstream indexes are exact convergence targets at source co
     });
     defer db.close();
     try db.addIndex(.{ .name = "default", .kind = .full_text, .config_json = "{}" });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_chunks",
         .kind = .chunk,
         .field = "body",
@@ -69215,10 +67035,10 @@ test "db starts resolver replay workers only while resolver catalog is configure
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try std.testing.expect(db.resolution_runtime != null);
-    try std.testing.expect(db.promotion_runtime != null);
-    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
-    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(db.enrichment.resolution.runtime != null);
+    try std.testing.expect(db.enrichment.promotion.runtime != null);
+    try std.testing.expect(!db.enrichment.resolution.runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.enrichment.promotion.runtime.?.worker_started.load(.acquire));
 
     try db.addIndex(.{
         .name = "relations_graph",
@@ -69230,8 +67050,8 @@ test "db starts resolver replay workers only while resolver catalog is configure
         \\}
         ,
     });
-    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
-    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.enrichment.resolution.runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.enrichment.promotion.runtime.?.worker_started.load(.acquire));
 
     try db.batch(.{
         .writes = &.{.{
@@ -69246,9 +67066,9 @@ test "db starts resolver replay workers only while resolver catalog is configure
     try std.testing.expect(!no_resolver_pending.resolution.catch_up_required);
     try std.testing.expect(!no_resolver_pending.promotion.enabled);
     try std.testing.expect(!no_resolver_pending.promotion.catch_up_required);
-    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
-    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
-    try db.drainResolverBackfill();
+    try std.testing.expect(!db.enrichment.resolution.runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.enrichment.promotion.runtime.?.worker_started.load(.acquire));
+    try db.enrichment.drainResolverBackfill();
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolver_catalog_mod.reresolve_resume_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolver_catalog_mod.reresolve_repair_resume_key));
 
@@ -69260,12 +67080,12 @@ test "db starts resolver replay workers only while resolver catalog is configure
         .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
         .config_generation = 1,
     });
-    try std.testing.expect(db.resolution_runtime.?.worker_started.load(.acquire));
-    try std.testing.expect(db.promotion_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(db.enrichment.resolution.runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(db.enrichment.promotion.runtime.?.worker_started.load(.acquire));
 
     try std.testing.expect(try db.removeResolver("kg_lifecycle"));
-    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
-    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.enrichment.resolution.runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.enrichment.promotion.runtime.?.worker_started.load(.acquire));
 }
 
 test "db backfills a mention name embedding so ann/cosine resolution links end-to-end" {
@@ -69400,7 +67220,7 @@ test "db runUntilIdle catches resolution up to the committed tail after a missed
     // Runtime notifications are wake-up optimizations, not correctness
     // state. Simulate losing the notification after the source artifact was
     // committed; runUntilIdle must recover from the durable replay tail.
-    const resolution_runtime = db.resolution_runtime.?;
+    const resolution_runtime = db.enrichment.resolution.runtime.?;
     resolution_runtime.target_sequence.store(
         resolution_runtime.applied_sequence.load(.acquire),
         .release,
@@ -69527,8 +67347,8 @@ test "db resolver workers recover pending journal targets after reopen without n
             }},
             .sync_level = .write,
         });
-        try db.runEnrichmentUntil(db.core.nextDerivedSequence());
-        if (resolved_before_close) try db.resolution_runtime.?.catchUp();
+        try db.enrichment.runUntil(db.core.nextDerivedSequence());
+        if (resolved_before_close) try db.enrichment.resolution.runtime.?.catchUp();
         const pending_hint: change_journal_mod.TargetHint = if (resolved_before_close) .promotion else .resolution;
         try std.testing.expect(try db.core.store.latestReplaySequenceForHint(pending_hint, 0) > 0);
         // Graph replay can finish while the independent cross-table promotion
@@ -69541,23 +67361,23 @@ test "db resolver workers recover pending journal targets after reopen without n
             .entity_sink = sink.sink(),
         });
         if (resolved_before_close) {
-            try std.testing.expect(db.promotionStageStats().catch_up_required);
+            try std.testing.expect(db.enrichment.promotionStageStats().catch_up_required);
         } else {
-            try std.testing.expect(db.resolutionStageStats().catch_up_required);
+            try std.testing.expect(db.enrichment.resolutionStageStats().catch_up_required);
         }
-        try db.activateResolverReplayRuntimes();
+        try db.enrichment.activateResolverReplayRuntimes();
         const io = db.backend_runtime.controlIo() orelse db.backend_runtime.io().?;
         for (0..1000) |_| {
             // Publishing promotion output does not certify the independent
             // resolution checkpoint/backfill worker has finished its turn.
             if (sink.count() == 2 and
-                !db.resolutionStageStats().catch_up_required and
-                !db.promotionStageStats().catch_up_required) break;
+                !db.enrichment.resolutionStageStats().catch_up_required and
+                !db.enrichment.promotionStageStats().catch_up_required) break;
             try io.sleep(.fromMilliseconds(5), .awake);
         }
         try std.testing.expectEqual(@as(usize, 2), sink.count());
-        try std.testing.expect(!db.resolutionStageStats().catch_up_required);
-        try std.testing.expect(!db.promotionStageStats().catch_up_required);
+        try std.testing.expect(!db.enrichment.resolutionStageStats().catch_up_required);
+        try std.testing.expect(!db.enrichment.promotionStageStats().catch_up_required);
     }
 }
 
@@ -69603,17 +67423,17 @@ test "db resolver worker resumes durable backfill after deferred activation and 
             .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
             .config_generation = 1,
         };
-        _ = try db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false });
-        try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
-        try std.testing.expect(db.resolutionStageStats().catch_up_required);
+        _ = try db.enrichment.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false });
+        try std.testing.expect(!db.enrichment.resolution.runtime.?.worker_started.load(.acquire));
+        try std.testing.expect(db.enrichment.resolutionStageStats().catch_up_required);
         if (reopen) {
             db.close();
             db = try DB.open(alloc, std.mem.span(path), .{ .start_resolver_workers = false });
-            try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
-            try std.testing.expect(db.resolutionStageStats().catch_up_required);
+            try std.testing.expect(!db.enrichment.resolution.runtime.?.worker_started.load(.acquire));
+            try std.testing.expect(db.enrichment.resolutionStageStats().catch_up_required);
         }
         // No synchronous catchUp/runUntilIdle or new write may drive this work.
-        try db.activateResolverReplayRuntimes();
+        try db.enrichment.activateResolverReplayRuntimes();
         const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", cfg.resolution_artifact);
         defer alloc.free(resolution_key);
         const io = db.backend_runtime.controlIo() orelse db.backend_runtime.io().?;
@@ -69621,7 +67441,7 @@ test "db resolver worker resumes durable backfill after deferred activation and 
         for (0..1000) |_| {
             if (db.core.store.get(alloc, resolution_key)) |raw| {
                 defer alloc.free(raw);
-                if (std.mem.indexOf(u8, raw, "person/ada_lovelace") != null and !db.resolutionStageStats().catch_up_required) {
+                if (std.mem.indexOf(u8, raw, "person/ada_lovelace") != null and !db.enrichment.resolutionStageStats().catch_up_required) {
                     completed = true;
                     break;
                 }
@@ -69678,18 +67498,18 @@ test "db managed resolver changes fence in-flight replay and reset durable curso
             .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
             .config_generation = 1,
         };
-        _ = try db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false });
+        _ = try db.enrichment.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false });
         // Leave generation-one decisions queued for promotion across DDL.
-        try db.resolution_runtime.?.catchUp();
+        try db.enrichment.resolution.runtime.?.catchUp();
         try std.testing.expectEqual(@as(usize, 0), sink.count());
         var replacement = cfg;
         replacement.config_generation = 2;
-        for ([_]*std.atomic.Mutex{ &db.resolution_runtime.?.catch_up_mutex, &db.promotion_runtime.?.catch_up_mutex }) |mutex| {
+        for ([_]*std.atomic.Mutex{ &db.enrichment.resolution.runtime.?.catch_up_mutex, &db.enrichment.promotion.runtime.?.catch_up_mutex }) |mutex| {
             try std.testing.expect(mutex.tryLock());
             defer mutex.unlock();
-            try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.updated_no_backfill, try db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false }));
-            try std.testing.expectError(error.WriterLocked, db.upsertResolverWithResultOptions(replacement, .{ .drain_backfill = false }));
-            try std.testing.expectError(error.WriterLocked, db.removeResolverWithoutDrain(cfg.name));
+            try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.updated_no_backfill, try db.enrichment.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false }));
+            try std.testing.expectError(error.WriterLocked, db.enrichment.upsertResolverWithResultOptions(replacement, .{ .drain_backfill = false }));
+            try std.testing.expectError(error.WriterLocked, db.enrichment.removeResolverWithoutDrain(cfg.name));
             var saved = (try db.resolverConfigByNameAlloc(cfg.name)).?;
             defer saved.deinit(alloc);
             try std.testing.expectEqual(@as(u64, 1), saved.config_generation);
@@ -69701,13 +67521,13 @@ test "db managed resolver changes fence in-flight replay and reset durable curso
             try txn.put(resolver_catalog_mod.reresolve_repair_resume_key, "past-doc-a");
             try txn.commit();
         }
-        _ = try db.upsertResolverWithResultOptions(replacement, .{ .drain_backfill = false });
+        _ = try db.enrichment.upsertResolverWithResultOptions(replacement, .{ .drain_backfill = false });
         for ([_][]const u8{ resolver_catalog_mod.reresolve_resume_key, resolver_catalog_mod.reresolve_repair_resume_key }) |key| {
             const cursor = try db.core.store.get(alloc, key);
             defer alloc.free(cursor);
             try std.testing.expectEqualStrings("", cursor);
         }
-        try db.promotion_runtime.?.catchUp();
+        try db.enrichment.promotion.runtime.?.catchUp();
         try std.testing.expectEqual(@as(usize, 0), sink.count());
         try db.runUntilIdle();
         try std.testing.expectEqual(@as(usize, 1), sink.count());
@@ -69721,11 +67541,11 @@ test "db managed resolver changes fence in-flight replay and reset durable curso
                 return false;
             }
         };
-        if (follower) db.setPromotionOwner(.{ .ptr = undefined, .vtable = &.{ .is_local_owner = FollowerOwner.isLocal } });
+        if (follower) db.enrichment.setPromotionOwner(.{ .ptr = undefined, .vtable = &.{ .is_local_owner = FollowerOwner.isLocal } });
         // Retirement is durable replay work; keep the catalog until it finishes.
-        try std.testing.expectError(error.WriterLocked, db.removeResolverWithoutDrain(cfg.name));
+        try std.testing.expectError(error.WriterLocked, db.enrichment.removeResolverWithoutDrain(cfg.name));
         try db.runUntilIdle();
-        try std.testing.expect(try db.removeResolverWithoutDrain(cfg.name));
+        try std.testing.expect(try db.enrichment.removeResolverWithoutDrain(cfg.name));
         try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
     }
 }
@@ -69850,18 +67670,18 @@ test "db drains pending resolver backfill when retrying a no-op upsertResolver" 
             try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.inserted, try db.core.upsertResolver(cfg));
         }
         try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
-        try std.testing.expect(try db.resolution_runtime.?.hasReresolveBacklog());
+        try std.testing.expect(try db.enrichment.resolution.runtime.?.hasReresolveBacklog());
 
         if (already_enqueued) {
             // Model the worker clearing the dirty cursor after enqueueing the
             // replay record, before resolution has materialized its output.
-            while (try db.resolution_runtime.?.hasReresolveBacklog()) {
-                var tick = try db.resolution_runtime.?.runReresolveBacklogWindow();
+            while (try db.enrichment.resolution.runtime.?.hasReresolveBacklog()) {
+                var tick = try db.enrichment.resolution.runtime.?.runReresolveBacklogWindow();
                 tick.deinit(db.runtime_alloc);
             }
             try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
-            try std.testing.expect(db.resolution_runtime.?.target_sequence.load(.acquire) >
-                db.resolution_runtime.?.applied_sequence.load(.acquire));
+            try std.testing.expect(db.enrichment.resolution.runtime.?.target_sequence.load(.acquire) >
+                db.enrichment.resolution.runtime.?.applied_sequence.load(.acquire));
         }
 
         // Retrying the same catalog config is a material no-op, but the durable
@@ -69872,7 +67692,7 @@ test "db drains pending resolver backfill when retrying a no-op upsertResolver" 
         defer alloc.free(raw);
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
         try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
-        try std.testing.expect(!try db.resolution_runtime.?.hasReresolveBacklog());
+        try std.testing.expect(!try db.enrichment.resolution.runtime.?.hasReresolveBacklog());
     }
 }
 
@@ -69978,7 +67798,7 @@ test "db refuses resolver removal while resolution or promotion replay is pendin
     // advancing promotion replay. Removing the resolver here would otherwise
     // erase the catalog signal that older retention logic used.
     try std.testing.expectError(error.ResolverReplayPending, db.removeResolver("kg_pending_remove"));
-    try std.testing.expect(db.promotionStageStats().catch_up_required);
+    try std.testing.expect(db.enrichment.promotionStageStats().catch_up_required);
 }
 
 /// Thread-safe capturing entity sink for the promotion integration test.
@@ -70158,14 +67978,14 @@ test "db graph index materializes unit-derived chunk artifacts into graph edge a
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
@@ -70221,13 +68041,13 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
 
     const ephemeral_chunker =
         "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}";
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "search_chunks_v1",
         .kind = .chunk,
         .field = "body",
         .chunker_json = ephemeral_chunker,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "graph_chunks_v1",
         .kind = .chunk,
         .field = "relation",
@@ -70304,7 +68124,7 @@ test "db member-mode chunk hits filter through the parent row on the full-text a
 
     const ephemeral_chunker =
         "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}";
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
         .field = "body",
@@ -70376,7 +68196,7 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
 
     const ephemeral_chunker =
         "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}";
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
         .field = "body",
@@ -70458,7 +68278,7 @@ test "db member-mode chunk hits apply query.bool.filter/must_not doc_id against 
 
     const ephemeral_chunker =
         "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}";
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
         .field = "body",
@@ -70947,14 +68767,14 @@ test "db asset consumes another asset artifact and re-derives on upstream change
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_text_v1",
         .kind = .asset,
         .field = "summary",
         .content_type = "text/plain",
         .producer_json = "{\"type\":\"copy\"}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_echo_v1",
         .kind = .asset,
         .source_artifact_name = "summary_text_v1",
@@ -71023,21 +68843,21 @@ test "db asset consuming asset validates upstream references at admission" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "a_v1",
         .kind = .asset,
         .field = "summary",
         .producer_json = "{\"type\":\"copy\"}",
     });
     // Self-reference is the one-hop cycle.
-    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.enrichment.addEnrichment(.{
         .name = "self_v1",
         .kind = .asset,
         .source_artifact_name = "self_v1",
         .producer_json = "{\"type\":\"copy\"}",
     }));
     // The upstream must already be an admitted asset.
-    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.enrichment.addEnrichment(.{
         .name = "b_v1",
         .kind = .asset,
         .source_artifact_name = "missing_v1",
@@ -71045,7 +68865,7 @@ test "db asset consuming asset validates upstream references at admission" {
     }));
     // Consuming assets read produced bytes; a document field cannot also be
     // the source.
-    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.enrichment.addEnrichment(.{
         .name = "c_v1",
         .kind = .asset,
         .field = "summary",
@@ -71053,14 +68873,14 @@ test "db asset consuming asset validates upstream references at admission" {
         .producer_json = "{\"type\":\"copy\"}",
     }));
     // Media-locator producers dereference the source as a URL and stay closed.
-    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.enrichment.addEnrichment(.{
         .name = "r_v1",
         .kind = .asset,
         .source_artifact_name = "a_v1",
         .producer_json = "{\"type\":\"reader\"}",
     }));
     // A valid chain admits.
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "d_v1",
         .kind = .asset,
         .source_artifact_name = "a_v1",
@@ -71085,7 +68905,7 @@ test "db multi-source full text unions chunk and textual asset streams across de
         });
         defer db.close();
 
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "body_chunks_v1",
             .kind = .chunk,
             .field = "body",
@@ -71093,7 +68913,7 @@ test "db multi-source full text unions chunk and textual asset streams across de
             \\{"provider":"antfly","store_chunks":false,"text":{"target_tokens":32,"overlap_tokens":0}}
             ,
         });
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "summary_text_v1",
             .kind = .asset,
             .field = "summary",
@@ -71969,7 +69789,7 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
     defer db.close();
     var promotion_sink = FakePromotionSink{ .alloc = alloc };
     defer promotion_sink.deinit();
-    db.setEntitySink(promotion_sink.sink());
+    db.enrichment.setEntitySink(promotion_sink.sink());
 
     try db.addIndex(.{
         .name = "prov_graph",
@@ -73019,13 +70839,13 @@ test "db multi-source graph precedence falls back after winner deletion and reop
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "primary_relations_v1",
             .kind = .asset,
             .field = "primary_relations",
             .content_type = "application/json",
         });
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "fallback_relations_v1",
             .kind = .asset,
             .field = "fallback_relations",
@@ -73130,13 +70950,13 @@ test "db multi-source graph precedence keeps the primary edge after removing the
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "primary_relations_v1",
             .kind = .asset,
             .field = "primary_relations",
             .content_type = "application/json",
         });
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "fallback_relations_v1",
             .kind = .asset,
             .field = "fallback_relations",
@@ -73232,13 +71052,13 @@ test "db portable restore rebuilds multi-source graph contender provenance" {
     {
         var source = try DB.open(alloc, std.mem.span(source_path), .{ .primary_backend = primary_backend });
         defer source.close();
-        try source.addEnrichment(.{
+        try source.enrichment.addEnrichment(.{
             .name = "primary_relations_v1",
             .kind = .asset,
             .field = "primary_relations",
             .content_type = "application/json",
         });
-        try source.addEnrichment(.{
+        try source.enrichment.addEnrichment(.{
             .name = "fallback_relations_v1",
             .kind = .asset,
             .field = "fallback_relations",
@@ -73421,7 +71241,7 @@ test "db graph artifact source lifecycle reuses and protects asset enrichments" 
         ,
     });
 
-    const created = (try db.getEnrichment(alloc, .asset, "relations_v1")) orelse return error.TestUnexpectedResult;
+    const created = (try db.enrichment.getEnrichment(alloc, .asset, "relations_v1")) orelse return error.TestUnexpectedResult;
     defer {
         var tmp = created;
         tmp.deinit(alloc);
@@ -73440,11 +71260,11 @@ test "db graph artifact source lifecycle reuses and protects asset enrichments" 
         ,
     });
 
-    try std.testing.expectError(error.EnrichmentInUse, db.deleteEnrichment(.asset, "relations_v1"));
+    try std.testing.expectError(error.EnrichmentInUse, db.enrichment.deleteEnrichment(.asset, "relations_v1"));
     try std.testing.expect(try db.deleteIndex("relations_graph_a"));
-    try std.testing.expectError(error.EnrichmentInUse, db.deleteEnrichment(.asset, "relations_v1"));
+    try std.testing.expectError(error.EnrichmentInUse, db.enrichment.deleteEnrichment(.asset, "relations_v1"));
 
-    const still_present = (try db.getEnrichment(alloc, .asset, "relations_v1")) orelse return error.TestUnexpectedResult;
+    const still_present = (try db.enrichment.getEnrichment(alloc, .asset, "relations_v1")) orelse return error.TestUnexpectedResult;
     defer {
         var tmp = still_present;
         tmp.deinit(alloc);
@@ -73471,7 +71291,7 @@ test "db query repair gate revalidates stale debt" {
     // intent was removed. The first rejected request proves absence and heals
     // the process-local gate instead of wedging the reader indefinitely.
     try db.core.index_manager.markUnscopedRepairUnavailable("stale_repair");
-    try db.failIfIndexQuarantined("stale_repair");
+    try db.maintenance.failIfIndexQuarantined("stale_repair");
     try std.testing.expect(!db.core.index_manager.repairUnavailable("stale_repair"));
 }
 
@@ -73630,7 +71450,7 @@ test "db graph artifact source reuses user enrichment and rejects incompatible s
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "relations_v1",
         .kind = .asset,
         .field = "relations",
@@ -74305,7 +72125,7 @@ test "db full_index precomputes generated enrichments into the committed batch" 
     const sparse_applied = try db.core.loadAppliedSequence(alloc, "sp_v1");
     try std.testing.expect(sparse_applied > 0);
 
-    const runtime = db.enrichment_runtime.?;
+    const runtime = db.enrichment.runtime.?;
     const dense_activity = runtime.indexEmbeddingActivity("dv_v1");
     const sparse_activity = runtime.indexEmbeddingActivity("sp_v1");
     for ([_]types.EmbeddingActivityStats{ dense_activity, sparse_activity }) |activity| {
@@ -74405,7 +72225,7 @@ test "db enrichments precomputes generated enrichments into the committed batch"
         },
         .sync_level = .enrichments,
     });
-    try std.testing.expectEqual(@as(u64, 1), db.enrichment_runtime.?.stats().applied_sequence);
+    try std.testing.expectEqual(@as(u64, 1), db.enrichment.runtime.?.stats().applied_sequence);
 
     const journal_entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
     defer {
@@ -74502,8 +72322,8 @@ test "db enrichments precomputed watermark advances across replay entries withou
     });
     defer alloc.free(inert_payload);
     try db.core.store.appendReplayOpaque(alloc, 1, inert_payload);
-    try db.enrichment_runtime.?.resumeFrom(0, 0);
-    try std.testing.expectEqual(@as(u64, 0), db.enrichment_runtime.?.stats().applied_sequence);
+    try db.enrichment.runtime.?.resumeFrom(0, 0);
+    try std.testing.expectEqual(@as(u64, 0), db.enrichment.runtime.?.stats().applied_sequence);
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -74518,7 +72338,7 @@ test "db enrichments precomputed watermark advances across replay entries withou
         .sync_level = .enrichments,
     });
 
-    try std.testing.expectEqual(db.core.nextDerivedSequence(), db.enrichment_runtime.?.stats().applied_sequence);
+    try std.testing.expectEqual(db.core.nextDerivedSequence(), db.enrichment.runtime.?.stats().applied_sequence);
 }
 
 test "db derived target advance does not skip unseen matching replay records" {
@@ -74618,35 +72438,35 @@ test "db asset producer enrichments execute fake providers and skip unchanged st
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "generated_title_v1",
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
         .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "image_text_v1",
         .kind = .asset,
         .field = "image",
         .content_type = "text/plain",
         .producer_json = "{\"type\":\"reader\",\"config\":{\"provider\":\"mock\"}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "audio_text_v1",
         .kind = .asset,
         .field = "audio",
         .content_type = "text/plain",
         .producer_json = "{\"type\":\"transcriber\",\"config\":{\"provider\":\"mock\"}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "relations_v1",
         .kind = .asset,
         .field = "body",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"extractor\",\"config\":{\"provider\":\"mock\"}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_copy_v1",
         .kind = .asset,
         .field = "body",
@@ -74800,7 +72620,7 @@ test "db asset producer enrichments batch compatible generated assets" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_v1",
         .kind = .asset,
         .field = "body",
@@ -74886,7 +72706,7 @@ test "db asset producer sync precompute fails closed on permanent item failure" 
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_v1",
         .kind = .asset,
         .field = "body",
@@ -75079,7 +72899,7 @@ test "db document extraction asset materializes unit artifacts from data url" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -75088,7 +72908,7 @@ test "db document extraction asset materializes unit artifacts from data url" {
     });
     // A source may have multiple asset enrichments. Opaque non-document
     // payloads must never be sniffed as extraction manifests by traversal.
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "source_copy_v1",
         .kind = .asset,
         .field = "url",
@@ -75555,7 +73375,7 @@ test "db hierarchy navigation seeks only the descriptor blocks needed by the pag
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -75668,7 +73488,7 @@ test "db hierarchy cursor binds every unit artifact revision under its source" {
     defer db.close();
 
     for ([_][]const u8{ "a/units_v1", "z_units_v1" }) |name| {
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = name,
             .kind = .asset,
             .field = "url",
@@ -75758,7 +73578,7 @@ test "db async document extraction accounts resource manager working set" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -75802,14 +73622,14 @@ test "db async document extraction deletes artifacts with corrupt previous extra
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
@@ -75888,7 +73708,7 @@ test "db document extraction routes mixed files using source metadata fields" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -75936,7 +73756,7 @@ test "db document extraction stores docx section units" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -75984,7 +73804,7 @@ test "db document extraction stores zip archive entry units" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -76033,7 +73853,7 @@ test "db document extraction marks image OCR not configured without a reader" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -76090,7 +73910,7 @@ test "db document extraction completes image OCR with reader producer" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -76143,7 +73963,7 @@ test "db document extraction attempts forced OCR for a scanned PDF" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -76211,7 +74031,7 @@ test "db async document extraction reuses generated OCR text across streaming pa
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -76261,7 +74081,7 @@ test "db document extraction stores structured OCR confidence and coordinates" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -76318,7 +74138,7 @@ test "db document extraction completes audio transcription with transcriber prod
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -76374,14 +74194,14 @@ test "db document extraction transcript segments time chunk artifacts" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"transcriber\":{\"provider\":\"mock-transcriber\",\"model\":\"test-transcriber\"}}}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
@@ -76463,14 +74283,14 @@ test "db document extraction keeps diarized speakers through reopen" {
         });
         defer db.close();
 
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "document_units_v1",
             .kind = .asset,
             .field = "url",
             .content_type = "application/json",
             .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"transcriber\":{\"provider\":\"mock-transcriber\",\"model\":\"test-transcriber\",\"diarization\":true}}}}",
         });
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "document_chunks_v1",
             .kind = .chunk,
             .field = "text",
@@ -76552,7 +74372,7 @@ test "db document extraction stores rfc822 email units" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -76607,7 +74427,7 @@ test "db document extraction stores multipart rfc822 text parts" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -76658,7 +74478,7 @@ test "db document extraction stores unsupported file manifest without searchable
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -76793,21 +74613,21 @@ test "db document extraction skips stable unit local rewrites without text consu
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
         .source_artifact_name = "document_units_v1",
         .chunk_size = 256,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunk_dense_v1",
         .kind = .embedding,
         .field = "text",
@@ -76891,14 +74711,14 @@ const plural_source_dense_test_support = if (builtin.is_test) struct {
             var db_open = true;
             defer if (db_open) db.close();
 
-            try db.addEnrichment(.{
+            try db.enrichment.addEnrichment(.{
                 .name = "document_units_v1",
                 .kind = .asset,
                 .field = "url",
                 .content_type = "application/json",
                 .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
             });
-            try db.addEnrichment(.{
+            try db.enrichment.addEnrichment(.{
                 .name = "document_chunks_v1",
                 .kind = .chunk,
                 .field = "text",
@@ -76909,7 +74729,7 @@ const plural_source_dense_test_support = if (builtin.is_test) struct {
                 try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = document }}, .sync_level = .full_index });
                 try db.runUntilIdle();
             }
-            try db.addEnrichment(.{
+            try db.enrichment.addEnrichment(.{
                 .name = "document_chunk_dense_v1",
                 .kind = .embedding,
                 .field = "text",
@@ -76986,7 +74806,7 @@ const plural_source_dense_test_support = if (builtin.is_test) struct {
             try std.testing.expect(counting.calls > calls_before_range);
             if (admission == .after_chunks) {
                 const calls_before_deferred = counting.calls;
-                db.enrichment_runtime.?.config.dense_embedder = null;
+                db.enrichment.runtime.?.config.dense_embedder = null;
                 try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_chunk_dense_v1"));
                 try std.testing.expectEqual(calls_before_deferred, counting.calls);
                 db.close();
@@ -77031,7 +74851,7 @@ test "runUntilIdle no-progress guard fails fast with a named stuck-index diagnos
     });
     defer db.close();
 
-    try std.testing.expect(db.lastRunUntilIdleNoProgressDiagnostic() == null);
+    try std.testing.expect(db.maintenance.lastRunUntilIdleNoProgressDiagnostic() == null);
 
     const now_ns = monotonicTimeNs();
     // Simulate `canAdvanceDerivedToTargetAsync` having observed
@@ -77040,7 +74860,7 @@ test "runUntilIdle no-progress guard fails fast with a named stuck-index diagnos
     try noteTargetAdvanceStuck(db.async_context, "chunk_vectors", now_ns -| (2 * std.time.ns_per_s), 5017, 0);
     try std.testing.expectError(error.RunUntilIdleNoProgress, db.checkTargetAdvanceNoProgress(1 * std.time.ns_per_s));
 
-    const diagnostic = db.lastRunUntilIdleNoProgressDiagnostic() orelse return error.TestUnexpectedResult;
+    const diagnostic = db.maintenance.lastRunUntilIdleNoProgressDiagnostic() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("chunk_vectors", diagnostic.index_name);
     try std.testing.expectEqual(@as(u64, 5017), diagnostic.indexed);
     try std.testing.expectEqual(@as(u64, 0), diagnostic.expected);
@@ -77091,7 +74911,7 @@ test "runUntilIdle no-progress guard interrupts the threaded derived wait" {
         .no_progress_timeout_ns = 1 * std.time.ns_per_s,
     }));
 
-    const diagnostic = db.lastRunUntilIdleNoProgressDiagnostic() orelse return error.TestUnexpectedResult;
+    const diagnostic = db.maintenance.lastRunUntilIdleNoProgressDiagnostic() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("chunk_vectors", diagnostic.index_name);
     clearTargetAdvanceStuck(db.async_context, "chunk_vectors");
 }
@@ -77274,7 +75094,7 @@ test "db dispatches generated document child range artifacts to remote owner" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -77530,7 +75350,7 @@ test "db retries remote document child range dispatch from durable outbox" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -77644,7 +75464,7 @@ test "db public extraction budget rejection publishes a failure manifest" {
         .enrichment = .{ .resource_manager = &manager },
     });
     defer db.close();
-    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
+    try db.enrichment.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
     const body = try alloc.alloc(u8, 64 * 1024);
     defer alloc.free(body);
     @memset(body, 'x');
@@ -77681,7 +75501,7 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
         },
     });
     defer db.close();
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -77707,7 +75527,7 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
         .writes = &.{.{ .key = "doc:retry", .value = "{\"body\":\"provider unavailable\"}" }},
         .sync_level = .write,
     });
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.enrichment.runUntil(db.core.nextEnrichmentSequence()));
 
     // Both public endpoints acknowledge the committed request without waiting
     // for the unrelated retry debt. The repair queue still uses full_index.
@@ -77754,21 +75574,21 @@ test "db document extraction manifest inspection and reprocess API" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
         .source_artifact_name = "document_units_v1",
         .chunk_size = 256,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunk_dense_v1",
         .kind = .embedding,
         .field = "text",
@@ -77928,7 +75748,7 @@ test "db generic artifact repair queue reprocesses document asset artifacts" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -78013,7 +75833,7 @@ test "db generic artifact repair queue regenerates set-valued chunk artifacts" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
         .field = "body",
@@ -79614,7 +77434,7 @@ test "db index repair replacement loads named artifact producer dependencies" {
         .ttl_cleanup = .{ .enabled = false },
     });
     defer db.close();
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_chunks",
         .kind = .chunk,
         .field = "body",
@@ -79623,7 +77443,7 @@ test "db index repair replacement loads named artifact producer dependencies" {
     for ([_]types.IndexKind{ .dense_vector, .sparse_vector }) |kind| {
         const dense = kind == .dense_vector;
         const source_name = if (dense) "dense_source" else "sparse_source";
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = source_name,
             .kind = .embedding,
             .field = "text",
@@ -80554,7 +78374,7 @@ test "db document extraction failure preserves last-known-good children and reco
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -80649,21 +78469,21 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
         .source_artifact_name = "document_units_v1",
         .chunk_size = 256,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunk_dense_v1",
         .kind = .embedding,
         .field = "text",
@@ -81135,21 +78955,21 @@ fn testMaterializedEmbeddingWriteGrowth(comptime mode: enum { dense, derived_den
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
         .source_artifact_name = "document_units_v1",
         .chunk_size = 256,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = embedding_name,
         .kind = .embedding,
         .field = "text",
@@ -81299,35 +79119,35 @@ test "db document extraction chunks units through source artifact enrichment" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
         .source_artifact_name = "document_units_v1",
         .chunk_size = 256,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunk_dense_v1",
         .kind = .embedding,
         .field = "text",
         .source_artifact_name = "document_chunks_v1",
         .expected_dims = 3,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunk_caption_dense_v1",
         .kind = .embedding,
         .field = "caption",
         .source_artifact_name = "document_chunks_v1",
         .expected_dims = 3,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunk_sparse_v1",
         .kind = .embedding,
         .field = "text",
@@ -81685,7 +79505,7 @@ test "db sync_level enrichments precompute for document-mode writes does not hol
     defer db.close();
     defer slow_asset.allow();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_v1",
         .kind = .asset,
         .field = "body",
@@ -81767,21 +79587,21 @@ test "db document extraction concurrent same-key writes converge without stale p
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
         .source_artifact_name = "document_units_v1",
         .chunk_size = 256,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunk_dense_v1",
         .kind = .embedding,
         .field = "text",
@@ -81898,21 +79718,21 @@ test "db document extraction pre-lock precompute survives a concurrent catalog m
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
         .source_artifact_name = "document_units_v1",
         .chunk_size = 256,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunk_dense_v1",
         .kind = .embedding,
         .field = "text",
@@ -81982,7 +79802,7 @@ test "db document extraction pre-lock precompute survives a concurrent catalog m
     // existing PreparedGenerationChanged retry path to run against the
     // replaced catalog entry.
     test_portable_runtime_batch_prelock_hook = null;
-    _ = try db.upsertEnrichment(.{
+    _ = try db.enrichment.upsertEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
@@ -82091,21 +79911,21 @@ test "db document extraction unit chunks embed in provider batches, not per chun
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
         .source_artifact_name = "document_units_v1",
         .chunk_size = 256,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunk_dense_v1",
         .kind = .embedding,
         .field = "text",
@@ -82179,7 +79999,7 @@ test "db sync_level enrichments returns without waiting on an unrelated enrichme
     defer db.close();
     defer slow_asset.allow();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_v1",
         .kind = .asset,
         .field = "body",
@@ -82205,7 +80025,7 @@ test "db sync_level enrichments returns without waiting on an unrelated enrichme
     // This row has no value in the enrichment's source field, so its own
     // sync_level: .enrichments precompute needs nothing from the producer
     // (generated_enrichment_refs stays empty) and must not wait for
-    // db.enrichment_runtime's applied_sequence to catch up to -- let alone
+    // db.enrichment.runtime's applied_sequence to catch up to -- let alone
     // past -- the backlogged "doc:backlog" commit still parked ahead of it.
     const wait_start_ns = monotonicTimeNs();
     try db.batch(.{
@@ -82311,14 +80131,14 @@ test "db document extraction changed version updates large chunked source docume
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"etag_field\":\"sha256\",\"version_field\":\"sha256\",\"content_type_field\":\"mime_type\",\"filename_field\":\"filename\"}}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
@@ -82426,14 +80246,14 @@ test "db document extraction chunk enrichment lifecycle rechunks adds and retire
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
@@ -82464,7 +80284,7 @@ test "db document extraction chunk enrichment lifecycle rechunks adds and retire
 
     // Growing the chunk size keeps the old chunk ids 0..n but must replace
     // their text, so the tail term moves into the new last chunk.
-    _ = try db.upsertEnrichment(.{
+    _ = try db.enrichment.upsertEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
@@ -82479,7 +80299,7 @@ test "db document extraction chunk enrichment lifecycle rechunks adds and retire
     try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
     try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "harbor0"));
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v2",
         .kind = .chunk,
         .field = "text",
@@ -82493,7 +80313,7 @@ test "db document extraction chunk enrichment lifecycle rechunks adds and retire
     try std.testing.expectEqual(@as(usize, 1), try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v2"));
     try std.testing.expectEqual(@as(u32, 2), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
 
-    try std.testing.expect(try db.deleteEnrichment(.chunk, "document_chunks_v2"));
+    try std.testing.expect(try db.enrichment.deleteEnrichment(.chunk, "document_chunks_v2"));
     try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 0), try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v2"));
@@ -82511,14 +80331,14 @@ test "db document extraction update recovers corrupt previous extraction state" 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"etag_field\":\"sha256\",\"version_field\":\"sha256\",\"content_type_field\":\"mime_type\",\"filename_field\":\"filename\"}}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
@@ -82585,7 +80405,7 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    var result = try db.extractEnrichments(alloc, &.{
+    var result = try db.enrichment.extractEnrichments(alloc, &.{
         .{
             .key = "doc:a",
             .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,2,3],\"sparse_idx\":{\"indices\":[1,5],\"values\":[0.5,0.75]}},\"_edges\":{\"graph_v1\":{\"cites\":[{\"target\":\"doc:b\",\"edge_id\":\"relationship-1\",\"metadata\":{\"source\":\"fixture\"},\"weight\":2.0}]}}}",
@@ -82615,7 +80435,7 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
 
     const Failure = struct {
         fn run(failure_alloc: Allocator, target: *DB) !void {
-            var extracted = try target.extractEnrichments(failure_alloc, &.{
+            var extracted = try target.enrichment.extractEnrichments(failure_alloc, &.{
                 .{
                     .key = "doc:a",
                     .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,2,3],\"sparse_idx\":{\"indices\":[1,5],\"values\":[0.5,0.75]}},\"_edges\":{\"graph_v1\":{\"cites\":[{\"target\":\"doc:b\",\"edge_id\":\"relationship-1\",\"metadata\":{\"source\":\"fixture\"},\"weight\":2.0}]}}}",
@@ -82623,7 +80443,7 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
             });
             defer extracted.deinit(failure_alloc);
             try std.testing.expectEqual(@as(usize, 1), extracted.graph_writes.len);
-            var packed_result = try target.extractEnrichments(failure_alloc, &.{.{ .key = "packed", .value = "{\"title\":\"packed\",\"_embeddings\":{\"dense_idx\":\"AACAPw==\"}}" }});
+            var packed_result = try target.enrichment.extractEnrichments(failure_alloc, &.{.{ .key = "packed", .value = "{\"title\":\"packed\",\"_embeddings\":{\"dense_idx\":\"AACAPw==\"}}" }});
             defer packed_result.deinit(failure_alloc);
             try std.testing.expectEqual(@as(f32, 1), packed_result.dense_embeddings[0].vector[0]);
         }
@@ -82642,7 +80462,7 @@ test "db extractEnrichments rejects unsupported legacy summaries field" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try std.testing.expectError(error.UnsupportedReservedField, db.extractEnrichments(alloc, &.{
+    try std.testing.expectError(error.UnsupportedReservedField, db.enrichment.extractEnrichments(alloc, &.{
         .{
             .key = "doc:a",
             .value = "{\"title\":\"alpha\",\"_summaries\":{\"sum_idx\":\"brief\"}}",
@@ -82678,7 +80498,7 @@ test "db computeEnrichments synchronously builds chunk and embedding outputs" {
         .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
     });
 
-    var result = try db.computeEnrichments(alloc, &.{
+    var result = try db.enrichment.computeEnrichments(alloc, &.{
         .{
             .key = "doc:a",
             .value = "{\"body\":\"abcdefghijklmno\"}",
@@ -82704,7 +80524,7 @@ test "db computeEnrichments synchronously builds chunk and embedding outputs" {
     try std.testing.expectEqualStrings("ft_chunks", result.documents[0].target_index_names[0]);
     try std.testing.expectEqualStrings("dv_v1", result.dense_embeddings[0].index_name);
 
-    const runtime_stats = db.enrichment_runtime.?.stats();
+    const runtime_stats = db.enrichment.runtime.?.stats();
     try std.testing.expectEqual(@as(u64, 1), runtime_stats.embed_batches_started);
     try std.testing.expectEqual(@as(u64, 1), runtime_stats.embed_batches_completed);
     try std.testing.expectEqual(@as(u64, 3), runtime_stats.embed_items_started);
@@ -82712,7 +80532,7 @@ test "db computeEnrichments synchronously builds chunk and embedding outputs" {
 
     const AllocationSweep = struct {
         fn run(failing: Allocator, target: *DB) !void {
-            var computed = try target.computeEnrichments(failing, &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }});
+            var computed = try target.enrichment.computeEnrichments(failing, &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }});
             defer computed.deinit(failing);
             try std.testing.expect(computed.artifact_writes.len != 0);
             try std.testing.expect(computed.documents.len != 0);
@@ -82816,12 +80636,12 @@ test "db leased enrichment worker renews text replay tenure across provider wait
     });
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"slow text provider\"}" }}, .sync_level = .write });
     try db.runUntilIdle();
-    const stats = db.enrichment_runtime.?.stats();
+    const stats = db.enrichment.runtime.?.stats();
     try std.testing.expectEqual(@as(usize, 1), slow.calls);
     try std.testing.expectEqual(@as(u64, 0), stats.lost_leases);
     try std.testing.expectEqual(db.core.nextEnrichmentSequence(), stats.applied_sequence);
     try std.testing.expect(stats.has_lease);
-    try std.testing.expect(db.enrichment_runtime.?.ownership.renewal_count > 0);
+    try std.testing.expect(db.enrichment.runtime.?.ownership.renewal_count > 0);
 }
 
 test "db leased enrichment worker backs off while a stale owner holds the lease" {
@@ -82859,7 +80679,7 @@ test "db leased enrichment worker backs off while a stale owner holds the lease"
     // the competing owner only after admission and before starting the worker.
     const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
     try std.testing.expect(try stale_lease.tryAcquire("worker-a", now_ms, 30_000));
-    try db.enrichment_runtime.?.start();
+    try db.enrichment.runtime.?.start();
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"blocked enrichment\"}" }},
@@ -82869,14 +80689,14 @@ test "db leased enrichment worker backs off while a stale owner holds the lease"
     var first_failures: u64 = 0;
     var attempts: usize = 0;
     while (attempts < default_test_wait_attempts) : (attempts += 1) {
-        first_failures = db.enrichment_runtime.?.stats().lease_acquire_failures;
+        first_failures = db.enrichment.runtime.?.stats().lease_acquire_failures;
         if (first_failures > 0) break;
         sleepPollInterval();
     }
     try std.testing.expect(first_failures > 0);
 
     sleepNs(250 * std.time.ns_per_ms);
-    const later_failures = db.enrichment_runtime.?.stats().lease_acquire_failures;
+    const later_failures = db.enrichment.runtime.?.stats().lease_acquire_failures;
     // A 100ms denial delay permits at most a handful of retries in this
     // observation window. The former zero-duration yield produces thousands.
     try std.testing.expect(later_failures - first_failures <= 5);
@@ -82913,7 +80733,7 @@ test "db leased enrichment worker generates dense embeddings with durable lsm pr
         .sync_level = .write,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
     try db.executor.waitForAll(2);
 
     const stats = try db.stats(alloc);
@@ -83161,7 +80981,7 @@ test "db retryable asset producer batches do not block independent dense publica
 
     // Register the unavailable asset producer first so request ordering cannot
     // be the mechanism that lets the dense producer make progress.
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_v1",
         .kind = .asset,
         .field = "body",
@@ -83171,7 +80991,7 @@ test "db retryable asset producer batches do not block independent dense publica
     // A distinct producer configuration forces a second native batch. Batch
     // partitioning must remain deferred so the first outage cannot perform
     // provider I/O while later producer classes are still being planned.
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_v2",
         .kind = .asset,
         .field = "body",
@@ -83254,7 +81074,7 @@ test "db blocked dense embedding lane does not force the independent asset lane 
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_v1",
         .kind = .asset,
         .field = "body",
@@ -83309,7 +81129,7 @@ test "db blocked dense embedding lane does not force the independent asset lane 
     var assets_cursor_seen = false;
     attempts = 0;
     while (attempts < slow_test_wait_attempts) : (attempts += 1) {
-        if (try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.assets")) |cursor| {
+        if (try enrichment_state.loadReplayCursor(alloc, db.enrichment.runtime.?.store, "generated.assets")) |cursor| {
             var owned = cursor;
             owned.deinit(alloc);
             assets_cursor_seen = true;
@@ -83372,7 +81192,7 @@ test "cross-quantum lane pipelining publishes a fast dense quantum while a slowe
     // one-way latch).
     defer slow_asset.allow();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_v1",
         .kind = .asset,
         .field = "body",
@@ -83426,7 +81246,7 @@ test "cross-quantum lane pipelining publishes a fast dense quantum while a slowe
     var dense_cursor_seen = false;
     attempts = 0;
     while (attempts < default_test_wait_attempts) : (attempts += 1) {
-        if (try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.dense")) |cursor| {
+        if (try enrichment_state.loadReplayCursor(alloc, db.enrichment.runtime.?.store, "generated.dense")) |cursor| {
             var owned = cursor;
             owned.deinit(alloc);
             dense_cursor_seen = true;
@@ -83500,7 +81320,7 @@ test "synchronous window checkpoints never advance the asset cursor past queued 
     defer db.close();
     defer slow_asset.allow();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_v1",
         .kind = .asset,
         .field = "body",
@@ -83510,7 +81330,7 @@ test "synchronous window checkpoints never advance the asset cursor past queued 
     // A copy asset is synchronous scanner work planned after the extractor:
     // it publishes through the shared window, never through an execution
     // lane, so it is what fills the window at the end of each group.
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "title_copy_v1",
         .kind = .asset,
         .field = "title",
@@ -83550,7 +81370,7 @@ test "synchronous window checkpoints never advance the asset cursor past queued 
         const copied = try db.core.store.get(alloc, copy_key);
         alloc.free(copied);
     }
-    const dense_cursor = try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.dense");
+    const dense_cursor = try enrichment_state.loadReplayCursor(alloc, db.enrichment.runtime.?.store, "generated.dense");
     try std.testing.expect(dense_cursor != null);
     var owned_dense_cursor = dense_cursor.?;
     owned_dense_cursor.deinit(alloc);
@@ -83560,7 +81380,7 @@ test "synchronous window checkpoints never advance the asset cursor past queued 
     // lane, and now the lane's quantum is in flight. A cursor at doc:c would
     // tell a restart that all three extractions are durable, and the
     // historical mid-scan checkpoint wrote exactly that for both streams.
-    if (try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.assets")) |cursor| {
+    if (try enrichment_state.loadReplayCursor(alloc, db.enrichment.runtime.?.store, "generated.assets")) |cursor| {
         var owned = cursor;
         defer owned.deinit(alloc);
         std.debug.print("unexpected asset cursor while extraction is outstanding: sequence={d} doc_key={s}\n", .{ owned.sequence, owned.doc_key });
@@ -83572,8 +81392,8 @@ test "synchronous window checkpoints never advance the asset cursor past queued 
 
     // The completed pass advanced the applied sequence and retired both
     // stream cursors; every extraction is durable.
-    try std.testing.expect((try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.assets")) == null);
-    try std.testing.expect((try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.dense")) == null);
+    try std.testing.expect((try enrichment_state.loadReplayCursor(alloc, db.enrichment.runtime.?.store, "generated.assets")) == null);
+    try std.testing.expect((try enrichment_state.loadReplayCursor(alloc, db.enrichment.runtime.?.store, "generated.dense")) == null);
     for ([_][]const u8{ "doc:a", "doc:b", "doc:c" }) |doc_key| {
         const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", "summary_v1");
         defer alloc.free(artifact_key);
@@ -83624,7 +81444,7 @@ test "cross-quantum dispatch clones queued requests so later caller reuse cannot
     // harmless (it is a one-way latch).
     defer slow_asset.allow();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_v1",
         .kind = .asset,
         .field = "body",
@@ -83682,7 +81502,7 @@ test "cross-quantum dispatch clones queued requests so later caller reuse cannot
     const unblock_thread = try std.Thread.spawn(.{}, Unblocker.run, .{&slow_asset});
     defer unblock_thread.join();
 
-    try db.runEnrichmentUntil(sequence);
+    try db.enrichment.runUntil(sequence);
 
     try std.testing.expectEqual(@as(usize, 1), slow_asset.calls.load(.acquire));
     try std.testing.expect(slow_asset.finished.load(.acquire));
@@ -84150,7 +81970,7 @@ test "retired repair cleanup resumes marker retirement and removes corrupt sidec
             sequenced.sequence = 20_000 + @as(u64, @intCast(i));
             try db.recordArtifactRepairIssue(alloc, sequenced);
         }
-        try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+        try db.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle();
         // The primary key remains trustworthy even when the payload does not.
         // Cleanup must use it to drain marker, generation, secondary, and
         // single-flight sidecars without following corrupt value fields.
@@ -84198,7 +82018,7 @@ test "retired repair cleanup resumes marker retirement and removes corrupt sidec
     defer docstore_mod.DocStore.freeResults(alloc, remaining_markers);
     try std.testing.expectEqual(@as(usize, 0), remaining_markers.len);
 
-    try reopened.runArtifactRepairMetadataMaintenanceUntilIdle();
+    try reopened.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle();
     try std.testing.expect(try reopened.artifactRepairSummaryReady(alloc));
 }
 
@@ -84522,7 +82342,7 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
 
     // While the cause persists, a forced retry fails and applies backoff.
     {
-        const result = try db.retryQuarantinedIndexLoads(true);
+        const result = try db.maintenance.retryQuarantinedIndexLoads(true);
         try std.testing.expectEqual(@as(usize, 0), result.recovered);
         try std.testing.expectEqual(@as(usize, 1), result.remaining);
     }
@@ -84531,7 +82351,7 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     // recover if it attempted).
     index_manager_mod.test_abort_text_backfill_after_batches = null;
     {
-        const result = try db.retryQuarantinedIndexLoads(false);
+        const result = try db.maintenance.retryQuarantinedIndexLoads(false);
         try std.testing.expectEqual(@as(usize, 0), result.recovered);
         try std.testing.expectEqual(@as(usize, 1), result.remaining);
     }
@@ -84547,7 +82367,7 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
         completed: std.atomic.Value(bool) = .init(false),
 
         fn run(state: *@This()) void {
-            state.result = state.db.retryQuarantinedIndexLoads(true) catch |err| {
+            state.result = state.db.maintenance.retryQuarantinedIndexLoads(true) catch |err| {
                 state.err = err;
                 state.completed.store(true, .release);
                 return;
@@ -84622,7 +82442,7 @@ test "db targeted quarantine retry does not open unrelated failed indexes" {
     try std.testing.expect(db.core.index_manager.loadFailure("ft_unrelated") != null);
 
     index_manager_mod.test_inject_index_open_error = null;
-    const result = try db.retryQuarantinedIndexLoad("ft_target", true);
+    const result = try db.maintenance.retryQuarantinedIndexLoad("ft_target", true);
     try std.testing.expectEqual(@as(usize, 1), result.recovered);
     try std.testing.expectEqual(@as(usize, 1), result.remaining);
     try std.testing.expectEqual(.recovered, result.target_outcome);
@@ -84669,7 +82489,7 @@ test "db read-only open propagates transient index load errors instead of quaran
     try std.testing.expectEqualStrings("FileNotFound", recorded);
 
     index_manager_mod.test_inject_index_open_error = null;
-    const result = try db.retryQuarantinedIndexLoads(true);
+    const result = try db.maintenance.retryQuarantinedIndexLoads(true);
     try std.testing.expectEqual(@as(usize, 1), result.recovered);
     try std.testing.expectEqual(@as(usize, 0), result.remaining);
     try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") == null);
@@ -84875,8 +82695,8 @@ test "db dense repair reprocesses corrupt managed source before rebuilding" {
     try std.testing.expect(incomplete.attempted);
     try std.testing.expect(incomplete.deferred);
     try std.testing.expect(!incomplete.repaired);
-    try std.testing.expect(db.enrichment_runtime != null);
-    try std.testing.expect(!db.enrichment_runtime.?.isStarted());
+    try std.testing.expect(db.enrichment.runtime != null);
+    try std.testing.expect(!db.enrichment.runtime.?.isStarted());
 
     // The bounded workerless repair owner drains the re-armed producer
     // synchronously before yielding its turn.
@@ -85879,7 +83699,7 @@ test "db generated enrichment recovery skips empty fields and advances coverage 
             .ttl_cleanup = .{ .enabled = false },
         });
         defer db.close();
-        try db.addEnrichment(.{ .name = "body_chunks", .kind = .chunk, .field = "body", .chunk_size = 512 });
+        try db.enrichment.addEnrichment(.{ .name = "body_chunks", .kind = .chunk, .field = "body", .chunk_size = 512 });
         try db.addIndex(.{ .name = "chunk_text", .kind = .full_text, .config_json = "{\"chunk_name\":\"body_chunks\"}" });
         for (indexes) |index| try db.addIndex(index);
         try db.batch(.{
@@ -86556,7 +84376,7 @@ test "db leased enrichment worker materializes chunk artifacts" {
         .sync_level = .write,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
@@ -86616,7 +84436,7 @@ test "db leased enrichment worker keeps chunk storage ephemeral when store_chunk
         .sync_level = .write,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
@@ -86647,7 +84467,7 @@ test "db leased enrichment worker keeps chunk storage ephemeral when store_chunk
         },
         .sync_level = .write,
     });
-    try db.enrichment_runtime.?.waitForApplied(2);
+    try db.enrichment.runtime.?.waitForApplied(2);
     try waitForDerivedReplayTarget(&db);
 
     const replayed_artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
@@ -86702,7 +84522,7 @@ test "db leased enrichment worker persists chunk storage when full text consumes
         .sync_level = .write,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
@@ -86954,7 +84774,7 @@ test "db leased enrichment worker persists chunk storage when chunker enables fu
         .sync_level = .write,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
@@ -87265,7 +85085,7 @@ test "db full_text sync level does not precompute template chunk full text routi
 
     try std.testing.expectEqual(@as(u32, 0), result.total_hits);
 
-    try db.runEnrichmentUntil(1);
+    try db.enrichment.runUntil(1);
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "semantic_template_chunked_idx_chunks");
     defer alloc.free(chunk_prefix);
@@ -87560,7 +85380,7 @@ test "db leased enrichment worker materializes chunk artifacts with durable lsm 
         .sync_level = .write,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
@@ -87626,7 +85446,7 @@ test "db shared embedding enrichment feeds multiple dense indexes" {
         .sync_level = .write,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
 
     const shared_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "shared_dense_v1");
@@ -87684,15 +85504,15 @@ test "db shared enrichment failure parks repair debt for every consumer" {
         .sync_level = .write,
     });
     const sequence = db.core.nextEnrichmentSequence();
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(sequence));
-    const retrying = db.enrichment_runtime.?.stats();
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.enrichment.runUntil(sequence));
+    const retrying = db.enrichment.runtime.?.stats();
     try std.testing.expect(retrying.retrying);
     // Request-owned provider retries are tracked by durable request identity;
     // they must not consume the unrelated table-wide pipeline retry budget.
     try std.testing.expectEqual(@as(u32, 0), retrying.consecutive_retry_count);
     try std.testing.expectEqual(@as(u64, 1), retrying.retryable_error_count);
     sleepNs(550 * std.time.ns_per_ms);
-    try db.runEnrichmentUntil(sequence);
+    try db.enrichment.runUntil(sequence);
 
     for ([_][]const u8{ "dv_a", "dv_b" }) |index_name| {
         const issues = try db.listArtifactRepairIssues(alloc, .embedding, index_name, 0);
@@ -87706,8 +85526,8 @@ test "db shared enrichment failure parks repair debt for every consumer" {
         try std.testing.expectEqual(@as(u64, 0), issues[0].attempts);
         try std.testing.expectEqualStrings("", issues[0].last_error);
     }
-    try std.testing.expect(db.enrichment_runtime.?.indexHasIsolatedFailure("dv_a"));
-    try std.testing.expect(db.enrichment_runtime.?.indexHasIsolatedFailure("dv_b"));
+    try std.testing.expect(db.enrichment.runtime.?.indexHasIsolatedFailure("dv_a"));
+    try std.testing.expect(db.enrichment.runtime.?.indexHasIsolatedFailure("dv_b"));
 
     // Model legacy debt discovered before generation failures were added to
     // the repair ledger. A forced generation rebuild may complete its work,
@@ -87782,21 +85602,21 @@ test "db upstream asset failure dominates downstream coverage in one replay sequ
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_v1",
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
         .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_chunks_v1",
         .kind = .chunk,
         .field = "value",
         .source_artifact_name = "summary_v1",
         .chunk_size = 8,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "summary_dense_v1",
         .kind = .embedding,
         .field = "value",
@@ -87813,7 +85633,7 @@ test "db upstream asset failure dominates downstream coverage in one replay sequ
         .sync_level = .write,
     });
     const sequence = db.core.nextEnrichmentSequence();
-    try db.runEnrichmentUntil(sequence);
+    try db.enrichment.runUntil(sequence);
 
     const generation = db.core.index_manager.coverageGenerationForIndex("semantic") orelse return error.TestUnexpectedResult;
     const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "semantic", generation, "doc:a");
@@ -87905,12 +85725,12 @@ test "db foreign inference provider failure releases enrichment waiter as termin
 
     try std.testing.expectError(
         error.EnrichmentWorkerFailed,
-        db.enrichment_runtime.?.waitForApplied(sequence),
+        db.enrichment.runtime.?.waitForApplied(sequence),
     );
 
     try std.testing.expectError(error.EnrichmentWorkerFailed, db.runUntilIdle());
 
-    const stats = db.enrichment_runtime.?.stats();
+    const stats = db.enrichment.runtime.?.stats();
     try std.testing.expectEqual(sequence, stats.applied_sequence);
     try std.testing.expectEqual(@as(usize, 1), failing.calls);
     try std.testing.expectEqual(@as(u64, 0), stats.retryable_error_count);
@@ -87923,17 +85743,17 @@ test "db foreign inference provider failure releases enrichment waiter as termin
     try std.testing.expectEqualStrings("InferenceProviderFailure", issues[0].generation_error);
     try std.testing.expectEqual(@as(u64, 1), issues[0].generation_attempts);
     try std.testing.expect(try enrichmentRequestFailureRangePending(
-        db.enrichment_append_context.?,
+        db.enrichment.append_context.?,
         sequence - 1,
         sequence,
     ));
     try std.testing.expect(try enrichmentRequestFailureRangePending(
-        db.enrichment_append_context.?,
+        db.enrichment.append_context.?,
         sequence + 10,
         sequence,
     ));
     try std.testing.expect(!try enrichmentRequestFailureRangePending(
-        db.enrichment_append_context.?,
+        db.enrichment.append_context.?,
         sequence,
         sequence + 1,
     ));
@@ -87966,10 +85786,10 @@ test "db foreign inference provider failure releases enrichment waiter as termin
     defer reopened.close();
     try std.testing.expectError(
         error.EnrichmentWorkerFailed,
-        reopened.enrichment_runtime.?.waitForApplied(sequence),
+        reopened.enrichment.runtime.?.waitForApplied(sequence),
     );
     try std.testing.expectEqual(@as(usize, 1), failing.calls);
-    try std.testing.expectEqual(sequence, reopened.enrichment_runtime.?.stats().applied_sequence);
+    try std.testing.expectEqual(sequence, reopened.enrichment.runtime.?.stats().applied_sequence);
 }
 
 test "db terminal enrichment sequence index survives coalescing and retires with repair debt" {
@@ -88016,7 +85836,7 @@ test "db terminal enrichment sequence index survives coalescing and retires with
     try std.testing.expectEqual(@as(usize, 1), issues.len);
     try std.testing.expectEqual(@as(u64, 20), issues[0].sequence);
 
-    const append_ctx = db.enrichment_append_context.?;
+    const append_ctx = db.enrichment.append_context.?;
     try std.testing.expect(try enrichmentRequestFailureRangePending(append_ctx, 9, 10));
     try std.testing.expect(!try enrichmentRequestFailureRangePending(append_ctx, 10, 15));
     try std.testing.expect(try enrichmentRequestFailureRangePending(append_ctx, 15, 20));
@@ -88160,7 +85980,7 @@ test "db terminal enrichment marker cleanup isolates corrupt cross issue reverse
     defer alloc.free(reverse_value);
     try std.testing.expectEqualStrings(marker_b.sequence_key, reverse_value);
     try std.testing.expect(try enrichmentRequestFailureRangePending(
-        db.enrichment_append_context.?,
+        db.enrichment.append_context.?,
         issue_b.sequence - 1,
         issue_b.sequence,
     ));
@@ -88244,8 +86064,8 @@ test "db terminal enrichment marker retirement is bounded and fences stale gener
     const after_recreate = try db.core.store.scanPrefix(alloc, marker_root);
     defer docstore_mod.DocStore.freeResults(alloc, after_recreate);
     try std.testing.expectEqual(@as(usize, 3), after_recreate.len);
-    try std.testing.expect(!try enrichmentRequestFailureRangePending(db.enrichment_append_context.?, 128, 129));
-    try std.testing.expect(try enrichmentRequestFailureRangePending(db.enrichment_append_context.?, 0, 1));
+    try std.testing.expect(!try enrichmentRequestFailureRangePending(db.enrichment.append_context.?, 128, 129));
+    try std.testing.expect(try enrichmentRequestFailureRangePending(db.enrichment.append_context.?, 0, 1));
 }
 
 test "db terminal enrichment markers do not resurrect across rollback recreation" {
@@ -88289,7 +86109,7 @@ test "db terminal enrichment markers do not resurrect across rollback recreation
     issue.sequence = 11;
     try db.saveArtifactRepairIssueWithSummary(alloc, issue_key, issue, true, &.{}, &.{});
 
-    try std.testing.expect(!try enrichmentRequestFailureRangePending(db.enrichment_append_context.?, 6, 7));
+    try std.testing.expect(!try enrichmentRequestFailureRangePending(db.enrichment.append_context.?, 6, 7));
     const marker_root = try internal_keys.enrichmentTerminalFailureSequenceRootPrefixAlloc(alloc);
     defer alloc.free(marker_root);
     const after_lazy_cleanup = try db.core.store.scanPrefix(alloc, marker_root);
@@ -88307,8 +86127,8 @@ test "db terminal enrichment markers do not resurrect across rollback recreation
     issue.sequence = 14;
     try db.recordArtifactRepairIssue(alloc, issue);
 
-    try std.testing.expect(!try enrichmentRequestFailureRangePending(db.enrichment_append_context.?, 11, 12));
-    try std.testing.expect(try enrichmentRequestFailureRangePending(db.enrichment_append_context.?, 13, 14));
+    try std.testing.expect(!try enrichmentRequestFailureRangePending(db.enrichment.append_context.?, 11, 12));
+    try std.testing.expect(try enrichmentRequestFailureRangePending(db.enrichment.append_context.?, 13, 14));
     const remaining = try db.core.store.scanPrefix(alloc, marker_root);
     defer docstore_mod.DocStore.freeResults(alloc, remaining);
     try std.testing.expectEqual(@as(usize, 1), remaining.len);
@@ -88354,11 +86174,11 @@ test "db enrichment retry makes monotonic progress across provider batches" {
         db.runUntilIdleWithoutWaitingForEnrichmentRetries(),
     );
     sleepNs(550 * std.time.ns_per_ms);
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(sequence));
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.enrichment.runUntil(sequence));
     sleepNs(550 * std.time.ns_per_ms);
-    try db.runEnrichmentUntil(sequence);
+    try db.enrichment.runUntil(sequence);
 
-    try std.testing.expectEqual(sequence, db.enrichment_runtime.?.stats().applied_sequence);
+    try std.testing.expectEqual(sequence, db.enrichment.runtime.?.stats().applied_sequence);
     const issues = try db.listArtifactRepairIssues(alloc, .embedding, "semantic", 0);
     defer types.freeArtifactRepairIssues(alloc, issues);
     try std.testing.expectEqual(@as(usize, 2), issues.len);
@@ -88397,9 +86217,9 @@ test "db shared enrichment repair regenerates one physical artifact once" {
         .sync_level = .write,
     });
     const sequence = db.core.nextEnrichmentSequence();
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(sequence));
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.enrichment.runUntil(sequence));
     sleepNs(550 * std.time.ns_per_ms);
-    try db.runEnrichmentUntil(sequence);
+    try db.enrichment.runUntil(sequence);
 
     const before = gated.snapshot();
     gated.allowAll();
@@ -88478,9 +86298,9 @@ test "db chunked enrichment failure repair completes from request coverage" {
         .sync_level = .write,
     });
     const sequence = db.core.nextEnrichmentSequence();
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(sequence));
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.enrichment.runUntil(sequence));
     sleepNs(550 * std.time.ns_per_ms);
-    try db.runEnrichmentUntil(sequence);
+    try db.enrichment.runUntil(sequence);
 
     const parked = try db.listArtifactRepairIssues(alloc, .embedding, "chunked_dense", 1);
     defer types.freeArtifactRepairIssues(alloc, parked);
@@ -88517,7 +86337,7 @@ test "db asset repair reports a missing source document precisely" {
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtime_workers = false });
     defer db.close();
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_copy_v1",
         .kind = .asset,
         .field = "body",
@@ -88675,7 +86495,7 @@ test "db shared embedding enrichment feeds multiple dense indexes with durable l
         .sync_level = .write,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
 
     const shared_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "shared_dense_v1");
@@ -88721,14 +86541,14 @@ test "db addEnrichment supports explicit shared definitions" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
         .field = "body",
         .chunk_size = 8,
         .chunk_overlap = 2,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "chunk_dense_v1",
         .kind = .embedding,
         .field = "body",
@@ -88749,7 +86569,7 @@ test "db addEnrichment supports explicit shared definitions" {
         .sync_level = .write,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
 
     const query_vec = try validating.deterministic.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
@@ -88772,21 +86592,21 @@ test "db addEnrichment supports explicit shared definitions" {
     try std.testing.expectEqualStrings("body_chunks_v1", chunk_ref.name);
     try std.testing.expect(chunk_ref.chunk_id != null);
 
-    const chunk = (try db.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
+    const chunk = (try db.enrichment.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
     defer {
         var tmp = chunk;
         tmp.deinit(alloc);
     }
     try std.testing.expectEqualStrings("body", chunk.field);
 
-    const embedding = (try db.getEnrichment(alloc, .embedding, "chunk_dense_v1")) orelse return error.TestUnexpectedResult;
+    const embedding = (try db.enrichment.getEnrichment(alloc, .embedding, "chunk_dense_v1")) orelse return error.TestUnexpectedResult;
     defer {
         var tmp = embedding;
         tmp.deinit(alloc);
     }
     try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
 
-    const enrichments = try db.listEnrichments(alloc);
+    const enrichments = try db.enrichment.listEnrichments(alloc);
     defer types.freeEnrichmentConfigs(alloc, enrichments);
     try std.testing.expectEqual(@as(usize, 2), enrichments.len);
 }
@@ -88829,7 +86649,7 @@ test "db preflight classifies canonical artifact full-text sources consistently"
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
         .field = "body",
@@ -88866,13 +86686,13 @@ test "artifact text replay deletes only keys owned by its source projection" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
         .field = "body",
         .chunk_size = 64,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "notes_chunks_v1",
         .kind = .chunk,
         .field = "notes",
@@ -88995,7 +86815,7 @@ test "db chunk deletion replay targets only matching vector sources" {
     for ([_][]const u8{ "body", "notes" }) |source| {
         const name = try std.fmt.allocPrint(alloc, "{s}_chunks", .{source});
         defer alloc.free(name);
-        try db.addEnrichment(.{ .name = name, .kind = .chunk, .field = source, .chunk_size = 64 });
+        try db.enrichment.addEnrichment(.{ .name = name, .kind = .chunk, .field = source, .chunk_size = 64 });
     }
     for ([_]types.IndexKind{ .dense_vector, .sparse_vector }) |kind| {
         for ([_][]const u8{ "body", "notes" }) |source| {
@@ -89003,7 +86823,7 @@ test "db chunk deletion replay targets only matching vector sources" {
             defer alloc.free(name);
             const chunk_name = try std.fmt.allocPrint(alloc, "{s}_chunks", .{source});
             defer alloc.free(chunk_name);
-            try db.addEnrichment(.{
+            try db.enrichment.addEnrichment(.{
                 .name = name,
                 .kind = .embedding,
                 .field = source,
@@ -89628,7 +87448,7 @@ test "db deleteEnrichment rejects referenced definitions" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
         .field = "body",
@@ -89641,7 +87461,7 @@ test "db deleteEnrichment rejects referenced definitions" {
         .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
     });
 
-    try std.testing.expectError(error.EnrichmentInUse, db.deleteEnrichment(.chunk, "body_chunks_v1"));
+    try std.testing.expectError(error.EnrichmentInUse, db.enrichment.deleteEnrichment(.chunk, "body_chunks_v1"));
 }
 
 test "db deleteEnrichment rejects asset referenced by chunk enrichment" {
@@ -89655,13 +87475,13 @@ test "db deleteEnrichment rejects asset referenced by chunk enrichment" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .source_artifact_name = "document_units_v1",
@@ -89669,7 +87489,7 @@ test "db deleteEnrichment rejects asset referenced by chunk enrichment" {
         .chunk_size = 512,
     });
 
-    try std.testing.expectError(error.EnrichmentInUse, db.deleteEnrichment(.asset, "document_units_v1"));
+    try std.testing.expectError(error.EnrichmentInUse, db.enrichment.deleteEnrichment(.asset, "document_units_v1"));
 }
 
 test "db upsertEnrichment rejects replacing referenced asset with chunk" {
@@ -89683,13 +87503,13 @@ test "db upsertEnrichment rejects replacing referenced asset with chunk" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .source_artifact_name = "document_units_v1",
@@ -89697,7 +87517,7 @@ test "db upsertEnrichment rejects replacing referenced asset with chunk" {
         .chunk_size = 512,
     });
 
-    try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(.{
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.enrichment.upsertEnrichment(.{
         .name = "document_units_v1",
         .kind = .chunk,
         .source_artifact_name = "document_units_v1",
@@ -89705,7 +87525,7 @@ test "db upsertEnrichment rejects replacing referenced asset with chunk" {
         .chunk_size = 512,
     }));
 
-    var asset = (try db.getEnrichment(alloc, .asset, "document_units_v1")).?;
+    var asset = (try db.enrichment.getEnrichment(alloc, .asset, "document_units_v1")).?;
     defer asset.deinit(alloc);
     try std.testing.expectEqual(types.EnrichmentKind.asset, asset.kind);
 }
@@ -89721,13 +87541,13 @@ test "db upsertEnrichment rejects replacing referenced chunk with asset" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "body",
         .chunk_size = 512,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_dense_v1",
         .kind = .embedding,
         .source_artifact_name = "document_chunks_v1",
@@ -89735,14 +87555,14 @@ test "db upsertEnrichment rejects replacing referenced chunk with asset" {
         .expected_dims = 3,
     });
 
-    try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(.{
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.enrichment.upsertEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
     }));
 
-    var chunk = (try db.getEnrichment(alloc, .chunk, "document_chunks_v1")).?;
+    var chunk = (try db.enrichment.getEnrichment(alloc, .chunk, "document_chunks_v1")).?;
     defer chunk.deinit(alloc);
     try std.testing.expectEqual(types.EnrichmentKind.chunk, chunk.kind);
 }
@@ -89758,7 +87578,7 @@ test "db upsertEnrichment rejects replacing indexed chunk with asset" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
         .field = "body",
@@ -89770,14 +87590,14 @@ test "db upsertEnrichment rejects replacing indexed chunk with asset" {
         .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
     });
 
-    try std.testing.expectError(error.InvalidEnrichmentConfig, db.upsertEnrichment(.{
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.enrichment.upsertEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
     }));
 
-    var chunk = (try db.getEnrichment(alloc, .chunk, "body_chunks_v1")).?;
+    var chunk = (try db.enrichment.getEnrichment(alloc, .chunk, "body_chunks_v1")).?;
     defer chunk.deinit(alloc);
     try std.testing.expectEqual(types.EnrichmentKind.chunk, chunk.kind);
 }
@@ -89793,13 +87613,13 @@ test "db addEnrichment rejects duplicate names across enrichment kinds" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_artifact_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
     });
-    try std.testing.expectError(error.EnrichmentAlreadyExists, db.addEnrichment(.{
+    try std.testing.expectError(error.EnrichmentAlreadyExists, db.enrichment.addEnrichment(.{
         .name = "document_artifact_v1",
         .kind = .chunk,
         .field = "body",
@@ -89823,7 +87643,7 @@ test "db addEnrichment allows unrelated definitions after field sparse index" {
         .kind = .sparse_vector,
         .config_json = "{\"field\":\"sparse\"}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
@@ -89847,7 +87667,7 @@ test "db enrichment artifact consumer resolution includes graph and default full
         .kind = .full_text,
         .config_json = "{}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "relations_v1",
         .kind = .asset,
         .field = "body",
@@ -89891,7 +87711,7 @@ test "db asset enrichment full_text_index feeds default full text index after fu
         .kind = .full_text,
         .config_json = "{}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "image_caption_v1",
         .kind = .asset,
         .field = "caption_json",
@@ -89981,7 +87801,7 @@ test "db dense index can reference existing whole-doc embedding enrichment" {
         .sync_level = .write,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
 
     const query_vec = try deterministic.interface().embedDense(alloc, "", "reference embedding text", 3);
@@ -90031,7 +87851,7 @@ test "db dense index can reference existing chunk embedding enrichment" {
         .sync_level = .write,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
     _ = try waitForAppliedSequenceAdvance(alloc, &db, "dv_ref", 0);
 
@@ -90075,7 +87895,7 @@ test "db persists shorthand chunk enrichment catalog across reopen" {
             .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"body_dense_v1\"}}",
         });
 
-        const enrichment = (try db.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
+        const enrichment = (try db.enrichment.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
         defer {
             var tmp = enrichment;
             tmp.deinit(alloc);
@@ -90084,7 +87904,7 @@ test "db persists shorthand chunk enrichment catalog across reopen" {
         try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
         try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
 
-        const embedding = (try db.getEnrichment(alloc, .embedding, "body_dense_v1")) orelse return error.TestUnexpectedResult;
+        const embedding = (try db.enrichment.getEnrichment(alloc, .embedding, "body_dense_v1")) orelse return error.TestUnexpectedResult;
         defer {
             var tmp = embedding;
             tmp.deinit(alloc);
@@ -90097,7 +87917,7 @@ test "db persists shorthand chunk enrichment catalog across reopen" {
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
 
-    const enrichment = (try reopened.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
+    const enrichment = (try reopened.enrichment.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
     defer {
         var tmp = enrichment;
         tmp.deinit(alloc);
@@ -90106,7 +87926,7 @@ test "db persists shorthand chunk enrichment catalog across reopen" {
     try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
     try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
 
-    const embedding = (try reopened.getEnrichment(alloc, .embedding, "body_dense_v1")) orelse return error.TestUnexpectedResult;
+    const embedding = (try reopened.enrichment.getEnrichment(alloc, .embedding, "body_dense_v1")) orelse return error.TestUnexpectedResult;
     defer {
         var tmp = embedding;
         tmp.deinit(alloc);
@@ -90138,7 +87958,7 @@ test "db persists shorthand chunk enrichment catalog across reopen with durable 
             .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"body_dense_v1\"}}",
         });
 
-        const enrichment = (try db.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
+        const enrichment = (try db.enrichment.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
         defer {
             var tmp = enrichment;
             tmp.deinit(alloc);
@@ -90147,7 +87967,7 @@ test "db persists shorthand chunk enrichment catalog across reopen with durable 
         try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
         try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
 
-        const embedding = (try db.getEnrichment(alloc, .embedding, "body_dense_v1")) orelse return error.TestUnexpectedResult;
+        const embedding = (try db.enrichment.getEnrichment(alloc, .embedding, "body_dense_v1")) orelse return error.TestUnexpectedResult;
         defer {
             var tmp = embedding;
             tmp.deinit(alloc);
@@ -90162,7 +87982,7 @@ test "db persists shorthand chunk enrichment catalog across reopen with durable 
     });
     defer reopened.close();
 
-    const enrichment = (try reopened.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
+    const enrichment = (try reopened.enrichment.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
     defer {
         var tmp = enrichment;
         tmp.deinit(alloc);
@@ -90171,7 +87991,7 @@ test "db persists shorthand chunk enrichment catalog across reopen with durable 
     try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
     try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
 
-    const embedding = (try reopened.getEnrichment(alloc, .embedding, "body_dense_v1")) orelse return error.TestUnexpectedResult;
+    const embedding = (try reopened.enrichment.getEnrichment(alloc, .embedding, "body_dense_v1")) orelse return error.TestUnexpectedResult;
     defer {
         var tmp = embedding;
         tmp.deinit(alloc);
@@ -90193,14 +88013,14 @@ test "db listEnrichments returns explicit definitions across reopen" {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "body_chunks_v1",
             .kind = .chunk,
             .field = "body",
             .chunk_size = 8,
             .chunk_overlap = 2,
         });
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "body_dense_v1",
             .kind = .embedding,
             .field = "body",
@@ -90212,7 +88032,7 @@ test "db listEnrichments returns explicit definitions across reopen" {
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
 
-    const enrichments = try reopened.listEnrichments(alloc);
+    const enrichments = try reopened.enrichment.listEnrichments(alloc);
     defer types.freeEnrichmentConfigs(alloc, enrichments);
     try std.testing.expectEqual(@as(usize, 2), enrichments.len);
     try std.testing.expectEqualStrings("body_chunks_v1", enrichments[0].name);
@@ -90237,14 +88057,14 @@ test "db listEnrichments returns explicit definitions across reopen with durable
         });
         defer db.close();
 
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "body_chunks_v1",
             .kind = .chunk,
             .field = "body",
             .chunk_size = 8,
             .chunk_overlap = 2,
         });
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "body_dense_v1",
             .kind = .embedding,
             .field = "body",
@@ -90258,7 +88078,7 @@ test "db listEnrichments returns explicit definitions across reopen with durable
     });
     defer reopened.close();
 
-    const enrichments = try reopened.listEnrichments(alloc);
+    const enrichments = try reopened.enrichment.listEnrichments(alloc);
     defer types.freeEnrichmentConfigs(alloc, enrichments);
     try std.testing.expectEqual(@as(usize, 2), enrichments.len);
     try std.testing.expectEqualStrings("body_chunks_v1", enrichments[0].name);
@@ -90388,7 +88208,7 @@ test "db full-text chunk consumer filters expired parents under ttl" {
         .sync_level = .full_index,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(2);
+    try db.enrichment.runtime.?.waitForApplied(2);
     try waitForDerivedReplayTarget(&db);
 
     var chunk_result = try waitForSearchResult(alloc, &db, .{
@@ -90777,7 +88597,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
         .sync_level = .write,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
@@ -90942,7 +88762,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes with 
         .sync_level = .write,
     });
 
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
@@ -91292,15 +89112,15 @@ test "db restart after provider failure resumes enrichment from retained async r
         // Generated-artifact commits also advance the shared journal tail.
         // Wait for the source obligation admitted by this write, rather than
         // racing an unrelated generated append that enrichment does not own.
-        first_applied_sequence = db.enrichment_runtime.?.stats().target_sequence;
+        first_applied_sequence = db.enrichment.runtime.?.stats().target_sequence;
         try std.testing.expect(first_applied_sequence > 0);
-        try db.enrichment_runtime.?.waitForApplied(first_applied_sequence);
+        try db.enrichment.runtime.?.waitForApplied(first_applied_sequence);
 
         try db.batch(.{
             .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"beta\"}" }},
             .sync_level = .write,
         });
-        failed_target_sequence = db.enrichment_runtime.?.stats().target_sequence;
+        failed_target_sequence = db.enrichment.runtime.?.stats().target_sequence;
         try std.testing.expect(failed_target_sequence > first_applied_sequence);
 
         var attempts: usize = 0;
@@ -91315,7 +89135,7 @@ test "db restart after provider failure resumes enrichment from retained async r
         // deadlock with the deliberately stopped enrichment worker. Calling
         // the truncation boundary directly exercises the worst-case consumer
         // request while the durable enrichment checkpoint still owns the debt.
-        db.enrichment_runtime.?.stop();
+        db.enrichment.runtime.?.stop();
         try truncateReplaySequenceAsync(db.async_context, failed_target_sequence);
 
         const failed_stats = try db.stats(alloc);
@@ -91457,7 +89277,7 @@ test "db async replay truncation retains journal behind generated enrichment" {
     }
     gated.allowAll();
     try db.runUntilIdle();
-    const recovered = db.enrichment_runtime.?.stats();
+    const recovered = db.enrichment.runtime.?.stats();
     try std.testing.expect(recovered.applied_sequence >= target_sequence);
     try std.testing.expectEqual(recovered.target_sequence, recovered.applied_sequence);
     for ([_][]const u8{ "ft_v1", "semantic_idx" }) |index_name| {
@@ -92128,21 +89948,21 @@ test "db read-only open modes reject catalog mutations before side effects" {
         defer readonly.close();
 
         try std.testing.expectError(error.ReadOnly, readonly.deleteIndex("missing_idx"));
-        try std.testing.expectError(error.ReadOnly, readonly.addEnrichment(.{
+        try std.testing.expectError(error.ReadOnly, readonly.enrichment.addEnrichment(.{
             .name = "readonly_asset_v1",
             .kind = .asset,
             .template = "{{url}}",
             .content_type = "application/json",
             .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
         }));
-        try std.testing.expectError(error.ReadOnly, readonly.upsertEnrichment(.{
+        try std.testing.expectError(error.ReadOnly, readonly.enrichment.upsertEnrichment(.{
             .name = "readonly_asset_v1",
             .kind = .asset,
             .template = "{{url}}",
             .content_type = "application/json",
             .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
         }));
-        try std.testing.expectError(error.ReadOnly, readonly.deleteEnrichment(.asset, "readonly_asset_v1"));
+        try std.testing.expectError(error.ReadOnly, readonly.enrichment.deleteEnrichment(.asset, "readonly_asset_v1"));
         try std.testing.expectError(error.ReadOnly, readonly.addResolver(.{
             .name = "readonly_resolver_v1",
             .table = "entities",
@@ -93105,7 +90925,7 @@ test "enrichment worker bounds retries against a durable foreign lease" {
     });
     defer db.close();
 
-    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    const runtime = db.enrichment.runtime orelse return error.TestUnexpectedResult;
     runtime.notifySequence(1);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -94688,7 +92508,7 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
         .enrichment = .{ .enable_without_producers = true },
     });
     defer db.close();
-    const append_ctx = db.enrichment_append_context orelse return error.TestExpectedEnrichmentRuntime;
+    const append_ctx = db.enrichment.append_context orelse return error.TestExpectedEnrichmentRuntime;
 
     const stage_key = "private:pdf-stage:1";
     const final_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:new", "visual_v1");
@@ -96277,7 +94097,7 @@ const PagedGraphMergeTest = struct {
         try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }}, .sync_level = .full_index });
     }
 
-    fn page(db: *DB, rows: []const types.BatchWrite) !void {
+    pub fn page(db: *DB, rows: []const types.BatchWrite) !void {
         try db.batch(.{ .merge_artifacts = rows, .merge_replication = .{
             .transition_id = 1,
             .donor_group_id = 2,
@@ -96308,7 +94128,7 @@ test "db paged merge fences in-flight source reconciliation through primary comm
     var receiver_open = true;
     defer if (receiver_open) receiver.close();
     for ([_]*DB{ &donor, &receiver }) |db| {
-        try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+        try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"},\"sources\":[{\"artifact\":\"relations_v1\"}]}" });
     }
     try donor.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"relations\":{\"type\":\"links\",\"target\":{\"document_id\":\"doc:b\"}}}" }}, .sync_level = .enrichments });
@@ -96491,7 +94311,7 @@ const GraphPrimaryPublicationTest = struct {
 
     pub fn seedWithGeneration(db: *DB, timed: bool, generation: u64) ![]u8 {
         const alloc = std.testing.allocator;
-        try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+        try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
         try db.addIndex(.{ .name = "g", .kind = .graph, .coverage_generation = generation, .config_json = if (timed)
             "{\"ttl\":{\"duration\":\"1h\"},\"max_edges_per_document\":2,\"sources\":[{\"artifact\":\"relations_v1\"}]}"
         else
@@ -96544,8 +94364,8 @@ test "db graph ttl document and relational cleanup retire all graph deadlines" {
         var clock = platform_clock.ManualClock{};
         clock.setRealtimeNs(timestamp + 2 * std.time.ns_per_s);
         try initStoppedTtlRuntimeForTest(&db, .{ .enabled = true, .grace_period_ns = 0, .clock = clock.clock() });
-        try db.ttl_runtime.?.runOnce();
-        try std.testing.expectEqual(@as(u64, 1), db.ttl_runtime.?.stats().deleted_docs);
+        try db.ttl.runtime.?.runOnce();
+        try std.testing.expectEqual(@as(u64, 1), db.ttl.runtime.?.stats().deleted_docs);
         const after = try db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
         defer docstore_mod.DocStore.freeResults(alloc, after);
         try std.testing.expectEqual(@as(usize, 0), after.len);
@@ -96690,7 +94510,7 @@ test "db paged merge late tombstone retires regenerated graph across restart and
     var receiver_open = true;
     defer if (receiver_open) receiver.close();
     for ([_]*DB{ &donor, &receiver }) |db| {
-        try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+        try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"},\"sources\":[{\"artifact\":\"relations_v1\"}]}" });
     }
     const padding = try alloc.alloc(u8, 1024 * 1024);
@@ -96769,7 +94589,7 @@ test "db paged merge contributor accounting survives page order retry and source
                 var receiver = try DB.open(alloc, receiver_tmp.path(), .{ .start_optional_runtimes = false });
                 defer receiver.close();
                 for ([_]*DB{ &donor, &receiver }) |db| {
-                    try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+                    try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
                     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = if (timed) "{\"ttl\":{\"duration\":\"1h\"},\"max_edges_per_document\":1,\"sources\":[{\"artifact\":\"relations_v1\"}]}" else "{\"max_edges_per_document\":1,\"sources\":[{\"artifact\":\"relations_v1\"}]}" });
                 }
                 try donor.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "doc:a", .target = "doc:b", .edge_type = "links", .weight = 4 }}, .sync_level = .full_index });
@@ -99503,14 +97323,14 @@ test "db managed full text admission replays transitive artifact producers" {
         }},
         .sync_level = .write,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
@@ -99675,7 +97495,7 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
         });
         defer db.close();
         try db.batch(.{ .writes = writes, .sync_level = .write });
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "semantic_embedding",
             .kind = .embedding,
             .field = "body",
@@ -99691,9 +97511,9 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
         try std.testing.expect(repair_id != 0);
 
         {
-            const driver = db.enrichment_runtime;
-            db.enrichment_runtime = null;
-            defer db.enrichment_runtime = driver;
+            const driver = db.enrichment.runtime;
+            db.enrichment.runtime = null;
+            defer db.enrichment.runtime = driver;
             const unavailable = try db.indexes.repair.advanceIntent(alloc, repair_id, .{ .source_replay_only = true });
             try std.testing.expect(!unavailable.attempted and !unavailable.repaired);
             var retained = try db.indexes.repair.loadEntryById(alloc, repair_id);
@@ -99746,7 +97566,7 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
     });
     defer reopened.close();
     try std.testing.expect(try DB.independentMaintenanceRun(&reopened, .repair));
-    try std.testing.expect(reopened.local_source_recovery_pending);
+    try std.testing.expect(reopened.maintenance.local_source.recovery_pending);
     var seeded = try reopened.indexes.repair.loadEntryById(alloc, repair_id);
     defer seeded.deinit(alloc);
     try std.testing.expect(seeded.intent.source_replay_resume_key == null);
@@ -100268,7 +98088,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
     }
     try std.testing.expect(!saw_partial_repair_degraded);
     try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
-    try db.failIfIndexQuarantined(cfg.name);
+    try db.maintenance.failIfIndexQuarantined(cfg.name);
 
     // The next producer batch can publish its artifact target before the HBC
     // reaches the matching visibility boundary. Reproduce that short window:
@@ -100289,7 +98109,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
         if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
         try std.testing.expect(index_stats.index_repair_active_generation_serviceable);
     }
-    try db.failIfIndexQuarantined(cfg.name);
+    try db.maintenance.failIfIndexQuarantined(cfg.name);
 
     // Model a newer live count before its next checkpoint. Native generations
     // reject direct HBC writes, so change only the published stats observation.
@@ -100685,9 +98505,9 @@ test "db progressive managed admission serves a checkpointed partial generation"
         // A producer runtime normally supplies another deferral edge after a
         // valid audit. Remove it for this one synchronous turn so stale audit
         // authority would observably fall through into shadow construction.
-        const saved_enrichment_runtime = db.enrichment_runtime;
-        db.enrichment_runtime = null;
-        defer db.enrichment_runtime = saved_enrichment_runtime;
+        const saved_enrichment_runtime = db.enrichment.runtime;
+        db.enrichment.runtime = null;
+        defer db.enrichment.runtime = saved_enrichment_runtime;
         break :blk try db.indexes.repair.advanceScheduledIntent(
             alloc,
             ownership_audit.repair_id,
@@ -100707,7 +98527,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
     // Keep a producer fence outstanding while the index cursor is already
     // at that replay boundary. An exact audit consumes its token and rearms
     // convergence without replacing the certified partial generation.
-    const pending_enrichment = (db.enrichment_runtime orelse return error.TestUnexpectedResult).stats();
+    const pending_enrichment = (db.enrichment.runtime orelse return error.TestUnexpectedResult).stats();
     try std.testing.expect(pending_enrichment.applied_sequence < pending_enrichment.target_sequence);
     const producer_fence = pending_enrichment.target_sequence;
     var producer_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
@@ -100745,9 +98565,9 @@ test "db progressive managed admission serves a checkpointed partial generation"
     const exact_attempt = blk: {
         // An expired audit must retain a certified partial generation even
         // without the shared producer runtime supplying a second wait fence.
-        const saved_enrichment_runtime = db.enrichment_runtime;
-        db.enrichment_runtime = null;
-        defer db.enrichment_runtime = saved_enrichment_runtime;
+        const saved_enrichment_runtime = db.enrichment.runtime;
+        db.enrichment.runtime = null;
+        defer db.enrichment.runtime = saved_enrichment_runtime;
         break :blk try db.indexes.repair.advanceScheduledIntent(
             alloc,
             exact_audit.repair_id,
@@ -100819,7 +98639,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
         try std.testing.expect(!(try entry.index.postingBacklogStats()).hasMaintenanceDebt());
     }
     try std.testing.expect(try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
-    const shared_enrichment = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    const shared_enrichment = db.enrichment.runtime orelse return error.TestUnexpectedResult;
     const enrichment_before_unrelated_work = shared_enrichment.stats();
     shared_enrichment.notifySequence(enrichment_before_unrelated_work.applied_sequence + 1);
     const enrichment_with_unrelated_work = shared_enrichment.stats();
@@ -100896,7 +98716,7 @@ test "db progressive managed sparse admission serves a checkpointed partial gene
     defer repair.deinit(alloc);
     try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
     try std.testing.expect(!try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
-    try db.failIfIndexQuarantined(cfg.name);
+    try db.maintenance.failIfIndexQuarantined(cfg.name);
 
     var partial = try db.search(alloc, .{
         .index_name = cfg.name,
@@ -100995,7 +98815,7 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
         try std.testing.expect(!resumed.terminal);
         try std.testing.expect(resumed.repaired);
         try std.testing.expect(!try db.indexes.repair.hasPendingIntents(alloc));
-        try db.failIfIndexQuarantined(cfg.name);
+        try db.maintenance.failIfIndexQuarantined(cfg.name);
         var result = try db.search(alloc, .{
             .index_name = cfg.name,
             .query = .{ .dense_knn = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 } },
@@ -101036,7 +98856,7 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
         // worker has finished, bypassing only the earlier scheduler probe.
         var ready_stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, ready_stats);
-        try db.failIfIndexQuarantined(cfg.name);
+        try db.maintenance.failIfIndexQuarantined(cfg.name);
         try std.testing.expect(try db.indexes.repair.beginLease(cfg.name));
         defer db.indexes.repair.endLease(cfg.name);
         const repair = try db.repairIndexIssuesWithRequest(alloc, .{
@@ -101047,7 +98867,7 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
         try std.testing.expectEqual(@as(u64, 0), repair.indexes_rebuilt);
         try std.testing.expectEqual(@as(u64, 1), repair.repaired);
         try std.testing.expect(!try db.indexes.repair.hasPendingIntents(alloc));
-        try db.failIfIndexQuarantined(cfg.name);
+        try db.maintenance.failIfIndexQuarantined(cfg.name);
         try std.testing.expect(db.overlayRuntimeStatusBestEffort(alloc, &ready_stats));
         for (ready_stats.indexes) |item| {
             if (!std.mem.eql(u8, item.name, cfg.name)) continue;
@@ -101155,7 +98975,7 @@ test "producer readiness local receipt migration retires only after source and c
         .enrichment = .{ .enable_without_producers = true },
     });
     defer db.close();
-    try db.addEnrichment(.{ .name = "copied", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.enrichment.addEnrichment(.{ .name = "copied", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
     const cfg = types.IndexConfig{
         .name = "text",
         .kind = .full_text,
@@ -101284,7 +99104,7 @@ test "db completed partial managed admission serves and retires redundant repair
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
     defer db.close();
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "thumbnail",
         .kind = .embedding,
         .field = "body",
@@ -101337,7 +99157,7 @@ test "db completed partial managed admission serves and retires redundant repair
     // Query admission may prove the pinned active generation independently of
     // the background scheduler, while the next scheduler quantum durably
     // removes the obsolete intent and admission marker without a shadow build.
-    try db.failIfIndexQuarantined(cfg.name);
+    try db.maintenance.failIfIndexQuarantined(cfg.name);
     try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
     const completed = try db.indexes.repair.advanceIntent(alloc, repair_id, .{});
     try std.testing.expect(completed.attempted);
@@ -101359,7 +99179,7 @@ test "db completed generated recovery retires an inactive candidate without an a
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
     defer db.close();
-    try db.addEnrichment(.{ .name = "thumbnail", .kind = .embedding, .field = "body", .expected_dims = 3 });
+    try db.enrichment.addEnrichment(.{ .name = "thumbnail", .kind = .embedding, .field = "body", .expected_dims = 3 });
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }}, .sync_level = .write });
     const cfg: types.IndexConfig = .{
         .name = "thumbnail",
@@ -101447,7 +99267,7 @@ test "db completed generated recovery retires an inactive candidate without an a
     const completed = try db.indexes.repair.advanceIntent(alloc, recovery, .{});
     try std.testing.expect(completed.repaired);
     try std.testing.expect(!try db.indexes.repair.hasPendingIntents(alloc));
-    try db.failIfIndexQuarantined(cfg.name);
+    try db.maintenance.failIfIndexQuarantined(cfg.name);
 }
 
 test "db completed chunked managed admission uses physical artifact count" {
@@ -102562,7 +100382,7 @@ test "db managed admission drain preserves a generation requested during the pas
         fn afterPass(ptr: *anyopaque, hooked_db: *DB) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.passes += 1;
-            if (self.passes == 1) hooked_db.requestManagedAdmissionMaterialization();
+            if (self.passes == 1) hooked_db.enrichment.requestManagedAdmissionMaterialization();
         }
     };
     var hook = Hook{};
@@ -102572,7 +100392,7 @@ test "db managed admission drain preserves a generation requested during the pas
     };
     defer DB.test_managed_admission_materialization_hook = null;
 
-    db.requestManagedAdmissionMaterialization();
+    db.enrichment.requestManagedAdmissionMaterialization();
     try db.drainManagedIndexAdmissions(alloc);
     try std.testing.expectEqual(@as(usize, 2), hook.passes);
     try std.testing.expect(!db.managedAdmissionMaterializationPending());
@@ -102853,7 +100673,7 @@ test "db managed admission cannot deadlock replay coverage deletion" {
         .ttl_cleanup = .{ .enabled = false },
     });
     defer db.close();
-    try db.addEnrichment(.{ .name = "copied", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    try db.enrichment.addEnrichment(.{ .name = "copied", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"copied\"}]}" });
     const manager = db.core.index_manager;
     // Retain the current plan without filling the single-flight cache. Replay
@@ -102987,7 +100807,7 @@ test "db managed admission reconciliation retains same-name catalog mismatches" 
         .replay_target_sequence = db.core.nextDerivedSequence(),
     });
     try db.core.store.put(admission_key, &marker);
-    db.requestManagedAdmissionMaterialization();
+    db.enrichment.requestManagedAdmissionMaterialization();
 
     try std.testing.expectError(error.InvalidManagedIndexAdmission, db.drainManagedIndexAdmissions(alloc));
     const retained = try db.core.store.get(alloc, admission_key);
@@ -104614,7 +102434,7 @@ test "db failed activated dense generation rolls back to retained predecessor" {
             var rolling_back = try db.indexes.repair.loadEntryById(db.alloc, observed_repair_id);
             defer rolling_back.deinit(db.alloc);
             try std.testing.expectEqual(index_repair_state.Phase.rolling_back, rolling_back.intent.phase);
-            const generic_retry = try db.retryQuarantinedIndexLoad("dense_idx", true);
+            const generic_retry = try db.maintenance.retryQuarantinedIndexLoad("dense_idx", true);
             try std.testing.expectEqual(
                 index_manager_mod.IndexManager.QuarantineRetryTargetOutcome.repair_claimed,
                 generic_retry.target_outcome,
@@ -105259,7 +103079,7 @@ test "db artifact dense target prefers current incarnation outcomes over stale n
     // still advance across source-only replay records; final source coverage
     // and shadow cutover must remain pending on that same durable state.
     db.async_context.enrichment_desired_running.store(false, .release);
-    db.enrichment_runtime.?.stop();
+    db.enrichment.runtime.?.stop();
     const applied = try db.core.loadAppliedSequence(alloc, config.name);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:pending", .value = "{\"body\":\"provider pending\"}" }},
@@ -105293,7 +103113,7 @@ test "db multi-source dense target uses physical artifact cardinality" {
     for ([_]types.EnrichmentConfig{
         .{ .name = "title_dense", .kind = .embedding, .field = "title", .expected_dims = 3, .vector_space = "test:multi-source" },
         .{ .name = "summary_dense", .kind = .embedding, .field = "summary", .expected_dims = 3, .vector_space = "test:multi-source" },
-    }) |enrichment| try db.addEnrichment(enrichment);
+    }) |enrichment| try db.enrichment.addEnrichment(enrichment);
     const config: types.IndexConfig = .{
         .name = "dense_idx",
         .kind = .dense_vector,
@@ -109506,8 +107326,8 @@ test "db graph untimed migration restores source order and direct contributor pr
     {
         var db = try DB.open(alloc, path_tmp.path(), .{ .start_optional_runtimes = false });
         defer db.close();
-        try db.addEnrichment(.{ .name = "primary_relations_v1", .kind = .asset, .field = "primary_relations", .content_type = "application/json" });
-        try db.addEnrichment(.{ .name = "fallback_relations_v1", .kind = .asset, .field = "fallback_relations", .content_type = "application/json" });
+        try db.enrichment.addEnrichment(.{ .name = "primary_relations_v1", .kind = .asset, .field = "primary_relations", .content_type = "application/json" });
+        try db.enrichment.addEnrichment(.{ .name = "fallback_relations_v1", .kind = .asset, .field = "fallback_relations", .content_type = "application/json" });
         try db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json =
             \\{"sources":[{"artifact":"primary_relations_v1"},{"artifact":"fallback_relations_v1"}]}
         });
@@ -109578,7 +107398,7 @@ test "db graph untimed migration restores source order and direct contributor pr
     {
         var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
         defer db.close();
-        try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+        try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"relations_v1\"}]}" });
         try db.batch(.{ .writes = &.{
             .{ .key = "doc:a", .value = "{\"relations\":{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:b\"},\"weight\":2}}" },
@@ -109674,8 +107494,8 @@ test "db graph ttl projects source contenders across reopen" {
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
-        try db.addEnrichment(.{ .name = "primary_relations_v1", .kind = .asset, .field = "primary_relations", .content_type = "application/json" });
-        try db.addEnrichment(.{ .name = "fallback_relations_v1", .kind = .asset, .field = "fallback_relations", .content_type = "application/json" });
+        try db.enrichment.addEnrichment(.{ .name = "primary_relations_v1", .kind = .asset, .field = "primary_relations", .content_type = "application/json" });
+        try db.enrichment.addEnrichment(.{ .name = "fallback_relations_v1", .kind = .asset, .field = "fallback_relations", .content_type = "application/json" });
         try db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json =
             \\{"ttl":{"duration":"1h"},"sources":[{"artifact":"primary_relations_v1"},{"artifact":"fallback_relations_v1"}]}
         });
@@ -109792,7 +107612,7 @@ test "db graph ttl tombstone suppresses unchanged source replay and admits chang
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
-    try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
     try db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json =
         \\{"ttl":{"duration":"1h"},"sources":[{"artifact":"relations_v1"}]}
     });
@@ -109894,7 +107714,7 @@ test "db enrichment graph ttl replay honors source tombstone" {
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
-    try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
     try db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json =
         \\{"ttl":{"duration":"1h"},"sources":[{"artifact":"relations_v1"}]}
     });
@@ -109949,7 +107769,7 @@ test "db storage kernel graph edges retain typed filters and physical scan budge
     defer directory.cleanup();
     var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
-    try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "relations", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "relations", .content_type = "application/json" });
     try db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json =
         \\{"sources":[{"artifact":"relations"}]}
     });
@@ -110013,7 +107833,7 @@ test "db document deletion retires graph source contender and due entry" {
     defer path_tmp.cleanup();
     var db = try DB.open(alloc, path_tmp.path(), .{ .start_optional_runtimes = false });
     defer db.close();
-    try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
     try db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json =
         \\{"ttl":{"duration":"1h"},"sources":[{"artifact":"relations_v1"}]}
     });
@@ -110043,8 +107863,8 @@ test "db graph ttl guarded cleanup removes one source and replays fallback" {
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
-    try db.addEnrichment(.{ .name = "primary_v1", .kind = .asset, .field = "primary", .content_type = "application/json" });
-    try db.addEnrichment(.{ .name = "fallback_v1", .kind = .asset, .field = "fallback", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "primary_v1", .kind = .asset, .field = "primary", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "fallback_v1", .kind = .asset, .field = "fallback", .content_type = "application/json" });
     try db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json =
         \\{"ttl":{"duration":"1h"},"sources":[{"artifact":"primary_v1"},{"artifact":"fallback_v1"}]}
     });
@@ -110124,7 +107944,7 @@ test "db graph ttl shared worker expires graph source without document ttl" {
     defer path_tmp.cleanup();
     var db = try DB.open(alloc, path_tmp.path(), .{ .start_optional_runtimes = false });
     defer db.close();
-    try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
     try db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json =
         \\{"ttl":{"duration":"1h"},"sources":[{"artifact":"relations_v1"}]}
     });
@@ -110140,8 +107960,8 @@ test "db graph ttl shared worker expires graph source without document ttl" {
     var manual_clock = platform_clock.ManualClock{};
     manual_clock.setRealtimeNs(due.deadline_ns + 1);
     try initStoppedTtlRuntimeForTest(&db, .{ .enabled = true, .grace_period_ns = 0, .clock = manual_clock.clock() });
-    try db.ttl_runtime.?.runOnce();
-    const stats = db.ttl_runtime.?.stats();
+    try db.ttl.runtime.?.runOnce();
+    const stats = db.ttl.runtime.?.stats();
     try std.testing.expectEqual(@as(u64, 1), stats.scanned_graph_candidates);
     try std.testing.expectEqual(@as(u64, 1), stats.expired_graph_sources);
     const due_after = try db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
@@ -110149,7 +107969,7 @@ test "db graph ttl shared worker expires graph source without document ttl" {
     try std.testing.expectEqual(@as(usize, 0), due_after.len);
     // Simulate a stale copied deadline row after the source has gone away.
     try db.core.store.put(due_rows[0].key, due_rows[0].value);
-    try db.ttl_runtime.?.runOnce();
+    try db.ttl.runtime.?.runOnce();
     const pruned = try db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, pruned);
     try std.testing.expectEqual(@as(usize, 0), pruned.len);
@@ -110167,7 +107987,7 @@ test "db graph ttl source retirement ignores abandoned replay reservations witho
     defer path_tmp.cleanup();
     var db = try DB.open(alloc, path_tmp.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
-    try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
     try db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json =
         \\{"ttl":{"duration":"1h"},"sources":[{"artifact":"relations_v1"}]}
     });
@@ -110201,8 +108021,8 @@ test "db graph ttl source retirement ignores abandoned replay reservations witho
     var manual_clock = platform_clock.ManualClock{};
     manual_clock.setRealtimeNs(due.deadline_ns + 1);
     try initStoppedTtlRuntimeForTest(&db, .{ .enabled = true, .grace_period_ns = 0, .clock = manual_clock.clock() });
-    try db.ttl_runtime.?.runOnce();
-    try std.testing.expectEqual(@as(u64, 1), db.ttl_runtime.?.stats().expired_graph_sources);
+    try db.ttl.runtime.?.runOnce();
+    try std.testing.expectEqual(@as(u64, 1), db.ttl.runtime.?.stats().expired_graph_sources);
     const due_after = try db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, due_after);
     try std.testing.expectEqual(@as(usize, 0), due_after.len);
@@ -110257,13 +108077,13 @@ test "db graph ttl shared worker conditionally expires direct edge artifact" {
     var manual_clock = platform_clock.ManualClock{};
     manual_clock.setRealtimeNs(due.deadline_ns + 1);
     try initStoppedTtlRuntimeForTest(&db, .{ .enabled = true, .grace_period_ns = 0, .clock = manual_clock.clock() });
-    try db.ttl_runtime.?.runOnce();
-    try std.testing.expectEqual(@as(u64, 1), db.ttl_runtime.?.stats().expired_graph_artifacts);
+    try db.ttl.runtime.?.runOnce();
+    try std.testing.expectEqual(@as(u64, 1), db.ttl.runtime.?.stats().expired_graph_artifacts);
     const due_after = try db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, due_after);
     try std.testing.expectEqual(@as(usize, 0), due_after.len);
     try db.core.store.put(due_rows[0].key, due_rows[0].value);
-    try db.ttl_runtime.?.runOnce();
+    try db.ttl.runtime.?.runOnce();
     const pruned = try db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, pruned);
     try std.testing.expectEqual(@as(usize, 0), pruned.len);
@@ -110281,7 +108101,7 @@ test "db graph ttl direct contribution yields to surviving asset source" {
     defer path_tmp.cleanup();
     var db = try DB.open(alloc, path_tmp.path(), .{ .start_optional_runtimes = false });
     defer db.close();
-    try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
     try db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json =
         \\{"ttl":{"duration":"1h"},"sources":[{"artifact":"relations_v1"}]}
     });
@@ -110313,7 +108133,7 @@ test "db graph ttl direct contribution yields to surviving asset source" {
     var manual_clock = platform_clock.ManualClock{};
     manual_clock.setRealtimeNs(direct_due.deadline_ns + 1);
     try initStoppedTtlRuntimeForTest(&db, .{ .enabled = true, .grace_period_ns = 0, .clock = manual_clock.clock() });
-    try db.ttl_runtime.?.runOnce();
+    try db.ttl.runtime.?.runOnce();
     const after = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, after);
     try std.testing.expectEqual(@as(usize, 1), after.len);
@@ -110449,9 +108269,9 @@ test "db graph ttl migration cold writer fences legacy expiry without changing r
         var clock = platform_clock.ManualClock{};
         clock.setRealtimeNs(deadline + 1);
         try initStoppedTtlRuntimeForTest(&db, .{ .enabled = true, .grace_period_ns = 0, .clock = clock.clock() });
-        try db.ttl_runtime.?.runOnce();
-        try std.testing.expectEqual(@as(u64, 1), db.ttl_runtime.?.stats().expired_graph_artifacts);
-        try std.testing.expectEqual(@as(u64, 0), db.ttl_runtime.?.stats().error_count);
+        try db.ttl.runtime.?.runOnce();
+        try std.testing.expectEqual(@as(u64, 1), db.ttl.runtime.?.stats().expired_graph_artifacts);
+        try std.testing.expectEqual(@as(u64, 0), db.ttl.runtime.?.stats().error_count);
         const preserved = try db.core.store.get(alloc, promotion.items);
         defer alloc.free(preserved);
         try std.testing.expectEqualStrings("promotion state", preserved);
@@ -110468,7 +108288,7 @@ test "db graph ttl due index rebuild resumes after reopen" {
     {
         var db = try DB.open(alloc, path_tmp.path(), .{ .start_optional_runtimes = false });
         defer db.close();
-        try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+        try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
         try db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json =
             \\{"ttl":{"duration":"1h"},"sources":[{"artifact":"relations_v1"}]}
         });
@@ -113183,7 +111003,7 @@ fn testChildGenerationInstall(native: bool) !void {
             try db.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .begin, .fence = fence } });
             try std.testing.expectError(error.InvalidBatchRequest, db.batchNativeFkGenerationApply(.{ .writes = &.{.{ .key = "no", .value = "{}" }}, .relational_topology = .{ .action = .begin, .fence = fence } }));
         } else try db.batch(.{ .relational_topology = .{ .action = .begin, .fence = fence } });
-        try std.testing.expect(try db.childGenerationSourcePinsSchemaJson(next_json));
+        try std.testing.expect(try db.recovery.childGenerationSourcePinsSchemaJson(next_json));
         try std.testing.expect(try db.childGenerationSourceDefersOwnerCatalog());
     }
     var after_catalog_digest: [32]u8 = undefined;
@@ -113196,7 +111016,7 @@ fn testChildGenerationInstall(native: bool) !void {
         });
         defer reopened.close();
         try std.testing.expectEqual(@as(u32, 0), reopened.core.schema.?.version);
-        try std.testing.expect(try reopened.childGenerationSourcePinsSchemaJson(next_json));
+        try std.testing.expect(try reopened.recovery.childGenerationSourcePinsSchemaJson(next_json));
         const public_json = try reopened.core.store.get(alloc, public_schema_json_key);
         defer alloc.free(public_json);
         try std.testing.expectEqualStrings(old_json, public_json);
@@ -113235,7 +111055,7 @@ fn testChildGenerationInstall(native: bool) !void {
     });
     defer installed.close();
     try std.testing.expectEqual(@as(u32, 1), installed.core.schema.?.version);
-    try std.testing.expect(!(try installed.childGenerationSourcePinsSchemaJson(next_json)));
+    try std.testing.expect(!(try installed.recovery.childGenerationSourcePinsSchemaJson(next_json)));
     const installed_public = try installed.core.store.get(alloc, public_schema_json_key);
     defer alloc.free(installed_public);
     try std.testing.expectEqualStrings(next_json, installed_public);
@@ -113264,7 +111084,7 @@ fn testChildGenerationInstall(native: bool) !void {
         .catalog_digest = installed_digest,
     };
     try installed.batch(.{ .relational_topology = .{ .action = .begin, .fence = dual_fence } });
-    try std.testing.expect(!(try installed.childGenerationSourcePinsSchemaJson(next_json)));
+    try std.testing.expect(!(try installed.recovery.childGenerationSourcePinsSchemaJson(next_json)));
     try std.testing.expect(try installed.childGenerationSourceDefersOwnerCatalog());
 }
 
@@ -115483,13 +113303,13 @@ test "db lookup includes unified artifact projection when _artifacts is requeste
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"hello world\"}" }},
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "page_ocr_v1",
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "entities_v1",
         .kind = .asset,
         .field = "body",
@@ -116457,7 +114277,7 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try db.ttl_runtime.?.runOnce();
+    try db.ttl.runtime.?.runOnce();
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "doc:expired"));
     {
@@ -116592,7 +114412,7 @@ test "db stats expose ttl cleanup activity" {
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try db.ttl_runtime.?.runOnce();
+    try db.ttl.runtime.?.runOnce();
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     try std.testing.expect(stats.ttl_cleanup.enabled);
@@ -116638,7 +114458,7 @@ test "db ttl cleanup can run under lease ownership" {
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try db.ttl_runtime.?.runOnce();
+    try db.ttl.runtime.?.runOnce();
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
 
@@ -116687,7 +114507,7 @@ test "db ttl cleanup can run under lease ownership with durable lsm primary back
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try db.ttl_runtime.?.runOnce();
+    try db.ttl.runtime.?.runOnce();
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
 
@@ -116735,7 +114555,7 @@ test "db ttl cleanup can run with manual clock" {
         .timestamp_ns = now_ns - 2 * std.time.ns_per_s,
     });
 
-    try db.ttl_runtime.?.runOnce();
+    try db.ttl.runtime.?.runOnce();
     try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "doc:expired_manual"));
 
     const stats = try db.stats(alloc);
@@ -116767,7 +114587,7 @@ test "db ttl cleanup background worker starts and deletes with manual clock" {
         .ttl_cleanup = ttl_cfg,
     });
     defer db.close();
-    try std.testing.expect(db.ttl_runtime != null);
+    try std.testing.expect(db.ttl.runtime != null);
 
     try db.setSchema(.{
         .version = 1,
@@ -119326,13 +117146,13 @@ test "db split preserves ttl graph source fallback ownership on destination" {
 
     var parent = try DB.open(alloc, std.mem.span(parent_path), .{});
     defer parent.close();
-    try parent.addEnrichment(.{
+    try parent.enrichment.addEnrichment(.{
         .name = "primary_relations_v1",
         .kind = .asset,
         .field = "primary_relations",
         .content_type = "application/json",
     });
-    try parent.addEnrichment(.{
+    try parent.enrichment.addEnrichment(.{
         .name = "fallback_relations_v1",
         .kind = .asset,
         .field = "fallback_relations",
@@ -119939,7 +117759,7 @@ test "db split cutover fences enrichment to the owning range" {
         },
         .sync_level = .write,
     });
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
     try db.executor.waitForAll(2);
 
     try db.split(db.getRange(), "doc:m", "", std.mem.span(dest), true);
@@ -120428,7 +118248,7 @@ test "db split cutover fences enrichment to the owning range with durable lsm pr
         },
         .sync_level = .write,
     });
-    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.enrichment.runtime.?.waitForApplied(1);
     try db.executor.waitForAll(2);
 
     try db.split(db.getRange(), "doc:m", "", std.mem.span(dest), true);
@@ -120536,7 +118356,7 @@ test "db merge-style cutover fences enrichment to the merged receiver range" {
         .writes = &.{.{ .key = "doc:y", .value = "{\"body\":\"donor pre-cutover\"}" }},
         .sync_level = .write,
     });
-    try donor.enrichment_runtime.?.waitForApplied(1);
+    try donor.enrichment.runtime.?.waitForApplied(1);
     try donor.executor.waitForAll(2);
 
     try receiver.updateRange(.{ .start = "doc:a", .end = "" });
@@ -120551,7 +118371,7 @@ test "db merge-style cutover fences enrichment to the merged receiver range" {
         .writes = &.{.{ .key = "doc:z", .value = "{\"body\":\"receiver merged this\"}" }},
         .sync_level = .write,
     });
-    try receiver.enrichment_runtime.?.waitForApplied(1);
+    try receiver.enrichment.runtime.?.waitForApplied(1);
     try receiver.executor.waitForAll(2);
 
     const receiver_vec = try deterministic_receiver.interface().embedDense(alloc, "", "receiver merged this", 3);
@@ -120636,7 +118456,7 @@ test "db merge-style cutover fences enrichment to the merged receiver range with
         .writes = &.{.{ .key = "doc:y", .value = "{\"body\":\"donor pre-cutover\"}" }},
         .sync_level = .write,
     });
-    try donor.enrichment_runtime.?.waitForApplied(1);
+    try donor.enrichment.runtime.?.waitForApplied(1);
     try donor.executor.waitForAll(2);
 
     try receiver.updateRange(.{ .start = "doc:a", .end = "" });
@@ -120651,7 +118471,7 @@ test "db merge-style cutover fences enrichment to the merged receiver range with
         .writes = &.{.{ .key = "doc:z", .value = "{\"body\":\"receiver merged this\"}" }},
         .sync_level = .write,
     });
-    try receiver.enrichment_runtime.?.waitForApplied(1);
+    try receiver.enrichment.runtime.?.waitForApplied(1);
     try receiver.executor.waitForAll(2);
 
     const receiver_vec = try deterministic_receiver.interface().embedDense(alloc, "", "receiver merged this", 3);
@@ -120817,9 +118637,9 @@ test "db direct merge import preserves graph source lifetime across generations"
     const index: types.IndexConfig = .{ .name = "relations_graph", .kind = .graph, .config_json =
         \\{"ttl":{"duration":"1h"},"sources":[{"artifact":"relations_v1"}]}
     };
-    try donor.addEnrichment(enrichment);
+    try donor.enrichment.addEnrichment(enrichment);
     try donor.addIndex(index);
-    try receiver.addEnrichment(enrichment);
+    try receiver.enrichment.addEnrichment(enrichment);
     try receiver.addIndex(index);
     try donor.batch(.{ .writes = &.{.{ .key = "doc:a", .value =
         \\{"title":"owner","relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":2}}
@@ -120920,7 +118740,7 @@ test "db direct merge import retires replaced owners and preserves shared entity
                 var receiver = try DB.open(alloc, receiver_tmp.path(), .{ .start_optional_runtimes = false });
                 defer receiver.close();
                 for ([_]*DB{ &donor, &receiver }) |db| {
-                    if (sourced) try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+                    if (sourced) try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
                     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = config_json });
                     try db.batch(.{ .writes = &.{ .{ .key = "doc:0", .value = "{}" }, .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:c", .value = "{}" } }, .sync_level = .full_index });
                 }
@@ -120984,7 +118804,7 @@ test "db direct merge import reconciles pending source inputs before snapshot co
                 var receiver = try DB.open(alloc, receiver_tmp.path(), .{ .start_optional_runtimes = false });
                 defer receiver.close();
                 for ([_]*DB{ &donor, &receiver }) |db| {
-                    try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+                    try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
                     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = if (timed) "{\"ttl\":{\"duration\":\"1h\"},\"sources\":[{\"artifact\":\"relations_v1\"}]}" else "{\"sources\":[{\"artifact\":\"relations_v1\"}]}" });
                 }
                 try receiver.batch(.{ .writes = &.{
@@ -121057,7 +118877,7 @@ test "db direct merge import and paged export reject donors awaiting source reco
         defer destination.close();
         const Setup = struct {
             fn graph(db: *DB, has_ttl: bool) !void {
-                try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+                try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
                 try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = if (has_ttl) "{\"ttl\":{\"duration\":\"1h\"},\"sources\":[{\"artifact\":\"relations_v1\"}]}" else "{\"sources\":[{\"artifact\":\"relations_v1\"}]}" });
             }
             fn paused(db: *DB, expected: bool) !void {
@@ -121257,7 +119077,7 @@ test "db direct merge import recovers interrupted primary and projection publica
                 var receiver = try DB.open(alloc, receiver_tmp.path(), .{ .start_optional_runtimes = false });
                 defer receiver.close();
                 for ([_]*DB{ &donor, &receiver }) |db| {
-                    try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+                    try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
                     try db.addIndex(config);
                     try db.batch(.{ .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:c", .value = "{}" }, .{ .key = "doc:0", .value = "{}" } }, .sync_level = .full_index });
                 }
@@ -121356,7 +119176,7 @@ test "db direct merge import replaces contributor membership and enforces visibl
     var receiver = try DB.open(alloc, receiver_tmp.path(), .{ .start_optional_runtimes = false });
     defer receiver.close();
     for ([_]*DB{ &donor, &receiver }) |db| {
-        try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+        try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"max_edges_per_document\":1,\"sources\":[{\"artifact\":\"relations_v1\"}]}" });
         try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }}, .sync_level = .full_index });
     }
@@ -121436,9 +119256,9 @@ test "db direct merge import preserves mixed graph ttl contributor precedence" {
     const index: types.IndexConfig = .{ .name = "relations_graph", .kind = .graph, .config_json =
         \\{"ttl":{"duration":"1h"},"sources":[{"artifact":"relations_v1"}]}
     };
-    try donor.addEnrichment(enrichment);
+    try donor.enrichment.addEnrichment(enrichment);
     try donor.addIndex(index);
-    try receiver.addEnrichment(enrichment);
+    try receiver.enrichment.addEnrichment(enrichment);
     try receiver.addIndex(index);
     try donor.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }}, .sync_level = .full_index });
     try donor.batch(.{ .graph_writes = &.{.{
@@ -121683,7 +119503,7 @@ test "db split cutover preserves enrichment resume and fencing across reopen" {
             },
             .sync_level = .write,
         });
-        try parent.enrichment_runtime.?.waitForApplied(1);
+        try parent.enrichment.runtime.?.waitForApplied(1);
         try waitForDerivedReplayTarget(&parent);
 
         try parent.split(parent.getRange(), "doc:m", "", std.mem.span(child_path), true);
@@ -121816,7 +119636,7 @@ test "db split cutover preserves enrichment resume and fencing across reopen wit
             },
             .sync_level = .write,
         });
-        try parent.enrichment_runtime.?.waitForApplied(1);
+        try parent.enrichment.runtime.?.waitForApplied(1);
         try waitForDerivedReplayTarget(&parent);
 
         try parent.split(parent.getRange(), "doc:m", "", std.mem.span(child_path), true);
@@ -121964,7 +119784,7 @@ test "db merge-style cutover preserves enrichment resume and fencing across reop
             .writes = &.{.{ .key = "doc:y", .value = "{\"body\":\"donor pre-cutover\"}" }},
             .sync_level = .write,
         });
-        try donor.enrichment_runtime.?.waitForApplied(1);
+        try donor.enrichment.runtime.?.waitForApplied(1);
         try donor.executor.waitForAll(2);
 
         try receiver.updateRange(.{ .start = "doc:a", .end = "" });
@@ -121974,7 +119794,7 @@ test "db merge-style cutover preserves enrichment resume and fencing across reop
             .writes = &.{.{ .key = "doc:z", .value = "{\"body\":\"receiver pre-reopen\"}" }},
             .sync_level = .write,
         });
-        try receiver.enrichment_runtime.?.waitForApplied(1);
+        try receiver.enrichment.runtime.?.waitForApplied(1);
         try receiver.executor.waitForAll(2);
     }
 
@@ -122101,7 +119921,7 @@ test "db merge-style cutover preserves enrichment resume and fencing across reop
             .writes = &.{.{ .key = "doc:y", .value = "{\"body\":\"donor pre-cutover\"}" }},
             .sync_level = .write,
         });
-        try donor.enrichment_runtime.?.waitForApplied(1);
+        try donor.enrichment.runtime.?.waitForApplied(1);
         try donor.executor.waitForAll(2);
 
         try receiver.updateRange(.{ .start = "doc:a", .end = "" });
@@ -122111,7 +119931,7 @@ test "db merge-style cutover preserves enrichment resume and fencing across reop
             .writes = &.{.{ .key = "doc:z", .value = "{\"body\":\"receiver pre-reopen\"}" }},
             .sync_level = .write,
         });
-        try receiver.enrichment_runtime.?.waitForApplied(1);
+        try receiver.enrichment.runtime.?.waitForApplied(1);
         try receiver.executor.waitForAll(2);
         try receiver.sync(true);
         try donor.sync(true);
@@ -123243,7 +121063,7 @@ test "db native snapshot admission bounds capture under concurrent writes" {
             self.done.store(true, .release);
         }
     };
-    const Maintenance = struct {
+    const MaintenanceHarness = struct {
         db: *DB,
         started: std.atomic.Value(bool) = .init(false),
         done: std.atomic.Value(bool) = .init(false),
@@ -123331,8 +121151,8 @@ test "db native snapshot admission bounds capture under concurrent writes" {
 
     // Apply release alone is not the publication boundary: the short metadata
     // pin still excludes physical index maintenance.
-    var maintenance = Maintenance{ .db = &db };
-    var maintenance_thread = try std.testing.io.concurrent(Maintenance.run, .{&maintenance});
+    var maintenance = MaintenanceHarness{ .db = &db };
+    var maintenance_thread = try std.testing.io.concurrent(MaintenanceHarness.run, .{&maintenance});
     defer {
         fence.release.store(true, .release);
         fence.release_copy.store(true, .release);
@@ -124382,7 +122202,7 @@ test "db restore snapshot replays managed chunked dense embeddings for durable l
 
     const rebuilt = try restored.rebuildDenseIndexesFromStoredEmbeddingArtifacts(alloc);
     try std.testing.expect(rebuilt > 0);
-    _ = try restored.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+    _ = try restored.enrichment.replayGeneratedEnrichmentsFromStoredDocs(alloc);
     try restored.runUntilIdle();
     const pending = restored.pendingWorkStats();
     try std.testing.expectEqual(pending.enrichment.target_sequence, pending.enrichment.applied_sequence);
@@ -125189,7 +123009,7 @@ test "db restore repair does not complete before regenerated chunk embeddings ar
         // Reopening between phases would hide a stale shutdown admission flag.
         while (try restored.restoreRuntimeRepairNeeded()) {
             try std.testing.expect(try restored.repairRestoreRuntimeStateStepIfNeeded(alloc));
-            try std.testing.expect(!restored.enrichment_runtime.?.isStarted());
+            try std.testing.expect(!restored.enrichment.runtime.?.isStarted());
         }
     }
 
@@ -125454,7 +123274,7 @@ test "db graph ownership restore materializes large artifacts in published segme
     try std.testing.expectEqual(@as(?usize, null), second.next_item_offset);
     try std.testing.expectEqual(@as(usize, 2), second.next_segment_index);
     try std.testing.expectEqual(@as(usize, 2050), second.key_count);
-    try std.testing.expectEqual(@as(usize, 1), db.graph_restore_parse_count_for_test);
+    try std.testing.expectEqual(@as(usize, 1), db.recovery.restore.graph_parse_count_for_test);
 
     var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse return error.TestUnexpectedResult;
     defer artifact_ref.deinit(alloc);
@@ -127416,15 +125236,15 @@ test "source vector table defers reopen GC and bounded maintenance preserves rea
             var old = try db.core.store.beginReadTxn();
             defer old.abort();
             try db.core.store.delete(key);
-            _ = try db.runArtifactRepairMetadataMaintenancePass();
+            _ = try db.enrichment.runArtifactRepairMetadataMaintenancePass();
             try std.testing.expect(!source.collectionPending());
             const retained = try old.get(key);
             try std.testing.expectEqualSlices(u8, second, retained);
         }
         try db.core.store.put(key, third);
-        _ = try db.runArtifactRepairMetadataMaintenancePass();
+        _ = try db.enrichment.runArtifactRepairMetadataMaintenancePass();
         try std.testing.expect(source.collectionPending());
-        _ = try db.runArtifactRepairMetadataMaintenancePass();
+        _ = try db.enrichment.runArtifactRepairMetadataMaintenancePass();
         try std.testing.expect(source.collectionPending());
         try std.testing.expectEqual(@as(u64, 1), source.statsSnapshot().collection_mark_max_step_rows);
         // Close cancels the partial mark before its primary owner is destroyed.
@@ -127443,7 +125263,7 @@ test "source vector table defers reopen GC and bounded maintenance preserves rea
     // workers disabled. An idle pass can mean admission was deferred, not
     // that verification completed. Drive the same later wakeups as the worker.
     while (source.statsSnapshot().collections == 0 and source.statsSnapshot().collection_copy_deferrals == 0) : (turns += 1) {
-        const pending = try db.runArtifactRepairMetadataMaintenancePass();
+        const pending = try db.enrichment.runArtifactRepairMetadataMaintenancePass();
         const stats = source.statsSnapshot();
         if (!pending and stats.collections == 0 and stats.collection_copy_deferrals == 0) {
             try std.testing.expect(stats.collection_deferrals != 0);
@@ -127451,12 +125271,12 @@ test "source vector table defers reopen GC and bounded maintenance preserves rea
         }
         try std.testing.expect(turns < 1024);
     }
-    try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+    try db.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle();
     try std.testing.expect(turns > 1);
     if (source.cost_based_gc) {
         try std.testing.expect(source.statsSnapshot().collection_deferred_obsolete_bytes != 0);
         source.garbage_deadline_seconds = 0;
-        try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+        try db.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle();
     }
     try std.testing.expectEqual(@as(u64, 1), source.statsSnapshot().retained_payloads);
     try std.testing.expectEqual(@as(u64, 1), source.statsSnapshot().collection_mark_max_step_rows);
@@ -129294,7 +127114,7 @@ test "db ordered artifact inventory producer coverage pages do not idle between 
     var db = try DB.open(alloc, tmp.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "extraction", .kind = .asset, .field = "body", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "extraction", .kind = .asset, .field = "body", .content_type = "application/json" });
     for (0..140) |i| {
         const name = try std.fmt.allocPrint(alloc, "doc-{d:0>4}", .{i});
         defer alloc.free(name);
@@ -129317,20 +127137,20 @@ test "db ordered artifact inventory producer coverage pages do not idle between 
     }
     // No protocol-15 work registry and no clock advancement. Both pages must
     // run immediately; otherwise a large census advances at 64 rows / 5 s.
-    try std.testing.expect(try db.advanceArtifactProducerWorkPage());
-    try std.testing.expectEqual(@as(u64, 0), db.artifact_producer_scheduler.retry_after_ns.load(.acquire));
-    try std.testing.expect(try db.advanceArtifactProducerWorkPage());
-    try std.testing.expectEqual(@as(u64, 0), db.artifact_producer_scheduler.retry_after_ns.load(.acquire));
+    try std.testing.expect(try db.enrichment.advanceArtifactProducerWorkPage());
+    try std.testing.expectEqual(@as(u64, 0), db.enrichment.artifacts.producer_scheduler.retry_after_ns.load(.acquire));
+    try std.testing.expect(try db.enrichment.advanceArtifactProducerWorkPage());
+    try std.testing.expectEqual(@as(u64, 0), db.enrichment.artifacts.producer_scheduler.retry_after_ns.load(.acquire));
     var turns: usize = 0;
-    while (db.artifact_producer_scheduler.retry_after_ns.load(.acquire) == 0 and turns < 1000) : (turns += 1) {
-        _ = try db.advanceArtifactProducerWorkPage();
+    while (db.enrichment.artifacts.producer_scheduler.retry_after_ns.load(.acquire) == 0 and turns < 1000) : (turns += 1) {
+        _ = try db.enrichment.advanceArtifactProducerWorkPage();
     }
     // Protocol-14 rows cannot fabricate protocol-15 receipts. The census can
     // finish, but an unresolved witness sweep must remain pending and back off.
     try std.testing.expect(turns < 1000);
-    try std.testing.expect(db.artifact_producer_scheduler.pending.load(.acquire));
-    try std.testing.expect(db.artifact_producer_scheduler.retry_after_ns.load(.acquire) > db.independentMaintenanceNowNs());
-    try std.testing.expect(!try db.advanceArtifactProducerWorkPage());
+    try std.testing.expect(db.enrichment.artifacts.producer_scheduler.pending.load(.acquire));
+    try std.testing.expect(db.enrichment.artifacts.producer_scheduler.retry_after_ns.load(.acquire) > db.independentMaintenanceNowNs());
+    try std.testing.expect(!try db.enrichment.advanceArtifactProducerWorkPage());
 }
 
 test "db ordered artifact inventory producer dispatch is durable and never completes work" {
@@ -129349,10 +127169,10 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
         defer db.close();
         // Keep the consumer paused so the wakeup can be inspected without
         // another write or a polling worker concealing a lost notification.
-        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+        try db.enrichment.reconfigureRuntimePaused(.{ .enable_without_producers = true });
         if (pass == 0) {
             try db.setSchemaJson(alloc, "{}");
-            try db.addEnrichment(.{ .name = "extraction", .kind = .asset, .field = "body", .content_type = "application/json" });
+            try db.enrichment.addEnrichment(.{ .name = "extraction", .kind = .asset, .field = "body", .content_type = "application/json" });
             var ordered = try db.artifactInventoryCommand(alloc);
             defer ordered.catalogs.deinit(alloc);
             ordered.binding.effect_protocol = 15;
@@ -129408,13 +127228,13 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
                 }, false, .{ .authority = authority, .item = old.items[0], .plan_generation = plan.generation(), .page = .{ .next_template = 1, .complete = true } }));
                 try std.testing.expectEqual(before, db.core.store.lastReplaySequence(0));
             }
-            try std.testing.expect(try db.advanceArtifactProducerWorkPage());
+            try std.testing.expect(try db.enrichment.advanceArtifactProducerWorkPage());
             expected_sequence = db.core.store.lastReplaySequence(0);
             expected_dispatch_sequence = expected_sequence;
             try std.testing.expect(expected_sequence > before);
-            try std.testing.expectEqual(expected_sequence, db.enrichment_runtime.?.stats().target_sequence);
+            try std.testing.expectEqual(expected_sequence, db.enrichment.runtime.?.stats().target_sequence);
         }
-        _ = try db.advanceArtifactProducerWorkPage();
+        _ = try db.enrichment.advanceArtifactProducerWorkPage();
         try std.testing.expectEqual(expected_sequence, db.core.store.lastReplaySequence(0));
         {
             var read = try db.core.store.beginReadTxn();
@@ -129433,12 +127253,12 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             // Lose the producer's queue/upload entirely: the durable original
             // dispatch is complete, but no accepted output exists. A bounded
             // retry sweep must append work without reopening that dispatch.
-            db.artifact_producer_scheduler.producer_retry_after_ns = 0;
-            db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
-            try std.testing.expect(try db.advanceArtifactProducerWorkPage());
+            db.enrichment.artifacts.producer_scheduler.producer_retry_after_ns = 0;
+            db.enrichment.artifacts.producer_scheduler.retry_after_ns.store(0, .release);
+            try std.testing.expect(try db.enrichment.advanceArtifactProducerWorkPage());
             const retried_sequence = db.core.store.lastReplaySequence(0);
             try std.testing.expect(retried_sequence > expected_sequence);
-            try std.testing.expectEqual(retried_sequence, db.enrichment_runtime.?.stats().target_sequence);
+            try std.testing.expectEqual(retried_sequence, db.enrichment.runtime.?.stats().target_sequence);
             expected_sequence = retried_sequence;
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
@@ -129463,9 +127283,9 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
                 try std.testing.expectEqual(@as(u64, 3), round);
                 try std.testing.expect(try obligations.stageRetry(alloc, &txn, authority, current, round, expected_sequence + 1, .{ .next_template = 1, .complete = true }));
             }
-            db.artifact_producer_scheduler.producer_retry_after_ns = 0;
-            db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
-            try std.testing.expect(try db.advanceArtifactProducerWorkPage());
+            db.enrichment.artifacts.producer_scheduler.producer_retry_after_ns = 0;
+            db.enrichment.artifacts.producer_scheduler.retry_after_ns.store(0, .release);
+            try std.testing.expect(try db.enrichment.advanceArtifactProducerWorkPage());
             expected_sequence = db.core.store.lastReplaySequence(0);
             {
                 var read = try db.core.store.beginReadTxn();
@@ -129478,8 +127298,8 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             }
             // A completed local retry round cannot spin while other work
             // keeps the maintenance scheduler on its active cadence.
-            db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
-            _ = try db.advanceArtifactProducerWorkPage();
+            db.enrichment.artifacts.producer_scheduler.retry_after_ns.store(0, .release);
+            _ = try db.enrichment.advanceArtifactProducerWorkPage();
             try std.testing.expectEqual(expected_sequence, db.core.store.lastReplaySequence(0));
             // A dependency repair can retain the primary position. It must
             // reopen durable dispatch even after a process restart.
@@ -129488,8 +127308,8 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             const authority = (try publication.authority(&txn)).?;
             _ = try obligations.mark(alloc, &txn, authority, "doc", null);
             try txn.commit();
-            db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
-            try std.testing.expect(try db.advanceArtifactProducerWorkPage());
+            db.enrichment.artifacts.producer_scheduler.retry_after_ns.store(0, .release);
+            try std.testing.expect(try db.enrichment.advanceArtifactProducerWorkPage());
             try std.testing.expect(db.core.store.lastReplaySequence(0) > expected_sequence);
         }
     }
@@ -129511,7 +127331,7 @@ test "db ordered artifact inventory producer pages resume after restart without 
         defer db.close();
         if (pass == 0) {
             try db.setSchemaJson(alloc, "{}");
-            for ([_][]const u8{ "first", "second", "third" }) |name| try db.addEnrichment(.{ .name = name, .kind = .asset, .field = "body", .content_type = "application/json" });
+            for ([_][]const u8{ "first", "second", "third" }) |name| try db.enrichment.addEnrichment(.{ .name = name, .kind = .asset, .field = "body", .content_type = "application/json" });
             var ordered = try db.artifactInventoryCommand(alloc);
             defer ordered.catalogs.deinit(alloc);
             ordered.binding.effect_protocol = 15;
@@ -129528,7 +127348,7 @@ test "db ordered artifact inventory producer pages resume after restart without 
             _ = try obligations.mark(alloc, &txn, authority, &document, null);
             try txn.commit();
         }
-        _ = try db.advanceArtifactProducerWorkPage();
+        _ = try db.enrichment.advanceArtifactProducerWorkPage();
         const sequence = db.core.store.lastReplaySequence(0);
         if (pass < 3) try std.testing.expect(sequence > previous_sequence) else try std.testing.expectEqual(previous_sequence, sequence);
         previous_sequence = sequence;
@@ -129697,7 +127517,7 @@ test "db ordered artifact inventory graph TTL definitions retain reader envelope
         defer db.close();
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"}}" });
         try Check.loaded(&db);
-        try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body" });
+        try db.enrichment.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body" });
         try Check.loaded(&db);
         try std.testing.expect(try db.deleteIndex("g"));
         // Removing the last TTL index cannot erase a permanent format fence.
@@ -129775,7 +127595,7 @@ test "db ordered artifact inventory resolver commit invalidates pinned producer 
     var db = try DB.open(alloc, path, .{ .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "extraction", .kind = .asset, .field = "body", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "extraction", .kind = .asset, .field = "body", .content_type = "application/json" });
     var before = try db.core.index_manager.acquireWritePlanSnapshot();
     defer before.release();
     try db.addResolver(.{ .name = "people", .table = "entities", .source_artifact = "extraction", .resolution_artifact = "resolved", .key_template = "{{canonical_name}}", .config_generation = 7 });
@@ -130076,7 +127896,7 @@ test "db graph endpoint cleanup pages progress after standalone ttl without anot
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
     try db.batch(.{ .writes = &.{.{ .key = "hub", .value = "{}" }}, .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R" }}, .timestamp_ns = currentTimeNs() - 2 * std.time.ns_per_s, .sync_level = .full_index });
     try initStoppedTtlRuntimeForTest(db, .{ .enabled = true, .grace_period_ns = 0 });
-    try db.ttl_runtime.?.runOnce();
+    try db.ttl.runtime.?.runOnce();
     try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "hub"));
     const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while (try db.core.store.hasGraphEndpointCleanup()) {
@@ -130400,12 +128220,14 @@ pub const test_support = if (builtin.is_test) struct {
     }
 
     pub fn transactionRecoveryExecution(db: *fixture_owner.DB) LocalMutationExecution {
-        const context = db.transaction_recovery_local_context.?;
+        const context = db.recovery.transactions.local_context.?;
         var view = context.execution.?.mutation();
-        view.transaction_recovery_local_context = context;
+        view.recovery.transactions.local_context = context;
         return view;
     }
-    pub const prepareTransactionRecoveryOwner = fixture_owner.DB.prepareTransactionRecoveryOwner;
+    pub fn prepareTransactionRecoveryOwner(db: *fixture_owner.DB) !void {
+        return db.recovery.prepareTransactionRecoveryOwner();
+    }
     pub const prepareOnlineVectorIntentBoundsLocked = fixture_owner.DB.prepareOnlineVectorIntentBoundsLocked;
     pub const batchInternal = fixture_owner.DB.batchInternal;
     pub const refreshArtifactProjections = fixture_owner.DB.refreshArtifactProjections;
@@ -131429,7 +129251,7 @@ test "db graph fact materialized scopes match journal" {
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    try db.enrichment.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
     try db.addIndex(.{ .name = "h", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"context\"}]}" });
     try db.addIndex(.{ .name = "plain", .kind = .full_text, .config_json = "{}" });
     const req: types.BatchRequest = .{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "f", .owner_document = "f" }} };
@@ -131490,17 +129312,17 @@ test "db graph fact enrichment observes pending graph replay" {
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    try db.enrichment.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
-    try db.initOptionalEnrichmentRuntime(&config);
+    try db.enrichment.initRuntime(&config);
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"Alice\"}" }}, .sync_level = .write });
-    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     const previous = producer.successful_requests.load(.acquire);
     try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "f", .owner_document = "f" }}, .sync_level = .write });
     const pending = db.core.nextDerivedSequence();
     const graph_checkpoint = try db.core.loadAppliedSequence(alloc, "g");
-    try db.enrichment_runtime.?.catchUpUntilForDrain(pending);
+    try db.enrichment.runtime.?.catchUpUntilForDrain(pending);
     // Source refresh must not certify this consumer while its producer runs.
     try std.testing.expectEqual(graph_checkpoint, try db.core.loadAppliedSequence(alloc, "g"));
     try std.testing.expect(producer.successful_requests.load(.acquire) > previous);
@@ -131508,7 +129330,7 @@ test "db graph fact enrichment observes pending graph replay" {
         fn run(failing_alloc: Allocator, resident: *DB) !void {
             var ctx = resident.async_context.*;
             ctx.alloc = failing_alloc;
-            var append_ctx = resident.enrichment_append_context.?.*;
+            var append_ctx = resident.enrichment.append_context.?.*;
             append_ctx.async_context = &ctx;
             resident.core.index_manager.graphIndex("g").?.invalidateNeighborSource();
             while (true) {
@@ -131528,7 +129350,7 @@ test "db graph fact enrichment observes pending graph replay" {
     try db.core.index_manager.deleteGraphDocsByName("g", &.{"f"});
     try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.graphIndex("g").?.neighbor_source_sequence);
     {
-        const source_cap = db.enrichment_runtime.?.config.neighbor_context_graph_source.?;
+        const source_cap = db.enrichment.runtime.?.config.neighbor_context_graph_source.?;
         const lease = try source_cap.acquire_fn(source_cap.ptr, "g");
         defer lease.release();
         const restored = try db.core.index_manager.graphIndex("g").?.index.getEdges(alloc, "a", "R", .out);
@@ -131536,13 +129358,13 @@ test "db graph fact enrichment observes pending graph replay" {
         try std.testing.expectEqual(@as(usize, 1), restored.len);
     }
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
     const current = producer.successful_requests.load(.acquire);
 
     try std.testing.expect(current > previous);
 
     try db.batch(.{ .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "f", .owner_document = "f" }}, .sync_level = .write });
-    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
     try std.testing.expect(producer.successful_requests.load(.acquire) > current);
     const edges = try db.core.index_manager.graphIndex("g").?.index.getEdges(alloc, "a", "R", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
@@ -131572,9 +129394,9 @@ test "db graph fact inline mutation wakes incoming producers for additions repla
             return GateAssetProducer.produce(ptr, alloc, request);
         }
         fn drain(db: *DB) !void {
-            try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+            try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
             try db.runDerivedUntil(db.core.nextDerivedSequence());
-            try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+            try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
         }
         fn hasNeighbor(db: *DB, doc: []const u8) !bool {
             const key = try internal_keys.artifactNamedPrefixAlloc(db.alloc, doc, "asset", "context");
@@ -131593,14 +129415,14 @@ test "db graph fact inline mutation wakes incoming producers for additions repla
         var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
         defer db.close();
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-        try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .in } });
+        try db.enrichment.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .in } });
         var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &producer, .vtable = &.{
             .produce = GateAssetProducer.produce,
             .produce_with_context = Fixture.produceBounded,
             .foreground_bounded = true,
             .invocation_memory_for_requests = GateAssetProducer.invocationMemory,
         } } };
-        try db.initOptionalEnrichmentRuntime(&config);
+        try db.enrichment.initRuntime(&config);
         try db.batch(.{ .writes = &.{ .{ .key = "b", .value = "{\"body\":\"Bob\"}" }, .{ .key = "c", .value = "{\"body\":\"Carol\"}" } }, .sync_level = sync_level });
         try Fixture.drain(&db);
         try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"b\",\"edge_id\":\"f\"}]}}}" }}, .sync_level = sync_level });
@@ -131637,11 +129459,11 @@ test "db graph fact neighbor context excludes foreign source namespace" {
     try db.core.store.put(internal_keys.graph_owning_table_key, "here");
     db.local_execution.row_policy_table_name = "here";
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    try db.enrichment.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
-    try db.initOptionalEnrichmentRuntime(&config);
+    try db.enrichment.initRuntime(&config);
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"Alpha\"}" }}, .sync_level = .write });
-    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "foreign-source-neighbor", .edge_type = "R", .edge_id = "f", .owner_document = "f", .metadata_json = "{\"source_table\":\"foreign\",\"target_table\":\"here\"}" }}, .sync_level = .write });
     try db.runDerivedUntil(db.core.nextDerivedSequence());
@@ -131649,7 +129471,7 @@ test "db graph fact neighbor context excludes foreign source namespace" {
     defer if (path) |value| paths_mod.freePath(alloc, value);
     try std.testing.expect(path == null);
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"Alpha revised\"}" }}, .sync_level = .write });
-    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
     const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "a", "asset", "context");
     defer alloc.free(key);
     const output = try db.core.store.get(alloc, key);
@@ -131664,17 +129486,17 @@ test "db graph fact neighbor refresh resumes bounded turns without certifying co
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    try db.enrichment.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
     var producer = GateAssetProducer{};
     producer.allowAll();
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
-    try db.initOptionalEnrichmentRuntime(&config);
+    try db.enrichment.initRuntime(&config);
     const record_count = 17;
     for (0..record_count) |i| {
         try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "f", .owner_document = "f", .weight = @floatFromInt(i + 1) }}, .sync_level = .write });
     }
     const checkpoint = try db.core.loadAppliedSequence(alloc, "g");
-    const source = db.enrichment_runtime.?.config.neighbor_context_graph_source.?;
+    const source = db.enrichment.runtime.?.config.neighbor_context_graph_source.?;
     const entry = db.core.index_manager.graphIndex("g").?;
     var previous = entry.neighbor_source_sequence;
     var turns: usize = 0;
@@ -131715,14 +129537,14 @@ test "db graph fact neighbor context resolves equal-key qualified reverse orient
         try db.core.store.put(internal_keys.graph_owning_table_key, "here");
         db.local_execution.row_policy_table_name = "here";
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-        try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = neighbor_context });
+        try db.enrichment.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = neighbor_context });
         var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
-        try db.initOptionalEnrichmentRuntime(&config);
+        try db.enrichment.initRuntime(&config);
         try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"Alpha\"}" }}, .sync_level = .write });
-        try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+        try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
         try db.runDerivedUntil(db.core.nextDerivedSequence());
         try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "a", .edge_type = "R", .edge_id = "f", .owner_document = "f", .metadata_json = "{\"source_table\":\"foreign\",\"target_table\":\"h\\u0065re\"}" }}, .sync_level = .write });
-        try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+        try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
         const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "a", "asset", "context");
         defer alloc.free(key);
         const output = try db.core.store.get(alloc, key);
@@ -131739,9 +129561,9 @@ test "db graph fact synchronous neighbor downstream chain" {
             return GateAssetProducer.produce(ptr, alloc, request);
         }
         fn drain(db: *DB) !void {
-            try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+            try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
             try db.runDerivedUntil(db.core.nextDerivedSequence());
-            try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+            try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
         }
         fn hasNeighbor(db: *DB, doc: []const u8) !bool {
             const key = try internal_keys.artifactNamedPrefixAlloc(db.alloc, doc, "asset", "context");
@@ -131770,16 +129592,16 @@ test "db graph fact synchronous neighbor downstream chain" {
         var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
         defer db.close();
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-        try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .in } });
-        try db.addEnrichment(.{ .name = "copied_context", .kind = .asset, .source_artifact_name = "context", .producer_json = "{\"type\":\"copy\"}" });
-        try db.addEnrichment(.{ .name = "mirrored_context", .kind = .asset, .source_artifact_name = "copied_context", .producer_json = "{\"type\":\"copy\"}" });
+        try db.enrichment.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .in } });
+        try db.enrichment.addEnrichment(.{ .name = "copied_context", .kind = .asset, .source_artifact_name = "context", .producer_json = "{\"type\":\"copy\"}" });
+        try db.enrichment.addEnrichment(.{ .name = "mirrored_context", .kind = .asset, .source_artifact_name = "copied_context", .producer_json = "{\"type\":\"copy\"}" });
         var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &producer, .vtable = &.{
             .produce = GateAssetProducer.produce,
             .produce_with_context = Fixture.produceBounded,
             .foreground_bounded = true,
             .invocation_memory_for_requests = GateAssetProducer.invocationMemory,
         } } };
-        try db.initOptionalEnrichmentRuntime(&config);
+        try db.enrichment.initRuntime(&config);
         try db.batch(.{ .writes = &.{ .{ .key = "b", .value = "{\"body\":\"Bob\"}" }, .{ .key = "c", .value = "{\"body\":\"Carol\"}" } }, .sync_level = sync_level });
         try Fixture.drain(&db);
         try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"b\",\"edge_id\":\"f\"}]}}}" }}, .sync_level = sync_level });
@@ -131817,15 +129639,15 @@ test "db graph fact generated projection wakes endpoint context" {
     try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json =
         \\{"source":{"artifact":"relations_v1","path":"$","nodes":{"source":"{{ _item.source }}","target":"{{ _item.target }}"},"edge":{"edge_id":"{{ _doc.key }}","type":"RELATES_TO"}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
     });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "facts", .direction = .out } });
+    try db.enrichment.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "facts", .direction = .out } });
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
-    try db.initOptionalEnrichmentRuntime(&config);
+    try db.enrichment.initRuntime(&config);
     try db.batch(.{ .writes = &.{.{ .key = "alice", .value = "{\"body\":\"Alice\"}" }}, .sync_level = .write });
-    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     try db.batch(.{ .writes = &.{.{ .key = "fact:works", .value = "{\"relations\":[{\"source\":\"alice\",\"target\":\"acme\"}]}" }}, .sync_level = .write });
     for (0..3) |_| {
-        try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+        try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
         try db.runDerivedUntil(db.core.nextDerivedSequence());
     }
     const entry = db.core.index_manager.graphIndex("facts").?;
@@ -131848,11 +129670,11 @@ test "db graph fact refresh bounds artifact work within one large record" {
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    try db.enrichment.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
     var producer = GateAssetProducer{};
     producer.allowAll();
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
-    try db.initOptionalEnrichmentRuntime(&config);
+    try db.enrichment.initRuntime(&config);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -131866,7 +129688,7 @@ test "db graph fact refresh bounds artifact work within one large record" {
     const tip = db.core.store.lastReplaySequence(0);
     try std.testing.expect((try db.core.loadAppliedSequence(alloc, "g")) < tip);
     try std.testing.expect((try before_entry.index.artifactRebuildSequence()) < tip);
-    const source = db.enrichment_runtime.?.config.neighbor_context_graph_source.?;
+    const source = db.enrichment.runtime.?.config.neighbor_context_graph_source.?;
     const checkpoint = try db.core.loadAppliedSequence(alloc, "g");
     try std.testing.expectError(error.GraphSourceReplayPending, source.acquire_fn(source.ptr, "g"));
     try std.testing.expect(before_entry.neighbor_refresh.sequence != 0);
@@ -131900,8 +129722,8 @@ test "db graph fact neighbor dependency admission rejects indirect feedback" {
     defer tmp.cleanup();
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
-    try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "facts", .direction = .out } });
-    try db.addEnrichment(.{ .name = "copied_relations", .kind = .asset, .source_artifact_name = "relations", .producer_json = "{\"type\":\"copy\"}" });
+    try db.enrichment.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "facts", .direction = .out } });
+    try db.enrichment.addEnrichment(.{ .name = "copied_relations", .kind = .asset, .source_artifact_name = "relations", .producer_json = "{\"type\":\"copy\"}" });
     try std.testing.expectError(error.InvalidEnrichmentConfig, db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"copied_relations\"}}" }));
     try std.testing.expect(db.core.index_manager.graphIndex("facts") == null);
 }
@@ -131922,15 +129744,15 @@ test "db graph fact failed neighbor producer blocks downstream stale artifact co
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
-    try db.addEnrichment(.{ .name = "copied_context", .kind = .asset, .source_artifact_name = "context", .producer_json = "{\"type\":\"copy\"}" });
+    try db.enrichment.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    try db.enrichment.addEnrichment(.{ .name = "copied_context", .kind = .asset, .source_artifact_name = "context", .producer_json = "{\"type\":\"copy\"}" });
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
-    try db.initOptionalEnrichmentRuntime(&config);
+    try db.enrichment.initRuntime(&config);
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"old\"}" }}, .sync_level = .write });
-    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
     fixture.fail = true;
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"new\"}" }}, .sync_level = .write });
-    try std.testing.expectError(error.EnrichmentWorkerFailed, db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence()));
+    try std.testing.expectError(error.EnrichmentWorkerFailed, db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence()));
     const issues = try db.listArtifactRepairIssues(alloc, .asset, null, 0);
     defer types.freeArtifactRepairIssues(alloc, issues);
     const downstream_failed = for (issues) |issue| {
@@ -131962,8 +129784,8 @@ test "db graph fact orphan stages recover after reopen with no replay debt" {
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
     var config: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
-    try db.initOptionalEnrichmentRuntime(&config);
-    const runtime = db.enrichment_runtime.?;
+    try db.enrichment.initRuntime(&config);
+    const runtime = db.enrichment.runtime.?;
     const before = runtime.stats();
     try std.testing.expect(runtime.graph_stage_recovery_pending);
     try std.testing.expectError(error.EnrichmentWaitTimeout, runtime.catchUpUntilWithVisibilityDeadline(0, .{}, 0));
@@ -131993,8 +129815,8 @@ test "db graph fact orphan stage maintenance preserves terminal worker failure" 
     const stage = "\x00\x00__graph_stage__:v1:old";
     try db.core.store.put(stage, "unpublished");
     var config: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
-    try db.initOptionalEnrichmentRuntime(&config);
-    const runtime = db.enrichment_runtime.?;
+    try db.enrichment.initRuntime(&config);
+    const runtime = db.enrichment.runtime.?;
     runtime.worker_failed = true;
     runtime.last_error_name = "InvalidExtractorResponse";
     runtime.target_sequence = 1;
@@ -132015,7 +129837,7 @@ test "db graph fact generated replacement retains overlap and retires withdrawn 
         \\{"source":{"artifact":"relations_v1","path":"$","nodes":{"source":"{{ _item.source }}","target":"{{ _item.target }}"},"edge":{"edge_id":"{{ _doc.key }}","type":"RELATES_TO"}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
     });
     var config: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
-    try db.initOptionalEnrichmentRuntime(&config);
+    try db.enrichment.initRuntime(&config);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -132024,7 +129846,7 @@ test "db graph fact generated replacement retains overlap and retires withdrawn 
         for (rows, 0..) |*row, i| row.* = .{ .source = "alice", .target = try std.fmt.allocPrint(a, "target:{d}", .{i + phase * 48}) };
         const raw = try std.json.Stringify.valueAlloc(a, .{ .relations = rows }, .{});
         try db.batch(.{ .writes = &.{.{ .key = "facts-owner", .value = raw }}, .sync_level = .write });
-        try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+        try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
         try db.runDerivedUntil(db.core.nextDerivedSequence());
         const entry = db.core.index_manager.graphIndex("facts").?;
         const edges = try entry.index.getEdges(alloc, "alice", "RELATES_TO", .out);
@@ -132040,7 +129862,7 @@ test "db graph fact generated replacement retains overlap and retires withdrawn 
         }
     }
     try db.batch(.{ .deletes = &.{"facts-owner"}, .sync_level = .write });
-    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    try db.enrichment.runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     const edges = try db.core.index_manager.graphIndex("facts").?.index.getEdges(alloc, "alice", "RELATES_TO", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
@@ -132069,21 +129891,21 @@ test "db document extraction concurrent writes with unchanged TTL timestamps con
 
     try db.setSchema(.{ .version = 1, .ttl_duration_ns = 60 * std.time.ns_per_s, .ttl_field = "expires" });
 
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
         .field = "text",
         .source_artifact_name = "document_units_v1",
         .chunk_size = 256,
     });
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "document_chunk_dense_v1",
         .kind = .embedding,
         .field = "text",
@@ -132489,7 +130311,7 @@ test "document collectors release text projections and materialized values on al
     var db = try DB.open(alloc, directory.path(), .{});
     defer db.close();
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "caption", .kind = .asset, .field = "caption", .content_type = "text/plain" });
+    try db.enrichment.addEnrichment(.{ .name = "caption", .kind = .asset, .field = "caption", .content_type = "text/plain" });
     const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "caption");
     defer alloc.free(asset_key);
     const key = try replayDocumentStoreKeyAlloc(alloc, "normal", false);
@@ -132537,8 +130359,8 @@ test "document collectors asset projection borrows ordinary names and preserves 
     defer directory.cleanup();
     var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
     defer db.close();
-    try db.addEnrichment(.{ .name = "json", .kind = .asset, .field = "caption", .content_type = "application/json" });
-    try db.addEnrichment(.{ .name = "cap\x00tion", .kind = .asset, .field = "caption", .content_type = "text/plain" });
+    try db.enrichment.addEnrichment(.{ .name = "json", .kind = .asset, .field = "caption", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "cap\x00tion", .kind = .asset, .field = "caption", .content_type = "text/plain" });
     const ordinary = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc\x00id", "asset", "json");
     defer alloc.free(ordinary);
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
@@ -132568,7 +130390,7 @@ test "document collectors ordinary slab excludes projected assets" {
     var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
     defer db.close();
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "caption", .kind = .asset, .field = "caption", .content_type = "text/plain" });
+    try db.enrichment.addEnrichment(.{ .name = "caption", .kind = .asset, .field = "caption", .content_type = "text/plain" });
     const asset = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "caption");
     defer alloc.free(asset);
     const normal = try replayDocumentStoreKeyAlloc(alloc, "normal", false);
@@ -132806,7 +130628,7 @@ test "db extractEnrichments field-index planning is allocation atomic" {
     try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"rel\",\"field\":\"links\"}]}" });
     const Check = struct {
         fn run(failure_alloc: Allocator, target: *DB, value: []const u8) !void {
-            var result = try target.extractEnrichments(failure_alloc, &.{.{ .key = "doc", .value = value }});
+            var result = try target.enrichment.extractEnrichments(failure_alloc, &.{.{ .key = "doc", .value = value }});
             defer result.deinit(failure_alloc);
             try std.testing.expectEqual(@as(usize, 1), result.cleaned_writes.len);
             if (std.mem.indexOf(u8, value, "target") != null) {
@@ -132847,7 +130669,7 @@ test "artifact projection construction releases failures with real local resourc
     defer directory.cleanup();
     var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
     defer db.close();
-    try db.addEnrichment(.{ .name = "structured", .kind = .asset, .field = "body", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "structured", .kind = .asset, .field = "body", .content_type = "application/json" });
     const Check = struct {
         fn run(failing: Allocator, source: read_projection.Source, kind: types.ArtifactKind, raw: []const u8) !void {
             var value = try read_projection.artifactProjectionValue(source, failing, .{
@@ -133339,7 +131161,7 @@ test "capi resolver replacement builds while replay gates remain available" {
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
     try db.addResolver(.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ uslug _entity.text }}", .promote = false });
     var enrichment_config: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
-    try db.initOptionalEnrichmentRuntime(&enrichment_config);
+    try db.enrichment.initRuntime(&enrichment_config);
     try db.batch(.{ .writes = &.{.{ .key = "claim", .value = "{\"kg\":{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]}}" }} });
     try db.runUntilIdle();
     {
@@ -133353,10 +131175,10 @@ test "capi resolver replacement builds while replay gates remain available" {
         fn call(database: *DB) anyerror!void {
             observed = true;
             try std.testing.expect(try database.core.index_manager.clampReplayForGraphReplacementBuilds(database.core.store, 99) <= database.core.nextDerivedSequence());
-            const resolution = database.resolution_runtime orelse return error.TestExpectedEqual;
+            const resolution = database.enrichment.resolution.runtime orelse return error.TestExpectedEqual;
             try std.testing.expect(resolution.catch_up_mutex.tryLock());
             resolution.catch_up_mutex.unlock();
-            if (database.promotion_runtime) |promotion| {
+            if (database.enrichment.promotion.runtime) |promotion| {
                 try std.testing.expect(promotion.catch_up_mutex.tryLock());
                 promotion.catch_up_mutex.unlock();
             }
@@ -134212,7 +132034,7 @@ test "capi resolver topology busy leaves pending replacement and resolver config
         try txn.commit();
     }
     resolver.min_confidence = 0.4;
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.upsertResolverWithResultOptions(resolver, .{ .drain_backfill = false }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.enrichment.upsertResolverWithResultOptions(resolver, .{ .drain_backfill = false }));
     try std.testing.expectEqual(@as(?f64, 0.2), db.core.index_manager.getResolver("concepts").?.min_confidence);
     {
         const pending = try db.indexes.graph.replacementStatusAlloc(a);
@@ -134227,7 +132049,7 @@ test "capi resolver topology busy leaves pending replacement and resolver config
         try topology.stageCancel(&txn, fence);
         try txn.commit();
     }
-    _ = try db.upsertResolverWithResultOptions(resolver, .{ .drain_backfill = false });
+    _ = try db.enrichment.upsertResolverWithResultOptions(resolver, .{ .drain_backfill = false });
     try db.runUntilIdle();
     try db.indexes.graph.waitReplacement("new", generation, 0);
     try std.testing.expectEqual(@as(?f64, 0.4), db.core.index_manager.getResolver("concepts").?.min_confidence);
@@ -134503,14 +132325,14 @@ test "inline resolver replacement replays graph producers without staged resolve
             var db = try DB.open(a, directory.path(), options);
             defer db.close();
             try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
-            if (mode != 0) _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .promote = false, .inline_managed = true }, .{ .drain_backfill = false });
+            if (mode != 0) _ = try db.enrichment.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .promote = false, .inline_managed = true }, .{ .drain_backfill = false });
             for (0..40) |i| {
                 const key = try std.fmt.allocPrint(a, "claim:{d:0>3}", .{i});
                 defer a.free(key);
                 try db.batch(.{ .writes = &.{.{ .key = key, .value = "{\"relations\":[{\"type\":\"mentions\",\"target\":\"doc:b\"}]}" }} });
             }
             try db.runUntilIdle();
-            try std.testing.expect(db.enrichment_runtime == null);
+            try std.testing.expect(db.enrichment.runtime == null);
             generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = next });
             try std.testing.expectEqual(mode, db.core.index_manager.resolvers.items.len);
             if (mode == 0) {
@@ -134543,12 +132365,12 @@ test "inline resolver replacement replays graph producers without staged resolve
             try std.testing.expectEqual(mode == 0, jobs.value[0].producer_replay_resume_b64 != null);
             try std.testing.expect(jobs.value[0].producer_replay_target > 0);
             try std.testing.expect(db.indexGeneration("new") == null);
-            try std.testing.expect(!db.enrichment_runtime.?.isStarted());
+            try std.testing.expect(!db.enrichment.runtime.?.isStarted());
         }
         {
             var db = try DB.open(a, directory.path(), options);
             defer db.close();
-            try std.testing.expect(db.enrichment_runtime == null);
+            try std.testing.expect(db.enrichment.runtime == null);
             try db.runUntilIdle();
             try db.indexes.graph.waitReplacement("new", generation, 0);
             for (0..40) |i| {
@@ -134559,7 +132381,7 @@ test "inline resolver replacement replays graph producers without staged resolve
                 try std.testing.expectEqual(@as(usize, 1), edges.len);
                 try std.testing.expectEqualStrings("doc:b", edges[0].target);
             }
-            try std.testing.expect(!db.enrichment_runtime.?.isStarted());
+            try std.testing.expect(!db.enrichment.runtime.?.isStarted());
         }
     }
 }
@@ -134577,13 +132399,13 @@ test "inline resolver replacement creates a synchronous enrichment driver on an 
     const next = try inlineResolverReplacementConfigAlloc(a, "kg_v2", "resolved_v2", "entity/{{ uslug _entity.text }}");
     defer a.free(next);
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
-    _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .promote = false, .inline_managed = true }, .{ .drain_backfill = false });
+    _ = try db.enrichment.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .promote = false, .inline_managed = true }, .{ .drain_backfill = false });
     const generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = next });
-    try std.testing.expect(db.enrichment_runtime == null);
+    try std.testing.expect(db.enrichment.runtime == null);
     try db.runUntilIdle();
     try db.indexes.graph.waitReplacement("new", generation, 0);
-    try std.testing.expect(db.enrichment_runtime != null);
-    try std.testing.expect(!db.enrichment_runtime.?.isStarted());
+    try std.testing.expect(db.enrichment.runtime != null);
+    try std.testing.expect(!db.enrichment.runtime.?.isStarted());
     try std.testing.expectEqualStrings("kg_v2", db.core.index_manager.getResolver("concepts").?.source_artifact);
 }
 
@@ -134596,8 +132418,8 @@ test "inline resolver replacement fences ownership in both reservation orders an
         defer runtime.deinit();
         var db = try DB.open(a, directory.path(), .{ .backend_runtime = runtime.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_independent_maintenance = false });
         defer db.close();
-        try db.initResolutionRuntime();
-        try db.initPromotionRuntime();
+        try db.enrichment.initResolutionRuntime();
+        try db.enrichment.initPromotionRuntime();
         const old = try inlineResolverReplacementConfigAlloc(a, "kg_v1", "resolved_v1", "entity/{{ uslug _entity.text }}");
         defer a.free(old);
         const next = try inlineResolverReplacementConfigAlloc(a, "kg_v2", "resolved_v2", "entity/{{ uslug _entity.text }}");
@@ -134605,7 +132427,7 @@ test "inline resolver replacement fences ownership in both reservation orders an
         const fields = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
         try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
         try db.addIndex(.{ .name = "other", .kind = .graph, .config_json = fields });
-        _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .promote = false, .inline_managed = true }, .{ .drain_backfill = false });
+        _ = try db.enrichment.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .promote = false, .inline_managed = true }, .{ .drain_backfill = false });
         if (mode == 1) {
             _ = try db.replaceGraphIndex("other", .{ .name = "z_sharing", .kind = .graph, .config_json = old });
             try std.testing.expectError(error.ResolverReplacementOwnershipConflict, db.replaceGraphIndex("old", .{ .name = "a_changing", .kind = .graph, .config_json = next }));
@@ -134677,9 +132499,9 @@ test "inline resolver replacement producer pages bound physical records bytes an
     const sequence = db.core.nextDerivedSequence();
     try std.testing.expect(try db.indexes.graph.advanceReplacementUntil(100));
     try std.testing.expectEqual(sequence, db.core.nextDerivedSequence());
-    try std.testing.expect(db.enrichment_runtime == null);
+    try std.testing.expect(db.enrichment.runtime == null);
     try db.indexes.graph.ensureReplacementEnrichmentRuntime();
-    var expired = try db.appendGeneratedEnrichmentsFromStoredDocsPage(a, &.{"relations"}, true, null, 32, .{ .deadline_ns = 100 });
+    var expired = try db.enrichment.appendGeneratedEnrichmentsFromStoredDocsPage(a, &.{"relations"}, true, null, 32, .{ .deadline_ns = 100 });
     defer expired.deinit(a);
     try std.testing.expect(!expired.complete);
     try std.testing.expectEqual(@as(usize, 0), expired.documents_scanned);
@@ -134692,7 +132514,7 @@ test "inline resolver replacement producer pages bound physical records bytes an
         var empty_pages: usize = 0;
         var completed = false;
         for (0..256) |_| {
-            var page = try db.appendGeneratedEnrichmentsFromStoredDocsPage(a, &.{"relations"}, true, page_resume, 32, budget);
+            var page = try db.enrichment.appendGeneratedEnrichmentsFromStoredDocsPage(a, &.{"relations"}, true, page_resume, 32, budget);
             defer page.deinit(a);
             documents += page.documents_scanned;
             refs += page.generated_ref_count;
@@ -134745,12 +132567,12 @@ test "inline resolver replacement gates promotion until durable activation acros
             {
                 var db = try DB.open(a, directory.path(), options);
                 defer db.close();
-                try db.initResolutionRuntime();
-                try db.initPromotionRuntime();
+                try db.enrichment.initResolutionRuntime();
+                try db.enrichment.initPromotionRuntime();
                 var enrichment: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
-                try db.initOptionalEnrichmentRuntime(&enrichment);
+                try db.enrichment.initRuntime(&enrichment);
                 try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
-                _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .promote = true, .inline_managed = true, .retain_work = if (std.mem.eql(u8, retention, "none")) .none else .full }, .{ .drain_backfill = false });
+                _ = try db.enrichment.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .promote = true, .inline_managed = true, .retain_work = if (std.mem.eql(u8, retention, "none")) .none else .full }, .{ .drain_backfill = false });
                 try db.batch(.{ .writes = &.{.{ .key = "claim", .value = "{\"kg\":{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]},\"kg_next\":{\"entities\":[{\"id\":\"a\",\"text\":\"Grace\",\"label\":\"person\"}]}}" }} });
                 try db.runUntilIdle();
                 try std.testing.expectEqual(@as(usize, 1), sink.count());
@@ -134758,10 +132580,10 @@ test "inline resolver replacement gates promotion until durable activation acros
                 // Drive producers/resolution/promotion without constructing or
                 // activating the shadow graph. Serving promotion stays live.
                 try std.testing.expect(try db.indexes.graph.advanceReplacement());
-                try db.enrichment_runtime.?.catchUpUntil(db.core.nextDerivedSequence());
-                try db.resolution_runtime.?.catchUp();
-                db.promotion_runtime.?.notifySequence(db.core.nextDerivedSequence());
-                try db.promotion_runtime.?.catchUp();
+                try db.enrichment.runtime.?.catchUpUntil(db.core.nextDerivedSequence());
+                try db.enrichment.resolution.runtime.?.catchUp();
+                db.enrichment.promotion.runtime.?.notifySequence(db.core.nextDerivedSequence());
+                try db.enrichment.promotion.runtime.?.catchUp();
                 const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(a, "claim", "resolved_v2");
                 defer a.free(resolution_key);
                 const resolved = try db.core.store.get(a, resolution_key);
@@ -134825,7 +132647,7 @@ test "inline resolver replacement preserves shared explicit and upstream produce
             defer db.close();
             try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = "{}" });
             const config = "{\"source\":{\"artifact\":\"relations\",\"format\":\"extraction_relation\"},\"artifact\":{\"name\":\"relations\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"},\"content_type\":\"application/json\"}}";
-            if (mode == 5) try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "relations", .content_type = "application/json" });
+            if (mode == 5) try db.enrichment.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "relations", .content_type = "application/json" });
             _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
             {
                 var probe = try db.core.store.beginProbeTxn();
@@ -134834,12 +132656,12 @@ test "inline resolver replacement preserves shared explicit and upstream produce
                 try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, @import("catalog/resolver_catalog.zig").readMinimumReaderVersion(&probe, 2));
             }
             if (mode == 1) try db.addIndex(.{ .name = "shared", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"relations\",\"format\":\"extraction_relation\"}}" });
-            if (mode == 2) _ = try db.upsertEnrichment(.{ .name = "relations", .kind = .asset, .field = "relations", .content_type = "application/json" });
+            if (mode == 2) _ = try db.enrichment.upsertEnrichment(.{ .name = "relations", .kind = .asset, .field = "relations", .content_type = "application/json" });
             if (mode == 3) {
                 try db.addIndex(.{ .name = "other", .kind = .graph, .config_json = "{}" });
                 _ = try db.replaceGraphIndex("other", .{ .name = "other_new", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"relations\",\"format\":\"extraction_relation\"}}" });
             }
-            if (mode == 4) try db.addEnrichment(.{ .name = "copied_relations", .kind = .asset, .source_artifact_name = "relations", .producer_json = "{\"type\":\"copy\"}" });
+            if (mode == 4) try db.enrichment.addEnrichment(.{ .name = "copied_relations", .kind = .asset, .source_artifact_name = "relations", .producer_json = "{\"type\":\"copy\"}" });
             try std.testing.expect(try db.indexes.graph.cancelReplacement("new"));
             if ((mode != 0) != (db.core.index_manager.getEnrichment(.asset, "relations") != null))
                 std.debug.print("producer ownership mode {d}\n", .{mode});
@@ -134922,10 +132744,10 @@ test "inline resolver replacement preserves serving identity and curated replay 
     {
         var db = try DB.open(a, directory.path(), options);
         defer db.close();
-        try db.initResolutionRuntime();
-        try db.initPromotionRuntime();
+        try db.enrichment.initResolutionRuntime();
+        try db.enrichment.initPromotionRuntime();
         try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
-        _ = try db.upsertResolverWithResultOptions(.{
+        _ = try db.enrichment.upsertResolverWithResultOptions(.{
             .name = "concepts",
             .table = "default",
             .source_artifact = "kg_v1",
@@ -134939,7 +132761,7 @@ test "inline resolver replacement preserves serving identity and curated replay 
             .merge_state_version = 1,
         }, .{ .drain_backfill = false });
         var enrichment: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
-        try db.initOptionalEnrichmentRuntime(&enrichment);
+        try db.enrichment.initRuntime(&enrichment);
         try db.batch(.{ .writes = &.{.{ .key = "claim", .value = "{\"kg\":{\"entities\":[{\"id\":\"a\",\"text\":\"Grace\",\"label\":\"person\"}]}}" }} });
         for (0..40) |i| {
             const key = try std.fmt.allocPrint(a, "extra:{d:0>3}", .{i});
@@ -134962,8 +132784,8 @@ test "inline resolver replacement preserves serving identity and curated replay 
         try std.testing.expectEqual(@as(usize, 1), visible.len);
         var change = visible[0];
         change.min_confidence = 0.4;
-        try std.testing.expectError(error.IndexReplacementPending, db.upsertResolverWithResultOptions(change, .{ .drain_backfill = false }));
-        try std.testing.expectError(error.IndexReplacementPending, db.removeResolverWithoutDrain("concepts"));
+        try std.testing.expectError(error.IndexReplacementPending, db.enrichment.upsertResolverWithResultOptions(change, .{ .drain_backfill = false }));
+        try std.testing.expectError(error.IndexReplacementPending, db.enrichment.removeResolverWithoutDrain("concepts"));
         try std.testing.expect(try db.indexes.graph.advanceReplacement());
         const progress = try db.indexes.graph.replacementStatusAlloc(a);
         defer progress.deinit();
@@ -134978,10 +132800,10 @@ test "inline resolver replacement preserves serving identity and curated replay 
     {
         var db = try DB.open(a, directory.path(), options);
         defer db.close();
-        try std.testing.expect(db.enrichment_runtime == null);
+        try std.testing.expect(db.enrichment.runtime == null);
         try db.runUntilIdle();
-        try std.testing.expect(db.enrichment_runtime != null);
-        try std.testing.expect(!db.enrichment_runtime.?.isStarted());
+        try std.testing.expect(db.enrichment.runtime != null);
+        try std.testing.expect(!db.enrichment.runtime.?.isStarted());
         try db.indexes.graph.waitReplacement("new", generation, 0);
         const successor = db.core.index_manager.getResolver("concepts").?;
         try std.testing.expectEqualStrings("kg_v2", successor.source_artifact);
@@ -135013,7 +132835,7 @@ test "inline resolver replacement cancellation preserves identity and permits a 
     const old = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}],\"resolvers\":[{\"name\":\"concepts\"}]}";
     const next = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}],\"resolvers\":[{\"name\":\"concepts\",\"table\":\"default\",\"source_artifact\":\"kg_v2\",\"resolution_artifact\":\"resolved_v2\",\"key_template\":\"entity/{{ uslug _entity.text }}\",\"promote\":false}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
-    _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ slug _entity.text }}", .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
+    _ = try db.enrichment.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ slug _entity.text }}", .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
     _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = next });
     const attempt_generation = db.core.index_manager.resolvers.items[1].effectiveGeneration();
     try std.testing.expect(try db.indexes.graph.cancelReplacement("new"));
@@ -135038,7 +132860,7 @@ test "inline resolver replacement rejects independently owned and shared identit
         const next = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}],\"resolvers\":[{\"name\":\"concepts\",\"table\":\"default\",\"source_artifact\":\"kg_v2\",\"resolution_artifact\":\"resolved_v2\",\"key_template\":\"entity/{{ uslug _entity.text }}\"}]}";
         try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
         if (mode == 1) try db.addIndex(.{ .name = "shared", .kind = .graph, .config_json = old });
-        _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ slug _entity.text }}", .inline_managed = mode != 0, .aliases = if (mode == 2) &.{.{ .key = "a", .target = "b" }} else &.{} }, .{ .drain_backfill = false });
+        _ = try db.enrichment.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ slug _entity.text }}", .inline_managed = mode != 0, .aliases = if (mode == 2) &.{.{ .key = "a", .target = "b" }} else &.{} }, .{ .drain_backfill = false });
         const expected = if (mode == 2) error.ResolverMergeNamespaceChange else error.ResolverReplacementOwnershipConflict;
         try std.testing.expectError(expected, db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = next }));
         try std.testing.expectEqual(@as(usize, 1), db.core.index_manager.resolvers.items.len);
@@ -135204,7 +133026,7 @@ test "inline resolver replacement manual wait drives producer and resolution dep
     const next = try inlineResolverReplacementConfigAlloc(a, "kg_v2", "resolved_v2", "entity/{{ uslug _entity.text }}");
     defer a.free(next);
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
-    _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
+    _ = try db.enrichment.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
     for (0..3) |i| {
         const key = try std.fmt.allocPrint(a, "claim:{d:0>3}", .{i});
         defer a.free(key);
@@ -135217,11 +133039,11 @@ test "inline resolver replacement manual wait drives producer and resolution dep
         defer jobs.deinit();
         const status = try std.json.Stringify.valueAlloc(a, jobs.value, .{});
         defer a.free(status);
-        std.debug.print("manual replacement {s}; enrichment={any}; resolution={any}\n", .{ status, db.enrichment_runtime.?.stats(), db.resolutionStageStats() });
+        std.debug.print("manual replacement {s}; enrichment={any}; resolution={any}\n", .{ status, db.enrichment.runtime.?.stats(), db.enrichment.resolutionStageStats() });
         return err;
     };
-    try std.testing.expect(!db.enrichment_runtime.?.isStarted());
-    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.enrichment.runtime.?.isStarted());
+    try std.testing.expect(!db.enrichment.resolution.runtime.?.worker_started.load(.acquire));
     for (0..3) |i| {
         const key = try std.fmt.allocPrint(a, "claim:{d:0>3}", .{i});
         defer a.free(key);
@@ -135243,9 +133065,9 @@ test "inline resolver replacement replays staged sources absent from graph sourc
     const old = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}],\"resolvers\":[{\"name\":\"concepts\"}]}";
     const next = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}],\"resolvers\":[{\"name\":\"concepts\",\"table\":\"default\",\"source_artifact\":\"kg_v2\",\"resolution_artifact\":\"resolved_v2\",\"key_template\":\"entity/{{ uslug _entity.text }}\",\"promote\":false}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
-    _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
+    _ = try db.enrichment.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
     try db.batch(.{ .writes = &.{.{ .key = "claim", .value = "{\"kg\":{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]}}" }} });
-    try db.addEnrichment(.{ .name = "kg_v2", .kind = .asset, .field = "kg", .content_type = "application/json" });
+    try db.enrichment.addEnrichment(.{ .name = "kg_v2", .kind = .asset, .field = "kg", .content_type = "application/json" });
     const generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = next });
     {
         const jobs = try db.indexes.graph.replacementStatusAlloc(a);
@@ -135318,11 +133140,11 @@ test "inline resolver replacement resolution deadline resumes a large record acr
     {
         var db = try DB.open(a, directory.path(), options);
         defer db.close();
-        _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ uslug _entity.text }}", .promote = false }, .{ .drain_backfill = false });
+        _ = try db.enrichment.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ uslug _entity.text }}", .promote = false }, .{ .drain_backfill = false });
         try db.runUntilIdle();
         for (source_keys) |key| try db.core.store.put(key, "{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]}");
         sequence = try appendDerivedBatchRecord(&db, .{ .changed_artifact_keys = &source_keys });
-        const runtime = db.resolution_runtime.?;
+        const runtime = db.enrichment.resolution.runtime.?;
         runtime.notifySequence(sequence);
         runtime.ordered_writer = .{ .ptr = &db, .process = Clock.process };
         try runtime.catchUpOnce(0);
@@ -135341,7 +133163,7 @@ test "inline resolver replacement resolution deadline resumes a large record acr
     {
         var db = try DB.open(a, directory.path(), options);
         defer db.close();
-        const runtime = db.resolution_runtime.?;
+        const runtime = db.enrichment.resolution.runtime.?;
         try std.testing.expectEqual(@as(usize, 1), runtime.replay_progress.?.next_key);
         runtime.ordered_writer = .{ .ptr = &db, .process = Clock.process };
         try runtime.catchUpOnce(2);
@@ -135349,7 +133171,7 @@ test "inline resolver replacement resolution deadline resumes a large record acr
         try runtime.catchUpOnce(std.math.maxInt(u64));
         try std.testing.expectEqual(@as(usize, 34), runtime.replay_progress.?.next_key);
         // Ordinary drains/workers must honor a manual owner's partial cut.
-        runtime.ordered_writer = .{ .ptr = db.resolution_append_context.?, .process = processOrderedResolutions };
+        runtime.ordered_writer = .{ .ptr = db.enrichment.resolution.append_context.?, .process = processOrderedResolutions };
         try db.runUntilIdle();
         try std.testing.expect(runtime.replay_progress == null);
         try std.testing.expect(runtime.applied_sequence.load(.acquire) >= sequence);
@@ -135391,11 +133213,11 @@ test "inline resolver replacement wait isolates later backed off producer failur
     }
     // An unrelated producer fault must not be observed by waiting for the
     // first ready replacement, which needs no producer work at all.
-    db.enrichment_runtime.?.worker_failed = true;
+    db.enrichment.runtime.?.worker_failed = true;
     try db.indexes.graph.waitReplacement("new_a", generation, 30_000);
     try std.testing.expect(db.indexGeneration("new_a") != null);
     try std.testing.expect(db.indexGeneration("old_b") != null);
-    try std.testing.expect(db.enrichment_runtime.?.worker_failed);
+    try std.testing.expect(db.enrichment.runtime.?.worker_failed);
 }
 
 test "inline resolver replacement named scheduler rejects a reused reservation generation" {
@@ -135450,14 +133272,14 @@ test "inline resolver replacement preserves serving sibling routing until durabl
         {
             var db = try DB.open(a, directory.path(), options);
             defer db.close();
-            try db.initResolutionRuntime();
-            try db.initPromotionRuntime();
+            try db.enrichment.initResolutionRuntime();
+            try db.enrichment.initPromotionRuntime();
             var enrichment: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
-            try db.initOptionalEnrichmentRuntime(&enrichment);
+            try db.enrichment.initRuntime(&enrichment);
             try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
-            _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "entities", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ slug _entity.text }}", .labels = &.{"person"}, .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
-            _ = try db.upsertResolverWithResultOptions(.{ .name = "fallback", .table = "entities", .source_artifact = "kg_v1", .resolution_artifact = "fallback_resolved", .key_template = "fallback/{{ slug _entity.text }}", .promote = false }, .{ .drain_backfill = false });
-            _ = try db.upsertResolverWithResultOptions(.{ .name = "events", .table = "entities", .source_artifact = "kg_v1", .resolution_artifact = "events_resolved", .key_template = "event/{{ hash _entity.event_identity }}", .labels = &.{"event"}, .promote = false }, .{ .drain_backfill = false });
+            _ = try db.enrichment.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "entities", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ slug _entity.text }}", .labels = &.{"person"}, .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
+            _ = try db.enrichment.upsertResolverWithResultOptions(.{ .name = "fallback", .table = "entities", .source_artifact = "kg_v1", .resolution_artifact = "fallback_resolved", .key_template = "fallback/{{ slug _entity.text }}", .promote = false }, .{ .drain_backfill = false });
+            _ = try db.enrichment.upsertResolverWithResultOptions(.{ .name = "events", .table = "entities", .source_artifact = "kg_v1", .resolution_artifact = "events_resolved", .key_template = "event/{{ hash _entity.event_identity }}", .labels = &.{"event"}, .promote = false }, .{ .drain_backfill = false });
             try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"kg\":{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"},{\"id\":\"b\",\"text\":\"Antfly\",\"label\":\"org\"}]}}" }} });
             try db.runUntilIdle();
             try Check.count(&db, 1);
@@ -135519,20 +133341,20 @@ test "inline resolver replacement isolates serving graph consumers and releases 
         {
             var db = try DB.open(a, directory.path(), options);
             defer db.close();
-            try db.initResolutionRuntime();
-            try db.initPromotionRuntime();
+            try db.enrichment.initResolutionRuntime();
+            try db.enrichment.initPromotionRuntime();
             try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
-            _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
-            try db.addEnrichment(.{ .name = "kg_v2", .kind = .asset, .field = "kg", .content_type = "application/json" });
+            _ = try db.enrichment.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
+            try db.enrichment.addEnrichment(.{ .name = "kg_v2", .kind = .asset, .field = "kg", .content_type = "application/json" });
             try db.addIndex(.{ .name = "serving", .kind = .graph, .config_json = serving });
             var enrichment: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
-            try db.initOptionalEnrichmentRuntime(&enrichment);
+            try db.enrichment.initRuntime(&enrichment);
             try db.batch(.{ .writes = &.{.{ .key = "claim", .value = document }} });
             try db.runUntilIdle();
             generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = next });
             try std.testing.expect(try db.indexes.graph.advanceReplacement());
-            try db.enrichment_runtime.?.catchUpUntil(db.core.nextDerivedSequence());
-            try db.resolution_runtime.?.catchUp();
+            try db.enrichment.runtime.?.catchUpUntil(db.core.nextDerivedSequence());
+            try db.enrichment.resolution.runtime.?.catchUp();
             try db.drainReplayStagesUntilStableWithOptions(.{});
             try std.testing.expect(db.indexGeneration("new") == null);
             // Foreground writes and endpoint reconstruction must use the same
@@ -135765,7 +133587,7 @@ test "grouped sources production yields across producer replacement and resumes 
         .enrichment = .{ .enable_without_producers = true },
     });
     defer db.closeOwned();
-    try db.addEnrichment(.{
+    try db.enrichment.addEnrichment(.{
         .name = "turns",
         .kind = .group,
         .source = .{ .group_by = "thread_id", .order_by = "ordinal", .segment_by = "turn_id", .field = "text" },
@@ -135786,7 +133608,7 @@ test "grouped sources production yields across producer replacement and resumes 
     Probe.called = false;
     DB.test_enrichment_reconfigure_after_detached_hook = Probe.run;
     defer DB.test_enrichment_reconfigure_after_detached_hook = null;
-    try db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true });
+    try db.enrichment.reconfigureRuntime(.{ .enable_without_producers = true });
     try std.testing.expect(Probe.called);
     try std.testing.expect(try db.documents.runGroupSourceSlice());
     try std.testing.expect(db.documents.group_sources.owner.state.submitted > 0);
@@ -135829,7 +133651,7 @@ test "grouped sources production publishes private units incrementally across de
     {
         const db = try DB.openOwned(a, path, .{ .enrichment = .{ .enable_without_producers = true } });
         defer db.closeOwned();
-        try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = config });
+        try db.enrichment.addEnrichment(.{ .name = "turns", .kind = .group, .source = config });
         try std.testing.expectError(error.InvalidBatchRequest, @import("../write.zig").validateGroupedSourceBatch(a, db, &.{.{ .key = "invalid", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"a\",\"ordinal\":\"invalid\",\"text\":\"source\"}" }}, &.{}, &.{}));
         try std.testing.expect((try db.lookup(a, "invalid", .{})) == null);
         try db.batchInternal(.{ .writes = &.{ .{ .key = "one", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"a\",\"ordinal\":1,\"text\":\"alpha\"}" }, .{ .key = "two", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"a\",\"ordinal\":2,\"text\":\"beta\"}" } }, .sync_level = .enrichments }, null, .{});
@@ -135878,7 +133700,7 @@ test "grouped sources production publishes private units incrementally across de
         defer a.free(old_unit);
         var replacement = config;
         replacement.max_bytes = 64;
-        _ = try db.upsertEnrichment(.{ .name = "turns", .kind = .group, .source = replacement });
+        _ = try db.enrichment.upsertEnrichment(.{ .name = "turns", .kind = .group, .source = replacement });
         const next_definition = @import("group_source_index.zig").Definition{ .table_incarnation = definition.table_incarnation, .configuration = groups.definitionDigest("turns", replacement) };
         try Harness.waitSnapshot(db, a, next_definition, "b", true);
         var retired = false;
@@ -135893,7 +133715,7 @@ test "grouped sources production publishes private units incrementally across de
         try std.testing.expect(retired);
         // Re-add an identical retired definition after its private records and
         // baseline checkpoint have been collected. It must rebuild the source.
-        _ = try db.upsertEnrichment(.{ .name = "turns", .kind = .group, .source = config });
+        _ = try db.enrichment.upsertEnrichment(.{ .name = "turns", .kind = .group, .source = config });
         try Harness.waitSnapshot(db, a, definition, "b", true);
         inline for (.{ @as(u32, 7), @as(u32, 8) }) |version| {
             const raw = try @import("catalog/resolver_catalog.zig").readerVersionBytes(version);
@@ -135922,13 +133744,13 @@ test "grouped sources production visibility retains its publication cut across l
     });
     defer db.close();
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread", .order_by = "ordinal", .field = "text" } });
-    try db.addEnrichment(.{ .name = "notes", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"generator\":{\"provider\":\"openai\",\"model\":\"fixture\",\"api_key\":\"fixture\"}}}" });
+    try db.enrichment.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread", .order_by = "ordinal", .field = "text" } });
+    try db.enrichment.addEnrichment(.{ .name = "notes", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"generator\":{\"provider\":\"openai\",\"model\":\"fixture\",\"api_key\":\"fixture\"}}}" });
     var fixture: Fixture = .{};
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
-    try db.initOptionalEnrichmentRuntime(&config);
+    try db.enrichment.initRuntime(&config);
     try db.batch(.{ .writes = &.{.{ .key = "earlier", .value = "{\"body\":\"first\"}" }}, .sync_level = .write });
-    const runtime = db.enrichment_runtime.?;
+    const runtime = db.enrichment.runtime.?;
     try runtime.catchUpUntilForDrain(db.core.nextDerivedSequence());
     var sequence = db.core.nextDerivedSequence();
     var phase: u8 = 1;
@@ -135962,7 +133784,7 @@ test "grouped sources production ordered transaction resolution never waits on d
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_independent_maintenance = false });
     defer db.close();
-    try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread", .order_by = "ordinal", .segment_by = "turn", .field = "text" } });
+    try db.enrichment.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread", .order_by = "ordinal", .segment_by = "turn", .field = "text" } });
     const txn = try db.beginTransaction(1);
     try db.writeTransaction(txn, .{ .writes = &.{.{ .key = "member", .value = "{\"thread\":\"t\",\"turn\":\"a\",\"ordinal\":1,\"text\":\"source\"}" }} });
     const Cancelled = struct {
@@ -136001,7 +133823,7 @@ fn testLiteExternalDenseLifecycle(recreate: bool) !void {
     var opts = OpenOptions{ .start_index_workers = recreate, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
     try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
     var db = try DB.open(a, path, opts);
-    db.run_until_idle_no_progress_timeout_ns = 5 * std.time.ns_per_s;
+    db.maintenance.run_until_idle.no_progress_timeout_ns = 5 * std.time.ns_per_s;
     defer db.close();
     const cfg: types.IndexConfig = .{ .name = "img", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}" };
     if (recreate) _ = try db.admitManagedIndex(cfg);
@@ -136061,7 +133883,7 @@ fn testLiteExternalDenseLifecycle(recreate: bool) !void {
     opts = .{ .start_index_workers = recreate, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
     try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
     db = try DB.open(a, path, opts);
-    db.run_until_idle_no_progress_timeout_ns = 5 * std.time.ns_per_s;
+    db.maintenance.run_until_idle.no_progress_timeout_ns = 5 * std.time.ns_per_s;
     try db.batch(.{ .writes = &.{.{ .key = "later", .value = "{\"body\":\"later write\",\"_embeddings\":{\"img\":[0.6,0.8,0]}}" }} });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(?u64, expected + 1), try DB.loadDenseArtifactTargetCounter(a, db.core.store, "img"));
@@ -136667,7 +134489,7 @@ test "db successful asset publication clears terminal debt but stale and failed 
         try std.testing.expectEqual(@as(usize, 1), issues.len);
     }
     try local_mutation.applyDerivedBatchToIndexContext(db.async_context, batch, .{ .name = "text", .kind = .full_text });
-    try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+    try db.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle();
     const issues = try db.listArtifactRepairIssues(a, .asset, "text", 0);
     defer types.freeArtifactRepairIssues(a, issues);
     try std.testing.expectEqual(@as(usize, 0), issues.len);
