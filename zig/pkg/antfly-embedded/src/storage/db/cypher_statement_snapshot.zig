@@ -46,6 +46,8 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
         graphs: []const cypher.catalog.Graph,
         catalog_guards: []cypher.catalog_guard.Guard,
         graph_index: usize = 0,
+        producer_visibility: cypher.producer_visibility.Memo = .{},
+        visibility_filter: ?@import("../../search/pattern_filter.zig").PreparedPatternFilter = null,
         tables: [1]Adapter.Table,
         adapter: Adapter,
         policy: @import("row_policy_gate.zig").Gate.Lease,
@@ -275,20 +277,27 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
             const examined = @max(membership.examined, seeds.items.len);
             return .{ .seeds = try seeds.toOwnedSlice(a), .examined = examined, .approximate = request.dense != null or request.dense_queries.len != 0 or request.query == .dense_knn or result.total_hits_relation != .exact };
         }
+        fn producerVisible(self: *Self, a: std.mem.Allocator, key: []const u8) !bool {
+            if (self.adapter.work) |work| try work.charge(work.ptr, 1);
+            var producer = (try self.db.getDocument(a, key, .{ .row_policy_principal_proof = self.input.principal_proof, .row_policy_database = self.input.database })) orelse return false;
+            defer producer.deinit(a);
+            if (self.input.filter_query_json.len != 0) {
+                if (self.visibility_filter == null) self.visibility_filter = try @import("../../search/pattern_filter.zig").PreparedPatternFilter.init(self.arena.allocator(), self.input.filter_query_json);
+                return self.visibility_filter.?.matchesJson(a, key, try std.json.parseFromSliceLeaky(std.json.Value, a, producer.json, .{ .parse_numbers = false }));
+            }
+            return true;
+        }
         fn projectRelationship(ptr: *anyopaque, a: std.mem.Allocator, relationship: *const cypher.value.Relationship) !?*const cypher.value.Relationship {
             const self = cast(ptr);
+            // Even a cached decision remains subordinate to current authority.
+            // The document bytes, TTL time and row filter belong to this cut.
+            try checkpoint(ptr);
             if (relationship.ownership != .explicit) {
-                const producer_identity = (try relationship.producingDocument(a)) orelse return error.CypherInvalidRelationship;
+                var identity_scratch = std.heap.ArenaAllocator.init(cypher.backend.reclaimingAllocator(a));
+                defer identity_scratch.deinit();
+                const producer_identity = (try relationship.producingDocument(identity_scratch.allocator())) orelse return error.CypherInvalidRelationship;
                 if (!std.mem.eql(u8, producer_identity.table, self.input.table)) return error.CypherInvalidRelationship;
-                // An artifact may override its source key. The producing row
-                // still owns its visibility, independently of both endpoints.
-                var producer = (try self.db.getDocument(a, producer_identity.key, .{ .row_policy_principal_proof = self.input.principal_proof, .row_policy_database = self.input.database })) orelse return null;
-                defer producer.deinit(a);
-                if (self.input.filter_query_json.len != 0) {
-                    var filter = try @import("../../search/pattern_filter.zig").PreparedPatternFilter.init(a, self.input.filter_query_json);
-                    defer filter.deinit();
-                    if (!try filter.matchesJson(a, producer_identity.key, try std.json.parseFromSliceLeaky(std.json.Value, a, producer.json, .{ .parse_numbers = false }))) return null;
-                }
+                if (!try self.producer_visibility.allows(a, producer_identity.key, self, producerVisible)) return null;
             }
             return relationship;
         }
@@ -424,6 +433,7 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
             self.db.close();
             if (comptime durable) self.source.releaseStatementQueryCut(.{ .id = &self.input.cut_id, .table_id = self.input.table_id, .expires_ms = self.input.expires_ms });
             self.policy.release();
+            if (self.visibility_filter) |*filter| filter.deinit();
             self.arena.deinit();
             self.a.destroy(self);
         }

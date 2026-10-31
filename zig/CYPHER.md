@@ -4866,3 +4866,35 @@ fallback regressions pass. Production disk safeguards and fixture headroom
 requirements are unchanged. Repository cache GC was attempted after the
 build and skipped because other native builds were active. The earlier
 enrichment owner-loss campaign remains outside this qualification.
+
+
+Producer visibility now uses reclaimable per-producer scratch instead of the
+owner reply arena. A retained owner prepares its effective row filter once and
+keeps a fixed 128-entry, four-way visibility memo (at most 256 key bytes per
+entry). Longer keys are not memoized and still release all decoding scratch.
+Only completed positive/negative decisions are retained. Every lookup remains
+subordinate to the owner checkpoint; cache misses charge actual producer reads.
+The memo and prepared filter belong to the immutable owner cut, including its
+principal, row policy and TTL time. SQL staged postimages keep their separate
+projection checks and producer masks. A public regression counts 128 parallel
+relationships from one 1 MiB producer under an effective row filter within an
+8 MiB query budget, then changes that producer's visibility in both directions
+across new statements while preserving its endpoints and relationships.
+
+Owner count reduction accepts a bounded vector of at most 64 total arguments.
+A single pass returns matched-row cardinality and non-NULL counts, allowing
+nullable property/parameter counts and multiple counts to share the same owner
+scan. Matching cardinality remains independent of the nullable counts and
+validates every partial (argument counts <= matched rows <= examined rows).
+The private RPC owns vector storage across decoding and native runtime
+boundaries; incomplete reductions still carry all discarded physical progress
+before fallback. Empty legacy requests retain the original COUNT(*) contract.
+
+The coordinator evaluates closed scalar expressions around the reduced counts,
+using the ordinary evaluator and original aggregate expression identities.
+This preserves column names, NULL behavior, lazy CASE branches and post-count
+arithmetic errors without transporting matched node rows. Mandatory COUNT(n)
+normalizes to COUNT(*). DISTINCT, optional matches, grouping bindings, fallible
+aggregate arguments and queries with additional semantic barriers retain their
+existing evaluators. This optimization reduces row transport to bounded owner
+partials; it does not exempt scans, filters or policies from their work budgets.

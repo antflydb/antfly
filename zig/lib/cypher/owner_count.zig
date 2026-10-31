@@ -37,7 +37,19 @@ pub fn expression(expr: *const ast.Expr, alias: ?[]const u8) bool {
         else => false,
     };
 }
+/// These arguments are total: moving their evaluation across owners cannot
+/// reorder scalar failures. Fallible expressions keep the scalar evaluator.
+pub fn argument(expr: *const ast.Expr, alias: ?[]const u8) bool {
+    return switch (expr.value) {
+        .literal, .parameter => true,
+        .variable => |name| alias != null and std.mem.eql(u8, name, alias.?),
+        .property => |p| argument(p.base, alias),
+        else => false,
+    };
+}
 pub fn eligible(input: b.CountInput) bool {
+    if (input.arguments.len > b.max_count_arguments) return false;
+    for (input.arguments) |expr| if (expr) |value| if (!argument(value, input.node.alias)) return false;
     if (input.node.labels.len != 1) return false;
     for (input.node.properties) |property| if (!expression(property.value, input.node.alias)) return false;
     if (input.predicate) |predicate| if (!expression(predicate, input.node.alias)) return false;
@@ -52,14 +64,42 @@ pub fn run(a: std.mem.Allocator, backend: b.Backend, graph: catalog.Graph, table
     callbacks.startup_work = null;
     const count: ast.Expr = .{ .span = .{}, .value = .{ .call = .{ .name = "count", .args = &.{}, .star = true } } };
     const path: ast.Path = .{ .span = .{}, .alias = null, .nodes = &.{input.node}, .edges = &.{} };
+    const calls = try a.alloc(ast.Expr, input.arguments.len + 1);
+    defer a.free(calls);
+    const items = try a.alloc(ast.Item, calls.len);
+    defer a.free(items);
+    const args = try a.alloc([1]*const ast.Expr, input.arguments.len);
+    defer a.free(args);
+    var initialized: usize = 0;
+    defer for (items[1..][0..initialized]) |item| a.free(item.alias.?);
+    calls[0] = count;
+    items[0] = .{ .expression = &calls[0], .alias = "_owner_rows" };
+    for (input.arguments, 0..) |expr, i| {
+        calls[i + 1] = count;
+        if (expr) |value| {
+            args[i] = .{value};
+            calls[i + 1].value.call.star = false;
+            calls[i + 1].value.call.args = &args[i];
+        }
+        items[i + 1] = .{ .expression = &calls[i + 1], .alias = try std.fmt.allocPrint(a, "_owner_count_{d}", .{i}) };
+        initialized += 1;
+    }
     const clauses = [_]ast.Clause{
         .{ .span = .{}, .operation = .{ .match = .{ .paths = &.{path}, .predicate = input.predicate } } },
-        .{ .span = .{}, .operation = .{ .project = .{ .final = true, .value = .{ .items = &.{.{ .expression = &count, .alias = "_owner_count" }} } } } },
+        .{ .span = .{}, .operation = .{ .project = .{ .final = true, .value = .{ .items = items } } } },
     };
     var compiled: @import("compiler.zig").Compiled = .{ .arena = .init(a), .query = .{ .source = input.source, .clauses = &clauses }, .parameters = &.{} };
     defer compiled.deinit();
     var result = try @import("runtime.zig").executeWithWork(a, .{ .ptr = backend.ptr, .vtable = &callbacks }, graph, &compiled, input.parameters, .{ .scanned_anchors = input.max_examined, .intermediate_states = input.max_work, .memory_bytes = input.memory_bytes }, work);
     defer result.deinit();
-    if (result.rows.len != 1 or result.rows[0].len != 1 or result.rows[0][0] != .integer or result.rows[0][0].integer < 0) return error.CypherInvalidBackendPage;
-    return .{ .count = @intCast(result.rows[0][0].integer), .examined = result.stats.scanned_anchors };
+    if (result.rows.len != 1 or result.rows[0].len != items.len or result.rows[0][0] != .integer or result.rows[0][0].integer < 0) return error.CypherInvalidBackendPage;
+    const counts = try a.alloc(usize, input.arguments.len);
+    errdefer a.free(counts);
+    for (counts, result.rows[0][1..]) |*out, value| {
+        if (value != .integer or value.integer < 0) return error.CypherInvalidBackendPage;
+        out.* = @intCast(value.integer);
+    }
+    const out: b.CountResult = .{ .count = @intCast(result.rows[0][0].integer), .counts = counts, .examined = result.stats.scanned_anchors };
+    try out.validateFor(input.max_examined, input.arguments.len);
+    return out;
 }

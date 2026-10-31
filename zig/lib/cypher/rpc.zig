@@ -89,7 +89,7 @@ pub const BatchReply = struct {
         return .{ .pages = pages, .examined = self.examined };
     }
 };
-pub const CountRequest = struct { node: ast.Node, predicate: ?*const ast.Expr = null, parameters: wire.Value, source: []const u8 = "", memory_bytes: usize = 64 << 20 };
+pub const CountRequest = struct { arguments: []const ?*const ast.Expr = &.{}, node: ast.Node, predicate: ?*const ast.Expr = null, parameters: wire.Value, source: []const u8 = "", memory_bytes: usize = 64 << 20 };
 pub const Request = struct {
     operation: Operation,
     count: ?CountRequest = null,
@@ -146,6 +146,7 @@ pub const Reply = struct {
     /// scratch (including per-document decoding) has been reclaimed.
     pub fn clone(self: Reply, a: A) !Reply {
         var out = self;
+        if (self.count) |result| out.count.?.counts = try a.dupe(usize, result.counts);
         try b.validateAdjacencyRoutes(self.adjacency_routes);
         const routes = try a.dupe(b.AdjacencyRoute, self.adjacency_routes);
         for (routes) |*route| {
@@ -418,7 +419,7 @@ pub const Client = struct {
     }
     fn countNodes(ptr: *anyopaque, a: A, table: []const u8, input: b.CountInput) !?b.CountResult {
         const self = cast(ptr);
-        const request: Request = .{ .read_fields = self.read_fields, .operation = .count, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .max_examined = input.max_examined, .max_work = input.max_work, .count = .{ .node = input.node, .predicate = input.predicate, .parameters = .{ .value = .{ .map = input.parameters } }, .source = input.source, .memory_bytes = input.memory_bytes } };
+        const request: Request = .{ .read_fields = self.read_fields, .operation = .count, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .max_examined = input.max_examined, .max_work = input.max_work, .count = .{ .arguments = input.arguments, .node = input.node, .predicate = input.predicate, .parameters = .{ .value = .{ .map = input.parameters } }, .source = input.source, .memory_bytes = input.memory_bytes } };
         var size = std.Io.Writer.Discarding.init(&.{});
         try std.json.Stringify.value(request, .{}, &size.writer);
         if (size.fullCount() > (1 << 20) - 2048) return null;
@@ -426,8 +427,13 @@ pub const Client = struct {
         defer arena.deinit();
         const reply = try self.invoke(arena.allocator(), request);
         if (reply.values.len != 0 or reply.next != null or reply.batch != null) return error.CypherInvalidBackendPage;
-        if (reply.count) |result| try result.validate(input.max_examined);
-        return reply.count;
+        if (reply.count) |result| {
+            try result.validateFor(input.max_examined, input.arguments.len);
+            var owned = result;
+            owned.counts = try a.dupe(usize, result.counts);
+            return owned;
+        }
+        return null;
     }
     fn probeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?b.Probe {
         const self = cast(ptr);
@@ -624,8 +630,8 @@ pub const Owner = struct {
                 const input = request.count orelse return error.CypherInvalidBackendPage;
                 if (input.parameters.value != .map) return error.InvalidCypherParameters;
                 const read = self.backend.vtable.count_nodes orelse return .{ .work = meter.units };
-                const result = read(self.backend.ptr, scratch, request.table, .{ .node = input.node, .predicate = input.predicate, .parameters = input.parameters.value.map, .source = input.source, .max_examined = request.max_examined, .max_work = request.max_work, .memory_bytes = @min(input.memory_bytes, 64 << 20) }) catch |err| return self.readFailure(meter.units, err);
-                if (result) |attempt| try attempt.validate(request.max_examined);
+                const result = read(self.backend.ptr, scratch, request.table, .{ .arguments = input.arguments, .node = input.node, .predicate = input.predicate, .parameters = input.parameters.value.map, .source = input.source, .max_examined = request.max_examined, .max_work = request.max_work, .memory_bytes = @min(input.memory_bytes, 64 << 20) }) catch |err| return self.readFailure(meter.units, err);
+                if (result) |attempt| try attempt.validateFor(request.max_examined, input.arguments.len);
                 try self.backend.vtable.checkpoint(self.backend.ptr);
                 return .{ .count = result, .work = meter.units };
             },
@@ -1238,4 +1244,30 @@ test "count attempts preserve incomplete progress and reject false cardinalities
     const legacy = try std.json.parseFromSliceLeaky(Reply, arena.allocator(), "{\"count\":{\"count\":3,\"examined\":4}}", .{});
     try std.testing.expect(legacy.count.?.complete);
     try legacy.count.?.validate(8);
+}
+
+test "count vectors validate shape cardinality and own reply storage" {
+    const Fixture = struct {
+        counts: [2]usize = .{ 2, 1 },
+        fn wireCall(_: *anyopaque, _: A, _: []const u8) ![]u8 {
+            return error.TestUnexpectedWireCall;
+        }
+        fn call(ptr: *anyopaque, _: A, _: Request) !Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .count = .{ .count = 3, .examined = 4, .counts = &self.counts } };
+        }
+    };
+    var fixture: Fixture = .{};
+    var client: Client = .{ .channel = .{ .ptr = &fixture, .call = Fixture.wireCall, .typed = Fixture.call }, .incarnation = 1, .revision = 1 };
+    const backend = client.backend();
+    var input: b.CountInput = .{ .arguments = &.{ null, null }, .node = .{ .span = .{}, .alias = "n", .labels = &.{"D"}, .properties = &.{} }, .max_examined = 8 };
+    const result = (try backend.vtable.count_nodes.?(backend.ptr, std.testing.allocator, "docs", input)).?;
+    defer std.testing.allocator.free(result.counts);
+    fixture.counts[0] = 1;
+    try std.testing.expectEqual(@as(usize, 2), result.counts[0]);
+    input.arguments = &.{null};
+    try std.testing.expectError(error.CypherInvalidBackendPage, backend.vtable.count_nodes.?(backend.ptr, std.testing.allocator, "docs", input));
+    input.arguments = &.{ null, null };
+    fixture.counts[0] = 4;
+    try std.testing.expectError(error.CypherInvalidBackendPage, backend.vtable.count_nodes.?(backend.ptr, std.testing.allocator, "docs", input));
 }

@@ -8603,42 +8603,79 @@ const Engine = struct {
         }
         return original;
     }
+    /// Residual output may use reduced counts and closed scalar expressions,
+    /// but must not introduce grouping keys, another graph read or volatility.
+    fn ownerCountOutput(value: anytype, calls: *const reduction_plan.Calls) bool {
+        const T = @TypeOf(value);
+        if (T == *const ast.Expr) {
+            if (calls.index.pointers.contains(value)) return true;
+            return ownerCountOutput(value.*, calls);
+        }
+        if (T == ast.Expr) switch (value.value) {
+            .literal, .parameter => return true,
+            .property, .index, .slice, .unary, .binary, .comparison, .list, .map, .case_when => {},
+            .call => |call_value| {
+                const signature = @import("functions.zig").lookup(call_value.name) orelse return false;
+                if (!signature.repeatable) return false;
+            },
+            else => return false,
+        };
+        switch (@typeInfo(T)) {
+            .pointer => |pointer| {
+                if (pointer.size == .one) return ownerCountOutput(value.*, calls);
+                if (pointer.size == .slice and pointer.child != u8) for (value) |child| if (!ownerCountOutput(child, calls)) return false;
+            },
+            .@"struct" => |structure| inline for (structure.field_names) |name| if (!ownerCountOutput(@field(value, name), calls)) return false,
+            .@"union" => switch (value) {
+                inline else => |payload| return ownerCountOutput(payload, calls),
+            },
+            .optional => if (value) |child| return ownerCountOutput(child, calls),
+            else => {},
+        }
+        return true;
+    }
     fn ownerCount(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) !?[]const Row {
         const read = self.backend.vtable.count_nodes orelse return null;
-        if (!self.backend.vtable.prefer_count_nodes) return null;
-        if (self.limits.memory_bytes < 8 << 20) return null;
-        if (!self.read_only or input.len != 1 or input[0].len != 0 or operation.optional or operation.paths.len != 1 or middle.len != 0 or projection.wildcard or projection.distinct or projection.predicate != null or projection.order.len != 0 or projection.skip != null or projection.limit != null or projection.items.len != 1) return null;
+        if (!self.backend.vtable.prefer_count_nodes or self.limits.memory_bytes < 8 << 20) return null;
+        if (!self.read_only or input.len != 1 or input[0].len != 0 or operation.optional or operation.paths.len != 1 or middle.len != 0 or projection.wildcard or projection.distinct or projection.predicate != null or projection.order.len != 0 or projection.skip != null or projection.limit != null or projection.items.len == 0) return null;
         const path = operation.paths[0];
         if (path.nodes.len != 1 or path.edges.len != 0 or path.alias != null or path.selector != .all) return null;
-        const item = projection.items[0];
-        if (item.expression.value != .call) return null;
-        const aggregate_call = item.expression.value.call;
         const node = path.nodes[0];
-        if (!std.ascii.eqlIgnoreCase(aggregate_call.name, "count") or aggregate_call.distinct) return null;
-        if (aggregate_call.star) {
-            if (aggregate_call.args.len != 0) return null;
-        } else {
-            // A mandatory single-node MATCH binds this alias to a non-NULL
-            // node. COUNT(alias) is exactly COUNT(*) over the same predicates.
-            // Expressions, nullable aliases and DISTINCT keep their evaluator.
-            if (aggregate_call.args.len != 1 or node.alias == null) return null;
-            const argument = aggregate_call.args[0];
-            if (argument.value != .variable or !std.mem.eql(u8, argument.value.variable, node.alias.?)) return null;
+        var calls: reduction_plan.Calls = .{};
+        for (projection.items) |item| {
+            if (!aggregates(item.expression) or !try self.collectStreamingAggregates(item.expression, &calls)) return null;
         }
-        const request: backend_mod.CountInput = .{ .node = node, .predicate = operation.predicate, .source = self.source, .parameters = self.parameters, .max_examined = self.limits.scanned_anchors -| self.stats.scanned_anchors, .max_work = remainingWork(self), .memory_bytes = self.limits.memory_bytes };
+        if (calls.items.len == 0 or calls.items.len > backend_mod.max_count_arguments) return null;
+        const arguments = try self.a.alloc(?*const ast.Expr, calls.items.len);
+        for (calls.items, arguments) |expr, *argument| {
+            const call_value = expr.value.call;
+            if (!std.ascii.eqlIgnoreCase(call_value.name, "count") or call_value.distinct) return null;
+            argument.* = if (call_value.star) null else call_value.args[0];
+            if (argument.*) |arg| {
+                if (!@import("owner_count.zig").argument(arg, node.alias)) return null;
+                // A mandatory alias is always non-NULL, including for an empty
+                // match. Normalize it to the same total row reduction as '*'.
+                if (arg.value == .variable) argument.* = null;
+            }
+        }
+        for (projection.items) |item| if (!ownerCountOutput(item.expression, &calls)) return null;
+        const legacy = arguments.len == 1 and arguments[0] == null;
+        const request: backend_mod.CountInput = .{ .arguments = if (legacy) &.{} else arguments, .node = node, .predicate = operation.predicate, .source = self.source, .parameters = self.parameters, .max_examined = self.limits.scanned_anchors -| self.stats.scanned_anchors, .max_work = remainingWork(self), .memory_bytes = self.limits.memory_bytes };
         if (!@import("owner_count.zig").eligible(request)) return null;
         const label = self.graph.label(node.labels[0]) orelse return null;
         const result = (try read(self.backend.ptr, self.a, label.table, request)) orelse return null;
-        try result.validate(request.max_examined);
+        try result.validateFor(request.max_examined, request.arguments.len);
         self.stats.scanned_anchors += result.examined;
         if (!result.complete) return null;
-        const total_count = std.math.cast(i64, result.count) orelse return error.CypherNumericOverflow;
-        const name = item.alias orelse try self.expressionName(item.expression);
-        self.columns = try self.a.dupe([]const u8, &.{name});
-        const row = try self.a.dupe(v.Entry, &.{.{ .name = name, .value = .{ .integer = total_count } }});
+        const values = try self.a.alloc(v.Value, calls.items.len);
+        for (values, 0..) |*value, index| value.* = .{ .integer = std.math.cast(i64, if (legacy) result.count else result.counts[index]) orelse return error.CypherNumericOverflow };
+        const previous = self.aggregate_overrides;
+        self.aggregate_overrides = .{ .index = &calls.index.pointers, .values = values };
+        defer self.aggregate_overrides = previous;
+        const rows = try self.projectUnordered(&.{&.{}}, projection, true);
         try self.stages.append(self.a, .{ .operation = "match", .span = match_span, .input_rows = 1, .output_rows = result.count });
-        try self.stages.append(self.a, .{ .operation = "project", .span = projection_span, .input_rows = result.count, .output_rows = 1 });
-        return try self.a.dupe(Row, &.{row});
+        try self.stages.append(self.a, .{ .operation = "project", .span = projection_span, .input_rows = result.count, .output_rows = rows.len });
+        return rows;
     }
     noinline fn streamMatchProjectionInto(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer) anyerror!?[]const Row {
         if (continuation == null and consumer == null and (input_weights == null or (input_weights.?.len == 1 and input_weights.?[0].isOne()))) {

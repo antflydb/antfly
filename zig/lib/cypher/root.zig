@@ -38,8 +38,10 @@ pub const rpc = @import("rpc.zig");
 pub const bounded_json = @import("bounded_json.zig");
 pub const regex = @import("regex.zig");
 pub const snapshot = @import("snapshot.zig");
+pub const producer_visibility = @import("producer_visibility.zig");
 pub const mutations = @import("mutations.zig");
 test {
+    _ = producer_visibility;
     _ = @import("fanout_test.zig");
     _ = @import("access_paths_test.zig");
     _ = @import("owner_operations_test.zig");

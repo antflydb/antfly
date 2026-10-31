@@ -71,15 +71,27 @@ pub const SeekWindow = struct { filter: ?usize, offset: usize = 0, primary: bool
 pub const Probe = struct { page: Page(*const v.Node), complete: bool };
 /// Exact scalar COUNT over a licensed single-node match. Owners evaluate the
 /// original Cypher predicate after policy projection, never admission hints.
-pub const CountInput = struct { node: ast.Node, predicate: ?*const ast.Expr = null, parameters: []const v.Entry = &.{}, source: []const u8 = "", max_examined: usize = 1_000_000, max_work: usize = 1_000_000, memory_bytes: usize = 64 << 20 };
+/// A reduction request scans once for at most 64 total scalar arguments.
+/// An empty argument vector is legacy COUNT(*); a NULL argument denotes '*'.
+pub const max_count_arguments = 64;
+pub const CountInput = struct { arguments: []const ?*const ast.Expr = &.{}, node: ast.Node, predicate: ?*const ast.Expr = null, parameters: []const v.Entry = &.{}, source: []const u8 = "", max_examined: usize = 1_000_000, max_work: usize = 1_000_000, memory_bytes: usize = 64 << 20 };
 /// Incomplete attempts carry physical progress without asserting a count.
 /// Null is reserved for unsupported operations which performed no reads.
 pub const CountResult = struct {
+    /// Matching rows, independently of nullable aggregate arguments.
     count: usize,
+    /// Non-NULL counts in request order, owned by the reply allocator.
+    counts: []const usize = &.{},
     examined: usize,
     complete: bool = true,
     pub fn validate(self: @This(), maximum: usize) !void {
         if (self.examined > maximum or self.count > self.examined or (!self.complete and self.count != 0)) return error.CypherInvalidBackendPage;
+        if (self.counts.len > max_count_arguments) return error.CypherInvalidBackendPage;
+        for (self.counts) |value| if (value > self.count) return error.CypherInvalidBackendPage;
+    }
+    pub fn validateFor(self: @This(), maximum: usize, arguments: usize) !void {
+        try self.validate(maximum);
+        if (arguments > max_count_arguments or (self.complete and self.counts.len != arguments) or (!self.complete and self.counts.len != 0 and self.counts.len != arguments)) return error.CypherInvalidBackendPage;
     }
 };
 /// First adjacency pages for a bounded frontier. NULL slots decline cache

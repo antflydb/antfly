@@ -146,10 +146,10 @@ test "owner COUNT normalizes mandatory aliases and retains nullable expression s
     for ([_]Case{
         .{ .query = "MATCH(n:D) WHERE n.value >= 8 RETURN count(n)", .expected = 25, .pushed = true },
         .{ .query = "MATCH(n:D {value:99}) RETURN count(n)", .expected = 0, .pushed = true },
-        .{ .query = "MATCH(n:D) RETURN count(n.value)", .expected = 33, .pushed = false },
+        .{ .query = "MATCH(n:D) RETURN count(n.value)", .expected = 33, .pushed = true },
         .{ .query = "MATCH(n:D) RETURN count(DISTINCT n)", .expected = 33, .pushed = false },
         .{ .query = "OPTIONAL MATCH(n:D {value:99}) RETURN count(n)", .expected = 0, .pushed = false },
-        .{ .query = "MATCH(n:D) RETURN count(null)", .expected = 0, .pushed = false },
+        .{ .query = "MATCH(n:D) RETURN count(null)", .expected = 0, .pushed = true },
     }) |case| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -177,7 +177,7 @@ test "declined distributed COUNT carries physical progress through coordinator R
             return owner.execute(a, body);
         }
     };
-    for ([_]usize{ 32, 49 }) |maximum| {
+    for ([_][]const u8{ "MATCH(n:D) RETURN count(n)", "MATCH(n:D) RETURN count(n.value)", "MATCH(n:D) RETURN count(n.value),count(*)" }) |query| for ([_]usize{ 32, 49 }) |maximum| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -196,7 +196,7 @@ test "declined distributed COUNT carries physical progress through coordinator R
         var coordinator: root.rpc.Owner = .{ .backend = set.backend(), .graph = definition, .table = "" };
         var client: root.rpc.Client = .{ .channel = .{ .ptr = &coordinator, .call = Wire.invoke }, .incarnation = 1, .revision = 1 };
         var diagnostic: root.compiler.Diagnostic = .{};
-        var compiled = try root.compiler.compile(a, "MATCH(n:D) RETURN count(n)", .{}, &diagnostic);
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
         defer compiled.deinit();
         const execution = root.runtime.execute(a, client.backend(), definition, &compiled, &.{}, .{ .scanned_anchors = maximum });
         if (maximum == 32) {
@@ -212,7 +212,7 @@ test "declined distributed COUNT carries physical progress through coordinator R
             try std.testing.expectEqual(result.stats.scanned_anchors, fixtures[0].physical_rows + fixtures[1].physical_rows);
         }
         for (fixtures) |fixture| try std.testing.expect(fixture.work == null);
-    }
+    };
 }
 test "frontier batches reduce adjacency RPCs and retain path counts" {
     var scalar: usize = 0;
@@ -415,4 +415,103 @@ test "bound pairs prune peer certificates across RPC orientations and native con
         try std.testing.expectEqual(expected, edges);
         try std.testing.expectEqual(expected * 2, calls);
     };
+}
+
+test "owner COUNT vectors fuse nullable arguments and evaluate residual output once" {
+    const Case = struct { query: []const u8, expected: []const i64 };
+    for ([_]Case{
+        .{ .query = "MATCH(n:D) RETURN count(*),count(n.value),count(n.missing),count(null),count($p)", .expected = &.{ 33, 16, 0, 0, 33 } },
+        .{ .query = "MATCH(n:D) RETURN count(n.value)+count(*),coalesce(count(n.missing),99),count(*)*2", .expected = &.{ 49, 0, 66 } },
+        .{ .query = "MATCH(n:D) RETURN CASE WHEN count(n.value)=16 THEN count(*) ELSE 1/0 END", .expected = &.{33} },
+        .{ .query = "MATCH(n:D {value:99}) RETURN count(n.value)+1,count(*)", .expected = &.{ 1, 0 } },
+    }) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var fixture: Fixture = .{};
+        try fixture.init(a);
+        for (&fixture.properties, 0..) |*props, i| if (i % 2 == 0) {
+            props[1].value = .null;
+        };
+        var channel: Fixture.Channel = .{ .fixture = &fixture, .owner = .{ .backend = fixture.backend(), .graph = definition, .table = "docs" } };
+        var client: root.rpc.Client = .{ .channel = .{ .ptr = &channel, .call = Fixture.Channel.invoke }, .incarnation = 1, .revision = 1 };
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, case.query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try root.runtime.execute(a, client.backend(), definition, &compiled, &.{.{ .name = "p", .value = .{ .integer = 7 } }}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqual(case.expected.len, result.rows[0].len);
+        for (case.expected, result.rows[0]) |expected, value| try std.testing.expectEqual(expected, value.integer);
+        try std.testing.expectEqual(@as(usize, 1), fixture.counts);
+        try std.testing.expectEqual(@as(usize, 0), fixture.rpc_scans);
+        try std.testing.expectEqual(@as(usize, 33), fixture.physical_rows);
+        try std.testing.expectEqual(fixture.physical_rows, result.stats.scanned_anchors);
+    }
+}
+
+test "owner COUNT vectors reduce across serial and parallel coordinator RPC owners" {
+    const Wire = struct {
+        fn invoke(ptr: *anyopaque, a: A, body: []const u8) ![]u8 {
+            const owner: *root.rpc.Owner = @ptrCast(@alignCast(ptr));
+            return owner.execute(a, body);
+        }
+    };
+    for ([_]bool{ false, true }) |parallel| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var fixtures = [_]Fixture{ .{ .range_end = 16 }, .{ .range_start = 16 } };
+        var channels: [2]Fixture.Channel = undefined;
+        var clients: [2]root.rpc.Client = undefined;
+        var snapshots: [2]root.distributed.Snapshot = undefined;
+        for (&fixtures, &channels, &clients, &snapshots) |*fixture, *channel, *client, *snapshot| {
+            try fixture.init(a);
+            for (&fixture.properties, 0..) |*props, i| if (i % 2 == 0) {
+                props[1].value = .null;
+            };
+            channel.* = .{ .fixture = fixture, .owner = .{ .backend = fixture.backend(), .graph = definition, .table = "docs" } };
+            client.* = .{ .channel = .{ .ptr = channel, .call = Fixture.Channel.invoke }, .incarnation = 1, .revision = 1 };
+            snapshot.* = .{ .backend = client.backend(), .ptr = fixture, .validate = Fixture.check, .close = undefined };
+        }
+        const targets = [_]root.distributed.Target{ .{ .table = "docs", .table_id = 1, .group_id = 1, .parallel = parallel }, .{ .table = "docs", .table_id = 1, .group_id = 2, .parallel = parallel } };
+        var set: root.distributed.ReadSet = .{ .a = a, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &fixtures, .checkpoint = Fixture.check, .admit = undefined, .capture = undefined, .fanout_io = std.testing.io, .fanout_width = 2 } };
+        var coordinator: root.rpc.Owner = .{ .backend = set.backend(), .graph = definition, .table = "" };
+        var client: root.rpc.Client = .{ .channel = .{ .ptr = &coordinator, .call = Wire.invoke }, .incarnation = 1, .revision = 1 };
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, "MATCH(n:D) RETURN count(*),count(n.value),count(n.value)+count(*),count(n.missing)", .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try root.runtime.execute(a, client.backend(), definition, &compiled, &.{}, .{});
+        defer result.deinit();
+        for ([_]i64{ 33, 16, 49, 0 }, result.rows[0]) |expected, value| try std.testing.expectEqual(expected, value.integer);
+        try std.testing.expectEqual(@as(usize, 33), result.stats.scanned_anchors);
+        for (fixtures) |fixture| {
+            try std.testing.expectEqual(@as(usize, 1), fixture.counts);
+            try std.testing.expectEqual(@as(usize, 0), fixture.rpc_scans);
+            try std.testing.expect(fixture.work == null);
+        }
+    }
+}
+
+test "owner COUNT residual failures and unsafe arguments keep evaluation semantics" {
+    const Case = struct { query: []const u8, expected: anyerror, pushed: bool };
+    for ([_]Case{
+        .{ .query = "MATCH(n:D) RETURN count(*)/0", .expected = error.CypherDivisionByZero, .pushed = true },
+        .{ .query = "MATCH(n:D) RETURN count(*)+9223372036854775807", .expected = error.CypherNumericOverflow, .pushed = true },
+        .{ .query = "MATCH(n:D) RETURN count(*),count(1/n.value)", .expected = error.CypherDivisionByZero, .pushed = false },
+    }) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var fixture: Fixture = .{};
+        try fixture.init(a);
+        var channel: Fixture.Channel = .{ .fixture = &fixture, .owner = .{ .backend = fixture.backend(), .graph = definition, .table = "docs" } };
+        var client: root.rpc.Client = .{ .channel = .{ .ptr = &channel, .call = Fixture.Channel.invoke }, .incarnation = 1, .revision = 1 };
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, case.query, .{}, &diagnostic);
+        defer compiled.deinit();
+        try std.testing.expectError(case.expected, root.runtime.execute(a, client.backend(), definition, &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, if (case.pushed) 1 else 0), fixture.counts);
+        if (case.pushed) try std.testing.expectEqual(@as(usize, 0), fixture.rpc_scans);
+    }
 }

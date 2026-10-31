@@ -37,6 +37,10 @@ fn invoke(_: *anyopaque, a: std.mem.Allocator, scratch: std.mem.Allocator, reque
         bytes[0] = 1;
     }
     if (request.graph_incarnation != 7) return error.CatalogGenerationChanged;
+    if (request.operation == .count and request.count != null) {
+        const counts = try owned.dupe(usize, &.{ 17, 9 });
+        return (rpc.Reply{ .count = .{ .count = 17, .counts = counts, .examined = 19 }, .work = 2 }).clone(a);
+    }
     if (request.operation == .count) return .{ .count = .{ .count = 0, .examined = 17, .complete = false }, .work = 2 };
     if (request.operation == .scan_ordered) return .{ .read_failure = .work, .search_failure = .anchors, .work = 2 };
     if (request.order.len != 1 or request.order[0].after.?.value.integer != 9 or request.filters.len != 1 or request.filters[0].op != .eq) return error.InvalidArgument;
@@ -87,6 +91,12 @@ test "typed graph callback preserves payloads across independently compiled runt
     const declined = try Boundary.call("invoke_typed", producer.dispatch, method, .{ &marker, a, scratch.allocator(), request });
     try std.testing.expect(!declined.count.?.complete);
     try std.testing.expectEqual(@as(usize, 17), declined.count.?.examined);
+    try std.testing.expectEqual(@as(usize, 0), scratch.end_index);
+    request.operation = .count;
+    request.count = .{ .arguments = &.{ null, null }, .node = .{ .span = .{}, .alias = "n", .labels = &.{"D"}, .properties = &.{} }, .parameters = .{ .value = .{ .map = &.{} } } };
+    const vector = try Boundary.call("invoke_typed", producer.dispatch, method, .{ &marker, a, scratch.allocator(), request });
+    @memset(scratch_storage, 0xa5);
+    try std.testing.expectEqualSlices(usize, &.{ 17, 9 }, vector.count.?.counts);
     try std.testing.expectEqual(@as(usize, 0), scratch.end_index);
     request.graph_incarnation = 8;
     try std.testing.expectError(error.CatalogGenerationChanged, Boundary.call("invoke_typed", producer.dispatch, method, .{ &marker, a, scratch.allocator(), request }));

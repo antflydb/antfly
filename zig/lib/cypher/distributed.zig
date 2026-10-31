@@ -364,7 +364,7 @@ pub const ReadSet = struct {
         fn usage(job: ReadJob) !usize {
             if (job.operation == .count) {
                 if (job.count_result) |result| {
-                    try result.validate(job.maximum);
+                    try result.validateFor(job.maximum, job.operation.count.input.arguments.len);
                     return result.examined;
                 }
                 return if (job.err != null and (job.err.? == error.CypherAnchorBudgetExceeded or job.err.? == error.CypherStateBudgetExceeded)) job.maximum else 0;
@@ -822,7 +822,11 @@ pub const ReadSet = struct {
             if (snapshot.backend.vtable.count_nodes == null) return null;
             try owners.append(inventory.allocator(), owner);
         };
-        var total: b.CountResult = .{ .count = 0, .examined = 0 };
+        if (owners.items.len == 0) return null;
+        const counts = try a.alloc(usize, input.arguments.len);
+        @memset(counts, 0);
+        errdefer a.free(counts);
+        var total: b.CountResult = .{ .count = 0, .counts = counts, .examined = 0 };
         var start: usize = 0;
         while (start < owners.items.len) {
             try checkpoint(ptr);
@@ -845,9 +849,16 @@ pub const ReadSet = struct {
             for (jobs) |job| {
                 // Every started owner has joined and its physical progress is
                 // included, even when another owner declined this reduction.
-                const result = job.count_result orelse return .{ .count = 0, .examined = total.examined, .complete = false };
-                if (!result.complete) return .{ .count = 0, .examined = total.examined, .complete = false };
+                const result = job.count_result orelse {
+                    a.free(counts);
+                    return .{ .count = 0, .examined = total.examined, .complete = false };
+                };
+                if (!result.complete) {
+                    a.free(counts);
+                    return .{ .count = 0, .examined = total.examined, .complete = false };
+                }
                 total.count += result.count;
+                for (counts, result.counts) |*out, value| out.* += value;
             }
             start += width;
         }

@@ -1086,6 +1086,8 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         for query in (
             "MATCH (n:P) RETURN count(*)",
             "MATCH (n:P) RETURN count(n)",
+            "MATCH (n:P) RETURN count(n.body)",
+            "MATCH (n:P) RETURN count(n.body)+count(n.missing)",
             "MATCH (n:P) WHERE antfly.documentKey(n) IN [i IN range(0,199) | 'n'+toString(i)] RETURN count(n.body)",
             f"CALL antfly.search('{payload_table}',{{query:'body:needle',mode:'text',limit:200}}) YIELD score RETURN count(*)",
         ):
@@ -1094,6 +1096,20 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                 {"query": query, "limits": {"memory_bytes": 8 << 20}},
             )
             assert pruned["rows"] == [[{"type": "integer", "value": "200"}]], pruned
+        vector_count = call(
+            f"/graphs/{payload_table}/query",
+            {
+                "query": "MATCH (n:P) RETURN count(*),count(n.body),count(n.missing)",
+                "limits": {"memory_bytes": 8 << 20},
+            },
+        )
+        assert vector_count["rows"] == [
+            [
+                {"type": "integer", "value": "200"},
+                {"type": "integer", "value": "200"},
+                {"type": "integer", "value": "0"},
+            ]
+        ], vector_count
         empty_count = call(
             f"/graphs/{payload_table}/query",
             {"query": "MATCH (n:P {body:'absent'}) RETURN count(n)"},
@@ -1352,4 +1368,146 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             )
     finally:
         session.close()
+        server.stop()
+
+
+def test_authenticated_cypher_producer_visibility_uses_bounded_scratch():
+    """One wide producer must not be retained once per relationship or filter."""
+    binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+    if not Path(binary).exists():
+        pytest.skip("native Antfly binary is unavailable")
+    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port(), pgwire=True)
+    prefix = "cypher_visibility_" + uuid.uuid4().hex
+    admin = requests.Session()
+    admin.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+    reader = requests.Session()
+    reader.auth = (prefix + "_reader", uuid.uuid4().hex)
+    base = server.api_url.rstrip("/")
+
+    def call(path, body=None, *, method="POST", session=admin, read_only=False):
+        deadline = time.monotonic() + 60
+        while True:
+            response = session.request(
+                method,
+                (server.url if path.startswith("/auth/") else base) + path,
+                json=body,
+                timeout=45,
+            )
+            if not (
+                read_only
+                and response.status_code == 503
+                and time.monotonic() < deadline
+            ):
+                break
+            time.sleep(0.1)
+        assert response.status_code in (200, 201, 202, 204), (
+            path,
+            response.status_code,
+            response.text,
+            server.log_path.read_text()[-4000:],
+        )
+        return response.json() if response.content else None
+
+    def query(session, expected):
+        result = call(
+            f"/graphs/{prefix}/query",
+            {
+                "query": "MATCH (a:D)-[r:R]->(b:D) WHERE antfly.documentKey(a)='a' RETURN count(r)",
+                "limits": {"memory_bytes": 8 << 20},
+            },
+            session=session,
+            read_only=True,
+        )
+        assert result["complete"] is True, result
+        assert result["rows"] == [[{"type": "integer", "value": str(expected)}]], result
+        assert result["stats"]["memory_bytes"] < 8 << 20, result
+
+    edges = [
+        {
+            "index_name": "links",
+            "source": "a",
+            "target": "b",
+            "edge_type": "link",
+            "edge_id": str(i),
+            "owner_document": "p",
+        }
+        for i in range(128)
+    ]
+    try:
+        call(
+            f"/tables/{prefix}",
+            {
+                "num_shards": 1,
+                "indexes": {
+                    "links": {"type": "graph", "edge_types": [{"name": "link"}]}
+                },
+            },
+        )
+        deadline = time.monotonic() + 60
+        while True:
+            index = call(f"/tables/{prefix}/indexes/links", method="GET")
+            complete = index.get("status", {}).get("milestones", {}).get("complete", {})
+            if complete.get("reached") and not complete.get("blockers"):
+                break
+            assert time.monotonic() < deadline, index
+            time.sleep(0.1)
+        call(
+            f"/graphs/{prefix}",
+            {
+                "labels": [{"name": "D", "table": prefix}],
+                "relationships": [
+                    {
+                        "name": "R",
+                        "index": "links",
+                        "source_label": "D",
+                        "target_label": "D",
+                        "stored_type": "link",
+                    }
+                ],
+            },
+        )
+        call(
+            f"/tables/{prefix}/batch",
+            {
+                "inserts": {
+                    "a": {"tenant": "acme"},
+                    "b": {"tenant": "acme"},
+                    "p": {"tenant": "acme", "payload": "x" * (1 << 20)},
+                },
+                "graph_writes": edges,
+                "sync_level": "full_index",
+            },
+        )
+        call(
+            f"/auth/v1/users/{reader.auth[0]}",
+            {
+                "password": reader.auth[1],
+                "initial_policies": [
+                    {"resource_type": "graph", "resource": prefix, "type": "read"},
+                    {"resource_type": "table", "resource": prefix, "type": "read"},
+                ],
+            },
+        )
+        call(
+            f"/auth/v1/users/{reader.auth[0]}/row-filters/{prefix}",
+            {"term": {"tenant": "acme"}},
+            method="PUT",
+        )
+        query(admin, 128)
+        query(reader, 128)
+        # New statements cannot inherit either a positive or negative decision
+        # from an older producer version, even with unchanged endpoints/edges.
+        for tenant, expected in (("other", 0), ("acme", 128)):
+            call(
+                f"/tables/{prefix}/batch",
+                {
+                    "inserts": {"p": {"tenant": tenant, "payload": "x" * (1 << 20)}},
+                    "graph_writes": edges,
+                    "sync_level": "full_index",
+                },
+            )
+            query(reader, expected)
+    finally:
+        reader.close()
+        admin.close()
         server.stop()
