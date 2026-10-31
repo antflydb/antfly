@@ -189,3 +189,342 @@ pub const Maintenance = struct {
         }
     }
 };
+
+test "owned DB open starts self-retaining workers at the stable allocation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/owned-db-worker", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const db = try DB.openOwned(alloc, path, .{});
+    defer db.closeOwned();
+    try std.testing.expect(db.maintenance.quarantineRetryWorkerStartedAtCurrentAddressForTest());
+}
+
+test "db query repair gate revalidates stale debt" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "stale_repair",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    // Model a reader that loaded repair debt immediately before its durable
+    // intent was removed. The first rejected request proves absence and heals
+    // the process-local gate instead of wedging the reader indefinitely.
+    try db.core.index_manager.markUnscopedRepairUnavailable("stale_repair");
+    try db.maintenance.failIfIndexQuarantined("stale_repair");
+    try std.testing.expect(!db.core.index_manager.repairUnavailable("stale_repair"));
+}
+
+// `checkTargetAdvanceNoProgress` is `runUntilIdle`'s opt-in stall guard (task
+// requirement: fail fast with a named, bounded diagnostic instead of
+// spinning on `canAdvanceDerivedToTargetAsync`'s deferred artifact-maintenance
+// check indefinitely). Exercised directly against a real (otherwise idle) DB
+// rather than by reproducing a genuinely broken pipeline, so the pass/fail
+// signal is deterministic and does not depend on timing.
+test "runUntilIdle no-progress guard fails fast with a named stuck-index diagnostic" {
+    @import("antfly_test_error_logs").expectErrorLogs(1);
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try std.testing.expect(db.maintenance.lastRunUntilIdleNoProgressDiagnostic() == null);
+
+    const now_ns = db_mod.monotonicTimeNs();
+    // Simulate `canAdvanceDerivedToTargetAsync` having observed
+    // "chunk_vectors" stuck (indexed=5017, expected_docs=0, matching the
+    // dogfood reproduction) for longer than the configured timeout.
+    try db_mod.noteTargetAdvanceStuck(db.async_context, "chunk_vectors", now_ns -| (2 * std.time.ns_per_s), 5017, 0);
+    try std.testing.expectError(error.RunUntilIdleNoProgress, db.checkTargetAdvanceNoProgress(1 * std.time.ns_per_s));
+
+    const diagnostic = db.maintenance.lastRunUntilIdleNoProgressDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("chunk_vectors", diagnostic.index_name);
+    try std.testing.expectEqual(@as(u64, 5017), diagnostic.indexed);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.expected);
+
+    // A shorter observed duration than the configured timeout must not fire.
+    db_mod.clearTargetAdvanceStuck(db.async_context, "chunk_vectors");
+    try db_mod.noteTargetAdvanceStuck(db.async_context, "chunk_vectors", now_ns, 12, 0);
+    try db.checkTargetAdvanceNoProgress(60 * std.time.ns_per_s);
+}
+
+test "runUntilIdle no-progress guard interrupts the threaded derived wait" {
+    // Reviewer-reported P2: with background index workers the guard only ran
+    // AFTER runDerivedUntilWithOptions returned, and the threaded
+    // waitForAll has no deadline — a derived index that can never satisfy
+    // its replay target parked the wait forever and the configured timeout
+    // never fired. The stall diagnostic now rides the wait's cancellation
+    // checkpoint, so the wait itself is interrupted. This test exercises the
+    // real threaded wait path: workers enabled, a target the workers cannot
+    // reach, and a stuck record older than the timeout. Environments whose io
+    // backend starts no derived workers skip (the guard mechanics have their
+    // own unit test below); the expected-error-log declaration must come
+    // AFTER the skip decision or the boundary check flags the skip itself.
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    if (!db.executor.hasWorkers()) return error.SkipZigTest;
+    @import("antfly_test_error_logs").expectErrorLogs(1);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"a\"}" }},
+        .sync_level = .write,
+    });
+
+    const now_ns = db_mod.monotonicTimeNs();
+    try db_mod.noteTargetAdvanceStuck(db.async_context, "chunk_vectors", now_ns -| (2 * std.time.ns_per_s), 5017, 0);
+    // A target far past anything committed: without the in-wait guard this
+    // call never returns on a stuck index.
+    const unreachable_sequence = db.core.nextDerivedSequence() + 1_000_000;
+    try std.testing.expectError(error.RunUntilIdleNoProgress, db.runDerivedUntilWithOptions(unreachable_sequence, .{
+        .no_progress_timeout_ns = 1 * std.time.ns_per_s,
+    }));
+
+    const diagnostic = db.maintenance.lastRunUntilIdleNoProgressDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("chunk_vectors", diagnostic.index_name);
+    db_mod.clearTargetAdvanceStuck(db.async_context, "chunk_vectors");
+}
+
+test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var writes = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
+        defer {
+            for (writes.items) |item| {
+                alloc.free(@constCast(item.key));
+                alloc.free(@constCast(item.value));
+            }
+            writes.deinit(alloc);
+        }
+        for (0..300) |i| {
+            try writes.append(alloc, .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"alpha\",\"n\":{d}}}", .{i}),
+            });
+        }
+        try db.batch(.{ .writes = writes.items });
+        try db.core.index_manager.addAllNoBackfill(db.core.store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+    }
+
+    db_mod.index_manager_mod.test_abort_text_backfill_after_batches = 1;
+    defer db_mod.index_manager_mod.test_abort_text_backfill_after_batches = null;
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") != null);
+    try std.testing.expect(db.core.textIndexEntry("ft_v1") == null);
+
+    // Writes keep flowing while the index is quarantined; the heal's resumed
+    // backfill must pick them up. They also guarantee the next backfill
+    // attempt flushes at least once, so the still-set abort knob fires.
+    {
+        var writes = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
+        defer {
+            for (writes.items) |item| {
+                alloc.free(@constCast(item.key));
+                alloc.free(@constCast(item.value));
+            }
+            writes.deinit(alloc);
+        }
+        for (300..400) |i| {
+            try writes.append(alloc, .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"alpha\",\"n\":{d}}}", .{i}),
+            });
+        }
+        try db.batch(.{ .writes = writes.items });
+    }
+
+    // While the cause persists, a forced retry fails and applies backoff.
+    {
+        const result = try db.maintenance.retryQuarantinedIndexLoads(true);
+        try std.testing.expectEqual(@as(usize, 0), result.recovered);
+        try std.testing.expectEqual(@as(usize, 1), result.remaining);
+    }
+    // Cause fixed — but the failed attempt set a backoff deadline, so a
+    // non-forced retry is skipped without re-attempting the open (it would
+    // recover if it attempted).
+    db_mod.index_manager_mod.test_abort_text_backfill_after_batches = null;
+    {
+        const result = try db.maintenance.retryQuarantinedIndexLoads(false);
+        try std.testing.expectEqual(@as(usize, 0), result.recovered);
+        try std.testing.expectEqual(@as(usize, 1), result.remaining);
+    }
+
+    // Forced retry recovers the index in-process — no reopen, no
+    // drop+recreate — resuming the persisted rebuild state. Hold a simulated
+    // query lease across the final publication and prove recovery waits for
+    // it rather than reallocating the inline catalog beneath a reader.
+    const RetryState = struct {
+        db: *DB,
+        result: ?db_mod.index_manager_mod.IndexManager.QuarantineRetryResult = null,
+        err: ?anyerror = null,
+        completed: std.atomic.Value(bool) = .init(false),
+
+        fn run(state: *@This()) void {
+            state.result = state.db.maintenance.retryQuarantinedIndexLoads(true) catch |err| {
+                state.err = err;
+                state.completed.store(true, .release);
+                return;
+            };
+            state.completed.store(true, .release);
+        }
+    };
+    db_mod.test_quarantine_publication_fence_entered.store(false, .release);
+    defer db_mod.test_quarantine_publication_fence_entered.store(false, .release);
+    db_mod.lockApplyShared(&db);
+    var apply_shared_held = true;
+    var retry_state = RetryState{ .db = &db };
+    var retry_thread = try std.testing.io.concurrent(RetryState.run, .{&retry_state});
+    var retry_thread_joined = false;
+    defer {
+        if (apply_shared_held) db.core.unlockApplyShared();
+        if (!retry_thread_joined) retry_thread.await(std.testing.io);
+    }
+
+    const publication_deadline = db_mod.monotonicTimeNs() +| 30 * std.time.ns_per_s;
+    while (!db_mod.test_quarantine_publication_fence_entered.load(.acquire) and db_mod.monotonicTimeNs() < publication_deadline) {
+        db_mod.sleepNs(100 * std.time.ns_per_us);
+    }
+    const publication_fence_entered = db_mod.test_quarantine_publication_fence_entered.load(.acquire);
+    const publication_waited_for_reader = publication_fence_entered and !retry_state.completed.load(.acquire);
+    db.core.unlockApplyShared();
+    apply_shared_held = false;
+    retry_thread.await(std.testing.io);
+    retry_thread_joined = true;
+
+    try std.testing.expect(publication_fence_entered);
+    try std.testing.expect(publication_waited_for_reader);
+    if (retry_state.err) |err| return err;
+    const result = retry_state.result orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), result.recovered);
+    try std.testing.expectEqual(@as(usize, 0), result.remaining);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") == null);
+    try std.testing.expect(db.core.textIndexEntry("ft_v1") != null);
+
+    try db.runUntilIdle();
+    var search_result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .limit = 500,
+    });
+    defer search_result.deinit();
+    try std.testing.expectEqual(@as(u32, 400), search_result.total_hits);
+}
+
+test "db targeted quarantine retry does not open unrelated failed indexes" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.core.index_manager.addAllNoBackfill(db.core.store, &.{
+            .{ .name = "ft_target", .kind = .full_text, .config_json = "{}" },
+            .{ .name = "ft_unrelated", .kind = .full_text, .config_json = "{}" },
+        });
+    }
+
+    db_mod.index_manager_mod.test_inject_index_open_error = error.InvalidIndexConfig;
+    defer db_mod.index_manager_mod.test_inject_index_open_error = null;
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_target") != null);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_unrelated") != null);
+
+    db_mod.index_manager_mod.test_inject_index_open_error = null;
+    const result = try db.maintenance.retryQuarantinedIndexLoad("ft_target", true);
+    try std.testing.expectEqual(@as(usize, 1), result.recovered);
+    try std.testing.expectEqual(@as(usize, 1), result.remaining);
+    try std.testing.expectEqual(.recovered, result.target_outcome);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_target") == null);
+    try std.testing.expect(db.core.textIndexEntry("ft_target") != null);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_unrelated") != null);
+    try std.testing.expect(db.core.textIndexEntry("ft_unrelated") == null);
+}
+
+test "db read-only open propagates transient index load errors instead of quarantining" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    }
+
+    db_mod.index_manager_mod.test_inject_index_open_error = error.FileNotFound;
+    defer db_mod.index_manager_mod.test_inject_index_open_error = null;
+
+    // A read-only (replica) open must NOT quarantine a transient read race
+    // (e.g. the writer reclaiming obsolete LSM runs mid-open): the error
+    // propagates so the query layer reopens against a fresh manifest and
+    // retries. A quarantined replica would instead serve IndexUnavailable
+    // until the read cache next invalidates it — the quarantine retry
+    // worker only runs on the writer.
+    try std.testing.expectError(error.FileNotFound, DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .query_readonly,
+    }));
+
+    // The writer open quarantines the same error: the writer cannot race
+    // its own (not yet started) reclaim, so a missing artifact there is
+    // persistent damage — and the in-process retry recovers it once the
+    // cause clears.
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const recorded = db.core.index_manager.loadFailure("ft_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("FileNotFound", recorded);
+
+    db_mod.index_manager_mod.test_inject_index_open_error = null;
+    const result = try db.maintenance.retryQuarantinedIndexLoads(true);
+    try std.testing.expectEqual(@as(usize, 1), result.recovered);
+    try std.testing.expectEqual(@as(usize, 0), result.remaining);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") == null);
+}

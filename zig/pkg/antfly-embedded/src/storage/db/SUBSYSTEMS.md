@@ -115,7 +115,13 @@ Rules:
   `open`, `deinitWrapperState` or `startOptionalRuntimes`, and reaches into
   each subsystem's fields. When most of a method's work is one subsystem's,
   move it there.
-- **Tests live with the subsystem** once its methods move.
+- **Tests live with the subsystem.** A test that exercises one subsystem goes
+  in that subsystem's file; tests that span subsystems stay in `db.zig`. A
+  moved test's full name follows its file (`storage.db.indexes.repair.test.…`),
+  so update any build filter that names it, and add a new subsystem file to
+  `storage/test_manifest.zig` and to one shard in `pkg/antfly/build/tests.zig`.
+  Files under `enrichment/`, `maintenance/` and `query/` belong to those
+  directories' shards.
 
 ## Field map
 

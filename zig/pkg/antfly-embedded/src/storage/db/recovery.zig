@@ -252,3 +252,500 @@ pub const Recovery = struct {
         self.portable_activation.owner.stop(db.portableActivationRecoveryPort());
     }
 };
+
+test "portable activation retry runtime job can be restarted" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    // A worker with no pending activation exits immediately. Exercise two full
+    // runtime-owned generations to prove completion releases launch admission.
+    for (0..2) |_| {
+        _ = db_mod.lockAtomic(&db.recovery.portable_activation.owner.lifecycle_mutex);
+        db.recovery.portable_activation.owner.stopping.store(false, .release);
+        db.recovery.portable_activation.owner.worker_running.store(true, .release);
+        const launch = db.recovery.launchPortableActivationRetryWorkerLocked() catch |err| {
+            db.recovery.portable_activation.owner.worker_running.store(false, .release);
+            db.recovery.portable_activation.owner.lifecycle_mutex.unlock();
+            return err;
+        };
+        db.recovery.portable_activation.owner.lifecycle_mutex.unlock();
+        try std.testing.expectEqual(db_mod.portable_activation_recovery.Owner.PortableActivationRetryLaunch.backend_runtime, launch);
+
+        const exit_deadline = db_mod.monotonicTimeNs() + std.time.ns_per_s;
+        while (db.recovery.portable_activation.owner.worker_running.load(.acquire) and db_mod.monotonicTimeNs() < exit_deadline) {
+            @import("antfly_platform").time.yieldNow();
+        }
+        try std.testing.expect(!db.recovery.portable_activation.owner.worker_running.load(.acquire));
+    }
+}
+
+test "portable activation retry stop joins the runtime worker final handshake" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const ExitCtx = struct {
+        db: *DB,
+        holding_final_lock: *std.atomic.Value(bool),
+        release_final_lock: *std.atomic.Value(bool),
+
+        fn run(ctx: @This()) void {
+            while (!ctx.db.recovery.portable_activation.owner.stopping.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            _ = db_mod.lockAtomic(&ctx.db.recovery.portable_activation.owner.lifecycle_mutex);
+            ctx.db.recovery.portable_activation.owner.worker_running.store(false, .release);
+            ctx.holding_final_lock.store(true, .release);
+            while (!ctx.release_final_lock.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            ctx.db.recovery.portable_activation.owner.lifecycle_mutex.unlock();
+        }
+    };
+    const StopCtx = struct {
+        db: *DB,
+        returned: *std.atomic.Value(bool),
+
+        fn run(ctx: @This()) void {
+            ctx.db.recovery.stopPortableActivationRetryWorker();
+            ctx.returned.store(true, .release);
+        }
+    };
+
+    var holding_final_lock = std.atomic.Value(bool).init(false);
+    var release_final_lock = std.atomic.Value(bool).init(false);
+    var stop_returned = std.atomic.Value(bool).init(false);
+    db.recovery.portable_activation.owner.stopping.store(false, .release);
+    db.recovery.portable_activation.owner.worker_running.store(true, .release);
+
+    var worker = try std.Thread.spawn(.{}, ExitCtx.run, .{ExitCtx{
+        .db = &db,
+        .holding_final_lock = &holding_final_lock,
+        .release_final_lock = &release_final_lock,
+    }});
+    var worker_joined = false;
+    defer if (!worker_joined) {
+        release_final_lock.store(true, .release);
+        worker.join();
+    };
+    var stopper = try std.Thread.spawn(.{}, StopCtx.run, .{StopCtx{
+        .db = &db,
+        .returned = &stop_returned,
+    }});
+    var stopper_joined = false;
+    defer if (!stopper_joined) stopper.join();
+
+    const hold_deadline = db_mod.monotonicTimeNs() + std.time.ns_per_s;
+    while (!holding_final_lock.load(.acquire) and db_mod.monotonicTimeNs() < hold_deadline) {
+        @import("antfly_platform").time.yieldNow();
+    }
+    try std.testing.expect(holding_final_lock.load(.acquire));
+    // Give the stopper ample time to observe the published false state. It
+    // must still wait for the lifecycle lock that fences the worker's return.
+    db_mod.sleepNs(10 * std.time.ns_per_ms);
+    try std.testing.expect(!stop_returned.load(.acquire));
+
+    release_final_lock.store(true, .release);
+    worker.join();
+    worker_joined = true;
+    stopper.join();
+    stopper_joined = true;
+    try std.testing.expect(stop_returned.load(.acquire));
+}
+
+test "portable activation retry shutdown rejects an already claimed maintenance probe" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+
+    db_mod.test_fail_portable_activation_retry_fallback_submit.store(true, .release);
+    defer db_mod.test_fail_portable_activation_retry_fallback_submit.store(false, .release);
+    defer db_mod.test_pause_portable_activation_retry_probe_before_lifecycle_lock.store(false, .release);
+    defer db_mod.test_portable_activation_retry_probe_paused.store(false, .release);
+    defer db_mod.test_release_portable_activation_retry_probe.store(true, .release);
+
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    db.recovery.startPortableActivationRetryWorkerIfNeededInner(true);
+    try std.testing.expect(db.recovery.portable_activation.owner.next_launch_ns > 0);
+
+    // Rearm the injected launch failures. The claimed probe must leave these
+    // untouched after close publishes the permanent stop state.
+    db_mod.test_fail_portable_activation_retry_fallback_submit.store(true, .release);
+    db.recovery.portable_activation.owner.next_launch_ns = 0;
+    db_mod.test_release_portable_activation_retry_probe.store(false, .release);
+    db_mod.test_portable_activation_retry_probe_paused.store(false, .release);
+    db_mod.test_pause_portable_activation_retry_probe_before_lifecycle_lock.store(true, .release);
+
+    const PollCtx = struct {
+        db: *DB,
+        completed: *std.atomic.Value(bool),
+
+        fn run(ctx: @This()) void {
+            // The runtime reaper and this explicit poll legitimately race to
+            // claim the probe. A zero count means the reaper won; the paused
+            // hook below proves that one of them did claim it.
+            _ = ctx.db.backend_runtime.durable_jobs.poll(1) catch return;
+            ctx.completed.store(true, .release);
+        }
+    };
+    const CloseCtx = struct {
+        db: *DB,
+        returned: *std.atomic.Value(bool),
+
+        fn run(ctx: @This()) void {
+            ctx.db.close();
+            ctx.returned.store(true, .release);
+        }
+    };
+
+    var poll_completed = std.atomic.Value(bool).init(false);
+    var close_returned = std.atomic.Value(bool).init(false);
+    var poller = try std.Thread.spawn(.{}, PollCtx.run, .{PollCtx{
+        .db = &db,
+        .completed = &poll_completed,
+    }});
+    var poller_joined = false;
+    defer if (!poller_joined) {
+        db_mod.test_release_portable_activation_retry_probe.store(true, .release);
+        poller.join();
+    };
+
+    const pause_deadline = db_mod.monotonicTimeNs() + std.time.ns_per_s;
+    while (!db_mod.test_portable_activation_retry_probe_paused.load(.acquire) and db_mod.monotonicTimeNs() < pause_deadline) {
+        @import("antfly_platform").time.yieldNow();
+    }
+    try std.testing.expect(db_mod.test_portable_activation_retry_probe_paused.load(.acquire));
+
+    var closer = try std.Thread.spawn(.{}, CloseCtx.run, .{CloseCtx{
+        .db = &db,
+        .returned = &close_returned,
+    }});
+    var closer_joined = false;
+    defer if (!closer_joined) {
+        db_mod.test_release_portable_activation_retry_probe.store(true, .release);
+        closer.join();
+    };
+
+    const stop_deadline = db_mod.monotonicTimeNs() + std.time.ns_per_s;
+    while (!db.recovery.portable_activation.owner.stopping.load(.acquire) and db_mod.monotonicTimeNs() < stop_deadline) {
+        @import("antfly_platform").time.yieldNow();
+    }
+    try std.testing.expect(db.recovery.portable_activation.owner.stopping.load(.acquire));
+    try std.testing.expect(!close_returned.load(.acquire));
+
+    db_mod.test_release_portable_activation_retry_probe.store(true, .release);
+    poller.join();
+    poller_joined = true;
+    closer.join();
+    closer_joined = true;
+
+    try std.testing.expect(poll_completed.load(.acquire));
+    try std.testing.expect(close_returned.load(.acquire));
+    try std.testing.expect(db_mod.test_fail_portable_activation_retry_fallback_submit.load(.acquire));
+}
+
+test "portable activation retry uses owner scoped runtime" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    _ = db_mod.lockAtomic(&db.recovery.portable_activation.owner.lifecycle_mutex);
+    db.recovery.portable_activation.owner.stopping.store(false, .release);
+    db.recovery.portable_activation.owner.worker_running.store(true, .release);
+    const launch = db.recovery.launchPortableActivationRetryWorkerLocked() catch |err| {
+        db.recovery.portable_activation.owner.worker_running.store(false, .release);
+        db.recovery.portable_activation.owner.lifecycle_mutex.unlock();
+        return err;
+    };
+    db.recovery.portable_activation.owner.lifecycle_mutex.unlock();
+    try std.testing.expectEqual(db_mod.portable_activation_recovery.Owner.PortableActivationRetryLaunch.backend_runtime, launch);
+
+    const recovery_deadline = db_mod.monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while ((db.async_context.portable_runtime_activation_pending.load(.acquire) or
+        db.recovery.portable_activation.owner.worker_running.load(.acquire)) and
+        db_mod.monotonicTimeNs() < recovery_deadline)
+    {
+        @import("antfly_platform").time.yieldNow();
+    }
+    try std.testing.expect(!db.async_context.portable_runtime_activation_pending.load(.acquire));
+    try std.testing.expect(!db.recovery.portable_activation.owner.worker_running.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), db.recovery.portable_activation.attempts.load(.monotonic));
+}
+
+test "portable activation retry automatically rearms after runtime submission fails" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    db_mod.test_fail_portable_activation_retry_fallback_submit.store(true, .release);
+    defer db_mod.test_fail_portable_activation_retry_fallback_submit.store(false, .release);
+
+    db.recovery.startPortableActivationRetryWorkerIfNeededInner(true);
+    try std.testing.expect(!db.recovery.portable_activation.owner.worker_running.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), db.recovery.portable_activation.owner.launch_failure_streak);
+    try std.testing.expect(db.recovery.portable_activation.owner.next_launch_ns > 0);
+
+    const recovery_deadline = db_mod.monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while ((db.async_context.portable_runtime_activation_pending.load(.acquire) or
+        db.recovery.portable_activation.owner.worker_running.load(.acquire)) and
+        db_mod.monotonicTimeNs() < recovery_deadline)
+    {
+        db_mod.sleepNs(std.time.ns_per_ms);
+    }
+    try std.testing.expect(!db.async_context.portable_runtime_activation_pending.load(.acquire));
+    try std.testing.expect(!db.recovery.portable_activation.owner.worker_running.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), db.recovery.portable_activation.owner.launch_failure_streak);
+    try std.testing.expectEqual(@as(u64, 0), db.recovery.portable_activation.owner.next_launch_ns);
+    try std.testing.expectEqual(@as(u64, 1), db.recovery.portable_activation.attempts.load(.monotonic));
+}
+
+test "db searches fail fast without joining portable activation recovery" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    var lookup_hook = db_mod.PublishedDenseCatalogLookupTestHook{ .io = io };
+    lookup_hook.release.set(io);
+    db_mod.test_published_dense_catalog_lookup_hook = &lookup_hook;
+    defer {
+        db_mod.test_published_dense_catalog_lookup_hook = null;
+        db.async_context.portable_runtime_activation_pending.store(false, .release);
+    }
+    const attempts_before = db.recovery.portable_activation.attempts.load(.monotonic);
+
+    try std.testing.expectError(error.PortableRuntimeActivationPending, db.search(alloc, .{
+        .index_name = "dense_idx",
+        .limit = 1,
+        .include_stored = false,
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } },
+    }));
+    try std.testing.expect(!lookup_hook.entered.isSet());
+    try std.testing.expectEqual(attempts_before, db.recovery.portable_activation.attempts.load(.monotonic));
+
+    try std.testing.expectError(error.PortableRuntimeActivationPending, db.searchDenseProfiled(alloc, .{
+        .index_name = "dense_idx",
+        .limit = 1,
+        .include_stored = false,
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } },
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 }));
+    try std.testing.expect(!lookup_hook.entered.isSet());
+    try std.testing.expectEqual(attempts_before, db.recovery.portable_activation.attempts.load(.monotonic));
+
+    try std.testing.expect(db.recovery.portable_activation.mutex.tryLock());
+    defer db.recovery.portable_activation.mutex.unlock();
+    try std.testing.expectError(error.PortableRuntimeActivationPending, db.recovery.retryPortableRuntimeActivationIfNeeded());
+    try std.testing.expectEqual(attempts_before, db.recovery.portable_activation.attempts.load(.monotonic));
+}
+
+test "db graph ownership restore materializes large artifacts in published segments" {
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{"source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+        ,
+    });
+
+    var raw = std.ArrayListUnmanaged(u8).empty;
+    defer raw.deinit(alloc);
+    try raw.appendSlice(alloc, "{\"relations\":[");
+    for (0..2050) |i| {
+        if (i > 0) try raw.append(alloc, ',');
+        const item = try std.fmt.allocPrint(alloc, "{{\"type\":\"mentions\",\"target\":\"doc:{d}\"}}", .{i});
+        defer alloc.free(item);
+        try raw.appendSlice(alloc, item);
+    }
+    try raw.appendSlice(alloc, "]}");
+    const artifact_key = try db_mod.internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(artifact_key);
+    try db.core.store.put(artifact_key, raw.items);
+
+    const first = try db_mod.materializeGraphSourceArtifactRestorePage(
+        &db,
+        alloc,
+        artifact_key,
+        "relations_graph",
+        0,
+        0,
+        0,
+        0,
+    );
+    try std.testing.expectEqual(@as(?usize, 2048), first.next_item_offset);
+    try std.testing.expectEqual(@as(usize, 1), first.next_segment_index);
+    try std.testing.expectEqual(@as(usize, 2048), first.key_count);
+
+    // A failed later page rolls back one committed segment atomically. With a
+    // single segment there is no continuation, and neither the visible edge
+    // nor its ownership manifest may survive.
+    var partial_ref = (try db_mod.decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse return error.TestUnexpectedResult;
+    defer partial_ref.deinit(alloc);
+    try std.testing.expect(!try db_mod.rollbackGraphSourceArtifactRestoreStatePage(&db, alloc, "relations_graph", partial_ref));
+    const partial_state_name = try db_mod.graphArtifactStateNameAlloc(alloc, partial_ref);
+    defer alloc.free(partial_state_name);
+    const partial_state_key = try db_mod.graphAssetStateKeyAlloc(alloc, "doc:a", "relations_graph", partial_state_name);
+    defer alloc.free(partial_state_key);
+    const partial_segment_key = try db_mod.internal_keys.graphAssetStateSegmentKeyAlloc(alloc, partial_state_key, 0);
+    defer alloc.free(partial_segment_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, partial_segment_key));
+    const partial_edge_key = try db_mod.internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:0");
+    defer alloc.free(partial_edge_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, partial_edge_key));
+
+    const restarted_first = try db_mod.materializeGraphSourceArtifactRestorePage(
+        &db,
+        alloc,
+        artifact_key,
+        "relations_graph",
+        0,
+        0,
+        0,
+        0,
+    );
+
+    const second = try db_mod.materializeGraphSourceArtifactRestorePage(
+        &db,
+        alloc,
+        artifact_key,
+        "relations_graph",
+        restarted_first.next_item_offset.?,
+        restarted_first.next_segment_index,
+        restarted_first.key_count,
+        restarted_first.manifest_bytes,
+    );
+    try std.testing.expectEqual(@as(?usize, null), second.next_item_offset);
+    try std.testing.expectEqual(@as(usize, 2), second.next_segment_index);
+    try std.testing.expectEqual(@as(usize, 2050), second.key_count);
+    try std.testing.expectEqual(@as(usize, 1), db.recovery.restore.graph_parse_count_for_test);
+
+    var artifact_ref = (try db_mod.decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse return error.TestUnexpectedResult;
+    defer artifact_ref.deinit(alloc);
+    const state_name = try db_mod.graphArtifactStateNameAlloc(alloc, artifact_ref);
+    defer alloc.free(state_name);
+    const state_key = try db_mod.graphAssetStateKeyAlloc(alloc, "doc:a", "relations_graph", state_name);
+    defer alloc.free(state_key);
+    const root_raw = try db.core.store.get(alloc, state_key);
+    defer alloc.free(root_raw);
+    try std.testing.expectEqual(db_mod.graph_asset_state.Format.v5, try db_mod.graph_asset_state.format(root_raw));
+    const restored_keys = (try db_mod.loadGraphAssetStateKeysAlloc(alloc, db.core.store, state_key, db.core.index_manager.graphIndex("relations_graph").?.config.coverage_generation)).?;
+    defer db_mod.freeOwnedConstKeySlice(alloc, restored_keys);
+    try std.testing.expectEqual(@as(usize, 2050), restored_keys.len);
+
+    try db.core.store.put(artifact_key, "{\"relations\":[{\"type\":\"mentions\",\"target\":\"doc:replacement\"}]}");
+    const changed = try db_mod.materializeGraphSourceArtifactsForIndex(
+        alloc,
+        db.core.store,
+        db.core.index_manager,
+        &.{artifact_key},
+        "relations_graph",
+        .{},
+    );
+    defer db_mod.freeOwnedKeySlice(alloc, changed);
+    const first_segment_key = try db_mod.internal_keys.graphAssetStateSegmentKeyAlloc(alloc, state_key, 0);
+    defer alloc.free(first_segment_key);
+    const second_segment_key = try db_mod.internal_keys.graphAssetStateSegmentKeyAlloc(alloc, state_key, 1);
+    defer alloc.free(second_segment_key);
+    const replacement_segment = try db.core.store.get(alloc, first_segment_key);
+    defer alloc.free(replacement_segment);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, second_segment_key));
+    const replacement_root = try db.core.store.get(alloc, state_key);
+    defer alloc.free(replacement_root);
+    try std.testing.expectEqual(db_mod.graph_asset_state.Format.v5, try db_mod.graph_asset_state.format(replacement_root));
+    const replacement_keys = (try db_mod.loadGraphAssetStateKeysAlloc(
+        alloc,
+        db.core.store,
+        state_key,
+        db.core.index_manager.graphIndex("relations_graph").?.config.coverage_generation,
+    )).?;
+    defer db_mod.freeOwnedConstKeySlice(alloc, replacement_keys);
+    try std.testing.expectEqual(@as(usize, 1), replacement_keys.len);
+}
