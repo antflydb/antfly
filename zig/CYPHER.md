@@ -4898,3 +4898,32 @@ normalizes to COUNT(*). DISTINCT, optional matches, grouping bindings, fallible
 aggregate arguments and queries with additional semantic barriers retain their
 existing evaluators. This optimization reduces row transport to bounded owner
 partials; it does not exempt scans, filters or policies from their work budgets.
+
+
+Producer/count-vector qualification on 2026-10-30 merges `origin/main` through
+`0ff73ed56f` in `63bd16ecbd`; implementation commit `f770971d53` contains both
+fixes and the permanent regressions. The frozen implementation passes all 527
+core ReleaseFast tests, ten focused Debug tests, 57 source/ownership/compilation
+contracts and both runtime-error and independent callback ABI gates (15 build
+steps). Count-vector tests verify one scan with no node-row RPCs, serial and
+parallel owner reductions, empty/nullable inputs, original post-reduction
+errors, reply ownership and examined-progress accounting through fallback.
+
+The rebuilt CLI passes all five authenticated public regressions in 322.94
+seconds: property plans/SQL overlays, bounded producer visibility, replicated
+owner reads/search and both producer-postimage variants. The original 128-edge,
+1 MiB producer case now succeeds with its effective row filter at an 8 MiB
+query limit; the review reproduction previously failed at both 8 and 64 MiB.
+The regression also verifies that positive and negative visibility decisions
+do not survive producer changes across statements. Nullable, multiple and
+wrapped count queries pass against the public native path at 8 MiB.
+
+All five native retained-cut/SQL graph tests pass with zero leaks. The combined
+native build successfully installed the CLI and completed 109/117 steps before
+the entire worktree `.zig-cache` disappeared during transport compilation,
+causing missing-object and missing-argument-directory errors. A dedicated
+transport retry passes all 58/58 steps and 13 tests with zero leaks, with no
+production source changes for the retry. Compilation uses the documented
+process-local `MallocLargeCache=0` workaround; public tests use the normal
+runtime allocator environment. The earlier enrichment owner-loss campaign
+remains outside this qualification.
