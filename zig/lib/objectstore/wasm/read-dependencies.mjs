@@ -14,7 +14,19 @@
 // limitations under the License.
 
 import {ObjectStoreError} from './r2.mjs';
-import {proofPrefetchBytes} from './read-ahead.mjs';
+import {proofPrefetchBytes,ReadAheadBudget} from './read-ahead.mjs';
+// These are the existing point-read lanes, independently bounded from
+// metadata proof I/O. Preparation leaves one lane available for admission.
+const pointBudgets=new WeakMap();
+export function pointDependencyBudgetFor(kernel){
+ let budget=pointBudgets.get(kernel);
+ if(!budget){budget=new ReadAheadBudget(Math.max(1,Math.min(4,kernel.slots.length)),{reserveQueued:typeof kernel.reserveQueuedAdmission==='function'?()=>kernel.reserveQueuedAdmission():undefined});pointBudgets.set(kernel,budget);}
+ return budget;
+}
+export function pointDependencyMetrics(kernel){
+ const b=pointBudgets.get(kernel);
+ return{point_dependency_active:b?.active??0,point_dependency_queued:b?.pending.length??0,point_dependency_bytes:b?.bytes??0,point_dependency_peak_bytes:b?.peakBytes??0,point_dependency_limit_bytes:b?b.limit*proofPrefetchBytes:0};
+}
 const encoder=new TextEncoder();
 // A bounded, request-owned immutable dependency transcript. Native execution
 // unwinds before external I/O; resumption revalidates the original read view.
@@ -30,13 +42,13 @@ export class ReadDependencies {
   if(!['get','head','bucket_exists','read_view_barrier'].includes(request.op))throw Error('PointReadWriteForbidden');
   if(request.op==='read_view_barrier')return{}; // admission already completed
   const immutable=request.bucket==='database'&&request.op==='get'&&request.version_id==null&&request.if_match_etag==null&&(/\/artifacts\/(?:sha256\/[a-f0-9]{2}\/[a-f0-9]{62}|graph\/[a-f0-9]{64}\/[a-f0-9]{32}\/[a-f0-9]{64})$/.test(request.key??'')||/\/manifests\/[^/]+\/manifests\/[0-9]+\.bin$/.test(request.key??'')||/\/wal-v1\/[a-f0-9]{64}\/pages\/(?:[a-f0-9]{32}\/)?[a-f0-9]{64}$/.test(request.key??''));
-  if(!enabled||!immutable)return transport(request,body);
+  if(!enabled||!immutable||this.disabled)return transport(request,body);
   const key=JSON.stringify(request),prior=this.values.get(key);
   if(prior){this.onMetrics({point_dependency_replays:1});if(prior.error)throw prior.error;return{json:structuredClone(prior.value.json),body:prior.value.body.slice()};}
   const maximum=request.max_response_bytes;
   const descriptorBytes=encoder.encode(key).byteLength;
   const charge=Number.isSafeInteger(maximum)&&maximum>0&&descriptorBytes<=4096?maximum*2+8192+descriptorBytes*2+512:Infinity;
-  if(this.steps>=this.maxSteps||charge>this.maxBytes-this.bytes)return transport(request,body);
+  if(this.steps>=this.maxSteps||charge>this.maxBytes-this.bytes){this.clear();this.disabled=true;this.onMetrics({point_dependency_fallbacks:1});return transport(request,body);}
   if(this.pending&&this.pending.key!==key)throw Error('InvalidReadDependency');
   this.pending={key,request:structuredClone(request),transport,charge};
   throw new ObjectStoreError(10,'immutable read dependency');

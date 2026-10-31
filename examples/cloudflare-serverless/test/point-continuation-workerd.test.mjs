@@ -29,7 +29,7 @@ test('point dependency continuation releases its WASM slot and retains timed-out
   await control('/_arm');const pending=call(input);const held=await until(s=>s.held>0&&s.metrics.reader_pool_reserved_bytes===0);assert.equal(held.metrics.reader_pool_reserved_bytes,0);assert.deepEqual(await control('/_probe'),{executed:true,held:1});await control('/_release');assert.equal((await pending).body.body,'{"text":"accepted"}');
   const completed=await control('/_metrics');assert.ok(completed.events.some(e=>e.point_dependency_gets>0),JSON.stringify(completed));
   await control('/_arm');const timed=call(input);await until(s=>s.held>0);const timeout=await timed;assert.notEqual(timeout.status,200);assert.match(timeout.body.error,/DeadlineExceeded/);
-  const draining=await control('/_metrics');assert.equal(draining.held,1);assert.equal(draining.metrics.proof_prefetch_active,1);assert.equal(draining.metrics.reader_pool_reserved_bytes,0);const marker=draining.events.find(e=>e.io_draining===true);assert.ok(marker);
-  await control('/_release?failure=true');const settled=await until(s=>s.held===0&&s.metrics.proof_prefetch_active===0&&s.events.some(e=>e.event==='antfly.io_settled'&&e.io_lifecycle_id===marker.io_lifecycle_id));assert.ok(settled.events.some(e=>e.failure_code==='SQLITE_NOMEM'));
+  const draining=await control('/_metrics');assert.equal(draining.held,1);assert.equal(draining.metrics.point_dependency_active,1);assert.equal(draining.metrics.reader_pool_reserved_bytes,0);const marker=draining.events.find(e=>e.io_draining===true);assert.ok(marker);
+  await control('/_release?failure=true');const settled=await until(s=>s.held===0&&s.metrics.point_dependency_active===0&&s.events.some(e=>e.event==='antfly.io_settled'&&e.io_lifecycle_id===marker.io_lifecycle_id));assert.ok(settled.events.some(e=>e.failure_code==='SQLITE_NOMEM'));
  }finally{await control('/_release').catch(()=>{});await mf.dispose();await rm(dir,{recursive:true,force:true});}
 });

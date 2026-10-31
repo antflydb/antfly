@@ -39,3 +39,14 @@ test('logical deadline retains physical settlement and late failure identity',as
  let reject;const d=fixture({deadlineMs:Date.now()+30}),t=d.wrap(()=>new Promise((_,no)=>reject=no));await assert.rejects(t(request),e=>e.status===10);
  let failure;try{await d.load();}catch(e){failure=e;}assert.equal(failure.message,'DeadlineExceeded');assert.ok(failure.ioSettled);const late=Error('SQLITE_NOMEM');reject(late);await assert.rejects(failure.ioSettled,e=>e===late);
 });
+test('point dependency admission preserves independent metadata proof capacity',async()=>{
+ const{pointDependencyBudgetFor,pointDependencyMetrics}=await import('../../../zig/lib/objectstore/wasm/read-dependencies.mjs');
+ const{readAheadBudgetFor}=await import('../../../zig/lib/objectstore/wasm/read-ahead.mjs');
+ const kernel={slots:Array.from({length:4},()=>({}))},point=pointDependencyBudgetFor(kernel),proof=readAheadBudgetFor(kernel,4),held=[];
+ for(let i=0;i<4;i++)held.push(point.tryAcquire('point/'+i));assert.equal(point.tryAcquire('point/overflow'),null);
+ for(let i=0;i<4;i++)held.push(proof.tryAcquire('proof/'+i));assert.ok(held.every(Boolean));assert.equal(pointDependencyMetrics(kernel).point_dependency_bytes,4*102400);for(const release of held)release();assert.equal(pointDependencyMetrics(kernel).point_dependency_active,0);
+});
+test('capacity fallback drops transcripts before using the ordinary native response envelope',async()=>{
+ const d=fixture(),t=d.wrap(async()=>({body:new Uint8Array(1)}));await assert.rejects(t(request),e=>e.status===10);await d.load();assert.ok(d.bytes>0);
+ await t({...request,key:request.key.replace('/aa/','/bb/'),max_response_bytes:128*1024});assert.equal(d.disabled,true);assert.equal(d.bytes,0);assert.equal(d.values.size,0);await t(request);
+});

@@ -35,10 +35,16 @@ aggregate allowance; the native read allowance remains separate and unchanged.
 
 Immutable preparation overlaps fresh admission. It returns its one-shot ticket
 and host preference to the final query. Before waiting for admission it releases
-its transcript buffers and auxiliary permit, so metadata observation can use the
-same bounded budget. Completed immutable bytes may remain only in their normal
+its transcript buffers and point permit. Point I/O uses the existing four
+logical point lanes, independently of the four metadata-proof permits; optional
+speculative preparation leaves one point lane available and starts only after
+metadata admission has begun. This preserves the existing point/metadata
+concurrency envelope instead of forcing both through one four-call queue.
+The point transcript ceiling is below the original point response envelope.
+Oversized dependencies drop the transcript before ordinary native I/O. Completed immutable bytes may remain only in their normal
 charged cache. Final execution re-acquires a permit and respects the shorter
-original lease deadline. Timeout/cancellation retains that permit and the caller
+original lease deadline. The validated native read-state cache remains enabled
+under its existing policy. Timeout/cancellation retains that permit and the caller
 background lifetime until physical settlement; late errors remain observable.
 Intermediate yields are preparation diagnostics, not completed logical reads.
 

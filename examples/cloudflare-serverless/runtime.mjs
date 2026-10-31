@@ -13,23 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {ReadDependencies} from "../../zig/lib/objectstore/wasm/read-dependencies.mjs";
-import {readAheadBudgetFor} from "../../zig/lib/objectstore/wasm/read-ahead.mjs";
-// Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
+import {ReadDependencies,pointDependencyBudgetFor} from "../../zig/lib/objectstore/wasm/read-dependencies.mjs";
 import {takeRpcData} from "./rpc-data.mjs";
 import {NativeReadPlans,withNativeReadPlan,withNativeReadPlanPermit,withNativeReadPreparation} from "./native-read-plan.mjs";
 import {PublicationReadHints} from "./publication-read-hints.mjs";
@@ -77,29 +61,36 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     try{
       if(!readAdmission&&env.NATIVE_POINT_CONTINUATIONS==="true"&&env.COORDINATOR_BACKEND==="r2"&&input.op==="lookup"&&!input.cursor&&requestBackground&&kernel.slots?.length){
         const deadlineMs=Date.now()+30000;
-        const fresh=prepareReadAdmission(env,input,trace,readViews?.get(env),{background:requestBackground,deadlineMs});fresh.catch(()=>{});
+        let admitted,freshReady=false;const begun=new Promise(resolve=>admitted=resolve);
+        const fresh=prepareReadAdmission(env,input,trace,readViews?.get(env),{background:requestBackground,deadlineMs,onAdmitted:admitted});fresh.then(()=>{freshReady=true;admitted();},()=>{freshReady=true;admitted();});fresh.catch(()=>{});
         let admission;
-        const budget=readAheadBudgetFor(kernel,Math.min(4,kernel.slots.length));let ticket;
+        const budget=pointDependencyBudgetFor(kernel);let ticket;
         let release,draining=false,preparedToken,preparedHost,preparedSpent=0,usage={operations:0,transferred_bytes:0};
         const dependencies=new ReadDependencies({deadlineMs,signal,onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.point_dependency",trace_id:trace.id,...sample}));}});
         try{
-          const acquire=async()=>{
+          const acquire=async()=>trace.span("point_dependency_queue",async()=>{
             ticket=budget.acquire(env.ANTFLY_INCARNATION,{concurrent:true});
             let timer,abort;try{release=await Promise.race([ticket.ready,new Promise((_,reject)=>{abort=()=>reject(Error("DeadlineExceeded"));timer=setTimeout(abort,Math.max(0,deadlineMs-Date.now()));signal?.addEventListener("abort",abort,{once:true});if(signal?.aborted)abort();})]);}finally{clearTimeout(timer);signal?.removeEventListener("abort",abort);}
             release.start();
-          };
+          });
           const executePhase=async(preparing)=>{const token=Array.from(crypto.getRandomValues(new Uint8Array(16)));for(let step=0;step<=64;step++){
-            dependencies.check();dependencies.operations=usage.operations;dependencies.transferred=usage.transferred_bytes;
+            dependencies.check();if(preparing&&env.OPPORTUNISTIC_READ_PREPARE==="true"&&freshReady)return;dependencies.operations=usage.operations;dependencies.transferred=usage.transferred_bytes;
             const execute=host=>{if(preparing)preparedHost=host.poolIdentity;return run(env,input,signal,collection,host,trace,preparing?{nativePreparation:{hint:nativeReadPlans.get(env),ticket:token,spentBytes:usage.transferred_bytes},deadlineMs}:{...admission,deadlineMs:dependencies.deadlineMs,...(preparedToken?{nativeResume:{ticket:preparedToken,hostIdentity:preparedHost,spentBytes:preparedSpent}}:{})},{...requestOptions,readDependencies:dependencies,dependenciesPreparation:preparing,readHint:nativeReadPlans.get(env),onNativeMetrics:sample=>{usage.operations+=sample.operations;usage.transferred_bytes+=sample.transferred_bytes;requestOptions.onNativeMetrics?.(sample);}});};
-            const options={signal,deadlineMs:dependencies.deadlineMs,fairKey:env.ANTFLY_INCARNATION,...(!preparing&&preparedHost?{preferredHostIdentity:preparedHost}:{}),...(env.NATIVE_READ_AFFINITY==="true"?{affinityKey:env.ANTFLY_INCARNATION}:{}),onStage:sample=>trace.stage(sample)};
+            const options={signal,deadlineMs:dependencies.deadlineMs,...(preparing&&env.OPPORTUNISTIC_READ_PREPARE==="true"?{tryOnly:true,preparationOnly:true}:{}),fairKey:env.ANTFLY_INCARNATION,...(!preparing&&preparedHost?{preferredHostIdentity:preparedHost}:{}),...(env.NATIVE_READ_AFFINITY==="true"?{affinityKey:env.ANTFLY_INCARNATION}:{}),onStage:sample=>trace.stage(sample)};
             const value=pointReadLanes&&env.DIRECT_READS==="true"?await withPointReadLane(kernel,execute,options):await kernel.withHost(execute,options);
+            if(value==null&&preparing)return;
             if(value.__read_dependency!==true){if(preparing&&value.__read_prepared){preparedToken=token;preparedSpent=value.__read_spent_bytes??0;}return value;}
             dependencies.operations=usage.operations;dependencies.transferred=usage.transferred_bytes;
             await trace.span("point_dependency_io",()=>dependencies.load());
             usage.operations=dependencies.operations;usage.transferred_bytes=dependencies.transferred;
           }
           throw Error("ObjectIoBudgetExceeded");};
-          if(nativeReadPlans.get(env)){await acquire();await executePhase(true);dependencies.clear();release();release=null;}
+          if(nativeReadPlans.get(env)){
+            await begun;
+            if(env.OPPORTUNISTIC_READ_PREPARE==="true"){if(!freshReady&&budget.active<budget.limit-1){release=budget.tryAcquire(env.ANTFLY_INCARNATION,{concurrent:true});release?.start();}}
+            else await acquire();
+            if(release){await executePhase(true);dependencies.clear();release();release=null;}
+          }
           admission=await fresh;dependencies.deadlineMs=Math.min(deadlineMs,admission.deadlineMs??Infinity);
           if(!admission.view)return await launch(admission);
           await acquire();return await executePhase(false);
@@ -268,7 +259,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     const compactDeadline=Date.now()+30000;let probeOperations=0,probeBytes=0,probeMetrics,batchRecords,batchVersion,preparedSlice=false;
     const priorReadUsage=readAdmission?.nativeResume?.usage??(requestOptions.readDependencies?{operations:requestOptions.readDependencies.operations,transferred_bytes:requestOptions.readDependencies.transferred,elapsed_ms:0,io_wait_ms:0,working_set_peak_bytes:0}:null);
     if(priorReadUsage&&(!Number.isSafeInteger(priorReadUsage.operations)||!Number.isSafeInteger(priorReadUsage.transferred_bytes)||priorReadUsage.operations>=1024||priorReadUsage.transferred_bytes>=32*1024*1024))throw Error("ObjectIoBudgetExceeded");
-    const executeNative=probe=>lane.request({ ...nativeInput, ...settings,...(env.IMMUTABLE_PREPARED_REUSE==="true"&&lane.readDependencyABI===1?{native_read_reuse:true}:{}),...(requestOptions.readDependencies?{...(lane.readDependencyABI===1?{native_read_yield:true}:{}),native_read_state:false,native_read_plan_mode:true,native_read_plan:readAdmission?.nativeResume?null:requestOptions.readHint}:{}),...(plannedPublication&&preparedPublication?{publication_continuations:preparedPublication.format===3,publication_batch_probe:false,publication_lease:preparedPublication.lease,...(batchRecords!==undefined?{publication_records:Math.min(batchRecords,publicationView.budget),publication_batch_version:batchVersion}:{})}:{}),...(plannedCompact?{compaction_probe_only:probe,publication_lease:preparedPublication?.lease??null}:{}), bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,background:requestBackground,onIoSettled:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify(sample));},...(priorReadUsage?{maxOperations:1024-priorReadUsage.operations,maxTransferBytes:32*1024*1024-priorReadUsage.transferred_bytes}:{}),...(readAdmission?.nativePlan?{deadlineMs:readAdmission.nativePlan.deadlineMs}:readAdmission?.deadlineMs?{deadlineMs:readAdmission.deadlineMs}:{}),...(plannedCompact||plannedPublication?{deadlineMs:compactDeadline,maxOperations:1024-probeOperations,maxTransferBytes:32*1024*1024-probeBytes}:{}),...(input.exact_scan?{deadlineMs:Date.now()+5000}:{}),
+    const executeNative=probe=>lane.request({ ...nativeInput, ...settings,...(env.IMMUTABLE_PREPARED_REUSE==="true"&&lane.readDependencyABI===1?{native_read_reuse:true}:{}),...(requestOptions.readDependencies?{...(lane.readDependencyABI===1?{native_read_yield:true}:{}),native_read_plan_mode:true,native_read_plan:readAdmission?.nativeResume?null:requestOptions.readHint}:{}),...(plannedPublication&&preparedPublication?{publication_continuations:preparedPublication.format===3,publication_batch_probe:false,publication_lease:preparedPublication.lease,...(batchRecords!==undefined?{publication_records:Math.min(batchRecords,publicationView.budget),publication_batch_version:batchVersion}:{})}:{}),...(plannedCompact?{compaction_probe_only:probe,publication_lease:preparedPublication?.lease??null}:{}), bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,background:requestBackground,onIoSettled:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify(sample));},...(priorReadUsage?{maxOperations:1024-priorReadUsage.operations,maxTransferBytes:32*1024*1024-priorReadUsage.transferred_bytes}:{}),...(readAdmission?.nativePlan?{deadlineMs:readAdmission.nativePlan.deadlineMs}:readAdmission?.deadlineMs?{deadlineMs:readAdmission.deadlineMs}:{}),...(plannedCompact||plannedPublication?{deadlineMs:compactDeadline,maxOperations:1024-probeOperations,maxTransferBytes:32*1024*1024-probeBytes}:{}),...(input.exact_scan?{deadlineMs:Date.now()+5000}:{}),
       onMetrics: metrics => {
         if(probeMetrics)metrics={...metrics,operations:metrics.operations+probeMetrics.operations,transferred_bytes:metrics.transferred_bytes+probeMetrics.transferred_bytes,elapsed_ms:metrics.elapsed_ms+probeMetrics.elapsed_ms,io_wait_ms:metrics.io_wait_ms+probeMetrics.io_wait_ms,working_set_peak_bytes:Math.max(metrics.working_set_peak_bytes,probeMetrics.working_set_peak_bytes)};
         requestOptions.onNativeMetrics?.(metrics);
