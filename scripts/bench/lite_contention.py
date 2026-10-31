@@ -396,11 +396,12 @@ def aggregate(workers: list[dict]) -> dict:
     )
     if proof_elapsed <= 0:
         raise RuntimeError("invalid proof-observation interval")
+    starved = sum(not row["success_latency_ns"] for row in workers)
     result = {
-        "status": "ok" if successful else "no_progress",
-        "workers_without_success": sum(
-            not row["success_latency_ns"] for row in workers
+        "status": (
+            "no_progress" if not successful else "starved_workers" if starved else "ok"
         ),
+        "workers_without_success": starved,
         "per_worker_background_publication_deltas": [
             row.get("background_publication_deltas", {}) for row in workers
         ],
@@ -421,6 +422,9 @@ def aggregate(workers: list[dict]) -> dict:
         ),
         "per_worker_successful_calls": [
             len(row["success_latency_ns"]) for row in workers
+        ],
+        "per_worker_proof_walks": [
+            row["proofs"]["allocator_proof_walks"] for row in workers
         ],
     }
     for name, values in (("success", successful), ("busy", busy)):
@@ -607,7 +611,7 @@ def native_cases(args):
                 results.close()
             row["worker_lifetime_seconds"] = time.monotonic() - worker_started
             row["file_bytes"] = database.stat().st_size
-            if row["status"] in ("ok", "no_progress"):
+            if row["status"] in ("ok", "no_progress", "starved_workers"):
                 expected = [
                     worker["last_write"]
                     for worker in workers
@@ -638,7 +642,7 @@ def native_cases(args):
                 except subprocess.TimeoutExpired:
                     row.update(status="verification_watchdog_timeout", censored=True)
             yield row
-            if row["status"] != "ok":
+            if row["status"] not in ("ok", "no_progress", "starved_workers"):
                 return
 
 

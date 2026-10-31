@@ -259,6 +259,15 @@ class ContentionReportTests(unittest.TestCase):
         self.assertEqual(result["workers_without_success"], 2)
         self.assertEqual(result["busy_fraction"], 1)
         self.assertEqual(result["successful_calls_per_second"], 0)
+        progressing = {
+            **worker,
+            "success_latency_ns": [30],
+            "admission": admission(30),
+        }
+        partial = bench.aggregate([worker, progressing])
+        self.assertEqual(partial["status"], "starved_workers")
+        self.assertEqual(partial["workers_without_success"], 1)
+        self.assertEqual(partial["successful_calls_per_second"], 1)
 
     def test_unsampled_admission_has_no_latency_even_with_successful_calls(self):
         worker = {
