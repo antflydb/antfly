@@ -85,6 +85,12 @@ pub const Config = struct {
     /// When false, the unpruned base graph is kept. Useful for comparisons.
     prune: bool = true,
     seed: u64 = 42,
+    /// Experimental: keep full-precision vectors for nodes on layer 1 and
+    /// above (about 1 in `max_degree` nodes). Upper-layer descent and linking
+    /// then use exact distances, and those nodes never need recomputing.
+    /// Not serialized or replicated yet: `serialize` and `Delta.encode`
+    /// refuse indexes and deltas that use it.
+    store_upper: bool = false,
 
     pub fn resolved(self: Config) !Config {
         if (self.dims == 0) return error.InvalidConfig;
@@ -293,6 +299,9 @@ pub const Index = struct {
     /// Layer-0 in-degree per node, kept in memory (rebuilt on load) so
     /// inserts never evict a node's last inbound edge.
     indegree: std.ArrayListUnmanaged(u32) = .empty,
+    /// `Config.store_upper` only: vectors of nodes on layer 1 and above, in
+    /// the space `decodeApprox` uses (rotated for RaBitQ).
+    upper_vectors: std.AutoHashMapUnmanaged(u32, []f32) = .empty,
 
     /// Builds an index from `vectors` (row-major, `dims` floats each). The
     /// vectors are only used during the build; the index keeps none of them.
@@ -334,6 +343,11 @@ pub const Index = struct {
             const lists = try alloc.alloc(NeighborList, levelFor(cfg.seed, @intCast(i), cfg.max_degree));
             @memset(lists, NeighborList.empty);
             index.upper.appendAssumeCapacity(lists);
+            if (cfg.store_upper and lists.len > 0) {
+                const kept = try alloc.dupe(f32, work[i * dims ..][0..dims]);
+                errdefer alloc.free(kept);
+                try index.upper_vectors.put(alloc, @intCast(i), kept);
+            }
         }
 
         const ctx = BuildContext{ .vectors = work, .dims = dims, .metric = cfg.metric };
@@ -409,6 +423,9 @@ pub const Index = struct {
         self.flags.deinit(self.alloc);
         self.codes.deinit(self.alloc);
         self.indegree.deinit(self.alloc);
+        var uv = self.upper_vectors.valueIterator();
+        while (uv.next()) |v| self.alloc.free(v.*);
+        self.upper_vectors.deinit(self.alloc);
         if (self.pq) |*pq| pq.deinit(self.alloc);
         if (self.rabitq) |*r| r.deinit(self.alloc);
         self.* = undefined;
@@ -433,6 +450,137 @@ pub const Index = struct {
         if (self.flags.items[id] & flag_deleted != 0) return;
         self.flags.items[id] |= flag_deleted;
         self.deleted_count += 1;
+    }
+
+    pub const ConsolidateStats = struct {
+        /// Neighbor lists that lost deleted members and were refilled.
+        patched_lists: u32 = 0,
+        /// Deleted nodes taken out of the graph by this pass.
+        removed: u32 = 0,
+    };
+
+    /// Experimental and local only (not yet a replicated delta). Takes deleted
+    /// nodes out of the graph, FreshDiskANN-style: every list that points to
+    /// a deleted node drops it and refills the freed slots with the closest
+    /// live neighbors of its deleted members (up to two hops), by approximate
+    /// distance, so it costs no recomputation. Deleted nodes keep their ids
+    /// and stay counted in `deletedFraction`, but no search reaches them.
+    pub fn consolidateDeletes(self: *Index) !ConsolidateStats {
+        const alloc = self.alloc;
+        var stats = ConsolidateStats{};
+        if (self.deleted_count == 0) return stats;
+        const d = self.dimension();
+        const a = try alloc.alloc(f32, d);
+        defer alloc.free(a);
+        const b = try alloc.alloc(f32, d);
+        defer alloc.free(b);
+
+        const Patch = struct { v: u32, layer: u8, ids: []u32 };
+        var patches = std.ArrayListUnmanaged(Patch).empty;
+        defer {
+            for (patches.items) |p| alloc.free(p.ids);
+            patches.deinit(alloc);
+        }
+        var keep = std.ArrayListUnmanaged(u32).empty;
+        defer keep.deinit(alloc);
+        var cands = std.ArrayListUnmanaged(Cand).empty;
+        defer cands.deinit(alloc);
+        var seen = std.AutoHashMapUnmanaged(u32, void).empty;
+        defer seen.deinit(alloc);
+
+        const Ctx = struct {
+            index: *const Index,
+            seen: *std.AutoHashMapUnmanaged(u32, void),
+            cands: *std.ArrayListUnmanaged(Cand),
+            a: []const f32,
+            b: []f32,
+            fn add(ctx: @This(), al: Allocator, w: u32) !void {
+                if (ctx.index.isDeleted(w)) return;
+                const gop = try ctx.seen.getOrPut(al, w);
+                if (gop.found_existing) return;
+                ctx.index.decodeApprox(w, ctx.b);
+                try ctx.cands.append(al, .{ .dist = distance(ctx.index.config.metric, ctx.a, ctx.b), .id = w });
+            }
+        };
+
+        for (0..self.node_count) |vi| {
+            const v: u32 = @intCast(vi);
+            if (self.isDeleted(v)) continue;
+            const levels: u8 = @intCast(self.upper.items[v].len);
+            var layer: u8 = 0;
+            while (layer <= levels) : (layer += 1) {
+                const list = self.neighbors(v, layer);
+                var has_deleted = false;
+                for (list) |x| {
+                    if (self.isDeleted(x)) has_deleted = true;
+                }
+                if (!has_deleted) continue;
+                keep.clearRetainingCapacity();
+                cands.clearRetainingCapacity();
+                seen.clearRetainingCapacity();
+                try seen.put(alloc, v, {});
+                for (list) |x| if (!self.isDeleted(x)) {
+                    try keep.append(alloc, x);
+                    try seen.put(alloc, x, {});
+                };
+                self.decodeApprox(v, a);
+                const ctx = Ctx{ .index = self, .seen = &seen, .cands = &cands, .a = a, .b = b };
+                for (list) |x| {
+                    if (!self.isDeleted(x)) continue;
+                    for (self.neighbors(x, layer)) |w| {
+                        if (self.isDeleted(w)) {
+                            for (self.neighbors(w, layer)) |w2| try ctx.add(alloc, w2);
+                        } else try ctx.add(alloc, w);
+                    }
+                }
+                std.mem.sortUnstable(Cand, cands.items, {}, candLessThan);
+                for (cands.items) |c| {
+                    if (keep.items.len >= list.len) break;
+                    try keep.append(alloc, c.id);
+                }
+                try patches.ensureUnusedCapacity(alloc, 1);
+                patches.appendAssumeCapacity(.{ .v = v, .layer = layer, .ids = try alloc.dupe(u32, keep.items) });
+            }
+        }
+
+        // Lists only shrink or keep their length, so nothing below allocates.
+        for (patches.items) |p| {
+            const list = if (p.layer == 0) &self.adjacency.items[p.v] else &self.upper.items[p.v][p.layer - 1];
+            list.clearRetainingCapacity();
+            list.appendSliceAssumeCapacity(p.ids);
+        }
+        stats.patched_lists = @intCast(patches.items.len);
+        for (0..self.node_count) |vi| {
+            const v: u32 = @intCast(vi);
+            if (!self.isDeleted(v)) continue;
+            var had_edges = self.adjacency.items[v].items.len > 0;
+            self.adjacency.items[v].clearRetainingCapacity();
+            for (self.upper.items[v]) |*list| {
+                if (list.items.len > 0) had_edges = true;
+                list.clearRetainingCapacity();
+            }
+            if (had_edges) stats.removed += 1;
+        }
+        if (self.isDeleted(self.entry)) {
+            var best: ?u32 = null;
+            var best_level: usize = 0;
+            for (0..self.node_count) |vi| {
+                const v: u32 = @intCast(vi);
+                if (self.isDeleted(v)) continue;
+                const lv = self.upper.items[v].len;
+                if (best == null or lv > best_level) {
+                    best = v;
+                    best_level = lv;
+                }
+            }
+            if (best) |e| {
+                self.entry = e;
+                self.max_level = @intCast(best_level);
+            }
+        }
+        try self.rebuildIndegree();
+        self.version += 1;
+        return stats;
     }
 
     pub fn deletedFraction(self: *const Index) f64 {
@@ -554,6 +702,7 @@ pub const Index = struct {
         delta.code = try self.encodeCode(alloc, v);
         delta.upper = try alloc.alloc([]u32, level);
         @memset(delta.upper, &.{});
+        if (self.config.store_upper and level > 0) delta.upper_vector = try self.toDecodeSpace(alloc, v);
 
         var stats = SearchStats{};
         var ep = try self.greedyDescentApprox(&approx, self.entry, self.max_level, level, &stats);
@@ -612,7 +761,7 @@ pub const Index = struct {
         defer alloc.free(b);
         const new_vec = try alloc.alloc(f32, d);
         defer alloc.free(new_vec);
-        self.decodeBytes(delta.code, new_vec);
+        if (delta.upper_vector.len > 0) @memcpy(new_vec, delta.upper_vector) else self.decodeBytes(delta.code, new_vec);
 
         for (delta.forward) |u| {
             const list = self.adjacency.items[u].items;
@@ -733,6 +882,12 @@ pub const Index = struct {
             const list = if (e.layer == 0) &self.adjacency.items[e.owner] else &self.upper.items[e.owner][e.layer - 1];
             try list.ensureUnusedCapacity(alloc, 1);
         }
+        var kept_vector: ?[]f32 = null;
+        defer if (kept_vector) |kv| alloc.free(kv);
+        if (delta.upper_vector.len > 0) {
+            kept_vector = try alloc.dupe(f32, delta.upper_vector);
+            try self.upper_vectors.ensureUnusedCapacity(alloc, 1);
+        }
 
         self.appendCodeAssumeCapacity(delta.code);
         self.flags.appendAssumeCapacity(0);
@@ -742,6 +897,10 @@ pub const Index = struct {
         forward_owned = false;
         self.upper.appendAssumeCapacity(new_upper);
         upper_owned = false;
+        if (kept_vector) |kv| {
+            self.upper_vectors.putAssumeCapacity(id, kv);
+            kept_vector = null;
+        }
         self.node_count += 1;
 
         for (delta.edits) |e| {
@@ -798,6 +957,7 @@ pub const Index = struct {
         var forward = self.adjacency.pop().?;
         forward.deinit(self.alloc);
         freeLists(self.alloc, self.upper.pop().?);
+        if (self.upper_vectors.fetchRemove(id)) |kv| self.alloc.free(kv.value);
         self.flags.items.len -= 1;
         self.indegree.items.len -= 1;
         self.popCode();
@@ -817,6 +977,8 @@ pub const Index = struct {
         if (delta.level != levelFor(self.config.seed, id, self.config.max_degree)) return error.InvalidDelta;
         if (delta.code.len != self.codeByteLen()) return error.InvalidDelta;
         if (delta.upper.len != delta.level) return error.InvalidDelta;
+        const want_vector: usize = if (self.config.store_upper and delta.level > 0) self.dimension() else 0;
+        if (delta.upper_vector.len != want_vector) return error.InvalidDelta;
         if (delta.forward.len > self.config.max_degree) return error.InvalidDelta;
         for (delta.forward) |u| if (u >= self.node_count) return error.InvalidDelta;
         for (delta.upper, 1..) |ids, l| {
@@ -872,8 +1034,19 @@ pub const Index = struct {
     /// Approximate reconstruction of a stored vector (in rotated space for
     /// RaBitQ). Only used to compare stored vectors with each other.
     fn decodeApprox(self: *const Index, id: u32, out: []f32) void {
+        if (self.upper_vectors.get(id)) |v| return @memcpy(out, v);
         if (self.rabitq) |*r| return r.decode(id, out);
         self.pq.?.decode(self.code(id), out);
+    }
+
+    /// Copies a (normalized for cosine) vector into the space `decodeApprox`
+    /// uses.
+    fn toDecodeSpace(self: *const Index, alloc: Allocator, v: []const f32) ![]f32 {
+        const out = try alloc.alloc(f32, v.len);
+        if (self.rabitq) |*r| {
+            _ = r.rotation.transform(v, out);
+        } else @memcpy(out, v);
+        return out;
     }
 
     fn code(self: *const Index, id: u32) []const u8 {
@@ -1094,6 +1267,16 @@ pub const Index = struct {
                 const p = pool.items[i];
                 if (p.lower >= tau) break;
                 if (self.isDeleted(p.id)) continue;
+                if (self.upper_vectors.contains(p.id)) {
+                    // Stored exactly (bound 0): no recomputation needed.
+                    const c = Cand{ .dist = p.lower, .id = p.id };
+                    if (top.len() < k) {
+                        try top.push(alloc, c);
+                    } else if (c.dist < top.top().dist) {
+                        top.replaceTop(c);
+                    }
+                    continue;
+                }
                 try ids.append(alloc, p.id);
             }
             if (ids.items.len == 0) {
@@ -1247,6 +1430,7 @@ pub const Index = struct {
     /// flags, levels, layer-0 CSR offsets and neighbors, then for each node
     /// with level > 0 and each of its layers a u32 count and the neighbors.
     pub fn serialize(self: *const Index, alloc: Allocator) ![]u8 {
+        if (self.config.store_upper) return error.UnsupportedStoreUpper;
         var w: std.Io.Writer.Allocating = .init(alloc);
         defer w.deinit();
         const wr = &w.writer;
@@ -1415,6 +1599,9 @@ pub const Delta = struct {
     /// Reverse-link edits, applied in order. Each writes the new id into
     /// `owner`'s list on `layer`, at `slot` or appended.
     edits: []Edit = &.{},
+    /// `Config.store_upper` only: the new node's vector when it lands on an
+    /// upper layer. Not encoded yet.
+    upper_vector: []f32 = &.{},
 
     pub const Kind = enum(u8) { insert = 1, delete = 2 };
     pub const append_slot: u32 = std.math.maxInt(u32);
@@ -1429,10 +1616,12 @@ pub const Delta = struct {
         for (self.upper) |ids| if (ids.len > 0) alloc.free(ids);
         if (self.upper.len > 0) alloc.free(self.upper);
         if (self.edits.len > 0) alloc.free(self.edits);
+        if (self.upper_vector.len > 0) alloc.free(self.upper_vector);
         self.* = undefined;
     }
 
     pub fn encode(self: Delta, alloc: Allocator) ![]u8 {
+        if (self.upper_vector.len > 0) return error.UnsupportedStoreUpper;
         var w: std.Io.Writer.Allocating = .init(alloc);
         defer w.deinit();
         const wr = &w.writer;
@@ -1521,6 +1710,8 @@ const Approx = struct {
     pairs: std.ArrayListUnmanaged(Pair) = .empty,
     ranges: std.ArrayListUnmanaged(rq.ScoreRange) = .empty,
     out: std.ArrayListUnmanaged(Est) = .empty,
+    /// Query in the space of `Index.upper_vectors`, when the index has any.
+    exact_q: []f32 = &.{},
 
     const Pair = struct { id: u32, slot: u32 };
 
@@ -1529,6 +1720,7 @@ const Approx = struct {
     fn init(alloc: Allocator, index: *const Index, q: []const f32) !Approx {
         var self = Approx{ .alloc = alloc, .index = index };
         errdefer self.deinit();
+        if (index.config.store_upper) self.exact_q = try index.toDecodeSpace(alloc, q);
         if (index.pq) |*pq| {
             self.table = try alloc.alloc(f32, pq.tableLen());
             pq.buildTable(index.config.metric, q, self.table);
@@ -1549,6 +1741,7 @@ const Approx = struct {
 
     fn deinit(self: *Approx) void {
         if (self.table.len > 0) self.alloc.free(self.table);
+        if (self.exact_q.len > 0) self.alloc.free(self.exact_q);
         if (self.scratch) |s| {
             s.deinit(self.alloc);
             self.alloc.destroy(s);
@@ -1560,6 +1753,15 @@ const Approx = struct {
 
     /// Scores `ids` (unique). The returned slice is valid until the next call.
     fn score(self: *Approx, ids: []const u32) ![]const Est {
+        const out = try self.scoreCodes(ids);
+        if (self.exact_q.len == 0) return out;
+        for (ids, out) |id, *o| {
+            if (self.index.upper_vectors.get(id)) |v| o.* = .{ .dist = distance(self.index.config.metric, self.exact_q, v), .bound = 0 };
+        }
+        return out;
+    }
+
+    fn scoreCodes(self: *Approx, ids: []const u32) ![]Est {
         try self.out.resize(self.alloc, ids.len);
         const out = self.out.items;
         if (ids.len == 0) return out;
@@ -2713,6 +2915,67 @@ test "leann: inserts are searchable" {
         defer resp.deinit(alloc);
         try testing.expectEqual(@as(u32, @intCast(i)), resp.results[0].id);
     }
+}
+
+test "leann: consolidating deletes removes them from the graph and keeps recall" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 2000, 20, 32, 24, 31);
+    defer fx.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = 32, .max_degree = 24, .quantizer = .rabitq }, fx.data);
+    defer index.deinit();
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 32 };
+    var prng = std.Random.DefaultPrng.init(5);
+    var deleted: usize = 0;
+    while (deleted < 600) {
+        const id = prng.random().uintLessThan(u32, 2000);
+        if (index.isDeleted(id)) continue;
+        try index.markDeleted(id);
+        deleted += 1;
+    }
+    if (index.isDeleted(index.entry) == false) try index.markDeleted(index.entry);
+    const st = try index.consolidateDeletes();
+    try testing.expect(st.patched_lists > 0);
+    try testing.expect(!index.isDeleted(index.entry));
+    for (index.adjacency.items, 0..) |list, v| {
+        if (index.isDeleted(@intCast(v))) try testing.expectEqual(@as(usize, 0), list.items.len);
+        for (list.items) |nb| try testing.expect(!index.isDeleted(nb));
+    }
+    for (index.upper.items) |lists| for (lists) |list| for (list.items) |nb| try testing.expect(!index.isDeleted(nb));
+    // Searches still find live neighbors and inserts still plan and apply.
+    var hits: usize = 0;
+    for (0..20) |qi| {
+        var resp = try index.search(alloc, src.source(), fx.query(qi), .{ .k = 10 });
+        defer resp.deinit(alloc);
+        for (resp.results) |r| try testing.expect(!index.isDeleted(r.id));
+        hits += resp.results.len;
+    }
+    try testing.expectEqual(@as(usize, 200), hits);
+}
+
+test "leann: stored upper vectors avoid recomputing upper nodes" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 2400, 20, 32, 24, 37);
+    defer fx.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = 32, .max_degree = 24, .quantizer = .rabitq, .store_upper = true }, fx.data[0 .. 2000 * 32]);
+    defer index.deinit();
+    try testing.expect(index.upper_vectors.count() > 0);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 32 };
+    for (2000..2400) |i| _ = try index.insert(src.source(), fx.data[i * 32 ..][0..32]);
+    var upper_nodes: usize = 0;
+    for (index.upper.items) |lists| {
+        if (lists.len > 0) upper_nodes += 1;
+    }
+    try testing.expectEqual(upper_nodes, index.upper_vectors.count());
+    const r = try recallAt(alloc, &index, &fx, src.source(), .{ .k = 10, .ef = 128 }, 20, std.math.maxInt(usize));
+    try testing.expect(r.recall >= 0.85);
+    try testing.expectError(error.UnsupportedStoreUpper, index.serialize(alloc));
+    // Reverting an insert drops its stored vector.
+    var delta = try index.planInsert(alloc, src.source(), fx.query(0));
+    defer delta.deinit(alloc);
+    const before = index.upper_vectors.count();
+    const undo = try index.applyDeltaUndoable(delta);
+    index.revertDelta(delta, undo);
+    try testing.expectEqual(before, index.upper_vectors.count());
 }
 
 test "leann: recompute failures propagate" {

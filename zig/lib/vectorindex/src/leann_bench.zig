@@ -19,6 +19,14 @@
 //!       [--data PREFIX] [--n 100000] [--queries 200] [--dims 64] \
 //!       [--metric l2|cosine|ip] [--m 30] [--efc 128] [--quantizer pq|rabitq|both] \
 //!       [--unpruned 1] [--cost FILE]
+//!       [--churn ROUNDS] [--churn-frac 0.05] [--rebuild-at 0.2]
+//!
+//! --churn switches to the mixed-workload benchmark: after the initial build,
+//! each round deletes `churn-frac * n` random live vectors and inserts as many
+//! new ones (rows after the first n of the training set), then measures
+//! recall and recomputations against exact ground truth over the live set.
+//! It compares tombstones with rebuilds at `rebuild-at` deleted, delete
+//! consolidation, and both with stored upper-layer vectors.
 //!
 //! --cost names a measured embedder cost curve: one "batch_size milliseconds"
 //! pair per line (see scripts/leann_embed_cost.py). When given, the bench
@@ -44,6 +52,9 @@ const Args = struct {
     quantizer: ?leann.Quantizer = null,
     unpruned: bool = false,
     cost: ?[]const u8 = null,
+    churn: usize = 0,
+    churn_frac: f64 = 0.05,
+    rebuild_at: f64 = 0.2,
 };
 
 /// Embedder cost curve: milliseconds per call at measured batch sizes,
@@ -125,12 +136,20 @@ pub fn main(init: std.process.Init) !void {
             args.quantizer = if (std.mem.eql(u8, value, "pq")) .pq else if (std.mem.eql(u8, value, "rabitq")) .rabitq else null;
         } else if (std.mem.eql(u8, flag, "--unpruned")) {
             args.unpruned = std.mem.eql(u8, value, "1");
+        } else if (std.mem.eql(u8, flag, "--churn")) {
+            args.churn = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--churn-frac")) {
+            args.churn_frac = try std.fmt.parseFloat(f64, value);
+        } else if (std.mem.eql(u8, flag, "--rebuild-at")) {
+            args.rebuild_at = try std.fmt.parseFloat(f64, value);
         } else if (std.mem.eql(u8, flag, "--cost")) {
             args.cost = value;
         } else if (std.mem.eql(u8, flag, "--metric")) {
             args.metric = if (std.mem.eql(u8, value, "cosine")) .cosine else if (std.mem.eql(u8, value, "ip")) .inner_product else .l2_squared;
         } else return error.UnknownFlag;
     }
+
+    if (args.churn > 0) return runChurn(alloc, io, out, args);
 
     var train: Matrix = undefined;
     var test_set: Matrix = undefined;
@@ -354,4 +373,281 @@ fn normalize(v: []f32) void {
     const n = @sqrt(s);
     if (n == 0) return;
     for (v) |*x| x.* /= n;
+}
+
+// ---------------------------------------------------------------------------
+// Mixed-workload (churn) benchmark.
+
+/// Counts recomputations served from node-id-indexed vectors.
+const CountingSource = struct {
+    vectors: []const f32,
+    dims: usize,
+    count: u64 = 0,
+
+    fn source(self: *CountingSource) leann.EmbeddingSource {
+        return .{ .ctx = self, .recompute_fn = recompute };
+    }
+
+    fn recompute(ctx: *anyopaque, ids: []const u32, out: []f32) anyerror!void {
+        const self: *CountingSource = @ptrCast(@alignCast(ctx));
+        self.count += ids.len;
+        for (ids, 0..) |id, i| {
+            const start = @as(usize, id) * self.dims;
+            if (start + self.dims > self.vectors.len) return error.UnknownNode;
+            @memcpy(out[i * self.dims ..][0..self.dims], self.vectors[start..][0..self.dims]);
+        }
+    }
+};
+
+/// The same deletes and inserts (by dataset row) for every variant, plus the
+/// exact top-k rows over the live set after each round.
+const Workload = struct {
+    deletes: [][]u32,
+    inserts: [][]u32,
+    /// truth[r]: k rows per query after round r (r = 0 is the initial set).
+    truth: [][]u32,
+
+    fn deinit(self: *Workload, alloc: Allocator) void {
+        for (self.deletes) |d| alloc.free(d);
+        for (self.inserts) |d| alloc.free(d);
+        for (self.truth) |d| alloc.free(d);
+        alloc.free(self.deletes);
+        alloc.free(self.inserts);
+        alloc.free(self.truth);
+    }
+};
+
+fn makeWorkload(alloc: Allocator, rows: Matrix, queries: Matrix, metric: leann.Metric, n0: usize, rounds: usize, per_round: usize, k: usize) !Workload {
+    var live = std.ArrayListUnmanaged(u32).empty;
+    defer live.deinit(alloc);
+    for (0..n0) |i| try live.append(alloc, @intCast(i));
+    var w = Workload{
+        .deletes = try alloc.alloc([]u32, rounds),
+        .inserts = try alloc.alloc([]u32, rounds),
+        .truth = try alloc.alloc([]u32, rounds + 1),
+    };
+    var prng = std.Random.DefaultPrng.init(7);
+    const rand = prng.random();
+    var next: u32 = @intCast(n0);
+    w.truth[0] = try truthOver(alloc, rows, queries, metric, live.items, k);
+    for (0..rounds) |r| {
+        w.deletes[r] = try alloc.alloc(u32, per_round);
+        for (w.deletes[r]) |*d| {
+            const i = rand.uintLessThan(usize, live.items.len);
+            d.* = live.swapRemove(i);
+        }
+        w.inserts[r] = try alloc.alloc(u32, per_round);
+        for (w.inserts[r]) |*d| {
+            d.* = next;
+            next += 1;
+            try live.append(alloc, d.*);
+        }
+        w.truth[r + 1] = try truthOver(alloc, rows, queries, metric, live.items, k);
+    }
+    return w;
+}
+
+fn truthOver(alloc: Allocator, rows: Matrix, queries: Matrix, metric: leann.Metric, live: []const u32, k: usize) ![]u32 {
+    const truth = try alloc.alloc(u32, queries.rows * k);
+    const dists = try alloc.alloc(f32, k);
+    defer alloc.free(dists);
+    const qbuf = try alloc.alloc(f32, rows.dims);
+    defer alloc.free(qbuf);
+    const rbuf = try alloc.alloc(f32, rows.dims);
+    defer alloc.free(rbuf);
+    for (0..queries.rows) |qi| {
+        @memcpy(qbuf, queries.row(qi));
+        if (metric == .cosine) normalize(qbuf);
+        const ids = truth[qi * k ..][0..k];
+        @memset(dists, std.math.inf(f32));
+        @memset(ids, 0);
+        for (live) |row_id| {
+            @memcpy(rbuf, rows.row(row_id));
+            if (metric == .cosine) normalize(rbuf);
+            const d = leann.distance(metric, qbuf, rbuf);
+            if (d >= dists[k - 1]) continue;
+            var pos = k - 1;
+            while (pos > 0 and dists[pos - 1] > d) : (pos -= 1) {
+                dists[pos] = dists[pos - 1];
+                ids[pos] = ids[pos - 1];
+            }
+            dists[pos] = d;
+            ids[pos] = row_id;
+        }
+    }
+    return truth;
+}
+
+const ChurnVariant = struct {
+    name: []const u8,
+    store_upper: bool,
+    consolidate: bool,
+    rebuild: bool,
+};
+
+/// One variant's index plus the node id <-> dataset row mapping.
+const ChurnState = struct {
+    index: leann.Index,
+    /// Node-id-indexed vectors served to the EmbeddingSource.
+    vecs: std.ArrayListUnmanaged(f32) = .empty,
+    node_row: std.ArrayListUnmanaged(u32) = .empty,
+    row_node: []u32,
+
+    fn deinit(self: *ChurnState, alloc: Allocator) void {
+        self.index.deinit();
+        self.vecs.deinit(alloc);
+        self.node_row.deinit(alloc);
+        alloc.free(self.row_node);
+    }
+
+    /// Builds over `live_rows`; node i is live_rows[i].
+    fn build(alloc: Allocator, cfg: leann.Config, rows: Matrix, live_rows: []const u32, total_rows: usize) !ChurnState {
+        var st = ChurnState{ .index = undefined, .row_node = try alloc.alloc(u32, total_rows) };
+        errdefer alloc.free(st.row_node);
+        @memset(st.row_node, std.math.maxInt(u32));
+        for (live_rows, 0..) |r, i| {
+            try st.vecs.appendSlice(alloc, rows.row(r));
+            try st.node_row.append(alloc, r);
+            st.row_node[r] = @intCast(i);
+        }
+        st.index = try leann.Index.build(alloc, cfg, st.vecs.items);
+        return st;
+    }
+
+    fn liveRows(self: *const ChurnState, alloc: Allocator) ![]u32 {
+        var out = std.ArrayListUnmanaged(u32).empty;
+        errdefer out.deinit(alloc);
+        for (self.node_row.items, 0..) |r, node| {
+            if (!self.index.isDeleted(@intCast(node))) try out.append(alloc, r);
+        }
+        return out.toOwnedSlice(alloc);
+    }
+};
+
+const Measured = struct { recall: f64, recomputed: f64, cpu_ms: f64 };
+
+fn measure(alloc: Allocator, io: std.Io, st: *ChurnState, queries: Matrix, truth: []const u32, k: usize, ef: u32) !Measured {
+    var src = CountingSource{ .vectors = st.vecs.items, .dims = queries.dims };
+    var hits: usize = 0;
+    var recomputed: u64 = 0;
+    const t0 = std.Io.Timestamp.now(io, .awake);
+    for (0..queries.rows) |qi| {
+        var resp = try st.index.search(alloc, src.source(), queries.row(qi), .{ .k = @intCast(k), .ef = ef, .rerank = .bounds, .bound_scale = 1 });
+        defer resp.deinit(alloc);
+        recomputed += resp.stats.recomputed;
+        const gt = truth[qi * k ..][0..k];
+        for (resp.results) |r| {
+            if (std.mem.indexOfScalar(u32, gt, st.node_row.items[r.id]) != null) hits += 1;
+        }
+    }
+    const nq: f64 = @floatFromInt(queries.rows);
+    return .{
+        .recall = @as(f64, @floatFromInt(hits)) / (nq * @as(f64, @floatFromInt(k))),
+        .recomputed = @as(f64, @floatFromInt(recomputed)) / nq,
+        .cpu_ms = @as(f64, @floatFromInt(t0.untilNow(io, .awake).nanoseconds)) / 1e6 / nq,
+    };
+}
+
+fn msSince(io: std.Io, t0: std.Io.Timestamp) f64 {
+    return @as(f64, @floatFromInt(t0.untilNow(io, .awake).nanoseconds)) / 1e6;
+}
+
+fn runChurn(alloc: Allocator, io: std.Io, out: *std.Io.Writer, args: Args) !void {
+    const prefix = args.data orelse return error.ChurnNeedsData;
+    const per_round: usize = @intFromFloat(@as(f64, @floatFromInt(args.n)) * args.churn_frac);
+    const total = args.n + per_round * args.churn;
+    const rows = try loadMatrix(alloc, io, prefix, "train", total);
+    defer alloc.free(rows.data);
+    if (rows.rows < total) return error.NotEnoughRows;
+    const queries = try loadMatrix(alloc, io, prefix, "test", args.queries);
+    defer alloc.free(queries.data);
+    const k = 10;
+    const quantizer = args.quantizer orelse .rabitq;
+    if (quantizer != .rabitq) return error.ChurnNeedsRaBitQ;
+
+    try out.print("churn: n={d} dims={d} queries={d} rounds={d} per round: {d} deletes + {d} inserts, rebuild at {d:.0}% deleted, M={d} efC={d}\n", .{ args.n, rows.dims, queries.rows, args.churn, per_round, per_round, args.rebuild_at * 100, args.m, args.efc });
+    try out.flush();
+    const t_truth = std.Io.Timestamp.now(io, .awake);
+    var w = try makeWorkload(alloc, rows, queries, args.metric, args.n, args.churn, per_round, k);
+    defer w.deinit(alloc);
+    try out.print("ground truth for {d} states in {d:.1}s\n", .{ args.churn + 1, msSince(io, t_truth) / 1000 });
+
+    const variants = [_]ChurnVariant{
+        .{ .name = "tombstones + rebuild", .store_upper = false, .consolidate = false, .rebuild = true },
+        .{ .name = "stored upper + rebuild", .store_upper = true, .consolidate = false, .rebuild = true },
+        .{ .name = "consolidate", .store_upper = false, .consolidate = true, .rebuild = false },
+        .{ .name = "stored upper + consolidate", .store_upper = true, .consolidate = true, .rebuild = false },
+    };
+    const initial = try alloc.alloc(u32, args.n);
+    defer alloc.free(initial);
+    for (initial, 0..) |*r, i| r.* = @intCast(i);
+
+    for (variants) |variant| {
+        const cfg = leann.Config{ .dims = @intCast(rows.dims), .metric = args.metric, .quantizer = .rabitq, .max_degree = args.m, .ef_construction = args.efc, .store_upper = variant.store_upper };
+        const tb = std.Io.Timestamp.now(io, .awake);
+        var st = try ChurnState.build(alloc, cfg, rows, initial, total);
+        defer st.deinit(alloc);
+        try out.print("\n== {s}: initial build {d:.1}s, upper vectors {d}\n", .{ variant.name, msSince(io, tb) / 1000, st.index.upper_vectors.count() });
+        try out.print("{s:>5} {s:>7} {s:>6} {s:>9} {s:>9} {s:>9} {s:>8} {s:>13} {s:>8} {s:>13} {s:>8}\n", .{ "round", "live", "del%", "write emb", "ins ms", "maint ms", "rebuilt", "recall@512", "rec/q", "recall@1024", "rec/q" });
+        var rebuild_embeds: u64 = 0;
+        var rebuilds: usize = 0;
+        for (0..args.churn + 1) |r| {
+            var write_embeds: u64 = 0;
+            var insert_ms: f64 = 0;
+            var maint_ms: f64 = 0;
+            var rebuilt = false;
+            if (r > 0) {
+                for (w.deletes[r - 1]) |row_id| {
+                    const node = st.row_node[row_id];
+                    var delta = try st.index.planDelete(node);
+                    defer delta.deinit(alloc);
+                    try st.index.applyDelta(delta);
+                    st.row_node[row_id] = std.math.maxInt(u32);
+                }
+                const ti = std.Io.Timestamp.now(io, .awake);
+                for (w.inserts[r - 1]) |row_id| {
+                    var src = CountingSource{ .vectors = st.vecs.items, .dims = rows.dims };
+                    const node = try st.index.insert(src.source(), rows.row(row_id));
+                    write_embeds += src.count;
+                    try st.vecs.appendSlice(alloc, rows.row(row_id));
+                    try st.node_row.append(alloc, row_id);
+                    std.debug.assert(node + 1 == st.node_row.items.len);
+                    st.row_node[row_id] = node;
+                }
+                insert_ms = msSince(io, ti) / @as(f64, @floatFromInt(per_round));
+                const tm = std.Io.Timestamp.now(io, .awake);
+                if (variant.consolidate) _ = try st.index.consolidateDeletes();
+                if (variant.rebuild and st.index.deletedFraction() >= args.rebuild_at) {
+                    const live = try st.liveRows(alloc);
+                    defer alloc.free(live);
+                    var fresh = try ChurnState.build(alloc, cfg, rows, live, total);
+                    st.deinit(alloc);
+                    st = fresh;
+                    fresh = undefined;
+                    rebuild_embeds += live.len;
+                    rebuilds += 1;
+                    rebuilt = true;
+                }
+                maint_ms = msSince(io, tm);
+            }
+            const m512 = try measure(alloc, io, &st, queries, w.truth[r], k, 512);
+            const m1024 = try measure(alloc, io, &st, queries, w.truth[r], k, 1024);
+            try out.print("{d:>5} {d:>7} {d:>6.1} {d:>9} {d:>9.2} {d:>9.0} {s:>8} {d:>13.3} {d:>8.1} {d:>13.3} {d:>8.1}\n", .{
+                r,
+                st.index.node_count - st.index.deleted_count,
+                st.index.deletedFraction() * 100,
+                write_embeds,
+                insert_ms,
+                maint_ms,
+                if (rebuilt) "yes" else "",
+                m512.recall,
+                m512.recomputed,
+                m1024.recall,
+                m1024.recomputed,
+            });
+            try out.flush();
+        }
+        try out.print("rebuilds {d}, embeddings for rebuilds {d}\n", .{ rebuilds, rebuild_embeds });
+        try out.flush();
+    }
 }
