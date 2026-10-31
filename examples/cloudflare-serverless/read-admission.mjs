@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {takeRpcData} from "./rpc-data.mjs";
 import{unsupportedRpc}from"./performance.mjs";
 import{bindReadLease,readLeaseRemaining}from"../../zig/lib/objectstore/wasm/read-view-lease.mjs";
 
@@ -25,7 +26,7 @@ export async function prepareReadAdmission(env,input,trace,readViews,{background
  const options={durable_pin:durablePin,trace_id:trace.id,required_visibility:input.required_visibility,allow_cached:!(["conditional","bounded-journal"].includes(env.METADATA_ROOT_BACKEND)&&durablePin)&&env.FENCED_READ_LEASES!=="false"&&input.fresh!==true&&!input.exact_state&&['lookup','list','count','search'].includes(input.op)&&typeof input.required_visibility==='string',...(deadlineMs!==undefined?{deadlineMs}:{}),...(input.exact_state?{version:input.exact_state.generation}:{})};
  const onLease=sample=>Object.assign(physical,sample);
  const admitted=view=>{const result={view,started,physical,invalidate:()=>readViews?.invalidate?.()};if(bindReadLease(view,{started})){const remaining=readLeaseRemaining(view);result.deadlineMs=Math.min(deadlineMs??Infinity,wallStarted+30000,Date.now()+remaining);result.confirm=token=>{if(readLeaseRemaining(view)<=0)throw Error('ManifestReadLeaseExpired');readViews?.confirm?.(view,token);};}return result;};
- const rpc=async()=>{onAdmitted?.();physical.rpc_calls++;return trace.span('rpc:openReadView',()=>env.COMMITS.getByName(env.ANTFLY_INCARNATION).openReadView(options));};
+ const rpc=async()=>{onAdmitted?.();physical.rpc_calls++;return trace.span('rpc:openReadView',()=>takeRpcData(env.COMMITS.getByName(env.ANTFLY_INCARNATION).openReadView(options)));};
  try{
   let view;
   if(readViews&&env.READ_ONLY_SNAPSHOTS!=="false"){

@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {takeRpcData} from "./rpc-data.mjs";
 import {NativeReadPlans,withNativeReadPlan,withNativeReadPlanPermit,withNativeReadPreparation} from "./native-read-plan.mjs";
 import {PublicationReadHints} from "./publication-read-hints.mjs";
 import {PreparedPublication} from "./prepared-publication.mjs";
@@ -153,7 +154,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     physical=readAdmission?.physical??{};
     for(const[key,value]of Object.entries(readAdmission?.nativeResume?.physical??{}))if(typeof value==="number")physical[key]=(physical[key]??0)+value;
     const stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION),readHints=env.COORDINATOR_BACKEND==="r2"&&["publish","compact","reindex"].includes(input.op)?new PublicationReadHints(env.ANTFLY_INCARNATION):null;
-    const rpc=async(method,...args)=>{physical.rpc_calls=(physical.rpc_calls??0)+1;if(method==="publicationCall"||method==="objectCall")countMetadataRpc(physical,args[0]);const start=performance.now();try{return await trace.span("rpc:"+method,()=>stub[method](...args));}finally{physical.rpc_wait_ms=(physical.rpc_wait_ms??0)+performance.now()-start;}};
+    const rpc=async(method,...args)=>{physical.rpc_calls=(physical.rpc_calls??0)+1;if(method==="publicationCall"||method==="objectCall")countMetadataRpc(physical,args[0]);const start=performance.now();try{return await trace.span("rpc:"+method,()=>takeRpcData(stub[method](...args)));}finally{physical.rpc_wait_ms=(physical.rpc_wait_ms??0)+performance.now()-start;}};
     const coordinator={objectCall:(request,body)=>rpc("objectCall",request,body,readHints?.forHead(request,body)),openReadView:options=>rpc("openReadView",{...options,trace_id:trace.id})};
     let publicationView;
     if(env.COORDINATOR_BACKEND==="r2"&&["publish","compact"].includes(input.op)){
@@ -205,7 +206,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
         request.dimensions !== Number(env.EMBEDDING_DIMENSIONS ?? 384) || !Array.isArray(request.texts) || request.texts.length < 1 || request.texts.length > 64 || request.texts.some(text => typeof text !== "string" || text.length > 16384)) throw new Error("HostedEmbeddingCapabilityUnsupported");
       return {json: await env.AI.run(env.EMBEDDING_MODEL, {text: request.texts}, {gateway: {id: env.AI_GATEWAY}})};
     };
-    if(actorMutation){try{return await trace.span("writer_rpc",()=>stub.mutateBatch({...input,...settings,__trace_id:trace.id}));}catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"mutateBatch"))throw error;return await run({...env,COORDINATOR_RPC_FALLBACK:"true"},input,signal,collection);}}
+    if(actorMutation){try{return await trace.span("writer_rpc",()=>takeRpcData(stub.mutateBatch({...input,...settings,__trace_id:trace.id})));}catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"mutateBatch"))throw error;return await run({...env,COORDINATOR_RPC_FALLBACK:"true"},input,signal,collection);}}
     const {wal_deferred_indexes:ignoredDeferred,point_read_blocks:ignoredPointBlocks,wal_packed_pages:ignoredWalPacked,bounded_manifest_reads:ignoredBounded,native_write_read_ahead:ignoredReadAhead,inline_point_bodies:ignoredInline,canonical_point_bodies:ignoredCanonical,native_read_plan_mode:ignoredReadMode,native_read_state:ignoredReadState,wal_document_index:ignoredDocumentIndex,native_read_plan:ignoredReadPlan,native_read_prepare:ignoredReadPrepare,native_read_resume:ignoredReadResume,native_read_spent_bytes:ignoredReadSpent,native_write_plan:ignoredWritePlan,publication_continuations:ignoredContinuation,publication_batch_probe:ignoredPublicationProbe,publication_batch_version:ignoredBatchVersion,publication_continuation_force:ignoredForce,publication_units:ignoredUnits,publication_adaptive_slices:ignoredAdaptive,publication_max_units:ignoredMaximum,publication_prepared_slices:ignoredPrepared,compaction_probe_only:ignoredProbe,...nativeInput}=input;
     const plannedCompact=env.NATIVE_COMPACTION_PLAN==="true"&&env.COORDINATOR_BACKEND==="r2"&&input.op==="compact"&&input.operation_id===undefined&&env.BATCHED_PUBLICATION!=="false";
     const plannedPublication=input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true";

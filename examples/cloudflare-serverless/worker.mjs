@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {takeRpcData} from "./rpc-data.mjs";
 import {placementProbe} from "./placement-probe.mjs";
 import {reserveInput} from "./request-pool.mjs";
 import {enableAppReads,readerKernel,sharedCache,kernelMetrics} from "./kernels.mjs";
@@ -55,13 +56,13 @@ async function runStep(env,input,signal,collection,trace,direct,backgroundTasks)
  const binding=read?env.READERS:env.BUILDERS;
  if(env.COORDINATOR_BACKEND==="r2"&&input.op!=="mutate"&&binding){
   const slot=read?readerSlot(input,readerSlots(env),readerCursor++):0;
-  try{return await binding.getByName(runtimeName(env.ANTFLY_INCARNATION,slot)).execute(input,collection,{trace_id:trace?.id});}
+  try{return await takeRpcData(binding.getByName(runtimeName(env.ANTFLY_INCARNATION,slot)).execute(input,collection,{trace_id:trace?.id}));}
   catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"execute"))throw error;}
  }
  return localRuntime.run(env,input,signal,collection,undefined,trace,undefined,{background:backgroundTasks});
 }
 async function background(env,input){
- if(env.COORDINATOR_BACKEND==="r2"&&env.BUILDERS)return env.BUILDERS.getByName(runtimeName(env.ANTFLY_INCARNATION,0)).execute(input);
+ if(env.COORDINATOR_BACKEND==="r2"&&env.BUILDERS)return takeRpcData(env.BUILDERS.getByName(runtimeName(env.ANTFLY_INCARNATION,0)).execute(input));
  if(input.op==="collect")return collect(env,(request,token)=>run(env,request,undefined,token),input.job_id);
  const stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION);
  return input.op==="collect_metadata"?stub.collectMetadata(input.job_id,{scheduled:input.scheduled}):stub.migrateFromSqlite();
