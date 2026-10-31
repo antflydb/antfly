@@ -2449,7 +2449,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const cmd_tests = b.addTest(.{
         .root_module = cmd_test_mod,
-        .filters = &.{ "cmd.cli.", "client URL option" },
+        .filters = &.{ "cmd.cli.", "client URL option", "client runtime" },
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,

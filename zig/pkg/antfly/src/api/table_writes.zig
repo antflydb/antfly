@@ -24884,7 +24884,11 @@ pub const ProvisionedTableWriteSource = struct {
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const group_result = try db.repairArtifactIssuesWithRequestOptions(alloc, req, effective_options);
-            if (group_result.scanned > 0) self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            // Deferred repair submits durable replay for the maintenance owner.
+            // Draining a transient writer here would execute providers while
+            // this request still owns the exclusive group-operation guard.
+            if (group_result.scanned > 0 and !effective_options.defer_durable_index_repair_execution)
+                self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             break :blk group_result;
         };
         errdefer result.deinit(alloc);
