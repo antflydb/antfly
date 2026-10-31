@@ -16709,7 +16709,11 @@ pub const DB = struct {
                             result.repaired += 1;
                             continue;
                         }
-                        result.failed += 1;
+                        // Successful providers may have published a later
+                        // derived batch that the index has not applied yet.
+                        // An unchanged, older diagnosis is not a failure of
+                        // this queued attempt; wait for its publication fence.
+                        if (issue.sequence < queued) result.in_progress += 1 else result.failed += 1;
                     }
                 } else {
                     const enqueued = self.enqueueArtifactIssueRepair(alloc, issue.*, completion_key, req.repair_job_id orelse 0) catch |err| {
@@ -95778,6 +95782,75 @@ test "db index repair summary deduplicates source documents across artifacts" {
     var summary = (try db.indexEnrichmentFailureSummary(alloc, "dv_a")).?;
     defer summary.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), summary.count);
+}
+
+test "db managed index repair completes ordinary asset publications without extraction metadata" {
+    for ([_][]const u8{ "healthy successful output", "{\"route_type\":\"error\",\"text\":\"healthy successful output\"}" }, 0..) |output, i| {
+        const alloc = std.testing.allocator;
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_optional_runtime_workers = false,
+            .start_index_workers = false,
+            .enrichment = .{ .owner_id = "worker-a", .enable_without_producers = true },
+        });
+        defer db.close();
+        try db.addEnrichment(.{
+            .name = "summary_text_v1",
+            .kind = .asset,
+            .field = "summary",
+            .content_type = if (i == 0) "text/plain" else "application/json",
+            .producer_json = "{\"type\":\"copy\"}",
+        });
+        try db.addIndex(.{ .name = "document_text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"summary_text_v1\"}]}" });
+        const document = try std.json.Stringify.valueAlloc(alloc, .{ .summary = output }, .{});
+        defer alloc.free(document);
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = document }}, .sync_level = .write });
+        const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary_text_v1");
+        defer alloc.free(artifact_key);
+        const hex = try bytesToHexAlloc(alloc, artifact_key);
+        defer alloc.free(hex);
+        const issue = types.ArtifactRepairIssue{
+            .artifact_kind = .asset,
+            .index_name = "document_text",
+            .doc_key = "doc:a",
+            .artifact_name = "summary_text_v1",
+            .index_source_artifact_name = "summary_text_v1",
+            .artifact_key = hex,
+            .sequence = db.core.nextEnrichmentSequence(),
+            .reason = .enrichment_failed,
+            .generation_error = "ModelNotFound",
+        };
+        try db.recordArtifactRepairIssue(alloc, issue);
+        const req = types.ArtifactRepairRunRequest{
+            .target = .index,
+            .index_name = "document_text",
+            .operator_initiated = true,
+            .repair_job_id = 42,
+            .repair_job_created_at_ms = 100,
+        };
+        const options = types.ArtifactRepairRunOptions{ .defer_durable_index_repair_execution = true };
+        var submitted = try db.repairArtifactIssuesWithRequestOptions(alloc, req, options);
+        defer submitted.deinit(alloc);
+        try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+        var awaiting_publication = try db.repairArtifactIssuesWithRequestOptions(alloc, req, options);
+        defer awaiting_publication.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 0), awaiting_publication.failed);
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+        try std.testing.expect(try db.artifactNowReadable(alloc, issue));
+        const payload = try db.core.store.get(alloc, artifact_key);
+        defer alloc.free(payload);
+        try std.testing.expectEqualStrings(output, payload);
+        var finished = try db.repairArtifactIssuesWithRequestOptions(alloc, req, options);
+        defer finished.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 0), finished.failed);
+        try std.testing.expect(!finished.debt_remaining);
+        var remaining = try db.listArtifactRepairIssuesPage(alloc, .{ .index_name = "document_text" });
+        defer remaining.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), remaining.issues.len);
+    }
 }
 
 test "db managed index repair keeps failed OCR manifests as debt" {

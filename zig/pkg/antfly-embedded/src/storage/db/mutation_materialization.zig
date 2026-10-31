@@ -4847,6 +4847,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const issue_key = try internal_keys.artifactRepairIssueKeyAlloc(ctx.alloc, index_name, kind_name, artifact_key_hex);
             defer ctx.alloc.free(issue_key);
 
+            // Pin the producer definitions before taking the repair-ledger
+            // mutex. Payload fields cannot identify the producer: ordinary
+            // JSON outputs may contain names such as `route_type` too.
+            var asset_plan = if (kind == .asset) try ctx.index_manager.acquireWritePlanSnapshot() else null;
+            defer if (asset_plan) |*view| view.release();
+
             const mutable_ctx = @constCast(ctx);
             lockAtomicWithBackoff(&mutable_ctx.artifact_repair_issue_mutex);
             defer mutable_ctx.artifact_repair_issue_mutex.unlock();
@@ -4856,34 +4862,42 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer issue.deinit(ctx.alloc);
             if (issue.sequence > published_sequence) return;
             if (kind == .asset) {
-                // Failed extraction retains older children. Their presence
-                // alone is no proof of repair; require a healthy publication.
                 const raw = ctx.store.get(ctx.alloc, artifact_key) catch |err| switch (err) {
                     error.NotFound => return,
                     else => return err,
                 };
                 defer ctx.alloc.free(raw);
-                var manifest = std.json.parseFromSlice(std.json.Value, ctx.alloc, raw, .{}) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => return,
-                };
-                defer manifest.deinit();
-                if (manifest.value != .object) return;
-                const route = manifest.value.object.get("route_type") orelse return;
-                if (route != .string or route.string.len == 0) return;
-                if (try enrichment_runtime_mod.documentExtractionEmptyCoverageIsTerminalFailure(ctx.alloc, raw)) return;
-                // Partial OCR may retain valid older units. A non-empty
-                // artifact is not sufficient to settle a terminal repair.
-                if (manifest.value.object.get("ocr_failed_count")) |count| {
-                    if (count != .integer or count.integer != 0) return;
-                }
-                if (manifest.value.object.get("ocr_failed_page_numbers")) |pages| {
-                    if (pages != .array or pages.array.items.len != 0) return;
-                }
-                if (manifest.value.object.get("merge_plan") orelse manifest.value.object.get("merge")) |merge| {
-                    if (merge != .object) return;
-                    const state = merge.object.get("status") orelse return;
-                    if (state != .string or !std.mem.eql(u8, state.string, "converged")) return;
+                const requires_manifest = for (asset_plan.?.plan().generated_templates) |request| {
+                    if (request.kind != .asset or !std.mem.eql(u8, enrichment_types.requestArtifactName(request), issue.artifact_name)) continue;
+                    var producer = try asset_producer_mod.parseProducerConfig(ctx.alloc, request.producer_json);
+                    defer producer.deinit(ctx.alloc);
+                    break producer.type == .document_extraction;
+                } else true; // Missing catalog authority retains conservative validation.
+                if (requires_manifest) {
+                    // Failed extraction retains older children. Their presence
+                    // alone is no proof of repair; require a healthy manifest.
+                    var manifest = std.json.parseFromSlice(std.json.Value, ctx.alloc, raw, .{}) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => return,
+                    };
+                    defer manifest.deinit();
+                    if (manifest.value != .object) return;
+                    const route = manifest.value.object.get("route_type") orelse return;
+                    if (route != .string or route.string.len == 0) return;
+                    if (try enrichment_runtime_mod.documentExtractionEmptyCoverageIsTerminalFailure(ctx.alloc, raw)) return;
+                    // Partial OCR may retain valid older units. A non-empty
+                    // artifact is not sufficient to settle a terminal repair.
+                    if (manifest.value.object.get("ocr_failed_count")) |count| {
+                        if (count != .integer or count.integer != 0) return;
+                    }
+                    if (manifest.value.object.get("ocr_failed_page_numbers")) |pages| {
+                        if (pages != .array or pages.array.items.len != 0) return;
+                    }
+                    if (manifest.value.object.get("merge_plan") orelse manifest.value.object.get("merge")) |merge| {
+                        if (merge != .object) return;
+                        const state = merge.object.get("status") orelse return;
+                        if (state != .string or !std.mem.eql(u8, state.string, "converged")) return;
+                    }
                 }
             }
 
