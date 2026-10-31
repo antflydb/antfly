@@ -16888,15 +16888,27 @@ pub const DB = struct {
         var result = try self.repairIndexGenerationIssuesWithRequest(alloc, generation_req, options, lease_authority);
         errdefer result.deinit(alloc);
         if (req.control != null) return result;
-        // Finish generation work before retrying source artifacts. Mixing
-        // both traversals can finish the artifact cursor while the rebuild
-        // is still pending, and also repeats work against an unavailable index.
-        if (result.in_progress != 0) return result;
         // Automatic, structural (index creation catch-up) and durable-owner
         // repair stay bounded generation work and make no model calls. Only
         // operator repair retries enrichment documents.
         if (!req.operator_initiated or lease_authority != .acquire) return result;
         const index_name = req.index_name orelse return result;
+        var admission_waits_for_sources = false;
+        if (result.in_progress != 0) {
+            var state = try self.loadIndexRepairState(alloc);
+            defer state.deinit(alloc);
+            const i = state.findIndex(index_name) orelse return result;
+            const pending = state.entries.items[i].intent;
+            // Initial admission needs source coverage to finish. Waiting for
+            // it before retrying failed providers creates a dependency loop.
+            // Structural rebuilds and activation still finish first.
+            admission_waits_for_sources = pending.work_class == .initial_build and
+                (pending.trigger == .catalog_admission or pending.trigger == .replay_artifact_unavailable) and
+                pending.root_generation == self.core.root_generation and
+                pending.group_id == self.localRepairGroupId() and
+                initialBuildCanRetireBeforeActivation(pending);
+            if (!admission_waits_for_sources) return result;
+        }
         var enrichment = try self.repairArtifactIssuesWithRequestOptionsInternal(alloc, .{
             .target = .artifact,
             .index_name = index_name,
@@ -16908,6 +16920,15 @@ pub const DB = struct {
             .operator_initiated = true,
         }, options, .acquire);
         defer enrichment.deinit(alloc);
+        if (admission_waits_for_sources and !enrichment.has_more and enrichment.in_progress == 0) {
+            // The traversal exhausted its retries. A failed source may live
+            // on an earlier page, so inspect one remaining ledger row before
+            // treating the dependent admission as independently runnable work.
+            // Preserve its debt, but let this job finish with failures.
+            var remaining = try self.listArtifactRepairIssuesPage(alloc, .{ .index_name = index_name, .limit = 1 });
+            defer remaining.deinit(alloc);
+            if (remaining.issues.len != 0) result.in_progress = 0;
+        }
         try mergeIndexEnrichmentRepairResult(alloc, &result, enrichment);
         return result;
     }
@@ -144728,4 +144749,79 @@ test "db managed index repair waits for generation before retrying enrichment" {
     try std.testing.expect(pass.debt_remaining);
     try std.testing.expectEqual(before, gated.snapshot().total_requests);
     try std.testing.expect(try db.hasPendingIndexRepairIntents(a));
+}
+
+test "db managed index repair recovers strict progressive admission after provider failure" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("review-admission-enrichment");
+    defer tmp.cleanup();
+    var gated = GateDenseEmbedder{};
+    var db = try DB.open(a, tmp.path(), .{
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .owner_id = "worker-a", .dense_embedder = gated.interface(), .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 2 },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }}, .sync_level = .write });
+    const cfg = types.IndexConfig{ .name = "semantic_idx", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":3,\"metric\":\"cosine\",\"embedding_name\":\"semantic_idx\",\"publication_policy\":\"progressive\",\"execution\":{\"embedding\":{\"batch_items\":1}},\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}", .coverage_generation = 45 };
+    const id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+    try drainManagedAdmissionSourceReplayForTest(&db, a, id);
+    try awaitManagedAdmissionPublicationForTest(&db, a, id);
+    gated.allowed_successes.store(gated.snapshot().successful_requests, .release);
+    gated.blocked_error = error.ModelNotFound;
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"beta\"}" }}, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentWorkerFailed, db.runUntilIdle());
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    _ = try db.finalizeDenseProjectionLifecycleForIdle();
+    var entry = try db.loadIndexRepairEntryById(a, id);
+    defer entry.deinit(a);
+    try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(a, entry.intent));
+    try std.testing.expect(!try db.managedAdmissionGenerationIsServiceable(a, entry.intent));
+    var issues = try db.listArtifactRepairIssuesPage(a, .{ .index_name = cfg.name });
+    defer issues.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), issues.issues.len);
+    try std.testing.expectEqual(types.ArtifactRepairReason.enrichment_failed, issues.issues[0].reason);
+    const options = types.ArtifactRepairRunOptions{ .defer_durable_index_repair_execution = true };
+    var request = types.ArtifactRepairRunRequest{ .target = .index, .index_name = cfg.name, .operator_initiated = true, .repair_job_id = 41, .repair_job_created_at_ms = 100 };
+    // A still-unavailable model must finish this attempt with a failure,
+    // rather than waiting forever for its dependent admission to retire.
+    var submitted_failure = try db.repairArtifactIssuesWithRequestOptions(a, request, options);
+    defer submitted_failure.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), submitted_failure.reprocessed);
+    try std.testing.expectError(error.EnrichmentWorkerFailed, db.runUntilIdle());
+    var failed = try db.repairArtifactIssuesWithRequestOptions(a, request, options);
+    defer failed.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), failed.failed);
+    try std.testing.expectEqual(@as(u64, 0), failed.in_progress);
+    try std.testing.expect(!failed.has_more);
+    try std.testing.expect(failed.debt_remaining);
+    gated.allowAll();
+    request.repair_job_id = 42;
+    const before = gated.snapshot().total_requests;
+    var submitted = try db.repairArtifactIssuesWithRequestOptions(a, request, options);
+    defer submitted.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), submitted.reprocessed);
+    try std.testing.expect(submitted.in_progress != 0);
+    try std.testing.expectEqual(before, gated.snapshot().total_requests);
+    try db.runUntilIdle();
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    _ = try db.finalizeDenseProjectionLifecycleForIdle();
+    const calls_after = gated.snapshot().total_requests;
+    try std.testing.expect(calls_after > before);
+    // Successful provider replay now lets the generation owner retire the
+    // admission; observation passes must never submit that work again.
+    for (0..32) |_| {
+        if ((try db.indexRepairIdForIndex(a, cfg.name)) == null) break;
+        const advanced = try db.advanceIndexRepairIntent(a, id, .{});
+        if (advanced.repaired) break;
+    }
+    try std.testing.expect((try db.indexRepairIdForIndex(a, cfg.name)) == null);
+    var done = try db.repairArtifactIssuesWithRequestOptions(a, request, options);
+    defer done.deinit(a);
+    try std.testing.expect(!done.debt_remaining);
+    try std.testing.expectEqual(@as(u64, 0), done.in_progress);
+    try std.testing.expectEqual(calls_after, gated.snapshot().total_requests);
+    var remaining = try db.listArtifactRepairIssuesPage(a, .{ .index_name = cfg.name });
+    defer remaining.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), remaining.issues.len);
 }
