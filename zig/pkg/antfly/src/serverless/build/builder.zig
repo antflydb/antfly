@@ -1130,7 +1130,7 @@ pub const Builder = struct {
         // The allocator adds no allocation header. Returned owned actions are
         // released by the caller using the original backing allocator.
         return bounded.predictPendingWalPublicationActionsBoundedAlloc(namespace, vector_metric, plan, cancellation, limits) catch |err| {
-            if (err == error.OutOfMemory and working_set.limit_exceeded) return error.LakeSidecarBuildBudgetExceeded;
+            if (err == error.OutOfMemory and working_set.limitExceeded()) return error.LakeSidecarBuildBudgetExceeded;
             return err;
         };
     }
@@ -1476,10 +1476,10 @@ pub fn publishDocumentFactsForManifest(
     };
     const prior_ref = if (current) |source| if (findArtifactIndex(source, .document_facts)) |idx| source.artifacts[idx] else null else null;
     if (prior_ref) |ref| {
-        const root = document_facts.loadRoot(operation_alloc, &pages, ref) catch |err| return graphPublicationError(err, working_set.limit_exceeded);
+        const root = document_facts.loadRoot(operation_alloc, &pages, ref) catch |err| return graphPublicationError(err, working_set.limitExceeded());
         if (root.wal_end_lsn != current.?.wal_end_lsn) return error.DocumentFactsSourceChanged;
     }
-    const ref = document_facts_builder.publishAlloc(operation_alloc, &pages, prior_ref, docs, mutations, manifest.stats.policy, manifest.stats.indexes_json, manifest.wal_end_lsn) catch |err| return graphPublicationError(err, working_set.limit_exceeded);
+    const ref = document_facts_builder.publishAlloc(operation_alloc, &pages, prior_ref, docs, mutations, manifest.stats.policy, manifest.stats.indexes_json, manifest.wal_end_lsn) catch |err| return graphPublicationError(err, working_set.limitExceeded());
     errdefer freeArtifactRef(alloc, ref);
     if (findArtifactIndex(manifest.*, .document_facts)) |idx| {
         freeArtifactRef(alloc, manifest.artifacts[idx]);
@@ -2861,7 +2861,7 @@ pub fn graphProjectionChangedForMutationsAlloc(
 ) !bool {
     var working_set = try graph_build_limits.WorkingSetAllocator.init(alloc, limits);
     return graphProjectionChangedBoundedAlloc(working_set.allocator(), source_table, before_docs, after_docs, mutations, cancellation, limits) catch |err| {
-        if (err == error.OutOfMemory and working_set.limit_exceeded) return error.LakeSidecarBuildBudgetExceeded;
+        if (err == error.OutOfMemory and working_set.limitExceeded()) return error.LakeSidecarBuildBudgetExceeded;
         return err;
     };
 }
@@ -4450,7 +4450,7 @@ fn buildGraphArtifactRefsFromImpactAllocUntil(
     var working_set = try graph_build_limits.WorkingSetAllocator.init(alloc, .{});
     var operation_artifacts = artifacts.*;
     operation_artifacts.allocator = working_set.allocator();
-    return buildGraphPageRefsBoundedAlloc(working_set.allocator(), &operation_artifacts, source_table, current, docs, mutations, changed, graph_index_names, attempt, cancellation) catch |err| return graphPublicationError(err, working_set.limit_exceeded);
+    return buildGraphPageRefsBoundedAlloc(working_set.allocator(), &operation_artifacts, source_table, current, docs, mutations, changed, graph_index_names, attempt, cancellation) catch |err| return graphPublicationError(err, working_set.limitExceeded());
 }
 
 /// Parses one coalesced after-image at a time. The reusable plan owns only
@@ -5064,7 +5064,7 @@ pub fn buildGraphSegmentWithLimitsAlloc(
 ) !GraphSegmentBuildResult {
     var working_set = try graph_build_limits.WorkingSetAllocator.init(alloc, limits);
     return buildGraphSegmentBoundedAlloc(working_set.allocator(), source_table, docs, include_graph, maintenance, limits) catch |err| {
-        if ((err == error.OutOfMemory and working_set.limit_exceeded) or err == error.GraphSegmentTooLarge)
+        if ((err == error.OutOfMemory and working_set.limitExceeded()) or err == error.GraphSegmentTooLarge)
             return error.LakeSidecarBuildBudgetExceeded;
         return err;
     };

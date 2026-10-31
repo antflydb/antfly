@@ -2345,7 +2345,7 @@ test "external lake required pack reads overlap and return every scheduler reser
             try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
         }
         try std.testing.expectEqual(@as(usize, 0), memory.live);
-        try std.testing.expectEqual(@as(usize, 0), build.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), build.liveBytes());
     }
 }
 

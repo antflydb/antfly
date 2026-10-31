@@ -423,13 +423,16 @@ test "external lake leased publication adaptive spill cache reduces wide drain r
             if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &stamp) != 0) @panic("CPU clock unavailable");
             return @as(i96, stamp.sec) * std.time.ns_per_s + stamp.nsec;
         }
-        fn run(compressed: bool, fixed: bool) !Measurement {
+        fn run(compressed: bool, fixed: bool, publication: bool) !Measurement {
             var resources = local.storage_resource_manager.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 << 20 } });
             defer resources.deinit(std.heap.smp_allocator);
             const memory = try @import("sql_memory_owner.zig").create(std.heap.smp_allocator, std.heap.smp_allocator, &resources);
             defer memory.release(memory.ptr);
             var budget: local.sql_memory_budget = .{ .backing = memory.allocator, .limit = 32 << 20, .pressure = memory.pressure };
-            const a = budget.allocator();
+            var working = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(if (publication) std.heap.smp_allocator else memory.allocator, .{ .max_working_set_bytes = 64 << 20 });
+            defer working.deinit();
+            var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = working.allocator() };
+            const a = if (publication) allocations.allocator() else budget.allocator();
             var marker: u8 = 0;
             var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = check, .compression = if (compressed) .snappy else .none, .async_writes = false };
             defer manager.deinit();
@@ -471,6 +474,7 @@ test "external lake leased publication adaptive spill cache reduces wide drain r
             }
             const reads_before_delivery = manager.read_bytes;
             budget.limit = budget.live + (32 << 20);
+            working.quota.max_live_bytes = working.quota.live_bytes + (32 << 20);
             const started = now();
             var seen: usize = 0;
             var window: Window = .{ .sort = &sort };
@@ -490,24 +494,32 @@ test "external lake leased publication adaptive spill cache reduces wide drain r
                 }
             }
             const cpu = now() - started;
-            std.debug.print("ADAPTIVE_SPILL codec={} fixed={} rows={} payload_reads={} drain_read_bytes={} total_read_bytes={} written_bytes={} cpu_ns={} budget_peak={} budget_limit={}\n", .{ manager.compression, fixed, seen, sort.payload_reads, manager.read_bytes - reads_before_delivery, manager.read_bytes, manager.written_bytes, cpu, budget.peak, budget.limit });
+            std.debug.print("ADAPTIVE_SPILL publication={} codec={} fixed={} rows={} payload_reads={} drain_read_bytes={} total_read_bytes={} written_bytes={} cpu_ns={} budget_peak={} budget_limit={}\n", .{ publication, manager.compression, fixed, seen, sort.payload_reads, manager.read_bytes - reads_before_delivery, manager.read_bytes, manager.written_bytes, cpu, if (publication) working.quota.peak_bytes else budget.peak, if (publication) working.maxBytes() else budget.limit });
             try std.testing.expectEqual(@as(usize, count), seen);
             try std.testing.expect(budget.peak <= budget.limit);
+            try std.testing.expect(working.quota.peak_bytes <= working.maxBytes());
             return .{ .read = manager.read_bytes, .written = manager.written_bytes, .drain = manager.read_bytes - reads_before_delivery, .payload_reads = sort.payload_reads, .cpu = cpu };
         }
     };
-    for ([_]bool{ false, true }) |compressed| {
-        const before = try Probe.run(compressed, true);
-        const after = try Probe.run(compressed, false);
+    for ([_]bool{ false, true }) |publication| for ([_]bool{ false, true }) |compressed| {
+        const before = try Probe.run(compressed, true, publication);
+        const after = try Probe.run(compressed, false, publication);
         try std.testing.expectEqual(before.written, after.written);
         try std.testing.expect(after.drain < before.drain / 2);
         try std.testing.expect(after.payload_reads < before.payload_reads / 2);
+    };
+    if (std.c.getenv("ANTFLY_LAKE_PUBLICATION_CACHE_BENCH") != null) {
+        for (0..6) |sample| {
+            std.debug.print("PUBLICATION_SAMPLE sample={}\n", .{sample});
+            _ = try Probe.run(true, sample % 2 == 0, true);
+            _ = try Probe.run(true, sample % 2 != 0, true);
+        }
     }
     if (std.c.getenv("ANTFLY_LAKE_ADAPTIVE_CACHE_BENCH") != null) {
         for (0..6) |sample| {
             std.debug.print("ADAPTIVE_SAMPLE sample={}\n", .{sample});
-            _ = try Probe.run(true, sample % 2 == 0);
-            _ = try Probe.run(true, sample % 2 != 0);
+            _ = try Probe.run(true, sample % 2 == 0, false);
+            _ = try Probe.run(true, sample % 2 != 0, false);
         }
     }
 }

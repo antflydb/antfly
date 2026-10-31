@@ -85,6 +85,7 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     var heartbeat_active = true;
     defer if (heartbeat_active) heartbeat.cancel(io);
     var working = try limits.WorkingSetAllocator.init(a, options.build_limits);
+    defer working.deinit();
     const build_alloc = working.allocator();
     var artifact_reads = @import("lake_index_artifact_recovery.zig").Reads.init(store.artifactStore());
     var handle = artifact_reads.store();
@@ -109,7 +110,7 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
         // Optional prefetch may have declined an earlier allocation. That
         // historical quota flag cannot replace an explicit source, integrity,
         // cancellation or lease error from the required construction path.
-        const working_limit = build_error == error.OutOfMemory and working.limit_exceeded;
+        const working_limit = build_error == error.OutOfMemory and working.limitExceeded();
         const failed_bytes = try catalog.encode(a, try admitted.value.fail(admitted.value.pending.?.token, if (working_limit) "LakeSidecarBuildLimitExceeded" else @errorName(build_error), retry_at));
         defer a.free(failed_bytes);
         try lease.replaceCatalog(failed_bytes);

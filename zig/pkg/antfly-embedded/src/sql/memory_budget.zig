@@ -148,6 +148,10 @@ pub fn footprint(self: *Budget) usize {
 /// Live headroom of this allocator's budget chain, when known. Unknown backing
 /// allocators provide no extra bound; they never imply unlimited admission.
 pub fn headroom(a: std.mem.Allocator) ?usize {
+    if (Residency.Quota.owner(a)) |owner| {
+        const available = owner.available();
+        return if (headroom(owner.backing)) |parent| @min(available, parent) else available;
+    }
     if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(a)) |parent| return headroom(parent);
     if (@import("spill.zig").Manager.parentAllocator(a)) |parent| return headroom(parent);
     if (@import("../storage/resource_manager.zig").BudgetedAllocator.reclamationLayer(a)) |layer| {
@@ -175,6 +179,7 @@ pub fn headroom(a: std.mem.Allocator) ?usize {
 /// complete headroom chains without treating opaque backings as unbounded.
 /// External reservation owners have no locally provable spare capacity.
 pub fn optionalLocalHeadroom(a: std.mem.Allocator) ?struct { available: usize, backing: std.mem.Allocator } {
+    if (Residency.Quota.owner(a)) |owner| return .{ .available = owner.available(), .backing = owner.backing };
     if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return null;
     const self: *Budget = @ptrCast(@alignCast(a.ptr));
     self.lock();
@@ -239,6 +244,11 @@ pub fn reusableHeadroom(a: std.mem.Allocator) ?usize {
             if (reclaimed.ptr != backing.ptr or reclaimed.vtable != backing.vtable) return null;
         };
         return @min(available, reusableHeadroom(backing) orelse return null);
+    }
+    if (Residency.Quota.owner(actual)) |owner| {
+        const backing = reclaimingAllocator(owner.backing);
+        if (backing.ptr != owner.backing.ptr or backing.vtable != owner.backing.vtable) return null;
+        return @min(owner.available(), reusableHeadroom(owner.backing) orelse return null);
     }
     if (comptime @import("builtin").is_test) {
         if (actual.vtable == std.testing.allocator.vtable and actual.ptr == std.testing.allocator.ptr) return std.math.maxInt(usize);

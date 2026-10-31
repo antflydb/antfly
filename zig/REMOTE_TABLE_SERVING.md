@@ -2628,3 +2628,25 @@ uses the same refundable-owner contract. Qualification compares fixed and
 adaptive spill policies through `sql_memory_owner`, with identical statement
 and host limits, and compares owning and leased range delivery against equal
 physical reads and independently checked bytes.
+
+### Publication quota reclamation
+
+Native publication uses the shared platform `reclamation.Quota` through its
+`WorkingSetAllocator` adapter. The allocator remains synchronized and retains
+its build working-set limit, live/peak accounting, and existing limit-error
+classification. Every allocation still passes through the original quota and
+backing allocator. Spill discovery recognizes this explicit refundable owner;
+it never treats an unknown wrapper as unlimited or unwraps an arena under it.
+
+Quota, statement and host owners register the same stable round-robin residency
+hooks. Required growth preflights idle spill roots before acquiring the quota
+mutex. Reclamation acquires known free-path locks without waiting and reuses
+already-held locks only for refundable teardown. Busy owners are skipped and
+borrower pins remain valid. Coordinator teardown checks that all quota hooks and
+live allocations have retired, including canceled and failed publication.
+
+Runtime ABI **80** fences this allocator contract. Reader protocol **97** and
+persisted artifact formats remain unchanged. Publication performance is measured
+separately from SQL execution: the drain fixture uses the actual quota/lock
+chain, while the real-Parquet runner measures table creation through the first
+queryable index revision and verifies the complete ordered result afterward.

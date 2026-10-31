@@ -25,6 +25,7 @@ const native_spill_supported = @import("builtin").os.tag != .freestanding;
 pub const none = std.math.maxInt(u64);
 const frame_bytes = 25;
 const snappy = @import("../encoding/snappy.zig");
+const Quota = @import("antfly_platform").allocator.reclamation.Quota;
 const HostBudget = @import("../storage/resource_manager.zig").BudgetedAllocator;
 
 pub const Manager = struct {
@@ -137,6 +138,8 @@ pub const Manager = struct {
                         if (@import("memory_budget.zig").parentAllocator(link_.allocator) != null) {
                             const budget: *@import("memory_budget.zig") = @ptrCast(@alignCast(link_.allocator.ptr));
                             budget.unregisterReclaimer(&link_.hook);
+                        } else if (Quota.owner(link_.allocator)) |owner| {
+                            owner.residency.unregister(&link_.hook);
                         } else HostBudget.reclamationLayer(link_.allocator).?.owner.residency.unregister(&link_.hook);
                     }
                     self.payload_budget_count = 0;
@@ -169,6 +172,7 @@ pub const Manager = struct {
         }
     }
     fn allocatorParent(a: Allocator) ?Allocator {
+        if (Quota.owner(a)) |owner| return owner.backing;
         if (@import("memory_budget.zig").parentAllocator(a)) |parent| return parent;
         if (parentAllocator(a)) |parent| return parent;
         if (HostBudget.reclamationLayer(a)) |layer| return layer.backing;
@@ -177,7 +181,7 @@ pub const Manager = struct {
     fn containsAllocator(a: Allocator, budget: Allocator) bool {
         var current = a;
         for (0..32) |_| {
-            if (current.ptr == budget.ptr and (@import("memory_budget.zig").parentAllocator(current) != null or HostBudget.reclamationLayer(current) != null)) return true;
+            if (current.ptr == budget.ptr and (@import("memory_budget.zig").parentAllocator(current) != null or HostBudget.reclamationLayer(current) != null or Quota.owner(current) != null)) return true;
             current = allocatorParent(current) orelse return false;
         }
         return false;
@@ -191,13 +195,16 @@ pub const Manager = struct {
         for (0..32) |_| {
             const sql = @import("memory_budget.zig").parentAllocator(current) != null;
             const host = HostBudget.reclamationLayer(current);
-            if (sql or host != null) {
+            const quota = Quota.owner(current);
+            if (sql or host != null or quota != null) {
                 const link = &self.payload_budget_links[self.payload_budget_count];
                 link.* = .{ .manager = self, .allocator = current, .hook = .{ .ptr = link, .reclaim = reclaimBudget } };
                 self.payload_budget_count += 1;
                 if (sql) {
                     const budget: *@import("memory_budget.zig") = @ptrCast(@alignCast(current.ptr));
                     budget.registerReclaimer(&link.hook);
+                } else if (quota) |owner| {
+                    owner.residency.register(&link.hook);
                 } else host.?.owner.residency.register(&link.hook);
             }
             current = allocatorParent(current) orelse return;
@@ -219,6 +226,10 @@ pub const Manager = struct {
             }
             if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(current)) |parent| {
                 current = parent;
+                continue;
+            }
+            if (Quota.owner(current)) |owner| {
+                current = owner.backing;
                 continue;
             }
             if (HostBudget.reclamationLayer(current)) |layer| {
@@ -256,6 +267,11 @@ pub const Manager = struct {
             }
             if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(current)) |parent| {
                 current = parent;
+                continue;
+            }
+            if (Quota.owner(current)) |owner| {
+                owner.prepare(growth);
+                current = owner.backing;
                 continue;
             }
             if (HostBudget.reclamationLayer(current)) |layer| {
@@ -4069,6 +4085,9 @@ const PayloadCache = struct {
                     const locked: *@import("parallel_scheduler.zig").LockedAllocator = @ptrCast(@alignCast(current.ptr));
                     if (!self.take(locked.shared_mutex orelse &locked.mutex)) return false;
                     current = parent;
+                } else if (Quota.owner(current)) |owner| {
+                    if (!self.take(&owner.mutex)) return false;
+                    current = owner.backing;
                 } else if (HostBudget.reclamationLayer(current)) |layer| {
                     if (!self.take(layer.mutex)) return false;
                     current = layer.backing;
@@ -10001,17 +10020,23 @@ test "SQL adaptive payload cache counts shared bodies and aliases and unwinds me
 }
 
 test "SQL adaptive payload cache returns idle sibling capacity to required scoped allocations" {
-    for ([_]bool{ false, true }) |host_backed| for (0..5) |mode| {
-        if (!host_backed and mode == 4) continue;
+    for (0..5) |backing_kind| for (0..5) |mode| {
+        const host_backed = backing_kind == 1 or backing_kind >= 3;
+        const quota_backed = backing_kind >= 2;
+        if (backing_kind == 0 and mode == 4) continue;
         const Hook = struct {
             fn check(_: *anyopaque) !void {}
         };
         var resources = @import("../storage/resource_manager.zig").ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 512 << 10 } });
         defer resources.deinit(std.testing.allocator);
-        var host = HostBudget.initReclaiming(&resources, .sql_execution_working_set, std.testing.allocator, 1);
+        var quota = Quota.init(std.testing.allocator, 512 << 10);
+        defer quota.deinit();
+        var host = HostBudget.initReclaiming(&resources, .sql_execution_working_set, if (backing_kind == 4) quota.allocator() else std.testing.allocator, 1);
         host.credit_quantum = 1;
         defer host.deinit();
-        var budget: @import("memory_budget.zig") = .{ .backing = if (host_backed) host.threadSafeAllocator() else std.testing.allocator, .limit = 512 << 10 };
+        if (backing_kind == 3) quota.backing = host.threadSafeAllocator();
+        const backing = if (backing_kind == 4 or backing_kind == 1) host.threadSafeAllocator() else if (quota_backed) quota.allocator() else std.testing.allocator;
+        var budget: @import("memory_budget.zig") = .{ .backing = backing, .limit = 512 << 10 };
         defer std.debug.assert(budget.live == 0);
         var marker: u8 = 0;
         var shared_backing: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = budget.allocator() };
@@ -10029,6 +10054,7 @@ test "SQL adaptive payload cache returns idle sibling capacity to required scope
         defer first.deinit();
         try std.testing.expect(first.registered and second.registered);
         if (host_backed) try std.testing.expect(host.residency.active());
+        if (quota_backed) try std.testing.expect(quota.residency.active());
         for ([_]*PayloadCache{ &first, &second }, 0..) |cache, offset| {
             const a = cache.manager.?.allocator();
             const block = try a.create(Sequential.OwnedBlock);
@@ -10046,13 +10072,13 @@ test "SQL adaptive payload cache returns idle sibling capacity to required scope
         defer region.deinit();
         var locked_region: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = region.allocator(), .shared_mutex = if (mode == 3) &shared_backing.mutex else null };
         const remaining: usize = if (mode == 3) 40 << 10 else 8 << 10;
-        const ballast_allocator = if (mode == 4) host.threadSafeAllocator() else budget.allocator();
+        const ballast_allocator = if (mode == 4) backing else budget.allocator();
         const ballast = try ballast_allocator.alloc(u8, @import("memory_budget.zig").headroom(ballast_allocator).? - remaining);
         defer ballast_allocator.free(ballast);
         const required_allocator = switch (mode) {
             0 => nested.allocator(),
             1 => budget.allocator(),
-            4 => host.threadSafeAllocator(),
+            4 => backing,
             else => locked_region.allocator(),
         };
         const required = block: {
@@ -10073,6 +10099,7 @@ test "SQL adaptive payload cache returns idle sibling capacity to required scope
         try std.testing.expectEqual(@as(usize, 0), second.entries.count());
         try std.testing.expect(!budget.isLocallyExhausted());
         if (host_backed) try std.testing.expect(!host.denied());
+        if (quota_backed) try std.testing.expect(!quota.limit_exceeded and quota.live_bytes <= quota.max_live_bytes);
         try std.testing.expect(budget.live <= budget.limit);
     };
 }

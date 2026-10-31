@@ -96,3 +96,99 @@ pub const Registry = struct {
         }
     }
 };
+
+/// A stable synchronized refundable quota owner. Allocator recognition is an
+/// opt-in contract, not permission to allocate through the backing directly.
+pub const Quota = struct {
+    backing: std.mem.Allocator,
+    live_bytes: usize = 0,
+    peak_bytes: usize = 0,
+    max_live_bytes: usize,
+    limit_exceeded: bool = false,
+    mutex: std.atomic.Mutex = .unlocked,
+    residency: Registry = .{},
+
+    pub fn init(backing: std.mem.Allocator, maximum: usize) Quota {
+        return .{ .backing = backing, .max_live_bytes = maximum };
+    }
+    pub fn deinit(self: *Quota) void {
+        std.debug.assert(self.live_bytes == 0 and !self.residency.active());
+    }
+    pub fn owner(a: std.mem.Allocator) ?*Quota {
+        if (a.vtable != &vtable) return null;
+        return @ptrCast(@alignCast(a.ptr));
+    }
+    pub fn allocator(self: *Quota) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    fn lock(self: *Quota) void {
+        @import("sync.zig").lockYielding(&self.mutex);
+    }
+    pub fn available(self: *Quota) usize {
+        const held = Guard.held(&self.mutex);
+        if (!held) self.lock();
+        defer if (!held) self.mutex.unlock();
+        return self.max_live_bytes -| self.live_bytes;
+    }
+    pub fn prepare(self: *Quota, growth: usize) void {
+        if (growth == 0 or !Guard.allowed() or !self.residency.active()) return;
+        while (growth > self.available()) if (!self.residency.reclaimOne()) return;
+    }
+    fn permits(self: *Quota, growth: usize) bool {
+        if (growth <= self.max_live_bytes -| self.live_bytes) return true;
+        self.limit_exceeded = true;
+        return false;
+    }
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *Quota = @ptrCast(@alignCast(raw));
+        self.prepare(len);
+        self.lock();
+        defer self.mutex.unlock();
+        Guard.enter(&self.mutex);
+        defer Guard.leave();
+        if (!self.permits(len)) return null;
+        const result = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+        self.live_bytes += len;
+        self.peak_bytes = @max(self.peak_bytes, self.live_bytes);
+        return result;
+    }
+    fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *Quota = @ptrCast(@alignCast(raw));
+        const growth = len -| bytes.len;
+        self.prepare(growth);
+        self.lock();
+        defer self.mutex.unlock();
+        Guard.enter(&self.mutex);
+        defer Guard.leave();
+        if (!self.permits(growth) or !self.backing.rawResize(bytes, alignment, len, ra)) return false;
+        self.live_bytes = self.live_bytes - bytes.len + len;
+        self.peak_bytes = @max(self.peak_bytes, self.live_bytes);
+        return true;
+    }
+    fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *Quota = @ptrCast(@alignCast(raw));
+        const growth = len -| bytes.len;
+        self.prepare(growth);
+        self.lock();
+        defer self.mutex.unlock();
+        Guard.enter(&self.mutex);
+        defer Guard.leave();
+        if (!self.permits(growth)) return null;
+        const result = self.backing.rawRemap(bytes, alignment, len, ra) orelse return null;
+        self.live_bytes = self.live_bytes - bytes.len + len;
+        self.peak_bytes = @max(self.peak_bytes, self.live_bytes);
+        return result;
+    }
+    fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *Quota = @ptrCast(@alignCast(raw));
+        const reuse = Guard.reuse(&self.mutex);
+        if (!reuse) self.lock();
+        defer if (!reuse) self.mutex.unlock();
+        Guard.enter(&self.mutex);
+        defer Guard.leave();
+        self.backing.rawFree(bytes, alignment, ra);
+        std.debug.assert(bytes.len <= self.live_bytes);
+        self.live_bytes -= bytes.len;
+    }
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+};

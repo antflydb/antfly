@@ -3182,14 +3182,14 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
         manifests.prefetch(ref);
         try std.testing.expect(manifests.pending != null);
         try probe.entered.wait(std.testing.io);
-        const held = try bounded.alloc(u8, budget.max_live_bytes - budget.live_bytes);
+        const held = try bounded.alloc(u8, budget.maxBytes() - budget.liveBytes());
         probe.gate.set(std.testing.io);
         while (!manifests.pending.?.task.isComplete()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
         bounded.free(held);
-        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), budget.liveBytes());
         // A completed successful read retains only its independently admitted
         // bytes: required reducer allocations may still use their entire quota.
-        const required_work = try bounded.alloc(u8, budget.max_live_bytes);
+        const required_work = try bounded.alloc(u8, budget.maxBytes());
         bounded.free(required_work);
         try std.testing.expect(scheduler.pull_bytes != 0);
         const before = probe.reads.load(.acquire);
@@ -3201,16 +3201,16 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
         try std.testing.expect(manifests.pending == null and probe.execution.active);
         try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
         required.deinit();
-        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), budget.liveBytes());
         manifests.prefetch(ref);
         try std.testing.expect(manifests.pending != null);
         while (!manifests.pending.?.task.isComplete()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
-        try std.testing.expect(budget.live_bytes >= ref.byte_len);
-        try std.testing.expectError(error.OutOfMemory, bounded.alloc(u8, budget.max_live_bytes));
+        try std.testing.expect(budget.liveBytes() >= ref.byte_len);
+        try std.testing.expectError(error.OutOfMemory, bounded.alloc(u8, budget.maxBytes()));
         const cached_reads = probe.reads.load(.acquire);
         _ = try manifests.load(arena.allocator(), ref);
         try std.testing.expectEqual(cached_reads, probe.reads.load(.acquire));
-        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), budget.liveBytes());
     }
     // A completed result retains its independent node reservation until join.
     scheduler.max_pull_bytes = 1;
@@ -3543,7 +3543,7 @@ test "external lake canonical multi-pack publication keeps worker allocations ou
     try std.testing.expect(probe.peak.load(.acquire) > 1);
     try std.testing.expectEqual(@as(usize, 1), segments.items.len);
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
-    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.liveBytes());
 }
 
 test "external lake text row deltas merge retained postings without reanalyzing old rows" {
