@@ -1420,6 +1420,25 @@ const LocalStandaloneMetadata = struct {
         self.epoch = @max(1, try store.standaloneRevision());
         self.durable_revision = self.epoch;
     }
+
+    /// CDC status/progress commands (replication source status upserts,
+    /// cutover claims, retirement) persist durably through the same
+    /// lifecycle store as restore jobs and schema-migration progress, but —
+    /// unlike those — they carry no catalog change for routing or
+    /// join-planning caches to see. Cluster mode's equivalent
+    /// (RaftApplyStore's per-command projection signals) only advances its
+    /// catalog_revision for table/range/metadata_incarnation changes; this
+    /// mirrors that by advancing only self.durable_revision (required so
+    /// beginCatalogMutationLocked's staleness guard keeps matching the
+    /// store) and leaving self.epoch — the routing/join-planning epoch —
+    /// untouched. Bumping it here would force every reader to rebuild
+    /// catalog-wide routing state on every status upsert, including idle
+    /// streaming polls.
+    fn applyCdcStatusCommandLocked(self: *LocalStandaloneMetadata, command: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
+        const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+        try store.applyStandaloneCommand(group_ids.main_metadata_group_id, command);
+        self.durable_revision = @max(1, try store.standaloneRevision());
+    }
     fn requireRestoreJobTermLocked(self: *LocalStandaloneMetadata, term: u64) !void {
         const current = if (self.hot_standby_mirror) |mirror| mirror.publisher.identity().epoch else @as(u64, 1);
         if (term != current) return error.NotLeader;
@@ -3910,7 +3929,7 @@ const LocalStandaloneMetadata = struct {
         fn apply(self: CdcService, command: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
             var lock = try self.metadata.lockMutation();
             defer lock.deinit();
-            try self.metadata.applyJobCommandLocked(command);
+            try self.metadata.applyCdcStatusCommandLocked(command);
         }
 
         pub fn upsertReplicationSourceStatus(self: CdcService, record: tm.ReplicationSourceStatusRecord) !void {
@@ -9574,6 +9593,49 @@ test "standalone cdc managed-source status reports cdc_supported false only for 
     var ha_metadata = try haBoundStandaloneMetadataForTest(alloc, backend_runtime.ptr(), &server);
     defer ha_metadata.deinit();
     try std.testing.expect(!(try ha_metadata.statusSource().replicationSourcesSupported()));
+}
+
+test "standalone cdc status upsert leaves the routing epoch unchanged, unlike a real catalog change" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+
+    const service = LocalStandaloneMetadata.CdcService{ .metadata = &metadata };
+    const epoch_before = metadata.epoch;
+    // An idle streaming poll upserts status on every round; it must never
+    // look like a catalog change to routing or join-planning caches.
+    try service.upsertReplicationSourceStatus(.{
+        .table_id = 77,
+        .source_ordinal = 0,
+        .source_kind = "postgres",
+        .external_table = "users",
+        .slot_name = "antfly_users_slot",
+        .publication_name = "antfly_users_pub",
+        .phase = "streaming",
+        .stream_checkpoint = "0/1C51080",
+    });
+    try std.testing.expectEqual(epoch_before, metadata.epoch);
+    try service.upsertReplicationSourceStatus(.{
+        .table_id = 77,
+        .source_ordinal = 0,
+        .source_kind = "postgres",
+        .external_table = "users",
+        .slot_name = "antfly_users_slot",
+        .publication_name = "antfly_users_pub",
+        .phase = "streaming",
+        .stream_checkpoint = "0/1C51100",
+    });
+    try std.testing.expectEqual(epoch_before, metadata.epoch);
+
+    // A genuine catalog mutation still advances it.
+    try LocalStandaloneMetadata.createTable(&metadata, alloc, "tickets", .{});
+    try std.testing.expect(metadata.epoch != epoch_before);
 }
 
 test "standalone table storage defaults persist without migrating legacy tables" {
