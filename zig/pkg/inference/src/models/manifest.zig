@@ -1670,16 +1670,36 @@ pub fn loadListingCandidateFromDir(
     allocator: std.mem.Allocator,
     model_dir_path: []const u8,
 ) !?ModelManifest {
-    return loadListingFromDir(allocator, model_dir_path) catch |err| {
-        if (isListingCandidateRejection(err)) return null;
+    return switch (try loadListingCandidateResult(allocator, model_dir_path)) {
+        .manifest => |manifest| manifest,
+        .rejected => null,
+    };
+}
+
+/// Outcome of loading one discovery candidate. A rejection names why that
+/// single candidate is unusable so listings can report it per entry.
+pub const ListingCandidate = union(enum) {
+    manifest: ModelManifest,
+    rejected: anyerror,
+};
+
+/// Like `loadListingCandidateFromDir`, but keeps the rejection reason so a
+/// listing can show the unusable model and its error instead of hiding it.
+pub fn loadListingCandidateResult(
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+) !ListingCandidate {
+    const manifest = loadListingFromDir(allocator, model_dir_path) catch |err| {
+        if (isListingCandidateRejection(err)) return .{ .rejected = err };
         return err;
     };
+    return .{ .manifest = manifest };
 }
 
 /// Only errors that conclusively describe one unusable candidate are safe to
 /// suppress during a registry scan. Keeping this as a rejection allowlist
 /// makes new filesystem, allocator, and runtime errors fail visible by default.
-fn isListingCandidateRejection(err: anyerror) bool {
+pub fn isListingCandidateRejection(err: anyerror) bool {
     return switch (err) {
         error.FileNotFound,
         error.NotDir,

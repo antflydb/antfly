@@ -31,8 +31,9 @@ requires an explicit opt-in before calling `/ai/v1`. Save `antfly.json`:
 antfly standalone --config antfly.json
 ```
 
-There is no enablement CLI flag. Without this setting, public execution returns
-HTTP 403 even when models are installed. See the
+There is no enablement CLI flag. Without this setting, `/ai/v1/models` still
+lists the installed models, marked `invocable: false`, but public execution
+returns HTTP 403. See the
 [public execution policy](/docs/reference/inference-gateway#public-execution-policy).
 This prerequisite applies to database API nodes on this source version; the
 independent `antfly inference run` listener and older stable releases have their

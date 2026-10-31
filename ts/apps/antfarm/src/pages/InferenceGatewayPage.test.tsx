@@ -450,6 +450,28 @@ it("shows deployment enablement instead of an executable playground when public 
   expect(client.inference.invoke).not.toHaveBeenCalled();
 });
 
+it("lists installed local models without run actions when public inference is disabled", async () => {
+  client.inference.models.mockResolvedValue({
+    object: "list",
+    data: [
+      { id: "acme/demo", task: "generate", invocable: false },
+      { id: "acme/embed", invocable: false },
+    ],
+    public_inference_enabled: false,
+  });
+  render(
+    <MemoryRouter>
+      <InferenceGatewayPage />
+    </MemoryRouter>
+  );
+  const list = await screen.findByRole("list", { name: "Installed models" });
+  expect(list.textContent).toContain("acme/demo");
+  expect(list.textContent).toContain("(generate)");
+  expect(list.textContent).toContain("acme/embed");
+  expect(screen.queryByRole("button", { name: "Run" })).toBeNull();
+  expect(client.inference.invoke).not.toHaveBeenCalled();
+});
+
 it("runs multimodal decision evidence for an image-capable decider", async () => {
   const id = "deciders/visual";
   client.inference.models.mockResolvedValue({

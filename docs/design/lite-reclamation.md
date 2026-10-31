@@ -21,8 +21,9 @@ bitmap. This replaces the proposed free-extent tree: dense counters also represe
 shared value ownership and packed-slot occupancy, and a bitmap remains compact
 under arbitrary fragmentation. Allocation prefers the lowest free page, naturally
 consuming contiguous runs, with eight summary levels rather than a file scan.
-Journal replay and periodic metadata checkpoints supply durable free capacity;
-commits do not serialize the entire free set or traverse historical records.
+Journal replay and periodic metadata checkpoints supply durable free capacity.
+Routine persistence journals ownership deltas; native connection handoff also
+fingerprints the loaded ownership metadata as described below.
 
 This is an asymptotic design choice, not a claim of globally optimal measured
 latency. The memory/write tradeoff and qualification requirements are below.
@@ -320,6 +321,63 @@ pending retirement. Explicit integrity checks use the same proof. This one-time
 open/reuse proof can read retained values; routine mutations and service never
 perform a whole-file trace. Private vacuum publication rebases retirement epochs
 and writes a metadata checkpoint when discarding earlier private recovery roots.
+
+Checked native connection owners carry that invariant across live commits using
+a private allocator certificate in the physical index catalog. The certificate
+binds both recovery slots and the complete canonical ownership state. Its own
+pages are included before the fingerprint is filled, and publication shares the
+caller's existing transaction and durability barrier. An unchecked or deferred
+writer cannot produce a trusted seal. Allocator-only retirement service does not
+replace the certificate: doing so would create new retirement work while
+consuming the old work and prevent quiescence. A peer admitting such a tip uses
+the existing protected-graph proof. Legacy clean-close certificates in the
+primary catalog remain readable and are still published at clean close.
+
+Before opening a replacement runtime, native admission checks the current tip's
+certificate even when the previous runtime had a valid proof for an older tip.
+Missing or mismatched certificates retain the protected-graph fallback. Explicit
+integrity checks still traverse the graph. Live `AFACERT2` seals bind a canonical
+Merkle digest of all ownership counters and pending entries, plus the complete
+allocator root and logical lengths. Counter chunks contain 256 counters; pending
+chunks cover 64 IDs. A compressed binary trie bounds each changed chunk's update
+to at most 64 branches, with memory proportional to live chunks rather than the
+largest historical retirement ID. Persistence cleanup retains digest dirtiness.
+Cold loads build the digest once, hashing each trie node once; warm commits hash
+only changed chunks and their paths. The older `AFACERT1` flat digest remains
+readable and is still emitted by the legacy clean-close path. Qualification must
+measure warm update cost separately from cold admission and contended progress.
+
+Storage-only maintenance can also replace a live certificate while deleting
+orphan artifact leases. The foreground may adopt that housekeeping only when
+both captures started at the same header, the current foreground is unchanged,
+and the published inode and complete checkpoint still match the maintenance
+result. Reclamation admission never rebases across an external publication.
+These fences allow the certificate catalog root to advance without reopening
+the database runtime and creating another set of leases.
+
+Contended path-lease admission uses randomized short sleeps, capped at four
+milliseconds only when a sidecar is absent or the executor cannot start a
+concurrent task. Normally, after the initial nonblocking attempt, admission
+joins the operating system's lock queue. A concurrent timer enforces the
+original deadline. Timeout and cancellation join the lock task before closing
+its descriptor, including when cancellation races a kernel grant. The first
+attempt still permits an uncontended acquisition after a slow allocator proof.
+Each shared storage owner supplies a lazy executor capped at two workers for
+the lock task and timer; the global debug executor cannot run concurrent tasks.
+Sidecar creation retains its inode fence. Qualification records CPU cost and
+progress for every writer rather than accepting aggregate throughput alone.
+
+A persistent, path-hashed maintenance sidecar serializes detached background
+turns across processes. Opening an uncertified revision-4 runtime and admitting
+its allocator proof also retain this turn, preventing peer index-lease opens
+from continually invalidating the captured tip. Nested work shares the turn
+within an owner; certified foreground callers retain their ordinary path-lease
+admission. Graph walks and provider computation still release the path-writer
+lease. Background publications join its queue for at most five seconds per
+acquisition, so a full round of foreground writers need not starve replay while
+close-time gate waits remain bounded. The coordination inode is never unlinked
+while an owner can still hold it. Refused or failed turn acquisition forces a
+100 ms backoff even with pending storage work or a nonzero namespace cursor.
 
 Opening an immutable artifact publishes an inode-local lease alias. These
 metadata-only commits have their own allocation policy. Mixed groups retain

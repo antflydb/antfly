@@ -275,9 +275,26 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
           <CardHeader>
             <CardTitle>Public inference is disabled</CardTitle>
           </CardHeader>
-          <CardContent>
-            Ask your deployment administrator to enable the inference gateway. Database indexing and
-            query inference remain available.
+          <CardContent className="space-y-3">
+            <p>
+              Ask your deployment administrator to enable the inference gateway. Database indexing
+              and query inference remain available.
+            </p>
+            {models.length > 0 ? (
+              <div className="space-y-1">
+                <p className="text-sm font-medium">
+                  Installed models (not invocable until enabled)
+                </p>
+                <ul aria-label="Installed models" className="list-disc pl-5 text-sm">
+                  {models.map((entry) => (
+                    <li key={entry.id}>
+                      <code>{entry.id}</code>
+                      {entry.task ? ` (${entry.task})` : null}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
           </CardContent>
         </Card>
       ) : (

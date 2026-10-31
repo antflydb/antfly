@@ -29,7 +29,7 @@ pub const StatusDetail = error_abi.Detail;
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
 // Combines the current control contract with retained document capabilities.
-pub const abi_version: u32 = 23;
+pub const abi_version: u32 = 24;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -89,6 +89,8 @@ pub const AuthorizationDecision = enum(c_int) {
     unauthorized = 1,
     forbidden = 2,
     not_ready = 3,
+    /// Deployment policy rejects public writes; distinct from missing RBAC.
+    public_inference_disabled = 4,
 };
 
 pub const AuthorizeInferenceContext = extern struct {
