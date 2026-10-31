@@ -367,3 +367,25 @@ separately and is not attributed to these frozen app timings. Reports, bundles,
 module copies and the 60-case metadata matrix are preserved under the example's
 `dist/qualification/next-*`; `dist/next-final-app-results.json` summarizes the app
 cases. Historical failed/prototype reports remain separate.
+
+
+### Final evidence closure
+
+Local follow-up source `67dc0b1006` is sealed at
+`examples/cloudflare-serverless/dist/qualification/next-local-sealed-1793408313866/evidence.json`:
+**2,196 verified artifacts / 1,486,863,728 bytes**, including 1,344 verified
+window-file references. Manifest SHA-256:
+`75b46e673be588d4ee5cb347b13a346b87d98360f29d25407b0907a0f4670bd5`.
+It retains full final/measured source archives, final modules, the native test
+binary, all reported app/component cases, historical failed replay, synthetic
+passing replay, failed prototypes and the initial sealing abort. Early prototype
+module paths were overwritten before binary copies were frozen; their intermediate
+binary closures remain unavailable and are not final qualification evidence.
+
+The corrected 517-artifact hosted closure and prior 568/1,069-artifact closures
+all reverify with zero missing files or hash changes. The invalid original
+516-artifact hosted seal and its summary discrepancy remain preserved and
+explicitly superseded in [the hosted record](cloudflare-twofold-trial.md).
+The older 163-artifact availability gap remains historical. Credentials,
+including local fixture token files, are excluded. No hosted gate pass or
+resolution of the historical live memory error is claimed.

@@ -129,15 +129,17 @@ The observer drain was resumed after two connection resets; both failure logs
 remain preserved. A subsequent exact-name cleanup confirmation resolved the
 automatic review's inability to associate the earlier approval with this scope.
 
-The hosted closure is independently sealed at
+The original hosted manifest was recorded at
 `examples/cloudflare-serverless/dist/qualification/twofold-hosted-1793401520945/evidence.json`:
-516 verified artifacts / 309,329,416 bytes, including all 224 referenced window
+516 artifacts / 309,329,416 bytes, including all 224 referenced window
 files, frozen deployed bundles/configurations, original report, selected archives,
 postmortem captures, lifecycle failures and cleanup inventories. Manifest SHA-256
 `b3a3ffdeb04f5f552386ed94c0c7de44ee22f1d60f9a595c168c4b20797fa718`.
 Credential files are excluded; the pre-cleanup scan found no disposable token
 values in 335 report/source/log files. Original local and historical hosted
-closures remain separate and unchanged.
+closures remain separate and unchanged. The summary self-reference discrepancy
+and corrected 517-artifact closure are documented below; use the corrected
+closure for verification.
 
 
 ## Local follow-up before another deployment
