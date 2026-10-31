@@ -1638,6 +1638,9 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    const ha_catalog_replication_sources_unsupported_body =
+        "{\"error\":\"REPLICATION_SOURCES_REQUIRE_CLUSTER\",\"message\":\"Postgres CDC replication sources are not supported with a hot-standby catalog; run a cluster to use CDC\"}";
+
     fn respondJsonErrorBody(ctx: *httpx.Context, status: u16, body: []const u8) !httpx.Response {
         _ = ctx.status(status);
         try ctx.setHeader("content-type", "application/json");
@@ -8272,6 +8275,7 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("initial foreign key generations require coordinated parent-owner publication; create the table without foreign keys, then add them through a schema update");
                 },
                 error.ObjectTablePlacementUnsupported => return textResponse(ctx, 400, "object tables do not accept num_shards or replication sources"),
+                error.HACatalogReplicationSourcesUnsupported => return respondJsonErrorBody(ctx, 400, ha_catalog_replication_sources_unsupported_body),
                 error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => {
                     _ = ctx.status(400);
                     return ctx.text("vector_store requires a fresh local single-shard standalone table without replication");

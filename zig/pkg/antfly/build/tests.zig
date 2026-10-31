@@ -459,6 +459,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "SQL pgwire native", "SQL stateless fallback" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const managed_sources_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"managed source"} });
+    b.step("antfly-api-managed-sources-test", "Run managed CDC source configuration and status contracts").dependOn(&addFilteredTestRunArtifact(b, managed_sources_tests).step);
     b.step("antfly-api-sql-native-cells-test", "Verify native SQL result cells and retained-read requirements")
         .dependOn(&addFilteredTestRunArtifact(b, sql_native_cells_tests).step);
     const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
@@ -5137,6 +5139,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"system catalog standalone relation coordinator"},
     });
     b.step("antfly-standalone-pgwire-ddl-test", "Run standalone relation publication and guarded DDL tests").dependOn(&addFilteredTestRunArtifact(b, standalone_ddl_tests).step);
+    const standalone_cdc_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"standalone cdc"},
+    });
+    b.step("antfly-standalone-cdc-test", "Run standalone PostgreSQL CDC scheduling and status tests").dependOn(&addFilteredTestRunArtifact(b, standalone_cdc_tests).step);
 
     // This filter set boots the real CLI/standalone and Lite server paths
     // (HA, hot-standby, Lite adoption, ...), which reach the real
@@ -5224,6 +5231,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
             "standalone table storage defaults persist",
+            "standalone rejects Postgres CDC replication sources it cannot run",
             "standalone Lite adoption preserves deterministic embedded document identity",
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",

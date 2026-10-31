@@ -1856,7 +1856,7 @@ pub const Executor = struct {
         defer self.alloc.free(dsn_z);
         const conn = self.pqconnectdb(dsn_z.ptr) orelse return error.ForeignConnectionFailed;
         if (self.pqstatus(conn) != CONNECTION_OK) {
-            _ = self.pqerrorMessage(conn);
+            self.logConnectFailure(conn);
             self.pqfinish(conn);
             return error.ForeignConnectionFailed;
         }
@@ -1864,6 +1864,14 @@ pub const Executor = struct {
         errdefer self.alloc.free(owned_dsn);
         try self.connections.put(self.alloc, owned_dsn, conn);
         return conn;
+    }
+
+    /// Keep PostgreSQL's reason (for example "permission denied to start WAL
+    /// sender") in the Antfly log; the returned error only names the class.
+    /// libpq's message names the host and port, never the password.
+    fn logConnectFailure(self: *@This(), conn: *PGconn) void {
+        const message = std.mem.trim(u8, std.mem.span(self.pqerrorMessage(conn)), " \t\r\n");
+        if (message.len > 0) std.log.warn("postgres libpq connect failed: {s}", .{message});
     }
 
     fn connectWithDeadline(self: *@This(), dsn: []const u8, execution_deadline_ns: ?u64) !?*PGconn {
@@ -1883,7 +1891,10 @@ pub const Executor = struct {
         while (true) {
             const polling_status = self.pqconnectPoll(conn);
             switch (polling_status) {
-                0 => return error.ForeignConnectionFailed,
+                0 => {
+                    self.logConnectFailure(conn);
+                    return error.ForeignConnectionFailed;
+                },
                 1 => try self.waitForSocket(conn, std.posix.POLL.IN, deadline_ns),
                 2 => try self.waitForSocket(conn, std.posix.POLL.OUT, deadline_ns),
                 3 => break,
@@ -1894,7 +1905,10 @@ pub const Executor = struct {
                 else => return error.ForeignConnectionFailed,
             }
         }
-        if (self.pqstatus(conn) != CONNECTION_OK) return error.ForeignConnectionFailed;
+        if (self.pqstatus(conn) != CONNECTION_OK) {
+            self.logConnectFailure(conn);
+            return error.ForeignConnectionFailed;
+        }
         if (self.pqsetnonblocking(conn, 0) != 0) return error.ForeignConnectionFailed;
 
         const owned_dsn = try self.alloc.dupe(u8, dsn);
@@ -1924,7 +1938,10 @@ pub const Executor = struct {
         while (true) {
             try ensureNotCancelled(cancellation);
             switch (self.pqconnectPoll(conn)) {
-                0 => return error.ForeignConnectionFailed,
+                0 => {
+                    self.logConnectFailure(conn);
+                    return error.ForeignConnectionFailed;
+                },
                 1 => try self.waitForSocketCancellable(conn, std.posix.POLL.IN, execution_deadline_ns, cancellation),
                 2 => try self.waitForSocketCancellable(conn, std.posix.POLL.OUT, execution_deadline_ns, cancellation),
                 3 => break,
@@ -1935,7 +1952,10 @@ pub const Executor = struct {
                 else => return error.ForeignConnectionFailed,
             }
         }
-        if (self.pqstatus(conn) != CONNECTION_OK) return error.ForeignConnectionFailed;
+        if (self.pqstatus(conn) != CONNECTION_OK) {
+            self.logConnectFailure(conn);
+            return error.ForeignConnectionFailed;
+        }
         return conn;
     }
 
@@ -2003,7 +2023,7 @@ pub const Executor = struct {
         defer alloc.free(dsn_z);
         const conn = self.pqconnectdb(dsn_z.ptr) orelse return error.ForeignConnectionFailed;
         if (self.pqstatus(conn) != CONNECTION_OK) {
-            _ = self.pqerrorMessage(conn);
+            self.logConnectFailure(conn);
             self.pqfinish(conn);
             return error.ForeignConnectionFailed;
         }

@@ -778,6 +778,8 @@ const LocalStandaloneMetadata = struct {
     storage_engine: antfly.common.config.StorageEngine = .local,
     vector_source_storage_allowed: bool = true,
     hot_standby_catalog_server: ?*antfly.data.runtime.DataServer = null,
+    /// PostgreSQL CDC rounds; see standalone/cdc.zig.
+    cdc: @import("cdc.zig").Scheduler = .{},
 
     epoch: u64 = 1,
     durable_revision: u64 = 0,
@@ -1036,6 +1038,7 @@ const LocalStandaloneMetadata = struct {
         if (self.join_planning_generation) |generation| generation.release();
         if (self.system_catalog_state) |*state| state.deinit();
         self.vector_migration_commands.deinit(self.alloc);
+        self.cdc.deinit(self.alloc);
         if (self.operator_lock) |file| file.close(self.backend_runtime.filesystemIo().?);
         self.extension_catalog.deinit();
         self.manager.deinit();
@@ -1819,6 +1822,11 @@ const LocalStandaloneMetadata = struct {
         errdefer self.extension_catalog.freeMembers(self.alloc, extension_members);
         const extension_dependencies = try self.extension_catalog.listDependencies(self.alloc);
         errdefer self.extension_catalog.freeDependencies(self.alloc, extension_dependencies);
+        const replication_source_statuses = if (self.lifecycle_store) |store|
+            try store.listReplicationSourceStatuses(self.alloc, group_ids.main_metadata_group_id)
+        else
+            try self.alloc.alloc(antfly.metadata.table_manager.ReplicationSourceStatusRecord, 0);
+        errdefer freeReplicationSourceStatusesOwned(self.alloc, replication_source_statuses);
 
         const stores = try self.alloc.alloc(antfly.metadata.StoreRecord, 1);
         errdefer self.alloc.free(stores);
@@ -1872,6 +1880,7 @@ const LocalStandaloneMetadata = struct {
             .installed_extensions = installed_extensions,
             .extension_members = extension_members,
             .extension_dependencies = extension_dependencies,
+            .replication_source_statuses = replication_source_statuses,
             .split_transitions = try self.alloc.alloc(antfly.metadata.SplitTransitionRecord, 0),
             .merge_transitions = try self.alloc.alloc(antfly.metadata.MergeTransitionRecord, 0),
         };
@@ -2165,6 +2174,7 @@ const LocalStandaloneMetadata = struct {
         self.extension_catalog.freeInstalled(self.alloc, snapshot.installed_extensions);
         self.extension_catalog.freeMembers(self.alloc, snapshot.extension_members);
         self.extension_catalog.freeDependencies(self.alloc, snapshot.extension_dependencies);
+        freeReplicationSourceStatusesOwned(self.alloc, snapshot.replication_source_statuses);
         self.alloc.free(snapshot.split_transitions);
         self.alloc.free(snapshot.merge_transitions);
         snapshot.* = undefined;
@@ -3686,7 +3696,268 @@ const LocalStandaloneMetadata = struct {
             error.FileNotFound, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
         };
+        try self.scheduleCdcRound();
     }
+
+    /// CDC runs where this process is the catalog's single owner. HA keeps a
+    /// separate writer/replica contract and rejects replication sources at
+    /// table creation, so it never reaches here with sources to replicate.
+    fn cdcOwned(self: *LocalStandaloneMetadata) bool {
+        if (self.lifecycle_store == null or self.data_server == null) return false;
+        return self.standaloneRelationPublicationSupported();
+    }
+
+    fn scheduleCdcRound(self: *LocalStandaloneMetadata) !void {
+        if (!self.cdcOwned()) return;
+        try self.cdc.schedule(self.alloc, self.backend_runtime, self, runCdcRoundJob, antfly.metadata_service.isExpectedCdcRoundError);
+    }
+
+    /// Close the CDC job owner before the data server and catalog go away.
+    fn shutdownCdc(self: *LocalStandaloneMetadata) void {
+        self.cdc.shutdown();
+    }
+
+    fn cdcPermitCheckpoint(ptr: *anyopaque, _: antfly.metadata_replication_backfill.WorkKind) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (self.cdc.shutdown_requested.load(.acquire)) return error.CdcWorkShuttingDown;
+        if (!self.cdcOwned()) return error.CdcWorkLeaseLost;
+    }
+
+    fn cdcPermitDeadline(ptr: *anyopaque) !u64 {
+        try cdcPermitCheckpoint(ptr, .snapshot_step);
+        return platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+    }
+
+    fn cdcWorkPermit(self: *LocalStandaloneMetadata) antfly.metadata_replication_backfill.WorkPermit {
+        return .{ .ptr = self, .checkpoint_fn = cdcPermitCheckpoint, .deadline_fn = cdcPermitDeadline };
+    }
+
+    /// One snapshot round then one streaming round, the same sequence and
+    /// coordinators cluster metadata runs from its leader.
+    fn runCdcRoundJob(self: *LocalStandaloneMetadata) anyerror!void {
+        try cdcPermitCheckpoint(self, .snapshot_step);
+        const server = self.data_server orelse return;
+        const backfill = antfly.metadata_replication_backfill;
+        const service = CdcService{ .metadata = self };
+        const io = self.backend_runtime.io() orelse std.Options.debug_io;
+        const write_source = server.write_source.source();
+        var snapshot = backfill.SnapshotBackfillCoordinator{
+            .alloc = self.alloc,
+            .runner = .{
+                .alloc = self.alloc,
+                .io = io,
+                .registry = &self.cdc.registry,
+                .write_source = write_source,
+                .secret_store = server.write_source.secret_store,
+                .work_permit = self.cdcWorkPermit(),
+                .destination_authorizer = server.write_source.destination_authorizer,
+            },
+        };
+        const summary = snapshot.runRound(service) catch |err| {
+            if (!antfly.metadata_service.isExpectedCdcRoundError(err)) return err;
+            std.log.warn("standalone cdc snapshot round skipped: {s}", .{@errorName(err)});
+            return;
+        };
+        if (summary.sources_considered > 0) std.log.info(
+            "standalone cdc snapshot round tables={d} sources={d} started={d} resumed={d} completed={d} yielded={d} failed={d}",
+            .{ summary.tables_considered, summary.sources_considered, summary.sources_started, summary.sources_resumed, summary.sources_completed, summary.sources_yielded, summary.sources_failed },
+        );
+        var streaming = backfill.StreamingReplicationCoordinator{
+            .alloc = self.alloc,
+            .runner = .{
+                .alloc = self.alloc,
+                .io = io,
+                .registry = &self.cdc.registry,
+                .write_source = write_source,
+                .secret_store = server.write_source.secret_store,
+                .work_permit = self.cdcWorkPermit(),
+                .destination_authorizer = server.write_source.destination_authorizer,
+            },
+        };
+        const stream_summary = streaming.runRound(service) catch |err| {
+            if (!antfly.metadata_service.isExpectedCdcRoundError(err)) return err;
+            std.log.warn("standalone cdc streaming round skipped: {s}", .{@errorName(err)});
+            return;
+        };
+        if (stream_summary.sources_considered > 0) std.log.info(
+            "standalone cdc streaming round tables={d} sources={d} started={d} resumed={d} skipped={d} polled={d} changes={d} failed={d}",
+            .{ stream_summary.tables_considered, stream_summary.sources_considered, stream_summary.sources_started, stream_summary.sources_resumed, stream_summary.sources_skipped_pending_snapshot, stream_summary.sources_polled, stream_summary.changes_applied, stream_summary.sources_failed },
+        );
+    }
+
+    /// The metadata surface the CDC coordinators read and write. Catalog rows
+    /// come from the local projection; replication status lives in the same
+    /// durable lifecycle journal as every other standalone metadata command,
+    /// applied synchronously because this process is its only writer.
+    const CdcService = struct {
+        metadata: *LocalStandaloneMetadata,
+        const tm = antfly.metadata.table_manager;
+        const group = group_ids.main_metadata_group_id;
+
+        fn store(self: CdcService) !*antfly.metadata.RaftApplyStore {
+            return self.metadata.lifecycle_store orelse error.MissingMetadataStore;
+        }
+
+        pub fn status(self: CdcService) !antfly.metadata_api.MetadataStatus {
+            return LocalStandaloneMetadata.status(self.metadata);
+        }
+
+        fn refreshLocked(m: *LocalStandaloneMetadata) !void {
+            if (m.lifecycle_store) |lifecycle| if (try lifecycle.standaloneRevision() != m.durable_revision) try m.reloadLifecycleProjectionLocked();
+        }
+
+        pub fn listProjectedTables(self: CdcService, alloc: std.mem.Allocator) ![]antfly.metadata.TableRecord {
+            const m = self.metadata;
+            lockAtomic(&m.mutex);
+            defer m.mutex.unlock();
+            try refreshLocked(m);
+            return m.manager.listTables(alloc);
+        }
+        pub fn freeProjectedTables(self: CdcService, alloc: std.mem.Allocator, tables: []antfly.metadata.TableRecord) void {
+            self.metadata.manager.freeTables(alloc, tables);
+        }
+        pub fn listProjectedRanges(self: CdcService, alloc: std.mem.Allocator) ![]antfly.metadata.RangeRecord {
+            const m = self.metadata;
+            lockAtomic(&m.mutex);
+            defer m.mutex.unlock();
+            try refreshLocked(m);
+            return m.manager.listRanges(alloc);
+        }
+        pub fn freeProjectedRanges(self: CdcService, alloc: std.mem.Allocator, ranges: []antfly.metadata.RangeRecord) void {
+            self.metadata.manager.freeRanges(alloc, ranges);
+        }
+        pub fn listProjectedStores(self: CdcService, alloc: std.mem.Allocator) ![]antfly.metadata.StoreRecord {
+            const m = self.metadata;
+            const stores = try alloc.alloc(antfly.metadata.StoreRecord, 1);
+            errdefer alloc.free(stores);
+            stores[0] = try tm.cloneStore(alloc, .{ .store_id = m.store_id, .node_id = m.local_node_id, .api_url = m.api_url, .role = "data", .health_class = "healthy", .live = true });
+            return stores;
+        }
+        pub fn freeProjectedStores(_: CdcService, alloc: std.mem.Allocator, stores: []antfly.metadata.StoreRecord) void {
+            for (stores) |record| tm.freeStore(alloc, record);
+            alloc.free(stores);
+        }
+        /// One local placement per range, as in the standalone admin snapshot.
+        pub fn listProjectedPlacementIntents(self: CdcService, alloc: std.mem.Allocator) ![]antfly.raft.PlacementIntent {
+            const m = self.metadata;
+            lockAtomic(&m.mutex);
+            defer m.mutex.unlock();
+            const ranges = try m.manager.listRanges(alloc);
+            defer m.manager.freeRanges(alloc, ranges);
+            const intents = try alloc.alloc(antfly.raft.PlacementIntent, ranges.len);
+            for (ranges, 0..) |range, i| intents[i] = .{
+                .record = .{ .group_id = range.group_id, .replica_id = 1, .local_node_id = m.local_node_id, .bootstrap_mode = .persisted, .metadata_version = m.epoch },
+                .store_id = m.store_id,
+                .peer_node_ids = &.{},
+            };
+            return intents;
+        }
+        pub fn freeProjectedPlacementIntents(_: CdcService, alloc: std.mem.Allocator, intents: []antfly.raft.PlacementIntent) void {
+            alloc.free(intents);
+        }
+        pub fn listProjectedSplitTransitions(_: CdcService, alloc: std.mem.Allocator) ![]antfly.metadata.SplitTransitionRecord {
+            return alloc.alloc(antfly.metadata.SplitTransitionRecord, 0);
+        }
+        pub fn freeProjectedSplitTransitions(_: CdcService, alloc: std.mem.Allocator, records: []antfly.metadata.SplitTransitionRecord) void {
+            alloc.free(records);
+        }
+        pub fn listProjectedMergeTransitions(_: CdcService, alloc: std.mem.Allocator) ![]antfly.metadata.MergeTransitionRecord {
+            return alloc.alloc(antfly.metadata.MergeTransitionRecord, 0);
+        }
+        pub fn freeProjectedMergeTransitions(_: CdcService, alloc: std.mem.Allocator, records: []antfly.metadata.MergeTransitionRecord) void {
+            alloc.free(records);
+        }
+        pub fn listProjectedReplicationSourceStatuses(self: CdcService, alloc: std.mem.Allocator) ![]tm.ReplicationSourceStatusRecord {
+            const m = self.metadata;
+            lockAtomic(&m.mutex);
+            defer m.mutex.unlock();
+            return (try self.store()).listReplicationSourceStatuses(alloc, group);
+        }
+        pub fn freeProjectedReplicationSourceStatuses(self: CdcService, alloc: std.mem.Allocator, records: []tm.ReplicationSourceStatusRecord) void {
+            const lifecycle = self.metadata.lifecycle_store orelse {
+                for (records) |record| tm.freeReplicationSourceStatus(alloc, record);
+                alloc.free(records);
+                return;
+            };
+            lifecycle.freeReplicationSourceStatuses(alloc, records);
+        }
+
+        fn apply(self: CdcService, command: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
+            var lock = try self.metadata.lockMutation();
+            defer lock.deinit();
+            try self.metadata.applyJobCommandLocked(command);
+        }
+
+        pub fn upsertReplicationSourceStatus(self: CdcService, record: tm.ReplicationSourceStatusRecord) !void {
+            try self.apply(.{ .upsert_replication_source_status = record });
+        }
+
+        /// Single-writer form of the cluster claim: the command applies before
+        /// returning, so the applied record is the proof.
+        pub fn claimReplicationSourceCutoverDurable(
+            self: CdcService,
+            expected_replication_sources_json: []const u8,
+            expected_authority_id: u64,
+            record: tm.ReplicationSourceStatusRecord,
+        ) !void {
+            if (record.cutover_intent_id == 0 or record.cutover_authority_id == 0 or
+                std.mem.allEqual(u8, &record.cutover_provider_identity, 0))
+                return error.InvalidReplicationCutoverIntent;
+            try self.apply(.{ .claim_replication_source_cutover = .{
+                .expected_replication_sources_json = expected_replication_sources_json,
+                .expected_authority_id = expected_authority_id,
+                .record = record,
+            } });
+            const m = self.metadata;
+            const alloc = m.alloc;
+            lockAtomic(&m.mutex);
+            defer m.mutex.unlock();
+            const lifecycle = try self.store();
+            if (try lifecycle.getReplicationSourceStatus(alloc, group, record.table_id, record.source_ordinal)) |applied| {
+                defer tm.freeReplicationSourceStatus(alloc, applied);
+                if (antfly.metadata_service.replicationCutoverIntentApplied(applied, record)) return;
+                if (applied.cutover_authority_id != expected_authority_id) return error.ReplicationCutoverAuthorityLost;
+            }
+            const table = (try lifecycle.getTable(alloc, group, record.table_id)) orelse return error.TableNotFound;
+            defer tm.freeTable(alloc, table);
+            if (!std.mem.eql(u8, table.replication_sources_json, expected_replication_sources_json)) return error.ReplicationSourceConfigChanged;
+            return error.ReplicationCutoverAuthorityLost;
+        }
+
+        pub fn replicationSourceAuthorityCurrent(
+            self: CdcService,
+            expected_replication_sources_json: []const u8,
+            expected: tm.ReplicationSourceStatusRecord,
+        ) !void {
+            const m = self.metadata;
+            const alloc = m.alloc;
+            lockAtomic(&m.mutex);
+            defer m.mutex.unlock();
+            const lifecycle = try self.store();
+            const table = (try lifecycle.getTable(alloc, group, expected.table_id)) orelse return error.ReplicationSourceConfigChanged;
+            defer tm.freeTable(alloc, table);
+            if (!std.mem.eql(u8, table.replication_sources_json, expected_replication_sources_json)) return error.ReplicationSourceConfigChanged;
+            const current = (try lifecycle.getReplicationSourceStatus(alloc, group, expected.table_id, expected.source_ordinal)) orelse return error.ReplicationCutoverAuthorityLost;
+            defer tm.freeReplicationSourceStatus(alloc, current);
+            if (!antfly.metadata_service.replicationCutoverAuthorityMatches(current, expected)) return error.ReplicationCutoverAuthorityLost;
+        }
+
+        pub fn completeReplicationSourceCutoverRetirementDurable(self: CdcService, expected: tm.ReplicationSourceStatusRecord) !void {
+            if (expected.cutover_authority_id == 0 or expected.retired_cutover_authority_id == 0 or
+                expected.retired_slot_name.len == 0 or expected.retired_publication_name.len == 0)
+                return error.InvalidReplicationCutoverIntent;
+            try self.apply(.{ .complete_replication_source_retirement = expected });
+            const m = self.metadata;
+            const alloc = m.alloc;
+            lockAtomic(&m.mutex);
+            defer m.mutex.unlock();
+            const current = (try (try self.store()).getReplicationSourceStatus(alloc, group, expected.table_id, expected.source_ordinal)) orelse return error.ReplicationCutoverAuthorityLost;
+            defer tm.freeReplicationSourceStatus(alloc, current);
+            if (!antfly.metadata_service.replicationCutoverAuthorityMatches(current, expected)) return error.ReplicationCutoverAuthorityLost;
+            if (current.retired_cutover_authority_id == 0 and current.retired_slot_name.len == 0 and current.retired_publication_name.len == 0) return;
+            return error.ReplicationCutoverAuthorityLost;
+        }
+    };
 
     /// Bootstrap the same durable publication protocol used by background rounds
     /// before any public listener can admit work. No readiness sleep or synthetic
@@ -5826,6 +6097,7 @@ pub fn runFromIterator(
     }
     try data_server.initApiServer();
     local_metadata.data_server = &data_server;
+    defer local_metadata.shutdownCdc();
     if (local_metadata.localFkPublicationSupported() and try local_metadata.nativeOwnerBindingRequiredOnOpen()) {
         var binding_lock = try local_metadata.lockMutation();
         defer binding_lock.deinit();
@@ -7023,6 +7295,11 @@ fn runLocalReplicaRootReconcileHook(
 fn runLocalReplicaRootReconcilePermitHook(ptr: *anyopaque) bool {
     const data_server: *antfly.data.runtime.DataServer = @ptrCast(@alignCast(ptr));
     return !data_server.shouldDeferProvisionedReplicaRootReconcile();
+}
+
+fn freeReplicationSourceStatusesOwned(alloc: std.mem.Allocator, records: []antfly.metadata.table_manager.ReplicationSourceStatusRecord) void {
+    for (records) |record| antfly.metadata.table_manager.freeReplicationSourceStatus(alloc, record);
+    alloc.free(records);
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
@@ -9167,6 +9444,31 @@ test "standalone Lite enforces one shard and one replica" {
     const local = try deriveStandaloneTableRecord(.local, "local", .{ .num_shards = 2 });
     try std.testing.expectEqual(@as(u32, 2), local.min_ranges);
     try std.testing.expectEqual(@as(u32, 1), local.desired_replica_count);
+}
+
+test "standalone cdc accepts Postgres replication sources" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://127.0.0.1:8080", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    const sources = "[{\"type\":\"postgres\",\"dsn\":\"${secret:pg}\",\"postgres_table\":\"public.tickets\"}]";
+    const owned_sources = try alloc.dupe(u8, sources);
+    defer alloc.free(owned_sources);
+    // Standalone runs the CDC coordinators, so a declared source is stored
+    // and its table replicates once the control loop schedules a round.
+    try LocalStandaloneMetadata.createTable(&metadata, alloc, "tickets", .{ .replication_sources_json = owned_sources });
+    const created = metadata.findTableByNameLocked("tickets") orelse return error.TestExpectedTable;
+    try std.testing.expect(std.mem.indexOf(u8, created.replication_sources_json, "public.tickets") != null);
+    // Tables without sources, and an explicit empty list, are unaffected.
+    try LocalStandaloneMetadata.createTable(&metadata, alloc, "plain", .{});
+    const empty_sources = try alloc.dupe(u8, "[]");
+    defer alloc.free(empty_sources);
+    try LocalStandaloneMetadata.createTable(&metadata, alloc, "empty_sources", .{ .replication_sources_json = empty_sources });
 }
 
 test "standalone table storage defaults persist without migrating legacy tables" {
@@ -14157,6 +14459,65 @@ test "runtime lease watchdog publishes active self-fenced proof from exact expir
     try std.testing.expectEqual(@as(u64, 0), proof.authority_remaining_ms);
     try std.testing.expectEqual(@as(u64, 3), proof.observed_lease_transitions);
     try std.testing.expectEqualStrings("primary-a", proof.observed_holder_node_id);
+}
+
+test "standalone cdc status persists in the lifecycle journal and reaches admin snapshots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+
+    const service = LocalStandaloneMetadata.CdcService{ .metadata = &metadata };
+    try service.upsertReplicationSourceStatus(.{
+        .table_id = 77,
+        .source_ordinal = 0,
+        .source_kind = "postgres",
+        .external_table = "users",
+        .slot_name = "antfly_users_slot",
+        .publication_name = "antfly_users_pub",
+        .phase = "streaming",
+        .stream_checkpoint = "0/1C51080",
+    });
+
+    const statuses = try service.listProjectedReplicationSourceStatuses(alloc);
+    defer service.freeProjectedReplicationSourceStatuses(alloc, statuses);
+    try std.testing.expectEqual(@as(usize, 1), statuses.len);
+    try std.testing.expectEqualStrings("streaming", statuses[0].phase);
+    try std.testing.expectEqualStrings("0/1C51080", statuses[0].stream_checkpoint);
+
+    // `sources/managed` and table detail read replication progress from the
+    // admin snapshot; an empty list there is what hid standalone CDC before.
+    var snapshot = try LocalStandaloneMetadata.catalogAdminSnapshot(&metadata);
+    defer LocalStandaloneMetadata.catalogFreeAdminSnapshot(&metadata, &snapshot);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.replication_source_statuses.len);
+    try std.testing.expectEqualStrings("antfly_users_slot", snapshot.replication_source_statuses[0].slot_name);
+}
+
+test "standalone cdc runs only where the process owns the catalog" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+
+    // No data server yet: nothing can apply replicated rows, so no round runs.
+    try std.testing.expect(!metadata.cdcOwned());
+    try metadata.scheduleCdcRound();
+    try std.testing.expect(!metadata.cdc.in_flight.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), metadata.cdc.owner_id);
+
+    // Once shutdown starts, provider checkpoints fail closed.
+    metadata.shutdownCdc();
+    try std.testing.expectError(error.CdcWorkShuttingDown, LocalStandaloneMetadata.cdcPermitCheckpoint(&metadata, .snapshot_step));
 }
 
 test "standalone metadata catalog source provides compact routing" {

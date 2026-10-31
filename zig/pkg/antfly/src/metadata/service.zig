@@ -5543,7 +5543,7 @@ pub fn replicationCutoverRetirementMatches(
         );
 }
 
-fn isExpectedCdcRoundError(err: anyerror) bool {
+pub fn isExpectedCdcRoundError(err: anyerror) bool {
     return switch (err) {
         error.UnknownReplicationSource,
         error.UnsupportedReplicationSource,

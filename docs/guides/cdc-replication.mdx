@@ -151,7 +151,7 @@ curl -s http://127.0.0.1:8080/db/v1/tables/users/documents/user-1 -u "admin:${AN
 
 Every column became a field. Updates flow the same way. Replicated rows go through the normal write path, so any embeddings index on the table embeds them as they land, exactly as a direct write would.
 
-If nothing arrives, the DSN is the first suspect: check that PostgreSQL is reachable from the Antfly metadata node, that `sslmode=require` is set for cloud providers, and that the host is the direct endpoint rather than a pooler.
+If nothing arrives, the DSN is the first suspect: check that PostgreSQL is reachable from the Antfly server (the metadata node in a cluster), that `sslmode=require` is set for cloud providers, and that the host is the direct endpoint rather than a pooler.
 
 ### 5. Shape the Document
 
