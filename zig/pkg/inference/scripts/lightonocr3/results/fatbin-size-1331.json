@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "scope": "Lossless fatbin packaging and focused CUDA regression; not model accuracy, throughput or hosted qualification.",
+  "base_commit": "7947911fddb5572638c46c011326a1ece8a513cd",
+  "nvcc_version": "13.2.86",
+  "compression_mode": "size",
+  "previous_bytes": 58185464,
+  "compressed_bytes": 7942584,
+  "reduction_percent": 86.35,
+  "artifact_sha256": "9b769b75e879feb35f0ac94ab09764b09b00d5dff1a44c7a0d723f87f6cbae46",
+  "regeneration_script_sha256": "a028ea81f61b8974b378039930a5220cde9ce300b5006bdddb86941643c33769",
+  "architecture_images": [
+    "sm_75",
+    "sm_80",
+    "sm_89",
+    "sm_90",
+    "sm_100",
+    "sm_110",
+    "sm_120"
+  ],
+  "ptx_fallback": "compute_75",
+  "validation": {
+    "required_symbols": "passed using cuobjdump --dump-elf-symbols",
+    "architecture_images": "passed using cuobjdump --dump-elf",
+    "regeneration_policy_tests": 5,
+    "cuda_tests": {
+      "optimization": "ReleaseSafe",
+      "hardware": "NVIDIA GB10",
+      "driver_version": "580.178.04",
+      "selected": 41,
+      "passed": 41,
+      "skipped": 0,
+      "note": "Focused recurrent tests plus imported test declarations; no allocator leaks reported.",
+      "binary_sha256": "73f51b41a2342b40a4609d64b1d63c8ab63f707cb270660a8a6f28eb266b68cb",
+      "log_sha256": "562c9d9db599775881e366f0167c46c57c08a69cdcba5ea21593a4e63ed500de"
+    }
+  }
+}

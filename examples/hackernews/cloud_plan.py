@@ -16,10 +16,10 @@
 """Render staged managed HN requests without creating infrastructure or credentials."""
 
 import argparse
-from copy import deepcopy
 import json
-from pathlib import Path, PurePosixPath
 import re
+from copy import deepcopy
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -41,7 +41,7 @@ def management_plan(project, image=None):
     )
     if not match or match[1] != RUNTIME["image"].rsplit("@", 1)[1]:
         raise ValueError(
-            "Supply the published, verified RC.6 multi-platform image digest recorded in runtime.json"
+            "Supply the published, verified RC.7 multi-platform image digest recorded in runtime.json"
         )
 
     def binding(name, bucket, prefix, mode):
@@ -127,6 +127,11 @@ def native_plan(project, archive_auth, current_auth, archive_prefix="archive"):
         "uri": f"gs://{project}-hn-archive/{archive_prefix}",
         "credentials": {"ref": connection(archive_auth)},
     }
+    # Relational indexes share the SQL relation namespace, including across
+    # object tables. The copied schemas must not reserve the same index names.
+    for table, definition in (("hn_archive", archive), ("hn_current", current)):
+        for index in definition["schema"]["relational_indexes"]:
+            index["name"] = table + "_" + index["name"]
     return {
         "archive-table.json": archive,
         "current-table.json": current,

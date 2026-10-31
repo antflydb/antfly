@@ -100,7 +100,9 @@ def test_gateway_uses_server_credential_for_readiness_and_search_and_bounds_rate
         t.start()
     try:
         root = f"http://127.0.0.1:{gateway.server_port}"
-        with urlopen(root + "/readyz") as response:
+        with urlopen(root + "/health") as response:
+            assert json.load(response) == {"ok": True}
+        with urlopen(root + "/ready") as response:
             assert json.load(response) == {"ready": True}
         with urlopen(root + "/readyz") as response:
             assert json.load(response) == {"ready": True}
@@ -156,6 +158,33 @@ def test_redirect_does_not_forward_credentials_or_replay_write():
             )
         assert error.value.code == 302
         assert seen == ["/redirect"]
+    finally:
+        backend.shutdown()
+        backend.server_close()
+        thread.join()
+
+
+def test_managed_client_identifies_itself_and_preserves_explicit_agent():
+    seen = []
+
+    class Backend(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            seen.append(self.headers.get("User-Agent"))
+            self.send_response(200)
+            self.end_headers()
+
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), Backend)
+    thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{backend.server_port}/"
+        for request in (url, Request(url, headers={"User-Agent": "custom-client/2"})):
+            with open_request(request, timeout=2) as response:
+                assert response.status == 200
+        assert seen == ["antfly-hackernews/1", "custom-client/2"]
     finally:
         backend.shutdown()
         backend.server_close()

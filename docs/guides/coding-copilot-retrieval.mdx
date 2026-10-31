@@ -41,19 +41,14 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
 
 ```json
 {
+  "status": "completed",
   "hits": [
     {
       "_id": "internal/config/defaults.go",
+      "_score": 0.283,
       "_source": {
         "path": "internal/config/defaults.go",
-        "body": "package config\n\n// applyDefaults fills unset fields..."
-      }
-    },
-    {
-      "_id": "internal/config/parse.go",
-      "_source": {
-        "path": "internal/config/parse.go",
-        "body": "package config\n\nfunc parseConfig(raw []byte) (*Config, error) {...}"
+        "body": "package config\n\n// applyDefaults fills unset fields...\nfunc applyDefaults(c *Config) {...}"
       }
     }
   ]
@@ -66,7 +61,7 @@ Antfly running in standalone mode with the embedding and reranking models pulled
 
 ```bash
 curl -s http://127.0.0.1:8080/db/v1/status | head -c 200
-antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1 --tasks embed
+antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
 antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
 ```
 
@@ -86,7 +81,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/repo \
         "template": "{{path}} {{body}}",
         "embedder": {
           "provider": "antfly",
-          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
+          "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
         },
         "chunker": {
           "provider": "antfly",
@@ -138,6 +133,8 @@ antfly query --table repo \
   --limit 30
 ```
 
+Both files come back: `parse.go` from the keyword side (it contains `parseConfig`) and `defaults.go` from the semantic side.
+
 Build the keyword side from the literal tokens in the copilot's request (identifiers, error strings, file names) and the semantic side from its description of the task, since each side finds what the other misses.
 
 ### 3. Rerank Against the Task
@@ -159,6 +156,8 @@ antfly query --table repo \
   }' \
   --pruner '{"min_score_ratio": 0.5}'
 ```
+
+Reranked against "where configuration defaults are applied", `defaults.go` scores 0.283 and `parse.go` scores 0.0026, so the pruner keeps only `defaults.go`. That is the point of reranking against the task: a file that matched the symbol but does not serve the task drops out. When the copilot needs the exact symbol's definition regardless, rerank against the symbol instead, or send it as a separate keyword-only query.
 
 ### 4. Fit the Context Budget
 

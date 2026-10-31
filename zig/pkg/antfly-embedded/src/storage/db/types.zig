@@ -15,6 +15,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+/// Shared transient/permanent classification and operator hints for
+/// enrichment and repair failures.
+pub const repair_failure = @import("repair_failure.zig");
 pub const SparseOrdinalSelection = @import("../../sparse/ordinal_lookup.zig").Selection;
 pub const SparseOrdinalWorkBudget = @import("../../sparse/ordinal_lookup.zig").WorkBudget;
 pub const SparseOrdinalKeyFilter = @import("../../sparse/ordinal_lookup.zig").KeyFilter;
@@ -4211,6 +4214,12 @@ pub const ArtifactRepairRunRequest = struct {
     repair_attempt_id: ?u64 = null,
     repair_job_created_at_ms: ?u64 = null,
     repair_cancel_base_uri: ?[]const u8 = null,
+    /// Set only by operator repair entry points (the run endpoint and repair
+    /// jobs). Operator repair retries the selected index's permanently failed
+    /// enrichment documents and backs off transient provider errors within
+    /// the pass. Automatic and structural repair never set it, so they make
+    /// no model calls.
+    operator_initiated: bool = false,
 };
 
 pub const RepairCancelCheck = struct {
@@ -4341,9 +4350,10 @@ pub const ArtifactRepairRunOptions = struct {
     /// Installed by the durable owner after admission. Shadow construction
     /// invokes it only at bounded publication/window boundaries.
     capacity_check: ?RepairCapacityCheck = null,
-    /// Managed operator requests persist/enqueue intent work and return
-    /// immediately. Standalone callers leave this false and advance through
-    /// the same state machine synchronously.
+    /// Managed operator requests persist/enqueue generation and enrichment
+    /// work without running providers under the group-operation guard. Polls
+    /// observe the durable replay outcome. Standalone callers leave this false
+    /// and execute their repair pass synchronously.
     defer_durable_index_repair_execution: bool = false,
 
     pub fn cancelled(self: ArtifactRepairRunOptions) bool {

@@ -36,14 +36,14 @@ pub const AgentDecision = struct {
     /// The question being answered
     question_id: []const u8,
     /// User answer, scalar or structured depending on the question kind
-    answer: ?std.json.Value = null,
+    answer: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// Used for confirm/review steps where the draft may be accepted as-is
     approved: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "question_id", "question_id", false },
-        .{ "answer", "answer", true },
+        .{ "answer", "answer", false },
         .{ "approved", "approved", true },
     };
 
@@ -59,9 +59,16 @@ pub const AgentDecision = struct {
         try jw.beginObject();
         try jw.objectField("question_id");
         try jw.write(self.question_id);
-        if (self.answer) |value| {
-            try jw.objectField("answer");
-            try jw.write(value);
+        switch (self.answer) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("answer");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("answer");
+                try jw.write(value);
+            },
         }
         if (self.approved) |value| {
             try jw.objectField("approved");
@@ -18901,9 +18908,9 @@ pub const FieldStatistics = struct {
     /// Number of rows with null values for this field.
     null_count: ?i64 = null,
     /// Minimum value for numeric/date fields.
-    min_value: ?std.json.Value = null,
+    min_value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// Maximum value for numeric/date fields.
-    max_value: ?std.json.Value = null,
+    max_value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// Average size in bytes for variable-length fields.
     avg_size: ?i64 = null,
 
@@ -18911,8 +18918,8 @@ pub const FieldStatistics = struct {
     pub const openApiFieldMetadata = .{
         .{ "cardinality", "cardinality", true },
         .{ "null_count", "null_count", true },
-        .{ "min_value", "min_value", true },
-        .{ "max_value", "max_value", true },
+        .{ "min_value", "min_value", false },
+        .{ "max_value", "max_value", false },
         .{ "avg_size", "avg_size", true },
     };
 
@@ -18934,13 +18941,27 @@ pub const FieldStatistics = struct {
             try jw.objectField("null_count");
             try jw.write(value);
         }
-        if (self.min_value) |value| {
-            try jw.objectField("min_value");
-            try jw.write(value);
+        switch (self.min_value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("min_value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("min_value");
+                try jw.write(value);
+            },
         }
-        if (self.max_value) |value| {
-            try jw.objectField("max_value");
-            try jw.write(value);
+        switch (self.max_value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max_value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max_value");
+                try jw.write(value);
+            },
         }
         if (self.avg_size) |value| {
             try jw.objectField("avg_size");
@@ -18958,6 +18979,32 @@ pub const FilterSpec = struct {
     operator: []const u8,
     /// Filter value (string, number, boolean, or array for range/in operators)
     value: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "field", "field", false },
+        .{ "operator", "operator", false },
+        .{ "value", "value", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("field");
+        try jw.write(self.field);
+        try jw.objectField("operator");
+        try jw.write(self.operator);
+        try jw.objectField("value");
+        try jw.write(self.value);
+        try jw.endObject();
+    }
 };
 
 /// Configuration for deterministic follow-up suggestions derived from the original query and the standard Antfly follow-up templates.
@@ -24928,7 +24975,7 @@ pub const GraphRelationshipPropertyPredicate = struct {
     field: []const u8,
     op: []const u8,
     /// Non-null scalar comparison value. Omit for is_null and is_not_null.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// Datetime compares RFC3339 instants rather than string ordering.
     value_type: ?[]const u8 = null,
 
@@ -24936,7 +24983,7 @@ pub const GraphRelationshipPropertyPredicate = struct {
     pub const openApiFieldMetadata = .{
         .{ "field", "field", false },
         .{ "op", "op", false },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "value_type", "value_type", true },
     };
 
@@ -24954,9 +25001,16 @@ pub const GraphRelationshipPropertyPredicate = struct {
         try jw.write(self.field);
         try jw.objectField("op");
         try jw.write(self.op);
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.value_type) |value| {
             try jw.objectField("value_type");
@@ -25909,6 +25963,7 @@ pub const GraphWhereExpression = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
+        if (source.object.count() != 1) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
             "and",
         })) {
@@ -26069,7 +26124,7 @@ pub const HierarchyAncestor = struct {
     key: ?[]const u8 = null,
     artifact_name: ?[]const u8 = null,
     source_field: ?[]const u8 = null,
-    provenance: ?std.json.Value = null,
+    provenance: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -26078,7 +26133,7 @@ pub const HierarchyAncestor = struct {
         .{ "key", "key", true },
         .{ "artifact_name", "artifact_name", true },
         .{ "source_field", "source_field", true },
-        .{ "provenance", "provenance", true },
+        .{ "provenance", "provenance", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -26111,9 +26166,16 @@ pub const HierarchyAncestor = struct {
             try jw.objectField("source_field");
             try jw.write(value);
         }
-        if (self.provenance) |value| {
-            try jw.objectField("provenance");
-            try jw.write(value);
+        switch (self.provenance) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("provenance");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("provenance");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -31434,6 +31496,12 @@ pub const InferenceModelInfo = struct {
     model_revision: ?[]const u8 = null,
     /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
     qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Whether this artifact can run in the current build. `incompatible` artifacts are rejected before load; a model whose directory cannot be read is listed as `incompatible` with `error` set.
+    compatibility: ?[]const u8 = null,
+    /// False when this deployment rejects public execution (`public_inference_enabled: false`); the model is installed and listed, but public calls return 403. Omitted when it can be invoked.
+    invocable: ?bool = null,
+    /// Why the model is unusable, set when its directory could not be read. Other models still list.
+    @"error": ?std.json.Value = null,
     /// List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring.
     capabilities: ?[]const []const u8 = null,
     /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
@@ -31446,6 +31514,9 @@ pub const InferenceModelInfo = struct {
         .{ "dense_output", "dense_output", true },
         .{ "model_revision", "model_revision", true },
         .{ "qualified_limits", "qualified_limits", true },
+        .{ "compatibility", "compatibility", true },
+        .{ "invocable", "invocable", true },
+        .{ "error", "error", true },
         .{ "capabilities", "capabilities", true },
         .{ "inputs", "inputs", true },
     };
@@ -31478,6 +31549,18 @@ pub const InferenceModelInfo = struct {
         }
         if (self.qualified_limits) |value| {
             try jw.objectField("qualified_limits");
+            try jw.write(value);
+        }
+        if (self.compatibility) |value| {
+            try jw.objectField("compatibility");
+            try jw.write(value);
+        }
+        if (self.invocable) |value| {
+            try jw.objectField("invocable");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
             try jw.write(value);
         }
         if (self.capabilities) |value| {
@@ -31629,7 +31712,7 @@ pub const InferenceModelKind = enum {
 };
 
 pub const InferenceModelsResponse = struct {
-    /// Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy.
+    /// Whether public inference execution is enabled on this deployment. When false, locally installed models are still listed with `invocable: false` and remote upstreams are not probed. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy.
     public_inference_enabled: ?bool = null,
     /// OpenAI-compatible response object type.
     object: []const u8,
@@ -45308,7 +45391,7 @@ pub const RelationalCheckConstraint = struct {
     column: ?[]const u8 = null,
     op: ?RelationalComparisonOp = null,
     /// Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// String comparison collation; uses the same rules as ordered indexes.
     collation: ?[]const u8 = null,
     expression: ?RelationalScalarExpression = null,
@@ -45318,7 +45401,7 @@ pub const RelationalCheckConstraint = struct {
         .{ "name", "name", false },
         .{ "column", "column", true },
         .{ "op", "op", true },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "collation", "collation", true },
         .{ "expression", "expression", true },
     };
@@ -45343,9 +45426,16 @@ pub const RelationalCheckConstraint = struct {
             try jw.objectField("op");
             try jw.write(value);
         }
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.collation) |value| {
             try jw.objectField("collation");
@@ -46168,7 +46258,7 @@ pub const RelationalIndexPredicate = struct {
     column: []const u8,
     op: RelationalComparisonOp,
     /// Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// String comparison collation with the same semantics as ordered keys.
     collation: ?[]const u8 = null,
 
@@ -46176,7 +46266,7 @@ pub const RelationalIndexPredicate = struct {
     pub const openApiFieldMetadata = .{
         .{ "column", "column", false },
         .{ "op", "op", false },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "collation", "collation", true },
     };
 
@@ -46194,9 +46284,16 @@ pub const RelationalIndexPredicate = struct {
         try jw.write(self.column);
         try jw.objectField("op");
         try jw.write(self.op);
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.collation) |value| {
             try jw.objectField("collation");
@@ -46372,14 +46469,14 @@ pub const RelationalRowCondition = struct {
     column: []const u8,
     op: RelationalComparisonOp,
     /// Typed scalar operand. Omission means NULL. Integer columns also accept exact decimal strings.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     collation: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "column", "column", false },
         .{ "op", "op", false },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "collation", "collation", true },
     };
 
@@ -46397,9 +46494,16 @@ pub const RelationalRowCondition = struct {
         try jw.write(self.column);
         try jw.objectField("op");
         try jw.write(self.op);
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.collation) |value| {
             try jw.objectField("collation");
@@ -46845,6 +46949,20 @@ pub const RepairIssueListRequest = struct {
     }
 };
 
+/// A group of documents whose repair still fails with the same error.
+pub const RepairRemainingFailure = struct {
+    /// Error recorded for the documents, for example `ModelNotFound`.
+    error_code: []const u8,
+    /// Number of documents in this group.
+    count: u64,
+    /// Highest repair attempt count among the group's documents.
+    attempts: u64,
+    /// Whether the error is temporary (admission refusal, rate limit). Repair retries these within a job; running repair again usually succeeds.
+    transient: bool,
+    /// What to do next.
+    hint: []const u8,
+};
+
 /// Bounded request to run a table repair pass.
 pub const RepairRunRequest = struct {
     target: ?RepairTarget = null,
@@ -47285,13 +47403,13 @@ pub const ReplicationTransformOp = struct {
     /// Antfly document field path. Required for `$set`, `$unset`, etc.
     path: ?[]const u8 = null,
     /// Value for the operation. Can be a literal (string, number, boolean) or a `{{column}}` reference to a PG column value. Use `{{col.key}}` to navigate into decoded JSONB columns.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "op", "op", false },
         .{ "path", "path", true },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -47310,9 +47428,16 @@ pub const ReplicationTransformOp = struct {
             try jw.objectField("path");
             try jw.write(value);
         }
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -53702,6 +53827,7 @@ pub const SqlSettingMutationRequest = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
+        if (source.object.count() != 1) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
             "drop",
         })) {
@@ -55067,7 +55193,7 @@ pub const TableRepairJob = struct {
     attempt_id: u64,
     /// Table being repaired.
     table_name: []const u8,
-    /// Lifecycle phase of the repair job.
+    /// Lifecycle phase of the repair job. `completed_with_failures` means every pass ran but some documents still fail; `remaining_failures` says why and what to do, and running repair again retries them. `failed` means the job itself could not run, for example an invalid request or a stale control fence.
     phase: []const u8,
     /// User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
     repair_status: []const u8,
@@ -55098,6 +55224,10 @@ pub const TableRepairJob = struct {
     last_updated_at_millis: u64,
     /// Unix epoch milliseconds when the job is eligible for cleanup.
     expires_at_millis: u64,
+    /// Documents that still fail, grouped by error code with the next step. Present on finished repair jobs that are not controls, read from the current repair issues.
+    remaining_failures: ?[]const RepairRemainingFailure = null,
+    /// Whether more repair issues exist than the summary scanned.
+    remaining_failures_truncated: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -55121,6 +55251,8 @@ pub const TableRepairJob = struct {
         .{ "created_at_millis", "created_at_millis", false },
         .{ "last_updated_at_millis", "last_updated_at_millis", false },
         .{ "expires_at_millis", "expires_at_millis", false },
+        .{ "remaining_failures", "remaining_failures", true },
+        .{ "remaining_failures_truncated", "remaining_failures_truncated", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -55201,6 +55333,14 @@ pub const TableRepairJob = struct {
         try jw.write(self.last_updated_at_millis);
         try jw.objectField("expires_at_millis");
         try jw.write(self.expires_at_millis);
+        if (self.remaining_failures) |value| {
+            try jw.objectField("remaining_failures");
+            try jw.write(value);
+        }
+        if (self.remaining_failures_truncated) |value| {
+            try jw.objectField("remaining_failures_truncated");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -55281,6 +55421,49 @@ pub const TableRepairRunResponse = struct {
     /// Effective repair limit.
     limit: u32,
     result: TableRepairRunResult,
+    /// Documents that still fail after this pass, grouped by error code with the next step. Omitted for control passes.
+    remaining_failures: ?[]const RepairRemainingFailure = null,
+    /// Whether more repair issues exist than the summary scanned.
+    remaining_failures_truncated: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", false },
+        .{ "target", "target", false },
+        .{ "limit", "limit", false },
+        .{ "result", "result", false },
+        .{ "remaining_failures", "remaining_failures", true },
+        .{ "remaining_failures_truncated", "remaining_failures_truncated", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.objectField("target");
+        try jw.write(self.target);
+        try jw.objectField("limit");
+        try jw.write(self.limit);
+        try jw.objectField("result");
+        try jw.write(self.result);
+        if (self.remaining_failures) |value| {
+            try jw.objectField("remaining_failures");
+            try jw.write(value);
+        }
+        if (self.remaining_failures_truncated) |value| {
+            try jw.objectField("remaining_failures_truncated");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Result of one bounded table repair pass.
@@ -57299,7 +57482,7 @@ pub const TransactionStageReadSnapshot = struct {
     table: []const u8,
     key: []const u8,
     version: []const u8,
-    document: ?std.json.Value,
+    document: std.json.Value,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -57494,22 +57677,7 @@ pub const TransformOp = struct {
     /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
     path: []const u8,
     /// Value for operation (not required for $unset). Type depends on the supported operator. `$pull` removes every array element exactly equal to this JSON value; projected graph-edge values identify the relationship by `target`.
-    value: ?std.json.Value = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "op", "op", false },
-        .{ "path", "path", false },
-        .{ "value", "value", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -57517,9 +57685,16 @@ pub const TransformOp = struct {
         try jw.write(self.op);
         try jw.objectField("path");
         try jw.write(self.path);
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }

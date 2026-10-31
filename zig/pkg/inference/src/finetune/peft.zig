@@ -695,13 +695,7 @@ fn validateUniqueTokenIndices(token_indices: []const u32) !void {
 }
 
 fn writeJsonEscaped(writer: *std.Io.Writer, text: []const u8) !void {
-    for (text) |c| {
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            else => try writer.writeByte(c),
-        }
-    }
+    try std.json.Stringify.encodeJsonStringChars(text, .{}, writer);
 }
 
 fn runEvalProgram(allocator: std.mem.Allocator, io: std.Io, program: []const u8) !u8 {
@@ -965,4 +959,17 @@ test "trainable token adapter rejects duplicate token indices" {
         2,
         &deltas,
     ));
+}
+
+test "PEFT JSON escaping round-trips control characters" {
+    const a = std.testing.allocator;
+    const raw = "nul\x00bell\x07esc\x1bnewline\nquote\"slash\\";
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try out.writer.writeByte('"');
+    try writeJsonEscaped(&out.writer, raw);
+    try out.writer.writeByte('"');
+    const parsed = try std.json.parseFromSlice([]const u8, a, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(raw, parsed.value);
 }

@@ -1,13 +1,13 @@
 ---
 title: Local Model Compatibility
-sidebar: concepts
-order: 4
 description: How Antfly decides whether a local model artifact can load, which artifacts are verified, and which are refused
 prerequisites:
   - Antfly installed and running
 difficulty: beginner
 estimatedTime: "5 min"
 tags: [inference, models, embedding, reranking, generation, gguf]
+sidebar: inference
+order: 3
 ---
 
 <Questions>
@@ -33,15 +33,15 @@ Each entry carries a `compatibility` field with one of the three states below.
 
 | Role | Use this | Verified alternates |
 |---|---|---|
+| Text and image embedding (default) | [`google/embeddinggemma-2:bf16-safetensors-bundle-v1`](/docs/guides/models/embeddinggemma2) | `Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1` for a smaller text-only GGUF |
 | Fast text embedding | `BAAI/bge-small-en-v1.5` | `sentence-transformers/all-MiniLM-L6-v2` |
-| Quickstart text retrieval | `Qwen/Qwen3-Embedding-0.6B-GGUF` | Q8_0 bundle; Antfly applies its query instruction |
 | Higher-quality embedding | `BAAI/bge-large-en-v1.5` | `BAAI/bge-base-en-v1.5`, `mixedbread-ai/mxbai-embed-large-v1` |
 | Multilingual dense embedding | `BAAI/bge-m3` | Qualified dense checkpoint; see below |
 | Sparse embedding | `sparse-encoder-testing/splade-bert-tiny-nq-onnx` | |
 | Text reranking | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0` | `mixedbread-ai/mxbai-rerank-base-v1`, `cross-encoder/ms-marco-MiniLM-L6-v2` |
 | Multimodal (text + image + audio) | `antflydb/clipclap` | |
 | Chunking | `fixed_bert` (built in) | `mirth/chonky_mmbert_small_multilingual_1` |
-| Entity, relation, and structured extraction | `antflydb/gliner2-base-v1` | `fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d` (qualified FP32 native/Metal/CUDA profiles) |
+| Entity, relation, and structured extraction | `fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d` (qualified FP32 native/Metal/CUDA profiles) | `antflydb/gliner2-base-v1` |
 | Document reading and OCR | [`lightonai/LightOnOCR-3-0.8B`](/docs/guides/models/lightonocr3) | `lightonai/LightOnOCR-3-4B` for harder pages; `antflydb/Florence-2-base` or `monkt/paddleocr-onnx` for small CPU footprints; [Apple Vision](/docs/guides/providers/apple) on macOS; any vision-capable generator |
 | Transcription | `openai/whisper-tiny` | |
 | Local multimodal generation | `ggml-org/gemma-4-E4B-it-GGUF` | Gemma 3, Llama 3.x, Qwen3 dense GGUFs |
@@ -49,14 +49,22 @@ Each entry carries a `compatibility` field with one of the three states below.
 Pull models by their full `owner/name` reference:
 
 ```bash
+antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
+antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
+antfly inference pull fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d --tasks extract
+antfly inference pull lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671bd8e479c517a004f7566bd9
+antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
+```
+
+Alternates pull the same way:
+
+```bash
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1
 antfly inference pull hf:BAAI/bge-small-en-v1.5 --tasks embed
 antfly inference pull hf:nomic-ai/nomic-embed-text-v1.5 --tasks embed
 antfly inference pull hf:BAAI/bge-m3 --tasks embed
-antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1
-antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
 antfly inference pull antflydb/clipclap:gguf:Q4_K --tasks embed
-antfly inference pull lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671bd8e479c517a004f7566bd9
-antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
+antfly inference pull antflydb/gliner2-base-v1 --tasks extract
 ```
 
 Gemma 4's automatically selected unified projector enables text, image, and audio generation inputs. Pass `--projector none` when only text generation is needed.
