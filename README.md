@@ -191,3 +191,5 @@ runtime, embedded engine, inference, CLI, SDKs, and bindings, is
 [Apache-2.0](LICENSES/Apache-2.0.txt). Third-party components retain their original
 licenses. See [LICENSING.md](LICENSING.md) and
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+<!-- Temporary App approval permission test; never merge. -->
