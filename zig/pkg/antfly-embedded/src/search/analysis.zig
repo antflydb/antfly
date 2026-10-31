@@ -1778,6 +1778,19 @@ pub const Analyzer = struct {
         return .{ .substring = SubstringStream.init(text) };
     }
 
+    /// Original-offset streaming for nonexpanding, token-local pipelines.
+    /// Unsupported character filters and expanding/stateful filters retain the
+    /// authoritative full analyzer. Each returned term lives until next().
+    pub fn sourceStream(self: *const Analyzer, a: Allocator, text: []const u8) ?SourceStream {
+        if (text.len > std.math.maxInt(u32)) return null;
+        if (self.char_filters.len != 0 or (self.tokenizer != .unicode_words and self.tokenizer != .whitespace)) return null;
+        for (self.filters) |filter| switch (filter) {
+            .lowercase, .stop_words, .stemmer, .stop_words_lang, .stemmer_lang, .length, .truncate, .reverse => {},
+            else => return null,
+        };
+        return .{ .analyzer = self.*, .text = text, .arena = .init(@import("../sql/memory_budget.zig").reclaimingAllocator(a)) };
+    }
+
     /// Analyze text into tokens. Caller owns the returned slice and all token terms.
     pub fn analyze(self: *const Analyzer, alloc: Allocator, text: []const u8) ![]Token {
         return self.analyzeControlled(alloc, text, .none);
@@ -1900,6 +1913,69 @@ pub const ControlledAnalyzer = struct {
     }
     pub fn analyzeWithSourceOffsets(self: *const ControlledAnalyzer, alloc: Allocator, text: []const u8) ![]Token {
         return self.analyzer.analyzeWithSourceOffsetsControlled(alloc, text, self.control);
+    }
+};
+
+pub const SourceStream = struct {
+    analyzer: Analyzer,
+    text: []const u8,
+    arena: std.heap.ArenaAllocator,
+    cursor: u32 = 0,
+    position: u32 = 0,
+    checkpoint: usize = 0,
+    control: Control = .none,
+    pub fn deinit(self: *SourceStream) void {
+        self.arena.deinit();
+    }
+    pub fn next(self: *SourceStream) !?Token {
+        try self.control.check();
+        while (self.cursor < self.text.len) {
+            if (!self.arena.reset(.{ .retain_with_limit = 64 * 1024 })) return error.OutOfMemory;
+            const a = self.arena.allocator();
+            const whitespace = self.analyzer.tokenizer == .whitespace;
+            self.cursor = try advanceRun(self.text, self.cursor, whitespace, whitespace, self.control, &self.checkpoint);
+            if (self.cursor >= self.text.len) return null;
+            const start = self.cursor;
+            self.cursor = try advanceRun(self.text, self.cursor, !whitespace, whitespace, self.control, &self.checkpoint);
+            const raw = self.text[start..self.cursor];
+            if (self.analyzer.filters.len == 0 or
+                (self.analyzer.filters.len == 1 and self.analyzer.filters[0] == .lowercase))
+            {
+                var stack: [256]u8 = undefined;
+                var heap: ?[]u8 = null;
+                const normalized = if (self.analyzer.filters.len == 0) raw else try lowercaseScratch(a, raw, &stack, &heap, self.control);
+                // Unchanged terms can borrow immutable source text; normalized
+                // stack bytes need only one token-local copy.
+                const term = if (normalized.ptr == raw.ptr or heap != null) normalized else try a.dupe(u8, normalized);
+                const token: Token = .{ .term = term, .position = self.position, .start_byte = start, .end_byte = self.cursor };
+                self.position = try std.math.add(u32, self.position, 1);
+                return token;
+            }
+            if (self.analyzer.isDefaultEnglishNoCharFilters()) {
+                var stack: [256]u8 = undefined;
+                var heap: ?[]u8 = null;
+                const normalized = try lowercaseScratch(a, raw, &stack, &heap, self.control);
+                if (stopwords_mod.getStopWords(.english).has(normalized)) continue;
+                const owned = try a.dupe(u8, normalized);
+                const term = try porter2StemControlled(a, owned, self.control);
+                const token: Token = .{ .term = term, .position = self.position, .start_byte = start, .end_byte = self.cursor };
+                self.position = try std.math.add(u32, self.position, 1);
+                return token;
+            }
+            var tokens = try a.alloc(Token, 1);
+            tokens[0] = .{ .term = try a.dupe(u8, raw), .position = self.position, .start_byte = start, .end_byte = self.cursor };
+            for (self.analyzer.filters) |filter| {
+                tokens = try filter.applyControlled(a, tokens, self.control);
+                if (tokens.len == 0) break;
+            }
+            if (tokens.len == 0) continue;
+            std.debug.assert(tokens.len == 1);
+            var token = tokens[0];
+            token.position = self.position;
+            self.position = try std.math.add(u32, self.position, 1);
+            return token;
+        }
+        return null;
     }
 };
 
@@ -2806,4 +2882,42 @@ test "highlight byte checkpoints amortize short token runs across one scan" {
         try std.testing.expectEqual(@as(usize, 1024), words.len);
         try std.testing.expect(count.calls <= 3);
     }
+}
+
+test "highlight source token streams match original offsets filters and allocation faults" {
+    const Check = struct {
+        fn run(a: Allocator) !void {
+            const custom: Analyzer = .{ .tokenizer = .whitespace, .filters = &.{ .lowercase, .{ .length = .{ .min = 2, .max = 64 } }, .{ .truncate = .{ .max_len = 5 } }, .reverse } };
+            const text = "The RUNNING foxes café München needle a q the NEEDLES!";
+            for ([_]*const Analyzer{ &simple_analyzer, &default_analyzer, &german_analyzer, &custom }) |analyzer| {
+                var reference = std.heap.ArenaAllocator.init(a);
+                defer reference.deinit();
+                const expected = try analyzer.analyzeWithSourceOffsets(reference.allocator(), text);
+                var stream = analyzer.sourceStream(a, text).?;
+                defer stream.deinit();
+                for (expected) |token| {
+                    const actual = (try stream.next()).?;
+                    try std.testing.expectEqualStrings(token.term, actual.term);
+                    try std.testing.expectEqual(token.position, actual.position);
+                    try std.testing.expectEqual(token.start_byte, actual.start_byte);
+                    try std.testing.expectEqual(token.end_byte, actual.end_byte);
+                }
+                try std.testing.expect(try stream.next() == null);
+            }
+        }
+    };
+    try Check.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try std.testing.expect(html_analyzer.sourceStream(std.testing.allocator, "<p>x</p>") == null);
+    try std.testing.expect(substring_analyzer.sourceStream(std.testing.allocator, "word") == null);
+    const Cancel = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    var marker: u8 = 0;
+    var stream = simple_analyzer.sourceStream(std.testing.allocator, "words").?;
+    defer stream.deinit();
+    stream.control = .{ .ptr = &marker, .check_fn = Cancel.check };
+    try std.testing.expectError(error.Canceled, stream.next());
 }

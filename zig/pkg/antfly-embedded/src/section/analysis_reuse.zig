@@ -65,6 +65,10 @@ pub const Cache = struct {
         if (!result.found_existing) result.value_ptr.* = .{};
         result.value_ptr.remaining += 1;
     }
+    pub fn repeated(self: *const Cache, key: Key) bool {
+        const entry = self.entries.get(key) orelse return false;
+        return entry.remaining > 1 or entry.tokens != null;
+    }
     pub fn acquire(self: *Cache, key: Key, analyzer: *const analysis.Analyzer, offsets: bool) !?Lease {
         const entry = self.entries.getPtr(key) orelse return null;
         if (entry.remaining == 1 and entry.tokens == null) return null;

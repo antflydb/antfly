@@ -116,8 +116,24 @@ fn dictionary(a: A, sink: *Sink, base: usize, pending: *std.ArrayList(u8), count
 /// Input tokens are borrowed from the indexing analysis. Only an index link
 /// per occurrence and one group per distinct term are added; term bytes are
 /// not copied. Compressed output goes straight into the private build run.
+/// Borrowed replayable tokens. A source can be a token slice or a compact
+/// seekable build spool; the encoder never requires an owning Token array.
+pub const TokenSlice = struct {
+    tokens: []const analysis.Token,
+    count: usize,
+    pub fn init(tokens: []const analysis.Token) TokenSlice {
+        return .{ .tokens = tokens, .count = tokens.len };
+    }
+    pub fn at(self: TokenSlice, index: usize) !analysis.Token {
+        if (index >= self.count) return error.InvalidData;
+        return self.tokens[index];
+    }
+};
 pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
-    const count = std.math.cast(u32, tokens.len) orelse return error.InvalidData;
+    return writeInput(a, sink, TokenSlice.init(tokens));
+}
+pub fn writeInput(a: A, sink: *Sink, input: anytype) !Encoded {
+    const count = std.math.cast(u32, input.count) orelse return error.InvalidData;
     const base = sink.len();
     try sink.appendNTimes(0, header_size);
     const Group = struct { term: []const u8, first: u32, last: u32, count: u32 = 1 };
@@ -125,14 +141,19 @@ pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
     defer groups.deinit(a);
     var by_term: std.StringHashMapUnmanaged(u32) = .empty;
     defer by_term.deinit(a);
-    const next = try a.alloc(u32, tokens.len);
+    const next = try a.alloc(u32, input.count);
     defer a.free(next);
     @memset(next, std.math.maxInt(u32));
     var ordered = true;
     var disjoint = true;
-    for (tokens, 0..) |token, i| {
-        if (i != 0 and (token.start_byte < tokens[i - 1].start_byte or (token.start_byte == tokens[i - 1].start_byte and token.end_byte > tokens[i - 1].end_byte))) ordered = false;
-        if (i != 0 and token.start_byte <= tokens[i - 1].end_byte) disjoint = false;
+    var previous_input: ?analysis.Token = null;
+    for (0..input.count) |i| {
+        const token = try input.at(i);
+        if (previous_input) |prior| {
+            if (token.start_byte < prior.start_byte or (token.start_byte == prior.start_byte and token.end_byte > prior.end_byte)) ordered = false;
+            if (token.start_byte <= prior.end_byte) disjoint = false;
+        }
+        previous_input = token;
         if (token.start_byte > token.end_byte) return error.InvalidData;
         const entry = try by_term.getOrPut(a, token.term);
         if (!entry.found_existing) {
@@ -178,7 +199,7 @@ pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
         var minimum_gap: u32 = std.math.maxInt(u32);
         var through_end: u32 = 0;
         var regular = true;
-        const first_token = tokens[group.first];
+        const first_token = try input.at(group.first);
         var stride: ?u32 = null;
         while (remaining != 0) {
             const n = @min(remaining, block_tokens);
@@ -187,7 +208,7 @@ pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
             var block_start: u32 = std.math.maxInt(u32);
             var block_gap: u32 = std.math.maxInt(u32);
             for (0..n) |_| {
-                const token = tokens[at];
+                const token = try input.at(at);
                 through_end = @max(through_end, token.end_byte);
                 if (prior) |previous_token| {
                     const step = token.start_byte -| previous_token.start_byte;
@@ -244,13 +265,14 @@ pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
         var begin: usize = 0;
         var through: u32 = 0;
         var previous_source: ?analysis.Token = null;
-        while (begin < tokens.len) {
-            const end = @min(tokens.len, begin + block_tokens);
+        while (begin < input.count) {
+            const end = @min(input.count, begin + block_tokens);
             raw.clearRetainingCapacity();
             var start: i64 = 0;
             var minimum_start: u32 = std.math.maxInt(u32);
             var minimum_gap: u32 = std.math.maxInt(u32);
-            for (tokens[begin..end], next[begin..end]) |token, ordinal| {
+            for (next[begin..end], begin..end) |ordinal, index| {
+                const token = try input.at(index);
                 if (previous_source) |prior| {
                     minimum_start = @min(minimum_start, token.start_byte -| prior.start_byte);
                     minimum_gap = @min(minimum_gap, token.start_byte -| prior.end_byte);

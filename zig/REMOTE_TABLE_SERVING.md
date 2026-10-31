@@ -2779,3 +2779,43 @@ caches and uncontrolled host activity; they establish no optimized-build,
 cloud, archive-scale or peak-RSS gain. The final runtime passes 404 shared native
 checks, 183 API checks and all 50 real Parquet/Iceberg E2E cases. Main
 `f91c9c0e4682a3ff20e39fce9a44d67b658a7b55` is included in both server binaries.
+
+
+### Quota-governed payload residency and streamed source capture
+
+Refundable, registered SQL payload-cache owners now size their payload, root,
+owner and frequency metadata allowances from live statement/host headroom.
+The prior 16-MiB, 1,024-root and 4,096-owner defaults no longer stop a healthy
+registered cache from using its admitted share. Payload and metadata allocations
+still pass through the same authoritative byte admission, and required work can
+reclaim idle optional owners. Half-headroom targeting leaves room for required
+operators and sibling readers. Unknown or monotonic allocators keep the small
+conservative fallback; explicit ceilings remain available for qualification.
+The count-min admission sketch scales with resident roots and is refunded with
+the cache. This trades spare admitted memory for fewer physical payload reads;
+it does not raise the statement or host memory limit.
+
+Large, singly bound source fields can stream nonexpanding token-local analysis
+into postings while capturing original spans in compact replay storage. Each
+16-byte record stores an interned term ID, byte bounds and position. The compact
+prefix uses at most an eighth of recognized initial headroom, capped at 4 MiB
+(256 KiB for an unknown owner), before moving once to an admitted private run.
+Backing capacity, distinct-term interning, occurrence links and run read buffers
+remain charged to the build owner. This removes the owning per-occurrence Token
+array and duplicate term strings; it does not make indexing constant-memory.
+
+The replay source and ordinary token slices instantiate the same native offset
+encoder. Persisted dictionary, occurrence and source-order lanes are unchanged.
+Character filters, expanding/stateful filters and unsupported tokenizers retain
+the authoritative materialized analyzer. Repeated physical bindings retain their
+existing document-local shared analysis, rather than analyzing each alias again.
+Small fields retain the ordinary path. The retained streaming path prioritizes
+bounded build memory: CPU can be slightly higher, especially for English
+stemming, so its kernel measurements are reported separately from publication.
+Runtime ABI 82 fences the changed cache state; reader protocol 97 is unchanged.
+
+Native probes have supported build targets, including all generated product and
+platform dependencies. `zig build lake-native-bench-build -Doptimize=fast` builds
+all three probes without referring to disposable cache-generated files. See the
+[benchmark instructions](bench/lake/README.md#quota-governed-residency-and-streamed-capture)
+for controls, exact timer boundaries and measured tradeoffs.

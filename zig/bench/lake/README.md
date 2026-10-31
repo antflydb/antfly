@@ -2964,3 +2964,51 @@ skips or leaks. Apache boundary, license headers, formatting and whitespace
 checks pass. Runtime ABI 81, reader protocol 97 and persisted formats are
 unchanged. Real-provider retention, peak RSS, cold storage, archive scale,
 optimized builds and a full WASM bundle remain unqualified here.
+
+
+## Quota-governed residency and streamed capture
+
+Build the native probes through the supported product graph (from `zig/`):
+
+```sh
+ZIG_GLOBAL_CACHE_DIR=.zig-cache/global ~/bin/zig build lake-native-bench-build -Doptimize=fast
+```
+
+This regenerates options, SDK metadata and dependencies after `make gc`; no
+ignored build snapshot or generated source path is required. The individual
+`lake-typed-merge-bench-build`, `lake-spill-residency-bench-build` and
+`lake-source-capture-bench-build` steps install their corresponding executables
+in `zig-out/bin`. Steps without `-build` run the probes. Historical observations
+above preserve their original commands; these targets supersede their manual
+cache-path build recipes for current-source reproduction.
+
+Run comparisons only after task-owned builds, tests and cleanup finish. Alternate
+both variants at least three times; keep other host activity and OS caches
+explicitly uncontrolled. The fixed-cap control uses the same candidate binary,
+not an old runtime, and isolates the former byte/root policy:
+
+```sh
+ANTFLY_MERGE_ROWS=65536 ANTFLY_MERGE_WORKSPACE=4194304 ANTFLY_MERGE_QUOTA=268435456 \
+  ANTFLY_LEGACY_RESIDENCY_CAPS=1 zig-out/bin/lake-spill-residency-bench
+ANTFLY_MERGE_ROWS=65536 ANTFLY_MERGE_WORKSPACE=4194304 ANTFLY_MERGE_QUOTA=268435456 \
+  zig-out/bin/lake-spill-residency-bench
+ANTFLY_CAPTURE_REPEATS=65536 ANTFLY_MATERIALIZED_CAPTURE=1 \
+  zig-out/bin/lake-source-capture-bench
+ANTFLY_CAPTURE_REPEATS=65536 zig-out/bin/lake-source-capture-bench
+```
+
+Set `ANTFLY_CAPTURE_ENGLISH=1` for English stemming; otherwise the capture probe
+uses the simple analyzer. Both variants must match every token's term, position
+and original byte-span digest, and the complete encoded offset SHA-256. Capture
+timing includes analysis, callback validation, encoding and temporary teardown;
+input creation, process startup, encoded-output verification and final Capture
+teardown are excluded. Tracked peak includes the complete capture operation,
+including its retained result, but excludes the immutable input. The callback
+hash represents a consumer, not complete postings construction or publication.
+
+The residency probe checks every sorted key, row ordinal, primitive value,
+SQL NULL and tagged string under identical quotas for none/Snappy compression.
+`CAPACITY` times the full leased drain with its value oracles; `TYPED_MERGE` times
+add, finish, drain and sort teardown. Manager construction and process startup
+are excluded. Payload-read counts and physical read bytes are distinct counters.
+These kernel comparisons make no HTTP, cloud, empty-cache or archive-scale claim.

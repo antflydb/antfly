@@ -3963,33 +3963,44 @@ const PayloadCache = struct {
     // LRU victim. Ties keep resident roots, making cyclic scans scan-resistant.
     // The sketch is charged with cache metadata and retired with the last root.
     const Frequency = struct {
-        counters: [4][1024]u8 = @splat(@splat(0)),
+        counters: []u8,
+        width: usize,
         samples: usize = 0,
-        sample_limit: usize = 10240,
+        sample_limit: usize,
+        fn create(a: Allocator, entries: usize) !*Frequency {
+            const width = std.math.ceilPowerOfTwo(usize, @max(1024, entries *| 2)) catch return error.OutOfMemory;
+            const self = try a.create(Frequency);
+            errdefer a.destroy(self);
+            self.* = .{ .counters = try a.alloc(u8, std.math.mul(usize, width, 4) catch return error.OutOfMemory), .width = width, .sample_limit = @max(64, entries *| 10) };
+            @memset(self.counters, 0);
+            return self;
+        }
+        fn deinit(self: *Frequency, a: Allocator) void {
+            a.free(self.counters);
+            a.destroy(self);
+        }
         fn hash(offset: u64) u64 {
             return std.hash.Wyhash.hash(0, std.mem.asBytes(&offset));
         }
         fn record(self: *@This(), offset: u64) void {
             if (self.samples == self.sample_limit) {
-                for (&self.counters) |*lane| {
-                    for (lane) |*count| count.* >>= 1;
-                }
+                for (self.counters) |*count| count.* >>= 1;
                 self.samples /= 2;
             }
             self.samples += 1;
             var bits = hash(offset);
-            for (&self.counters) |*lane| {
-                const count = &lane[@as(usize, @intCast(bits & 1023))];
+            for (0..4) |lane| {
+                const count = &self.counters[lane * self.width + @as(usize, @intCast(bits & (self.width - 1)))];
                 count.* = @min(15, count.* + 1);
-                bits >>= 10;
+                bits = std.math.rotr(u64, bits, @as(u6, @intCast(@ctz(self.width))));
             }
         }
         fn estimate(self: *const @This(), offset: u64) u8 {
             var value: u8 = 15;
             var bits = hash(offset);
-            for (&self.counters) |lane| {
-                value = @min(value, lane[@as(usize, @intCast(bits & 1023))]);
-                bits >>= 10;
+            for (0..4) |lane| {
+                value = @min(value, self.counters[lane * self.width + @as(usize, @intCast(bits & (self.width - 1)))]);
+                bits = std.math.rotr(u64, bits, @as(u6, @intCast(@ctz(self.width))));
             }
             return value;
         }
@@ -4006,8 +4017,10 @@ const PayloadCache = struct {
     newest: ?*Entry = null,
     bytes: usize = 0,
     metadata_bytes: usize = 0,
-    max_bytes: usize = 16 * 1024 * 1024,
-    max_entries: usize = 1024,
+    // Recognized refundable owners bound residency by live byte admission.
+    // Explicit caps remain useful for controls; opaque owners stay conservative.
+    max_bytes: usize = std.math.maxInt(usize),
+    max_entries: usize = std.math.maxInt(usize),
     reserve: usize = 0,
     denied: bool = false,
     accesses: usize = 0,
@@ -4071,10 +4084,18 @@ const PayloadCache = struct {
         return @min(self.max_bytes, (available +| owned) / 2 -| self.reserve);
     }
     fn modeThreshold(self: *const PayloadCache) usize {
-        return @max(16, self.entries.count() * 2);
+        return @max(16, self.entries.count() *| 2);
+    }
+    fn entryLimit(self: *const PayloadCache, bytes: usize) usize {
+        // Metadata is admitted and charged separately. This count bound scales
+        // with the same byte allowance and stops pathological tiny roots.
+        return @min(self.max_entries, if (self.registered) @max(4, bytes / 256) else @as(usize, 4));
+    }
+    fn ownerLimit(self: *const PayloadCache) usize {
+        return if (self.registered) @max(4096, self.target() / 128) else 4096;
     }
     fn clearFrequency(self: *PayloadCache) void {
-        if (self.frequency) |frequency| self.allocator().destroy(frequency);
+        if (self.frequency) |frequency| frequency.deinit(self.allocator());
         self.frequency = null;
         self.consecutive_misses = 0;
         self.consecutive_hits = 0;
@@ -4102,7 +4123,7 @@ const PayloadCache = struct {
             owner.references += 1;
             return;
         }
-        if (self.owners.count() >= 4096) return error.SqlPayloadCacheFull;
+        if (self.owners.count() >= self.ownerLimit()) return error.SqlPayloadCacheFull;
         const own_bytes = block.ownRetainedBytes();
         const previous = self.addresses.get(offset);
         try self.owners.put(self.allocator(), block, .{ .block = block, .bytes = own_bytes, .next_same = previous });
@@ -4263,7 +4284,7 @@ const PayloadCache = struct {
         if (self.frequency) |frequency| frequency.record(offset);
         const block = if (self.entries.get(offset)) |entry| entry.block else self.addresses.get(offset) orelse {
             self.consecutive_hits = 0;
-            self.consecutive_misses = @min(2048, self.consecutive_misses + 1);
+            self.consecutive_misses = @min(self.modeThreshold(), self.consecutive_misses +| 1);
             if (self.accesses % 64 == 0) {
                 self.refresh();
                 self.trim();
@@ -4296,8 +4317,8 @@ const PayloadCache = struct {
         self.reserve = reserve;
         self.denied = false;
         if (self.max_entries == 0 or self.max_bytes == 0) return;
-        const limit = @min(self.max_entries, if (self.registered) @as(usize, 1024) else @as(usize, 4));
         const target_bytes = self.target();
+        const limit = self.entryLimit(target_bytes);
         // A full cache alone is not evidence of thrashing: fitting phases
         // routinely replace each other. Require a miss run longer than twice
         // residency before enabling frequency admission, and leave it again
@@ -4307,11 +4328,10 @@ const PayloadCache = struct {
             (self.entries.count() >= limit or block.retainedBytes() > target_bytes -| (self.bytes +| self.metadata_bytes)))
         {
             if (self.frequency == null) {
-                const frequency = self.allocator().create(Frequency) catch |err| {
+                const frequency = Frequency.create(self.allocator(), self.entries.count()) catch |err| {
                     if (err == error.OutOfMemory and self.denied) return;
                     return err;
                 };
-                frequency.* = .{ .sample_limit = @max(64, self.entries.count() * 10) };
                 var entries = self.entries.keyIterator();
                 while (entries.next()) |offset| frequency.record(offset.*);
                 frequency.record(block.physical_offset.?);
@@ -4326,7 +4346,7 @@ const PayloadCache = struct {
         // refresh in get instead of walking every retained owner on every row.
         self.refresh();
         self.trim();
-        while (self.entries.count() >= @min(self.max_entries, if (self.registered) @as(usize, 1024) else @as(usize, 4))) _ = self.evictLocked();
+        while (self.entries.count() >= self.entryLimit(self.target())) _ = self.evictLocked();
         self.adopt(block) catch |err| {
             // Optional descriptor admission can decline without poisoning the
             // required row. Genuine allocator and integrity failures propagate.
@@ -10430,4 +10450,47 @@ test "SQL typed spill merge gathers primitive dictionaries preserves SQL null an
     try std.testing.expect(try C.gatherPhysical(no_allocations.allocator(), &.{&decimal}, &.{0}) == null);
     try std.testing.expect(try C.gatherPhysical(no_allocations.allocator(), &.{ &text, &integer }, &.{ 0, 0 }) == null);
     try std.testing.expectError(error.InvalidSqlSpill, C.gatherPhysical(a, &.{&integer}, &.{3}));
+}
+
+test "SQL adaptive payload cache grows beyond legacy ceilings and refunds required pressure" {
+    const a = std.testing.allocator;
+    var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 128 << 20 };
+    defer std.debug.assert(budget.live == 0);
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = Check.call, .async_writes = false };
+    defer manager.deinit();
+    var pages = try JoinPayloads.init(&manager);
+    defer pages.close();
+    const body = try a.alloc(u8, 16 * 1024);
+    defer a.free(body);
+    @memset(body, 'x');
+    var offsets_: [1100]u64 = undefined;
+    for (&offsets_, 0..) |*offset, i| {
+        std.mem.writeInt(u64, body[0..8], i, .little);
+        const cells = [_]Datum{Datum.json(.{ .string = body })};
+        offset.* = try pages.appendBatch(.{ .rows = &.{&cells} });
+    }
+    try pages.file.seal();
+    var reader = PayloadReader.init(&pages);
+    defer reader.deinit();
+    for (offsets_, 0..) |offset, i| {
+        const payload = try reader.read(.{ .offset = offset, .index = 0 });
+        defer payload.release();
+        try std.testing.expectEqual(i, std.mem.readInt(u64, (try payload.block.cell(0, 0)).value.string[0..8], .little));
+    }
+    try std.testing.expect(reader.cache.entries.count() > 1024);
+    try std.testing.expect(reader.cache.bytes > 16 << 20);
+    const reads = reader.reads;
+    for (offsets_, 0..) |_, i| {
+        const payload = try reader.read(.{ .offset = offsets_[offsets_.len - 1 - i], .index = 0 });
+        payload.release();
+    }
+    try std.testing.expectEqual(reads, reader.reads);
+    const required = try budget.allocator().alloc(u8, 120 << 20);
+    defer budget.allocator().free(required);
+    try std.testing.expect(reader.cache.entries.count() < offsets_.len);
+    try std.testing.expect(budget.live <= budget.limit);
 }

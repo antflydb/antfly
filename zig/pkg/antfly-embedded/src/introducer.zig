@@ -1883,16 +1883,34 @@ fn addSingleTextFieldToBuilders(
     const analyzer = try cachedFieldAnalyzer(alloc, analyzer_cache, field, default_analyzer, text_analysis);
     const analyzer_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     const capture = try source_capture.wants(doc_idx, field.source_field orelse field.field_name, field.text, source_root, analyzer);
+    var streaming = if (capture != null and field.text.len >= SourceCapture.stream_min_bytes and !reuse.repeated(.{ .field = field.source_field orelse field.field_name, .text = field.text, .signature = capture.?.signature })) analyzer.sourceStream(alloc, field.text) else null;
+    defer if (streaming) |*stream| stream.deinit();
     const producer = if (capture == null and field.text.len >= 128) analyzer.tokenStream(field.text) else null;
     var shared: ?AnalysisReuse.Lease = null;
-    if (producer == null and reuse.entries.count() != 0) shared = try reuse.acquire(.{ .field = field.source_field orelse field.field_name, .text = field.text, .signature = try source_capture.signatureFor(analyzer) }, analyzer, capture != null);
+    if (streaming == null and producer == null and reuse.entries.count() != 0) shared = try reuse.acquire(.{ .field = field.source_field orelse field.field_name, .text = field.text, .signature = try source_capture.signatureFor(analyzer) }, analyzer, capture != null);
     defer if (shared) |held| held.release();
     var field_acc = FieldAcc.init(alloc);
     defer field_acc.deinit();
     // Compiled contributions contain positions, but not original source spans.
     // Source capture and document-local token leases must finish before this
     // optional cross-document acceleration can replace analysis.
-    if (capture == null and shared == null and try accumulateCachedContribution(doc_alloc, &field_acc, analyzer, field.text, profile, contribution_cache, repeatedContribution(contribution_uses, field, analyzer))) {
+    if (streaming) |*stream| {
+        const Consumer = struct {
+            a: Allocator,
+            field: *FieldAcc,
+            fn accept(raw: *anyopaque, token: analysis_mod.Token) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try accumulateToken(self.a, self.field, token, 0, true);
+            }
+        };
+        var consumer: Consumer = .{ .a = doc_alloc, .field = &field_acc };
+        const count = try source_capture.recordStream(capture.?, stream, .{ .ptr = &consumer, .accept = Consumer.accept });
+        field_acc.token_offset = count;
+        if (profile) |p| {
+            p.token_count +|= count;
+            if (profile_timings) p.analyzer_ns +|= platform_time.monotonicNs() - analyzer_start_ns;
+        }
+    } else if (capture == null and shared == null and try accumulateCachedContribution(doc_alloc, &field_acc, analyzer, field.text, profile, contribution_cache, repeatedContribution(contribution_uses, field, analyzer))) {
         // The cached term contribution already has exact norms and positions.
     } else if (producer) |stream| {
         const started = if (profile_timings) platform_time.monotonicNs() else 0;
@@ -1994,6 +2012,39 @@ fn accumulateTokenStream(a: Allocator, field: *FieldAcc, input: analysis_mod.Tok
 fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, timings: bool, source_capture: *SourceCapture, doc: u32, source_field: []const u8, source_root: ?std.json.Value, reuse: *AnalysisReuse, contribution_cache: ?*AnalyzedContributionCache, known_reuse: bool) !void {
     const analysis_started = if (timings) platform_time.monotonicNs() else 0;
     const capture = try source_capture.wants(doc, source_field, text, source_root, analyzer);
+    var streaming = if (capture != null and text.len >= SourceCapture.stream_min_bytes and !reuse.repeated(.{ .field = source_field, .text = text, .signature = capture.?.signature })) analyzer.sourceStream(scratch, text) else null;
+    defer if (streaming) |*stream| stream.deinit();
+    if (streaming) |*stream| {
+        const Consumer = struct {
+            a: Allocator,
+            scratch: Allocator,
+            fields: *std.StringHashMapUnmanaged(FieldAcc),
+            name: []const u8,
+            field: ?*FieldAcc = null,
+            base: u32 = 0,
+            fn accept(raw: *anyopaque, token: analysis_mod.Token) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.field == null) {
+                    const slot = try self.fields.getOrPut(self.a, self.name);
+                    if (!slot.found_existing) {
+                        slot.key_ptr.* = self.name;
+                        slot.value_ptr.* = .init(self.scratch);
+                    }
+                    self.field = slot.value_ptr;
+                    self.base = slot.value_ptr.token_offset;
+                }
+                try accumulateToken(self.a, self.field.?, token, self.base, true);
+            }
+        };
+        var consumer: Consumer = .{ .a = a, .scratch = scratch, .fields = fields, .name = name };
+        const count = try source_capture.recordStream(capture.?, stream, .{ .ptr = &consumer, .accept = Consumer.accept });
+        if (consumer.field) |field| field.token_offset = try std.math.add(u32, consumer.base, count);
+        if (profile) |p| {
+            p.token_count +|= count;
+            if (timings) p.analyzer_ns +|= platform_time.monotonicNs() - analysis_started;
+        }
+        return;
+    }
     const producer = if (capture == null and text.len >= 128) analyzer.tokenStream(text) else null;
     const shared = if (producer == null and reuse.entries.count() != 0) try reuse.acquire(.{ .field = source_field, .text = text, .signature = try source_capture.signatureFor(analyzer) }, analyzer, capture != null) else null;
     defer if (shared) |held| held.release();
@@ -5522,4 +5573,56 @@ test "highlight indexing capture follows sorted output ordinals rather than inpu
         } else return error.MissingSourceTerm;
         try std.testing.expectEqual(offset, found.start_byte);
     }
+}
+
+test "highlight streaming indexing preserves native postings source positions and field norms" {
+    const a = std.testing.allocator;
+    const pattern = "Running dogs café ";
+    const repeats = 8192;
+    const text = try a.alloc(u8, pattern.len * repeats);
+    defer a.free(text);
+    for (0..repeats) |i| @memcpy(text[i * pattern.len ..][0..pattern.len], pattern);
+    var source: std.json.ObjectMap = .empty;
+    defer source.deinit(a);
+    try source.put(a, "body", .{ .string = text });
+    var reference = std.heap.ArenaAllocator.init(a);
+    defer reference.deinit();
+    const expected = try analysis_mod.default_analyzer.analyzeWithSourceOffsets(reference.allocator(), text);
+    const fields = [_]TextField{
+        .{ .field_name = "body", .source_field = "body", .text = text },
+        .{ .field_name = "tail", .source_field = "tail", .text = "extra" },
+    };
+    for ([_]bool{ false, true }) |disk| for ([_]usize{ 1, 2 }) |field_count| {
+        var profile: BuildTextProfile = .{};
+        const bytes = try buildSegmentFromTextWithAnalysisOptions(a, &.{.{
+            .id = "row",
+            .stored_data = "{}",
+            .stored_source = .{ .object = source },
+            .text_fields = fields[0..field_count],
+        }}, &analysis_mod.default_analyzer, .{}, .{ .store_source_columns = true, .profile = &profile, .postings_run_io = if (disk) std.testing.io else null });
+        defer a.free(bytes);
+        try std.testing.expectEqual(expected.len + field_count - 1, profile.token_count);
+        try std.testing.expectEqual(@as(u64, 1), profile.source_vectors_captured);
+        var reader = try segment_mod.SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        const column = @import("section/source_column.zig");
+        var cursor = column.Cursor.init((try reader.storedColumnScoped(a, "body")).?);
+        defer cursor.deinit();
+        const stored = (try cursor.text(0)).?;
+        const tokens = (try stored.tokens(a, try column.fingerprint(a, &analysis_mod.default_analyzer), .none)).?;
+        defer tokens.deinit();
+        try std.testing.expectEqual(expected.len, tokens.items.len);
+        for (expected, tokens.items) |left, right| {
+            try std.testing.expectEqualStrings(left.term, right.term);
+            try std.testing.expectEqual(left.position, right.position);
+            try std.testing.expectEqual(left.start_byte, right.start_byte);
+            try std.testing.expectEqual(left.end_byte, right.end_byte);
+        }
+        var writer = try index_mod.IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegment(bytes);
+        const result = try writer.snapshot().search(a, "body", &.{"run"}, 10);
+        defer a.free(result.hits);
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    };
 }

@@ -77,7 +77,22 @@ pub const Capture = struct {
         };
         return .{ .key = key, .signature = signature, .text_bytes = text.len };
     }
+    pub const stream_min_bytes = 64 * 1024;
+    pub const TokenConsumer = struct { ptr: *anyopaque, accept: *const fn (*anyopaque, analysis.Token) anyerror!void };
+    pub fn recordStream(self: *Capture, request: Request, stream: *analysis.SourceStream, consumer: TokenConsumer) !u32 {
+        var spool = @import("source_token_spool.zig").Spool.init(self.a, self.io, self.directory, self.resources);
+        defer spool.deinit();
+        while (try stream.next()) |token| {
+            try consumer.accept(consumer.ptr, token);
+            try spool.append(token);
+        }
+        try self.recordInput(request, try spool.input(), null);
+        return @intCast(spool.count);
+    }
     pub fn record(self: *Capture, request: Request, tokens: []const analysis.Token) !void {
+        return self.recordInput(request, offsets.TokenSlice.init(tokens), tokens);
+    }
+    fn recordInput(self: *Capture, request: Request, input: anytype, tokens: ?[]const analysis.Token) !void {
         var scratch = std.heap.ArenaAllocator.init(@import("../sql/memory_budget.zig").reclaimingAllocator(self.a));
         defer scratch.deinit();
         const sa = scratch.allocator();
@@ -90,9 +105,9 @@ pub const Capture = struct {
                 used +|= variant.bytes +| 52;
             };
             const allowance = request.text_bytes * 2 -| used;
-            if (allowance <= 52 or !try column.smallOffsetMetadataFits(sa, tokens, allowance - 52)) return;
+            if (allowance <= 52 or !try column.smallOffsetMetadataFits(sa, tokens orelse return error.InvalidArgument, allowance - 52)) return;
             var output = staged.sink();
-            const encoded = try offsets.write(sa, &output, tokens);
+            const encoded = try offsets.writeInput(sa, &output, input);
             if (encoded.bytes > allowance - 52) return;
             small = encoded;
         }
@@ -104,7 +119,7 @@ pub const Capture = struct {
         }
         var sink = if (self.spool) |run| run.sink() else self.memory.sink();
         const begin = sink.len();
-        const encoded = if (small) |value| value else try offsets.write(sa, &sink, tokens);
+        const encoded = if (small) |value| value else try offsets.writeInput(sa, &sink, input);
         if (small != null) try sink.appendSlice(staged.out.items);
         if (self.spool) |run| try run.seal(begin);
         const slot = try self.entries.getOrPut(self.a, request.key);
@@ -196,4 +211,47 @@ test "highlight small offset admission rejects diverse metadata before spilling 
     const repeated = try analysis.simple_analyzer.analyzeWithSourceOffsets(arena.allocator(), body.items);
     try capture.record(useful, repeated);
     try std.testing.expectEqual(@as(usize, 1), (try capture.variants(1, "body")).items.len);
+}
+
+test "highlight streaming capture matches the materialized codec and refunds faults" {
+    const Check = struct {
+        fn consume(_: *anyopaque, _: analysis.Token) !void {}
+        fn run(a: A, disk: bool) !void {
+            const text = try a.alloc(u8, 8192);
+            defer a.free(text);
+            @memset(text, '.');
+            var at: usize = 0;
+            for (0..100) |i| {
+                const word = try std.fmt.bufPrint(text[at..], "Needle{d:0>3} café running ", .{i});
+                at += word.len;
+            }
+            const analyzer = &analysis.simple_analyzer;
+            const request: Capture.Request = .{ .key = .{ .doc = 0, .field = "body" }, .signature = try column.fingerprint(a, analyzer), .text_bytes = text.len };
+            var legacy = Capture.init(a, true, if (disk) std.testing.io else null, ".", null);
+            defer legacy.deinit();
+            var streamed = Capture.init(a, true, if (disk) std.testing.io else null, ".", null);
+            defer streamed.deinit();
+            var reference = std.heap.ArenaAllocator.init(a);
+            defer reference.deinit();
+            const tokens = try analyzer.analyzeWithSourceOffsets(reference.allocator(), text);
+            try legacy.record(request, tokens);
+            var stream = analyzer.sourceStream(a, text).?;
+            defer stream.deinit();
+            var marker: u8 = 0;
+            try std.testing.expectEqual(tokens.len, try streamed.recordStream(request, &stream, .{ .ptr = &marker, .accept = consume }));
+            const left = try legacy.variants(0, "body");
+            const right = try streamed.variants(0, "body");
+            try std.testing.expectEqual(left.items[0].bytes, right.items[0].bytes);
+            const before = try a.alloc(u8, left.items[0].bytes);
+            defer a.free(before);
+            const after = try a.alloc(u8, right.items[0].bytes);
+            defer a.free(after);
+            try left.view.readInto(left.items[0].offset, before);
+            try right.view.readInto(right.items[0].offset, after);
+            try std.testing.expectEqualSlices(u8, before, after);
+        }
+    };
+    try Check.run(std.testing.allocator, false);
+    try Check.run(std.testing.allocator, true);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{false});
 }
