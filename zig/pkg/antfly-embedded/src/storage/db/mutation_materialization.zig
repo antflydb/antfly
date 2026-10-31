@@ -4884,19 +4884,32 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (manifest.value != .object) return;
                     const route = manifest.value.object.get("route_type") orelse return;
                     if (route != .string or route.string.len == 0) return;
-                    if (try enrichment_runtime_mod.documentExtractionEmptyCoverageIsTerminalFailure(ctx.alloc, raw)) return;
-                    // Partial OCR may retain valid older units. A non-empty
-                    // artifact is not sufficient to settle a terminal repair.
-                    if (manifest.value.object.get("ocr_failed_count")) |count| {
-                        if (count != .integer or count.integer != 0) return;
-                    }
-                    if (manifest.value.object.get("ocr_failed_page_numbers")) |pages| {
-                        if (pages != .array or pages.array.items.len != 0) return;
-                    }
                     if (manifest.value.object.get("merge_plan") orelse manifest.value.object.get("merge")) |merge| {
                         if (merge != .object) return;
                         const state = merge.object.get("status") orelse return;
-                        if (state != .string or !std.mem.eql(u8, state.string, "converged")) return;
+                        if (state != .string or !std.mem.eql(u8, state.string, "converged")) {
+                            if (state == .string and std.mem.eql(u8, state.string, "failed"))
+                                try noteFailedArtifactRepairPublicationContext(ctx, issue, artifact_key_hex, published_sequence);
+                            return;
+                        }
+                    }
+                    if (try enrichment_runtime_mod.documentExtractionEmptyCoverageIsTerminalFailure(ctx.alloc, raw)) {
+                        try noteFailedArtifactRepairPublicationContext(ctx, issue, artifact_key_hex, published_sequence);
+                        return;
+                    }
+                    // Partial OCR may retain valid older units. A non-empty
+                    // artifact is not sufficient to settle a terminal repair.
+                    if (manifest.value.object.get("ocr_failed_count")) |count| {
+                        if (count != .integer or count.integer != 0) {
+                            try noteFailedArtifactRepairPublicationContext(ctx, issue, artifact_key_hex, published_sequence);
+                            return;
+                        }
+                    }
+                    if (manifest.value.object.get("ocr_failed_page_numbers")) |pages| {
+                        if (pages != .array or pages.array.items.len != 0) {
+                            try noteFailedArtifactRepairPublicationContext(ctx, issue, artifact_key_hex, published_sequence);
+                            return;
+                        }
                     }
                 }
             }
@@ -4964,6 +4977,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             borrowed_write_count = writes.items.len;
             try appendArtifactRepairSummaryDirtyForStore(ctx.alloc, ctx.store, &writes, &deletes, &owned_delete_keys);
             try ctx.store.putBatch(writes.items, deletes.items);
+        }
+
+        /// Requires artifact_repair_issue_mutex. Preserve the diagnosis and
+        /// success fence; this only tells a queued operator attempt that its
+        /// publication finished with failures rather than still awaiting apply.
+        fn noteFailedArtifactRepairPublicationContext(
+            ctx: *const AsyncContext,
+            issue: types.ArtifactRepairIssue,
+            artifact_key_hex: []const u8,
+            published_sequence: u64,
+        ) !void {
+            if (issue.reason != .enrichment_failed) return;
+            const key = try internal_keys.artifactRepairCompletionKeyAlloc(ctx.alloc, @tagName(issue.artifact_kind), artifact_key_hex);
+            defer ctx.alloc.free(key);
+            var completion = (try loadArtifactRepairCompletionStateFromStore(ctx.alloc, ctx.store, key)) orelse ArtifactRepairCompletionState{ .pending_issues = 1 };
+            if (completion.failed_sequence >= published_sequence) return;
+            completion.failed_sequence = published_sequence;
+            var encoded: [artifact_repair_completion_state_len]u8 = undefined;
+            encodeArtifactRepairCompletionState(&encoded, completion);
+            try ctx.store.put(key, &encoded);
         }
 
         pub fn clearPublishedEmbeddingArtifactRepairIssuesContext(
@@ -8318,6 +8351,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             std.mem.writeInt(u64, out[16..24], state.pending_issues, .little);
             std.mem.writeInt(u64, out[24..32], state.queued_sequence, .little);
             std.mem.writeInt(u64, out[32..40], state.queued_job_id, .little);
+            std.mem.writeInt(u64, out[40..48], state.failed_sequence, .little);
         }
 
         pub fn encodeArtifactRepairIssueValueAlloc(alloc: Allocator, issue: types.ArtifactRepairIssue) ![]u8 {
@@ -9310,13 +9344,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // This fence is an optimization, never authoritative repair debt. Treat a
             // malformed value as absent so metadata corruption cannot wedge repair;
             // the next issue transition overwrites or deletes it atomically.
-            if (raw.len != 24 and raw.len != artifact_repair_completion_state_len) return null;
+            if (raw.len != 24 and raw.len != 40 and raw.len != artifact_repair_completion_state_len) return null;
             return .{
                 .epoch = std.mem.readInt(u64, raw[0..8], .little),
                 .completed_sequence = std.mem.readInt(u64, raw[8..16], .little),
                 .pending_issues = std.mem.readInt(u64, raw[16..24], .little),
                 .queued_sequence = if (raw.len >= 40) std.mem.readInt(u64, raw[24..32], .little) else 0,
                 .queued_job_id = if (raw.len >= 40) std.mem.readInt(u64, raw[32..40], .little) else 0,
+                .failed_sequence = if (raw.len >= 48) std.mem.readInt(u64, raw[40..48], .little) else 0,
             };
         }
 

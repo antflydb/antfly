@@ -2155,6 +2155,9 @@ pub const ArtifactRepairCompletionState = struct {
     /// the managed request's group-operation guard. Survives owner restart.
     queued_sequence: u64 = 0,
     queued_job_id: u64 = 0,
+    /// A terminally unhealthy artifact reached index publication. In
+    /// particular, partial OCR can publish chunks without failing replay.
+    failed_sequence: u64 = 0,
 };
 
 pub const ManagedIndexBatchApplicability = enum {
