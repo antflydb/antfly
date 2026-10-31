@@ -245,7 +245,7 @@ export class R2CoordinatorStore {
       }
       const plannedObservation=async(state,coordinate)=>{
         if(!this.readContinuations||!this.observationPlanSupported||this.rootBackend!=="bounded_journal"||!captured||!snapshotProof||typeof background!=="function"||!this.proofBudget)return null;
-        const acquisition=this.proofBudget.acquire(this.namespace);
+        const acquisition=this.proofBudget.acquire(this.namespace,{concurrent:true});
         try{proofPermit=await beforeProofDeadline(acquisition.ready,deadlineMs,monotonicDeadline,this.clock);}catch(error){acquisition.cancel();throw error;}
         let result;
         try{

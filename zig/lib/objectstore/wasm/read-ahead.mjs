@@ -32,27 +32,27 @@ export class ReadAheadBudget {
  constructor(maxInFlight=4,{reserveQueued}={}){
   if(!Number.isInteger(maxInFlight)||maxInFlight<1||maxInFlight>4)throw Error('InvalidReadAheadBudget');
   this.limit=maxInFlight;this.active=0;this.bytes=0;this.peakBytes=0;this.started=0;
-  this.activeKeys=new Set();this.pending=[];this.lastKey=null;this.reserveQueued=reserveQueued;
+  this.activeKeys=new Map();this.pending=[];this.lastKey=null;this.reserveQueued=reserveQueued;
  }
- tryAcquire(key=Symbol('unkeyed proof')){
-  if(this.active>=this.limit||this.activeKeys.has(key))return null;
-  this.active++;this.bytes+=proofPrefetchBytes;this.peakBytes=Math.max(this.peakBytes,this.bytes);this.activeKeys.add(key);this.lastKey=key;
+ tryAcquire(key=Symbol('unkeyed proof'),{concurrent=false}={}){
+  if(this.active>=this.limit||(!concurrent&&this.activeKeys.has(key))||this.activeKeys.get(key)===-1)return null;
+  this.active++;this.bytes+=proofPrefetchBytes;this.peakBytes=Math.max(this.peakBytes,this.bytes);this.activeKeys.set(key,concurrent?(this.activeKeys.get(key)??0)+1:-1);this.lastKey=key;
   let held=true,started=false;
-  const release=()=>{if(held){held=false;this.active--;this.bytes-=proofPrefetchBytes;this.activeKeys.delete(key);this.drain();}};
+  const release=()=>{if(held){held=false;this.active--;this.bytes-=proofPrefetchBytes;const count=this.activeKeys.get(key);if(count===-1||count===1)this.activeKeys.delete(key);else this.activeKeys.set(key,count-1);this.drain();}};
   release.start=()=>{if(held&&!started){started=true;this.started++;}};
   return release;
  }
- acquire(key){
+ acquire(key,{concurrent=false}={}){
   if(typeof key!=='string'||key.length===0||key.length>4096)throw Error('InvalidReadAheadKey');
   this.drain();
-  const immediate=this.tryAcquire(key);
+  const immediate=this.pending.some(waiter=>waiter.key===key&&!waiter.concurrent)?null:this.tryAcquire(key,{concurrent});
   if(immediate)return{ready:Promise.resolve(immediate),cancel:immediate};
   if(this.pending.length>=32)return{ready:Promise.reject(Error('ReadAheadCapacityExceeded')),cancel(){}};
   const queueRelease=this.reserveQueued?.();
   if(this.reserveQueued&&!queueRelease)return{ready:Promise.reject(Error('ReadAheadCapacityExceeded')),cancel(){}};
   let waiter,release,stopped=false;
   const ready=new Promise((resolve,reject)=>{
-   waiter={key,reject,queueRelease,admit:value=>{release=value;if(stopped)value();else resolve(value);}};
+   waiter={key,concurrent,reject,queueRelease,admit:value=>{release=value;if(stopped)value();else resolve(value);}};
    this.pending.push(waiter);this.drain();
   });
   return{ready,cancel:()=>{
@@ -64,11 +64,11 @@ export class ReadAheadBudget {
  }
  drain(){
   while(this.active<this.limit){
-   const eligible=waiter=>!this.activeKeys.has(waiter.key);
-   let index=this.pending.findIndex(waiter=>eligible(waiter)&&waiter.key!==this.lastKey);
+   const eligible=(waiter,index)=>waiter.concurrent?this.activeKeys.get(waiter.key)!==-1&&!this.pending.slice(0,index).some(prior=>prior.key===waiter.key&&!prior.concurrent):!this.activeKeys.has(waiter.key);
+   let index=this.pending.findIndex((waiter,index)=>eligible(waiter,index)&&waiter.key!==this.lastKey);
    if(index<0)index=this.pending.findIndex(eligible);
    if(index<0)return;
-   const waiter=this.pending.splice(index,1)[0];waiter.queueRelease?.();const release=this.tryAcquire(waiter.key);
+   const waiter=this.pending.splice(index,1)[0];waiter.queueRelease?.();const release=this.tryAcquire(waiter.key,{concurrent:waiter.concurrent});
    // Resolving admission never starts another caller's storage work here.
    waiter.admit(release);
   }
