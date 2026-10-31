@@ -72,6 +72,7 @@ def _exercise_lake_writer(call, secret, tmp_path, admin):
         "/tables/" + table,
         {
             "storage": {"engine": "object"},
+            "indexes": {"body_text": {"type": "full_text", "store_source": True}},
             "schema": {
                 "storage_mode": "relational",
                 "default_type": "row",
@@ -147,6 +148,36 @@ def _exercise_lake_writer(call, secret, tmp_path, admin):
     status, accepted = call("POST", f"/tables/{table}/lake/changes", changes, writer)
     assert status == 202, accepted
     assert accepted["state"] == "accepted" and accepted["wal_lsn"] > 0
+    # The scoped writer can consume its receipt without catalog-admin authority.
+    # This freshly initialized table can still be building its first index;
+    # tolerate only that readiness response, never auth errors or HTTP 500.
+    deadline = time.monotonic() + 60
+    while True:
+        status, visible = call(
+            "POST",
+            f"/tables/{table}/query",
+            {
+                "full_text_search": {"match_all": {}},
+                "filter_query": {"term": {"path": "/id", "value": 7}},
+                "read_requirements": {
+                    "visibility": "accepted",
+                    "after_write": accepted["read_receipt"],
+                    "wait_ms": 1000,
+                },
+            },
+            writer,
+        )
+        if status == 200:
+            break
+        assert (
+            status == 503
+            and json.loads(visible)["code"] == "index_rebuilding"
+            and time.monotonic() < deadline
+        ), visible
+        time.sleep(0.1)
+    assert [hit["_source"] for hit in visible["responses"][0]["hits"]["hits"]] == [
+        {"id": 7, "body": "writer fixture"}
+    ], visible
     deleted = dict(
         changes,
         batch_id="writer-delete",
