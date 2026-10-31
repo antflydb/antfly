@@ -374,9 +374,8 @@ func openExistingLite(path, inferenceURL string) (*embedded.DB, error) {
 
 // requireInferenceProvider fails fast with a clear message when the
 // configured antfly inference server is not reachable, or when the
-// configured extraction model is not servable (e.g. GLiNER2.5 is gated off
-// pending a production qualification row -- see extractSmokeInput's doc
-// comment). Without this check, ingest would silently accumulate enrichment
+// configured extraction model is not servable (for example, it isn't pulled,
+// or its artifact is incompatible with this build). Without this check, ingest would silently accumulate enrichment
 // debt with no producer able to satisfy it, or fail deep inside RunUntilIdle
 // with a much less clear error.
 func requireInferenceProvider(db *embedded.DB, inferenceURL, extractModel string) error {
@@ -432,11 +431,8 @@ func probeInferenceHealth(inferenceURL string) error {
 
 // extractSmokeInput is a one-sentence input used to smoke-test whether a
 // model can actually serve /ai/v1/extract before ingest commits to it.
-// fastino/gliner2.5-base-v1 pulls successfully but is intentionally gated off
-// for serving until a production qualification row lands
-// (zig/pkg/inference/src/models/gliner_boundary_qualification.zig); probing
-// here surfaces that as a clear preflight failure instead of a confusing
-// failure deep inside RunUntilIdle.
+// Probing surfaces a missing or unservable model as a clear preflight failure
+// instead of a confusing failure deep inside RunUntilIdle.
 const extractSmokeInput = "Raft handles leader election and log replication between nodes."
 
 // probeExtractor issues a minimal POST to the inference server's
