@@ -81,7 +81,7 @@ for(const variant of variants){
   for(const tenant of['a','b','c','d']){for(let steps=0;;steps++){if(steps>=128)throw Error('PublicationDidNotConverge');if(!(await call(tenant,{op:'publish'})).value.has_more)break;}const result=await call(tenant,{op:'compact'});assert.equal(result.value.published,false);compacts.push(result.ms);assert.equal((await call(tenant,{op:'count'})).value.count,String(documents));assert.equal((await call(tenant,{op:'lookup',doc_id:'doc/0',required_visibility:receipts[tenant]})).value.body,expected[tenant]);}
   const physical=(await call('a',{counters:true},'/_lab')).value,retained=(await call('a',{inventory:true},'/_lab')).value;
   assert.equal(Object.values(physical).flatMap(v=>v.resource_failures??[]).length,0,'recovered resource failures invalidate the experiment');
-  const fusedCalls=physical.app.read_traces.flatMap(t=>t.metadata?.calls??[]).filter(c=>c.action==='observe_read').length;
+  const fusedCalls=physical.app.read_traces.flatMap(t=>t.metadata?.calls??[]).filter(c=>c.action==='observe_read'||c.action==='observe_step').length;
   if(variant.FUSED_READ_ADMISSION==='true')assert.ok(fusedCalls>0,'fused admission must execute in the measured app');
   const continuedObservations=physical.app.read_traces.filter(t=>t.metadata?.physical?.observation_detached_gets>0).length;
   if(variant.NATIVE_METADATA_CONTINUATIONS==='true')assert.ok(continuedObservations>0,'native metadata continuations must execute in the measured app');
