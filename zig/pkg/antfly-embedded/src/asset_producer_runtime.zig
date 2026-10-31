@@ -2592,6 +2592,7 @@ pub const Runtime = struct {
             else
                 return error.BatchIncompatible;
             defer transcribing.deinitResponse(alloc, &result);
+            try transcribing.requireComplete(result);
 
             // Diarized transcripts keep their speaker turns in the text
             // form too (`SPEAKER_00: ...` lines); JSON carries them as fields.
@@ -3611,6 +3612,7 @@ pub const Runtime = struct {
             else
                 return error.UnsupportedTranscriberProvider;
             defer transcribing.deinitResponse(alloc, &result);
+            try transcribing.requireComplete(result);
 
             if (isJsonContentType(request.content_type)) {
                 return try std.json.Stringify.valueAlloc(alloc, result, .{});
@@ -3699,6 +3701,7 @@ pub const Runtime = struct {
             return err;
         };
         defer transcribing.deinitResponse(alloc, &result);
+        try transcribing.requireComplete(result);
 
         if (isJsonContentType(request.content_type)) {
             return try std.json.Stringify.valueAlloc(alloc, result, .{});

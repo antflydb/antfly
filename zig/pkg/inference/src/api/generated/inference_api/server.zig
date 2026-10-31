@@ -93,11 +93,6 @@ pub fn parseRewriteTextBody(allocator: std.mem.Allocator, body: []const u8) !std
     return std.json.parseFromSlice(types.RewriteRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Parse the JSON request body for transcribeAudio.
-pub fn parseTranscribeAudioBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TranscribeRequest) {
-    return std.json.parseFromSlice(types.TranscribeRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
 /// Parse the JSON request body for createTranscriptionSession.
 pub fn parseCreateTranscriptionSessionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TranscriptionSessionRequest) {
     return std.json.parseFromSlice(types.TranscriptionSessionRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -177,7 +172,6 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/read/execute", .operation_id = "executeReadDocumentRemote", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/rerank", .operation_id = "rerankDocuments", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/rewrite", .operation_id = "rewriteText", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/transcribe", .operation_id = "transcribeAudio", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/transcription/sessions", .operation_id = "createTranscriptionSession", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/transcription/sessions/{session_id}", .operation_id = "getTranscriptionSession", .request_body = .none, .streaming_response = false },
     .{ .method = "DELETE", .path = "/transcription/sessions/{session_id}", .operation_id = "deleteTranscriptionSession", .request_body = .none, .streaming_response = false },
@@ -220,7 +214,6 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "executeReadDocumentRemote")) @compileError("ServerRouter: Impl missing required method 'executeReadDocumentRemote'");
         if (!@hasDecl(Impl, "rerankDocuments")) @compileError("ServerRouter: Impl missing required method 'rerankDocuments'");
         if (!@hasDecl(Impl, "rewriteText")) @compileError("ServerRouter: Impl missing required method 'rewriteText'");
-        if (!@hasDecl(Impl, "transcribeAudio")) @compileError("ServerRouter: Impl missing required method 'transcribeAudio'");
         if (!@hasDecl(Impl, "createTranscriptionSession")) @compileError("ServerRouter: Impl missing required method 'createTranscriptionSession'");
         if (!@hasDecl(Impl, "getTranscriptionSession")) @compileError("ServerRouter: Impl missing required method 'getTranscriptionSession'");
         if (!@hasDecl(Impl, "deleteTranscriptionSession")) @compileError("ServerRouter: Impl missing required method 'deleteTranscriptionSession'");
@@ -261,7 +254,6 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/read/execute", httpx.Handler.bind(self.impl, executeReadDocumentRemote));
             try server.post("/rerank", httpx.Handler.bind(self.impl, rerankDocuments));
             try server.post("/rewrite", httpx.Handler.bind(self.impl, rewriteText));
-            try server.post("/transcribe", httpx.Handler.bind(self.impl, transcribeAudio));
             try server.post("/transcription/sessions", httpx.Handler.bind(self.impl, createTranscriptionSession));
             try server.get("/transcription/sessions/:session_id", httpx.Handler.bind(self.impl, getTranscriptionSession));
             try server.delete("/transcription/sessions/:session_id", httpx.Handler.bind(self.impl, deleteTranscriptionSession));
@@ -409,12 +401,6 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.rewriteText(ctx);
         }
 
-        /// Transcribe audio to text (speech-to-text)
-        /// POST /transcribe
-        fn transcribeAudio(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.transcribeAudio(ctx);
-        }
-
         /// Open a streaming transcription session
         /// POST /transcription/sessions
         fn createTranscriptionSession(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -488,7 +474,6 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn executeReadDocumentRemote(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn rerankDocuments(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn rewriteText(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn transcribeAudio(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createTranscriptionSession(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getTranscriptionSession(self: *Impl, ctx: *httpx.Context, session_id: []const u8) !httpx.Response
 //   fn deleteTranscriptionSession(self: *Impl, ctx: *httpx.Context, session_id: []const u8) !httpx.Response

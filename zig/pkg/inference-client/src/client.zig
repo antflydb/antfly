@@ -42,25 +42,24 @@ pub const DenseEmbeddings = struct {
 /// Raw generated client -- exposes every inference API operation.
 pub const RawClient = api.client.Client;
 
-/// One transcription result. `object()` is the first (and only) transcript
-/// object; `segments` carries its timestamped phrases when the server
-/// produced them.
-pub const Transcription = struct {
-    parsed: std.json.Parsed(api.TranscribeResponse),
+/// One audio reading. `audio()` returns the optional temporal evidence;
+/// `text()` returns the transcript without interpretation or cleanup.
+pub const Reading = struct {
+    parsed: std.json.Parsed(api.ReadResponse),
 
-    pub fn object(self: *const Transcription) api.TranscribeObject {
+    pub fn object(self: *const Reading) api.ReadObject {
         return self.parsed.value.data[0];
     }
 
-    pub fn text(self: *const Transcription) []const u8 {
+    pub fn text(self: *const Reading) []const u8 {
         return self.object().text;
     }
 
-    pub fn segments(self: *const Transcription) []const api.DictationSegment {
-        return self.object().segments orelse &.{};
+    pub fn audio(self: *const Reading) ?api.AudioReadMetadata {
+        return self.object().audio;
     }
 
-    pub fn deinit(self: *Transcription) void {
+    pub fn deinit(self: *Reading) void {
         self.parsed.deinit();
     }
 };
@@ -118,14 +117,14 @@ pub const Client = struct {
     /// WAV, MP3, M4A, MP4, Ogg, WebM, FLAC) and return the transcript with
     /// timestamped segments. Clips longer than one Whisper window are
     /// transcribed in windows cut at pauses by the server.
-    pub fn transcribe(self: *Client, model: []const u8, audio: []const u8, language: ?[]const u8) !Transcription {
+    pub fn readAudio(self: *Client, model: []const u8, audio: []const u8, options: api.AudioReadOptions) !Reading {
         const encoded = try self.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(audio.len));
         defer self.allocator.free(encoded);
         _ = std.base64.standard.Encoder.encode(encoded, audio);
-        var resp = try self.raw.transcribeAudio(.{
+        var resp = try self.raw.readImages(.{
             .model = model,
             .audio = encoded,
-            .language = language,
+            .audio_options = options,
         });
         defer resp.deinit();
 
@@ -187,11 +186,11 @@ test "client module compiles" {
     // how transcribe came to read a field the response does not have.
     _ = &Client.embedDense;
     _ = &denseFromJson;
-    _ = &Client.transcribe;
+    _ = &Client.readAudio;
     _ = &Client.listModels;
     _ = &DenseEmbeddings.deinit;
-    _ = &Transcription.text;
-    _ = &Transcription.segments;
+    _ = &Reading.text;
+    _ = &Reading.audio;
 }
 
 fn checkDenseFromJsonAllocationFailures(allocator: std.mem.Allocator) !void {
@@ -315,22 +314,22 @@ fn runEmbedDense(allocator: std.mem.Allocator, io: std.Io, server: *httpx.TestSe
     return result orelse error.NoEmbeddings;
 }
 
-test "transcribe returns the transcript and owns it after the response is freed" {
+test "audio read returns the transcript and owns it after the response is freed" {
     const allocator = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
     const body =
-        "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0," ++
-        "\"text\":\"hello there\",\"language\":\"en\",\"duration_ms\":900," ++
-        "\"segments\":[{\"text\":\"hello there\",\"start_ms\":0,\"end_ms\":900,\"words\":[]," ++
-        "\"speaker\":\"SPEAKER_00\"}],\"speakers\":[\"SPEAKER_00\"]}]," ++
+        "{\"object\":\"list\",\"data\":[{\"object\":\"read\",\"index\":0," ++
+        "\"text\":\"hello there\",\"audio\":{\"language\":\"en\",\"duration_ms\":900," ++
+        "\"segments\":[{\"text\":\"hello there\",\"start_ms\":0,\"end_ms\":900,\"text_start\":0,\"text_end\":11," ++
+        "\"speaker\":\"SPEAKER_00\"}],\"speakers\":[\"SPEAKER_00\"]}}]," ++
         "\"model\":\"openai/whisper-tiny\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2,\"total_tokens\":2}}";
 
     var server = try httpx.TestServer.start(allocator, io, &.{.{
         .method = .POST,
-        .path = "/transcribe",
+        .path = "/read",
         .respond = .{ .body = body },
     }});
     defer server.deinit();
@@ -339,15 +338,15 @@ test "transcribe returns the transcript and owns it after the response is freed"
     var http = httpx.Client.initWithConfig(allocator, io, .{ .keep_alive = false });
     defer http.deinit();
 
-    var result: ?Transcription = null;
+    var result: ?Reading = null;
     defer if (result) |*value| value.deinit();
     var run_err: ?anyerror = null;
     var group = std.Io.Group.init;
     const Fiber = struct {
-        fn run(a: std.mem.Allocator, h: *httpx.Client, url: []const u8, out: *?Transcription, err_out: *?anyerror) std.Io.Cancelable!void {
+        fn run(a: std.mem.Allocator, h: *httpx.Client, url: []const u8, out: *?Reading, err_out: *?anyerror) std.Io.Cancelable!void {
             var client = Client.init(a, h, url);
             defer client.deinit();
-            out.* = client.transcribe("openai/whisper-tiny", "fake audio", null) catch |err| {
+            out.* = client.readAudio("openai/whisper-tiny", "fake audio", .{ .timestamps = true }) catch |err| {
                 err_out.* = err;
                 return;
             };
@@ -362,7 +361,7 @@ test "transcribe returns the transcript and owns it after the response is freed"
     // been freed, which is the whole point of taking ownership of it.
     const transcription = &result.?;
     try std.testing.expectEqualStrings("hello there", transcription.text());
-    const segments = transcription.segments();
+    const segments = transcription.audio().?.segments.?;
     try std.testing.expectEqual(@as(usize, 1), segments.len);
     try std.testing.expectEqualStrings("SPEAKER_00", segments[0].speaker.?);
 }

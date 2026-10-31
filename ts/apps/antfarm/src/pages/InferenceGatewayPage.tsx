@@ -35,7 +35,6 @@ const samples: Record<InferenceGatewayOperation, Record<string, unknown>> = {
   read: { images: [{ url: "data:image/png;base64,..." }] },
   extract: { schema_version: 2, input: ["Ada works at Antfly"], tasks: [] },
   rewrite: { inputs: ["Please rewrite this sentence."] },
-  transcribe: { audio: "<base64 audio>" },
   dictate: { audio: "<base64 audio>" },
   synthesize: { text: "Hello from Antfly", format: "mp3" },
   predict: { input: [[1, 2]] },
@@ -77,7 +76,7 @@ const taskOperation: Record<string, InferenceGatewayOperation> = {
   read: "read",
   extract: "extract",
   rewrite: "rewrite",
-  transcribe: "transcribe",
+  transcribe: "read",
   synthesize: "synthesize",
   predict: "predict",
 };
@@ -88,8 +87,9 @@ function sampleRequest(
 ): string {
   // Streaming requires affirmative gateway support; unknown includes manually
   // entered IDs and catalog entries without capability metadata.
-  const sample =
-    operation === "chat/completions"
+  const sample = operation === "read" && (model?.task === "transcribe" || model?.id.startsWith("transcribers/"))
+    ? { audio: "<base64 audio>", audio_options: {} }
+    : operation === "chat/completions"
       ? { ...samples[operation], stream: model?.gateway_capabilities?.streaming === "supported" }
       : samples[operation];
   return JSON.stringify(sample, null, 2);

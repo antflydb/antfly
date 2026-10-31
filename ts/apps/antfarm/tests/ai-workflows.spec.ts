@@ -623,7 +623,7 @@ test.describe("AI workflow routes", () => {
         },
       });
     });
-    await page.route("**/ai/v1/transcribe", async (route) => {
+    await page.route("**/ai/v1/read", async (route) => {
       const body = route.request().postDataJSON();
       transcribedAudio.push(body.audio);
       await route.fulfill({

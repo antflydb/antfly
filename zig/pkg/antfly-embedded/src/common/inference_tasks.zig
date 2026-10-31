@@ -392,9 +392,41 @@ pub const Executor = struct {
         });
     }
 
-    pub fn read(self: Executor, a: std.mem.Allocator, name: []const u8, request: readers.Request) !readers.BatchResult {
+    pub fn read(self: Executor, a: std.mem.Allocator, name: []const u8, supplied: readers.Request) !readers.BatchResult {
         try self.context.check();
-        var cfg = try (self.view.readers orelse return error.ModelNotFound).getConfig(name);
+        const target = try self.view.resolve(.read, name, &.{});
+        var request = supplied;
+        if (target == .configured and target.configured.task == .transcribe) {
+            const asr = try self.view.transcribers.?.getConfig(target.configured.name);
+            const defaults = transcribing.requestDefaults(asr);
+            var options = request.audio_options orelse @import("inference_api").AudioReadOptions{};
+            options.language = options.language orelse defaults.language;
+            options.timestamps = options.timestamps orelse defaults.timestamps;
+            options.diarization = options.diarization orelse defaults.diarization;
+            if ((asr.provider == .vertex or asr.provider == .apple) and options.language == null) options.language = "en-US";
+            request.audio_options = options;
+            try transcribing.validateReadOptions(asr, options);
+            if (asr.provider != .antfly) {
+                if (request.images.len != 0 or request.documents.len != 0) return error.UnsupportedAudioReadCapability;
+                if (request.prompt != null or request.max_tokens != null) return error.UnsupportedAudioReadCapability;
+                const audio_url = try readers.audioSourceUrl(a, request.audio orelse return error.InvalidInferenceRequest);
+                var result = self.transcribe(a, target.configured.name, .{
+                    .url = audio_url,
+                    .language = options.language,
+                    .timestamps = (options.timestamps orelse false) or (options.diarization orelse false),
+                    .diarization = options.diarization orelse false,
+                }) catch |err| switch (err) {
+                    error.UnsupportedTranscriptionOptions, error.UnsupportedAppleTranscriptionOptions => return error.UnsupportedAudioReadCapability,
+                    else => return err,
+                };
+                defer transcribing.deinitResponse(a, &result);
+                const json = try transcribing.readResponseJsonAlloc(a, name, asr, result, options);
+                defer a.free(json);
+                const items = try readers.documentResults(a, json);
+                return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
+            }
+        }
+        var cfg = try self.view.readConfig(target);
         const uses_default = cfg.provider == .antfly and cfg.resolvedUrl() == null;
         if (cfg.provider == .antfly and cfg.resolvedUrl() == null and self.antfly_provider == null) if (self.inference_api_url) |endpoint| {
             cfg.api_url = try gateway.apiBaseAlloc(a, endpoint);
@@ -485,6 +517,20 @@ pub fn generatedGenerator(a: std.mem.Allocator, cfg: generating.GeneratorConfig,
 
 /// Preserve the complete read surface (including documents and retained
 /// artifacts) through configured aliases. Only deployment defaults are projected.
+pub fn audioReadingBody(a: std.mem.Allocator, cfg: transcribing.Config, request: Json) ![]u8 {
+    var forwarded = request;
+    try forwarded.object.put(a, "model", .{ .string = cfg.model orelse return error.ModelRequired });
+    var options = forwarded.object.get("audio_options") orelse Json{ .object = .empty };
+    if (options == .null) options = .{ .object = .empty };
+    if (options != .object) return error.InvalidInferenceRequest;
+    const defaults = transcribing.requestDefaults(cfg);
+    inline for (.{ "language", "timestamps", "diarization" }) |field| if (options.object.get(field) == null or options.object.get(field).? == .null) {
+        if (@field(defaults, field)) |value| try options.object.put(a, field, try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{}));
+    };
+    try forwarded.object.put(a, "audio_options", options);
+    return readingBody(a, .{ .provider = .antfly, .model = cfg.model }, forwarded);
+}
+
 pub fn readingBody(a: std.mem.Allocator, cfg: readers.Config, request: Json) ![]u8 {
     if (cfg.provider != .antfly or request != .object) return error.UnsupportedInferenceFeature;
     var forwarded = request;
@@ -829,4 +875,111 @@ test "provider registry gateway read aliases preserve documents retention and ca
     const image = try std.json.parseFromSliceLeaky(Json, a, legacy, .{});
     try std.testing.expectEqualStrings("url", image.object.get("images").?.array.items[0].object.get("url").?.string);
     try std.testing.expectEqualStrings("caller", image.object.get("prompt").?.string);
+}
+
+// Explicit opt-in qualification against an already-running local inference
+// server. Ordinary gateway contracts never load or download models.
+test "provider registry gateway qualified audio reads preserve real ASR and generator evidence" {
+    const endpoint = std.mem.span(std.c.getenv("ANTFLY_AUDIO_READ_QUALIFICATION_URL") orelse return error.SkipZigTest);
+    const audio = std.mem.span(std.c.getenv("ANTFLY_AUDIO_READ_QUALIFICATION_AUDIO") orelse return error.SkipZigTest);
+    const whisper = std.mem.span(std.c.getenv("ANTFLY_AUDIO_READ_QUALIFICATION_WHISPER") orelse return error.SkipZigTest);
+    const gemma = std.mem.span(std.c.getenv("ANTFLY_AUDIO_READ_QUALIFICATION_GEMMA") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer http.deinit();
+    var providers = @import("provider_registry.zig").Registry.init(a);
+    defer providers.deinit();
+    var asr = transcribing.Registry.init(a);
+    defer asr.deinit();
+    var reading = readers.Registry.init(a);
+    defer reading.deinit();
+    try asr.registerConfig("speech", .{ .provider = .antfly, .model = whisper, .api_url = endpoint, .language_code = "en", .timestamps = true });
+    try reading.registerConfig("audio", .{ .provider = .antfly, .model = gemma, .api_url = endpoint });
+    try providers.registerGeneratorConfig("multimodal", .{ .provider = .antfly, .model = gemma, .url = endpoint });
+    const executor = Executor{ .view = .{ .providers = &providers, .transcribers = &asr, .readers = &reading }, .http = &http, .context = .{ .io = io, .deadline_ns = null } };
+    for ([_][]const u8{ "transcribers/speech", "readers/audio", "generators/multimodal" }, 0..) |target, index| {
+        var result = try executor.read(a, target, .{ .audio = audio });
+        defer result.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), result.items.len);
+        const row = try std.json.parseFromSliceLeaky(Json, a, result.items[0].document_json.?, .{});
+        try std.testing.expectEqualStrings("audio", row.object.get("kind").?.string);
+        try std.testing.expectEqualStrings("none", row.object.get("coordinate_space").?.string);
+        try std.testing.expectEqualStrings("complete", row.object.get("status").?.string);
+        try std.testing.expectEqualStrings("transcription", row.object.get("origin").?.string);
+        try std.testing.expect(std.mem.indexOf(u8, result.items[0].text, "fox") != null);
+        const metadata = row.object.get("audio").?.object;
+        try std.testing.expect(metadata.get("duration_ms").?.integer > 0);
+        if (index == 0) {
+            try std.testing.expectEqualStrings("forced", metadata.get("language_source").?.string);
+            try std.testing.expect(metadata.get("segments").?.array.items.len > 0);
+        } else {
+            try std.testing.expect(metadata.get("segments").? == .null);
+            try std.testing.expect(metadata.get("speakers").? == .null);
+        }
+    }
+}
+
+test "provider registry gateway hosted ASR reads preserve named defaults and original recording evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "name=\"language\"\r\n\r\nfr") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "verbose_json") != null);
+        }
+    };
+    var server = try httpx.TestServer.start(std.testing.allocator, io, &.{.{
+        .method = .POST,
+        .path = "/audio/transcriptions",
+        .assert_request = Check.request,
+        .respond = .{ .body =
+        \\{"text":"hello","language":"french","duration":90,"segments":[{"text":"hello","start":65,"end":66}]}
+        },
+    }});
+    defer server.deinit();
+    var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer http.deinit();
+    var providers = @import("provider_registry.zig").Registry.init(a);
+    defer providers.deinit();
+    var asr = transcribing.Registry.init(a);
+    defer asr.deinit();
+    try asr.registerConfig("speech", .{ .provider = .openai, .model = "whisper-1", .base_url = server.baseUrl(), .api_key = "fixture", .language_code = "fr", .timestamps = true });
+    const executor = Executor{ .view = .{ .providers = &providers, .transcribers = &asr }, .http = &http, .context = .{ .io = io, .deadline_ns = null } };
+    try std.testing.expectError(error.UnsupportedAudioReadCapability, executor.read(a, "transcribers/speech", .{ .audio = "ZmFrZQ==", .audio_options = .{ .diarization = true } }));
+    try std.testing.expectError(error.UnsupportedAudioReadCapability, executor.read(a, "transcribers/speech", .{ .audio = "ZmFrZQ==", .images = &.{"image"} }));
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    const Serve = struct {
+        fn run(fixture: *httpx.TestServer, err: *?anyerror) std.Io.Cancelable!void {
+            fixture.handleOne() catch |problem| {
+                err.* = problem;
+            };
+        }
+    };
+    try group.concurrent(io, Serve.run, .{ &server, &failure });
+    var result = try executor.read(a, "transcribers/speech", .{ .audio = "ZmFrZQ==" });
+    defer result.deinit(a);
+    try group.await(io);
+    if (failure) |err| return err;
+    const item = result.items[0];
+    try std.testing.expectEqualStrings("hello", item.text);
+    try std.testing.expect(result.usage == null);
+    const row = try std.json.parseFromSliceLeaky(Json, a, item.document_json.?, .{});
+    try std.testing.expectEqualStrings("audio-0", row.object.get("source_id").?.string);
+    try std.testing.expectEqualStrings("none", row.object.get("coordinate_space").?.string);
+    const metadata = row.object.get("audio").?.object;
+    try std.testing.expectEqualStrings("fr", metadata.get("language").?.string);
+    try std.testing.expectEqualStrings("forced", metadata.get("language_source").?.string);
+    try std.testing.expectEqual(@as(i64, 90000), metadata.get("duration_ms").?.integer);
+    const segment = metadata.get("segments").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 65000), segment.get("start_ms").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), segment.get("text_end").?.integer);
 }

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for /api/transcribe (speech-to-text) endpoint.
+"""Tests for /ai/v1/read (speech-to-text) endpoint.
 
 Matches Go antfly's transcriber_test.go patterns.
 """
@@ -37,7 +37,7 @@ def test_transcribe_audio(api):
     """Transcribing audio should return text output."""
     wav_b64 = make_wav_b64(0.5)
     audio_uri = f"data:audio/wav;base64,{wav_b64}"
-    resp = api.transcribe(audio=audio_uri, model="openai/whisper-tiny")
+    resp = api.read_audio(audio=audio_uri, model="openai/whisper-tiny")
     assert_openai_list_response(resp, expected_len=1)
     assert "text" in resp["data"][0]
     # Silent audio may return empty text, but should not error
@@ -48,7 +48,7 @@ def test_transcribe_returns_text_key(api):
     """Response should always contain a 'text' field."""
     wav_b64 = make_wav_b64(0.1)
     audio_uri = f"data:audio/wav;base64,{wav_b64}"
-    resp = api.transcribe(audio=audio_uri, model="openai/whisper-tiny")
+    resp = api.read_audio(audio=audio_uri, model="openai/whisper-tiny")
     assert "text" in resp["data"][0]
 
 
@@ -59,9 +59,9 @@ def test_whisper_tiny_transcribes_spoken_phrase(api):
         "data:audio/wav;base64,"
         + base64.b64encode(_WHISPER_QUALITY_WAV.read_bytes()).decode()
     )
-    resp = api.transcribe(audio=audio_uri, model="openai/whisper-tiny")
+    resp = api.read_audio(audio=audio_uri, model="openai/whisper-tiny")
     assert_openai_list_response(resp, expected_len=1)
-    assert resp["data"][0].get("language") == "en"
+    assert resp["data"][0]["audio"].get("language") == "en"
 
     transcript = " ".join(resp["data"][0]["text"].lower().split())
     for expected_word in ("quick", "brown", "fox", "lazy", "dog"):
@@ -77,9 +77,9 @@ def test_whisper_tiny_autodetects_spanish(api):
         "data:audio/wav;base64,"
         + base64.b64encode(_WHISPER_SPANISH_QUALITY_WAV.read_bytes()).decode()
     )
-    resp = api.transcribe(audio=audio_uri, model="openai/whisper-tiny")
+    resp = api.read_audio(audio=audio_uri, model="openai/whisper-tiny")
     assert_openai_list_response(resp, expected_len=1)
-    assert resp["data"][0].get("language") == "es"
+    assert resp["data"][0]["audio"].get("language") == "es"
 
     transcript = " ".join(resp["data"][0]["text"].lower().split())
     for expected_word in ("buenos", "prueba", "reconocimiento", "idioma"):
@@ -142,18 +142,18 @@ def test_whisper_tiny_diarizes_two_speakers(api):
     transcript is the same one an undiarized request returns.
     """
     audio_uri = "data:audio/wav;base64," + _two_speaker_wav_b64()
-    resp = api.transcribe(
+    resp = api.read_audio(
         audio=audio_uri, model="openai/whisper-tiny", diarization=True
     )
     assert_openai_list_response(resp, expected_len=1)
     item = resp["data"][0]
 
-    speakers = item.get("speakers")
+    speakers = item["audio"].get("speakers")
     assert speakers, f"diarization returned no speakers: {item!r}"
     # Dense and numbered in order of first appearance.
     assert speakers == [f"SPEAKER_{i:02d}" for i in range(len(speakers))]
 
-    segments = item["segments"]
+    segments = item["audio"]["segments"]
     assert segments, "diarized response has no segments"
     labels = [segment.get("speaker") for segment in segments]
     assert all(label in speakers for label in labels), (
@@ -163,6 +163,89 @@ def test_whisper_tiny_diarizes_two_speakers(api):
     assert sorted(set(labels)) == sorted(speakers), (
         f"speakers {speakers!r} do not match the labels used {sorted(set(labels))!r}"
     )
-    # Splitting a phrase at a speaker change must not alter the transcript.
-    plain = api.transcribe(audio=audio_uri, model="openai/whisper-tiny")
+    # Compare the same timestamped recognition mode: diarization itself must
+    # not change its transcript. Untimed decoding may choose different tokens.
+    plain = api.read_audio(
+        audio=audio_uri, model="openai/whisper-tiny", timestamps=True
+    )
     assert " ".join(item["text"].split()) == " ".join(plain["data"][0]["text"].split())
+
+
+@pytest.mark.multimodal
+def test_audio_read_verified_silence_preserves_evidence(api):
+    result = api.read_audio(audio=make_wav_b64(0.5), model="openai/whisper-tiny")
+    item = result["data"][0]
+    assert item["text"] == ""
+    assert item["status"] == "complete"
+    assert item["kind"] == "audio"
+    assert item["coordinate_space"] == "none"
+    assert item["audio"]["duration_ms"] == 500
+    assert "audio_silence" in item["findings"]
+
+
+@pytest.mark.multimodal
+@pytest.mark.slow
+def test_whisper_read_long_recording_uses_original_source_timestamps(api):
+    import io
+    import wave
+
+    with wave.open(str(_WHISPER_QUALITY_WAV)) as source:
+        params = source.getparams()
+        speech = source.readframes(source.getnframes())
+    frame_bytes = params.nchannels * params.sampwidth
+    silence_byte = b"\x80" if params.sampwidth == 1 else b"\x00"
+    leading_silence = silence_byte * (params.framerate * 65 * frame_bytes)
+    pcm = leading_silence + speech
+    recording = io.BytesIO()
+    with wave.open(recording, "wb") as output:
+        output.setparams(params)
+        output.writeframes(pcm)
+    response = api.read_audio(
+        audio="data:audio/wav;base64,"
+        + base64.b64encode(recording.getvalue()).decode(),
+        model="openai/whisper-tiny",
+        language="en",
+        timestamps=True,
+    )
+    item = response["data"][0]
+    metadata = item["audio"]
+    assert metadata["duration_ms"] > 65000
+    assert metadata["language_source"] == "forced"
+    assert item["status"] == "complete"
+    assert "fox" in item["text"].lower()
+    assert metadata["segments"]
+    # With a silent prefix, the pause-aware planner chooses the midpoint of
+    # the last quiet 20 ms frame: 29,990 ms and then 59,980 ms. Compare the
+    # identical final window read alone, rather than assuming that Whisper's
+    # estimated phrase onset coincides with the first nonzero audio sample.
+    window_start_ms = 59980
+    window_start_frame = window_start_ms * params.framerate // 1000
+    window = io.BytesIO()
+    with wave.open(window, "wb") as output:
+        output.setparams(params)
+        output.writeframes(pcm[window_start_frame * frame_bytes :])
+    control = api.read_audio(
+        audio="data:audio/wav;base64," + base64.b64encode(window.getvalue()).decode(),
+        model="openai/whisper-tiny",
+        language="en",
+        timestamps=True,
+    )["data"][0]
+    assert control["status"] == "complete"
+    assert item["text"] == control["text"]
+    assert metadata["duration_ms"] == control["audio"]["duration_ms"] + window_start_ms
+    assert len(metadata["segments"]) == len(control["audio"]["segments"])
+    text_bytes = item["text"].encode()
+    for segment, local in zip(metadata["segments"], control["audio"]["segments"]):
+        assert segment["text"] == local["text"]
+        assert segment["start_ms"] == local["start_ms"] + window_start_ms
+        assert segment["end_ms"] == local["end_ms"] + window_start_ms
+        assert (
+            window_start_ms
+            <= segment["start_ms"]
+            <= segment["end_ms"]
+            <= metadata["duration_ms"]
+        )
+        assert (
+            text_bytes[segment["text_start"] : segment["text_end"]].decode()
+            == segment["text"]
+        )

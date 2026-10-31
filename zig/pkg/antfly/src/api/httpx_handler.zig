@@ -1376,7 +1376,6 @@ pub const AntflyApiHandler = struct {
         try root_server.postResponseStreaming("/ai/v1/read", httpx.Handler.bind(self, gatewayRead));
         try root_server.postResponseStreaming("/ai/v1/extract", httpx.Handler.bind(self, gatewayExtract));
         try root_server.postResponseStreaming("/ai/v1/rewrite", httpx.Handler.bind(self, gatewayRewrite));
-        try root_server.postResponseStreaming("/ai/v1/transcribe", httpx.Handler.bind(self, gatewayTranscribe));
         try root_server.postResponseStreaming("/ai/v1/synthesize", httpx.Handler.bind(self, gatewaySynthesize));
         try root_server.postResponseStreaming("/ai/v1/rerank", httpx.Handler.bind(self, gatewayRerank));
         try root_server.postResponseStreaming("/ai/v1/chunk", httpx.Handler.bind(self, gatewayChunk));
@@ -4374,9 +4373,6 @@ pub const AntflyApiHandler = struct {
     fn gatewayRead(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequest(ctx, .read);
     }
-    fn gatewayTranscribe(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
-        return self.gatewayRequest(ctx, .transcribe);
-    }
     fn gatewaySynthesize(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequest(ctx, .synthesize);
     }
@@ -4838,8 +4834,9 @@ pub const AntflyApiHandler = struct {
             error.DocumentStorageNotConfigured, error.NotLeader => 503,
             error.TooManyActiveJobs => 429,
             error.InlineCredentialNotAllowed => 400,
+            error.InvalidTranscriptionLanguage => 400,
             error.Canceled, error.Cancelled => return error.Canceled,
-            error.ProviderTokenBudgetExceeded, error.UnsupportedMediaTokenBudget, error.UnsupportedBedrockContentPart, error.UnsupportedBedrockGenerationOptions, error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
+            error.ProviderTokenBudgetExceeded, error.UnsupportedMediaTokenBudget, error.UnsupportedBedrockContentPart, error.UnsupportedBedrockGenerationOptions, error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature, error.UnsupportedAudioReadCapability => 400,
             else => 502,
         };
         _ = ctx.status(status);
@@ -19830,7 +19827,7 @@ test "httpx inference gateway preserves framed media through raw and named nativ
     const Case = struct { path: []const u8, operation: []const u8, body: []const u8 };
     for ([_]Case{
         .{ .path = "read", .operation = "read", .body = "{\"model\":\"local/backend\",\"images\":[{\"url\":\"attachment:0\"}]}" },
-        .{ .path = "transcribe", .operation = "transcribe", .body = "{\"model\":\"local/backend\",\"audio\":\"attachment:0\"}" },
+        .{ .path = "read", .operation = "read", .body = "{\"model\":\"local/backend\",\"audio\":\"attachment:0\",\"audio_options\":{\"timestamps\":true}}" },
         .{ .path = "extract", .operation = "extract", .body = "{\"model\":\"extractors/entities\",\"input\":[{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}]}" },
         .{ .path = "chunk", .operation = "chunk", .body = "{\"model\":\"chunkers/paragraphs\",\"input\":{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}}" },
         .{ .path = "generate", .operation = "generate", .body = "{\"model\":\"generators/native\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}]}]}" },
@@ -20479,7 +20476,7 @@ test "httpx inference gateway request errors remain client errors without reclas
         .{ Task.embed, "/ai/v1/embeddings", "{\"model\":\"x\",\"model\":\"y\"}" },
         .{ Task.embed, "/ai/v1/embeddings", "{\"model\":\"embedders/dense\",\"input\":[{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"!\"}]}" },
         .{ Task.synthesize, "/ai/v1/synthesize", "{\"model\":\"synthesizers/voice\",\"text\":\"hello\",\"format\":\"invalid\"}" },
-        .{ Task.transcribe, "/ai/v1/transcribe", "{\"model\":\"transcribers/speech\",\"audio\":\"AAAA\",\"diarization\":true}" },
+        .{ Task.read, "/ai/v1/read", "{\"model\":\"transcribers/speech\",\"audio\":\"AAAA\",\"audio_options\":{\"diarization\":true}}" },
     };
     inline for (cases) |case| {
         var request = try httpx.Request.init(a, .POST, "http://localhost" ++ case[1]);

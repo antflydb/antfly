@@ -1034,17 +1034,6 @@ pub const Client = struct {
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
-    /// Transcribe audio to text (speech-to-text)
-    /// POST /ai/v1/transcribe
-    pub fn transcribeAudio(self: *@This(), body: types.InferenceTranscribeRequest) !ApiResponse(types.InferenceTranscribeResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/transcribe", .{self.base_url});
-        defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
-        defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.InferenceTranscribeResponse).fromResponse(self.allocator, &resp);
-    }
-
     /// Open a streaming transcription session
     /// POST /ai/v1/transcription/sessions
     pub fn createTranscriptionSession(self: *@This(), body: types.InferenceTranscriptionSessionRequest) !ApiResponse(types.InferenceTranscriptionSession) {

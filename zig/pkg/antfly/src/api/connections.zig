@@ -594,7 +594,6 @@ fn inferenceCapability(operation: []const u8) ?[]const u8 {
         .{ "extract", "models.extract" },
         .{ "rewrite", "models.rewrite" },
         .{ "read", "models.read" },
-        .{ "transcribe", "models.transcribe" },
         .{ "dictate", "models.transcribe" },
         .{ "synthesize", "models.synthesize" },
         .{ "predict", "models.predict" },
@@ -2718,4 +2717,11 @@ test "httpx inference gateway reader aliases scope remote credentials and admiss
     try std.testing.expectEqualStrings("revision", explicit.remote.capability_revision.?);
     try std.testing.expectEqual(InferenceAdmissionOwner.caller, try inferenceConnectionAdmissionOwner(&cfg, null, "readers/remote", "read"));
     try std.testing.expectError(error.UnsupportedInferenceOperation, resolveInferenceConnection(&cfg, null, "readers/remote", "generate"));
+}
+
+test "httpx inference connection reading replaces one-shot transcription" {
+    try std.testing.expectEqualStrings("models.read", inferenceCapability("read").?);
+    try std.testing.expect(inferenceCapability("transcribe") == null);
+    try std.testing.expectEqualStrings("models.transcribe", inferenceCapability("dictate").?);
+    try std.testing.expectEqualStrings("models.transcribe", inferenceCapability("transcription/sessions").?);
 }

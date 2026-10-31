@@ -24,7 +24,9 @@ pub const Action = @import("antfly_documents").types.Action;
 pub const Origin = @import("antfly_documents").types.Origin;
 pub const Operation = enum { read, decide, extract };
 pub const Provider = enum { antfly, cloudflare };
+pub const AudioReadOptions = @import("antfly_documents").types.AudioReadOptions;
 pub const Binding = struct {
+    audio_options: AudioReadOptions = .{},
     name: []const u8,
     model: []const u8,
     operation: Operation,

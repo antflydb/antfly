@@ -466,8 +466,11 @@ components:
 
     STTResponse:
       type: object
-      description: "Response from speech transcription."
+      description: "Response from speech recognition used by internal providers and streaming workflows."
       properties:
+        status:
+          type: string
+          enum: [complete, unresolved, truncated]
         text:
           type: string
           description: "Full transcribed text."

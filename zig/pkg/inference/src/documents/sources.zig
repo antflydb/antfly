@@ -41,6 +41,23 @@ pub fn isAudioMediaType(mime: []const u8) bool {
     const essence = @import("antfly_readers").mediaTypeEssence(mime) catch return false;
     return audio.detectFormatFromMime(essence) != null;
 }
+/// All audio transports normalize to an ordinary document source. A supplied
+/// MIME declaration is validated independently of model/backend selection.
+pub fn audioInput(a: A, value: []const u8) !Input {
+    const uri = @import("antfly_scraping").data_uri;
+    const url = try @import("antfly_readers").audioSourceUrl(a, value);
+    var mime: []const u8 = "";
+    if (try uri.parse(url)) |parsed| {
+        const declared = parsed.effectiveMediaTypeEssence();
+        if (!std.mem.eql(u8, declared, "application/octet-stream")) {
+            if (!isAudioMediaType(declared)) return error.UnsupportedInferenceMimeType;
+            mime = declared;
+        }
+        _ = try parsed.decodedSize();
+    }
+    return .{ .id = "audio-0", .url = url, .media_type = mime };
+}
+
 pub fn audioMime(bytes: []const u8) ![]const u8 {
     return switch (audio.detectFormat(bytes) orelse return error.UnsupportedDocumentFormat) {
         .wav => "audio/wav",

@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.inference_audio_read_capabilities import InferenceAudioReadCapabilities
     from ..models.inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
     from ..models.inference_model_info_dense_output import InferenceModelInfoDenseOutput
     from ..models.inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
@@ -23,6 +24,7 @@ class InferenceModelInfo:
     """Information about a model including its capabilities
 
     Attributes:
+        audio_read (InferenceAudioReadCapabilities | Unset):
         chunking_limits (InferenceModelInfoChunkingLimits | Unset): Effective model-aware chunk operational ceilings for
             working/output/event
             bytes, chunk/dependency/index counts and remote fetched bytes, requests
@@ -46,6 +48,7 @@ class InferenceModelInfo:
         inputs (list[str] | Unset): List of input modalities this model accepts, such as `text`, `image`, or `audio`
     """
 
+    audio_read: InferenceAudioReadCapabilities | Unset = UNSET
     chunking_limits: InferenceModelInfoChunkingLimits | Unset = UNSET
     inference_capabilities: InferenceModelInfoInferenceCapabilities | Unset = UNSET
     dense_output: InferenceModelInfoDenseOutput | Unset = UNSET
@@ -56,6 +59,10 @@ class InferenceModelInfo:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        audio_read: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.audio_read, Unset):
+            audio_read = self.audio_read.to_dict()
+
         chunking_limits: dict[str, Any] | Unset = UNSET
         if not isinstance(self.chunking_limits, Unset):
             chunking_limits = self.chunking_limits.to_dict()
@@ -85,6 +92,8 @@ class InferenceModelInfo:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if audio_read is not UNSET:
+            field_dict["audio_read"] = audio_read
         if chunking_limits is not UNSET:
             field_dict["chunking_limits"] = chunking_limits
         if inference_capabilities is not UNSET:
@@ -104,12 +113,20 @@ class InferenceModelInfo:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_audio_read_capabilities import InferenceAudioReadCapabilities
         from ..models.inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
         from ..models.inference_model_info_dense_output import InferenceModelInfoDenseOutput
         from ..models.inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
         from ..models.inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 
         d = dict(src_dict)
+        _audio_read = d.pop("audio_read", UNSET)
+        audio_read: InferenceAudioReadCapabilities | Unset
+        if isinstance(_audio_read, Unset):
+            audio_read = UNSET
+        else:
+            audio_read = InferenceAudioReadCapabilities.from_dict(_audio_read)
+
         _chunking_limits = d.pop("chunking_limits", UNSET)
         chunking_limits: InferenceModelInfoChunkingLimits | Unset
         if isinstance(_chunking_limits, Unset):
@@ -145,6 +162,7 @@ class InferenceModelInfo:
         inputs = cast(list[str], d.pop("inputs", UNSET))
 
         inference_model_info = cls(
+            audio_read=audio_read,
             chunking_limits=chunking_limits,
             inference_capabilities=inference_capabilities,
             dense_output=dense_output,

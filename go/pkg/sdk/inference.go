@@ -34,6 +34,7 @@ package sdk
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -716,46 +717,9 @@ func (c *InferenceClient) RewriteText(ctx context.Context, model string, inputs 
 	return resp.JSON200, nil
 }
 
-// TranscribeConfig carries the optional settings of a transcription request.
-type TranscribeConfig struct {
-	// Language is an ISO 639-1 code. Empty lets the model detect it.
-	Language string
-	// Diarization labels each segment with the speaker who said it
-	// (SPEAKER_00, SPEAKER_01, ...) and lists the speakers found. The local
-	// provider needs its speaker model pulled; see the transcription guide.
-	Diarization bool
-}
-
-// Transcribe transcribes audio to text using a speech-to-text model.
-// The audio should be base64-encoded audio data (WAV, MP3, FLAC, etc.).
-// Model must name the transcriber explicitly so local and distributed routing agree.
-// Language is optional - if empty, the model will auto-detect.
-func (c *InferenceClient) Transcribe(ctx context.Context, model string, audio []byte, language string) (*oapi.InferenceTranscribeResponse, error) {
-	return c.TranscribeWithConfig(ctx, model, audio, TranscribeConfig{Language: language})
-}
-
-// TranscribeWithConfig transcribes audio with the optional settings in cfg.
-func (c *InferenceClient) TranscribeWithConfig(ctx context.Context, model string, audio []byte, cfg TranscribeConfig) (*oapi.InferenceTranscribeResponse, error) {
-	req := oapi.InferenceTranscribeRequest{
-		Model:       model,
-		Audio:       audio,
-		Language:    cfg.Language,
-		Diarization: cfg.Diarization,
-	}
-
-	resp, err := c.client.TranscribeAudioWithResponse(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("sending request: %w", err)
-	}
-
-	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
-		return nil, err
-	}
-	if resp.JSON200 == nil {
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
-	}
-
-	return resp.JSON200, nil
+// ReadAudio reads encoded audio through the canonical read service.
+func (c *InferenceClient) ReadAudio(ctx context.Context, model string, audio []byte, options oapi.InferenceAudioReadOptions) (*oapi.InferenceReadResponse, error) {
+	return c.Read(ctx, oapi.InferenceReadRequest{Model: model, Audio: base64.StdEncoding.EncodeToString(audio), AudioOptions: options})
 }
 
 // GenerateConfig contains configuration for text generation.

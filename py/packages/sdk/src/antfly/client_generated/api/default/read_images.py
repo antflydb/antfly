@@ -106,7 +106,10 @@ def sync_detailed(
      Reads text from images and documents with a local reader model. OCR and document-reading tasks can
     also run on a vision-capable generator or a connected provider.
 
-    Audio input uses an audio-capable generator such as Gemma 4. Supported video
+    Audio input dispatches to Whisper ASR or an audio-capable generator such as Gemma 4 using the same
+    document service and read envelope. Whisper supports language control, timestamps, diarization and
+    long-recording windowing. Gemma supports recordings up to 30 seconds and rejects unsupported audio
+    options. Supported video
     containers are transcribed from their audio track. Results report truncation;
     generated text does not imply word alignment or speaker identification.
 
@@ -155,9 +158,9 @@ def sync_detailed(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest): Read exactly one of images, documents, or audio. Audio reads
-            use an audio-capable generator such as Gemma 4 and transcribe the audio track of supported
-            video containers.
+        body (InferenceReadRequest): Read exactly one of images, documents, or audio using
+            capability-aware reader dispatch, with provenance and completion status. Supported video
+            containers are read from their audio track only.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -188,7 +191,10 @@ def sync(
      Reads text from images and documents with a local reader model. OCR and document-reading tasks can
     also run on a vision-capable generator or a connected provider.
 
-    Audio input uses an audio-capable generator such as Gemma 4. Supported video
+    Audio input dispatches to Whisper ASR or an audio-capable generator such as Gemma 4 using the same
+    document service and read envelope. Whisper supports language control, timestamps, diarization and
+    long-recording windowing. Gemma supports recordings up to 30 seconds and rejects unsupported audio
+    options. Supported video
     containers are transcribed from their audio track. Results report truncation;
     generated text does not imply word alignment or speaker identification.
 
@@ -237,9 +243,9 @@ def sync(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest): Read exactly one of images, documents, or audio. Audio reads
-            use an audio-capable generator such as Gemma 4 and transcribe the audio track of supported
-            video containers.
+        body (InferenceReadRequest): Read exactly one of images, documents, or audio using
+            capability-aware reader dispatch, with provenance and completion status. Supported video
+            containers are read from their audio track only.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -265,7 +271,10 @@ async def asyncio_detailed(
      Reads text from images and documents with a local reader model. OCR and document-reading tasks can
     also run on a vision-capable generator or a connected provider.
 
-    Audio input uses an audio-capable generator such as Gemma 4. Supported video
+    Audio input dispatches to Whisper ASR or an audio-capable generator such as Gemma 4 using the same
+    document service and read envelope. Whisper supports language control, timestamps, diarization and
+    long-recording windowing. Gemma supports recordings up to 30 seconds and rejects unsupported audio
+    options. Supported video
     containers are transcribed from their audio track. Results report truncation;
     generated text does not imply word alignment or speaker identification.
 
@@ -314,9 +323,9 @@ async def asyncio_detailed(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest): Read exactly one of images, documents, or audio. Audio reads
-            use an audio-capable generator such as Gemma 4 and transcribe the audio track of supported
-            video containers.
+        body (InferenceReadRequest): Read exactly one of images, documents, or audio using
+            capability-aware reader dispatch, with provenance and completion status. Supported video
+            containers are read from their audio track only.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -345,7 +354,10 @@ async def asyncio(
      Reads text from images and documents with a local reader model. OCR and document-reading tasks can
     also run on a vision-capable generator or a connected provider.
 
-    Audio input uses an audio-capable generator such as Gemma 4. Supported video
+    Audio input dispatches to Whisper ASR or an audio-capable generator such as Gemma 4 using the same
+    document service and read envelope. Whisper supports language control, timestamps, diarization and
+    long-recording windowing. Gemma supports recordings up to 30 seconds and rejects unsupported audio
+    options. Supported video
     containers are transcribed from their audio track. Results report truncation;
     generated text does not imply word alignment or speaker identification.
 
@@ -394,9 +406,9 @@ async def asyncio(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest): Read exactly one of images, documents, or audio. Audio reads
-            use an audio-capable generator such as Gemma 4 and transcribe the audio track of supported
-            video containers.
+        body (InferenceReadRequest): Read exactly one of images, documents, or audio using
+            capability-aware reader dispatch, with provenance and completion status. Supported video
+            containers are read from their audio track only.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

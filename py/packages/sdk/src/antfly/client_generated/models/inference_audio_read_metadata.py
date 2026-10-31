@@ -6,51 +6,46 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.inference_transcribe_object_object import InferenceTranscribeObjectObject
+from ..models.inference_audio_read_metadata_language_source import InferenceAudioReadMetadataLanguageSource
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.inference_dictation_segment import InferenceDictationSegment
+    from ..models.inference_audio_read_segment import InferenceAudioReadSegment
 
 
-T = TypeVar("T", bound="InferenceTranscribeObject")
+T = TypeVar("T", bound="InferenceAudioReadMetadata")
 
 
 @_attrs_define
-class InferenceTranscribeObject:
-    """
-    Attributes:
-        object_ (InferenceTranscribeObjectObject):
-        index (int): Input audio index.
-        text (str): Transcribed text from the audio Example: Hello, how are you today?.
-        language (str | Unset): Detected or forced language Example: en.
-        duration_ms (int | Unset): Decoded clip duration in milliseconds.
-        segments (list[InferenceDictationSegment] | Unset): Timestamped phrases in clip order, so a transcript can be
-            indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment
-            offsets are relative to the whole clip.
-        speakers (list[str] | Unset): Speaker labels found by diarization, in order of first appearance. Present only
-            when `diarization` was requested.
+class InferenceAudioReadMetadata:
+    """Recognition evidence for the audio track only. Video frames are not captioned. Absent segments and speakers make no
+    alignment or speaker claim.
+
+        Attributes:
+            duration_ms (int | None): Decoded recording duration in milliseconds. Null when a remote recognition provider
+                does not report duration.
+            language (str | Unset):
+            language_source (InferenceAudioReadMetadataLanguageSource | Unset):
+            segments (list[InferenceAudioReadSegment] | Unset):
+            speakers (list[str] | Unset):
     """
 
-    object_: InferenceTranscribeObjectObject
-    index: int
-    text: str
+    duration_ms: int | None
     language: str | Unset = UNSET
-    duration_ms: int | Unset = UNSET
-    segments: list[InferenceDictationSegment] | Unset = UNSET
+    language_source: InferenceAudioReadMetadataLanguageSource | Unset = UNSET
+    segments: list[InferenceAudioReadSegment] | Unset = UNSET
     speakers: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        object_ = self.object_.value
-
-        index = self.index
-
-        text = self.text
+        duration_ms: int | None
+        duration_ms = self.duration_ms
 
         language = self.language
 
-        duration_ms = self.duration_ms
+        language_source: str | Unset = UNSET
+        if not isinstance(self.language_source, Unset):
+            language_source = self.language_source.value
 
         segments: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.segments, Unset):
@@ -67,15 +62,13 @@ class InferenceTranscribeObject:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "object": object_,
-                "index": index,
-                "text": text,
+                "duration_ms": duration_ms,
             }
         )
         if language is not UNSET:
             field_dict["language"] = language
-        if duration_ms is not UNSET:
-            field_dict["duration_ms"] = duration_ms
+        if language_source is not UNSET:
+            field_dict["language_source"] = language_source
         if segments is not UNSET:
             field_dict["segments"] = segments
         if speakers is not UNSET:
@@ -85,42 +78,47 @@ class InferenceTranscribeObject:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inference_dictation_segment import InferenceDictationSegment
+        from ..models.inference_audio_read_segment import InferenceAudioReadSegment
 
         d = dict(src_dict)
-        object_ = InferenceTranscribeObjectObject(d.pop("object"))
 
-        index = d.pop("index")
+        def _parse_duration_ms(data: object) -> int | None:
+            if data is None:
+                return data
+            return cast(int | None, data)
 
-        text = d.pop("text")
+        duration_ms = _parse_duration_ms(d.pop("duration_ms"))
 
         language = d.pop("language", UNSET)
 
-        duration_ms = d.pop("duration_ms", UNSET)
+        _language_source = d.pop("language_source", UNSET)
+        language_source: InferenceAudioReadMetadataLanguageSource | Unset
+        if isinstance(_language_source, Unset):
+            language_source = UNSET
+        else:
+            language_source = InferenceAudioReadMetadataLanguageSource(_language_source)
 
         _segments = d.pop("segments", UNSET)
-        segments: list[InferenceDictationSegment] | Unset = UNSET
+        segments: list[InferenceAudioReadSegment] | Unset = UNSET
         if _segments is not UNSET:
             segments = []
             for segments_item_data in _segments:
-                segments_item = InferenceDictationSegment.from_dict(segments_item_data)
+                segments_item = InferenceAudioReadSegment.from_dict(segments_item_data)
 
                 segments.append(segments_item)
 
         speakers = cast(list[str], d.pop("speakers", UNSET))
 
-        inference_transcribe_object = cls(
-            object_=object_,
-            index=index,
-            text=text,
-            language=language,
+        inference_audio_read_metadata = cls(
             duration_ms=duration_ms,
+            language=language,
+            language_source=language_source,
             segments=segments,
             speakers=speakers,
         )
 
-        inference_transcribe_object.additional_properties = d
-        return inference_transcribe_object
+        inference_audio_read_metadata.additional_properties = d
+        return inference_audio_read_metadata
 
     @property
     def additional_keys(self) -> list[str]:

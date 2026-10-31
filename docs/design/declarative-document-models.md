@@ -65,12 +65,11 @@ mutually exclusive with `images` and `documents`:
 MP4/MOV and WebM containers use their audio track; this mode does not caption
 video frames. The ordinary generator capability contract and audio projector
 limits apply. Oversized clips fail rather than silently dropping later speech;
-long-recording windowing is currently provided by Whisper through `/transcribe`.
+Whisper provides pause-aware long-recording windowing through the same `/read` service. Gemma reads are bounded to 30 seconds.
 
 Each response contains one `data` entry with `origin: "transcription"`, transcript
 `text`, and `status: "complete"` or `"truncated"`. Check status before using the
-text as extraction evidence. Usage reports measured generator tokens. An optional
-`prompt` can request a language or a different transcription style. Word
+text as extraction evidence. Usage reports measured generator tokens. Use `audio_options.language` for forced Whisper recognition. A custom generator `prompt` produces interpretation provenance. Word
 timestamps and speaker labels are not inferred from generated text.
 
 Audio also participates in the document planner. Register a reader at
@@ -141,6 +140,7 @@ Submit the audio source directly to `/ai/v1/extract`:
   "model": "hearing-entities",
   "schema_version": 2,
   "schema": {"entities": ["person", "organization"]},
+  "options": {"include_spans": true},
   "documents": [{
     "id": "hearing",
     "url": "data:audio/wav;base64,...",
@@ -1072,7 +1072,7 @@ the existing checkpoint frame ceiling; count admission uses the session's stage
 capacity. The decoder validates frame lengths, version and receipt count before
 allocating the receipt list, and can read the bounded older raster format.
 
-The pinned document adapter identity is v7. Runs already prepared with an older
+The pinned document adapter identity is v8. Runs already prepared with an older
 adapter must be resubmitted; request/source snapshots that have not been prepared
 still use the existing storage format. The adapter pin prevents older executors
 from taking over runs that use the current frame and physical-cost semantics.

@@ -898,7 +898,7 @@ paths:
       description: |
         Reads text from images and documents with a local reader model. OCR and document-reading tasks can also run on a vision-capable generator or a connected provider.
 
-        Audio input uses an audio-capable generator such as Gemma 4. Supported video
+        Audio input dispatches to Whisper ASR or an audio-capable generator such as Gemma 4 using the same document service and read envelope. Whisper supports language control, timestamps, diarization and long-recording windowing. Gemma supports recordings up to 30 seconds and rejects unsupported audio options. Supported video
         containers are transcribed from their audio track. Results report truncation;
         generated text does not imply word alignment or speaker identification.
 
@@ -988,80 +988,6 @@ paths:
                 $ref: '#/components/schemas/Error'
         '502':
           description: Remote content fetch failed
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '503':
-          $ref: '#/components/responses/TransientCapacity'
-  /transcribe:
-    post:
-      summary: Transcribe audio to text (speech-to-text)
-      description: |
-        Transcribes audio to text using Speech2Seq models like Whisper, Wav2Vec2, or HuBERT.
-
-        ## Models
-
-        Models are auto-discovered from `models_dir/transcribers/` at startup.
-        Use the `/api/models` endpoint to list available models.
-
-        - **Whisper**: OpenAI's Whisper models (multilingual, automatic language detection)
-        - **Wav2Vec2**: Facebook's Wav2Vec 2.0 models (English-focused)
-        - **HuBERT**: Facebook's HuBERT models (self-supervised)
-
-        ## Audio Input
-
-        Audio data should be base64-encoded. Supported formats depend on the model:
-        - WAV (recommended - raw PCM)
-        - MP3
-        - FLAC
-        - M4A/AAC
-
-        ## Example
-
-        ```json
-        {
-          "model": "openai/whisper-tiny",
-          "audio": "UklGRi..."
-        }
-        ```
-
-        With language hint:
-        ```json
-        {
-          "model": "openai/whisper-tiny",
-          "audio": "UklGRi...",
-          "language": "en"
-        }
-        ```
-      operationId: transcribeAudio
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TranscribeRequest'
-      responses:
-        '200':
-          description: Audio transcribed successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TranscribeResponse'
-        '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '404':
-          description: Model not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          description: Internal server error
           content:
             application/json:
               schema:
@@ -2962,21 +2888,60 @@ components:
           description: Token classification predictions sorted by score descending.
           items:
             $ref: '#/components/schemas/DocumentTokenClassificationPrediction'
+    AudioReadCapabilities:
+      type: object
+      required: [forced_language, detected_language, timestamps, diarization, windowing]
+      properties:
+        forced_language: {type: boolean}
+        detected_language: {type: boolean}
+        timestamps: {type: boolean}
+        diarization: {type: boolean}
+        windowing: {type: boolean}
+        max_duration_ms: {type: integer, format: int64, nullable: true, description: Maximum duration for this backend in milliseconds. Null means windowed recognition bounded by source and execution budgets.}
+    AudioReadOptions:
+      $ref: '../ai/extraction.yaml#/components/schemas/AudioReadOptions'
+    AudioReadSegment:
+      type: object
+      required: [text, start_ms, end_ms, text_start, text_end]
+      properties:
+        text: {type: string}
+        granularity: {type: string, enum: [phrase, window], description: "phrase uses recognizer-supplied phrase clocks; window provides only the original recognition-window bounds. Neither claims word alignment. Absent means unspecified."}
+        start_ms: {type: integer, format: int64, minimum: 0, description: Start in milliseconds relative to the original recording.}
+        end_ms: {type: integer, format: int64, minimum: 0, description: Exclusive end in milliseconds relative to the original recording.}
+        text_start: {type: integer, format: int64, minimum: 0, description: Start UTF-8 byte offset in the containing read result text.}
+        text_end: {type: integer, format: int64, minimum: 0, description: Exclusive end UTF-8 byte offset in the containing read result text.}
+        speaker: {type: string, description: Speaker label when diarization was requested and established.}
+    AudioReadMetadata:
+      type: object
+      required: [duration_ms]
+      description: Recognition evidence for the audio track only. Video frames are not captioned. Absent segments and speakers make no alignment or speaker claim.
+      properties:
+        duration_ms: {type: integer, format: int64, nullable: true, minimum: 0, description: Decoded recording duration in milliseconds. Null when a remote recognition provider does not report duration.}
+        language: {type: string}
+        language_source: {type: string, enum: [forced, detected, unknown]}
+        segments:
+          type: array
+          items: {$ref: '#/components/schemas/AudioReadSegment'}
+        speakers:
+          type: array
+          items: {type: string}
     ReadRequest:
       type: object
       required:
         - model
-      description: Read exactly one of images, documents, or audio. Audio reads use an audio-capable generator such as Gemma 4 and transcribe the audio track of supported video containers.
+      description: Read exactly one of images, documents, or audio using capability-aware reader dispatch, with provenance and completion status. Supported video containers are read from their audio track only.
       x-antfly-exactly-one-of: [images, documents, audio]
       properties:
         model:
           type: string
-          description: Reader model from models_dir/readers/, or an audio-capable generator from models_dir/generators/ for audio inputs.
+          description: Explicit reader, ASR, audio-capable generator, named target, or composed document model. ASR storage remains models_dir/transcribers/.
           example: lightonai/LightOnOCR-3-0.8B
+        audio_options:
+          $ref: '#/components/schemas/AudioReadOptions'
         audio:
           type: string
           minLength: 1
-          description: Base64-encoded audio or a data URI, mutually exclusive with images and documents. Supports audio tracks in MP4/MOV and WebM containers. Uses an audio-capable generator from models_dir/generators/ such as Gemma 4. Returns transcript text without word timestamps or speaker labels; video frames are not captioned. Use a registered document reader with an audio binding for planning, fallback, verification, artifact retention, and durable jobs.
+          description: Base64-encoded audio, a data URI, or a supported source URL, mutually exclusive with images and documents. Audio tracks in supported video containers are transcribed; frames are not captioned. Whisper preserves long-recording windowing; Gemma is bounded to 30 seconds. All audio reads use document orchestration, artifacts and durable jobs.
         retain_artifact:
           type: boolean
           default: false
@@ -3012,10 +2977,9 @@ components:
           example: What type of document is this?
         max_tokens:
           type: integer
-          description: Maximum tokens to generate
+          description: Maximum tokens to generate (256 by default for generator readers). For audio, this is supported by generator backends; Whisper uses its recognition and execution budgets and rejects an explicit max_tokens.
           minimum: 1
           maximum: 1024
-          default: 256
           example: 256
     TextRegion:
       type: object
@@ -3082,6 +3046,8 @@ components:
       required:
         - text
       properties:
+        audio:
+          $ref: '#/components/schemas/AudioReadMetadata'
         source_id:
           type: string
           description: Original document source ID.
@@ -3189,7 +3155,10 @@ components:
           type: string
           description: Name of model used for reading
         usage:
-          $ref: '#/components/schemas/GenerateUsage'
+          allOf:
+            - $ref: '#/components/schemas/GenerateUsage'
+          nullable: true
+          description: Measured token usage, or null when the selected provider does not report it.
         execution:
           $ref: '#/components/schemas/BatchExecutionReport'
           description: Observed execution path. Omitted by older compatible servers.
@@ -3208,89 +3177,6 @@ components:
             index:
               type: integer
               description: Original input image index.
-    TranscribeRequest:
-      type: object
-      required:
-        - model
-        - audio
-      properties:
-        model:
-          type: string
-          minLength: 1
-          description: Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
-          example: openai/whisper-tiny
-        audio:
-          type: string
-          format: byte
-          description: Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
-        language:
-          type: string
-          description: Force specific language for transcription (optional, model-dependent)
-          example: en
-        timestamps:
-          type: boolean
-          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
-        diarization:
-          type: boolean
-          description: Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
-    TranscribeResponse:
-      type: object
-      required:
-        - object
-        - data
-        - model
-        - usage
-      properties:
-        object:
-          type: string
-          enum:
-            - list
-          description: Object type, always "list"
-        data:
-          type: array
-          items:
-            $ref: '#/components/schemas/TranscribeObject'
-          description: Transcription result objects.
-        model:
-          type: string
-          description: Name of model used for transcription
-        usage:
-          $ref: '#/components/schemas/GenerateUsage'
-    TranscribeObject:
-      type: object
-      required:
-        - object
-        - index
-        - text
-      properties:
-        object:
-          type: string
-          enum:
-            - transcription
-        index:
-          type: integer
-          description: Input audio index.
-        text:
-          type: string
-          description: Transcribed text from the audio
-          example: Hello, how are you today?
-        language:
-          type: string
-          description: Detected or forced language
-          example: en
-        duration_ms:
-          type: integer
-          description: Decoded clip duration in milliseconds.
-        segments:
-          type: array
-          items:
-            $ref: '#/components/schemas/DictationSegment'
-          description: Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip.
-        speakers:
-          type: array
-          items:
-            type: string
-          description: Speaker labels found by diarization, in order of first appearance. Present only when `diarization` was requested.
     DictationStyle:
       type: string
       description: |
@@ -3324,7 +3210,7 @@ components:
           example: en
         timestamps:
           type: boolean
-          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
+          description: Enable timestamp-aware decoding. Omitted preserves the dictation default (on).
         cleanup_model:
           type: string
           description: Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
@@ -3765,6 +3651,8 @@ components:
       type: object
       description: Information about a model including its capabilities
       properties:
+        audio_read:
+          $ref: '#/components/schemas/AudioReadCapabilities'
         chunking_limits:
           type: object
           additionalProperties:

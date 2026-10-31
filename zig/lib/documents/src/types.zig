@@ -113,7 +113,39 @@ pub const InheritedPart = struct {
     background_visual: bool,
     conditional_content: bool = false,
 };
+/// Audio hints apply only to recognition. A language forces the decoder; omitted
+/// language is detected by backends that support detection. No cleanup is implied.
+pub const AudioReadOptions = struct {
+    language: ?[]const u8 = null,
+    timestamps: ?bool = null,
+    diarization: ?bool = null,
+
+    pub fn withDefaults(self: @This(), defaults: @This()) @This() {
+        return .{ .language = self.language orelse defaults.language, .timestamps = self.timestamps orelse defaults.timestamps, .diarization = self.diarization orelse defaults.diarization };
+    }
+};
+pub const AudioSegment = struct {
+    text: []const u8,
+    granularity: enum { phrase, window } = .phrase,
+    /// Milliseconds relative to the original recording, including after windowing.
+    start_ms: u64,
+    end_ms: u64,
+    /// Half-open UTF-8 byte range in the containing read result's text.
+    text_start: usize,
+    text_end: usize,
+    speaker: ?[]const u8 = null,
+};
+pub const AudioMetadata = struct {
+    duration_ms: u64,
+    language: ?[]const u8 = null,
+    language_source: enum { forced, detected, unknown } = .unknown,
+    /// Null means temporal alignment was not requested or is unavailable.
+    segments: ?[]const AudioSegment = null,
+    speakers: ?[]const []const u8 = null,
+};
+
 pub const Page = struct {
+    audio: ?AudioMetadata = null,
     object: []const u8 = "read",
     index: usize = 0,
     source_id: []const u8,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -32,7 +32,8 @@ class InferenceReadResponse:
             handle.
         events (list[InferenceReadResponseEventsItem] | Unset): Bounded progress and audit events. These contain model
             names and source IDs, never credentials.
-        usage (InferenceGenerateUsage | Unset):
+        usage (InferenceGenerateUsage | None | Unset): Measured token usage, or null when the selected provider does not
+            report it.
         execution (InferenceBatchExecutionReport | Unset): Observed executor behavior, not a capability prediction.
     """
 
@@ -41,11 +42,13 @@ class InferenceReadResponse:
     model: str
     document: InferenceReadResponseDocument | Unset = UNSET
     events: list[InferenceReadResponseEventsItem] | Unset = UNSET
-    usage: InferenceGenerateUsage | Unset = UNSET
+    usage: InferenceGenerateUsage | None | Unset = UNSET
     execution: InferenceBatchExecutionReport | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.inference_generate_usage import InferenceGenerateUsage
+
         object_ = self.object_.value
 
         data = []
@@ -66,9 +69,13 @@ class InferenceReadResponse:
                 events_item = events_item_data.to_dict()
                 events.append(events_item)
 
-        usage: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.usage, Unset):
+        usage: dict[str, Any] | None | Unset
+        if isinstance(self.usage, Unset):
+            usage = UNSET
+        elif isinstance(self.usage, InferenceGenerateUsage):
             usage = self.usage.to_dict()
+        else:
+            usage = self.usage
 
         execution: dict[str, Any] | Unset = UNSET
         if not isinstance(self.execution, Unset):
@@ -130,12 +137,22 @@ class InferenceReadResponse:
 
                 events.append(events_item)
 
-        _usage = d.pop("usage", UNSET)
-        usage: InferenceGenerateUsage | Unset
-        if isinstance(_usage, Unset):
-            usage = UNSET
-        else:
-            usage = InferenceGenerateUsage.from_dict(_usage)
+        def _parse_usage(data: object) -> InferenceGenerateUsage | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                usage_type_1 = InferenceGenerateUsage.from_dict(data)
+
+                return usage_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(InferenceGenerateUsage | None | Unset, data)
+
+        usage = _parse_usage(d.pop("usage", UNSET))
 
         _execution = d.pop("execution", UNSET)
         execution: InferenceBatchExecutionReport | Unset

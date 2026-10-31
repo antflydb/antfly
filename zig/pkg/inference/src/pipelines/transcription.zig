@@ -134,6 +134,7 @@ pub const TranscribeResult = struct {
     temperature: f32 = 0,
     /// True when the window was judged silence; `text` is empty then.
     silent: bool = false,
+    truncated: bool = false,
 
     pub fn deinit(self: *TranscribeResult) void {
         self.allocator.free(self.text);
@@ -378,6 +379,7 @@ pub const TranscriptionPipeline = struct {
             .compression_ratio = attempt.compression_ratio,
             .temperature = attempt.temperature,
             .silent = silent,
+            .truncated = !silent and !attempt.completed,
         };
     }
 
@@ -400,6 +402,7 @@ pub const TranscriptionPipeline = struct {
 
     /// One full decode of the window at `temperature` (0 = greedy).
     const Attempt = struct {
+        completed: bool = false,
         generated: std.ArrayListUnmanaged(i32),
         detected_language: ?[]const u8,
         no_speech_prob: f32,
@@ -668,6 +671,7 @@ pub const TranscriptionPipeline = struct {
         defer allocator.free(text);
         return .{
             .generated = generated,
+            .completed = completed,
             .detected_language = detected_language,
             .no_speech_prob = no_speech_prob,
             .avg_logprob = avg_logprob,
@@ -792,7 +796,7 @@ pub const TranscriptionPipeline = struct {
                 // encode the lookahead; the cache is consistent with
                 // `dec_len` either way.
                 try self.output_token_budget.check();
-                return dec_len.* >= max_len;
+                return false;
             }
             try decoder.submit();
             slot = 1 - slot;

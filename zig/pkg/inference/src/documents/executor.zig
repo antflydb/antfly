@@ -22,6 +22,7 @@ const ir = @import("representation.zig");
 const support = @import("source_support.zig");
 pub const Action = c.Action;
 pub const Candidate = struct {
+    audio: ?@import("antfly_documents").types.AudioMetadata = null,
     model: ?[]const u8 = null,
     status: ?c.Status = null,
     origin: c.Origin = .transcription,
@@ -293,6 +294,7 @@ fn applyPage(a: A, supplied: c.Page, candidate: Candidate, model: []const u8, li
     var page = supplied;
     if (candidate.silent_audio and (page.kind != .audio or candidate.text.len != 0 or candidate.truncated)) return error.InvalidDocumentModelResult;
     try ir.finding(a, &page, "audio_silence", candidate.silent_audio);
+    page.audio = if (candidate.audio) |audio| try std.json.parseFromSliceLeaky(@import("antfly_documents").types.AudioMetadata, a, try std.json.Stringify.valueAlloc(a, audio, .{}), .{}) else null;
     page.text = try a.dupe(u8, candidate.text);
     page.regions = try ir.cloneRegions(a, candidate.regions, limit);
     page.tables = try ir.cloneTables(a, candidate.tables, limit);

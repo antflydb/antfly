@@ -60,6 +60,15 @@ pub fn mediaTypeEssence(value: []const u8) ![]const u8 {
     return data_uri.mediaTypeEssence(value);
 }
 
+/// Normalize all audio transports to a source URL. Complete URLs are borrowed;
+/// a bare base64 recording is wrapped using the caller's invocation arena.
+pub fn audioSourceUrl(a: Allocator, value: []const u8) ![]const u8 {
+    if (value.len == 0) return error.InvalidDocumentSource;
+    const url = if (data_uri.hasScheme(value) or std.mem.startsWith(u8, value, "https://") or std.mem.startsWith(u8, value, "http://") or std.mem.startsWith(u8, value, "s3://")) value else try std.fmt.allocPrint(a, "data:application/octet-stream;base64,{s}", .{value});
+    if (try data_uri.parse(url)) |parsed| _ = try parsed.decodedSize();
+    return url;
+}
+
 pub const InlineContentTrust = enum {
     untrusted,
     trusted_internal,
@@ -78,6 +87,7 @@ pub const DocumentSource = struct {
 pub const Request = struct {
     /// Base64 or data URI audio (including audio tracks in video containers).
     audio: ?[]const u8 = null,
+    audio_options: ?inference_api.AudioReadOptions = null,
     images: []const []const u8 = &.{},
     documents: []const DocumentSource = &.{},
     prompt: ?[]const u8 = null,
@@ -639,6 +649,7 @@ const AntflyReaderState = struct {
                 .model = self.model,
                 .documents = if (req.documents.len > 0) @as(?[]const DocumentSource, req.documents) else null,
                 .audio = req.audio,
+                .audio_options = req.audio_options,
                 .prompt = req.prompt orelse self.prompt,
                 .max_tokens = req.max_tokens orelse self.max_tokens,
             }, .{ .emit_null_optional_fields = false });
@@ -1651,13 +1662,13 @@ fn decodeReadBatch(a: Allocator, json: []const u8, expected_images: ?usize) !Bat
         };
     }
     var usage: ?inference_api.GenerateUsage = null;
-    if (parsed.value.object.get("usage")) |value| {
+    if (parsed.value.object.get("usage")) |value| if (value != .null) {
         var decoded = try std.json.parseFromValue(inference_api.GenerateUsage, a, value, .{ .ignore_unknown_fields = true });
         defer decoded.deinit();
         const counts = decoded.value;
         if (counts.prompt_tokens < 0 or counts.completion_tokens < 0 or counts.total_tokens < 0) return error.InvalidReadExecutionReport;
         usage = counts;
-    }
+    };
     var execution = try batchExecutionFromWire(null, out.len);
     if (parsed.value.object.get("execution")) |value| if (value != .null) {
         var decoded = try std.json.parseFromValue(inference_api.BatchExecutionReport, a, value, .{ .ignore_unknown_fields = true });

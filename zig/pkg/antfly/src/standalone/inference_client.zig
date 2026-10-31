@@ -507,6 +507,7 @@ fn cloneTranscriptionResponse(
         .speakers = null,
     };
     errdefer transcribing.deinitResponse(alloc, &out);
+    out.status = if (response.status) |value| try alloc.dupe(u8, value) else null;
     out.language = if (response.language) |value| try alloc.dupe(u8, value) else null;
     if (response.segments) |segments| {
         const owned = try alloc.alloc(transcribing.Segment, segments.len);

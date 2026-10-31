@@ -81,6 +81,13 @@ const StructureBudget = struct {
 };
 
 pub fn validatePage(page: c.Page, limit: usize) !void {
+    if (page.audio) |audio| {
+        if (page.kind != .audio or page.coordinate_space != .none) return error.InvalidDocumentModelResult;
+        if (audio.segments) |segments| for (segments) |segment| {
+            if (segment.start_ms > segment.end_ms or segment.end_ms > audio.duration_ms or segment.text_start > segment.text_end or segment.text_end > page.text.len or
+                !std.mem.eql(u8, segment.text, page.text[segment.text_start..segment.text_end])) return error.InvalidDocumentModelResult;
+        };
+    }
     var budget = StructureBudget.init(limit);
     try budget.regions(page.regions, 0);
     try budget.tables(page.tables);

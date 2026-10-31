@@ -13,6 +13,7 @@ from ..models.inference_read_result_status import InferenceReadResultStatus
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.inference_audio_read_metadata import InferenceAudioReadMetadata
     from ..models.inference_read_result_fields_type_0 import InferenceReadResultFieldsType0
     from ..models.inference_read_result_inherited_parts_item import InferenceReadResultInheritedPartsItem
     from ..models.inference_read_result_raster_to_source_type_0 import InferenceReadResultRasterToSourceType0
@@ -31,6 +32,8 @@ class InferenceReadObject:
         text (str): Extracted text from the image Example: Invoice Total: $123.45.
         object_ (InferenceReadObjectObject):
         index (int): Original input image index.
+        audio (InferenceAudioReadMetadata | Unset): Recognition evidence for the audio track only. Video frames are not
+            captioned. Absent segments and speakers make no alignment or speaker claim.
         source_id (str | Unset): Original document source ID.
         number (int | Unset): One-based original page or slide number.
         kind (InferenceReadResultKind | Unset):
@@ -58,6 +61,7 @@ class InferenceReadObject:
     text: str
     object_: InferenceReadObjectObject
     index: int
+    audio: InferenceAudioReadMetadata | Unset = UNSET
     source_id: str | Unset = UNSET
     number: int | Unset = UNSET
     kind: InferenceReadResultKind | Unset = UNSET
@@ -84,6 +88,10 @@ class InferenceReadObject:
         object_ = self.object_.value
 
         index = self.index
+
+        audio: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.audio, Unset):
+            audio = self.audio.to_dict()
 
         source_id = self.source_id
 
@@ -161,6 +169,8 @@ class InferenceReadObject:
                 "index": index,
             }
         )
+        if audio is not UNSET:
+            field_dict["audio"] = audio
         if source_id is not UNSET:
             field_dict["source_id"] = source_id
         if number is not UNSET:
@@ -196,6 +206,7 @@ class InferenceReadObject:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_audio_read_metadata import InferenceAudioReadMetadata
         from ..models.inference_read_result_fields_type_0 import InferenceReadResultFieldsType0
         from ..models.inference_read_result_inherited_parts_item import InferenceReadResultInheritedPartsItem
         from ..models.inference_read_result_raster_to_source_type_0 import InferenceReadResultRasterToSourceType0
@@ -209,6 +220,13 @@ class InferenceReadObject:
         object_ = InferenceReadObjectObject(d.pop("object"))
 
         index = d.pop("index")
+
+        _audio = d.pop("audio", UNSET)
+        audio: InferenceAudioReadMetadata | Unset
+        if isinstance(_audio, Unset):
+            audio = UNSET
+        else:
+            audio = InferenceAudioReadMetadata.from_dict(_audio)
 
         source_id = d.pop("source_id", UNSET)
 
@@ -315,6 +333,7 @@ class InferenceReadObject:
             text=text,
             object_=object_,
             index=index,
+            audio=audio,
             source_id=source_id,
             number=number,
             kind=kind,

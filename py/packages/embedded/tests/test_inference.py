@@ -20,6 +20,7 @@ zig/CAPI.md "Inference" and antfly.h).
 
 from __future__ import annotations
 
+import base64
 import glob
 import json
 import os
@@ -41,6 +42,61 @@ def _has_qwen_embedding_model() -> bool:
 
 
 PULL_TEST_MODEL = os.environ.get("ANTFLY_INFERENCE_PULL_TEST_MODEL")
+
+
+@pytest.mark.parametrize("backend", ["whisper", "gemma"])
+def test_qualified_audio_read_and_retained_extraction(backend: str) -> None:
+    """Opt-in installed-model qualification; never download model weights."""
+    models = os.environ.get("ANTFLY_AUDIO_READ_QUALIFICATION_MODELS_DIR")
+    model = os.environ.get(f"ANTFLY_AUDIO_READ_QUALIFICATION_{backend.upper()}")
+    extractor = os.environ.get("ANTFLY_AUDIO_READ_QUALIFICATION_EXTRACTOR")
+    if not models or not model or not extractor:
+        pytest.skip("audio read qualification models were not selected")
+    fixture = Path(__file__).resolve().parents[4] / "zig/e2e/inference/testdata/whisper_quality.wav"
+    audio = "data:audio/wav;base64," + base64.b64encode(fixture.read_bytes()).decode()
+    with antfly_embedded.Inference.open(
+        models_dir=models,
+        process_memory_budget_mb=24576,
+        call_timeout_ms=120_000,
+    ) as inference:
+        unsupported = (
+            {"audio_options": {"timestamps": True}} if backend == "gemma" else {"prompt": "Rewrite the transcript"}
+        )
+        with pytest.raises(errors.AntflyError, match="UnsupportedAudioReadCapability"):
+            inference.read({"model": model, "audio": "https://example.invalid/must-not-fetch.wav", **unsupported})
+        with pytest.raises(errors.AntflyError):
+            inference.read({"model": model, "audio": audio, "images": []})
+        options = {"audio_options": {"language": "en", "timestamps": True}} if backend == "whisper" else {}
+        reading = inference.read({"model": model, "audio": audio, "retain_artifact": True, **options})
+        item = reading["data"][0]
+        assert item["status"] == "complete"
+        assert item["kind"] == "audio" and item["coordinate_space"] == "none"
+        assert item["origin"] == "transcription"
+        assert all(word in item["text"].lower() for word in ("fox", "dog"))
+        assert item["audio"]["duration_ms"] == 2496
+        if backend == "whisper":
+            assert item["audio"]["language_source"] == "forced"
+            assert item["audio"]["segments"]
+        else:
+            assert item["audio"]["segments"] is None
+            assert item["audio"]["speakers"] is None
+        handle = reading["document"]["artifact_id"]
+        assert len(handle) == 64
+        extracted = inference.extract(
+            {
+                "model": extractor,
+                "schema_version": 2,
+                "schema": {"entities": ["animal"]},
+                "options": {"include_spans": True},
+                "read_artifact": handle,
+            }
+        )
+        assert extracted["data"][0]["entities"]
+        assert extracted["data"][0]["entities"][0]["evidence"][0]["origin"] == "transcription"
+        assert extracted["usage"]["physical_model_calls"] == 1
+        if backend == "gemma":
+            partial = inference.read({"model": model, "audio": audio, "max_tokens": 1})
+            assert partial["data"][0]["status"] == "truncated"
 
 
 # -- open / close -------------------------------------------------------------
