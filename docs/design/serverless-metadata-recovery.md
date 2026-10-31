@@ -552,3 +552,25 @@ Both orders are retained. A 512-document flags-off forward outlier must not be u
 The first prototype found and corrected three integration issues before final measurement: point I/O sharing metadata proof lanes and disabling native read-state reuse; the new facts-root version receiving lower immutable-hint priority than the previous format; and a BigInt metric silently omitting reuse diagnostics. Interrupted matrices, original failures and partial cases remain exploratory and explicitly preserved. No gate, resource limit or freshness threshold was relaxed.
 
 No new cloud resources were created. Existing account authentication was verified read-only. The local evidence does not justify promoting the combined profile to a hosted qualification candidate. Placement remains a separate hosted experiment because fetch placement cannot establish RPC or Durable Object location; the collector now retains bounded recognized placement headers. The historical hosted `SQLITE_NOMEM`, complete live diagnostic reconciliation, hour-long paired trials and physical cold samples remain open.
+
+
+### Bounded-serving evidence closure
+
+`examples/cloudflare-serverless/dist/qualification/serving-v2-sealed-1793422718995/evidence.json` preserves **1,201
+verified artifacts / 4,046,650,131 bytes**, SHA-256
+`e342b56fb147750b14f23bc26d09d07911cc1460445458c69828c9aabfb6ec49`. The closure retains all final and exploratory reports,
+interrupted-driver records, measured source archives, the previous local
+candidate, production/test modules, native test binaries and final validation
+logs. Source archive `bbdf7b9c4a` includes the measured results; this reference is
+added afterward. The original overwritten prototype module remains unavailable
+and is not treated as final evidence. Credential files and the seal's own
+post-write summary are excluded.
+
+All five preceding corrected closures and their recorded window references
+reverify with zero missing or changed artifacts (293, 2,196, 517, 568 and 1,069
+artifacts). The original invalid 516-artifact self-summary and older 163-artifact
+availability gap remain historical. These closures preserve evidence; they do
+not convert local results into a hosted qualification pass. Guarded cache cleanup
+was attempted and skipped because a native build was active or process inspection
+was unavailable; the guard was not bypassed. Successful native test binaries
+were frozen before that attempt.

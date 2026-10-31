@@ -232,3 +232,10 @@ hosted results and failures above remain unchanged. No new cloud resources or
 credentials were created; existing account authentication was checked read-only.
 The original hosted gate, whole-window coverage and live `SQLITE_NOMEM` remain
 open. Injected-error tests establish lifetime/error retention, not the live cause.
+
+
+The local evidence closure is `examples/cloudflare-serverless/dist/qualification/serving-v2-sealed-1793422718995/evidence.json`:
+**1,201 verified artifacts / 4,046,650,131 bytes**, SHA-256
+`e342b56fb147750b14f23bc26d09d07911cc1460445458c69828c9aabfb6ec49`. All five preceding corrected closures and recorded
+window references reverify unchanged. Credentials are excluded. This preserves
+local comparisons and failed attempts, not a new hosted gate pass.
