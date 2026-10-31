@@ -28,14 +28,10 @@ case "$("$nvcc" --version)" in
   *) echo "Use CUDA 13.0 to reproduce the driver-13.0-compatible PTX image" >&2; exit 2 ;;
 esac
 mkdir -p "$output_dir"
-"$nvcc" -ptx -arch=compute_80 -O3 "$pkg_root/src/ops/cuda/prototypes/vision_projection_programs.cu" -o "$output_dir/lighton_vision.ptx"
-"${PYTHON:-python3}" - "$output_dir/lighton_vision.ptx" <<'PY'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-p.write_bytes(p.read_bytes().rstrip(b"\n") + b"\n")
-PY
-cmp "$pkg_root/src/ops/cuda/lighton_vision.ptx" "$output_dir/lighton_vision.ptx"
+"${PYTHON:-python3}" "$pkg_root/scripts/regen_cuda_standalone.py" \
+  --root "$repo_root" --nvcc "$nvcc" --family vision_projection_bf16 \
+  --report "$output_dir/native-image-identity.json"
+cp "$pkg_root/src/ops/cuda/lighton_vision.ptx" "$output_dir/lighton_vision.ptx"
 "${PYTHON:-python3}" "$pkg_root/scripts/lightonocr3/make_cuda_vision_oracle.py" \
   --prototype "$pkg_root/src/ops/cuda/prototypes/vision_projection_programs.cu" \
   --reference "$pkg_root/src/ops/cuda/artifacts/inference_cuda_kernels.cu" \

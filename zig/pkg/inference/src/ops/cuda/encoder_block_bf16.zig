@@ -93,11 +93,15 @@ pub const Module = struct {
         try self.program.init(ctx);
     }
 
-    pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
-        self.up.deinit(ctx);
-        self.down.deinit(ctx);
-        self.program.deinitChecked(ctx) catch return;
+    pub fn deinitChecked(self: *Module, ctx: anytype) !void {
+        try self.up.deinitChecked(ctx);
+        try self.down.deinitChecked(ctx);
+        try self.program.deinitChecked(ctx);
         self.* = .{};
+    }
+
+    pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
+        self.deinitChecked(ctx) catch {};
     }
 
     fn launch(self: *Module, ctx: *context.CudaContext, function: Program.Entry, grid: usize, args: []?*anyopaque) !void {

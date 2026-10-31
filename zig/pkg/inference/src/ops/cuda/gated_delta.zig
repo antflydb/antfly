@@ -118,31 +118,8 @@ comptime {
 }
 
 // Native export names remain the compatibility ABI of the qualified PTX.
-const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("lighton_recurrent.ptx") ++ "\x00", .{
-    .causal_conv = "antfly_gdn_causal_conv",
-    .normalize_qk = "lighton_normalize",
-    .recurrent = "lighton_recurrent",
-    .gated_norm = "lighton_gated_norm",
-    .batch_causal_conv = "lighton_batch_conv",
-    .batch_recurrent = "lighton_batch_recurrent",
-    .batch_conv_normalize = "lighton_batch_conv_normalize",
-    .batch_recurrent_norm = "lighton_batch_recurrent_norm",
-    .batch_conv_normalize_cached_gates = "lighton_batch_conv_normalize_cached_gates",
-    .batch_recurrent_norm_cached_gates = "lighton_batch_recurrent_norm_cached_gates",
-    .conv_cached_gates = "lighton_conv_cached_gates",
-    .recurrent_cached_gates = "lighton_recurrent_cached_gates",
-    .split_projections = "lighton_split_projections",
-    .prefix_conv_normalize_cached_gates = "lighton_prefix_conv_normalize_cached_gates",
-    .prefix_batch_conv_normalize = "lighton_prefix_batch_conv_normalize",
-    .prefix_batch_recurrent = "lighton_prefix_batch_recurrent",
-    .prefix_batch_recurrent_shared_qk = "lighton_prefix_batch_recurrent_shared_qk",
-    .ragged_conv_normalize_cached_gates = "lighton_ragged_conv_normalize_cached_gates",
-    .ragged_recurrent_shared_qk = "lighton_ragged_recurrent_shared_qk",
-    .ragged_prefix_conv = "lighton_ragged_prefix_conv",
-    .ragged_recurrent_prefix_only = "lighton_ragged_recurrent_prefix_only",
-    .ragged_prefix_gated_norm = "lighton_ragged_prefix_gated_norm",
-    .decode_fused_p2 = "lighton_decode_fused_p2",
-});
+const catalog = @import("../../tile/cuda_standalone.zig");
+const Program = @import("embedded_module.zig").EmbeddedModule(@import("embedded_module.zig").profile(catalog.gated_delta).image, catalog.gated_delta_entries);
 
 pub const Module = struct {
     program: Program = .{},
@@ -181,8 +158,11 @@ pub const Module = struct {
     }
 
     pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
-        if (self.bf16_prefill) |*prefill| prefill.deinit(ctx);
-        self.program.deinit(ctx);
+        if (self.bf16_prefill) |*prefill| {
+            prefill.deinitChecked(ctx) catch return;
+            self.bf16_prefill = null;
+        }
+        self.program.deinitChecked(ctx) catch return;
         self.* = .{};
     }
 

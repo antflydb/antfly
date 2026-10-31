@@ -21,14 +21,31 @@ const context = @import("context.zig");
 const driver = @import("driver.zig");
 
 pub fn EmbeddedModule(comptime image: [:0]const u8, comptime entries: anytype) type {
-    const fields = @typeInfo(@TypeOf(entries)).@"struct".field_names;
+    return Module(image, entries);
+}
+
+/// Architecture selection stays in the caller; the owner shares lookup and retirement.
+pub fn SelectedModule(comptime entries: anytype) type {
+    return Module(null, entries);
+}
+
+fn Module(comptime image: ?[:0]const u8, comptime entries: anytype) type {
+    const enum_entries = @TypeOf(entries) == type;
+    const fields = if (enum_entries) @typeInfo(entries).@"enum".field_names else @typeInfo(@TypeOf(entries)).@"struct".field_names;
+    comptime {
+        if (enum_entries) for (fields, 0..) |field, index| {
+            if (@backingInt(@field(entries, field)) != index)
+                @compileError("CUDA entry enums must use dense declaration order");
+        };
+    }
     return struct {
         const Self = @This();
-        pub const Entry = std.meta.FieldEnum(@TypeOf(entries));
+        pub const Entry = if (enum_entries) entries else std.meta.FieldEnum(@TypeOf(entries));
         module: driver.CUmodule = null,
+        pending_module: driver.CUmodule = null,
         functions: [fields.len]driver.CUfunction = @splat(null),
 
-        pub fn function(self: *const Self, entry: Entry) driver.CUfunction {
+        pub inline fn function(self: *const Self, entry: Entry) driver.CUfunction {
             return self.functions[@backingInt(entry)];
         }
 
@@ -42,24 +59,37 @@ pub fn EmbeddedModule(comptime image: [:0]const u8, comptime entries: anytype) t
         pub fn init(self: *Self, ctx: *context.CudaContext) !void {
             try ctx.makeCurrent();
             if (self.module != null) return;
-            try self.load(&ctx.driver);
+            try self.initCurrent(&ctx.driver);
         }
 
-        fn load(self: *Self, api: anytype) !void {
+        /// Initialize a fixed image after the caller selected its context.
+        pub fn initCurrent(self: *Self, api: anytype) !void {
+            try self.loadCurrent(api, comptime image orelse @compileError("selected images require loadCurrent"));
+        }
+
+        /// Caller has selected the context. Success adds no context/driver calls
+        /// on cached access; failed retirement is retried before another load.
+        pub fn loadCurrent(self: *Self, api: anytype, bytes: []const u8) !void {
+            if (self.module != null) return;
             const names: [fields.len][:0]const u8 = comptime blk: {
                 var result: [fields.len][:0]const u8 = undefined;
-                for (fields, 0..) |field, i| result[i] = @field(entries, field);
+                for (fields, 0..) |field, i| result[i] = if (enum_entries) field else @field(entries, field);
                 break :blk result;
             };
-            const loaded = try loadImage(api, image, names);
+            const loaded = try loadImage(api, bytes, names, &self.pending_module);
             self.* = .{ .module = loaded.module, .functions = loaded.functions };
         }
 
         pub fn deinitChecked(self: *Self, ctx: anytype) !void {
-            if (self.module == null) return;
+            if (self.module == null and self.pending_module == null) return;
             try ctx.makeCurrent();
-            try ctx.driver.check(ctx.driver.fns.cuModuleUnload(self.module));
-            self.* = .{};
+            try self.deinitCurrent(&ctx.driver);
+        }
+
+        pub fn deinitCurrent(self: *Self, api: anytype) !void {
+            try unloadImage(api, &self.module);
+            self.functions = @splat(null);
+            try unloadImage(api, &self.pending_module);
         }
 
         pub fn deinit(self: *Self, ctx: *context.CudaContext) void {
@@ -92,9 +122,10 @@ pub fn EmbeddedPrograms(comptime descriptors: anytype) type {
         const Self = @This();
         pub const Program = std.meta.FieldEnum(@TypeOf(descriptors));
         modules: [fields.len]driver.CUmodule = @splat(null),
+        pending_modules: [fields.len]driver.CUmodule = @splat(null),
         functions: [fields.len]driver.CUfunction = @splat(null),
 
-        pub fn function(self: *const Self, program: Program) driver.CUfunction {
+        pub inline fn function(self: *const Self, program: Program) driver.CUfunction {
             return self.functions[@backingInt(program)];
         }
 
@@ -108,18 +139,18 @@ pub fn EmbeddedPrograms(comptime descriptors: anytype) type {
         fn load(self: *Self, api: anytype, program: Program) !void {
             const index = @backingInt(program);
             const image = images[index];
-            const loaded = try loadImage(api, image.image, [_][:0]const u8{image.entry});
+            const loaded = try loadImage(api, image.image, [_][:0]const u8{image.entry}, &self.pending_modules[index]);
             self.modules[index] = loaded.module;
             self.functions[index] = loaded.functions[0];
         }
 
         pub fn deinitChecked(self: *Self, ctx: anytype) !void {
             try ctx.makeCurrent();
-            for (&self.modules, &self.functions) |*module, *handle| if (module.* != null) {
-                try ctx.driver.check(ctx.driver.fns.cuModuleUnload(module.*));
-                module.* = null;
+            for (&self.modules, &self.pending_modules, &self.functions) |*module, *pending, *handle| {
+                try unloadImage(&ctx.driver, module);
                 handle.* = null;
-            };
+                try unloadImage(&ctx.driver, pending);
+            }
         }
 
         pub fn deinit(self: *Self, ctx: *context.CudaContext) void {
@@ -132,10 +163,19 @@ fn LoadedImage(comptime count: usize) type {
     return struct { module: driver.CUmodule, functions: [count]driver.CUfunction };
 }
 
-fn loadImage(api: anytype, image: [:0]const u8, names: anytype) !LoadedImage(names.len) {
+fn unloadImage(api: anytype, module: *driver.CUmodule) !void {
+    if (module.* == null) return;
+    try api.check(api.fns.cuModuleUnload(module.*));
+    module.* = null;
+}
+
+fn loadImage(api: anytype, image: []const u8, names: anytype, pending: *driver.CUmodule) !LoadedImage(names.len) {
+    try unloadImage(api, pending);
     var module: driver.CUmodule = null;
     try api.check(api.fns.cuModuleLoadDataEx(&module, image.ptr, 0, null, null));
-    errdefer _ = api.fns.cuModuleUnload(module);
+    errdefer {
+        if (api.fns.cuModuleUnload(module) != 0) pending.* = module;
+    }
     var functions: [names.len]driver.CUfunction = @splat(null);
     inline for (0..names.len) |i| try api.check(api.fns.cuModuleGetFunction(&functions[i], module, names[i].ptr));
     return .{ .module = module, .functions = functions };
@@ -149,6 +189,7 @@ test "embedded CUDA program publishes all entries atomically and retries failed 
         var fail_load: bool = false;
         var fail_lookup: bool = true;
         var fail_unload: bool = false;
+        var fail_module: driver.CUmodule = null;
         fns: struct {
             cuModuleLoadDataEx: @TypeOf(&load) = &load,
             cuModuleGetFunction: @TypeOf(&lookup) = &lookup,
@@ -168,8 +209,8 @@ test "embedded CUDA program publishes all entries atomically and retries failed 
             out.* = @ptrFromInt(0x2000 + lookups * 16);
             return 0;
         }
-        fn unload(_: driver.CUmodule) c_int {
-            if (fail_unload) return 1;
+        fn unload(module: driver.CUmodule) c_int {
+            if (fail_unload or (fail_module != null and module == fail_module)) return 1;
             unloads += 1;
             return 0;
         }
@@ -180,16 +221,16 @@ test "embedded CUDA program publishes all entries atomically and retries failed 
     Mock.fail_lookup = true;
     var api: Mock = .{};
     var program: EmbeddedModule("image", .{ .first = "first", .second = "second" }) = .{};
-    try std.testing.expectError(error.MockDriverFailure, program.load(&api));
+    try std.testing.expectError(error.MockDriverFailure, program.initCurrent(&api));
     try std.testing.expectEqual(@as(usize, 0), Mock.unloads);
     Mock.fail_load = false;
-    try std.testing.expectError(error.MockDriverFailure, program.load(&api));
+    try std.testing.expectError(error.MockDriverFailure, program.initCurrent(&api));
     try std.testing.expect(program.module == null);
     try std.testing.expect(program.function(.first) == null);
     try std.testing.expect(program.function(.second) == null);
     try std.testing.expectEqual(@as(usize, 1), Mock.unloads);
     Mock.fail_lookup = false;
-    try program.load(&api);
+    try program.initCurrent(&api);
     try std.testing.expect(program.module != null);
     try std.testing.expect(program.function(.first) != null);
     try std.testing.expect(program.function(.second) != null);
@@ -243,4 +284,36 @@ test "embedded CUDA program publishes all entries atomically and retries failed 
     Mock.fail_unload = false;
     try program.deinitChecked(&current);
     try std.testing.expect(program.module == null);
+    var selected: SelectedModule(enum { first, second }) = .{};
+    Mock.lookups = 0;
+    Mock.fail_lookup = true;
+    Mock.fail_unload = true;
+    try std.testing.expectError(error.MockDriverFailure, selected.loadCurrent(&api, "selected-image"));
+    try std.testing.expect(selected.module == null and selected.pending_module != null);
+    try std.testing.expect(selected.function(.first) == null);
+    Mock.fail_lookup = false;
+    const lookups = Mock.lookups;
+    try std.testing.expectError(error.MockDriverFailure, selected.loadCurrent(&api, "selected-image"));
+    try std.testing.expectEqual(lookups, Mock.lookups);
+    Mock.fail_unload = false;
+    try selected.loadCurrent(&api, "selected-image");
+    try std.testing.expect(selected.pending_module == null and selected.function(.second) != null);
+    const ready_lookups = Mock.lookups;
+    try selected.loadCurrent(&api, "selected-image");
+    try std.testing.expectEqual(ready_lookups, Mock.lookups);
+    try selected.deinitChecked(&current);
+    try std.testing.expect(selected.module == null and selected.function(.first) == null);
+    // A parent must retain a failed child, even after another child retired.
+    var composite: @import("encoder_block_bf16.zig").Module = .{};
+    composite.up.programs.modules[0] = @ptrFromInt(0x3000);
+    composite.down.programs.pending_modules[0] = @ptrFromInt(0x4000);
+    composite.program.module = @ptrFromInt(0x5000);
+    Mock.fail_module = @ptrFromInt(0x4000);
+    try std.testing.expectError(error.MockDriverFailure, composite.deinitChecked(&current));
+    try std.testing.expect(composite.up.programs.modules[0] == null);
+    try std.testing.expectEqual(Mock.fail_module, composite.down.programs.pending_modules[0]);
+    try std.testing.expect(composite.program.module != null);
+    Mock.fail_module = null;
+    try composite.deinitChecked(&current);
+    try std.testing.expect(composite.down.programs.pending_modules[0] == null and composite.program.module == null);
 }

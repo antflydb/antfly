@@ -67,9 +67,13 @@ pub const Module = struct {
         try self.programs.init(ctx, @fromBackingInt(@intCast(index)));
     }
 
-    pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
-        self.programs.deinitChecked(ctx) catch return;
+    pub fn deinitChecked(self: *Module, ctx: anytype) !void {
+        try self.programs.deinitChecked(ctx);
         self.* = .{};
+    }
+
+    pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
+        self.deinitChecked(ctx) catch {};
     }
 
     pub fn run(self: *Module, ctx: *context.CudaContext, r: Request) !void {
@@ -148,9 +152,13 @@ pub const DownModule = struct {
         try self.programs.init(ctx, @fromBackingInt(@intCast(index)));
     }
 
-    pub fn deinit(self: *DownModule, ctx: *context.CudaContext) void {
-        self.programs.deinitChecked(ctx) catch return;
+    pub fn deinitChecked(self: *DownModule, ctx: anytype) !void {
+        try self.programs.deinitChecked(ctx);
         self.* = .{};
+    }
+
+    pub fn deinit(self: *DownModule, ctx: *context.CudaContext) void {
+        self.deinitChecked(ctx) catch {};
     }
 
     pub fn run(self: *DownModule, ctx: *context.CudaContext, r: DownRequest) !void {

@@ -27,4 +27,9 @@ pub const images = struct {
     pub const @"projection_residual_sm121_k4096_n1024_io_bf16.ptx" = @embedFile("../projection_residual_sm121_k4096_n1024_io_bf16.ptx") ++ "\x00";
     pub const @"projection_top1_bf16_k1024_n248320_partial.ptx" = @embedFile("../projection_top1_bf16_k1024_n248320_partial.ptx") ++ "\x00";
     pub const @"projection_top1_bf16_k1024_n248320_finish.ptx" = @embedFile("../projection_top1_bf16_k1024_n248320_finish.ptx") ++ "\x00";
+    pub const @"lighton_activation.ptx" = @embedFile("../lighton_activation.ptx") ++ "\x00";
+    pub const @"lighton_attention.ptx" = @embedFile("../lighton_attention.ptx") ++ "\x00";
+    pub const @"lighton_recurrent.ptx" = @embedFile("../lighton_recurrent.ptx") ++ "\x00";
+    pub const @"lighton_vision.ptx" = @embedFile("../lighton_vision.ptx") ++ "\x00";
+    pub const @"florence_fused.ptx" = @embedFile("../florence_fused.ptx") ++ "\x00";
 };

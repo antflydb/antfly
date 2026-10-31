@@ -592,26 +592,19 @@ fn annexPacket(a: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8,
     }
 }
 
+const PreprocessProgram = @import("embedded_module.zig").EmbeddedModule(@embedFile("video_preprocess.ptx"), .{ .patches = "video_patches", .rgb8 = "video_rgb8" });
+
 pub const Preprocessor = struct {
     ctx: *context.CudaContext,
-    module: driver.CUmodule,
-    function: driver.CUfunction,
-    rgb_function: driver.CUfunction,
+    program: PreprocessProgram,
     pub fn init(a: std.mem.Allocator, ctx: *context.CudaContext) !Preprocessor {
         _ = a;
-        try ctx.makeCurrent();
-        var module: driver.CUmodule = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&module, @embedFile("video_preprocess.ptx").ptr, 0, null, null));
-        errdefer _ = ctx.driver.fns.cuModuleUnload(module);
-        var function: driver.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, "video_patches"));
-        var rgb_function: driver.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rgb_function, module, "video_rgb8"));
-        return .{ .ctx = ctx, .module = module, .function = function, .rgb_function = rgb_function };
+        var program: PreprocessProgram = .{};
+        try program.init(ctx);
+        return .{ .ctx = ctx, .program = program };
     }
     pub fn deinit(self: *Preprocessor) void {
-        self.ctx.makeCurrent() catch {};
-        _ = self.ctx.driver.fns.cuModuleUnload(self.module);
+        self.program.deinit(self.ctx);
     }
     pub fn rgb8(self: *Preprocessor, compute: *cuda.CudaCompute, frame: Frame) !ops.CT {
         if (frame.device == 0 or frame.width == 0 or frame.height == 0 or frame.width > 4096 or frame.height > 4096 or frame.pitch < frame.width or frame.width % 2 != 0 or frame.height % 2 != 0) return error.InvalidVideoGeometry;
@@ -626,7 +619,7 @@ pub const Preprocessor = struct {
         args[0] = &src;
         args[1] = &dst;
         for (&sizes, 2..) |*value, i| args[i] = value;
-        try self.ctx.driver.check(self.ctx.driver.fns.cuLaunchKernel(self.rgb_function, (frame.width * frame.height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null));
+        try self.ctx.driver.check(self.ctx.driver.fns.cuLaunchKernel(self.program.function(.rgb8), (frame.width * frame.height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null));
         self.ctx.noteKernelLaunch();
         return output;
     }
@@ -646,7 +639,7 @@ pub const Preprocessor = struct {
         args[1] = &dst;
         for (&sizes, 2..) |*value, i| args[i] = value;
         for (&normalization, 10..) |*value, i| args[i] = value;
-        try self.ctx.driver.check(self.ctx.driver.fns.cuLaunchKernel(self.function, (width * height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null));
+        try self.ctx.driver.check(self.ctx.driver.fns.cuLaunchKernel(self.program.function(.patches), (width * height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null));
         self.ctx.noteKernelLaunch();
         return output;
     }

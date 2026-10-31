@@ -170,7 +170,7 @@ On the qualified Linux toolchain, run:
 python3 -B zig/pkg/inference/scripts/regen_cuda_standalone.py --report RECEIPT.json
 ```
 
-The default checks all twelve images byte-for-byte. `--write` publishes images
+The default checks all seventeen catalog images byte-for-byte. `--write` publishes images
 only after every image's export contract passes. Scratch and compiler caches
 stay in the worktree. This path requires NVCC 13.0.88 and Triton 3.7.1; canonical
 multi-architecture fatbin generation separately uses NVCC 13.2.86.
@@ -203,3 +203,18 @@ must meet that reference; the baseline is never implicitly trusted as an oracle.
 A baseline reference failure remains a failure, even when the candidate passes.
 Export full and chunked-prefill logits to check state/position handling against
 the same independent decoder reference without widening the chunk parity gate.
+
+Standalone CUDA images share `EmbeddedModule` for fixed images and
+`SelectedModule` for architecture-selected images. A dense export enum can be
+used directly when its names are the device ABI. Use `initCurrent` or
+`loadCurrent` when the caller has already selected the context; preserve the
+qualified placement of context calls and cached returns. Keep launch geometry
+and parameter packing with the tuned schedule. Retire children through checked
+APIs before resetting their parent, so a failed unload remains retryable.
+
+The standalone catalog now owns 17 PTX images, including activation, paged
+attention, recurrence, vision and encoder/decoder families. Native NVCC flags
+are per-family precision policies. `cuda-standalone-check -- --family <name>`
+checks one exact family without requiring unrelated producer dependencies.
+Historical image filenames and exported symbols are compatibility contracts;
+new producer names describe operations and physical schedules.

@@ -1857,7 +1857,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/cuda/lighton_vision.ptx",
                     "src/ops/cuda/florence_fused.ptx",
                     "src/ops/cuda/prototypes/gated_delta_recurrent.cu",
-                    "src/ops/cuda/prototypes/lighton_batched_attention.cu",
+                    "src/ops/cuda/prototypes/paged_attention_bf16_programs.cu",
                     "src/ops/cuda/prototypes/bf16_activation_programs.cu",
                     "src/ops/cuda/prototypes/vision_projection_programs.cu",
                     "src/ops/cuda/prototypes/vision_f16_programs.cu",

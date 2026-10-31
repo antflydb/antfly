@@ -61,10 +61,16 @@ def main():
     parser.add_argument("--libdevice", default="/usr/local/cuda-13.0/nvvm/libdevice/libdevice.10.bc")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--write", action="store_true")
+    parser.add_argument("--family", action="append", help="Check only these exact operation families")
     args = parser.parse_args()
     root = args.root.resolve()
     cuda = root / "zig/pkg/inference/src/ops/cuda"
     specs = json.loads((cuda / "generated/standalone_programs.json").read_text())
+    if args.family:
+        unknown = set(args.family) - {spec["family"] for spec in specs}
+        if unknown:
+            parser.error("Unknown native program families: " + ", ".join(sorted(unknown)))
+        specs = [spec for spec in specs if spec["family"] in args.family]
     version = subprocess.check_output([args.nvcc, "--version"], text=True)
     if "V13.0.88" not in version:
         raise RuntimeError("Standalone regeneration requires NVCC 13.0.88")
@@ -81,8 +87,8 @@ def main():
             source = cuda / "prototypes" / producer
             if source.suffix == ".cu":
                 spec = profiles[0]
-                subprocess.run([args.nvcc, "--ptx", "-arch=sm_" + str(spec["target"]), "-O3",
-                                "--fmad=false", "-std=c++17", str(source), "-o", str(output / spec["file"])],
+                subprocess.run([args.nvcc, "--ptx", "-arch=compute_" + str(spec["target"]), "-O3",
+                                *spec["nvcc_flags"], str(source), "-o", str(output / spec["file"])],
                                env=env, check=True)
                 p = output / spec["file"]
                 p.write_bytes(p.read_bytes().rstrip() + b"\n")

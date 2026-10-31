@@ -49,15 +49,8 @@ comptime {
 }
 
 // Native export names remain the compatibility ABI of the qualified PTX.
-const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("lighton_attention.ptx") ++ "\x00", .{
-    .chunks_d128 = "lighton_attention_chunks",
-    .combine_d128 = "lighton_attention_combine",
-    .write_suffix = "lighton_attention_write_suffix",
-    .chunks128_d128 = "lighton_attention_chunks128",
-    .advance_graph = "lighton_graph_advance",
-    .grouped_chunks32_d128 = "lighton_attention_grouped_chunks32",
-    .grouped_chunks128_d128 = "lighton_attention_grouped_chunks128",
-});
+const catalog = @import("../../tile/cuda_standalone.zig");
+const Program = @import("embedded_module.zig").EmbeddedModule(@import("embedded_module.zig").profile(catalog.paged_attention_bf16).image, catalog.paged_attention_bf16_entries);
 
 pub const Module = struct {
     program: Program = .{},
@@ -67,10 +60,8 @@ pub const Module = struct {
     items: usize = 0,
 
     pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
-        if (self.program.module != null) {
-            self.program.deinit(ctx);
-            self.* = .{};
-        }
+        self.program.deinitChecked(ctx) catch return;
+        self.* = .{};
     }
     pub fn init(self: *Module, ctx: *context.CudaContext) !void {
         try self.program.init(ctx);

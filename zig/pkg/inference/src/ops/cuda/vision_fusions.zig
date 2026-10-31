@@ -17,13 +17,8 @@ const context = @import("context.zig");
 const driver = @import("driver.zig");
 
 // Native export names remain the compatibility ABI of the qualified PTX.
-const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("lighton_vision.ptx") ++ "\x00", .{
-    .layer_norm_bf16 = "lighton_vision_norm_bf16",
-    .bias_gelu_bf16 = "lighton_vision_bias_gelu_bf16",
-    .bias_residual_f32 = "lighton_vision_bias_residual_f32",
-    .split_qkv_rope_2d_bf16 = "antfly_qkv_rope_two_axis_bf16",
-    .learned_positions = "lighton_vision_learned_positions_f32",
-});
+const catalog = @import("../../tile/cuda_standalone.zig");
+const Program = @import("embedded_module.zig").EmbeddedModule(@import("embedded_module.zig").profile(catalog.vision_projection_bf16).image, catalog.vision_projection_bf16_entries);
 
 pub const Module = struct {
     program: Program = .{},
@@ -35,7 +30,7 @@ pub const Module = struct {
         try self.program.init(ctx);
     }
     pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
-        self.program.deinit(ctx);
+        self.program.deinitChecked(ctx) catch return;
         self.* = .{};
     }
     pub fn norm(self: *Module, ctx: *context.CudaContext, pointers: [4]driver.CUdeviceptr, rows: u32, dim: u32, epsilon: f32) !void {

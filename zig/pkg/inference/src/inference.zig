@@ -126,6 +126,9 @@ pub const native_compute = struct {
 };
 
 test {
+    // Keep host-only ownership/descriptor tests reachable under narrow filters.
+    if (!build_options.enable_wasm) _ = @import("ops/cuda/embedded_module.zig");
+    _ = @import("ops/kernel_geometry.zig");
     _ = server;
     _ = @import("extractors/gliner_span_long_executor.zig");
     _ = @import("architectures/modern_bert.zig");

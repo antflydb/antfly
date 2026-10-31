@@ -17,13 +17,8 @@ const context = @import("context.zig");
 const driver = @import("driver.zig");
 
 // Native export names remain the compatibility ABI of the qualified PTX.
-const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("lighton_activation.ptx") ++ "\x00", .{
-    .silu_product_f32 = "lighton_silu_up_bf16",
-    .packed_silu_product_f32 = "lighton_packed_silu_up_bf16",
-    .rms_f32 = "antfly_rms_tree_bf16",
-    .silu_product_bf16 = "lighton_silu_up_bf16_inputs",
-    .residual_f32 = "lighton_bf16_residual_f32",
-});
+const catalog = @import("../../tile/cuda_standalone.zig");
+const Program = @import("embedded_module.zig").EmbeddedModule(@import("embedded_module.zig").profile(catalog.activation_bf16).image, catalog.activation_bf16_entries);
 
 pub const Module = struct {
     program: Program = .{},
@@ -35,7 +30,7 @@ pub const Module = struct {
         try self.program.init(ctx);
     }
     pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
-        self.program.deinit(ctx);
+        self.program.deinitChecked(ctx) catch return;
         self.* = .{};
     }
     pub fn runSeparate(self: *Module, ctx: *context.CudaContext, pointers: [3]driver.CUdeviceptr, count: u32) !void {

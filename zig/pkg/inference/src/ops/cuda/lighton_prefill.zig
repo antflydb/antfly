@@ -74,10 +74,14 @@ pub const Module = struct {
         return self.scratch;
     }
 
-    pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
-        self.clearWorkspace(ctx) catch {};
+    pub fn deinitChecked(self: *Module, ctx: *context.CudaContext) !void {
+        try self.clearWorkspace(ctx);
         self.library.close();
         self.* = undefined;
+    }
+
+    pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
+        self.deinitChecked(ctx) catch {};
     }
 
     pub fn workspaceBytes(self: *const Module, packet: *const anyopaque) !usize {
