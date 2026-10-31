@@ -861,7 +861,10 @@ test "external lake Cypher execution reads immutable native document and graph c
         var diagnostic: cypher.compiler.Diagnostic = .{};
         var compiled = try cypher.compiler.compile(a, case.query, .{}, &diagnostic);
         defer compiled.deinit();
-        var result = try cypher.runtime.execute(a, client.backend(), graph, &compiled, &.{}, .{ .scanned_anchors = case.anchors });
+        var result = cypher.runtime.execute(a, client.backend(), graph, &compiled, &.{}, .{ .scanned_anchors = case.anchors }) catch |err| {
+            std.debug.print("owner planned query failed: {s}: {s}\n", .{ @errorName(err), case.query });
+            return err;
+        };
         defer result.deinit();
         try std.testing.expectEqual(case.count, result.rows[0][0].integer);
         try std.testing.expect(result.stats.scanned_anchors <= case.anchors);

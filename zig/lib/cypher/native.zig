@@ -487,10 +487,15 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     // equality scans. Unsupported values remain authoritative
                     // graph membership checks after the storage reader.
                     if (filter.op != .is_null and !filterCompatible(column.column_type, filter.value)) continue;
-                    // Large integer operands on DOUBLE need an exact binary64
-                    // admission proof; leave them to the scalar residual here.
-                    if (column.column_type == .number and filter.value == .integer and (filter.value.integer < -9007199254740992 or filter.value.integer > 9007199254740992)) continue;
-                    const value = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, filter.value, .{}), .{ .parse_numbers = false });
+                    const value: std.json.Value = if (column.column_type == .number and filter.value == .integer and (filter.value.integer < -9007199254740992 or filter.value.integer > 9007199254740992)) exact: {
+                        // Share ordinary native equality's binary64 proof. An
+                        // exactly representable large integer is a valid seek;
+                        // ranges and rounded integers remain scalar residuals.
+                        if (filter.op != .eq) continue;
+                        const number: f64 = @floatFromInt(filter.value.integer);
+                        if (@as(i128, @intFromFloat(number)) != @as(i128, filter.value.integer)) continue;
+                        break :exact .{ .float = number };
+                    } else try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, filter.value, .{}), .{ .parse_numbers = false });
                     try conditions.append(temporary, .{ .column = filter.property, .op = switch (filter.op) {
                         .eq => .eq,
                         .lt => .lt,

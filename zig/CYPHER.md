@@ -5042,3 +5042,12 @@ user filters, while still reporting their physical progress. The portable
 post-write regression combines reserved records with a user filter, and the
 public regression checks that rejected rows exhaust scan budgets and that a
 fully hidden population does not evaluate a failing scalar predicate.
+
+Count access hints preserve native binary64 equality admission. An INTEGER
+outside JavaScript's safe range may still be exactly representable by a DOUBLE
+index: equality converts it to binary64 only after an exact round trip through
+`i128`. Inexact integers and large-integer ranges remain scalar residuals.
+The existing public and retained-owner sparse-planning campaigns enforce
+one-anchor equality seeks for `9007199254740994`, including alongside unrelated
+sparse domains; these checks prevent a conservative conversion rule from
+silently replacing a valid index seek with a primary scan.
