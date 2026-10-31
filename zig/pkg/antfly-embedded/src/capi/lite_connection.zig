@@ -625,6 +625,10 @@ pub const Owner = struct {
     gate: *PathGate,
     connections: std.ArrayList(*Connection) = .empty,
     worker: ?std.Thread = null,
+    // The path gate permits one foreground lease wait per owner. The global
+    // debug Io cannot spawn tasks; this lazy pool supplies exactly the lock
+    // waiter and its deadline timer, and is shared by compatible connections.
+    path_lock_io: std.Io.Threaded,
     stopping: std.atomic.Value(bool) = .init(false),
     // One graph walk per owner. Admission waits without the foreground gate;
     // the worker only try-locks under that gate and yields to an active proof.
@@ -1690,6 +1694,7 @@ pub const Owner = struct {
         self.reader_coordinator.release();
         if (self.owned_ttl_owner_id) |id| alloc.free(id);
         if (self.owned_models_dir) |directory| alloc.free(directory);
+        self.path_lock_io.deinit();
         alloc.destroy(self);
     }
 };
@@ -1762,7 +1767,7 @@ pub const Connection = struct {
                 const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
                 if (remaining <= 0) return error.FileBusy;
                 if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| hook.notify(hook.ptr);
-                if (native.waitPathLockWithIo(alloc, io, self.path, h.liteOpenModeCanWrite(self.options.open_mode), deadline)) |held| return held else |wait_err| switch (wait_err) {
+                if (native.waitPathLockWithIo(alloc, self.owner.path_lock_io.io(), self.path, h.liteOpenModeCanWrite(self.options.open_mode), deadline)) |held| return held else |wait_err| switch (wait_err) {
                     // Sidecar-free read-only snapshots retain their inode
                     // authority. Resource-limited executors retain bounded
                     // polling rather than making the deadline unbounded.
@@ -2011,7 +2016,10 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     const owner = existing orelse try alloc.create(Owner);
     errdefer if (existing == null) alloc.destroy(owner);
     if (existing == null) {
-        owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id, .owned_models_dir = models_dir };
+        owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id, .owned_models_dir = models_dir, .path_lock_io = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) }) };
+    }
+    errdefer if (existing == null) owner.path_lock_io.deinit();
+    if (existing == null) {
         owner.reader_coordinator = try native.ReaderCoordinator.create(alloc, io);
         owner.options.reader_coordinator = owner.reader_coordinator;
         if (initial) |root| root.owned_lite_backend.?.native_docstore.?.file.reader_coordinator = owner.reader_coordinator;
@@ -3513,6 +3521,40 @@ const AdmissionFollowupProbe = struct {
         return error.Canceled;
     }
 };
+
+test "capi native allocator proof path admission uses its bounded concurrent executor" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("queued-path-admission", 30, .batch);
+    defer fixture.deinit();
+    const connection = fixture.connection;
+    const io = h.handleLockIo();
+    var held = try native.lockWriterPathWithIo(alloc, io, fixture.path);
+    const Probe = struct {
+        retries: usize = 0,
+        fn busy(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.retries += 1;
+        }
+    };
+    var probe: Probe = .{};
+    connection.test_path_lease_busy = .{ .ptr = &probe, .notify = Probe.busy };
+    defer connection.test_path_lease_busy = null;
+    const result = connection.acquire();
+    held.close();
+    if (result) |value| {
+        var unexpected = value;
+        unexpected.close();
+        connection.gate.mutex.unlock(io);
+        return error.ExpectedBusy;
+    } else |err| try std.testing.expectEqual(error.FileBusy, err);
+    try std.testing.expectEqual(@as(usize, 1), probe.retries);
+    try std.testing.expectEqual(std.Io.Limit.limited(2), connection.owner.path_lock_io.concurrent_limit);
+    // A fallback through debug_io would never have started these workers.
+    try std.testing.expect(connection.owner.path_lock_io.worker_threads.load(.acquire) != null);
+    var acquired = try connection.acquire();
+    acquired.close();
+    connection.gate.mutex.unlock(io);
+}
 
 test "capi native allocator proof live commits carry a checked peer certificate" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
