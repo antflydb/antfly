@@ -2753,7 +2753,9 @@ SQL NULL flags stay distinct from JSON null. Decimal, heterogeneous JSON and
 shared/unsupported encodings decline before gathering and retain the existing
 scalar or frozen codec. Floating-point bits, including signed zero, are preserved.
 
-A merge gathers and encodes one column at a time using the existing bounded
+Merge tiles below 16 rows keep scalar encoding so boundary flushes do not pay
+for physical gathering. A productive merge gathers and encodes one column at a
+time using the existing bounded
 column scratch arena. Row sizing retains the prior block boundaries, so wide
 rows do not retain a full matrix of gathered columns. Input blocks remain pinned
 through the synchronous encode, and all added scratch uses the existing manager

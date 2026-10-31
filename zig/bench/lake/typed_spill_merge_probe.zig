@@ -25,7 +25,10 @@ fn now() i96 {
     return @as(i96, stamp.sec) * std.time.ns_per_s + stamp.nsec;
 }
 test "typed spill merge full sort probe" {
-    const count = 8192;
+    const large = std.c.getenv("ANTFLY_MERGE_LARGE_WORKSPACE") != null;
+    const count: usize = if (std.c.getenv("ANTFLY_MERGE_ROWS")) |value| try std.fmt.parseInt(usize, std.mem.span(value), 10) else if (large) 65536 else 8192;
+    const workspace: usize = if (std.c.getenv("ANTFLY_MERGE_WORKSPACE")) |value| try std.fmt.parseInt(usize, std.mem.span(value), 10) else if (large) 4 * 1024 * 1024 else 64 * 1024;
+    if (count < 64 or count % 64 != 0 or workspace == 0) return error.InvalidBenchmarkShape;
     for ([_]bool{ false, true }) |compressed| {
         var budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 32 << 20 };
         defer std.debug.assert(budget.live == 0);
@@ -34,7 +37,7 @@ test "typed spill merge full sort probe" {
         defer manager.deinit();
         const started = now();
         {
-            var sort = spill.Sort.init(budget.allocator(), &manager, &.{.{}}, 64 * 1024);
+            var sort = spill.Sort.init(budget.allocator(), &manager, &.{.{}}, workspace);
             defer sort.deinit();
             sort.allow_indirect = false;
             sort.shared_runs = true;
@@ -87,7 +90,7 @@ test "typed spill merge full sort probe" {
             try std.testing.expect((try sort.nextLeased()) == null);
             try std.testing.expect(manager.merges > 0);
         }
-        std.debug.print("TYPED_MERGE compressed={any} rows={d} cpu_ns={d} reads={d} writes={d} merges={d} peak={d} quota={d}\n", .{ compressed, count, now() - started, manager.read_bytes, manager.written_bytes, manager.merges, budget.peak, budget.limit });
+        std.debug.print("TYPED_MERGE compressed={any} rows={d} workspace={d} cpu_ns={d} reads={d} writes={d} merges={d} peak={d} quota={d}\n", .{ compressed, count, workspace, now() - started, manager.read_bytes, manager.written_bytes, manager.merges, budget.peak, budget.limit });
         try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
         try std.testing.expectEqual(@as(usize, 0), manager.files);
     }

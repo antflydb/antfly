@@ -5507,15 +5507,19 @@ pub const Sort = struct {
             }
             return Sequential.EncodedColumn.gatherPhysical(a, columns[0..self.locations.len], rows[0..self.locations.len]);
         }
-        fn batch(self: *@This()) @import("execution_batch.zig").Batch {
+        fn batch(self: *@This(), comptime native: bool) @import("execution_batch.zig").Batch {
             const block = self.locations[0].block;
-            return .{ .reader = .{ .ptr = self, .read = cell, .read_physical = physical, .read_frozen = frozen, .read_json = json, .width = if (self.keys) block.keyWidth() else block.width(), .count = self.locations.len } };
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_physical = if (native) physical else null, .read_frozen = frozen, .read_json = json, .width = if (self.keys) block.keyWidth() else block.width(), .count = self.locations.len } };
         }
         fn write(locations: []const Location, ordinals: []const u64, output: *Sequential) !void {
             if (locations.len == 0) return;
             var values: MergeRows = .{ .locations = locations, .keys = false };
             var keys: MergeRows = .{ .locations = locations, .keys = true };
-            try output.appendMergeBatch(values.batch(), keys.batch(), ordinals);
+            // Native gather amortizes column scratch over a useful tile.
+            // Tiny boundary flushes retain the scalar path without allocating
+            // physical descriptors or attempting a gather for every column.
+            if (locations.len < 16) return output.appendBatch(values.batch(false), keys.batch(false), ordinals);
+            try output.appendMergeBatch(values.batch(true), keys.batch(true), ordinals);
         }
     };
     fn mergeMany(self: *Sort, inputs: []const *Sequential) !Sequential {
