@@ -63,3 +63,9 @@ test('accepted writes survive a dirty restart and clean checkpoint sync serializ
  await checkpoint;await write;assert.equal(f.local.value.dirty,true);
  const recovered=await f.reopen();assert.equal(await recovered.ownerRead(tx=>tx.get('value')),2);
 });
+
+test('retirement suppresses new recovery hints before physical I/O',async()=>{
+ const f=await fixture(),store=await f.reopen();await store.transaction(tx=>tx.put('value',1));const before=f.calls();store.freezeRequested=true;
+ assert.deepEqual(await store.checkpointHint(),{busy:true});assert.equal(f.calls(),before);
+ await assert.rejects(store.flushDurableCheckpoint(),/CoordinatorMigrationRequired/);
+});

@@ -93,7 +93,7 @@ export class R2CommitCoordinator extends DurableObject {
   async freezeDurableServing(){
     await this.ensureAuthority();if(!this.store.durableBootstrap)throw Error("DurableBootstrapStorageRequired");this.store.freezeRequested=true;
     const deadline=Date.now()+30000;
-    while(this.store.running||this.store.pending.length||this.store.snapshotReaders||this.store.ioDrain||this.store.durableCheckpoint?.pending){if(Date.now()>=deadline)throw Error("DeadlineExceeded");await new Promise(r=>setTimeout(r,2));}
+    while(this.store.running||this.store.pending.length||this.store.snapshotReaders||this.store.ioDrain||this.store.idleCheckpoint?.pending||this.store.durableCheckpoint?.pending){if(Date.now()>=deadline)throw Error("DeadlineExceeded");await new Promise(r=>setTimeout(r,2));}
     await this.store.durableBootstrap.freeze();this.store.durableReadState=null;this.store.acquired=false;return{frozen:true};
   }
   async lookupResident(input,{trace_id,cohort,requestWall:submittedWall,requestMono:submittedMono}={}) {

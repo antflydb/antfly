@@ -115,7 +115,7 @@ export class R2CoordinatorStore {
   // its mutable accounting. Native authentication/CAS rejects stale owners and
   // preserves a newer checkpoint; the native one-second write limit applies.
   async checkpointHint({deadlineMs=Infinity}={}) {
-    if(this.rootBackend==="conditional"||!this.acquired||this.recovering||this.ioDrain||!this.state)return{busy:true};
+    if(this.freezeRequested||this.rootBackend==="conditional"||!this.acquired||this.recovering||this.ioDrain||!this.state)return{busy:true};
     const state=structuredClone(this.state),physical={};
     // Capture the proof and its state together before yielding. Expired proofs
     // retain the existing strict recovery path; hints never renew authority.
