@@ -4840,3 +4840,29 @@ orientation. Missing bounds remain conservative, while an empty or excluding
 bound can prove that orientation impossible. RPC regressions reduce eight
 owner calls to one for disjoint peer envelopes and retain native owner cursors,
 both stored orientations and producer endpoints outside primary shard ranges.
+
+Count/peer follow-up qualification on 2026-10-30 merges `origin/main` through
+`c2896f4324` in `a3de6a38e9`; implementation commit `1f9081f68a` contains the
+incomplete-count accounting, mandatory alias reduction and peer-bound routing
+changes. All 522 core Cypher tests, six focused Debug regressions, 57 source,
+ownership and compilation-contract tests, runtime error/callback ABI gates,
+the full Go SDK suite and 12 merge publisher tests pass.
+
+The frozen implementation passes all 117 stripped ReleaseFast native build
+steps with pinned Zig 0.17.0, including five retained-cut/SQL graph tests and
+13 transport tests, with zero reported leaks. Compilation uses the previously
+documented process-local `MallocLargeCache=0` workaround; the rebuilt CLI's
+public tests use the normal runtime allocator environment. All three
+authenticated cluster regressions pass: replicated-owner reads/search and
+both producer-postimage variants.
+
+The standalone property-plan/SQL-overlay performance regression could not
+start its server: its storage-headroom preflight found 9,216,061,440 available
+bytes against 17,448,304,640 required bytes. The public invocation therefore
+reports three passed and one failed in 381.60 seconds, with that failure
+entirely at disk preflight. The new public alias-count assertions in that
+standalone case remain unqualified in this run; core/RPC alias-count and
+fallback regressions pass. Production disk safeguards and fixture headroom
+requirements are unchanged. Repository cache GC was attempted after the
+build and skipped because other native builds were active. The earlier
+enrichment owner-loss campaign remains outside this qualification.
