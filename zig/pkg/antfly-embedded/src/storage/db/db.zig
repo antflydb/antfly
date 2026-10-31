@@ -9514,6 +9514,17 @@ pub const DB = struct {
                 try ctx.store.putBatch(&.{}, secondary_deletes);
                 return true;
             }
+            const failure_prefix = try internal_keys.artifactRepairEnrichmentFailurePrefixAlloc(ctx.alloc, index_name);
+            defer ctx.alloc.free(failure_prefix);
+            const failure_rows = try ctx.store.scanPrefixPage(ctx.alloc, failure_prefix, null, retired_index_artifact_repair_cleanup_page_size);
+            defer docstore_mod.DocStore.freeResults(ctx.alloc, failure_rows);
+            if (failure_rows.len != 0) {
+                const failure_deletes = try ctx.alloc.alloc([]const u8, failure_rows.len);
+                defer ctx.alloc.free(failure_deletes);
+                for (failure_rows, 0..) |row, i| failure_deletes[i] = row.key;
+                try ctx.store.putBatch(&.{}, failure_deletes);
+                return true;
+            }
             return false;
         }
 
@@ -9566,6 +9577,8 @@ pub const DB = struct {
             }
 
             try deletes.append(ctx.alloc, row.key);
+            const failure_key = try internal_keys.artifactRepairEnrichmentFailureKeyAlloc(ctx.alloc, index_name, row.key);
+            try Batch.appendOwnedDelete(ctx.alloc, &deletes, &owned_keys, failure_key);
             removed_issue_count += 1;
 
             // The marker generation is keyed by the authoritative primary
@@ -10551,42 +10564,7 @@ pub const DB = struct {
         extra_writes: []const docstore_mod.KVPair,
         extra_deletes: []const []const u8,
     ) !void {
-        const kind_key = try self.repairIssueKindKeyForIssueAlloc(alloc, issue);
-        defer alloc.free(kind_key);
-        const encoded = try self.encodeArtifactRepairIssueAlloc(alloc, issue);
-        defer alloc.free(encoded);
-        if (!new_issue) {
-            var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-            defer writes.deinit(alloc);
-            try writes.append(alloc, .{ .key = key, .value = encoded });
-            try writes.append(alloc, .{ .key = kind_key, .value = encoded });
-            try writes.appendSlice(alloc, extra_writes);
-            try self.core.store.putBatch(writes.items, extra_deletes);
-            return;
-        }
-
-        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-        var borrowed_write_count: usize = 0;
-        defer {
-            for (writes.items[borrowed_write_count..]) |item| alloc.free(@constCast(item.value));
-            writes.deinit(alloc);
-        }
-        var deletes = std.ArrayListUnmanaged([]const u8).empty;
-        defer deletes.deinit(alloc);
-        var owned_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
-        defer {
-            for (owned_delete_keys.items) |owned_key| alloc.free(@constCast(owned_key));
-            owned_delete_keys.deinit(alloc);
-        }
-
-        try writes.append(alloc, .{ .key = key, .value = encoded });
-        try writes.append(alloc, .{ .key = kind_key, .value = encoded });
-        borrowed_write_count = writes.items.len;
-        try writes.appendSlice(alloc, extra_writes);
-        borrowed_write_count = writes.items.len;
-        try deletes.appendSlice(alloc, extra_deletes);
-        try self.appendArtifactRepairSummaryDirty(alloc, &writes, &deletes, &owned_delete_keys);
-        try self.core.store.putBatch(writes.items, deletes.items);
+        return saveArtifactRepairIssueToStoreWithSummary(alloc, self.core.store, key, issue, new_issue, extra_writes, extra_deletes);
     }
 
     fn deleteArtifactRepairIssueWithSummary(
@@ -10599,6 +10577,8 @@ pub const DB = struct {
     ) !void {
         const kind_key = try self.repairIssueKindKeyForIssueAlloc(alloc, existing_issue);
         defer alloc.free(kind_key);
+        const failure_key = try internal_keys.artifactRepairEnrichmentFailureKeyAlloc(alloc, existing_issue.index_name, key);
+        defer alloc.free(failure_key);
 
         var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer writes.deinit(alloc);
@@ -10615,6 +10595,7 @@ pub const DB = struct {
 
         try deletes.append(alloc, key);
         try deletes.append(alloc, kind_key);
+        try deletes.append(alloc, failure_key);
         try deletes.appendSlice(alloc, extra_deletes);
         if (existing_issue.reason == .enrichment_failed) {
             try appendEnrichmentTerminalFailureMarkerDeletesForIssue(
@@ -10637,7 +10618,9 @@ pub const DB = struct {
         const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse {
             const stale_kind_key = try self.repairIssueKindKeyForIssueAlloc(alloc, issue);
             defer alloc.free(stale_kind_key);
-            try self.core.store.putBatch(&.{}, &.{stale_kind_key});
+            const failure_key = try internal_keys.artifactRepairEnrichmentFailureKeyAlloc(alloc, issue.index_name, key);
+            defer alloc.free(failure_key);
+            try self.core.store.putBatch(&.{}, &.{ stale_kind_key, failure_key });
             return;
         };
         var existing_issue = existing;
@@ -11099,11 +11082,15 @@ pub const DB = struct {
             error.NotFound => return false,
             else => return err,
         };
-        alloc.free(ready);
-        return true;
+        defer alloc.free(ready);
+        return std.mem.eql(u8, ready, "2");
     }
 
     fn rebuildArtifactRepairKindIndexIfMissing(self: *DB, alloc: Allocator) !bool {
+        // A bounded rebuild page and ordinary issue transitions must share
+        // one fence, or a deleted failure could be reintroduced by the scan.
+        lockAtomicWithBackoff(&self.async_context.artifact_repair_issue_mutex);
+        defer self.async_context.artifact_repair_issue_mutex.unlock();
         if (try self.artifactRepairKindIndexReady(alloc)) return false;
 
         const prefix = try internal_keys.artifactRepairIssueRootPrefixAlloc(alloc);
@@ -11111,7 +11098,9 @@ pub const DB = struct {
         const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
         defer if (upper) |buf| alloc.free(buf);
 
-        const progress_key = try internal_keys.artifactRepairKindIndexProgressKeyAlloc(alloc);
+        const legacy_progress_key = try internal_keys.artifactRepairKindIndexProgressKeyAlloc(alloc);
+        defer alloc.free(legacy_progress_key);
+        const progress_key = try std.fmt.allocPrint(alloc, "{s}:v2", .{legacy_progress_key});
         defer alloc.free(progress_key);
         const raw_progress = self.core.store.get(alloc, progress_key) catch |err| switch (err) {
             error.NotFound => null,
@@ -11155,11 +11144,22 @@ pub const DB = struct {
                 var issue = try decodeArtifactRepairIssueValueAlloc(state.alloc, value);
                 defer issue.deinit(state.alloc);
 
-                const kind_key = try artifactRepairIssueKindKeyForIssueAlloc(state.alloc, issue);
-                errdefer state.alloc.free(kind_key);
-                const value_copy = try state.alloc.dupe(u8, value);
-                errdefer state.alloc.free(value_copy);
-                try state.writes.append(state.alloc, .{ .key = kind_key, .value = value_copy });
+                {
+                    const kind_key = try artifactRepairIssueKindKeyForIssueAlloc(state.alloc, issue);
+                    errdefer state.alloc.free(kind_key);
+                    const value_copy = try state.alloc.dupe(u8, value);
+                    errdefer state.alloc.free(value_copy);
+                    try state.writes.append(state.alloc, .{ .key = kind_key, .value = value_copy });
+                }
+                if (issue.reason == .enrichment_failed) {
+                    const primary_key = try artifactRepairIssueKeyForIssueAlloc(state.alloc, issue);
+                    defer state.alloc.free(primary_key);
+                    const failure_key = try internal_keys.artifactRepairEnrichmentFailureKeyAlloc(state.alloc, issue.index_name, primary_key);
+                    errdefer state.alloc.free(failure_key);
+                    const failure_value = try state.alloc.dupe(u8, value);
+                    errdefer state.alloc.free(failure_value);
+                    try state.writes.append(state.alloc, .{ .key = failure_key, .value = failure_value });
+                }
                 state.rows += 1;
                 if (state.last_key) |key| state.alloc.free(key);
                 state.last_key = try artifactRepairIssueKeyForIssueAlloc(state.alloc, issue);
@@ -11175,10 +11175,10 @@ pub const DB = struct {
         if (state.rows < ScanState.batch_limit) {
             const ready_key = try internal_keys.artifactRepairKindIndexReadyKeyAlloc(alloc);
             errdefer alloc.free(ready_key);
-            const ready_value = try alloc.dupe(u8, "1");
+            const ready_value = try alloc.dupe(u8, "2");
             errdefer alloc.free(ready_value);
             try writes.append(alloc, .{ .key = ready_key, .value = ready_value });
-            const deletes = [_][]const u8{progress_key};
+            const deletes = [_][]const u8{ progress_key, legacy_progress_key };
             try self.core.store.putBatchWithReplayWithOptions(null, writes.items, deletes[0..], null, .{ .defer_commit_flush = true });
             return false;
         }
@@ -11481,7 +11481,7 @@ pub const DB = struct {
         };
     }
 
-    /// Bounds the artifact-ledger scan behind one index-level summary row.
+    /// Bounds the failures materialized behind one index-level summary row.
     const index_enrichment_failure_summary_scan_limit: u32 = 500;
 
     const IndexEnrichmentFailureSummary = struct {
@@ -11525,16 +11525,54 @@ pub const DB = struct {
         }
     };
 
+    /// New databases use the failure selector; older databases stream the
+    /// primary ledger until the bounded background index rebuild completes.
+    /// The materialization limit counts failures, never unrelated issues.
+    fn listIndexEnrichmentFailures(self: *DB, alloc: Allocator, index_name: []const u8) !types.ArtifactRepairListResult {
+        const indexed = try self.artifactRepairKindIndexReady(alloc);
+        const prefix = if (indexed)
+            try internal_keys.artifactRepairEnrichmentFailurePrefixAlloc(alloc, index_name)
+        else
+            try internal_keys.artifactRepairIssueIndexPrefixAlloc(alloc, index_name);
+        defer alloc.free(prefix);
+        const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
+        defer if (upper) |key| alloc.free(key);
+        const Scan = struct {
+            alloc: Allocator,
+            issues: std.ArrayListUnmanaged(types.ArtifactRepairIssue) = .empty,
+            scanned: u64 = 0,
+            has_more: bool = false,
+
+            fn visit(raw: ?*anyopaque, _: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(raw.?));
+                if (state.issues.items.len >= index_enrichment_failure_summary_scan_limit) {
+                    state.has_more = true;
+                    return .stop;
+                }
+                state.scanned += 1;
+                var issue = try decodeArtifactRepairIssueValueAlloc(state.alloc, value);
+                if (issue.reason != .enrichment_failed) {
+                    issue.deinit(state.alloc);
+                    return .@"continue";
+                }
+                errdefer issue.deinit(state.alloc);
+                try state.issues.append(state.alloc, issue);
+                return .@"continue";
+            }
+        };
+        var state = Scan{ .alloc = alloc };
+        errdefer {
+            for (state.issues.items) |*issue| issue.deinit(alloc);
+            state.issues.deinit(alloc);
+        }
+        try self.core.store.scanWithContext(prefix, if (upper) |key| key else "", .{}, &state, Scan.visit);
+        return .{ .issues = try state.issues.toOwnedSlice(alloc), .limit = index_enrichment_failure_summary_scan_limit, .scanned = state.scanned, .has_more = state.has_more };
+    }
+
     /// Summarizes `enrichment_failed` artifact debt recorded for one index.
     /// Returns null when the index has none.
-    // Explicit error set: this re-enters listArtifactRepairIssuesPage, which
-    // dispatches index targets back to listIndexRepairIssuesPage.
     fn indexEnrichmentFailureSummary(self: *DB, alloc: Allocator, index_name: []const u8) anyerror!?IndexEnrichmentFailureSummary {
-        var page = try self.listArtifactRepairIssuesPage(alloc, .{
-            .target = .artifact,
-            .index_name = index_name,
-            .limit = index_enrichment_failure_summary_scan_limit,
-        });
+        var page = try self.listIndexEnrichmentFailures(alloc, index_name);
         defer page.deinit(alloc);
         var count: u64 = 0;
         var latest: ?usize = null;
@@ -16850,6 +16888,10 @@ pub const DB = struct {
         var result = try self.repairIndexGenerationIssuesWithRequest(alloc, generation_req, options, lease_authority);
         errdefer result.deinit(alloc);
         if (req.control != null) return result;
+        // Finish generation work before retrying source artifacts. Mixing
+        // both traversals can finish the artifact cursor while the rebuild
+        // is still pending, and also repeats work against an unavailable index.
+        if (result.in_progress != 0) return result;
         // Automatic, structural (index creation catch-up) and durable-owner
         // repair stay bounded generation work and make no model calls. Only
         // operator repair retries enrichment documents.
@@ -55808,15 +55850,7 @@ fn saveArtifactRepairIssueToStore(
 ) !void {
     const key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue);
     defer alloc.free(key);
-    const kind_key = try artifactRepairIssueKindKeyForIssueAlloc(alloc, issue);
-    defer alloc.free(kind_key);
-    const encoded = try encodeArtifactRepairIssueValueAlloc(alloc, issue);
-    defer alloc.free(encoded);
-    const writes = [_]docstore_mod.KVPair{
-        .{ .key = key, .value = encoded },
-        .{ .key = kind_key, .value = encoded },
-    };
-    try store.putBatch(writes[0..], &.{});
+    try saveArtifactRepairIssueToStoreWithSummary(alloc, store, key, issue, false, &.{}, &.{});
 }
 
 const appendKeysForPrefixDeleteInStore = local_mutation.appendKeysForPrefixDeleteInStore;
@@ -144513,6 +144547,9 @@ test "db successful asset publication clears terminal debt but stale and failed 
     const issues = try db.listArtifactRepairIssues(a, .asset, "text", 0);
     defer types.freeArtifactRepairIssues(a, issues);
     try std.testing.expectEqual(@as(usize, 0), issues.len);
+    var failures = try db.listIndexEnrichmentFailures(a, "text");
+    defer failures.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), failures.issues.len);
     try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
     try recordArtifactRepairIssueContextDetailed(db.async_context, .asset, "graph", "doc", "", "", "units", "", "units", key, null, 5, .enrichment_failed, 1, "ConnectionRefused");
     // Root manifests are metadata, not extraction-relation rows. Replay must
@@ -144613,4 +144650,82 @@ test "db managed index repair settles partial OCR publication failure and retrie
     defer done.deinit(a);
     try std.testing.expectEqual(@as(u64, 0), done.failed);
     try std.testing.expect(!done.debt_remaining);
+}
+
+test "db index repair summary finds enrichment failures beyond unrelated issues" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("review-summary-bound");
+    defer tmp.cleanup();
+    var db = try DB.open(a, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    for (0..500) |i| {
+        const id = try std.fmt.allocPrint(a, "{x:0>8}", .{i});
+        defer a.free(id);
+        try db.recordArtifactRepairIssue(a, .{ .artifact_kind = .asset, .index_name = "text", .artifact_key = id, .artifact_name = "units", .doc_key = id, .reason = .missing_artifact });
+    }
+    try db.recordArtifactRepairIssue(a, .{ .artifact_kind = .asset, .index_name = "text", .artifact_key = "ffffffff", .artifact_name = "units", .doc_key = "failed-doc", .reason = .enrichment_failed, .generation_error = "ModelNotFound" });
+    var all = try db.listArtifactRepairIssuesPage(a, .{ .target = .artifact, .index_name = "text", .limit = 501 });
+    defer all.deinit(a);
+    var page = try db.listArtifactRepairIssuesPage(a, .{ .target = .index, .index_name = "text", .limit = 50 });
+    defer page.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), page.issues.len);
+    var indexed = try db.listIndexEnrichmentFailures(a, "text");
+    defer indexed.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), indexed.scanned);
+    // An old database has kind-only rows and may have a partially completed
+    // v1 rebuild. Neither can make the failure selector authoritative yet.
+    const primary = try artifactRepairIssueKeyForIssueAlloc(a, all.issues[500]);
+    defer a.free(primary);
+    const failure_key = try internal_keys.artifactRepairEnrichmentFailureKeyAlloc(a, "text", primary);
+    defer a.free(failure_key);
+    const ready_key = try internal_keys.artifactRepairKindIndexReadyKeyAlloc(a);
+    defer a.free(ready_key);
+    const progress_key = try internal_keys.artifactRepairKindIndexProgressKeyAlloc(a);
+    defer a.free(progress_key);
+    try db.core.store.putBatch(&.{ .{ .key = ready_key, .value = "1" }, .{ .key = progress_key, .value = primary } }, &.{failure_key});
+    var legacy = try db.listIndexEnrichmentFailures(a, "text");
+    defer legacy.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), legacy.issues.len);
+    try std.testing.expectEqual(@as(u64, 501), legacy.scanned);
+    try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+    var migrated = try db.listIndexEnrichmentFailures(a, "text");
+    defer migrated.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), migrated.issues.len);
+    try std.testing.expectEqual(@as(u64, 1), migrated.scanned);
+    var changed = all.issues[500];
+    changed.reason = .missing_artifact;
+    try db.recordArtifactRepairIssue(a, changed);
+    try std.testing.expect((try db.indexEnrichmentFailureSummary(a, "text")) == null);
+    changed.reason = .enrichment_failed;
+    try db.recordArtifactRepairIssue(a, changed);
+    try db.clearArtifactRepairIssueWithSummary(a, changed);
+    var cleared = try db.listIndexEnrichmentFailures(a, "text");
+    defer cleared.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), cleared.issues.len);
+    try std.testing.expectEqual(@as(u64, 0), cleared.scanned);
+}
+
+test "db managed index repair waits for generation before retrying enrichment" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("review-mixed-repair");
+    defer tmp.cleanup();
+    var gated = GateDenseEmbedder{};
+    var db = try DB.open(a, tmp.path(), parkedEnrichmentFailureTestOptions(&gated));
+    defer db.close();
+    try parkEnrichmentFailureForTest(&db);
+    const req = types.ArtifactRepairRunRequest{ .target = .index, .index_name = "dv_a", .operator_initiated = true, .repair_job_id = 42, .repair_job_created_at_ms = 100, .force = true };
+    const options = types.ArtifactRepairRunOptions{ .defer_durable_index_repair_execution = true };
+    const before = gated.snapshot().total_requests;
+    var queued = try db.repairArtifactIssuesWithRequestOptions(a, req, options);
+    defer queued.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), queued.in_progress);
+    try std.testing.expectEqual(before, gated.snapshot().total_requests);
+    var pass = try db.repairArtifactIssuesWithRequestOptions(a, req, options);
+    defer pass.deinit(a);
+    try std.testing.expectEqual(@as(u64, 0), pass.failed);
+    try std.testing.expectEqual(@as(u64, 1), pass.in_progress);
+    try std.testing.expect(pass.debt_remaining);
+    try std.testing.expectEqual(before, gated.snapshot().total_requests);
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(a));
 }
