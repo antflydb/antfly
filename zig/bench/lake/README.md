@@ -2896,3 +2896,71 @@ focused metadata checks then pass, covering the corrected assertion and the
 previously passing cases, with no skips or leaks. The qualified implementation
 binary is unchanged by those test-only commits. Runtime ABI 81, reader protocol
 97 and persisted formats remain unchanged.
+
+
+## Ordered identity maps and typed merge columns
+
+Fresh ID maps reuse the pending stream's existing order and leased records.
+With no retained membership, queued changes or prior result root, the by-ID map
+feeds the authenticated tree writer directly. A single input cohort has a
+constant recipe prefix and preserves the same order. Retained or interleaved
+input continues through the general mutation reducer.
+
+Spill merges gather compatible primitive wire lanes from pinned blocks into
+native columns, including dictionary values. Encoding gathers one column at a
+time under the existing scratch quota. SQL NULL, integer precision and floating
+bits retain their contracts; decimal, JSON null, heterogeneous and unsupported
+columns use the scalar/frozen codec. Tiles below 16 rows avoid gathering.
+
+[ordered-identity-and-typed-merges-v1-observation.json](ordered-identity-and-typed-merges-v1-observation.json)
+qualifies runtime `4fb464d08b12f1aaf1d570ebf7d00698d285ecde` against the
+post-main-merge baseline `bbbede9c8de3250f7e0f9eb9499c7c8891496e2f`.
+Both include main `f91c9c0e4682a3ff20e39fce9a44d67b658a7b55`.
+The exact native build command and build-options snapshot, frozen binary
+identities, complete-publication commands, reports and result digests are
+recorded separately from the older observations above.
+
+Three alternating native pairs at 65,536 rows and a 4-MiB workspace measure the
+complete sort, including add, finish, full leased drain, every value oracle and
+sort teardown. Manager construction and executable startup are excluded.
+
+| Compression | Previous median thread CPU | Candidate median thread CPU | Candidate change | Faster candidate pairs |
+| --- | ---: | ---: | ---: | ---: |
+| None | 5,068.054 ms | 4,717.067 ms | 6.9% lower | 3/3 |
+| Snappy | 5,899.222 ms | 5,701.613 ms | 3.3% lower | 3/3 |
+
+Reads, writes, ten merges, tracked live peaks and the 32-MiB quota are identical
+within each compression cohort. Uncompressed reads/writes are 134,866,274 /
+101,631,258 bytes, with a 973,907-byte tracked peak. Snappy reads/writes are
+14,273,560 / 11,712,767 bytes, with a 985,850-byte peak. Every key, ordinal,
+primitive value, SQL NULL and tagged string is checked. The 1-MiB workspace case
+is essentially flat; 64-KiB workspace results are mixed. An initial ungated
+diagnostic overlapped builds/tests and is excluded from performance claims.
+These observations support keeping native gathering for productive tiles,
+with scalar fallback for boundary flushes.
+
+Three alternating complete real-Parquet publication pairs at each size verify
+all rows and all ten columns after the timed interval:
+
+| Parquet rows | Previous median publication | Candidate median publication | Candidate change | Faster candidate pairs |
+| --- | ---: | ---: | ---: | ---: |
+| 8,192 | 5,384.655 ms | 5,063.972 ms | 6.0% lower | 3/3 |
+| 65,536 | 45,459.256 ms | 39,718.982 ms | 12.6% lower | 3/3 |
+
+Timing runs from table creation through the first queryable, complete
+publication whose revision matches its target. Startup, fixture creation and
+complete SQL verification in disjoint 64-row intervals are excluded. Fixture,
+runner, configuration, schema definition and complete-result digests match
+within each cohort. Both servers use the default 4-MiB coordinator workspace,
+1-MiB metadata sort preference and 1-GiB working-set cap. Task-owned builds,
+tests and cleanup finish before measurement; other host work is uncontrolled.
+These are fresh-storage local Parquet/FsStore Debug measurements with retained
+OS caches. The combined refinements improve these publication cohorts; native
+kernel timing measures a separate scope.
+
+Qualification at this runtime passes 404 shared checks, 183 API checks and all
+50 real Parquet/Iceberg E2E cases (385.45 seconds). Native checks have no failures,
+skips or leaks. Apache boundary, license headers, formatting and whitespace
+checks pass. Runtime ABI 81, reader protocol 97 and persisted formats are
+unchanged. Real-provider retention, peak RSS, cold storage, archive scale,
+optimized builds and a full WASM bundle remain unqualified here.

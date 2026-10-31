@@ -2761,3 +2761,21 @@ rows do not retain a full matrix of gathered columns. Input blocks remain pinned
 through the synchronous encode, and all added scratch uses the existing manager
 allocator and quotas. The ordinary borrowed-batch write path remains available.
 Runtime ABI 81, reader protocol 97 and persisted formats are unchanged.
+
+
+The [ordered-map and typed-merge observation](bench/lake/ordered-identity-and-typed-merges-v1-observation.json)
+qualifies runtime `4fb464d08b12f1aaf1d570ebf7d00698d285ecde` against the
+post-main-merge baseline `bbbede9c8de3250f7e0f9eb9499c7c8891496e2f`.
+Three alternating complete real-Parquet publication pairs reduce median latency
+from 5,384.655 to 5,063.972 ms at 8,192 rows (6.0%), and from 45,459.256 to
+39,718.982 ms at 65,536 rows (12.6%). Every candidate is faster, and every row
+and all ten columns are independently verified outside timing.
+
+The native full-sort probe at 65,536 rows and a 4-MiB workspace reduces median
+thread CPU by 6.9% uncompressed and 3.3% with Snappy. Reads, writes and tracked
+peaks stay identical under the same quota. The 1-MiB case is essentially flat
+and 64-KiB results are mixed. These Debug local-storage observations retain OS
+caches and uncontrolled host activity; they establish no optimized-build,
+cloud, archive-scale or peak-RSS gain. The final runtime passes 404 shared native
+checks, 183 API checks and all 50 real Parquet/Iceberg E2E cases. Main
+`f91c9c0e4682a3ff20e39fce9a44d67b658a7b55` is included in both server binaries.
