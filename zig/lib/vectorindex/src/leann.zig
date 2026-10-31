@@ -275,6 +275,9 @@ pub const Index = struct {
     entry: u32 = 0,
     max_level: u8 = 0,
     deleted_count: u32 = 0,
+    /// Number of deltas (inserts and deletes) applied since this graph was
+    /// built. Deltas carry the version they were planned against.
+    version: u64 = 0,
     /// Layer-0 neighbor lists (pruned).
     adjacency: std.ArrayListUnmanaged(NeighborList) = .empty,
     /// Upper-layer neighbor lists per node; `upper.items[v].len` is v's level.
@@ -424,6 +427,9 @@ pub const Index = struct {
     /// (the paper suggests about 5%).
     pub fn markDeleted(self: *Index, id: u32) !void {
         if (id >= self.node_count) return error.UnknownNode;
+        // Planned inserts skip deleted nodes, so a delete changes what later
+        // plans produce and advances the version even when repeated.
+        self.version += 1;
         if (self.flags.items[id] & flag_deleted != 0) return;
         self.flags.items[id] |= flag_deleted;
         self.deleted_count += 1;
@@ -506,16 +512,31 @@ pub const Index = struct {
 
     /// Inserts one embedding and returns its node id. Ids are dense and
     /// assigned in insertion order, so the caller's EmbeddingSource must be
-    /// able to recompute the new id afterwards.
+    /// able to recompute the new id afterwards. Equivalent to `planInsert`
+    /// followed by `applyDelta`.
+    pub fn insert(self: *Index, source: EmbeddingSource, vector: []const f32) !u32 {
+        var delta = try self.planInsert(self.alloc, source, vector);
+        defer delta.deinit(self.alloc);
+        try self.applyDelta(delta);
+        return delta.id;
+    }
+
+    /// Plans an insert without changing the index. Replicated deployments run
+    /// this on one node (the leader), replicate the returned delta, and every
+    /// replica, the planner included, applies it with `applyDelta` in the
+    /// same order. Replicas then hold identical graphs even on hardware whose
+    /// floating-point results differ, because only the planner computes
+    /// distances.
     ///
     /// Upper layers are linked with approximate distances, so they cost no
     /// recomputation. Layer 0 uses the paper's simplified neighbor selection:
     /// the closest `low_degree` live candidates become forward edges. With PQ
     /// they come from a two-level search (which recomputes); with RaBitQ from
     /// an estimate-only search (which does not). Full reverse lists drop their
-    /// farthest member by approximate distance.
-    pub fn insert(self: *Index, source: EmbeddingSource, vector: []const f32) !u32 {
-        const alloc = self.alloc;
+    /// farthest member by approximate distance, but never a node's last
+    /// inbound layer-0 edge; if every list rejects the new node it is attached
+    /// to its closest neighbor over the cap.
+    pub fn planInsert(self: *const Index, alloc: Allocator, source: EmbeddingSource, vector: []const f32) !Delta {
         const d = self.dimension();
         if (vector.len != d) return error.DimensionMismatch;
         if (self.node_count == std.math.maxInt(u32) - 1) return error.IndexFull;
@@ -528,26 +549,27 @@ pub const Index = struct {
         var approx = try Approx.init(alloc, self, v);
         defer approx.deinit();
 
-        const new_upper = try alloc.alloc(NeighborList, level);
-        @memset(new_upper, NeighborList.empty);
-        var forward = NeighborList.empty;
-        var committed = false;
-        errdefer if (!committed) {
-            freeLists(alloc, new_upper);
-            forward.deinit(alloc);
-        };
+        var delta = Delta{ .kind = .insert, .base_version = self.version, .id = id, .level = level };
+        errdefer delta.deinit(alloc);
+        delta.code = try self.encodeCode(alloc, v);
+        delta.upper = try alloc.alloc([]u32, level);
+        @memset(delta.upper, &.{});
 
         var stats = SearchStats{};
         var ep = try self.greedyDescentApprox(&approx, self.entry, self.max_level, level, &stats);
         var found = std.ArrayListUnmanaged(Cand).empty;
         defer found.deinit(alloc);
+        var picked = std.ArrayListUnmanaged(u32).empty;
+        defer picked.deinit(alloc);
         var layer = @min(level, self.max_level);
         while (layer > 0) : (layer -= 1) {
             try self.beamSearchApprox(alloc, &approx, layer, ep, self.config.ef_construction, &found);
+            picked.clearRetainingCapacity();
             for (found.items) |c| {
-                if (new_upper[layer - 1].items.len >= self.config.max_degree) break;
-                try new_upper[layer - 1].append(alloc, c.id);
+                if (picked.items.len >= self.config.max_degree) break;
+                try picked.append(alloc, c.id);
             }
+            delta.upper[layer - 1] = try alloc.dupe(u32, picked.items);
             ep = found.items[0].id;
         }
 
@@ -557,99 +579,225 @@ pub const Index = struct {
         } else {
             try self.twoLevelSearch(alloc, source, v, &approx, ep, .{ .k = ef, .ef = ef }, &found, &stats);
         }
+        picked.clearRetainingCapacity();
         for (found.items) |c| {
-            if (forward.items.len >= self.config.low_degree) break;
+            if (picked.items.len >= self.config.low_degree) break;
             if (self.isDeleted(c.id)) continue;
-            try forward.append(alloc, c.id);
+            try picked.append(alloc, c.id);
         }
+        delta.forward = try alloc.dupe(u32, picked.items);
 
-        // Reserve everything up front: nothing below the commit may fail.
-        var rq_row: ?RaBitQCodes.Row = null;
-        defer if (rq_row) |*row| row.deinit(alloc);
-        if (self.rabitq) |*r| {
-            rq_row = try r.encodeRow(alloc, v);
-            try r.reserve(alloc, 1);
-        } else {
-            try self.codes.ensureUnusedCapacity(alloc, self.config.pq_subspaces);
-        }
-        try self.flags.ensureUnusedCapacity(alloc, 1);
-        try self.indegree.ensureUnusedCapacity(alloc, 1);
-        try self.adjacency.ensureUnusedCapacity(alloc, 1);
-        try self.upper.ensureUnusedCapacity(alloc, 1);
-        for (forward.items, 0..) |u, i| try self.adjacency.items[u].ensureUnusedCapacity(alloc, if (i == 0) 2 else 1);
-        for (new_upper, 1..) |list, l| {
-            for (list.items) |u| try self.upper.items[u][l - 1].ensureUnusedCapacity(alloc, 1);
-        }
+        // Reverse links, simulated against an overlay of in-degree changes so
+        // the plan matches what applying the edits in order produces.
+        var overlay = std.AutoHashMapUnmanaged(u32, i64).empty;
+        defer overlay.deinit(alloc);
+        const Deg = struct {
+            fn get(index: *const Index, ov: *const std.AutoHashMapUnmanaged(u32, i64), node: u32, new_id: u32) i64 {
+                const base: i64 = if (node == new_id) 0 else index.indegree.items[node];
+                return base + (ov.get(node) orelse 0);
+            }
+            fn add(a: Allocator, ov: *std.AutoHashMapUnmanaged(u32, i64), node: u32, by: i64) !void {
+                const gop = try ov.getOrPut(a, node);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += by;
+            }
+        };
+        for (delta.forward) |u| try Deg.add(alloc, &overlay, u, 1);
+
+        var edits = std.ArrayListUnmanaged(Delta.Edit).empty;
+        defer edits.deinit(alloc);
         const a = try alloc.alloc(f32, d);
         defer alloc.free(a);
         const b = try alloc.alloc(f32, d);
         defer alloc.free(b);
+        const new_vec = try alloc.alloc(f32, d);
+        defer alloc.free(new_vec);
+        self.decodeBytes(delta.code, new_vec);
 
-        if (self.rabitq) |*r| {
-            r.appendRowAssumeCapacity(&rq_row.?);
-        } else {
-            const sub = self.config.pq_subspaces;
-            const code_start = self.codes.items.len;
-            self.codes.items.len += sub;
-            self.pq.?.encode(v, self.codes.items[code_start..][0..sub]);
+        for (delta.forward) |u| {
+            const list = self.adjacency.items[u].items;
+            if (list.len < self.config.max_degree) {
+                try edits.append(alloc, .{ .layer = 0, .owner = u, .slot = Delta.append_slot });
+                try Deg.add(alloc, &overlay, id, 1);
+                continue;
+            }
+            self.decodeApprox(u, a);
+            var worst_i: usize = list.len;
+            var worst = distance(self.config.metric, a, new_vec);
+            for (list, 0..) |w, i| {
+                if (Deg.get(self, &overlay, w, id) <= 1) continue;
+                self.decodeApprox(w, b);
+                const dist = distance(self.config.metric, a, b);
+                if (dist > worst) {
+                    worst = dist;
+                    worst_i = i;
+                }
+            }
+            if (worst_i == list.len) continue;
+            try edits.append(alloc, .{ .layer = 0, .owner = u, .slot = @intCast(worst_i) });
+            try Deg.add(alloc, &overlay, list[worst_i], -1);
+            try Deg.add(alloc, &overlay, id, 1);
         }
-        self.flags.appendAssumeCapacity(0);
-        self.indegree.appendAssumeCapacity(0);
-        for (forward.items) |u| self.indegree.items[u] += 1;
-        self.adjacency.appendAssumeCapacity(forward);
-        self.upper.appendAssumeCapacity(new_upper);
-        self.node_count += 1;
-        committed = true;
-
-        for (forward.items) |u| _ = self.addReverseLink(&self.adjacency.items[u], u, id, a, b, self.indegree.items);
-        // Keep the new node reachable on layer 0: if every full reverse list
-        // rejected it, attach it to its closest neighbor over the cap, as the
-        // build's connectivity pass does.
-        if (self.indegree.items[id] == 0 and forward.items.len > 0) {
-            self.adjacency.items[forward.items[0]].appendAssumeCapacity(id);
-            self.indegree.items[id] += 1;
+        if (Deg.get(self, &overlay, id, id) == 0 and delta.forward.len > 0) {
+            try edits.append(alloc, .{ .layer = 0, .owner = delta.forward[0], .slot = Delta.append_slot });
         }
-        for (new_upper, 1..) |list, l| {
-            for (list.items) |u| _ = self.addReverseLink(&self.upper.items[u][l - 1], u, id, a, b, null);
-        }
-        if (level > self.max_level) {
-            self.max_level = level;
-            self.entry = id;
-        }
-        return id;
-    }
-
-    /// Appends `id` to `list` (owned by `owner`), or replaces the member
-    /// farthest from `owner` by approximate distance when the list is full.
-    /// Capacity must already be reserved. With `indegree` (layer 0), a member
-    /// whose only inbound edge is this one is never evicted, and the counts
-    /// are kept current. Returns whether `id` was linked.
-    fn addReverseLink(self: *const Index, list: *NeighborList, owner: u32, id: u32, a: []f32, b: []f32, indegree: ?[]u32) bool {
-        if (list.items.len < self.config.max_degree) {
-            list.appendAssumeCapacity(id);
-            if (indegree) |deg| deg[id] += 1;
-            return true;
-        }
-        self.decodeApprox(owner, a);
-        self.decodeApprox(id, b);
-        var worst_i: usize = list.items.len;
-        var worst = distance(self.config.metric, a, b);
-        for (list.items, 0..) |w, i| {
-            if (indegree) |deg| if (deg[w] <= 1) continue;
-            self.decodeApprox(w, b);
-            const dist = distance(self.config.metric, a, b);
-            if (dist > worst) {
-                worst = dist;
-                worst_i = i;
+        for (delta.upper, 1..) |list_ids, l| {
+            for (list_ids) |u| {
+                const list = self.upper.items[u][l - 1].items;
+                if (list.len < self.config.max_degree) {
+                    try edits.append(alloc, .{ .layer = @intCast(l), .owner = u, .slot = Delta.append_slot });
+                    continue;
+                }
+                self.decodeApprox(u, a);
+                var worst_i: usize = list.len;
+                var worst = distance(self.config.metric, a, new_vec);
+                for (list, 0..) |w, i| {
+                    self.decodeApprox(w, b);
+                    const dist = distance(self.config.metric, a, b);
+                    if (dist > worst) {
+                        worst = dist;
+                        worst_i = i;
+                    }
+                }
+                if (worst_i == list.len) continue;
+                try edits.append(alloc, .{ .layer = @intCast(l), .owner = u, .slot = @intCast(worst_i) });
             }
         }
-        if (worst_i == list.items.len) return false;
-        if (indegree) |deg| {
-            deg[list.items[worst_i]] -= 1;
-            deg[id] += 1;
+        delta.edits = try edits.toOwnedSlice(alloc);
+        return delta;
+    }
+
+    /// Plans a soft delete of a live node.
+    pub fn planDelete(self: *const Index, id: u32) !Delta {
+        if (id >= self.node_count) return error.UnknownNode;
+        return .{ .kind = .delete, .base_version = self.version, .id = id };
+    }
+
+    /// Applies a delta planned against this exact graph version. Rejects a
+    /// delta planned against any other version with `error.DeltaVersionMismatch`
+    /// (the caller then needs a fresh generation) and malformed deltas with
+    /// `error.InvalidDelta`; in both cases the index is unchanged.
+    pub fn applyDelta(self: *Index, delta: Delta) !void {
+        if (delta.base_version != self.version) return error.DeltaVersionMismatch;
+        switch (delta.kind) {
+            .delete => {
+                if (delta.id >= self.node_count) return error.InvalidDelta;
+                try self.markDeleted(delta.id);
+                return;
+            },
+            .insert => {},
         }
-        list.items[worst_i] = id;
-        return true;
+        try self.validateInsertDelta(delta);
+        const alloc = self.alloc;
+        const id = delta.id;
+
+        // Reserve everything up front: nothing below the commit may fail.
+        try self.reserveCode(alloc);
+        try self.flags.ensureUnusedCapacity(alloc, 1);
+        try self.indegree.ensureUnusedCapacity(alloc, 1);
+        try self.adjacency.ensureUnusedCapacity(alloc, 1);
+        try self.upper.ensureUnusedCapacity(alloc, 1);
+        var forward = try NeighborList.initCapacity(alloc, delta.forward.len);
+        var forward_owned = true;
+        defer if (forward_owned) forward.deinit(alloc);
+        forward.appendSliceAssumeCapacity(delta.forward);
+        const new_upper = try alloc.alloc(NeighborList, delta.level);
+        @memset(new_upper, NeighborList.empty);
+        var upper_owned = true;
+        defer if (upper_owned) freeLists(alloc, new_upper);
+        for (new_upper, delta.upper) |*list, ids| {
+            try list.ensureTotalCapacity(alloc, ids.len);
+            list.appendSliceAssumeCapacity(ids);
+        }
+        for (delta.edits) |e| {
+            if (e.slot != Delta.append_slot) continue;
+            const list = if (e.layer == 0) &self.adjacency.items[e.owner] else &self.upper.items[e.owner][e.layer - 1];
+            try list.ensureUnusedCapacity(alloc, 1);
+        }
+
+        self.appendCodeAssumeCapacity(delta.code);
+        self.flags.appendAssumeCapacity(0);
+        self.indegree.appendAssumeCapacity(0);
+        for (delta.forward) |u| self.indegree.items[u] += 1;
+        self.adjacency.appendAssumeCapacity(forward);
+        forward_owned = false;
+        self.upper.appendAssumeCapacity(new_upper);
+        upper_owned = false;
+        self.node_count += 1;
+
+        for (delta.edits) |e| {
+            const list = if (e.layer == 0) &self.adjacency.items[e.owner] else &self.upper.items[e.owner][e.layer - 1];
+            if (e.slot == Delta.append_slot) {
+                list.appendAssumeCapacity(id);
+            } else {
+                const old = list.items[e.slot];
+                list.items[e.slot] = id;
+                if (e.layer == 0) self.indegree.items[old] -= 1;
+            }
+            if (e.layer == 0) self.indegree.items[id] += 1;
+        }
+        if (delta.level > self.max_level) {
+            self.max_level = delta.level;
+            self.entry = id;
+        }
+        self.version += 1;
+    }
+
+    fn validateInsertDelta(self: *const Index, delta: Delta) !void {
+        const id = delta.id;
+        if (id != self.node_count) return error.InvalidDelta;
+        if (delta.level != levelFor(self.config.seed, id, self.config.max_degree)) return error.InvalidDelta;
+        if (delta.code.len != self.codeByteLen()) return error.InvalidDelta;
+        if (delta.upper.len != delta.level) return error.InvalidDelta;
+        if (delta.forward.len > self.config.max_degree) return error.InvalidDelta;
+        for (delta.forward) |u| if (u >= self.node_count) return error.InvalidDelta;
+        for (delta.upper, 1..) |ids, l| {
+            if (ids.len > self.config.max_degree) return error.InvalidDelta;
+            for (ids) |u| if (u >= self.node_count or self.upper.items[u].len < l) return error.InvalidDelta;
+        }
+        // Slots refer to list positions before this delta; appends only grow
+        // lists, so a slot valid before stays valid while edits apply.
+        for (delta.edits) |e| {
+            if (e.owner >= self.node_count) return error.InvalidDelta;
+            if (e.layer > 0 and self.upper.items[e.owner].len < e.layer) return error.InvalidDelta;
+            const len = if (e.layer == 0) self.adjacency.items[e.owner].items.len else self.upper.items[e.owner][e.layer - 1].items.len;
+            if (e.slot != Delta.append_slot and e.slot >= len) return error.InvalidDelta;
+            if (e.slot != Delta.append_slot and e.layer == 0) {
+                const old = self.adjacency.items[e.owner].items[e.slot];
+                if (self.indegree.items[old] == 0) return error.InvalidDelta;
+            }
+        }
+    }
+
+    /// Bytes of one node's compressed code.
+    fn codeByteLen(self: *const Index) usize {
+        if (self.rabitq) |*r| return r.rowByteLen();
+        return self.config.pq_subspaces;
+    }
+
+    /// Encodes a (normalized for cosine) vector into code bytes.
+    fn encodeCode(self: *const Index, alloc: Allocator, v: []const f32) ![]u8 {
+        if (self.rabitq) |*r| return try r.encodeRowBytes(alloc, v);
+        const out = try alloc.alloc(u8, self.config.pq_subspaces);
+        self.pq.?.encode(v, out);
+        return out;
+    }
+
+    /// Approximate reconstruction from code bytes, in the same space as
+    /// `decodeApprox`.
+    fn decodeBytes(self: *const Index, bytes: []const u8, out: []f32) void {
+        if (self.rabitq) |*r| return r.decodeRowBytes(bytes, out);
+        self.pq.?.decode(bytes, out);
+    }
+
+    fn reserveCode(self: *Index, alloc: Allocator) !void {
+        if (self.rabitq) |*r| return r.reserve(alloc, 1);
+        try self.codes.ensureUnusedCapacity(alloc, self.config.pq_subspaces);
+    }
+
+    fn appendCodeAssumeCapacity(self: *Index, bytes: []const u8) void {
+        if (self.rabitq) |*r| return r.appendRowBytesAssumeCapacity(bytes);
+        self.codes.appendSliceAssumeCapacity(bytes);
     }
 
     /// Approximate reconstruction of a stored vector (in rotated space for
@@ -1023,7 +1171,7 @@ pub const Index = struct {
     // ---------------------------------------------------------------------
 
     const magic = "LEANNIDX";
-    pub const format_version: u32 = 3;
+    pub const format_version: u32 = 4;
 
     /// Serializes the graph layers, quantizer state, codes, and flags. No
     /// embeddings are written. Layout after the header: quantizer section,
@@ -1048,6 +1196,7 @@ pub const Index = struct {
         try wr.writeInt(u32, self.node_count, .little);
         try wr.writeInt(u32, self.entry, .little);
         try wr.writeByte(self.max_level);
+        try wr.writeInt(u64, self.version, .little);
         if (self.pq) |*pq| {
             try wr.writeInt(u32, pq.k, .little);
             for (pq.centroids) |f| try wr.writeInt(u32, @bitCast(f), .little);
@@ -1100,9 +1249,10 @@ pub const Index = struct {
         const n = try readU32(&r);
         const entry = try readU32(&r);
         const max_level = r.takeByte() catch return error.InvalidFormat;
+        const version = r.takeInt(u64, .little) catch return error.InvalidFormat;
         if (n == 0 or entry >= n or max_level > max_level_cap) return error.InvalidFormat;
 
-        var index = Index{ .alloc = alloc, .config = cfg, .node_count = n, .entry = entry, .max_level = max_level };
+        var index = Index{ .alloc = alloc, .config = cfg, .node_count = n, .entry = entry, .max_level = max_level, .version = version };
         errdefer index.deinit();
 
         switch (cfg.quantizer) {
@@ -1174,6 +1324,111 @@ pub const Index = struct {
         if (r.bufferedLen() != 0) return error.InvalidFormat;
         try index.rebuildIndegree();
         return index;
+    }
+};
+
+/// A replicable change to an index: an insert planned by `planInsert` or a
+/// delete planned by `planDelete`. Apply with `Index.applyDelta`. Owned
+/// slices are freed by `deinit`.
+pub const Delta = struct {
+    kind: Kind,
+    /// Index version the delta was planned against.
+    base_version: u64,
+    /// New node id (insert) or deleted node id (delete).
+    id: u32,
+    level: u8 = 0,
+    /// Compressed code bytes for the new node.
+    code: []u8 = &.{},
+    /// Layer-0 forward edges.
+    forward: []u32 = &.{},
+    /// Forward edges for layers 1..level.
+    upper: [][]u32 = &.{},
+    /// Reverse-link edits, applied in order. Each writes the new id into
+    /// `owner`'s list on `layer`, at `slot` or appended.
+    edits: []Edit = &.{},
+
+    pub const Kind = enum(u8) { insert = 1, delete = 2 };
+    pub const append_slot: u32 = std.math.maxInt(u32);
+    pub const Edit = struct { layer: u8, owner: u32, slot: u32 };
+
+    pub fn deinit(self: *Delta, alloc: Allocator) void {
+        if (self.code.len > 0) alloc.free(self.code);
+        if (self.forward.len > 0) alloc.free(self.forward);
+        for (self.upper) |ids| if (ids.len > 0) alloc.free(ids);
+        if (self.upper.len > 0) alloc.free(self.upper);
+        if (self.edits.len > 0) alloc.free(self.edits);
+        self.* = undefined;
+    }
+
+    pub fn encode(self: Delta, alloc: Allocator) ![]u8 {
+        var w: std.Io.Writer.Allocating = .init(alloc);
+        defer w.deinit();
+        const wr = &w.writer;
+        try wr.writeByte(@backingInt(self.kind));
+        try wr.writeInt(u64, self.base_version, .little);
+        try wr.writeInt(u32, self.id, .little);
+        if (self.kind == .insert) {
+            try wr.writeByte(self.level);
+            try wr.writeInt(u32, @intCast(self.code.len), .little);
+            try wr.writeAll(self.code);
+            try writeIds(wr, self.forward);
+            for (self.upper) |ids| try writeIds(wr, ids);
+            try wr.writeInt(u32, @intCast(self.edits.len), .little);
+            for (self.edits) |e| {
+                try wr.writeByte(e.layer);
+                try wr.writeInt(u32, e.owner, .little);
+                try wr.writeInt(u32, e.slot, .little);
+            }
+        }
+        return w.toOwnedSlice();
+    }
+
+    fn writeIds(wr: *std.Io.Writer, ids: []const u32) !void {
+        try wr.writeInt(u32, @intCast(ids.len), .little);
+        for (ids) |id| try wr.writeInt(u32, id, .little);
+    }
+
+    /// Decodes a delta. Structural limits keep a corrupt record from
+    /// allocating unboundedly; `applyDelta` validates it against the index.
+    pub fn decode(alloc: Allocator, bytes: []const u8) !Delta {
+        var r: std.Io.Reader = .fixed(bytes);
+        const kind = std.enums.fromInt(Kind, r.takeByte() catch return error.InvalidDelta) orelse return error.InvalidDelta;
+        var out = Delta{
+            .kind = kind,
+            .base_version = r.takeInt(u64, .little) catch return error.InvalidDelta,
+            .id = r.takeInt(u32, .little) catch return error.InvalidDelta,
+        };
+        errdefer out.deinit(alloc);
+        if (kind == .insert) {
+            out.level = r.takeByte() catch return error.InvalidDelta;
+            if (out.level > max_level_cap) return error.InvalidDelta;
+            const code_len = r.takeInt(u32, .little) catch return error.InvalidDelta;
+            if (code_len > 1 << 20) return error.InvalidDelta;
+            out.code = try alloc.dupe(u8, r.take(code_len) catch return error.InvalidDelta);
+            out.forward = try readIds(alloc, &r);
+            out.upper = try alloc.alloc([]u32, out.level);
+            @memset(out.upper, &.{});
+            for (out.upper) |*ids| ids.* = try readIds(alloc, &r);
+            const n_edits = r.takeInt(u32, .little) catch return error.InvalidDelta;
+            if (n_edits > 4096) return error.InvalidDelta;
+            out.edits = try alloc.alloc(Edit, n_edits);
+            for (out.edits) |*e| e.* = .{
+                .layer = r.takeByte() catch return error.InvalidDelta,
+                .owner = r.takeInt(u32, .little) catch return error.InvalidDelta,
+                .slot = r.takeInt(u32, .little) catch return error.InvalidDelta,
+            };
+        }
+        if (r.bufferedLen() != 0) return error.InvalidDelta;
+        return out;
+    }
+
+    fn readIds(alloc: Allocator, r: *std.Io.Reader) ![]u32 {
+        const n = r.takeInt(u32, .little) catch return error.InvalidDelta;
+        if (n > 1024) return error.InvalidDelta;
+        const ids = try alloc.alloc(u32, n);
+        errdefer alloc.free(ids);
+        for (ids) |*id| id.* = r.takeInt(u32, .little) catch return error.InvalidDelta;
+        return ids;
     }
 };
 
@@ -1370,6 +1625,51 @@ pub const RaBitQCodes = struct {
         defer alloc.free(rotated);
         _ = self.rotation.transform(v, rotated);
         return .{ .set = try self.quantizer.quantize(self.centroid, rotated, 1) };
+    }
+
+    /// Row byte layout: `width` u64 code words, u32 code count, f32 centroid
+    /// distance, f32 quantized dot product, then f32 centroid dot product
+    /// for inner product and cosine.
+    fn rowByteLen(self: *const RaBitQCodes) usize {
+        return self.width * 8 + 12 + (if (self.metric != .l2_squared) @as(usize, 4) else 0);
+    }
+
+    fn encodeRowBytes(self: *const RaBitQCodes, alloc: Allocator, v: []const f32) ![]u8 {
+        var row = try self.encodeRow(alloc, v);
+        defer row.deinit(alloc);
+        const out = try alloc.alloc(u8, self.rowByteLen());
+        var pos: usize = 0;
+        for (row.set.codes.data) |word| {
+            std.mem.writeInt(u64, out[pos..][0..8], word, .little);
+            pos += 8;
+        }
+        std.mem.writeInt(u32, out[pos..][0..4], row.set.code_counts[0], .little);
+        std.mem.writeInt(u32, out[pos + 4 ..][0..4], @bitCast(row.set.centroid_distances[0]), .little);
+        std.mem.writeInt(u32, out[pos + 8 ..][0..4], @bitCast(row.set.quantized_dot_products[0]), .little);
+        if (self.metric != .l2_squared) std.mem.writeInt(u32, out[pos + 12 ..][0..4], @bitCast(row.set.centroid_dot_products[0]), .little);
+        return out;
+    }
+
+    fn appendRowBytesAssumeCapacity(self: *RaBitQCodes, bytes: []const u8) void {
+        var pos: usize = 0;
+        for (0..self.width) |_| {
+            self.codes.appendAssumeCapacity(std.mem.readInt(u64, bytes[pos..][0..8], .little));
+            pos += 8;
+        }
+        self.code_counts.appendAssumeCapacity(std.mem.readInt(u32, bytes[pos..][0..4], .little));
+        self.centroid_distances.appendAssumeCapacity(@bitCast(std.mem.readInt(u32, bytes[pos + 4 ..][0..4], .little)));
+        self.quantized_dot_products.appendAssumeCapacity(@bitCast(std.mem.readInt(u32, bytes[pos + 8 ..][0..4], .little)));
+        if (self.metric != .l2_squared) self.centroid_dot_products.appendAssumeCapacity(@bitCast(std.mem.readInt(u32, bytes[pos + 12 ..][0..4], .little)));
+    }
+
+    fn decodeRowBytes(self: *const RaBitQCodes, bytes: []const u8, out: []f32) void {
+        const cd: f32 = @bitCast(std.mem.readInt(u32, bytes[self.width * 8 + 4 ..][0..4], .little));
+        const scale = cd / @sqrt(@as(f32, @floatFromInt(self.dims)));
+        for (out, 0..) |*o, j| {
+            const word = std.mem.readInt(u64, bytes[(j / 64) * 8 ..][0..8], .little);
+            const bit = (word >> @intCast(63 - j % 64)) & 1;
+            o.* = self.centroid[j] + (if (bit == 1) scale else -scale);
+        }
     }
 
     fn reserve(self: *RaBitQCodes, alloc: Allocator, extra: usize) !void {
@@ -2402,4 +2702,119 @@ test "leann: rabitq serialization and inserts without recomputation" {
         bad[bad.len / 3] ^= 0x10;
         try testing.expectError(error.InvalidFormat, Index.deserialize(alloc, bad));
     }
+}
+
+test "leann: replicas applying the leader's deltas stay byte-identical" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 900, 1, 32, 12, 43);
+    defer fx.deinit(alloc);
+    for ([_]Quantizer{ .pq, .rabitq }) |quantizer| {
+        var leader = try Index.build(alloc, .{ .dims = 32, .metric = .cosine, .quantizer = quantizer, .max_degree = 12 }, fx.data[0 .. 500 * 32]);
+        defer leader.deinit();
+        const snapshot = try leader.serialize(alloc);
+        defer alloc.free(snapshot);
+        var follower_a = try Index.deserialize(alloc, snapshot);
+        defer follower_a.deinit();
+        var follower_b = try Index.deserialize(alloc, snapshot);
+        defer follower_b.deinit();
+
+        // Node id -> vector, so recomputation reads the right rows.
+        var node_vectors = std.ArrayListUnmanaged(f32).empty;
+        defer node_vectors.deinit(alloc);
+        try node_vectors.appendSlice(alloc, fx.data[0 .. 500 * 32]);
+        var last_insert: u32 = 0;
+        for (500..900) |i| {
+            var src = SliceEmbeddingSource{ .vectors = node_vectors.items, .dims = 32 };
+            var delta = if (i % 7 == 0)
+                try leader.planDelete(@intCast(i / 3))
+            else
+                try leader.planInsert(alloc, src.source(), fx.data[i * 32 ..][0..32]);
+            defer delta.deinit(alloc);
+            if (delta.kind == .insert) {
+                last_insert = delta.id;
+                try node_vectors.appendSlice(alloc, fx.data[i * 32 ..][0..32]);
+            }
+            // Replicate through the wire encoding, as a log entry would.
+            const wire = try delta.encode(alloc);
+            defer alloc.free(wire);
+            for ([_]*Index{ &leader, &follower_a, &follower_b }) |replica| {
+                var copy = try Delta.decode(alloc, wire);
+                defer copy.deinit(alloc);
+                try replica.applyDelta(copy);
+            }
+        }
+        const a = try leader.serialize(alloc);
+        defer alloc.free(a);
+        const b = try follower_a.serialize(alloc);
+        defer alloc.free(b);
+        const c = try follower_b.serialize(alloc);
+        defer alloc.free(c);
+        try testing.expectEqualSlices(u8, a, b);
+        try testing.expectEqualSlices(u8, a, c);
+        try testing.expectEqual(@as(u64, 400), leader.version);
+
+        // The replicated graph still answers queries: the last inserted
+        // vector (i = 899) finds its own node.
+        var src = SliceEmbeddingSource{ .vectors = node_vectors.items, .dims = 32 };
+        var resp = try follower_b.search(alloc, src.source(), fx.data[899 * 32 ..][0..32], .{ .k = 1, .ef = 256 });
+        defer resp.deinit(alloc);
+        try testing.expectEqual(last_insert, resp.results[0].id);
+    }
+}
+
+test "leann: stale and malformed deltas are rejected without changes" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 400, 1, 16, 6, 47);
+    defer fx.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = 16, .quantizer = .rabitq, .max_degree = 8 }, fx.data[0 .. 300 * 16]);
+    defer index.deinit();
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 16 };
+
+    var first = try index.planInsert(alloc, src.source(), fx.data[300 * 16 ..][0..16]);
+    defer first.deinit(alloc);
+    var stale = try index.planInsert(alloc, src.source(), fx.data[301 * 16 ..][0..16]);
+    defer stale.deinit(alloc);
+    try index.applyDelta(first);
+
+    const before = try index.serialize(alloc);
+    defer alloc.free(before);
+    try testing.expectError(error.DeltaVersionMismatch, index.applyDelta(stale));
+    try testing.expectError(error.DeltaVersionMismatch, index.applyDelta(first));
+
+    var fresh = try index.planInsert(alloc, src.source(), fx.data[301 * 16 ..][0..16]);
+    defer fresh.deinit(alloc);
+    const wire = try fresh.encode(alloc);
+    defer alloc.free(wire);
+    // Corrupt one edit slot, one forward id, and the code length.
+    {
+        var bad = try Delta.decode(alloc, wire);
+        defer bad.deinit(alloc);
+        if (bad.edits.len > 0) {
+            bad.edits[0].slot = 9999;
+            try testing.expectError(error.InvalidDelta, index.applyDelta(bad));
+        }
+    }
+    {
+        var bad = try Delta.decode(alloc, wire);
+        defer bad.deinit(alloc);
+        bad.forward[0] = 1_000_000;
+        try testing.expectError(error.InvalidDelta, index.applyDelta(bad));
+    }
+    {
+        var bad = try Delta.decode(alloc, wire);
+        defer bad.deinit(alloc);
+        bad.id += 1;
+        try testing.expectError(error.InvalidDelta, index.applyDelta(bad));
+    }
+    try testing.expectError(error.InvalidDelta, Delta.decode(alloc, wire[0 .. wire.len - 3]));
+    try testing.expectError(error.UnknownNode, index.planDelete(5000));
+
+    const after = try index.serialize(alloc);
+    defer alloc.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+
+    var ok = try Delta.decode(alloc, wire);
+    defer ok.deinit(alloc);
+    try index.applyDelta(ok);
+    try testing.expectEqual(@as(u64, 2), index.version);
 }
