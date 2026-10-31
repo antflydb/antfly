@@ -4994,3 +4994,32 @@ default or explicitly large count budgets must not be rejected as invalid
 relational requests. The portable regression covers a 16,384-anchor allowance
 as well as exact physical-progress enforcement. Explicit query predicates keep
 the existing evaluator and its ordinary payload memory requirements.
+
+Authenticated node visibility checks request no relational user columns: the
+reader still evaluates row filters against the full retained row, but returns
+only identity metadata. This prevents a visibility-only point read from
+reconstructing wide properties and exhausting an otherwise bounded count's
+memory budget. The authenticated count campaign covers both unrestricted and
+row-filtered principals. Its strict one-anchor virtual-label probe waits for
+asynchronous index backfill readiness without relaxing the final anchor bound.
+
+Qualification after merging `origin/main` through `f91c9c0e46`:
+
+- ReleaseFast core suite: 530 tests passed. Projection, callback ABI,
+  independently compiled scan/progress callbacks, portable count and runtime
+  error-identity gates passed, with zero leaks. Debug portable/projection/scan
+  callback gates also passed.
+- The authenticated 32-row, 512 KiB escaped-string campaign passes at 8 MiB in
+  both storage modes, including combined counts, logical-label predicates,
+  missing/null/false values, row-filtered readers and scan/work limit failures.
+  Scalar `COUNT(n.body)` returns 16 with 32 scanned anchors and 980 work units.
+  Peak statement memory is 13,912 bytes for document storage and 11,814 bytes
+  for relational storage. The preceding implementation required 27,923,332
+  bytes for the original wide-property count and failed the 8 MiB ceiling.
+  These measurements demonstrate allocation reduction, not a wall-time claim.
+- Authenticated SQL/property plans, bounded producer visibility, replicated-owner
+  queries and both producer-postimage storage variants pass. The affected local
+  SQL and visibility campaigns were rerun after the final metadata-only fix.
+- The merged Go SDK tests and Antfarm typecheck/build pass; Antfarm's suite
+  passes all 305 tests. Generated SDK/schema and bundled workbench merge
+  conflicts were resolved by regeneration from the combined source.

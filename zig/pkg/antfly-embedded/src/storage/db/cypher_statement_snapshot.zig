@@ -176,7 +176,12 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
         fn project(ptr: *anyopaque, a: std.mem.Allocator, node: *const cypher.value.Node) !?*const cypher.value.Node {
             const self = cast(ptr);
             if (self.input.filter_query_json.len != 0) {
-                var match = try self.db.scan(a, node.identity.key, node.identity.key, try self.db.cypherDocumentScanOptions(a, .{ .inclusive_from = true, .limit = 1, .execution_deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s, .filter_query_json = self.input.filter_query_json, .row_policy_principal_proof = self.input.principal_proof, .row_policy_database = self.input.database }));
+                var opts = try self.db.cypherDocumentScanOptions(a, .{ .inclusive_from = true, .limit = 1, .execution_deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s, .filter_query_json = self.input.filter_query_json, .row_policy_principal_proof = self.input.principal_proof, .row_policy_database = self.input.database });
+                // Visibility needs only an admitted identity. Keep the filter
+                // authoritative against the full row, but never project wide
+                // user payloads into this metadata-only relational read.
+                if (opts.relational_query) |*query| query.fields = &.{};
+                var match = try self.db.scan(a, node.identity.key, node.identity.key, opts);
                 defer match.deinit(a);
                 if (match.hashes.len == 0) return null;
             }

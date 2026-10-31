@@ -1527,7 +1527,7 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
     reader.auth = (prefix + "_reader", uuid.uuid4().hex)
     base = server.api_url.rstrip("/")
 
-    def call(path, body=None, *, method="POST", session=admin):
+    def call(path, body=None, *, method="POST", session=admin, wait_for_index=False):
         deadline = time.monotonic() + 60
         while True:
             response = session.request(
@@ -1536,7 +1536,12 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
                 json=body,
                 timeout=45,
             )
-            if response.status_code != 503 or time.monotonic() >= deadline:
+            waiting = response.status_code == 503 or (
+                wait_for_index
+                and response.status_code == 429
+                and response.json().get("code") == "CypherAnchorBudgetExceeded"
+            )
+            if not waiting or time.monotonic() >= deadline:
                 break
             time.sleep(0.1)
         assert response.status_code in (200, 201, 202, 204), (
@@ -1617,6 +1622,7 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
                     "query": "MATCH (n:One) RETURN count(n.body)",
                     "limits": {"memory_bytes": 8 << 20, "scanned_anchors": 1},
                 },
+                wait_for_index=True,
             )
             assert indexed_label["rows"] == [[{"type": "integer", "value": "1"}]], (
                 indexed_label
