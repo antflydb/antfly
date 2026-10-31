@@ -717,6 +717,7 @@ pub const Owner = struct {
         maintenance_errors: u64 = 0,
         maintenance_queue_timeouts: u64 = 0,
         allocator_refusals: u64 = 0,
+        allocator_service_admissions: u64 = 0,
         index_input_refusals: u64 = 0,
         // Detached graph-walk totals, including foreground and maintenance.
         // These survive runtime refresh and exclude lease/queue wait time.
@@ -741,6 +742,7 @@ pub const Owner = struct {
     test_before_allocator_reader_close: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *native.NativeFile) void } else void = if (h.builtin.is_test) null else {},
     test_allocator_wait: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
     test_after_stop: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
+    test_before_storage_service: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle) void } else void = if (h.builtin.is_test) null else {},
     test_before_maintenance_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
 
     /// Caller holds the path lease, so the checkpoint and catalog cannot race
@@ -1118,7 +1120,15 @@ pub const Owner = struct {
         defer probe.close();
         const file = &root.owned_lite_backend.?.native_docstore.?.file;
         if ((try probe.file.stat(probe.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
-        if (!std.meta.eql(probe.header, file.header)) {
+        if (!std.meta.eql(probe.header, file.header) and scope == .allocator_service) {
+            // Bounded allocator/orphan service computes no detached output.
+            // Start it on the current ledger under the fair writer lease;
+            // vacuum assessment/copy publication still rejects a moved tip.
+            try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(probe.header);
+            if (self.current) |current| try file.inheritAllocatorVerification(&current.owned_lite_backend.?.native_docstore.?.file);
+            if (!file.free_pages_verified) _ = try file.inheritAllocatorCertificate();
+            self.publication_stats.rebased +|= 1;
+        } else if (!std.meta.eql(probe.header, file.header)) {
             if (scope == .reclamation) return error.EnrichmentWaitCanceled;
             const publication = root.maintenance_publication orelse return error.EnrichmentWaitCanceled;
             try publication.validateStorageCurrent();
@@ -1150,6 +1160,7 @@ pub const Owner = struct {
             self.publication_stats.allocator_refusals +|= 1;
             return error.EnrichmentWaitCanceled;
         }
+        if (scope == .allocator_service) self.publication_stats.allocator_service_admissions +|= 1;
         root.maintenance_writer_lease = lease;
         root.maintenance_writer_references = 1;
     }
@@ -1601,6 +1612,11 @@ pub const Owner = struct {
         root.maintenance_publication = null;
         if (source_read) |*read| read.abort();
         source_read = null;
+        // No detached computation/publication can use the catalog now. Drop
+        // its checkpoint pin before physical service, which otherwise retains
+        // an obsolete reader fence throughout its own reuse/vacuum attempt.
+        if (catalog) |*proof| proof.deinit();
+        catalog = null;
         if (independent and root.db_live) {
             // End the input fences before reclamation. Keeping them in an
             // idle runtime would needlessly prevent in-place page service.
@@ -1609,6 +1625,7 @@ pub const Owner = struct {
             root.db.closeImmutableSnapshot();
             root.db_live = false;
         }
+        if (comptime h.builtin.is_test) if (self.test_before_storage_service) |hook| hook.notify(hook.ptr, root);
         store.maintainOnce(false) catch |err| {
             if (maintenance_error == null) maintenance_error = err;
             pending = true;
@@ -1627,10 +1644,6 @@ pub const Owner = struct {
         }
         store.writer_admission = null;
         root.maintenance_owner = null;
-        // The raw native pin borrows this snapshot's store. Release it before
-        // collectRetired can destroy a superseded hosted/serving root.
-        if (catalog) |*proof| proof.deinit();
-        catalog = null;
         root.maintenance_references -= 1;
         if (independent) inheritReclamationTelemetry(self.current.?.owned_lite_backend.?.native_docstore.?, store);
         if (!independent and self.current != root) {
@@ -4219,4 +4232,141 @@ test "capi native allocator proof initial admission survives a long local queue 
     thread.join();
     try std.testing.expectEqual(h.capi.ErrorCode.ok, writer.result);
     try fixture.expectWritten(.batch, true);
+}
+
+test "capi native allocator proof issue1431 committed transform visibility timeout is not Busy" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("committed-transform-visibility", 1000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const root = fixture.connection.owner.current.?;
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        try root.db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    }
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&output);
+    const seed = "{\"inserts\":{\"counter\":{\"body\":\"counter\",\"count\":0}},\"sync_level\":\"write\"}";
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice(seed), &output));
+    api.antfly_buffer_free_zero(&output);
+    // Native serving handles omit optional runtimes. Install a manual one to
+    // reproduce the public batch path's post-commit visibility refusal.
+    const workers = root.db.start_index_workers;
+    root.db.start_index_workers = true;
+    root.db.initOptionalTextMergeRuntime(.{ .enabled = true, .manual_producer_assistance = true }) catch |err| {
+        root.db.start_index_workers = workers;
+        return err;
+    };
+    root.db.start_index_workers = workers;
+    const runtime = root.db.text_merge_runtime.?;
+    runtime.config.max_pending_segments = 12;
+    runtime.config.resume_pending_segments = 6;
+    runtime.config.max_pending_bytes = 0;
+    runtime.config.backpressure_max_wait_ms = 100;
+    const active = root.db.core.index_manager.textActiveSegmentCountSnapshot("ft_v1");
+    try std.testing.expect(active < runtime.config.max_pending_segments);
+    var held = try runtime.acquireProducerPermit("ft_v1", runtime.config.max_pending_segments - active, 0);
+    defer held.release();
+    const increment = "{\"transforms\":[{\"key\":\"counter\",\"operations\":[{\"op\":\"$inc\",\"path\":\"count\",\"value\":1}]}],\"sync_level\":\"full_text\"}";
+    try std.testing.expectEqual(h.capi.ErrorCode.stalled, api.antfly_db_batch_json(fixture.id, .fromSlice(increment), &output));
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(h.capi.lastErrorDetail()), "primary write committed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(h.capi.lastErrorDetail()), "do not retry") != null);
+    const raw = (try root.db.get(std.testing.allocator, "counter")).?;
+    defer std.testing.allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
+    held.release();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(fixture.id));
+    // A separate refusal before primary execution remains Busy and does not
+    // apply the transform. Only derived completion was retried above.
+    fixture.connection.options.busy_timeout_ms = 0;
+    {
+        var lease = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), fixture.path);
+        defer lease.close();
+        try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_batch_json(fixture.id, .fromSlice(increment), &output));
+    }
+    const completed = (try root.db.get(std.testing.allocator, "counter")).?;
+    defer std.testing.allocator.free(completed);
+    var visible = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, completed, .{});
+    defer visible.deinit();
+    try std.testing.expectEqual(@as(i64, 1), visible.value.object.get("count").?.integer);
+}
+
+test "capi native allocator proof issue1431 bounded allocator service rebases a moved checkpoint" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("allocator-service-rebase", 1000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    var detached: *h.Handle = undefined;
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        detached = try owner.refreshMaintenanceSnapshot(owner.current.?, false);
+    }
+    const file = &detached.owned_lite_backend.?.native_docstore.?.file;
+    const captured = file.header;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    try std.testing.expect(!std.meta.eql(captured, owner.current.?.owned_lite_backend.?.native_docstore.?.file.header));
+    detached.maintenance_owner = owner;
+    defer detached.maintenance_owner = null;
+    // A prepared vacuum must still refuse this stale capture.
+    try std.testing.expectError(error.EnrichmentWaitCanceled, Owner.enterMaintenanceWriter(detached, .reclamation));
+    try std.testing.expectEqual(captured, file.header);
+    const admitted = owner.publication_stats.allocator_service_admissions;
+    try Owner.enterMaintenanceWriter(detached, .allocator_service);
+    var held = true;
+    defer if (held) Owner.leaveMaintenanceWriter(detached);
+    try std.testing.expect(std.meta.eql(file.header, owner.current.?.owned_lite_backend.?.native_docstore.?.file.header));
+    try std.testing.expectEqual(admitted + 1, owner.publication_stats.allocator_service_admissions);
+    _ = try file.reclaimPagesForMaintenanceWithCancel(8, null);
+    try std.testing.expect((try file.check()).valid);
+    Owner.leaveMaintenanceWriter(detached);
+    held = false;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.read));
+    try fixture.expectWritten(.batch, true);
+}
+
+test "capi native allocator proof issue1431 physical maintenance releases detached catalog pins" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("maintenance-releases-catalog", 1000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    const Probe = struct {
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        fn notify(ptr: *anyopaque, root: *h.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const store = root.owned_lite_backend.?.native_docstore.?;
+            const file = std.Io.Dir.cwd().openFile(h.handleLockIo(), store.file.path, .{
+                .mode = .read_write,
+                .lock = .exclusive,
+                .lock_nonblocking = true,
+            }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            file.close(h.handleLockIo());
+        }
+    };
+    var probe: Probe = .{};
+    owner.test_before_storage_service = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_before_storage_service = null;
+    for (0..8) |_| {
+        owner.maintenance_pending = true;
+        _ = try owner.maintenanceTurn();
+        if (probe.calls != 0) break;
+    }
+    try std.testing.expect(probe.calls != 0);
+    if (probe.failure) |err| return err;
 }

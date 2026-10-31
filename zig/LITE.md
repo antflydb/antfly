@@ -1224,6 +1224,32 @@ merges when text-publication admission is blocked. A reduction in the blocked
 segment or heap-byte dimension renews their no-progress wait budget; unrelated or
 stale work does not. Total merge time remains visible in backpressure telemetry.
 Owners with background merge workers retain their existing wait budget.
+Manual merge turns participate in runtime lifecycle admission too. Pause and stop
+prevent new tasks and drain borrowed index state before structural index changes;
+permanent shutdown also drains producer/assistance bookkeeping. Resuming a manual
+runtime restores admission without starting an optional worker.
+
+A batch can commit primary data before its requested full-text visibility is
+ready. Failures in retryable admission after that commit are reported as
+`CommitVisibilityNotSatisfied` (`ANTFLY_STALLED` at the C boundary), with a
+committed/visibility-pending diagnostic. Resume derived work rather than replaying
+the batch, especially for transforms such as `$inc`. Pre-commit Busy refusals keep
+their existing retry behavior. SQL retains its committed-pending outcome.
+
+Physical maintenance releases detached catalog/source pins before starting
+allocator service or a vacuum assessment. Bounded allocator/orphan service joins
+the fair writer queue and starts from the current checkpoint; prepared vacuum
+publication still rejects a changed tip. A worthwhile shrink assessment retains
+an automatic retry deadline across checkpoint refreshes until a rewrite succeeds
+or a later assessment finds no useful shrink. Retries require no additional file
+growth and preserve the scan-cost budget (at least 30 seconds, or 64 times the
+previous scan duration).
+
+Ordinary coordinated native read-only
+opens retain allocator metadata as well as data, preserving integrity inspection
+of both captured recovery slots. Logical transaction read pins remain explicit
+data-only views.
+
 These changes require a rebuilt native library; they do not
 change SDK request schemas or the public C ABI.
 

@@ -4678,7 +4678,10 @@ pub fn antfly_db_batch(
     defer guard.leave();
     const handle = guard.handle;
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": write and predicate pointers must not be null when their counts are nonzero");
-    batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level) catch |err| return capi.mapError(err);
+    batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level) catch |err| return if (err == error.CommitVisibilityNotSatisfied)
+        capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch")
+    else
+        capi.mapError(err);
     return .ok;
 }
 
@@ -4700,7 +4703,10 @@ pub fn antfly_db_batch_json(
     var owned = batch_api.parseBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
 
-    handle.database().*.batch(owned.req) catch |err| return capi.mapError(err);
+    handle.database().*.batch(owned.req) catch |err| return if (err == error.CommitVisibilityNotSatisfied)
+        capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch")
+    else
+        capi.mapError(err);
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err| return capi.mapError(err);
     out_buf.* = .{
         .ptr = response.ptr,

@@ -1416,7 +1416,7 @@ var next_score_cache_owner: std.atomic.Value(u64) = .init(1);
 /// Optional owner admission around every document/index publication.
 /// Detached computation can retain this Store without retaining a file
 /// writer lease; admission must validate its checkpoint before mutation.
-pub const PublicationScope = enum { primary, index, reclamation, artifact_lease };
+pub const PublicationScope = enum { primary, index, reclamation, artifact_lease, allocator_service };
 
 pub const WriterAdmission = struct {
     ptr: *anyopaque,
@@ -2031,7 +2031,17 @@ pub const Store = struct {
                 retry_at = .zero;
                 const more = self.maintenanceNeedsService() catch false;
                 if (self.maintenance_cancel.requested.load(.acquire)) break;
-                if (!more) self.maintenance_wake.waitUncancelable(io);
+                if (!more) {
+                    lockStore(self);
+                    const rewrite_retry = self.maintenance_policy.rewrite_retry_at_ns;
+                    self.mutex.unlock();
+                    if (rewrite_retry) |deadline| {
+                        self.maintenance_wake.waitTimeout(io, .{ .duration = .{
+                            .raw = std.Io.Clock.awake.now(io).durationTo(.{ .nanoseconds = deadline }),
+                            .clock = .awake,
+                        } }) catch {};
+                    } else self.maintenance_wake.waitUncancelable(io);
+                }
             }
         }
     }
@@ -2083,7 +2093,7 @@ pub const Store = struct {
             return;
         }
         {
-            if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
+            if (self.writer_admission) |admission| try admission.enter(admission.ptr, .allocator_service);
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
             lockStore(self);
             defer self.mutex.unlock();
@@ -2128,13 +2138,14 @@ pub const Store = struct {
             }
             const size = (try self.file.file.stat(self.file.runtime())).size;
             self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
-            if (!force and !self.maintenance_policy.due(size)) return;
+            const retry_due = self.maintenance_policy.rewriteRetryDue(std.Io.Clock.awake.now(self.file.runtime()).nanoseconds);
+            if (!force and !self.maintenance_policy.due(size) and !retry_due) return;
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
             assessed_checkpoint = self.file.activeCheckpoint();
             assessed_size = size;
             assessed_indexed = self.file.header.indexed_reclamation or self.file.vacuum_target_indexed;
             assessed_generation = self.assessment_generation;
-            if (force) {
+            if (force or retry_due) {
                 if (self.assessment_cache) |cache| {
                     if (cache.generation == assessed_generation and cache.indexed == assessed_indexed and std.meta.eql(cache.checkpoint, assessed_checkpoint)) {
                         cached_stats = cache.stats;
@@ -2184,7 +2195,11 @@ pub const Store = struct {
             self.maintenance_policy.status.state = .idle;
             self.maintenance_policy.status.reason = .none;
             self.maintenance_policy.status.last_error = null;
-            if (!due) break :blk false;
+            if (!due) {
+                self.maintenance_policy.rewrite_retry_at_ns = null;
+                break :blk false;
+            }
+            self.maintenance_policy.scheduleRewriteRetry(scan_finished.nanoseconds, if (cached_stats == null) scan_started.durationTo(scan_finished).nanoseconds else null);
             const workspace = (try self.admitShrinkWorkspaceAssumeLocked(stats.compact_size, cancel)) orelse break :blk false;
             self.maintenance_policy.status.state = .rewriting;
             self.maintenance_policy.status.temporary_bytes = workspace;
@@ -11589,4 +11604,54 @@ test "lite typed score spans admit exact encoder after warmed graph scratch" {
     _ = try scope.readSortedScoreColumn("", nodes, &values);
     try std.testing.expectEqual(@as(f64, 1), values[0]);
     for (values[1..]) |value| try std.testing.expect(std.math.isNan(value));
+}
+
+test "lite reclamation issue1431 canceled automatic rewrites retry without file growth" {
+    const Admission = struct {
+        captures: usize = 0,
+        refuse_copy: bool = true,
+        fn enter(ptr: *anyopaque, scope: PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (scope == .reclamation) {
+                self.captures += 1;
+                if (self.refuse_copy and self.captures == 2) return error.EnrichmentWaitCanceled;
+            }
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "canceled-automatic-rewrite.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    for (0..64) |_| try store.file.putDocument("doc", "retained value");
+    store.maintenance_policy = try reclamation.Policy.init(.{ .page_reuse = false, .assessment_bytes = 4096, .minimum_reclaim_bytes = 128 * 1024 });
+    var admission: Admission = .{};
+    store.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer store.writer_admission = null;
+    const before = (try store.file.file.stat(std.testing.io)).size;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, store.maintainOnce(false));
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    try std.testing.expect(!store.maintenance_policy.due(before));
+    try std.testing.expect(store.maintenance_policy.rewrite_retry_at_ns != null);
+    // Simulate the detached owner's next checkpoint refresh: preserve policy,
+    // discard physical roots/estimates. Retry must not depend on that cache.
+    store.assessment_cache = null;
+    admission.refuse_copy = false;
+    for (0..3) |_| try store.maintainOnce(false);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    try std.testing.expectEqual(before, (try store.file.file.stat(std.testing.io)).size);
+    store.maintenance_policy.rewrite_retry_at_ns = 0;
+    try store.maintainOnce(false);
+    try std.testing.expectEqual(@as(u64, 2), store.maintenance_policy.status.assessment_count);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.rewrite_count);
+    try std.testing.expect(store.maintenance_policy.rewrite_retry_at_ns == null);
+    try std.testing.expect((try store.file.file.stat(std.testing.io)).size < before);
+    const value = (try store.file.getDocumentAlloc(a, "doc")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("retained value", value);
+    try std.testing.expect((try store.file.check()).valid);
 }

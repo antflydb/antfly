@@ -926,7 +926,7 @@ test "lite allocator v4 overwrite reuses pages across reopen" {
     defer a.free(reopened);
     try std.testing.expectEqualSlices(u8, value, reopened);
 }
-test "lite coordinated readers permit reuse while preserving snapshots and foreign fences" {
+test "lite coordinated data readers permit reuse while preserving snapshots and foreign fences" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -940,7 +940,10 @@ test "lite coordinated readers permit reuse while preserving snapshots and forei
     writer.reader_coordinator = &coordinator;
     var value: [8192]u8 = @splat('a');
     for (0..80) |_| try writer.putDocument("doc", &value);
-    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &coordinator });
+    // This contract deliberately retains only logical document data. Generic
+    // read-only opens also inspect allocator metadata and use full fences.
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true, .reader_coordinator = &coordinator });
+    try reader.acquireReaderFence(writer.activeCheckpoint().commit_sequence, &writer);
     var reader_open = true;
     defer if (reader_open) reader.close();
     const before = (try writer.allocatorStats()).?.reused_pages;
@@ -4575,7 +4578,7 @@ pub const NativeFile = struct {
             .page_cache_enabled = .init(true),
         };
         if (opts.read_only and !opts.internal_reader and !opts.externally_locked) {
-            if (opts.reader_coordinator) |coordinator| result.reader_fence = try coordinator.register(file, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint());
+            if (opts.reader_coordinator) |coordinator| result.reader_fence = try coordinator.registerFull(file, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint());
         }
         if (opts.resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         return result;
@@ -20346,4 +20349,57 @@ test "lite allocator v4 live Merkle certificates retain their cache across commi
         try std.testing.expect(try peer.inheritAllocatorCertificate());
         try std.testing.expect((try peer.check()).valid);
     }
+}
+
+test "issue1431 ordinary coordinated reader retains allocator metadata" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "full-snapshot-reuse.aflite");
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.reader_coordinator = &coordinator;
+    const value: [8192]u8 = @splat('v');
+    try writer.putDocument("keep", &value);
+    for (0..128) |i| {
+        var key: [32]u8 = undefined;
+        try writer.putDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+    }
+    for (0..128) |i| {
+        var key: [32]u8 = undefined;
+        try writer.deleteDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+    }
+    _ = try writer.reclaimPages(8192);
+    try std.testing.expect((try writer.allocatorStats()).?.reusable_pages > 64);
+    var snapshot = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &coordinator });
+    defer snapshot.close();
+    const captured_size = (try snapshot.file.stat(io)).size;
+    const before = (try writer.allocatorStats()).?.reused_pages;
+    for (0..32) |i| {
+        var key: [32]u8 = undefined;
+        try writer.putDocument(try std.fmt.bufPrint(&key, "new-{d}", .{i}), &value);
+    }
+    try std.testing.expect((try writer.allocatorStats()).?.reused_pages > before);
+    // No cache may conceal overwritten old ledger pages. Check both captured
+    // recovery slots and their allocator after the writer has advanced far.
+    try std.testing.expect(snapshot.ledger == null);
+    const captured_report = try snapshot.checkAtFileSizeWithCancel(captured_size, null);
+    std.debug.print("review1436 ordinary snapshot valid={any} issue={any}\n", .{ captured_report.valid, captured_report.issue });
+    try std.testing.expect(captured_report.valid);
+    const captured = (try snapshot.getDocumentAlloc(a, "keep")).?;
+    defer a.free(captured);
+    try std.testing.expectEqualSlices(u8, &value, captured);
+    try std.testing.expect((try writer.check()).valid);
+    const reused = (try writer.allocatorStats()).?.reused_pages;
+    writer.reader_coordinator = null;
+    try writer.putDocument("unrecognized-publication", "external writer");
+    writer.reader_coordinator = &coordinator;
+    try writer.putDocument("after-unrecognized-publication", "must retain the inode fence");
+    try std.testing.expectEqual(reused, (try writer.allocatorStats()).?.reused_pages);
+    try std.testing.expect((try snapshot.checkAtFileSizeWithCancel(captured_size, null)).valid);
+    try std.testing.expect((try writer.check()).valid);
 }

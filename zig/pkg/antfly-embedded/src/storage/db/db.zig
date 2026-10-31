@@ -8616,6 +8616,46 @@ pub const DB = struct {
     /// turning one request into unbounded CPU/provider work.
     pub fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         if (comptime storage_engine.enabled) return storage_engine.call("batchInternal", .{ self, req, profile, opts });
+        var committed = false;
+        var tracked = opts;
+        tracked.primary_committed = opts.primary_committed orelse &committed;
+        self.batchInternalWithVisibility(req, profile, tracked) catch |err| {
+            if (tracked.primary_committed.?.*) switch (err) {
+                error.TextMergeBackpressureTimeout,
+                error.TextMergeRuntimeShutdown,
+                error.InferenceProviderCallCapacityExhausted,
+                error.EmbeddingProbeUnavailable,
+                error.MemoryConfigurationTransition,
+                error.MemoryRetryNotReady,
+                error.Busy,
+                error.WouldBlock,
+                error.WriterLocked,
+                error.FileBusy,
+                error.LiteRetirementBacklogExceeded,
+                error.SourceFileChanged,
+                error.GenerationTransitionActive,
+                error.IndexArtifactCleanupPending,
+                error.ResolverCurationConflict,
+                error.RowPolicyCatalogChanged,
+                error.RowPolicyReadersActive,
+                error.InvalidRowPolicyReceipt,
+                error.InvalidRowPolicyBundle,
+                error.PortableImportPublicationInProgress,
+                error.PortableRuntimeActivationPending,
+                error.VersionConflict,
+                error.Canceled,
+                error.Cancelled,
+                error.EnrichmentWaitCanceled,
+                error.EnrichmentWaitTimeout,
+                error.EnrichmentRetryInProgress,
+                => return error.CommitVisibilityNotSatisfied,
+                else => {},
+            };
+            return err;
+        };
+    }
+
+    fn batchInternalWithVisibility(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         if (opts.visibility_completion != null or !opts.wait_for_sync_level or
             (req.sync_level != .enrichments and req.sync_level != .full_index) or !self.core.index_manager.hasGroupSources())
             return self.batchInternalCommit(req, profile, opts);
@@ -144981,4 +145021,154 @@ test "db managed index repair summary reports a newer provider failure after reo
     var summary = (try db.indexEnrichmentFailureSummary(a, "dv_a")).?;
     defer summary.deinit(a);
     try std.testing.expectEqualStrings("InvalidEmbeddingResponse", types.repair_failure.issueErrorCode(summary.latest));
+}
+
+test "db manual text producers merge capacity without optional workers lifecycle drains structural mutations" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const ActionKind = enum { pause, create, delete, stop };
+    for (std.meta.tags(ActionKind)) |kind| {
+        const a = std.testing.allocator;
+        var runtime_owner = try background_runtime_mod.BackendRuntimeHandle.init(a, .{});
+        defer runtime_owner.deinit();
+        var tmp = try TestDirectory.init("manual-merge-lifecycle");
+        defer tmp.cleanup();
+        const path = tmp.path().ptr;
+        defer cleanupTempDir(path);
+        var db = try DB.open(a, std.mem.span(path), .{
+            .backend_runtime = runtime_owner.ptr(),
+            .executor = .{ .backend = .manual },
+            .start_optional_runtime_workers = false,
+            .text_merge = .{ .enabled = true, .max_pending_segments = 12, .resume_pending_segments = 6, .max_pending_bytes = 0, .backpressure_max_wait_ms = 2000 },
+        });
+        defer db.close();
+        // Removing this first index moves the assisted task's inline index.
+        try db.addIndex(.{ .name = "other-ft", .kind = .full_text, .config_json = "{}" });
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+        const runtime = db.text_merge_runtime.?;
+        for (0..12) |i| {
+            var buffer: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&buffer, "doc:{d}", .{i});
+            _ = try db.indexTextKernelDocuments("ft_v1", &.{.{ .id = key, .stored_data = "{}", .text_fields = &.{.{ .field_name = "body", .text = "manual merge lifecycle" }}, .doc_ordinal = @intCast(i + 1) }});
+        }
+        text_merge_runtime_mod.test_task_begin_entered.store(false, .release);
+        text_merge_runtime_mod.test_stop_entered.store(false, .release);
+        text_merge_runtime_mod.test_release_after_task_begin.store(false, .release);
+        text_merge_runtime_mod.test_block_after_task_begin.store(true, .release);
+        defer {
+            text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+            text_merge_runtime_mod.test_block_after_task_begin.store(false, .release);
+        }
+        const Assist = struct {
+            runtime: *text_merge_runtime_mod.TextMergeRuntime,
+            failure: ?anyerror = null,
+            fn run(self: *@This()) void {
+                var permit = self.runtime.acquireProducerPermit("ft_v1", 1, 0) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                permit.release();
+            }
+        };
+        var assist: Assist = .{ .runtime = runtime };
+        var assisting = try std.testing.io.concurrent(Assist.run, .{&assist});
+        defer assisting.await(std.testing.io);
+        defer text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+        for (0..5000) |_| {
+            if (text_merge_runtime_mod.test_task_begin_entered.load(.acquire)) break;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(text_merge_runtime_mod.test_task_begin_entered.load(.acquire));
+        const Action = struct {
+            db: *DB,
+            runtime: *text_merge_runtime_mod.TextMergeRuntime,
+            kind: ActionKind,
+            returned: std.atomic.Value(bool) = .init(false),
+            failure: ?anyerror = null,
+            resume_needed: bool = false,
+            fn run(self: *@This()) void {
+                self.perform() catch |err| {
+                    self.failure = err;
+                };
+                self.returned.store(true, .release);
+            }
+            fn perform(self: *@This()) !void {
+                switch (self.kind) {
+                    .pause => self.resume_needed = self.runtime.pause(),
+                    .create => try self.db.addIndex(.{ .name = "new-ft", .kind = .full_text, .config_json = "{}" }),
+                    .delete => try std.testing.expect(try self.db.deleteIndex("other-ft")),
+                    .stop => {
+                        _ = self.runtime.stop();
+                    },
+                }
+            }
+        };
+        var action: Action = .{ .db = &db, .runtime = runtime, .kind = kind };
+        var mutation = try std.testing.io.concurrent(Action.run, .{&action});
+        defer mutation.await(std.testing.io);
+        defer text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+        for (0..5000) |_| {
+            if (action.returned.load(.acquire) or text_merge_runtime_mod.test_stop_entered.load(.acquire)) break;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(text_merge_runtime_mod.test_stop_entered.load(.acquire));
+        try std.testing.expect(!action.returned.load(.acquire));
+        text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+        mutation.await(std.testing.io);
+        assisting.await(std.testing.io);
+        text_merge_runtime_mod.test_block_after_task_begin.store(false, .release);
+        if (action.failure) |err| return err;
+        if (assist.failure) |err| switch (err) {
+            error.Canceled, error.TextMergeRuntimeShutdown => {},
+            else => return err,
+        };
+        if (kind == .pause) {
+            try std.testing.expect(action.resume_needed);
+            try runtime.resumeAfterPause();
+        }
+        try std.testing.expect(!runtime.isStarted());
+        if (kind == .stop) {
+            try std.testing.expectError(error.TextMergeRuntimeShutdown, runtime.acquireProducerPermit("ft_v1", 1, 0));
+        } else {
+            var resumed = try runtime.acquireProducerPermit("ft_v1", 1, 0);
+            resumed.release();
+        }
+    }
+}
+
+test "db manual text producers merge capacity without optional workers visibility timeout preserves a committed transform" {
+    const alloc = std.testing.allocator;
+    var runtime_owner = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime_owner.deinit();
+    var path_tmp = try TestDirectory.init("review1436-postcommit-busy");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime_owner.ptr(),
+        .executor = .{ .backend = .manual },
+        .start_optional_runtime_workers = false,
+        .text_merge = .{ .enabled = true, .max_pending_segments = 12, .max_pending_bytes = 0, .backpressure_max_wait_ms = 100 },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"body\":\"counter\",\"count\":0}" }}, .sync_level = .write });
+    var held = try db.text_merge_runtime.?.acquireProducerPermit("ft_v1", 12, 0);
+    defer held.release();
+    const request: types.BatchRequest = .{
+        .transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }},
+        .sync_level = .full_text,
+    };
+    try std.testing.expectError(error.CommitVisibilityNotSatisfied, db.batch(request));
+    const raw = (try db.get(alloc, "counter")).?;
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
+    held.release();
+    try db.runUntilIdle();
+    const visible = (try db.get(alloc, "counter")).?;
+    defer alloc.free(visible);
+    var completed = try std.json.parseFromSlice(std.json.Value, alloc, visible, .{});
+    defer completed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), completed.value.object.get("count").?.integer);
 }

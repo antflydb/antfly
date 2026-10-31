@@ -92,6 +92,20 @@ pub const Policy = struct {
     assessment_activity_bytes: u64 = 0,
     retirement_bytes: u64 = 0,
     assessed_retirement_bytes: u64 = 0,
+    /// Retained by an external owner's checkpoint refresh even when its exact
+    /// assessment cache is discarded. A canceled copy must not require more
+    /// file growth before shrinking gets another bounded attempt.
+    rewrite_retry_at_ns: ?i96 = null,
+    rewrite_retry_delay_ns: i96 = 30 * std.time.ns_per_s,
+
+    pub fn rewriteRetryDue(self: Policy, now_ns: i96) bool {
+        return if (self.rewrite_retry_at_ns) |deadline| now_ns >= deadline else false;
+    }
+
+    pub fn scheduleRewriteRetry(self: *Policy, now_ns: i96, scan_ns: ?i96) void {
+        if (scan_ns) |elapsed| self.rewrite_retry_delay_ns = @max(@as(i96, 30 * std.time.ns_per_s), elapsed *| 64);
+        self.rewrite_retry_at_ns = now_ns +| self.rewrite_retry_delay_ns;
+    }
 
     pub fn init(options: Options) !Policy {
         try options.validate();
@@ -137,6 +151,7 @@ pub const Policy = struct {
         self.resetAssessmentBudget(physical);
         self.status.rewrite_count +|= 1;
         self.status.last_reclaimed_bytes = reclaimed;
+        self.rewrite_retry_at_ns = null;
         self.status.state = if (self.options.enabled) .idle else .disabled;
         self.status.reason = if (self.options.enabled) .none else .disabled;
         self.status.last_error = null;
