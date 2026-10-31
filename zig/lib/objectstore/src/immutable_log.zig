@@ -115,7 +115,47 @@ pub const ProofAuthority = struct {
 /// deriving accepted state. No root bytes or proof clocks come from this hint.
 pub const ReadHint = struct { epoch: [16]u8, next: u64, revision: u64 };
 pub const CertifiedRecovery = struct { recovery: Recovery, proof: WriteProof };
+/// Request-owned warm observation. Its purpose-separated MAC never grants a
+/// read/write certificate. Only a fresh end probe can renew the original anchor.
+pub const ObservationPlan = struct {
+    format: u8 = 1,
+    state: State,
+    source_anchor: ProofTime,
+    anchor: ProofTime,
+    steps: u8 = 0,
+    follow_owners: bool,
+    auth: [32]u8 = @splat(0),
+
+    fn signature(self: ObservationPlan, log: Log, authority: ProofAuthority) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-journal-warm-observation-v1");
+        hash.update(&authority.signature(log, self.state, self.anchor));
+        hash.update(&log.owner);
+        var counters: [19]u8 = undefined;
+        counters[0] = self.format;
+        counters[1] = self.steps;
+        counters[2] = @intFromBool(self.follow_owners);
+        std.mem.writeInt(u64, counters[3..11], self.source_anchor.wall_ms, .little);
+        std.mem.writeInt(u64, counters[11..19], self.source_anchor.mono_ms, .little);
+        hash.update(&counters);
+        var result: [32]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&result, &hash.finalResult(), &authority.key);
+        return result;
+    }
+    fn check(self: ObservationPlan, log: Log, authority: ProofAuthority) !void {
+        if (self.format != 1 or self.steps >= 8) return error.InvalidImmutableLogObservationPlan;
+        try Log.validate(self.state);
+        if (!std.crypto.timing_safe.eql([32]u8, self.auth, self.signature(log, authority))) return error.InvalidImmutableLogObservationPlan;
+        try authority.current(self.source_anchor);
+        try authority.current(self.anchor);
+        if (!self.follow_owners and !std.mem.eql(u8, &self.state.owner, &log.owner)) return error.ImmutableLogFenced;
+    }
+};
+pub const ObservationResponse = struct { key: []const u8, body: ?[]const u8 };
+pub const ObservationStep = union(enum) { pending: ObservationPlan, complete: CertifiedRecovery };
 pub const ObservationMetrics = struct {
+    continuation_steps: u32 = 0,
+    continuation_handoffs: u32 = 0,
     cold_starts: u32 = 0,
     expired_refreshes: u32 = 0,
     checkpoint_rebases: u32 = 0,
@@ -526,6 +566,66 @@ pub const Log = struct {
     pub fn observeCertified(self: Log, result_alloc: A, source: State, authority: ProofAuthority, proof: WriteProof, follow_owners: bool) !CertifiedRecovery {
         return self.observeCertifiedMode(result_alloc, source, authority, proof, follow_owners, null, authority.now(), 8);
     }
+    /// A bounded warm certificate authenticates the source before request-owned
+    /// I/O leaves the execution slot. Cold/expired paths keep native recovery.
+    pub fn startObservation(self: Log, source: State, authority: ProofAuthority, proof: WriteProof, follow_owners: bool) !ObservationPlan {
+        const anchor = authority.now();
+        try authority.check(self, source, proof);
+        if (anchor.wall_ms < proof.anchor.wall_ms or anchor.mono_ms < proof.anchor.mono_ms) return error.ImmutableLogProofExpired;
+        if (!follow_owners and !std.mem.eql(u8, &source.owner, &self.owner)) return error.ImmutableLogFenced;
+        var plan = ObservationPlan{ .state = source, .source_anchor = proof.anchor, .anchor = anchor, .follow_owners = follow_owners };
+        plan.auth = plan.signature(self, authority);
+        return plan;
+    }
+    pub fn observationKey(self: Log, a: A, authority: ProofAuthority, plan: ObservationPlan) ![]u8 {
+        try plan.check(self, authority);
+        return self.key(a, plan.state.epoch, plan.state.next);
+    }
+    /// Short warm tails perform one exact GET outside WASM per step. Eight
+    /// positive frames hand off to the existing native batching loop, retaining
+    /// both the original anchor and its remaining 64-step allowance.
+    pub fn resumeObservation(self: Log, a: A, authority: ProofAuthority, plan: ObservationPlan, response: ObservationResponse) !ObservationStep {
+        try plan.check(self, authority);
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const m = scratch.allocator();
+        const expected = try self.key(m, plan.state.epoch, plan.state.next);
+        if (!std.mem.eql(u8, response.key, expected)) return error.InvalidImmutableLogObservationResponse;
+        if (self.observation_metrics) |metrics| metrics.continuation_steps += 1;
+        const bytes = response.body orelse {
+            var accepted = plan.state;
+            accepted.root = try a.dupe(u8, accepted.root);
+            errdefer a.free(accepted.root);
+            return .{ .complete = .{ .recovery = .{ .state = accepted }, .proof = try authority.issue(self, accepted, plan.anchor) } };
+        };
+        if (bytes.len > 16384) return error.InvalidImmutableLog;
+        const next = try self.observedFrame(m, plan.state, bytes);
+        if (self.observation_metrics) |metrics| {
+            if (next.kind == .seal) metrics.seals_followed += 1 else metrics.slots_followed += 1;
+        }
+        if (!plan.follow_owners and !std.mem.eql(u8, &next.state.owner, &self.owner)) return error.ImmutableLogFenced;
+        var continuation = plan;
+        continuation.state = next.state;
+        continuation.steps += 1;
+        if (continuation.steps == 8) {
+            if (self.observation_metrics) |metrics| metrics.continuation_handoffs += 1;
+            const source = try authority.issue(self, continuation.state, plan.source_anchor);
+            return .{ .complete = try self.observeCertifiedModeLimit(a, continuation.state, authority, source, plan.follow_owners, null, plan.anchor, 0, max_steps - continuation.steps) };
+        }
+        try authority.current(plan.source_anchor);
+        try authority.current(plan.anchor);
+        continuation.auth = continuation.signature(self, authority);
+        continuation.state.root = try a.dupe(u8, continuation.state.root);
+        return .{ .pending = continuation };
+    }
+    fn observedFrame(_: Log, a: A, state: State, bytes: []const u8) !Frame {
+        const next = try frame(a, bytes, state.epoch, state.next);
+        if (next.parent_revision != state.revision) return error.InvalidImmutableLog;
+        if (next.kind == .seal) {
+            if (!std.mem.eql(u8, next.state.root, state.root)) return error.InvalidImmutableLog;
+        } else if (!std.mem.eql(u8, &next.state.owner, &state.owner)) return error.InvalidImmutableLog;
+        return next;
+    }
     const ObservationBatch = struct {
         arena: std.heap.ArenaAllocator,
         results: []?types.GetResult = &.{},
@@ -571,6 +671,9 @@ pub const Log = struct {
         }
     };
     fn observeCertifiedMode(self: Log, result_alloc: A, source: State, authority: ProofAuthority, proof: WriteProof, follow_owners: bool, first: ?*const ?types.GetResult, anchor: ProofTime, batch_after: usize) !CertifiedRecovery {
+        return self.observeCertifiedModeLimit(result_alloc, source, authority, proof, follow_owners, first, anchor, batch_after, max_steps);
+    }
+    fn observeCertifiedModeLimit(self: Log, result_alloc: A, source: State, authority: ProofAuthority, proof: WriteProof, follow_owners: bool, first: ?*const ?types.GetResult, anchor: ProofTime, batch_after: usize, step_limit: usize) !CertifiedRecovery {
         try authority.check(self, source, proof);
         var arena = std.heap.ArenaAllocator.init(result_alloc);
         defer arena.deinit();
@@ -580,7 +683,7 @@ pub const Log = struct {
         var consecutive: usize = 0;
         var root_buffer: [max_root_bytes]u8 = undefined;
         var state = source;
-        for (0..max_steps) |step| {
+        for (0..step_limit) |step| {
             std.mem.copyForwards(u8, root_buffer[0..state.root.len], state.root);
             state.root = root_buffer[0..state.root.len];
             _ = arena.reset(.retain_capacity);
@@ -591,7 +694,7 @@ pub const Log = struct {
             // prefetch after two commits; warm observation requires eight.
             // Serial-only providers retain their existing path.
             if (self.read_batch and self.client.vtable.get_objects != null and consecutive >= batch_after and !batch.contains(state) and state.next < epoch_commits)
-                try batch.load(self, state, max_steps - step);
+                try batch.load(self, state, step_limit - step);
             const stored = if (step == 0 and first != null) first.?.* else if (batch.contains(state)) blk: {
                 if (batch.results[@intCast(state.next - batch.first)]) |value| break :blk value;
                 // A prefetched absence may precede acceptance of its parent.
@@ -605,13 +708,11 @@ pub const Log = struct {
                 state.root = try result_alloc.dupe(u8, state.root);
                 return .{ .recovery = .{ .state = state }, .proof = try authority.issue(self, state, anchor) };
             };
-            const next = try frame(a, item.body, state.epoch, state.next);
-            if (next.parent_revision != state.revision) return error.InvalidImmutableLog;
+            const next = try self.observedFrame(a, state, item.body);
             if (next.kind == .seal) {
                 if (self.observation_metrics) |metrics| metrics.seals_followed += 1;
-                if (!std.mem.eql(u8, next.state.root, state.root)) return error.InvalidImmutableLog;
                 consecutive = 0;
-            } else if (!std.mem.eql(u8, &next.state.owner, &state.owner)) return error.InvalidImmutableLog;
+            }
             if (next.kind == .commit) {
                 consecutive += 1;
                 if (self.observation_metrics) |metrics| metrics.slots_followed += 1;
@@ -1559,4 +1660,220 @@ test "immutable log advisory commit locations authenticate stored state and stil
     try std.testing.expectError(error.ImmutableLogProofExpired, log.appendCertified(m, accepted.recovery.state, "resurrected", auth, accepted.proof));
     backend.read_batch_delay_ms = 30000;
     try std.testing.expectError(error.ImmutableLogProofExpired, log.observeHintCertified(m, hint, auth));
+}
+
+test "immutable log observation continuations bind source namespace clocks and purpose without IO" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory };
+    var table: Client.VTable = undefined;
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "continuation", .owner = @splat(1), .io = std.testing.io };
+    const auth = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const initial = (try log.recover(m, null, true)).state;
+    const proof = try auth.issue(log, initial, auth.now());
+    backend.time.wall_ms += 100;
+    backend.time.mono_ms += 100;
+    memory.resetOperationCount();
+    const plan = try log.startObservation(initial, auth, proof, true);
+    const key = try log.observationKey(m, auth, plan);
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
+    backend.time.wall_ms += 200;
+    backend.time.mono_ms += 200;
+    const complete = (try log.resumeObservation(m, auth, plan, .{ .key = key, .body = null })).complete;
+    try std.testing.expectEqual(plan.anchor, complete.proof.anchor);
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
+    try std.testing.expectError(error.InvalidImmutableLogProof, auth.check(log, initial, .{ .anchor = plan.anchor, .auth = plan.auth }));
+    for (0..5) |field| {
+        var forged = plan;
+        switch (field) {
+            0 => forged.state.root = "forged",
+            1 => forged.steps += 1,
+            2 => forged.follow_owners = false,
+            3 => forged.source_anchor.wall_ms += 1,
+            else => forged.anchor.mono_ms += 1,
+        }
+        try std.testing.expectError(error.InvalidImmutableLogObservationPlan, log.observationKey(m, auth, forged));
+    }
+    var other = log;
+    other.prefix = "different";
+    try std.testing.expectError(error.InvalidImmutableLogObservationPlan, other.observationKey(m, auth, plan));
+    other = log;
+    other.owner = @splat(2);
+    try std.testing.expectError(error.InvalidImmutableLogObservationPlan, other.observationKey(m, auth, plan));
+    try std.testing.expectError(error.InvalidImmutableLogObservationResponse, log.resumeObservation(m, auth, plan, .{ .key = "wrong", .body = null }));
+    const replay = (try log.resumeObservation(m, auth, plan, .{ .key = key, .body = null })).complete;
+    try std.testing.expectEqual(plan.anchor, replay.proof.anchor);
+    backend.time.wall_ms += 30000;
+    backend.time.mono_ms += 30000;
+    try std.testing.expectError(error.ImmutableLogProofExpired, log.observationKey(m, auth, plan));
+}
+
+test "immutable log observation continuations follow concurrent commits and preserve long native batching" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory, .read_batch_delay_ms = 1 };
+    var table: Client.VTable = undefined;
+    var metrics = ObservationMetrics{};
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "continuation", .owner = @splat(1), .io = std.testing.io, .read_batch = true, .observation_metrics = &metrics };
+    table.preferred_read_window = 4;
+    const auth = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const initial = (try log.recover(m, null, true)).state;
+    const proof = try auth.issue(log, initial, auth.now());
+    var pending = try log.startObservation(initial, auth, proof, true);
+    var accepted = CertifiedRecovery{ .recovery = .{ .state = initial }, .proof = proof };
+    for (0..32) |_| accepted = try log.appendCertified(m, accepted.recovery.state, "accepted", auth, accepted.proof);
+    metrics = .{};
+    var complete: ?CertifiedRecovery = null;
+    for (0..9) |_| {
+        const key = try log.observationKey(m, auth, pending);
+        var c = client;
+        c.allocator = m;
+        const value = try c.getObject("db", key, .{});
+        switch (try log.resumeObservation(m, auth, pending, .{ .key = key, .body = value.body })) {
+            .pending => |plan| pending = plan,
+            .complete => |result| {
+                complete = result;
+                break;
+            },
+        }
+    }
+    try std.testing.expect(complete != null);
+    try std.testing.expectEqual(accepted.recovery.state.revision, complete.?.recovery.state.revision);
+    try std.testing.expectEqual(@as(u32, 8), metrics.continuation_steps);
+    try std.testing.expectEqual(@as(u32, 1), metrics.continuation_handoffs);
+    try std.testing.expectEqual(@as(u32, 32), metrics.slots_followed);
+    try std.testing.expectEqual(@as(usize, 4), backend.maximum_batch);
+    try std.testing.expectEqual(pending.anchor, complete.?.proof.anchor);
+    try std.testing.expect(!complete.?.recovery.has_more);
+}
+
+test "immutable log continuation handoff retains the original step bound and old deadline for partial results" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory, .read_batch_delay_ms = 1 };
+    var table: Client.VTable = undefined;
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "bound", .owner = @splat(1), .io = std.testing.io, .read_batch = true };
+    table.preferred_read_window = 4;
+    const auth = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const initial = (try log.recover(m, null, true)).state;
+    const proof = try auth.issue(log, initial, auth.now());
+    backend.time.wall_ms += 100;
+    backend.time.mono_ms += 100;
+    var pending = try log.startObservation(initial, auth, proof, true);
+    var state = initial;
+    var certificate = proof;
+    for (0..80) |_| {
+        if (state.next == 64) {
+            state = (try log.recover(m, state, false)).state;
+            certificate = try auth.issue(log, state, auth.now());
+        }
+        const next = try log.appendCertified(m, state, "accepted", auth, certificate);
+        state = next.recovery.state;
+        certificate = next.proof;
+    }
+    var c = client;
+    c.allocator = m;
+    var complete: ?CertifiedRecovery = null;
+    for (0..8) |_| {
+        const key = try log.observationKey(m, auth, pending);
+        const value = try c.getObject("db", key, .{});
+        switch (try log.resumeObservation(m, auth, pending, .{ .key = key, .body = value.body })) {
+            .pending => |plan| pending = plan,
+            .complete => |result| {
+                complete = result;
+                break;
+            },
+        }
+    }
+    try std.testing.expect(complete != null and complete.?.recovery.has_more);
+    try std.testing.expectEqual(@as(u64, 64), complete.?.recovery.state.next);
+    try std.testing.expectEqual(proof.anchor, complete.?.proof.anchor);
+    const final = try log.observeCertified(m, complete.?.recovery.state, auth, complete.?.proof, true);
+    try std.testing.expectEqual(state.revision, final.recovery.state.revision);
+    try std.testing.expect(!final.recovery.has_more);
+}
+
+test "immutable log observation continuations preserve ownership fences across seals" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory };
+    var table: Client.VTable = undefined;
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "seal-plan", .owner = @splat(1), .io = std.testing.io };
+    const auth = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const initial = (try log.recover(m, null, true)).state;
+    const proof = try auth.issue(log, initial, auth.now());
+    const follow = try log.startObservation(initial, auth, proof, true);
+    const owned = try log.startObservation(initial, auth, proof, false);
+    var other = log;
+    other.owner = @splat(2);
+    const taken = (try other.recover(m, null, true)).state;
+    var c = client;
+    c.allocator = m;
+    const key = try log.observationKey(m, auth, follow);
+    const frame_value = try c.getObject("db", key, .{});
+    const pending = (try log.resumeObservation(m, auth, follow, .{ .key = key, .body = frame_value.body })).pending;
+    try std.testing.expectEqual(taken.owner, pending.state.owner);
+    try std.testing.expectError(error.ImmutableLogFenced, log.resumeObservation(m, auth, owned, .{ .key = key, .body = frame_value.body }));
+    const end_key = try log.observationKey(m, auth, pending);
+    const complete = (try log.resumeObservation(m, auth, pending, .{ .key = end_key, .body = null })).complete;
+    try std.testing.expectEqual(taken.revision, complete.recovery.state.revision);
+    try std.testing.expectEqual(follow.anchor, complete.proof.anchor);
+}
+
+test "immutable log observation resume releases scratch and owned roots on every allocation failure" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var backend = ProofTestBackend{ .memory = &memory };
+    var table: Client.VTable = undefined;
+    const log = Log{ .client = backend.client(&table), .bucket = "db", .prefix = "alloc-plan", .owner = @splat(1), .io = std.testing.io };
+    const auth = ProofAuthority{ .key = @splat(42), .scope = @splat(9), .clock_ptr = &backend, .clock_fn = ProofTestBackend.clock };
+    const initial = (try log.recover(m, null, true)).state;
+    const proof = try auth.issue(log, initial, auth.now());
+    const plan = try log.startObservation(initial, auth, proof, true);
+    const next = try log.appendCertified(m, initial, "accepted", auth, proof);
+    const end = try log.startObservation(next.recovery.state, auth, next.proof, true);
+    var c = client;
+    c.allocator = m;
+    const key = try log.observationKey(m, auth, plan);
+    const value = try c.getObject("db", key, .{});
+    const Fixture = struct {
+        fn run(alloc: A, l: Log, authority_: ProofAuthority, token: ObservationPlan, response: ObservationResponse) !void {
+            switch (try l.resumeObservation(alloc, authority_, token, response)) {
+                .pending => |result| alloc.free(result.state.root),
+                .complete => |result| alloc.free(result.recovery.state.root),
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{ log, auth, plan, ObservationResponse{ .key = key, .body = value.body } });
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{ log, auth, end, ObservationResponse{ .key = try log.observationKey(m, auth, end), .body = null } });
 }

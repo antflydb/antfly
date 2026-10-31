@@ -14,6 +14,7 @@
 // limitations under the License.
 
 // Cloudflare-independent adapter for the shared native ordered metadata store.
+import {readObservationResponse} from "../../zig/lib/objectstore/wasm/observation-plan.mjs";
 import {normalizeReadHints} from "./publication-read-hints.mjs";
 import {RequestPool} from "./request-pool.mjs";
 import {recoveryReadAhead,warmRecoveryReadAhead,proofPrefetchBytes} from "./recovery-read-ahead.mjs";
@@ -41,9 +42,9 @@ function rootMetrics(state){try{const root=JSON.parse(state?.root??'null');retur
 export const encode = value => JSON.stringify(value, (_, v) => v instanceof Uint8Array || v instanceof ArrayBuffer ? {__antfly_bytes: Array.from(new Uint8Array(v.buffer ?? v, v.byteOffset ?? 0, v.byteLength))} : v);
 const decode = value => JSON.parse(value, (_, v) => v && Object.keys(v).length === 1 && Array.isArray(v.__antfly_bytes) ? Uint8Array.from(v.__antfly_bytes) : v);
 export class R2CoordinatorStore {
-  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, inlineReadSet,transport,kernel,readKernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8,remoteCache=transport=>transport,proofBudget,rowBudgetBytes=512*1024,readBatch=true} = {}) {
+  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, inlineReadSet,transport,kernel,readKernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8,remoteCache=transport=>transport,proofBudget,rowBudgetBytes=512*1024,readBatch=true,readContinuations=false} = {}) {
     if(!Number.isSafeInteger(rowBudgetBytes)||rowBudgetBytes<32768||rowBudgetBytes>512*1024)throw Error("InvalidCoordinatorRowBudget");this.rowBudgetBytes=rowBudgetBytes;
-    this.rootBackend="journal";this.rootCursor=null;this.journalProof=null;this.readBatch=readBatch;
+    this.rootBackend="journal";this.rootCursor=null;this.journalProof=null;this.readBatch=readBatch;this.readContinuations=readContinuations;this.observationPlanSupported=false;
     this.module = module; this.bucket = bucket; this.namespace = namespace; this.prefix = prefix; this.clock = clock; this.onMetrics = onMetrics; this.background = background;
     this.kernel=kernel;this.boundRows=boundRows;this.checkpointCommits=checkpointCommits;this.recoveryWindow=recoveryWindow;
     const copyOwner=value=>{if(!Array.isArray(value)&&!(value instanceof Uint8Array)||value.length!==16||!Array.from(value).every(v=>Number.isInteger(v)&&v>=0&&v<=255))throw Error("InvalidCoordinatorOwner");return Array.from(value);};
@@ -211,6 +212,7 @@ export class R2CoordinatorStore {
     const native=async(state,coordinate)=>{
       if(usedOperations>=254||usedBytes>=8*1024*1024)throw Error("ReadSnapshotNeedsAdmission");
       const result=await this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{...this.rootOptions(),...(this.rootBackend==="bounded_journal"?{journal_proof:snapshotProof,...(capturedHint?{journal_hint:capturedHint}:{})}:{}),owner:coordinate.action==="read"?state.owner:this.owner,state,...coordinate}},{transport,background:background??this.background,onIoSettled:sample=>this.onMetrics?.(sample),fairKey:this.namespace,priority,onStage:sample=>{if(sample.name==="kernel_queue"){onAdmission?.();capsuleMetrics.observation_queue_ms=(capsuleMetrics.observation_queue_ms??0)+sample.duration_ms;}if(sample.name==="wasm_instantiate")capsuleMetrics.observation_instantiate_ms=(capsuleMetrics.observation_instantiate_ms??0)+sample.duration_ms;},deadlineMs,maxOperations:254-usedOperations,maxTransferBytes:8*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,action:coordinate.action,...sample});}catch{}}});
+      if(result.observation_plan_supported===true)this.observationPlanSupported=true;
       if(Object.hasOwn(result,"journal_proof"))snapshotProof=result.journal_proof;for(const[key,value]of Object.entries(result.journal_observation??{}))if(Number.isSafeInteger(value)&&value>=0)capsuleMetrics['journal_'+key]=(capsuleMetrics['journal_'+key]??0)+value;return result;
     };
     this.snapshotReaders++;
@@ -241,9 +243,33 @@ export class R2CoordinatorStore {
         reserve(1,proofPrefetchBytes-4*16384);proofPermit.start();
         await beforeProofDeadline(proofTransport.prime({op:"get",bucket:"database",key:this.base+"/CHECKPOINT"}),deadlineMs,monotonicDeadline,this.clock);
       }
+      const plannedObservation=async(state,coordinate)=>{
+        if(!this.readContinuations||!this.observationPlanSupported||this.rootBackend!=="bounded_journal"||!captured||!snapshotProof||typeof background!=="function"||!this.proofBudget)return null;
+        const acquisition=this.proofBudget.acquire(this.namespace);
+        try{proofPermit=await beforeProofDeadline(acquisition.ready,deadlineMs,monotonicDeadline,this.clock);}catch(error){acquisition.cancel();throw error;}
+        let result;
+        try{
+          result=await native(state,{...coordinate,action:"observe_step"});
+          for(let step=0;result.observation_plan;step++){
+            if(step>=8)throw Error("InvalidImmutableLogObservationPlan");
+            proofPermit.start();
+            const response=await readObservationResponse(transport,result.observation_key,{base:this.base,reserve,
+              wait:pending=>beforeProofDeadline(pending,deadlineMs,monotonicDeadline,this.clock),
+              check:()=>{if(this.clock()>=deadlineMs||performance.now()>=monotonicDeadline)throw Error("DeadlineExceeded");},
+              onDraining:ioSettled=>{const id=crypto.randomUUID();try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,io_draining:true,io_lifecycle_id:id});}catch{}ioSettled.then(()=>{try{this.onMetrics?.({event:"antfly.io_settled",io_lifecycle_id:id});}catch{}});},
+            });
+            capsuleMetrics.observation_detached_gets=(capsuleMetrics.observation_detached_gets??0)+1;
+            result=await native(state,{...coordinate,action:"observe_step",observation_plan:result.observation_plan,observation_response:response});
+          }
+        }catch(error){if(error.message!=="ImmutableLogProofExpired")throw error;capsuleMetrics.observation_continuation_expired=(capsuleMetrics.observation_continuation_expired??0)+1;result=null;}
+        if(!result||result.observation_fallback){proofPermit();proofPermit=null;return null;}
+        return result;
+      };
       let observed,state=captured;
       for(let attempt=0;attempt<4;attempt++){
-        observed=await native(state,readKeys?{action:"observe_read",observe_owned:owned,commands:readKeys.map(key=>({kind:"get",key})),read_prefix:readPrefix??null}:{action:owned?"observe":"observe_committed"});state=observed.state;
+        const coordinate=readKeys?{action:"observe_read",observe_owned:owned,commands:readKeys.map(key=>({kind:"get",key})),read_prefix:readPrefix??null} :{action:owned?"observe":"observe_committed"};
+        observed=readKeys?await plannedObservation(state,coordinate):null;
+        observed??=await native(state,coordinate);state=observed.state;
         if(!observed.has_more)break;
         // A sealed epoch may lack START after a partial hint upload. A
         // legacy unowned observer cannot authenticate that continuation independently.
