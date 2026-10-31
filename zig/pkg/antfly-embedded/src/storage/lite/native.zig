@@ -4904,7 +4904,7 @@ pub const NativeFile = struct {
         return digest;
     }
 
-    fn headerFingerprint(self: *NativeFile) [32]u8 {
+    pub fn headerFingerprint(self: *NativeFile) [32]u8 {
         const header = self.transaction_header orelse self.header;
         if (self.header_fingerprint_cache.lookup(header)) |digest| return digest;
         // Hash outside the cache lock. Concurrent first readers may duplicate

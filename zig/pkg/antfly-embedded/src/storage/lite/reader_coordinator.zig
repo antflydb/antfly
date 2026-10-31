@@ -140,6 +140,14 @@ pub const Coordinator = struct {
             fence.suspended = false;
         };
     }
+    /// Caller holds the path-writer lease and has read the current header.
+    /// Fence readers captured before an unrecognized publication, then admit
+    /// newly captured readers against this authoritative tip. Waiting until a
+    /// writer window begins would poison those fresh readers too.
+    pub fn observeCurrent(self: *Coordinator, inode: u64, tip: [32]u8) void {
+        self.published(inode, tip, tip, false);
+    }
+
     pub fn published(self: *Coordinator, inode: u64, previous_tip: [32]u8, tip: [32]u8, uncertain: bool) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

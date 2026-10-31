@@ -755,7 +755,11 @@ pub const Owner = struct {
             var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer probe.close();
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
-            const same_inode = (try probe.file.stat(probe.runtime())).inode == (try file.file.stat(file.runtime())).inode;
+            const probe_inode = (try probe.file.stat(probe.runtime())).inode;
+            // Establish the fenced tip before opening any new read pins.
+            // Existing readers of an unknown peer publication remain poisoned.
+            self.reader_coordinator.observeCurrent(probe_inode, probe.headerFingerprint());
+            const same_inode = probe_inode == (try file.file.stat(file.runtime())).inode;
             if (current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) {
                 if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
@@ -4369,4 +4373,60 @@ test "capi native allocator proof issue1431 physical maintenance releases detach
     }
     try std.testing.expect(probe.calls != 0);
     if (probe.failure) |err| return err;
+}
+
+test "capi native allocator proof issue1431 refreshed readers distinguish current and old tips" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("fresh-reader-tip", 1000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const owner = fixture.connection.owner;
+    const root = owner.current.?;
+    const file = &root.owned_lite_backend.?.native_docstore.?.file;
+    var value: [8192]u8 = @splat('v');
+    for (0..80) |_| try file.putDocument("padding", &value);
+    try std.testing.expect((try file.allocatorStats()).?.reusable_pages > 0);
+    const coordinator = file.reader_coordinator.?;
+    // Emulate publication by a peer: it cannot update this owner's local
+    // reader coordinator. The path lease fences admission of the new tip.
+    {
+        file.reader_coordinator = null;
+        defer file.reader_coordinator = coordinator;
+        try file.putDocument("peer", "published");
+    }
+    try std.testing.expect(try owner.refresh() == root);
+    var reader = try native.NativeFile.openWithIo(std.testing.allocator, h.handleLockIo(), fixture.path, .{ .read_only = true, .internal_reader = true, .reader_coordinator = coordinator });
+    var reader_open = true;
+    defer if (reader_open) reader.close();
+    try reader.acquireReaderFence(file.activeCheckpoint().commit_sequence, file);
+    try std.testing.expect(!reader.reader_fence.?.poisoned);
+    const before = (try file.allocatorStats()).?.reused_pages;
+    try file.putDocument("resumed", &value);
+    try std.testing.expect((try file.allocatorStats()).?.reused_pages > before);
+    // An already captured reader still belongs to the old tip. Observing a
+    // later peer publication must preserve its whole-inode protection.
+    {
+        file.reader_coordinator = null;
+        defer file.reader_coordinator = coordinator;
+        value[0] = 'w';
+        try file.putDocument("padding", &value);
+    }
+    try std.testing.expect(try owner.refresh() == root);
+    try std.testing.expect(reader.reader_fence.?.poisoned);
+    const blocked = (try file.allocatorStats()).?.reused_pages;
+    try file.putDocument("still-fenced", "safe");
+    try std.testing.expectEqual(blocked, (try file.allocatorStats()).?.reused_pages);
+    const captured = (try reader.getDocumentAlloc(std.testing.allocator, "padding")).?;
+    defer std.testing.allocator.free(captured);
+    try std.testing.expectEqual(@as(u8, 'v'), captured[0]);
+    reader.close();
+    reader_open = false;
+    try file.putDocument("after-reader-close", "safe");
+    try std.testing.expect((try file.allocatorStats()).?.reused_pages > blocked);
+    try std.testing.expect((try file.check()).valid);
 }

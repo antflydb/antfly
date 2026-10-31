@@ -1249,6 +1249,9 @@ Ordinary coordinated native read-only
 opens retain allocator metadata as well as data, preserving integrity inspection
 of both captured recovery slots. Logical transaction read pins remain explicit
 data-only views.
+Writer-leased refresh records the authoritative checkpoint before admitting new
+reader pins. Readers captured before an unknown peer publication retain their
+whole-inode protection; readers captured after refresh can use coordinated reuse.
 
 These changes require a rebuilt native library; they do not
 change SDK request schemas or the public C ABI.
