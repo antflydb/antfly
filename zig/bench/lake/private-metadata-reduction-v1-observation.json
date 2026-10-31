@@ -1,0 +1,641 @@
+{
+  "version": 1,
+  "created_utc": "2026-10-31T05:15:40.593552+00:00",
+  "qualified_runtime_source_commit": "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+  "qualified_test_source_commit": "b85b735fc421d317c6dbc7b033ea100e458352b0",
+  "main_commit": "0ff73ed56fb7acfbe4d6a14158f84c4b74c8dadb",
+  "runtime_abi": 81,
+  "native_reader_protocol": 97,
+  "persisted_formats": "unchanged",
+  "implementation": "One byte-bounded external sort stages metadata. Leased equal-key reduction preserves stable ordinal/latest/addition-first semantics and feeds COW applySorted directly, eliminating fixed 1024-record flushes, intermediate private page trees and their binary merge forest. Durable checkpoint forests remain.",
+  "binary": {
+    "qualified_source_commit": "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+    "main_commit": "0ff73ed56fb7acfbe4d6a14158f84c4b74c8dadb",
+    "binary_sha256": "c778fb546d6d2bbfdd50c5f8f6dcbd71754b87d6554088d6ef45ca87ca9807ec",
+    "binary_bytes": 802998040
+  },
+  "validation": {
+    "native_unique_checks": 585,
+    "native_shared": 403,
+    "native_api": 182,
+    "initial_native_api_passed": 181,
+    "initial_native_api_failed": 1,
+    "initial_failure": "Test-only assertion incorrectly compared cumulative writes to a live disk quota. Restored the original cumulative-writes-exceed-quota recycling oracle in 86d3f4cbc6; no production code changed.",
+    "focused_recheck_passed": 9,
+    "focused_recheck_failed": 0,
+    "skips": 0,
+    "leaks": 0,
+    "test_discovery": "b85b735fc4 directly imports metadata modules in the API test root so focused filters discover their checks without other test bodies.",
+    "final_covered_checks_failed": 0,
+    "real_parquet_iceberg_e2e": 50,
+    "e2e_seconds": 397.32,
+    "native_command": [
+      "/Users/ajroetker/bin/zig",
+      "build",
+      "lake-api-test",
+      "-Dtest-filter=api.lake_index_page_mutations.",
+      "-Dtest-filter=api.lake_row_",
+      "-Dtest-filter=api.lake_index_text_directory.",
+      "-Dtest-filter=api.lake_index_aggregate_",
+      "-Dtest-filter=api.lake_index_serving_compaction.",
+      "-Dtest-filter=api.lake_index_text_forward.",
+      "-Dtest-filter=highlight",
+      "-Dtest-filter=SQL adaptive payload cache",
+      "-Dtest-filter=SQL shared",
+      "-Dtest-filter=SQL memory",
+      "-Dtest-filter=SQL monotonic",
+      "-Dtest-filter=SQL nested",
+      "-Dtest-filter=SQL native",
+      "-Dtest-filter=SQL compact delivery",
+      "-Dtest-filter=storage.resource_manager.test.",
+      "-Dtest-filter=external lake metadata navigation",
+      "-Dtest-filter=external lake dynamic exact keys",
+      "-Dtest-filter=external lake bounded window profiles",
+      "-Dtest-filter=external lake Parquet",
+      "-Dtest-filter=external lake leased publication",
+      "-Dtest-filter=external lake warm tie pagination",
+      "-Dtest-filter=external lake ordered",
+      "-Dtest-filter=external lake aggregate persistent state admits",
+      "-Dtest-filter=external lake publication quota",
+      "-Dtest-filter=external lake native coordinator",
+      "-Dtest-filter=lake build working-set",
+      "-Dtest-filter=sql.spill.test.",
+      "--summary",
+      "all"
+    ],
+    "focused_recheck_command": [
+      "/Users/ajroetker/bin/zig",
+      "build",
+      "lake-api-test",
+      "-Dtest-filter=api.lake_index_text_directory.",
+      "-Dtest-filter=api.lake_index_page_mutations.",
+      "--summary",
+      "all"
+    ],
+    "e2e_command": [
+      "zig/e2e/antfly/.venv/bin/python",
+      "-B",
+      "-m",
+      "pytest",
+      "zig/e2e/antfly/test_lake_archive_qualification.py",
+      "zig/e2e/antfly/test_iceberg_sql.py",
+      "-n2",
+      "-q"
+    ],
+    "final_checks": {
+      "apache_boundary": {
+        "exit_code": 0,
+        "command": [
+          "python3",
+          "-B",
+          "scripts/check_apache_boundary.py"
+        ]
+      },
+      "license": {
+        "exit_code": 0,
+        "command": [
+          "python3",
+          "-B",
+          "scripts/license_headers.py",
+          "--check"
+        ]
+      },
+      "formatting": {
+        "exit_code": 0,
+        "command": [
+          "/Users/ajroetker/bin/zig",
+          "fmt",
+          "--check",
+          "zig/pkg/antfly/src/api/lake_index_aggregate_reductions.zig",
+          "zig/pkg/antfly/src/api/lake_index_aggregate_rows.zig",
+          "zig/pkg/antfly/src/api/lake_index_page_mutations.zig",
+          "zig/pkg/antfly/src/api/lake_index_serving_compaction.zig",
+          "zig/pkg/antfly/src/api/lake_index_text_directory.zig",
+          "zig/pkg/antfly/src/api/lake_index_text_forward.zig",
+          "zig/pkg/antfly/src/api/lake_row_fragments.zig",
+          "zig/pkg/antfly/src/api/lake_row_identity_build.zig",
+          "zig/pkg/antfly/src/api/lake_row_identity_delta.zig",
+          "zig/pkg/antfly/src/api/lake_row_payloads.zig",
+          "zig/pkg/antfly/src/api/lake_row_translation_delta.zig",
+          "zig/pkg/antfly/src/api_http_runtime_test_root.zig"
+        ]
+      },
+      "whitespace": {
+        "exit_code": 0,
+        "command": [
+          "git",
+          "diff",
+          "--check"
+        ]
+      }
+    },
+    "cleanup": "scripts/cache_gc.sh\nNative build active or process inspection unavailable; skipping cache cleanup.\n",
+    "runtime_changes_after_qualified_commit": "None: 86d3f4cbc6 adjusts only a test assertion/comment, and b85b735fc4 adds two test-root imports."
+  },
+  "method": {
+    "runner": "zig/bench/lake/publication_residency.py",
+    "build": "Zig 0.17.0 Debug; frozen executables",
+    "order": "Three alternating before/after pairs at each size; reversed second pair.",
+    "timed": "Table creation POST through first queryable, complete published revision matching target; 25-ms readiness polling.",
+    "untimed": "Server startup, real Parquet fixture generation/verification and complete SQL row/value verification in disjoint 64-row intervals.",
+    "quota": "Unchanged default 4-MiB coordinator workspace, 1-MiB metadata sort preference, and 1-GiB working-set cap. Memory, spill-byte and file-count admission remain in force.",
+    "overlap": "No task-owned builds, native tests or E2E tests overlapped publication measurements. Other host activity is uncontrolled; an unrelated inference benchmark was observed during the larger cohort.",
+    "limitations": "Local Parquet/FsStore, fresh server storage and retained OS caches. Three pairs do not establish archive-scale/cloud latency, production optimized-build performance or peak RSS. Real-provider retention qualification remains deferred; external HN fixture unavailable."
+  },
+  "publication_cohorts": [
+    {
+      "rows": 8192,
+      "pairs": 3,
+      "before_elapsed_ns": [
+        5849954791,
+        6557286750,
+        6349022209
+      ],
+      "after_elapsed_ns": [
+        5315066250,
+        5581566916,
+        5727496208
+      ],
+      "before_median_elapsed_ns": 6349022209,
+      "after_median_elapsed_ns": 5581566916,
+      "observed_median_latency_reduction_percent": 12.087771435294403,
+      "faster_candidate_pairs": 3,
+      "paired_latency_reduction_percent": [
+        9.143464524254307,
+        14.879932374468751,
+        9.789318426370619
+      ]
+    },
+    {
+      "rows": 65536,
+      "pairs": 3,
+      "before_elapsed_ns": [
+        51494965375,
+        43619620708,
+        42965595000
+      ],
+      "after_elapsed_ns": [
+        47997071125,
+        44143504417,
+        44190543209
+      ],
+      "before_median_elapsed_ns": 43619620708,
+      "after_median_elapsed_ns": 44190543209,
+      "observed_median_latency_reduction_percent": -1.3088662664489714,
+      "faster_candidate_pairs": 1,
+      "paired_latency_reduction_percent": [
+        6.792691721467148,
+        -1.2010276579592416,
+        -2.8509978949436077
+      ]
+    }
+  ],
+  "publication_runs": [
+    {
+      "label": "metadata-reducer-before-8192-0",
+      "report": ".benchmark-results/lake/publication-residency-v1/metadata-reducer-before-8192-0/report.json",
+      "report_sha256": "766e091c2acc3b0615e1bc6de905c3b60af46ec7be7a82ecf0497233ab4974c5",
+      "source_commit": "85a62db7644bdfde24b6f957d4d9f89f862c5371",
+      "binary_sha256": "761e78a68bea26b86fdfea2705511044e2d26f6030129f900ee52a109cd0d60f",
+      "parquet_sha256": "194b160808291f9ebe801d412db14ad8ae06dd6d210082aa0bd1e322c36203d7",
+      "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "rows": 8192,
+      "columns": 10,
+      "publication_elapsed_ns": 5849954791,
+      "polls": 58,
+      "verified_result_sha256": "6d65ce8dade3126d12e616db6dfee12dc7b9c6e1ff239efba479f98bea963cd5",
+      "status": {
+        "index_type": "relational",
+        "readiness": {
+          "state": "ready",
+          "queryable": true,
+          "complete": true,
+          "target_revision": 1,
+          "published_revision": 1,
+          "pending_reasons": []
+        },
+        "target_revision": 1,
+        "published_revision": 1
+      }
+    },
+    {
+      "label": "metadata-reducer-after-8192-0",
+      "report": ".benchmark-results/lake/publication-residency-v1/metadata-reducer-after-8192-0/report.json",
+      "report_sha256": "10edf5dee240f69c8bc1cc6303904e7cf539d9f768c45c5ac27fe5e008002627",
+      "source_commit": "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+      "binary_sha256": "c778fb546d6d2bbfdd50c5f8f6dcbd71754b87d6554088d6ef45ca87ca9807ec",
+      "parquet_sha256": "194b160808291f9ebe801d412db14ad8ae06dd6d210082aa0bd1e322c36203d7",
+      "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "rows": 8192,
+      "columns": 10,
+      "publication_elapsed_ns": 5315066250,
+      "polls": 58,
+      "verified_result_sha256": "6d65ce8dade3126d12e616db6dfee12dc7b9c6e1ff239efba479f98bea963cd5",
+      "status": {
+        "index_type": "relational",
+        "readiness": {
+          "state": "ready",
+          "queryable": true,
+          "complete": true,
+          "target_revision": 1,
+          "published_revision": 1,
+          "pending_reasons": []
+        },
+        "target_revision": 1,
+        "published_revision": 1
+      }
+    },
+    {
+      "label": "metadata-reducer-before-8192-1",
+      "report": ".benchmark-results/lake/publication-residency-v1/metadata-reducer-before-8192-1/report.json",
+      "report_sha256": "5197c81d94ed576a23c68adc7e4f3f0c97db0809d447995389a11c4601acb0d9",
+      "source_commit": "85a62db7644bdfde24b6f957d4d9f89f862c5371",
+      "binary_sha256": "761e78a68bea26b86fdfea2705511044e2d26f6030129f900ee52a109cd0d60f",
+      "parquet_sha256": "194b160808291f9ebe801d412db14ad8ae06dd6d210082aa0bd1e322c36203d7",
+      "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "rows": 8192,
+      "columns": 10,
+      "publication_elapsed_ns": 6557286750,
+      "polls": 75,
+      "verified_result_sha256": "6d65ce8dade3126d12e616db6dfee12dc7b9c6e1ff239efba479f98bea963cd5",
+      "status": {
+        "index_type": "relational",
+        "readiness": {
+          "state": "ready",
+          "queryable": true,
+          "complete": true,
+          "target_revision": 1,
+          "published_revision": 1,
+          "pending_reasons": []
+        },
+        "target_revision": 1,
+        "published_revision": 1
+      }
+    },
+    {
+      "label": "metadata-reducer-after-8192-1",
+      "report": ".benchmark-results/lake/publication-residency-v1/metadata-reducer-after-8192-1/report.json",
+      "report_sha256": "d83b1589cfbf2ee42df4fb21315b31a9ddc87d5bf9a16e679c267dd196f769f4",
+      "source_commit": "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+      "binary_sha256": "c778fb546d6d2bbfdd50c5f8f6dcbd71754b87d6554088d6ef45ca87ca9807ec",
+      "parquet_sha256": "194b160808291f9ebe801d412db14ad8ae06dd6d210082aa0bd1e322c36203d7",
+      "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "rows": 8192,
+      "columns": 10,
+      "publication_elapsed_ns": 5581566916,
+      "polls": 68,
+      "verified_result_sha256": "6d65ce8dade3126d12e616db6dfee12dc7b9c6e1ff239efba479f98bea963cd5",
+      "status": {
+        "index_type": "relational",
+        "readiness": {
+          "state": "ready",
+          "queryable": true,
+          "complete": true,
+          "target_revision": 1,
+          "published_revision": 1,
+          "pending_reasons": []
+        },
+        "target_revision": 1,
+        "published_revision": 1
+      }
+    },
+    {
+      "label": "metadata-reducer-before-8192-2",
+      "report": ".benchmark-results/lake/publication-residency-v1/metadata-reducer-before-8192-2/report.json",
+      "report_sha256": "d4c5d00c50dbd5b14288ee06cb46b9a91e16cc76700b6ffa7d57d96bff37fb1f",
+      "source_commit": "85a62db7644bdfde24b6f957d4d9f89f862c5371",
+      "binary_sha256": "761e78a68bea26b86fdfea2705511044e2d26f6030129f900ee52a109cd0d60f",
+      "parquet_sha256": "194b160808291f9ebe801d412db14ad8ae06dd6d210082aa0bd1e322c36203d7",
+      "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "rows": 8192,
+      "columns": 10,
+      "publication_elapsed_ns": 6349022209,
+      "polls": 71,
+      "verified_result_sha256": "6d65ce8dade3126d12e616db6dfee12dc7b9c6e1ff239efba479f98bea963cd5",
+      "status": {
+        "index_type": "relational",
+        "readiness": {
+          "state": "ready",
+          "queryable": true,
+          "complete": true,
+          "target_revision": 1,
+          "published_revision": 1,
+          "pending_reasons": []
+        },
+        "target_revision": 1,
+        "published_revision": 1
+      }
+    },
+    {
+      "label": "metadata-reducer-after-8192-2",
+      "report": ".benchmark-results/lake/publication-residency-v1/metadata-reducer-after-8192-2/report.json",
+      "report_sha256": "e7c74477e9ff4d9e7aa05ddfd97aec6737fe12ae1825265ae9f05213abeb3f19",
+      "source_commit": "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+      "binary_sha256": "c778fb546d6d2bbfdd50c5f8f6dcbd71754b87d6554088d6ef45ca87ca9807ec",
+      "parquet_sha256": "194b160808291f9ebe801d412db14ad8ae06dd6d210082aa0bd1e322c36203d7",
+      "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "rows": 8192,
+      "columns": 10,
+      "publication_elapsed_ns": 5727496208,
+      "polls": 66,
+      "verified_result_sha256": "6d65ce8dade3126d12e616db6dfee12dc7b9c6e1ff239efba479f98bea963cd5",
+      "status": {
+        "index_type": "relational",
+        "readiness": {
+          "state": "ready",
+          "queryable": true,
+          "complete": true,
+          "target_revision": 1,
+          "published_revision": 1,
+          "pending_reasons": []
+        },
+        "target_revision": 1,
+        "published_revision": 1
+      }
+    },
+    {
+      "label": "metadata-reducer-before-65536-0",
+      "report": ".benchmark-results/lake/publication-residency-v1/metadata-reducer-before-65536-0/report.json",
+      "report_sha256": "cb49ff43ab2af842aa6b56e9c4401632edac6036d74ffd3422d4d9e1ec89086a",
+      "source_commit": "85a62db7644bdfde24b6f957d4d9f89f862c5371",
+      "binary_sha256": "761e78a68bea26b86fdfea2705511044e2d26f6030129f900ee52a109cd0d60f",
+      "parquet_sha256": "1a0d13cd014a0cc1165816c078b83db8b3a6f8cd87673f173a01ecd64a97d21b",
+      "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "rows": 65536,
+      "columns": 10,
+      "publication_elapsed_ns": 51494965375,
+      "polls": 600,
+      "verified_result_sha256": "56e692ad157cf820b206fabe5d899ecec72a459f31629a2e0abf2ce0abfcf9bb",
+      "status": {
+        "index_type": "relational",
+        "readiness": {
+          "state": "ready",
+          "queryable": true,
+          "complete": true,
+          "target_revision": 1,
+          "published_revision": 1,
+          "pending_reasons": []
+        },
+        "target_revision": 1,
+        "published_revision": 1
+      }
+    },
+    {
+      "label": "metadata-reducer-after-65536-0",
+      "report": ".benchmark-results/lake/publication-residency-v1/metadata-reducer-after-65536-0/report.json",
+      "report_sha256": "8aaf22b74a9b5bc6b76c403551638d817060a036ce1bace2f2e2bca59dbc947c",
+      "source_commit": "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+      "binary_sha256": "c778fb546d6d2bbfdd50c5f8f6dcbd71754b87d6554088d6ef45ca87ca9807ec",
+      "parquet_sha256": "1a0d13cd014a0cc1165816c078b83db8b3a6f8cd87673f173a01ecd64a97d21b",
+      "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "rows": 65536,
+      "columns": 10,
+      "publication_elapsed_ns": 47997071125,
+      "polls": 592,
+      "verified_result_sha256": "56e692ad157cf820b206fabe5d899ecec72a459f31629a2e0abf2ce0abfcf9bb",
+      "status": {
+        "index_type": "relational",
+        "readiness": {
+          "state": "ready",
+          "queryable": true,
+          "complete": true,
+          "target_revision": 1,
+          "published_revision": 1,
+          "pending_reasons": []
+        },
+        "target_revision": 1,
+        "published_revision": 1
+      }
+    },
+    {
+      "label": "metadata-reducer-before-65536-1",
+      "report": ".benchmark-results/lake/publication-residency-v1/metadata-reducer-before-65536-1/report.json",
+      "report_sha256": "f7fc4524ecf1f7cdcf899b098f96bba09ac68956c4d45df95754e1837cbd0805",
+      "source_commit": "85a62db7644bdfde24b6f957d4d9f89f862c5371",
+      "binary_sha256": "761e78a68bea26b86fdfea2705511044e2d26f6030129f900ee52a109cd0d60f",
+      "parquet_sha256": "1a0d13cd014a0cc1165816c078b83db8b3a6f8cd87673f173a01ecd64a97d21b",
+      "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "rows": 65536,
+      "columns": 10,
+      "publication_elapsed_ns": 43619620708,
+      "polls": 561,
+      "verified_result_sha256": "56e692ad157cf820b206fabe5d899ecec72a459f31629a2e0abf2ce0abfcf9bb",
+      "status": {
+        "index_type": "relational",
+        "readiness": {
+          "state": "ready",
+          "queryable": true,
+          "complete": true,
+          "target_revision": 1,
+          "published_revision": 1,
+          "pending_reasons": []
+        },
+        "target_revision": 1,
+        "published_revision": 1
+      }
+    },
+    {
+      "label": "metadata-reducer-after-65536-1",
+      "report": ".benchmark-results/lake/publication-residency-v1/metadata-reducer-after-65536-1/report.json",
+      "report_sha256": "6b26585844b68fe9ec306e179aa03656603fe8f0cccedf99a7c461d225f924b6",
+      "source_commit": "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+      "binary_sha256": "c778fb546d6d2bbfdd50c5f8f6dcbd71754b87d6554088d6ef45ca87ca9807ec",
+      "parquet_sha256": "1a0d13cd014a0cc1165816c078b83db8b3a6f8cd87673f173a01ecd64a97d21b",
+      "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "rows": 65536,
+      "columns": 10,
+      "publication_elapsed_ns": 44143504417,
+      "polls": 518,
+      "verified_result_sha256": "56e692ad157cf820b206fabe5d899ecec72a459f31629a2e0abf2ce0abfcf9bb",
+      "status": {
+        "index_type": "relational",
+        "readiness": {
+          "state": "ready",
+          "queryable": true,
+          "complete": true,
+          "target_revision": 1,
+          "published_revision": 1,
+          "pending_reasons": []
+        },
+        "target_revision": 1,
+        "published_revision": 1
+      }
+    },
+    {
+      "label": "metadata-reducer-before-65536-2",
+      "report": ".benchmark-results/lake/publication-residency-v1/metadata-reducer-before-65536-2/report.json",
+      "report_sha256": "82bfc0b4cc4a43668b72891307b938b772e625ad4fdfa3b88e1966ec4c4880e4",
+      "source_commit": "85a62db7644bdfde24b6f957d4d9f89f862c5371",
+      "binary_sha256": "761e78a68bea26b86fdfea2705511044e2d26f6030129f900ee52a109cd0d60f",
+      "parquet_sha256": "1a0d13cd014a0cc1165816c078b83db8b3a6f8cd87673f173a01ecd64a97d21b",
+      "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "rows": 65536,
+      "columns": 10,
+      "publication_elapsed_ns": 42965595000,
+      "polls": 559,
+      "verified_result_sha256": "56e692ad157cf820b206fabe5d899ecec72a459f31629a2e0abf2ce0abfcf9bb",
+      "status": {
+        "index_type": "relational",
+        "readiness": {
+          "state": "ready",
+          "queryable": true,
+          "complete": true,
+          "target_revision": 1,
+          "published_revision": 1,
+          "pending_reasons": []
+        },
+        "target_revision": 1,
+        "published_revision": 1
+      }
+    },
+    {
+      "label": "metadata-reducer-after-65536-2",
+      "report": ".benchmark-results/lake/publication-residency-v1/metadata-reducer-after-65536-2/report.json",
+      "report_sha256": "b369623bb5feed89d120287a2e09a4e6117f5f991f3a8df302dfda27185a8483",
+      "source_commit": "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+      "binary_sha256": "c778fb546d6d2bbfdd50c5f8f6dcbd71754b87d6554088d6ef45ca87ca9807ec",
+      "parquet_sha256": "1a0d13cd014a0cc1165816c078b83db8b3a6f8cd87673f173a01ecd64a97d21b",
+      "runner_sha256": "f88513094782db5728b9c6c2450881bf1a3e471570e2d93f74a6bc4af85c9e76",
+      "config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
+      "rows": 65536,
+      "columns": 10,
+      "publication_elapsed_ns": 44190543209,
+      "polls": 591,
+      "verified_result_sha256": "56e692ad157cf820b206fabe5d899ecec72a459f31629a2e0abf2ce0abfcf9bb",
+      "status": {
+        "index_type": "relational",
+        "readiness": {
+          "state": "ready",
+          "queryable": true,
+          "complete": true,
+          "target_revision": 1,
+          "published_revision": 1,
+          "pending_reasons": []
+        },
+        "target_revision": 1,
+        "published_revision": 1
+      }
+    }
+  ],
+  "publication_commands": [
+    [
+      "zig/e2e/antfly/.venv/bin/python",
+      "-B",
+      "zig/bench/lake/publication_residency.py",
+      "metadata-reducer-before-8192-0",
+      "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/scan-resistant-v2/after/antfly",
+      "85a62db7644bdfde24b6f957d4d9f89f862c5371",
+      "8192"
+    ],
+    [
+      "zig/e2e/antfly/.venv/bin/python",
+      "-B",
+      "zig/bench/lake/publication_residency.py",
+      "metadata-reducer-after-8192-0",
+      "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/metadata-reduction-v1/after/antfly",
+      "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+      "8192"
+    ],
+    [
+      "zig/e2e/antfly/.venv/bin/python",
+      "-B",
+      "zig/bench/lake/publication_residency.py",
+      "metadata-reducer-after-8192-1",
+      "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/metadata-reduction-v1/after/antfly",
+      "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+      "8192"
+    ],
+    [
+      "zig/e2e/antfly/.venv/bin/python",
+      "-B",
+      "zig/bench/lake/publication_residency.py",
+      "metadata-reducer-before-8192-1",
+      "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/scan-resistant-v2/after/antfly",
+      "85a62db7644bdfde24b6f957d4d9f89f862c5371",
+      "8192"
+    ],
+    [
+      "zig/e2e/antfly/.venv/bin/python",
+      "-B",
+      "zig/bench/lake/publication_residency.py",
+      "metadata-reducer-before-8192-2",
+      "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/scan-resistant-v2/after/antfly",
+      "85a62db7644bdfde24b6f957d4d9f89f862c5371",
+      "8192"
+    ],
+    [
+      "zig/e2e/antfly/.venv/bin/python",
+      "-B",
+      "zig/bench/lake/publication_residency.py",
+      "metadata-reducer-after-8192-2",
+      "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/metadata-reduction-v1/after/antfly",
+      "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+      "8192"
+    ],
+    [
+      "zig/e2e/antfly/.venv/bin/python",
+      "-B",
+      "zig/bench/lake/publication_residency.py",
+      "metadata-reducer-before-65536-0",
+      "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/scan-resistant-v2/after/antfly",
+      "85a62db7644bdfde24b6f957d4d9f89f862c5371",
+      "65536"
+    ],
+    [
+      "zig/e2e/antfly/.venv/bin/python",
+      "-B",
+      "zig/bench/lake/publication_residency.py",
+      "metadata-reducer-after-65536-0",
+      "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/metadata-reduction-v1/after/antfly",
+      "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+      "65536"
+    ],
+    [
+      "zig/e2e/antfly/.venv/bin/python",
+      "-B",
+      "zig/bench/lake/publication_residency.py",
+      "metadata-reducer-after-65536-1",
+      "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/metadata-reduction-v1/after/antfly",
+      "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+      "65536"
+    ],
+    [
+      "zig/e2e/antfly/.venv/bin/python",
+      "-B",
+      "zig/bench/lake/publication_residency.py",
+      "metadata-reducer-before-65536-1",
+      "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/scan-resistant-v2/after/antfly",
+      "85a62db7644bdfde24b6f957d4d9f89f862c5371",
+      "65536"
+    ],
+    [
+      "zig/e2e/antfly/.venv/bin/python",
+      "-B",
+      "zig/bench/lake/publication_residency.py",
+      "metadata-reducer-before-65536-2",
+      "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/scan-resistant-v2/after/antfly",
+      "85a62db7644bdfde24b6f957d4d9f89f862c5371",
+      "65536"
+    ],
+    [
+      "zig/e2e/antfly/.venv/bin/python",
+      "-B",
+      "zig/bench/lake/publication_residency.py",
+      "metadata-reducer-after-65536-2",
+      "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/metadata-reduction-v1/after/antfly",
+      "fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5",
+      "65536"
+    ]
+  ]
+}

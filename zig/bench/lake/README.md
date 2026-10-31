@@ -2850,3 +2850,49 @@ license headers, formatting and whitespace checks pass. The merged `origin/main`
 revision `0ff73ed56fb7acfbe4d6a14158f84c4b74c8dadb` changes documentation and
 examples; it leaves the qualified Zig runtime unchanged. Real-provider retention,
 RSS, cold-storage/archive scale and a full WASM bundle remain unqualified here.
+
+
+## Private metadata reduction
+
+Metadata mutations now use one byte-bounded external sort and leased equal-key
+reduction directly into the final copy-on-write tree. This removes fixed
+1,024-record flushes, owning-row copies, intermediate private page trees and a
+second binary merge forest. Durable maintenance checkpoint forests remain.
+Latest-write and addition-priority ordering, destination reductions, cancellation
+and resource admission retain their contracts.
+
+[private-metadata-reduction-v1-observation.json](private-metadata-reduction-v1-observation.json)
+records implementation source `fd245554ebd4d3e3bd0a4201d3e4f59b140eeee5`, frozen
+binary hashes, exact commands and all twelve fully verified reports from
+`publication_residency.py`. The before binary uses the already gated spill cache,
+so the comparison isolates metadata staging from the preceding cache work.
+
+| Real Parquet rows | Previous median publication | Candidate median publication | Candidate change | Faster candidate pairs |
+| --- | ---: | ---: | ---: | ---: |
+| 8,192 | 6,349.022 ms | 5,581.567 ms | 12.1% lower | 3/3 |
+| 65,536 | 43,619.621 ms | 44,190.543 ms | 1.3% higher | 1/3 |
+
+Timing includes table creation through the first queryable, complete publication
+whose revision matches the target. Startup, fixture verification and complete SQL
+verification in disjoint 64-row intervals are excluded. All runs verify every row
+and all ten columns; fixture, configuration, runner and complete-result digests
+match within each cohort. Both binaries use the same default 4-MiB coordinator
+workspace, 1-MiB metadata sort preference and 1-GiB working-set cap. No task-owned
+builds, native tests or E2E tests overlap the measured runs.
+
+These are local Parquet/FsStore Debug observations with fresh server storage and
+retained OS caches. Other host work was uncontrolled, and an unrelated inference
+benchmark was observed during the larger cohort. The larger workload shows no
+demonstrated publication improvement. The retained shape simplifies private
+staging and improves the smaller measured cohort; it does not establish
+optimized-build, archive-scale, cloud or peak-RSS gains.
+
+Qualification covers 403 shared checks, 182 API checks and 50 real
+Parquet/Iceberg E2E cases (397.32 seconds). The initial API run passed 181 checks;
+its only failure was a test assertion treating cumulative writes as bounded by a
+live disk quota. A test-only correction restores the recycling oracle. Explicit
+API-root imports also make these metadata tests directly discoverable. Nine
+focused metadata checks then pass, covering the corrected assertion and the
+previously passing cases, with no skips or leaks. The qualified implementation
+binary is unchanged by those test-only commits. Runtime ABI 81, reader protocol
+97 and persisted formats remain unchanged.

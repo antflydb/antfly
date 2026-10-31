@@ -2704,10 +2704,32 @@ the latest mutation; addition-priority updates select the latest addition if one
 exists, otherwise a deletion. This policy applies across every spill run. The
 source retains only a winner and one lookahead lease, including when a key has
 many updates. It releases both on success, cancellation or failure without
-building an owning row DOM or an intermediate authenticated page tree.
+materializing owning rows or an intermediate authenticated page tree.
 
 The destination still owns authentication, publication I/O accounting, aggregate
 reductions and copy-on-write subtree reuse. Persisted formats and reader/runtime
 protocols are unchanged. No root is returned on partial failure, and the prior
 root remains valid. Raw spill staging does not need a separate artifact I/O phase
 or an addition policy duplicated in a second reducer.
+
+
+The measured comparison is recorded in
+[private-metadata-reduction-v1-observation.json](bench/lake/private-metadata-reduction-v1-observation.json).
+Three alternating pairs of real local Parquet publications verify every row and
+all ten columns outside the timed interval. At 8,192 rows, median publication
+falls from 6,349.022 to 5,581.567 ms (12.1%); all three candidates are faster. At
+65,536 rows, the median rises from 43,619.621 to 44,190.543 ms (1.3%); only one
+candidate pair is faster. The larger cohort does not establish a publication
+speedup. These Debug measurements retain OS caches, and unrelated host work,
+including an inference benchmark during the larger cohort, was uncontrolled.
+The smaller-cohort gain and removal of a redundant staging layer support this
+shape; they do not establish large-archive or cloud throughput improvements.
+
+Qualification covers 403 shared native checks and 182 API checks, including
+allocation-failure sweeps for row identity and translations. An initial test
+incorrectly bounded cumulative writes by the live spill quota; restoring its
+recycling invariant and directly importing the metadata modules into the API
+test root produces nine passing focused checks. That correction changes no
+production code. All 50 real Parquet/Iceberg E2E cases pass against the frozen
+implementation binary. Memory, spill-byte and file-count admission remain in
+force, including cumulative writes exceeding a bounded live disk quota.
