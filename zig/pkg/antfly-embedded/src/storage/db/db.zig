@@ -28558,7 +28558,11 @@ pub const DB = struct {
     }
     pub fn visitCypherDocuments(self: *DB, alloc: Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("visitCypherDocuments", .{ self, alloc, from, to, opts, visitor });
-        if (!opts.isRelational()) return self.scanVisit(alloc, from, to, opts, visitor);
+        if (!opts.isRelational()) {
+            var node_opts = opts;
+            node_opts.cypher_node_keys_only = true;
+            return self.scanVisit(alloc, from, to, node_opts, visitor);
+        }
         // Session admission accepts one bounded page, while visitation may
         // consume many pages up to the statement's total scan budget.
         var page_opts = opts;
@@ -42096,6 +42100,10 @@ pub const DB = struct {
                     if ((state.opts.exclusive_to and order != .lt) or (!state.opts.exclusive_to and order == .gt))
                         return .stop;
                 }
+                // Optional owner progress precedes TTL and row-filter rejection.
+                // Ordinary scans have no callback and keep their page contract.
+                try state.visitor.reportProgress(1);
+                if (state.opts.cypher_node_keys_only and !DB.cypherDocumentKeyAllowed(raw_key)) return .@"continue";
                 const relational = internal_keys.isRelationalRowKey(store_key);
                 const row_plan = if (relational)
                     try state.schemaPlan(try relational_store.rowSchemaVersion(stored_value))

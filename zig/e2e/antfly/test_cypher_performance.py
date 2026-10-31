@@ -1579,7 +1579,7 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
             call(
                 "/sql",
                 {
-                    "statement": f"CREATE TABLE {prefix} (id TEXT, tenant TEXT, body TEXT)"
+                    "statement": f"CREATE TABLE {prefix} (id TEXT, tenant TEXT, body TEXT, enabled BOOLEAN)"
                 },
             )
             call("/sql", {"statement": f"CREATE INDEX {prefix}_id ON {prefix}(id)"})
@@ -1592,6 +1592,7 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
                     "inserts": {
                         f"n{i}": {
                             "id": f"n{i}",
+                            "enabled": i % 2 == 1,
                             "tenant": "acme" if i % 4 < 2 else "other",
                             "body": ('escaped\\"\n' + "x" * (512 << 10))
                             if i % 2
@@ -1676,16 +1677,84 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
             method="PUT",
         )
         count("D", reader, (16, 8))
-        # Predicates retain the ordinary evaluator and its payload budget;
-        # only the eligible count-only statements above use nullness projection.
+        # The retained scan applies effective row filters once. Rejected rows
+        # still consume physical progress before policy evaluation.
+        denied_budget = reader.post(
+            base + f"/graphs/{prefix}/query",
+            json={
+                "query": "MATCH (n:D) RETURN count(n.body)",
+                "limits": {"memory_bytes": 8 << 20, "scanned_anchors": 31},
+            },
+            timeout=45,
+        )
+        assert denied_budget.status_code == 429, denied_budget.text
+        assert denied_budget.json()["code"] == "CypherAnchorBudgetExceeded"
+        # Predicate values remain real; aggregate-only properties stay borrowed.
+        for session, bodies in ((admin, 16), (reader, 8)):
+            for pattern, predicate, expected in (
+                ("n:D", "", bodies),
+                ("n:D", "WHERE true", bodies),
+                ("n:D", "WHERE false", 0),
+                ("n:D", "WHERE null", 0),
+                ("n:D", "WHERE n.tenant='acme'", 8),
+                ("n:D {tenant:'acme'}", "", 8),
+                ("n:D", "WHERE n.missing IS NULL", bodies),
+            ):
+                for memory in (1 << 20, 4 << 20) if session is admin else (8 << 20,):
+                    bounded = call(
+                        f"/graphs/{prefix}/query",
+                        {
+                            "query": f"MATCH ({pattern}) {predicate} RETURN count(n.body)",
+                            "limits": {"memory_bytes": memory},
+                        },
+                        session=session,
+                    )
+                    assert bounded["rows"] == [
+                        [{"type": "integer", "value": str(expected)}]
+                    ], bounded
+                    assert bounded["stats"]["memory_bytes"] < memory, bounded
+                    assert bounded["stats"]["scanned_anchors"] == 32, bounded
+            # A predicate observing the count input must see its actual value,
+            # rather than the nullness sentinel used by other count statements.
+            observed = call(
+                f"/graphs/{prefix}/query",
+                {
+                    "query": "MATCH (n:D) WHERE n.enabled=false RETURN count(n.enabled)",
+                    "limits": {"memory_bytes": 8 << 20},
+                },
+                session=session,
+            )
+            assert observed["rows"] == [[{"type": "integer", "value": str(bodies)}]], (
+                observed
+            )
         residual = call(
             f"/graphs/{prefix}/query",
             {
                 "query": "MATCH (n:D) WHERE n.id='n1' RETURN count(n.body)",
-                "limits": {"memory_bytes": 64 << 20},
+                "limits": {
+                    "memory_bytes": 1 << 20,
+                    "scanned_anchors": 1 if relational else 32,
+                },
             },
         )
         assert residual["rows"] == [[{"type": "integer", "value": "1"}]], residual
+        # An effective filter that admits no rows must not evaluate a hidden
+        # row's scalar predicate. Progress still accounts for all candidates.
+        call(
+            f"/auth/v1/users/{reader.auth[0]}/row-filters/{prefix}",
+            {"term": {"tenant": "absent"}},
+            method="PUT",
+        )
+        hidden = call(
+            f"/graphs/{prefix}/query",
+            {
+                "query": "MATCH (n:D) WHERE 1/0=0 RETURN count(n.body)",
+                "limits": {"memory_bytes": 8 << 20},
+            },
+            session=reader,
+        )
+        assert hidden["rows"] == [[{"type": "integer", "value": "0"}]], hidden
+        assert hidden["stats"]["scanned_anchors"] == 32, hidden
     finally:
         reader.close()
         admin.close()

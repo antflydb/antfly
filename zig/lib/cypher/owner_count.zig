@@ -104,22 +104,49 @@ pub fn run(a: std.mem.Allocator, backend: b.Backend, graph: catalog.Graph, table
     return out;
 }
 
-/// A nullness projection is licensed only for direct node properties. Predicates,
-/// inline constraints and nested property evaluation retain the ordinary planner
-/// and evaluator, including their index seeks and scalar error ordering.
+/// Preserve actual values observed by membership and predicates. Only properties
+/// observed exclusively by direct COUNT arguments may use a nullness sentinel.
 pub const Projection = struct {
     fields: []const []const u8,
     presence: []const []const u8,
     arguments: []const Argument,
     pub const Argument = union(enum) { field: []const u8, present: bool };
+    fn dependencies(a: std.mem.Allocator, expr: *const ast.Expr, values: *std.StringHashMapUnmanaged(void)) !bool {
+        return switch (expr.value) {
+            .literal, .parameter => true,
+            .property => |p| if (p.base.value == .variable) add: {
+                try values.put(a, p.name, {});
+                break :add true;
+            } else try dependencies(a, p.base, values),
+            .unary => |u| try dependencies(a, u.operand, values),
+            .binary => |op| try dependencies(a, op.left, values) and try dependencies(a, op.right, values),
+            .comparison => |chain| all: {
+                for (chain.operands) |operand| if (!try dependencies(a, operand, values)) break :all false;
+                break :all true;
+            },
+            .list => |items| all: {
+                for (items) |item| if (!try dependencies(a, item, values)) break :all false;
+                break :all true;
+            },
+            // Whole entities and extension expressions keep the ordinary path.
+            else => false,
+        };
+    }
     pub fn init(a: std.mem.Allocator, graph: catalog.Graph, input: b.CountInput) !?Projection {
-        if (!eligible(input) or input.predicate != null or input.node.properties.len != 0) return null;
+        if (!eligible(input)) return null;
         var fields: std.StringHashMapUnmanaged(void) = .empty;
         var values: std.StringHashMapUnmanaged(void) = .empty;
         for (graph.labels) |label| for (label.predicate) |entry| {
             try fields.put(a, entry.name, {});
             try values.put(a, entry.name, {});
         };
+        for (input.node.properties) |property| {
+            try values.put(a, property.name, {});
+            if (!try dependencies(a, property.value, &values)) return null;
+        }
+        if (input.predicate) |predicate| if (!try dependencies(a, predicate, &values)) return null;
+        var dependencies_ = values.keyIterator();
+        while (dependencies_.next()) |name| try fields.put(a, name.*, {});
         const arguments = try a.alloc(Argument, input.arguments.len);
         for (input.arguments, arguments) |expr, *out| {
             const value = expr orelse {

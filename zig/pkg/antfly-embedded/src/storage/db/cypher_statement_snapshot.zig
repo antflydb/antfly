@@ -107,7 +107,7 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
             for (graphs, guards) |entry, *guard| guard.* = try cypher.catalog_guard.Guard.init(owned, entry, copied.table);
             self.* = .{ .catalog_guards = guards, .a = a, .arena = arena, .source = db, .db = readonly, .population_upper_bound = population, .input = copied, .graph = graph, .graphs = graphs, .policy = authority, .tables = undefined, .adapter = undefined };
             self.tables = .{.{ .name = self.input.table, .db = &self.db }};
-            self.adapter = .{ .tables = &self.tables, .ttl_now_ns = copied.ttl_now_ns, .partitioned = true, .authority = .{ .ptr = self, .bind = bind, .checkpoint = checkpoint, .project = project, .project_relationship = projectRelationship, .read_authorization = readAuthorization, .population_upper_bound = populationUpperBound, .search = search, .storage_projection = true, .ordered_projection = true } };
+            self.adapter = .{ .tables = &self.tables, .ttl_now_ns = copied.ttl_now_ns, .partitioned = true, .authority = .{ .ptr = self, .bind = bind, .checkpoint = checkpoint, .project = project, .project_stored = projectStored, .project_relationship = projectRelationship, .read_authorization = readAuthorization, .population_upper_bound = populationUpperBound, .search = search, .storage_projection = true, .ordered_projection = true } };
             const backend = self.adapter.backend();
             stage = "bind";
             // Every allowed immutable binding is checked once. Switching an
@@ -171,7 +171,13 @@ fn Implementation(comptime DB: type, comptime ReadDB: type) type {
             const self = cast(ptr);
             if (!std.mem.eql(u8, table, self.input.table)) return error.Forbidden;
             const remaining_ms = self.input.expires_ms -| @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
-            return .{ .proof = self.input.principal_proof, .database = self.input.database, .deadline_ns = @import("antfly_platform").time.monotonicNs() + @as(u64, @min(remaining_ms, 5000)) * std.time.ns_per_ms };
+            return .{ .proof = self.input.principal_proof, .database = self.input.database, .filter_query_json = self.input.filter_query_json, .deadline_ns = @import("antfly_platform").time.monotonicNs() + @as(u64, @min(remaining_ms, 5000)) * std.time.ns_per_ms };
+        }
+        fn projectStored(ptr: *anyopaque, _: std.mem.Allocator, node: *const cypher.value.Node) !?*const cypher.value.Node {
+            // Only the count visitor calls this after the retained source has
+            // checked the same full-record policy and effective row filter.
+            try checkpoint(ptr);
+            return node;
         }
         fn project(ptr: *anyopaque, a: std.mem.Allocator, node: *const cypher.value.Node) !?*const cypher.value.Node {
             const self = cast(ptr);

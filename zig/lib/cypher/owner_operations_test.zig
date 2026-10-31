@@ -516,7 +516,7 @@ test "owner COUNT residual failures and unsafe arguments keep evaluation semanti
     }
 }
 
-test "owner COUNT nullness projection retains label values and declines fallible paths" {
+test "owner COUNT nullness projection retains predicate values and declines opaque entities" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -534,5 +534,83 @@ test "owner COUNT nullness projection retains label values and declines fallible
     try std.testing.expect(try @import("owner_count.zig").Projection.init(a, graph, input) == null);
     input.arguments = &.{&body};
     input.predicate = &tenant;
+    try std.testing.expect(try @import("owner_count.zig").Projection.init(a, graph, input) != null);
+    input.predicate = &body;
+    const observed = (try @import("owner_count.zig").Projection.init(a, graph, input)).?;
+    try std.testing.expectEqual(@as(usize, 0), observed.presence.len);
+    input.predicate = &alias;
     try std.testing.expect(try @import("owner_count.zig").Projection.init(a, graph, input) == null);
+}
+
+test "owner COUNT predicate scopes preserve scalar semantics and native access hints" {
+    const Case = struct { suffix: []const u8, expected: usize };
+    for ([_]Case{
+        .{ .suffix = "WHERE true", .expected = 33 },
+        .{ .suffix = "WHERE false", .expected = 0 },
+        .{ .suffix = "WHERE null", .expected = 0 },
+        .{ .suffix = "WHERE n.value >= 8 AND n.start = true", .expected = 8 },
+        .{ .suffix = "WHERE n.value IN [0,1,null]", .expected = 2 },
+        .{ .suffix = "WHERE n.missing IS NULL", .expected = 33 },
+        .{ .suffix = "WHERE n.value + 1 > 30", .expected = 3 },
+    }) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var fixture: Fixture = .{};
+        try fixture.init(a);
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, try std.fmt.allocPrint(a, "MATCH(n:D) {s} RETURN count(n.value)", .{case.suffix}), .{}, &diagnostic);
+        defer compiled.deinit();
+        const operation = compiled.query.clauses[0].operation.match;
+        const input: b.CountInput = .{ .node = operation.paths[0].nodes[0], .predicate = operation.predicate };
+        _ = (try @import("owner_count.zig").Projection.init(a, definition, input)).?;
+        _ = try root.runtime.ownerCountFilters(a, fixture.backend(), definition, input, null);
+        var found: usize = 0;
+        for (&fixture.nodes) |*node| {
+            var row = std.heap.ArenaAllocator.init(a);
+            defer row.deinit();
+            if (try root.runtime.ownerCountMatches(row.allocator(), fixture.backend(), definition, input, node, null)) found += 1;
+        }
+        try std.testing.expectEqual(case.expected, found);
+    }
+}
+
+test "owner COUNT callback remains available below eight MiB" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: Fixture = .{};
+    try fixture.init(a);
+    var channel: Fixture.Channel = .{ .fixture = &fixture, .owner = .{ .backend = fixture.backend(), .graph = definition, .table = "docs" } };
+    var client: root.rpc.Client = .{ .channel = .{ .ptr = &channel, .call = Fixture.Channel.invoke }, .incarnation = 1, .revision = 1 };
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(a, "MATCH(n:D) RETURN count(n.value)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try root.runtime.execute(a, client.backend(), definition, &compiled, &.{}, .{ .memory_bytes = 1 << 20 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 33), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(usize, 1), fixture.counts);
+    try std.testing.expectEqual(@as(usize, 0), fixture.rpc_scans);
+}
+
+test "owner COUNT scoped predicates retain scalar failures and constraint order" {
+    for ([_][]const u8{
+        "MATCH(n:D) WHERE 1/0=0 RETURN count(n.value)",
+        "MATCH(n:D) WHERE n.value RETURN count(n.value)",
+        "MATCH(n:D {value:1/0}) RETURN count(n.value)",
+    }, [_]anyerror{ error.CypherDivisionByZero, error.CypherTypeMismatch, error.CypherDivisionByZero }) |query, failure| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var fixture: Fixture = .{ .count_enabled = false };
+        try fixture.init(a);
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const operation = compiled.query.clauses[0].operation.match;
+        const input: b.CountInput = .{ .node = operation.paths[0].nodes[0], .predicate = operation.predicate };
+        _ = (try @import("owner_count.zig").Projection.init(a, definition, input)).?;
+        try std.testing.expectError(failure, root.runtime.ownerCountMatches(a, fixture.backend(), definition, input, &fixture.nodes[0], null));
+        try std.testing.expectError(failure, root.runtime.execute(a, fixture.backend(), definition, &compiled, &.{}, .{}));
+    }
 }

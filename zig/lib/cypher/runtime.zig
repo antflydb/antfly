@@ -1880,6 +1880,37 @@ const NodeOrder = struct {
         self.initial_cursor = proof.next;
     }
 };
+/// The owner fold uses the same scalar evaluation and access hints as ordinary
+/// MATCH. Each scope belongs to one planning/record arena; no row cache survives
+/// into a later borrowed storage record.
+fn countEngine(a: A, backend: backend_mod.Backend, graph: catalog.Graph, input: backend_mod.CountInput, work: ?backend_mod.Work) Engine {
+    return .{ .a = a, .planning_allocator = a, .scratch_allocator = a, .backend = backend, .graph = graph, .source = input.source, .parameters = input.parameters, .limits = .{ .intermediate_states = input.max_work, .memory_bytes = input.memory_bytes }, .parent_work = work, .read_only = true, .regex = .{ .a = a, .scratch = .init(a) } };
+}
+pub fn ownerCountFilters(a: A, backend: backend_mod.Backend, graph: catalog.Graph, input: backend_mod.CountInput, work: ?backend_mod.Work) ![]const backend_mod.PropertyFilter {
+    var engine = countEngine(a, backend, graph, input, work);
+    engine.values = .{ .a = a, .ptr = &engine, .charge = Engine.chargeWork };
+    engine.strings = engine.newStringWork(a);
+    defer engine.regex.deinit();
+    defer if (engine.invariants) |state_value| state_value.deinit();
+    return engine.nodeFilters(input.node, input.predicate, &.{});
+}
+pub fn ownerCountMatches(a: A, backend: backend_mod.Backend, graph: catalog.Graph, input: backend_mod.CountInput, node: *const v.Node, work: ?backend_mod.Work) !bool {
+    if (input.node.properties.len == 0 and input.predicate == null) return true;
+    var engine = countEngine(a, backend, graph, input, work);
+    engine.values = .{ .a = a, .ptr = &engine, .charge = Engine.chargeWork };
+    engine.strings = engine.newStringWork(a);
+    defer engine.regex.deinit();
+    defer if (engine.invariants) |state_value| state_value.deinit();
+    const binding = [_]v.Entry{.{ .name = input.node.alias orelse "", .value = .{ .node = node } }};
+    const row: Row = if (input.node.alias != null) &binding else &.{};
+    for (input.node.properties) |property| {
+        const actual = try engine.values.property(.{ .node = node }, property.name);
+        if ((try engine.values.equal(actual, try engine.eval(property.value, row, null))) != true) return false;
+    }
+    if (input.predicate) |predicate| return (try (try engine.eval(predicate, row, null)).truth()) == true;
+    return true;
+}
+
 const Engine = struct {
     const Invariants = struct {
         const MappingKey = struct { expression: *const ast.Expr, source: Identity };
@@ -8636,7 +8667,7 @@ const Engine = struct {
     }
     fn ownerCount(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) !?[]const Row {
         const read = self.backend.vtable.count_nodes orelse return null;
-        if (!self.backend.vtable.prefer_count_nodes or self.limits.memory_bytes < 8 << 20) return null;
+        if (!self.backend.vtable.prefer_count_nodes) return null;
         if (!self.read_only or input.len != 1 or input[0].len != 0 or operation.optional or operation.paths.len != 1 or middle.len != 0 or projection.wildcard or projection.distinct or projection.predicate != null or projection.order.len != 0 or projection.skip != null or projection.limit != null or projection.items.len == 0) return null;
         const path = operation.paths[0];
         if (path.nodes.len != 1 or path.edges.len != 0 or path.alias != null or path.selector != .all) return null;

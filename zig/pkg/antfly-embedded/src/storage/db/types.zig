@@ -1585,6 +1585,9 @@ pub const ScanOptions = struct {
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     filter_query_json: []const u8 = "",
+    /// Internal Cypher visitation only. Reserved document identities consume
+    /// progress but must not be decoded by a user row filter. Never serialized.
+    cypher_node_keys_only: bool = false,
     /// Internal-only response mode used by linear merge. Public scans leave
     /// this false and retain their existing NDJSON shape.
     include_content_hashes: bool = false,

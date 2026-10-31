@@ -119,9 +119,10 @@ pub fn visit(db: anytype, a: A, cut: *Snapshot, from: []const u8, to: []const u8
     var schema = db.core.acquireSchemaView();
     defer if (schema) |*view| view.release();
     if ((if (schema) |view| view.version() else 0) != cut.schema_version) return error.CatalogGenerationChanged;
-    if (schema == null or schema.?.storageMode() != .relational)
-        return db.scanVisitAtCypherSnapshot(a, from, to, input, visitor, cut);
     var opts = input;
+    opts.cypher_node_keys_only = true;
+    if (schema == null or schema.?.storageMode() != .relational)
+        return db.scanVisitAtCypherSnapshot(a, from, to, opts, visitor, cut);
     opts.sql_document_preimage = true;
     var facade: Database(@TypeOf(db.*)) = .{ .source = db, .core = db.core, .cut = cut.* };
     // The session's admission bound describes one page, not the total count

@@ -502,6 +502,25 @@ test "embedded api Cypher catalog and writes share portable retained graph value
     const node_rows = identity_rows.value.object.get("rows").?.array.items;
     if (node_rows.len != 2) std.debug.print("portable graph node identities: {s}\n", .{identities});
     try std.testing.expectEqual(@as(usize, 2), node_rows.len);
+    // Visibility is evaluated in the source scan. Reserved graph records must
+    // consume progress without being parsed as user documents by that filter.
+    const Visibility = struct {
+        examined: usize = 0,
+        found: usize = 0,
+        fn progress(ptr: ?*anyopaque, count: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.examined += count;
+        }
+        fn visit(ptr: ?*anyopaque, entry: embedded_db.types.ScanVisitEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try std.testing.expectEqualStrings("a", entry.id);
+            self.found += 1;
+        }
+    };
+    var visible: Visibility = .{};
+    try api.db.inner.visitCypherDocuments(a, "", "", .{ .include_documents = true, .fields = &.{"id"}, .include_all_fields = false, .filter_query_json = "{\"term\":{\"id\":\"a\"}}", .limit = 64 }, .{ .borrow_documents = true, .context = &visible, .visit = Visibility.visit, .progress = Visibility.progress });
+    try std.testing.expectEqual(@as(usize, 1), visible.found);
+    try std.testing.expect(visible.examined >= 2);
     // The portable host must expose owner COUNT as well as row reads. Wide
     // count-only values stay borrowed at its retained cut, including hosted IO.
     const body = try a.alloc(u8, 512 << 10);
@@ -529,6 +548,18 @@ test "embedded api Cypher catalog and writes share portable retained graph value
     const counts = parsed.value.object.get("rows").?.array.items[0].array.items;
     for (counts, [_][]const u8{ "34", "16", "0" }) |value, expected| try std.testing.expectEqualStrings(expected, value.object.get("value").?.string);
     try std.testing.expect(parsed.value.object.get("stats").?.object.get("memory_bytes").?.integer < 8 << 20);
+    for ([_][]const u8{ "true", "false", "n.missing IS NULL", "n.id='a'" }, [_][]const u8{ "16", "0", "16", "0" }) |predicate, expected| {
+        const query = try std.fmt.allocPrint(a, "MATCH (n:Document) WHERE {s} RETURN count(n.body)", .{predicate});
+        defer a.free(query);
+        const request = try std.json.Stringify.valueAlloc(a, .{ .query = query, .limits = .{ .memory_bytes = 1 << 20 } }, .{});
+        defer a.free(request);
+        const bounded = try api.cypherJson(a, "knowledge", request);
+        defer a.free(bounded);
+        var bounded_value = try std.json.parseFromSlice(std.json.Value, a, bounded, .{});
+        defer bounded_value.deinit();
+        try std.testing.expectEqualStrings(expected, bounded_value.value.object.get("rows").?.array.items[0].array.items[0].object.get("value").?.string);
+        try std.testing.expect(bounded_value.value.object.get("stats").?.object.get("memory_bytes").?.integer < 1 << 20);
+    }
 }
 
 test "embedded api round-trips batch lookup scan and search over memory-backed durable lsm" {

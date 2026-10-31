@@ -4930,8 +4930,8 @@ remains outside this qualification.
 
 Owner COUNT now has a synchronous storage fold for mandatory single-node scans
 whose arguments are direct properties, scalar literals, parameters or the bound
-node. The projection distinguishes fields needed as values for graph label
-predicates from fields needed only for nullness. Count-only document properties
+node. The projection distinguishes fields needed as values for graph labels,
+inline constraints and scalar predicates from fields needed only for nullness. Count-only document properties
 are validated through JSON spans and represented as true/null inside the trusted
 fold; false, zero and empty containers remain present. Large escaped strings
 never become graph Values. Relational TEXT cells stay borrowed, and JSON cells
@@ -4948,15 +4948,22 @@ syntax/duplicate checks and Cypher depth limits remain enforced. Count-only
 representations never escape as public node properties or owner RPC rows.
 
 The fold requires certified storage and value-preserving authority projection.
-Opaque providers, selector-ambiguous literal property names, nested property
-expressions, inline constraints and predicates retain the existing evaluator and
-its indexed access paths. All rows and count arguments consume owner work;
+Opaque providers, selector-ambiguous literal property names, whole-entity
+predicates and nested aggregate arguments retain the ordinary evaluator. Scalar
+predicates and inline constraints share the runtime's MATCH evaluator in a
+reclaimable scope per record, with their value dependencies excluded from
+nullness substitution. Native access hints come from the same MATCH planner;
+sparse union domains retain its existing index path. All rows, predicates and
+count arguments consume owner work;
 source and membership allocations remain inside the statement memory ceiling.
 The public regression exercises document and relational storage with 32 rows,
 half containing 512 KiB escaped strings, at an 8 MiB memory limit, including
 nullable/missing counts, combined output expressions, logical labels, effective
-row filters and predicate fallback. Both storage modes fail with
-CypherMemoryBudgetExceeded on the preceding implementation.
+row filters and predicate evaluation. The expanded campaign also exercises
+safe predicates and inline constraints at 1 MiB and 4 MiB: owner admission uses
+the actual memory quota rather than an eight-MiB optimization threshold.
+Both storage modes failed with CypherMemoryBudgetExceeded for these wide-row
+predicate counts on the preceding implementation.
 
 Portable read-only queries expose the owner count callback directly; write
 queries retain their transaction overlay. The portable hosted regression also
@@ -4979,8 +4986,9 @@ for admitted members, after label and policy checks.
 Relational count visitation reports each physical candidate through a named
 progress callback before TTL, policy and predicate evaluation. Rejected rows
 therefore consume scan/work budget even when no node value is produced. The
-fold uses these reports instead of counting only emitted rows; document
-providers retain per-entry accounting. A portable relational regression proves
+fold uses these reports instead of counting only emitted rows. Document
+visitation also reports candidate progress before TTL and effective row filters;
+providers without progress callbacks retain per-entry accounting. A portable relational regression proves
 that a one-anchor budget fails on a three-candidate scan with one matching row,
 while a three-anchor budget returns the correct count. Progress budget and
 authority failures are also checked across independently compiled archives.
@@ -4992,8 +5000,8 @@ relational session page admission. Session initialization uses a bounded page
 request, while the visitor retains the full statement limit across pages;
 default or explicitly large count budgets must not be rejected as invalid
 relational requests. The portable regression covers a 16,384-anchor allowance
-as well as exact physical-progress enforcement. Explicit query predicates keep
-the existing evaluator and its ordinary payload memory requirements.
+as well as exact physical-progress enforcement. Scalar query predicates use
+the shared evaluator on their value-preserving per-record projection.
 
 Authenticated node visibility checks request no relational user columns: the
 reader still evaluates row filters against the full retained row, but returns
@@ -5023,3 +5031,14 @@ Qualification after merging `origin/main` through `f91c9c0e46`:
 - The merged Go SDK tests and Antfarm typecheck/build pass; Antfarm's suite
   passes all 305 tests. Generated SDK/schema and bundled workbench merge
   conflicts were resolved by regeneration from the combined source.
+
+
+Certified owner counts apply effective row filters in the original retained
+reader. An explicit `project_stored` capability permits the immutable snapshot
+owner to refresh authority without performing a second exact scan for every
+node. Generic/opaque projections and ordinary point reads keep their existing
+checks. Document visitation excludes reserved Cypher identities before decoding
+user filters, while still reporting their physical progress. The portable
+post-write regression combines reserved records with a user filter, and the
+public regression checks that rejected rows exhaust scan budgets and that a
+fully hidden population does not evaluate a failing scalar predicate.

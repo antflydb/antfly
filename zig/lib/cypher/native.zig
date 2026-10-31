@@ -93,7 +93,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             /// capability in a query backend after releasing the fence.
             capture_fence: if (@hasDecl(DB, "StatementReadFence")) ?*const DB.StatementReadFence else ?*const anyopaque = null,
         };
-        pub const ReadAuthorization = struct { proof: []const u8 = "", database: []const u8 = "", deadline_ns: ?u64 = null };
+        pub const ReadAuthorization = struct { proof: []const u8 = "", database: []const u8 = "", deadline_ns: ?u64 = null, filter_query_json: []const u8 = "" };
         /// Mandatory hooks hold graph/table authority, refresh revocation at
         /// checkpoints, and apply field projection before any value is bound.
         pub const Authority = struct {
@@ -101,6 +101,9 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             bind: *const fn (*anyopaque, root.catalog.Graph) anyerror!void,
             checkpoint: *const fn (*anyopaque) anyerror!void,
             project: *const fn (*anyopaque, A, *const v.Node) anyerror!?*const v.Node,
+            /// Opt in only when the retained reader has enforced the complete
+            /// read authorization above. Does not license point-read bypasses.
+            project_stored: ?*const fn (*anyopaque, A, *const v.Node) anyerror!?*const v.Node = null,
             project_relationship: *const fn (*anyopaque, A, *const v.Relationship) anyerror!?*const v.Relationship,
             search: ?*const fn (*anyopaque, A, []const u8, b.SearchInput) anyerror!b.SearchPage = null,
             read_authorization: ?*const fn (*anyopaque, A, []const u8) anyerror!ReadAuthorization = null,
@@ -272,6 +275,9 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             return self.fullNodeValue(a, table, key, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }));
         }
         fn fullNodeValue(self: *Self, a: A, table: []const u8, key: []const u8, input: std.json.Value) !?*const v.Node {
+            return self.projectNodeValue(a, table, key, input, false);
+        }
+        fn projectNodeValue(self: *Self, a: A, table: []const u8, key: []const u8, input: std.json.Value, stored: bool) !?*const v.Node {
             const value = try v.Value.fromJson(a, input);
             if (value != .map) return error.CypherInvalidDocument;
             const result = try a.create(v.Node);
@@ -280,6 +286,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             var labels: std.ArrayList([]const u8) = .empty;
             for (self.graph.?.labels) |label| if (try self.graph.?.admits(result, label.name, &membership)) try labels.append(a, label.name);
             result.labels = try labels.toOwnedSlice(a);
+            if (stored) if (self.authority.project_stored) |project| return project(self.authority.ptr, a, result);
             return self.authority.project(self.authority.ptr, a, result);
         }
         fn scan(ptr: *anyopaque, a: A, table: []const u8, cursor: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
@@ -377,6 +384,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 examined: usize = 0,
                 progress_reported: bool = false,
                 counts: []usize,
+                stored: bool = false,
                 fn charge(ptr: *anyopaque, amount: usize) !void {
                     const fold: *@This() = @ptrCast(@alignCast(ptr));
                     const local = fold.meter.work();
@@ -415,7 +423,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     const scratch = row.allocator();
                     const counted_node = candidate: {
                         if (entry.document_stream) |document| if (try document.countProjection(scratch, fold.projection.presence)) |projected|
-                            break :candidate try fold.adapter.fullNodeValue(scratch, fold.table, entry.id, projected);
+                            break :candidate try fold.adapter.projectNodeValue(scratch, fold.table, entry.id, projected, fold.stored);
                         // Providers without the optional borrowed projection
                         // retain ordinary JSON validation and scalar semantics.
                         if (entry.document_json) |json| break :candidate try fold.adapter.fullNode(scratch, fold.table, entry.id, json);
@@ -430,6 +438,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     } orelse return;
                     var membership = fold.adapter.valueWork(scratch);
                     if (!try fold.adapter.graph.?.admits(counted_node, fold.input.node.labels[0], &membership)) return;
+                    if (!try @import("runtime.zig").ownerCountMatches(scratch, fold.adapter.backend(), fold.adapter.graph.?, fold.input, counted_node, fold.adapter.work)) return;
                     try charge(fold, fold.projection.arguments.len);
                     fold.count += 1;
                     for (fold.projection.arguments, fold.counts) |argument_value, *count| {
@@ -445,32 +454,56 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const counts = try temporary.alloc(usize, input.arguments.len);
             @memset(counts, 0);
             var fold: Fold = .{ .adapter = self, .projection = projection, .input = input, .table = table, .quota = quota, .parent = self.work, .meter = .{ .a = quota.allocator(), .backend = self.backend(), .limit = input.max_work }, .counts = counts };
+            const previous_work = self.work;
+            const previous_fields = self.read_fields;
+            defer {
+                self.work = previous_work;
+                self.read_fields = previous_fields;
+            }
             self.work = .{ .ptr = &fold, .charge = Fold.charge, .value = Fold.value };
             self.read_fields = projection.fields;
             const db = try self.selected(table);
             const authorization = try self.readAuthorization(temporary, table);
-            var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(input.max_examined + 1) });
-            if (opts.relational_query) |*query| if (label.predicate.len != 0) {
+            // Only certified owner projections may consume visibility at the
+            // original scan. Opaque providers retain their per-node callback.
+            fold.stored = self.authority.project_stored != null;
+            var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .filter_query_json = if (fold.stored) authorization.filter_query_json else "", .include_documents = true, .limit = @intCast(input.max_examined + 1) });
+            if (opts.relational_query) |*query| {
+                const filters = try @import("runtime.zig").ownerCountFilters(temporary, self.backend(), graph, input, self.work);
+                // Sparse union domains retain the established index planner;
+                // replacing them with a primary scan would lose bounded seeks.
+                for (filters) |filter| if (filter.op == .in) return null;
                 var schema = acquireSchema(db) orelse return error.SchemaVersionChanged;
                 defer schema.release();
                 const Query = @TypeOf(query.*);
                 var conditions: std.ArrayList(Query.Condition) = .empty;
                 try conditions.appendSlice(temporary, query.conditions);
-                for (label.predicate) |entry| {
+                for (filters) |filter| {
                     if (conditions.items.len == 256) break;
                     const column = for (schema.tableSchema().relational_columns) |column| {
-                        if (std.mem.eql(u8, column.name, entry.name)) break column;
+                        if (std.mem.eql(u8, column.name, filter.property)) break column;
                     } else continue;
                     // The same exact scalar admission used by ordinary native
                     // equality scans. Unsupported values remain authoritative
                     // graph membership checks after the storage reader.
-                    if (!filterCompatible(column.column_type, entry.value)) continue;
-                    const value = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, entry.value, .{}), .{ .parse_numbers = false });
-                    try conditions.append(temporary, .{ .column = entry.name, .op = .eq, .value = value });
+                    if (filter.op != .is_null and !filterCompatible(column.column_type, filter.value)) continue;
+                    // Large integer operands on DOUBLE need an exact binary64
+                    // admission proof; leave them to the scalar residual here.
+                    if (column.column_type == .number and filter.value == .integer and (filter.value.integer < -9007199254740992 or filter.value.integer > 9007199254740992)) continue;
+                    const value = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, filter.value, .{}), .{ .parse_numbers = false });
+                    try conditions.append(temporary, .{ .column = filter.property, .op = switch (filter.op) {
+                        .eq => .eq,
+                        .lt => .lt,
+                        .lte => .lte,
+                        .gt => .gt,
+                        .gte => .gte,
+                        .is_null => .is_not_distinct,
+                        .in => unreachable,
+                    }, .value = if (filter.op == .is_null) null else value });
                 }
                 query.conditions = conditions.items;
                 query.auto_index = true;
-            };
+            }
             try db.visitCypherDocuments(quota.allocator(), "", "", opts, .{ .borrow_documents = true, .context = &fold, .visit = Fold.visit, .progress = Fold.progress });
             try checkpoint(self);
             const result: b.CountResult = .{ .count = fold.count, .counts = try a.dupe(usize, counts), .examined = fold.examined };
