@@ -273,6 +273,53 @@ fn resolveMode(a: A, request: V, port: ?Port, policy: ?RetentionPolicy) !Payload
     return lease;
 }
 pub const Verified = struct { bytes: usize, digest: [64]u8, mime: []const u8, pixels: u64, data: []const u8 = &.{} };
+
+/// Prove equality against an invocation-owned verified codec, not a caller's
+/// digest claim. Canonical base64 can be compared in bounded scratch without
+/// another full decoded allocation, SHA pass or image inspection. Other valid
+/// spellings keep ordinary verification as a compatibility fallback.
+pub fn matchesVerifiedUrl(reference: Reference, url: []const u8, prior: Verified) bool {
+    if (reference.byte_length != prior.bytes or !std.mem.eql(u8, reference.sha256, &prior.digest) or !std.mem.eql(u8, reference.mime_type, prior.mime)) return false;
+    const prefix_len = 13 + prior.mime.len;
+    if (url.len != prefix_len + std.base64.standard.Encoder.calcSize(prior.data.len)) return false;
+    if (!std.mem.startsWith(u8, url, "data:") or !std.mem.eql(u8, url[5..][0..prior.mime.len], prior.mime) or !std.mem.eql(u8, url[5 + prior.mime.len .. prefix_len], ";base64,")) return false;
+    var buffer: [4096]u8 = undefined;
+    var raw: usize = 0;
+    var encoded: usize = prefix_len;
+    while (raw < prior.data.len) {
+        const end = @min(raw + 3072, prior.data.len);
+        const bytes = std.base64.standard.Encoder.encode(&buffer, prior.data[raw..end]);
+        if (!std.mem.eql(u8, bytes, url[encoded..][0..bytes.len])) return false;
+        raw = end;
+        encoded += bytes.len;
+    }
+    return true;
+}
+
+test "httpx inference gateway verified URL comparison crosses chunk boundaries and rejects forged claims" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 1, 2, 3, 3071, 3072, 3073, 8192 }) |length| {
+        const data = try a.alloc(u8, length);
+        defer a.free(data);
+        for (data, 0..) |*byte, i| byte.* = @truncate(i);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+        const prior: Verified = .{ .bytes = length, .digest = std.fmt.bytesToHex(digest, .lower), .mime = "image/png", .pixels = 1, .data = data };
+        const reference: Reference = .{ .table = "docs", .document_id = "a", .field = "image", .revision_field = "revision", .revision = "r1", .sha256 = &prior.digest, .mime_type = prior.mime, .byte_length = length, .max_pixels = 1 };
+        const prefix = "data:image/png;base64,";
+        const url = try a.alloc(u8, prefix.len + std.base64.standard.Encoder.calcSize(length));
+        defer a.free(url);
+        @memcpy(url[0..prefix.len], prefix);
+        _ = std.base64.standard.Encoder.encode(url[prefix.len..], data);
+        try std.testing.expect(matchesVerifiedUrl(reference, url, prior));
+        url[prefix.len + (url.len - prefix.len) / 2] ^= 1;
+        try std.testing.expect(!matchesVerifiedUrl(reference, url, prior));
+        try std.testing.expect(!matchesVerifiedUrl(reference, url[0 .. url.len - 1], prior));
+        var wrong = reference;
+        wrong.byte_length += 1;
+        try std.testing.expect(!matchesVerifiedUrl(wrong, url, prior));
+    }
+}
 fn verify(a: A, reference: Reference, url: []const u8) !void {
     _ = try verifyInfo(a, reference, url);
 }

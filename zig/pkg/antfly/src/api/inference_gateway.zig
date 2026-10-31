@@ -1616,7 +1616,7 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
     const observed = observation.stream(transport.stream());
     var guard = tasks.FallbackSink{ .downstream = observed };
     const execution_context = @import("antfly_inference_execution_context");
-    var framed = try execution_context.encodeVerifiedGenerate(ctx.allocator, ctx.allocator, body, options.attachments, options.verified_media);
+    var framed = try execution_context.encodeVerifiedGenerateSegments(ctx.allocator, ctx.allocator, body, options.attachments, options.verified_media);
     defer framed.deinit(ctx.allocator);
     const encoded = framed.bytes;
     var owned_client: ?httpx.Client = null;
@@ -1627,7 +1627,7 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
         owned_client = httpx.Client.initWithConfig(ctx.allocator, server.inferenceIo(), .{ .keep_alive = false });
         break :blk &owned_client.?;
     };
-    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = framed.content_type, .attempt_observer = observeAttempt(ctx, options.attempt_observer) }) catch |err| {
+    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = framed.content_type, .body_segments = if (framed.segments) |segments| segments.segments else null, .attempt_observer = observeAttempt(ctx, options.attempt_observer) }) catch |err| {
         if (transport.started or guard.committed) return error.InferenceResponseCommitted;
         return guard.failure orelse err;
     };

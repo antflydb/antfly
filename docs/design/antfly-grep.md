@@ -3036,3 +3036,314 @@ not a newly untested CPU code path. The final merge manifest is
 Full PR CI and required human approval remain separate merge requirements;
 local qualification does not bypass them. No raw benchmark reports, logs or
 executables are added to the PR.
+
+
+## Sorted range batches and segmented HTTP (2026-10-30)
+
+This follow-up removes repeated traversal, codec verification, and transport
+copies using the existing document and attachment formats. It does not add a
+public API field, change worker protocol 8 or ASCH25, or implement a persistent
+storage-layout migration. Source authorization, revision, membership and logical
+model admission remain independent of these physical choices.
+
+### Read planning and ownership
+
+Range batches use the same immutable snapshot and sorted-key cost model as
+ordinary multi-get. Cursor-friendly sorted keys share one merge cursor and its
+run/index positions. Monotone indexed seeks skip gaps without a sequential walk
+through unrelated values. Sparse and duplicate-key batches retain the existing
+point-read path; empty ranges do not cause cursor construction. Each selected
+span is copied before its borrowed value can move. Cancellation/deadline polling
+still happens before each requested value, and cursor/scratch cleanup completes
+on success or failure.
+
+Point batches release temporary payload pins between values. Dense cursor
+batches can retain current block/index leases within the existing cursor and
+resource quotas until the batch ends, enabling reuse. This is a bounded ownership
+choice, not a guarantee that the one-MiB projection window bounds process RSS.
+The existing 64-key, one-MiB physical-value planning and 256-range query bounds
+remain in force. Complete checksummed/compressed blocks are still fetched.
+
+### Verified source reuse
+
+An existing invocation-owned codec can prove that a new actual source URL has
+identical content. The producer compares canonical base64 against that verified
+codec using a four-KiB stack buffer. A caller-supplied SHA/MIME/length claim only
+selects a candidate; it never establishes equivalence. The full byte comparison
+runs outside the codec-table mutex. Matching sources avoid a second decoded
+allocation, SHA pass and image inspection; per-reference revision, permissions,
+identity and stricter pixel limits still apply. Nonmatching or alternate valid
+spellings use ordinary verification, preserving accepted-input behavior. First
+verification remains mandatory. No source URL or verification result persists
+across requests.
+
+### HTTP envelope transport
+
+The gateway can carry rewritten compact metadata and immutable codec bytes as
+replayable borrowed segments. Remote buffered and streamed-response requests use
+the HTTP client's existing segmented H1/H2 writers and correct total body length
+for attempt accounting. The existing native envelope reader admits bounded
+payload storage and incrementally reads streamed attachments. There is no new
+public framing version: each occurrence retains its own attachment index and
+wire payload, including duplicates. The private worker payload-sharing contract
+remains separate.
+
+Metadata and framing are owned until the synchronous invocation returns; codec
+bytes belong to the source lease. Local ABI targets retain their contiguous-body
+contract through a bounded-lifetime join at the invocation boundary. Segments
+cannot be combined with a flat body or a streaming-body callback. Existing
+attempt, timeout, cancellation, redirect and retry policies remain in force.
+
+### Reproducible preparation measurements
+
+Run `zig build bench-source-preparation -Doptimize=ReleaseFast -Dstrip=true -j2`
+from `zig/`. It runs seven alternating rounds per case and installs the test
+executable as `zig-out/bin/antfly-source-preparation-bench`. Raw results and the
+executable/source identities remain in ignored `output/projection-followup/`.
+
+Repeated-verification measurements start after the first source was verified.
+Both paths validate an actual source; the reuse path proves byte equality and
+checks the pixel claim. This excludes query authorization, initial verification,
+cache-table lookup, storage, transport and models:
+
+| Codec bytes | Full verification µs/check | Reuse proof µs/check | Allocated bytes/check before → after |
+|---|---:|---:|---:|
+| 1,108 | 0.871 | 0.434 | 1,308 → 0 |
+| 65,835 | 49.500 | 25.690 | 66,035 → 0 |
+| 1,050,904 | 757.234 | 412.151 | 1,051,104 → 0 |
+
+The envelope fixture measures canonical metadata adaptation and construction
+only, using caller-owned synthetic codecs. It excludes HTTP writes/receive,
+source verification and models. Flat and segmented variants produce equal wire
+lengths and preserve public attachment cardinality:
+
+| Codec bytes / references | µs before → after | Allocated bytes/op before → after |
+|---|---:|---:|
+| 68 / 1 | 0.857 → 0.816 | 6,552 → 6,670 |
+| 68 / 2 | 1.290 → 1.227 | 6,280 → 6,683 |
+| 68 / 8 | 3.165 → 3.255 | 14,662 → 14,863 |
+| 65,536 / 1 | 7.447 → 0.832 | 72,020 → 6,670 |
+| 65,536 / 2 | 11.803 → 1.186 | 137,216 → 6,683 |
+| 65,536 / 8 | 40.290 → 3.243 | 538,406 → 14,863 |
+| 1,048,576 / 1 | 75.445 → 0.865 | 1,055,060 → 6,670 |
+| 1,048,576 / 2 | 159.626 → 1.249 | 2,103,296 → 6,683 |
+| 1,048,576 / 8 | 649.599 → 3.271 | 8,402,726 → 14,863 |
+
+Large-payload construction allocates substantially fewer bytes, while tiny
+payloads show small allocation increases (118–403 bytes/op in this fixture).
+These are preparation measurements, not whole-request speedups, RSS guarantees
+or model/provider savings. Existing first-verification/evidence-JSON controls
+are retained separately from repeated-verification measurements.
+
+The persisted 32-document native selected-copy fixture uses 128 batched scratch
+allocations across four trials, versus 260 in the previous pooled implementation
+and 384 through individual calls. This is a 50.8% reduction relative to the
+previous batching shape. Snapshot/tombstone, per-value cancellation, credit
+refund and retained-span tests pass. Whole-server measurements qualify the
+workload tradeoffs separately.
+
+
+
+### Whole-server controls and independent repeats
+
+The same-main baseline and candidate above pass all **47** whole-server
+controls: seven source workloads across six phases, three batch-projection
+workloads, and two source-media workloads. Initial runs use five alternating
+rounds and 50 reads per phase. Six independent repeats use seven alternating
+rounds and 100 reads per phase (**31** repeated phase controls). Each round
+starts fresh baseline/candidate servers; our builds and benchmark workloads do
+not overlap. Reads use warm storage after ingestion on the same shared macOS
+host. This does not qualify cold-cache, constrained-CPU or native Linux behavior.
+
+CPU and elapsed medians are milliseconds per operation; ingestion is one whole
+batch submission. CPU includes background server work. RSS and macOS physical
+footprint are MiB, sampled during operations and include earlier process/cache
+state. They are observed process costs, not allocation bounds or incremental
+per-query memory. Response parsing and equality assertions run outside timing.
+Every read compares IDs, values, scores and counts, with equivalent conditional
+receipts. Media controls end at `ModelRequired`: they measure authorized source
+materialization/adaptation, without model/provider execution or billing.
+
+Source cases use eight rows by default: `eligible` is ASCII/256 KiB;
+`pair-rejected` is ASCII/768 KiB with 60 metadata outputs; `wide-large` is
+ASCII/1 MiB with 60 outputs; `wide-small` is 16 KiB with 60 outputs; `escaped`
+is 256 KiB. `dense64` and `sparse64` use 64 rows/16 KiB/60 outputs, with clustered
+and spread IDs respectively. The three 64-row batch cases use scalar metadata
+with 16 KiB or 1 MiB payloads, or nested metadata with 256 KiB payloads.
+
+Initial controls:
+
+| Case / phase | CPU ms before → after | Elapsed ms before → after | RSS MiB before → after | Footprint MiB before → after |
+|---|---:|---:|---:|---:|
+| dense64 / ingest | 43.892 → 44.841 | 26.086 → 30.626 | 141.516 → 145.688 | 128.689 → 131.767 |
+| dense64 / ordinary | 1.095 → 1.288 | 1.983 → 2.618 | 146.500 → 149.750 | 130.353 → 132.470 |
+| dense64 / full | 5.487 → 5.449 | 7.292 → 7.067 | 101.312 → 69.047 | 136.798 → 136.892 |
+| dense64 / reference_full | 5.455 → 5.442 | 7.238 → 7.041 | 151.000 → 150.047 | 132.978 → 132.860 |
+| dense64 / conditional | 6.252 → 6.158 | 8.103 → 8.123 | 70.766 → 67.500 | 136.923 → 137.048 |
+| dense64 / reference | 6.342 → 6.234 | 8.223 → 7.951 | 65.297 → 63.688 | 136.517 → 138.048 |
+| eligible / ingest | 77.078 → 70.743 | 62.901 → 68.483 | 137.984 → 111.250 | 150.579 → 151.064 |
+| eligible / ordinary | 5.127 → 5.066 | 8.951 → 9.404 | 115.922 → 117.375 | 157.079 → 158.642 |
+| eligible / full | 6.160 → 6.251 | 9.334 → 9.975 | 94.234 → 92.688 | 165.861 → 163.689 |
+| eligible / reference_full | 9.343 → 10.005 | 12.707 → 14.175 | 93.812 → 95.078 | 164.001 → 168.048 |
+| eligible / conditional | 1.299 → 1.181 | 2.982 → 2.805 | 95.141 → 92.125 | 167.939 → 157.220 |
+| eligible / reference | 5.386 → 5.473 | 7.530 → 7.421 | 94.930 → 90.688 | 159.611 → 157.235 |
+| escaped / ingest | 146.989 → 150.144 | 180.863 → 141.373 | 178.266 → 179.531 | 165.532 → 166.032 |
+| escaped / ordinary | 8.719 → 8.872 | 11.436 → 11.951 | 188.148 → 185.359 | 174.056 → 173.673 |
+| escaped / full | 17.192 → 17.442 | 20.164 → 20.227 | 95.000 → 100.023 | 159.767 → 153.564 |
+| escaped / reference_full | 31.251 → 31.130 | 33.788 → 33.626 | 106.266 → 107.703 | 175.189 → 174.251 |
+| escaped / conditional | 1.185 → 1.150 | 2.443 → 2.387 | 94.516 → 98.703 | 153.548 → 153.564 |
+| escaped / reference | 16.536 → 16.363 | 17.621 → 17.472 | 94.469 → 94.250 | 150.392 → 148.954 |
+| pair-rejected / ingest | 148.812 → 145.749 | 150.274 → 184.938 | 223.125 → 185.438 | 211.579 → 212.032 |
+| pair-rejected / ordinary | 12.893 → 12.845 | 18.656 → 18.616 | 258.766 → 269.594 | 371.751 → 374.197 |
+| pair-rejected / full | 18.625 → 18.659 | 24.813 → 23.789 | 339.734 → 393.406 | 539.369 → 535.408 |
+| pair-rejected / reference_full | 27.569 → 28.260 | 32.587 → 33.997 | 344.102 → 380.586 | 545.697 → 534.705 |
+| pair-rejected / conditional | 2.770 → 2.562 | 4.813 → 4.128 | 325.672 → 357.891 | 481.642 → 549.080 |
+| pair-rejected / reference | 14.306 → 14.001 | 16.437 → 15.560 | 212.172 → 251.727 | 464.314 → 521.252 |
+| sparse64 / ingest | 40.748 → 45.553 | 38.101 → 52.825 | 143.141 → 145.375 | 130.267 → 131.610 |
+| sparse64 / ordinary | 1.367 → 1.328 | 2.922 → 2.795 | 145.000 → 148.031 | 130.704 → 131.360 |
+| sparse64 / full | 5.579 → 5.742 | 7.519 → 8.059 | 69.656 → 98.656 | 136.907 → 134.642 |
+| sparse64 / reference_full | 5.656 → 5.732 | 7.523 → 7.598 | 118.305 → 109.664 | 132.032 → 132.314 |
+| sparse64 / conditional | 6.440 → 6.507 | 8.418 → 8.599 | 67.352 → 66.844 | 137.501 → 137.110 |
+| sparse64 / reference | 6.570 → 6.716 | 8.838 → 8.766 | 66.531 → 66.656 | 137.657 → 138.954 |
+| wide-large / ingest | 185.234 → 189.362 | 194.596 → 211.094 | 259.016 → 255.906 | 244.157 → 241.861 |
+| wide-large / ordinary | 15.970 → 16.287 | 21.492 → 21.932 | 376.812 → 369.805 | 454.173 → 451.744 |
+| wide-large / full | 23.395 → 23.103 | 29.251 → 28.657 | 481.070 → 529.195 | 691.627 → 636.010 |
+| wide-large / reference_full | 36.067 → 35.251 | 41.330 → 40.890 | 477.516 → 497.742 | 642.197 → 647.775 |
+| wide-large / conditional | 2.599 → 2.487 | 4.017 → 3.637 | 431.828 → 548.023 | 606.533 → 635.299 |
+| wide-large / reference | 17.725 → 17.690 | 18.819 → 18.583 | 395.734 → 503.430 | 573.377 → 609.549 |
+| wide-small / ingest | 35.510 → 28.145 | 25.373 → 18.760 | 133.000 → 135.891 | 119.329 → 123.142 |
+| wide-small / ordinary | 0.744 → 0.711 | 1.998 → 1.877 | 136.562 → 139.812 | 119.876 → 123.407 |
+| wide-small / full | 2.154 → 2.111 | 3.693 → 3.566 | 140.969 → 143.992 | 122.345 → 125.829 |
+| wide-small / reference_full | 2.251 → 2.191 | 3.753 → 3.893 | 141.000 → 143.750 | 122.220 → 125.439 |
+| wide-small / conditional | 2.360 → 2.161 | 4.005 → 3.415 | 142.344 → 137.266 | 126.939 → 126.814 |
+| wide-small / reference | 2.233 → 2.232 | 3.827 → 3.617 | 109.672 → 95.656 | 127.126 → 127.157 |
+| nested-medium / read | 3.244 → 3.434 | 4.853 → 5.323 | 163.031 → 210.547 | 204.025 → 211.204 |
+| scalar-large / read | 4.458 → 4.288 | 6.157 → 5.883 | 368.633 → 360.758 | 436.626 → 437.267 |
+| scalar-small / read | 2.359 → 2.311 | 3.651 → 3.693 | 146.031 → 137.766 | 127.587 → 127.423 |
+| large_distinct_unique_eight / read | 29.022 → 28.427 | 13.447 → 12.638 | 230.430 → 232.508 | 210.689 → 210.501 |
+| tiny_shared_duplicates / read | 0.608 → 0.580 | 1.860 → 1.734 | 134.188 → 133.953 | 117.595 → 117.595 |
+
+Seven-round repeats (100 reads per phase):
+
+| Case / phase | CPU ms before → after | Elapsed ms before → after | RSS MiB before → after | Footprint MiB before → after |
+|---|---:|---:|---:|---:|
+| dense64 / ingest | 39.564 → 42.922 | 28.927 → 34.650 | 142.266 → 142.047 | 129.579 → 129.032 |
+| dense64 / ordinary | 1.043 → 1.107 | 1.870 → 2.030 | 146.953 → 147.469 | 130.407 → 131.235 |
+| dense64 / full | 5.126 → 5.042 | 6.279 → 6.141 | 67.484 → 68.781 | 136.329 → 135.814 |
+| dense64 / reference_full | 5.066 → 5.092 | 6.142 → 6.251 | 110.031 → 100.141 | 132.157 → 133.517 |
+| dense64 / conditional | 5.747 → 5.686 | 6.899 → 6.836 | 63.422 → 65.406 | 136.720 → 136.423 |
+| dense64 / reference | 5.793 → 5.718 | 6.955 → 6.787 | 63.547 → 65.141 | 136.970 → 136.735 |
+| eligible / ingest | 66.357 → 70.454 | 60.384 → 93.090 | 163.531 → 163.406 | 150.626 → 150.642 |
+| eligible / ordinary | 4.601 → 4.901 | 7.462 → 8.221 | 165.609 → 133.578 | 156.798 → 157.142 |
+| eligible / full | 5.954 → 6.097 | 8.841 → 9.062 | 93.695 → 93.172 | 156.907 → 157.392 |
+| eligible / reference_full | 9.223 → 9.550 | 12.129 → 12.906 | 94.781 → 92.953 | 160.220 → 160.001 |
+| eligible / conditional | 1.172 → 1.230 | 2.658 → 2.721 | 94.422 → 93.016 | 153.423 → 154.454 |
+| eligible / reference | 5.278 → 5.119 | 7.059 → 6.961 | 93.898 → 90.078 | 153.439 → 154.298 |
+| nested-medium / read | 2.845 → 2.839 | 3.853 → 3.846 | 229.141 → 232.047 | 195.798 → 197.298 |
+| pair-rejected / ingest | 140.171 → 145.400 | 161.165 → 163.076 | 222.859 → 224.344 | 210.751 → 211.704 |
+| pair-rejected / ordinary | 12.127 → 12.153 | 16.667 → 17.000 | 344.617 → 338.562 | 485.150 → 490.416 |
+| pair-rejected / full | 17.627 → 18.280 | 21.892 → 23.598 | 458.055 → 409.086 | 517.986 → 504.767 |
+| pair-rejected / reference_full | 27.003 → 27.376 | 31.626 → 32.083 | 411.453 → 396.070 | 531.095 → 522.298 |
+| pair-rejected / conditional | 2.415 → 2.533 | 3.746 → 4.162 | 387.875 → 369.891 | 470.549 → 514.736 |
+| pair-rejected / reference | 13.815 → 14.049 | 15.186 → 15.648 | 334.852 → 232.102 | 414.705 → 499.845 |
+| sparse64 / ingest | 34.478 → 38.453 | 21.566 → 38.222 | 161.719 → 162.875 | 129.845 → 128.907 |
+| sparse64 / ordinary | 1.088 → 1.069 | 1.956 → 1.903 | 167.164 → 167.828 | 131.579 → 130.876 |
+| sparse64 / full | 4.946 → 4.939 | 5.882 → 5.884 | 176.203 → 156.094 | 137.954 → 134.376 |
+| sparse64 / reference_full | 5.060 → 5.040 | 6.058 → 6.041 | 172.141 → 172.031 | 133.689 → 132.782 |
+| sparse64 / conditional | 5.611 → 5.642 | 6.550 → 6.581 | 156.125 → 156.297 | 138.423 → 134.735 |
+| sparse64 / reference | 5.654 → 5.700 | 6.581 → 6.629 | 156.500 → 156.359 | 138.704 → 136.298 |
+| wide-large / ingest | 181.959 → 186.333 | 200.121 → 208.318 | 254.422 → 231.922 | 243.267 → 241.657 |
+| wide-large / ordinary | 15.904 → 15.964 | 21.363 → 21.448 | 362.875 → 381.711 | 587.088 → 590.814 |
+| wide-large / full | 22.136 → 23.236 | 27.018 → 28.930 | 494.688 → 472.523 | 680.924 → 683.002 |
+| wide-large / reference_full | 35.152 → 35.172 | 39.826 → 39.986 | 443.273 → 493.781 | 659.260 → 657.322 |
+| wide-large / conditional | 2.341 → 2.530 | 3.500 → 3.894 | 471.547 → 401.688 | 659.580 → 600.799 |
+| wide-large / reference | 17.527 → 17.512 | 18.587 → 18.702 | 293.234 → 281.664 | 553.564 → 558.345 |
+
+
+The repeated dense conditional/reference reads are about 1% lower in CPU and
+1–2% lower in elapsed time; nested reads are essentially at parity. Other
+controls remain slower: eligible ordinary reads are +6.5% CPU/+10.2% elapsed,
+and pair-rejected/wide-large conditional reads are +4.9%/+8.1% CPU and about
++11% elapsed. Large-row footprint varies by phase, including a repeated
+pair-reference increase of about 85 MiB. These observations establish neither
+a general query speedup nor an RSS reduction. Preparation/allocation gains
+above have a narrower, directly measured scope.
+
+Odd-round ingestion medians show a substantial server-position effect. In the
+eligible repeat, most first-position submissions take about 58–70 ms while
+second-position submissions take about 93–111 ms, with an additional outlier.
+Seven alternating rounds put the candidate second four times and the baseline
+second three times. Eligible/sparse pooled ingestion medians consequently show
++54%/+77% elapsed, with +6%/+12% CPU. The original samples and medians remain
+above; the balanced ingestion qualification below gives each binary four first
+and four second positions. Future ingestion comparisons should use balanced
+even-round AB/BA runs and retain per-position samples.
+
+Separate, untimed admission attribution is identical for both binaries:
+24 attempts/admitted batches and 64 loaded/planned rows in the eligible case;
+56 attempts rejected before loading or planning any row in the oversized-pair
+case. Wide oversized physical values also keep point lookup; retained selected
+copies still require complete physical block reads. Read planning continues to
+use the shared sorted-key snapshot cost model rather than corpus-specific
+thresholds.
+
+Reproduce with `bench_source_projection.py`, `bench_projection_batches.py` and
+`bench_media_materialization.py` under `zig/e2e/antfly/`, passing candidate and
+`--baseline BASELINE --rounds 5 --queries-per-phase 50 --output OUTPUT` plus the
+case parameters above. Repeats use `--rounds 7 --queries-per-phase 100`; balanced
+ingestion checks use `--rounds 8 --queries-per-phase 1`, with only ingestion
+included in their timing claims. The media workloads are
+`tiny_shared_duplicates` and `large_distinct_unique_eight`. Every raw report
+records corpus/output, driver and binary hashes, sample order and host details.
+Reports and full logs remain ignored.
+
+### Balanced ingestion qualification
+
+Eight alternating rounds give each binary four first and four second positions.
+One read per phase still checks output equivalence, but only ingestion timings
+are qualified here. This is a separate control; no earlier observation is removed.
+
+| Case | CPU ms before → after | Elapsed ms before → after |
+|---|---:|---:|
+| eligible | 65.070 → 65.227 | 48.372 → 46.142 |
+| dense64 | 40.922 → 41.523 | 24.297 → 22.567 |
+| sparse64 | 37.919 → 37.554 | 20.272 → 20.389 |
+
+Balanced ingestion CPU ranges from −1.0% to +1.5%; elapsed medians range from
+−7.1% to +0.6% across these three controls. This supports an ordering explanation for the large pooled
+odd-round ingestion medians, while leaving the read-latency and footprint
+increases in the repeated tables as measured limitations. No universal query
+latency or memory improvement is established.
+
+### Candidate qualification and provenance
+
+The frozen implementation passes **98/98 native build steps**, including the
+213 query contracts, 94 logical contracts/one optional skip, 49 runtime,
+33 provider, 80 gateway/one optional skip and 24 catalog owner cases. Shared
+inference and HTTP client contracts pass **694 tests with 8 skips** across
+18/18 build steps. The optimized preparation target passes **11/11 tests** and
+56/56 build steps. Its captured executable independently replays the actual
+42 verification and 126 envelope samples; that concurrent-build replay is a
+functional artifact check, excluded from timing results.
+
+The stripped ReleaseFast server and CLI builds pass **71/71** and **7/7** steps.
+Real-server indexed and segmented-transport integration passes **60 tests with
+7 optional profiling skips**. All three new transport fixtures also pass on the
+unchanged baseline, establishing buffered success, SSE success and upstream
+failure behavior before the optimization. The comparison uses Zig 0.17.0,
+ReleaseFast, stripping and `-j2` on the same shared ARM64 macOS host, with main
+`0ff73ed56fb7acfbe4d6a14158f84c4b74c8dadb` already merged at the captured source base `3d8c478e059f2f0f5aa91512bee0e326591d03c4`.
+
+- Baseline server SHA-256: `f7291e7222f0296a6526342a8e66bd96844794a50e7cc31e5553176c92f14807` (235,702,616 bytes).
+- Candidate server SHA-256: `ff98bfbc8192d6279e0e7929888ed5b812c04e4237f01429c3e748f2f6dc50d7` (235,719,032 bytes).
+- CLI SHA-256: `e8f7f1ec76751de7cf1fc9157cc9d50a0d2ce41e795d9dfb32d8c18b28caaf25` (unchanged from baseline).
+- Preparation benchmark SHA-256: `e6c27718e70f8bd228fb399fea472e766d80836f6607ce659722f60de92f7450`.
+- Compiler SHA-256: `1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523`.
+
+The server grows by 16,416 bytes
+(0.007%). The candidate,
+baseline, micro, source and driver identities are retained under ignored
+`output/projection-followup/round4-*.json`; no raw report or executable is tracked.
+First-verification/evidence-JSON allocation volumes are identical across all
+twelve existing controls. Their separately ordered artifact timings are retained
+as diagnostics, not advertised as an alternating whole-product comparison.

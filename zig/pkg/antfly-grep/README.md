@@ -5059,8 +5059,10 @@ The [current ownership and transport qualification](../../../docs/design/antfly-
 records the contracts, complete paired controls, independent repeats and artifact
 identities. Selected LSM reads borrow one admitted point until selected spans
 are copied. Controlled batches retain one bounded scratch owner while polling
-cancellation/deadlines between whole-value reads and retiring payload pins per
-document. The persisted-row fixture uses 32.3% fewer scratch allocations.
+cancellation/deadlines between whole-value reads. Point batches retire payload
+pins per document; dense cursor batches can retain current block/index leases
+within resource quotas until the batch ends. The earlier persisted-row fixture
+uses 32.3% fewer scratch allocations.
 
 Gateway media jobs transfer request-local payload leases and release completed
 parsing scratch. Compatible native generators/deciders reuse verified codec
@@ -5108,3 +5110,22 @@ The final merge of main through `0ff73ed56f` rebuilds byte-identical macOS serve
 and grep artifacts. Indexed HTTP integration passes 57 tests (7 optional
 profiling skips); native fixture, allocation/wire and Linux VM scopes are
 recorded in the linked design. Full PR CI and required review remain separate.
+
+
+The [sorted range and HTTP transport follow-up](../../../docs/design/antfly-grep.md#sorted-range-batches-and-segmented-http-2026-10-30)
+shares snapshot cursor/index work for dense sorted range batches and retains
+point lookup for sparse keys. The persisted-row fixture reduces batched scratch
+allocations a further 50.8%. Proofs of actual byte equality avoid repeated base64
+decoding, hashing and image inspection while preserving each reference's
+authorization and claims.
+Remote native HTTP requests borrow codec segments through synchronous invocation;
+local ABI targets retain contiguous-body compatibility.
+
+Repeated verification of a roughly 1 MiB source takes 757 → 412 µs in the isolated
+fixture, with no decoded-buffer allocation on the reuse path. Constructing eight
+1 MiB HTTP attachments allocates 8,402,726 → 14,863 bytes; tiny frames allocate
+118–403 additional bytes. Public wire occurrences and logical model budgets do
+not change. The design retains complete whole-query controls and independent
+repeats, including slower cases. These are scoped preparation/allocation gains,
+not universal query latency, RSS or provider-billing improvements. Public API,
+document format and ASCH25 remain unchanged.

@@ -117,3 +117,7 @@ test "httpx inference gateway source discovery" {
 test "linear merge discovery" {
     _ = @import("api/linear_merge.zig");
 }
+
+test "verified source preparation benchmark discovery" {
+    _ = @import("api/bench_source_verification.zig");
+}

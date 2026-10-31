@@ -282,6 +282,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, api_http_runtime_test_mod, true, true);
     api_http_runtime_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
+    const source_preparation_bench = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "verified source", "httpx inference gateway source codec preparation benchmark" } });
+    const run_source_preparation_bench = b.addRunArtifact(source_preparation_bench);
+    run_source_preparation_bench.setEnvironmentVariable("ANTFLY_BENCH_SOURCE_MEDIA", "1");
+    const source_preparation_bench_step = b.step("bench-source-preparation", "Measure repeated source verification and segmented envelope construction (use ReleaseFast)");
+    source_preparation_bench_step.dependOn(&run_source_preparation_bench.step);
+    source_preparation_bench_step.dependOn(&b.addInstallArtifact(source_preparation_bench, .{ .dest_sub_path = "antfly-source-preparation-bench" }).step);
+
     const schema_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/schema_contract_test_root.zig"),
         .target = target,

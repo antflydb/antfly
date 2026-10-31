@@ -3705,6 +3705,19 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 }
                 if (requests.len == 0) return;
                 try control.check();
+                // Reuse the existing snapshot cost model. Dense sorted keys
+                // share one merge cursor, run indexes and loaded blocks; sparse
+                // keys retain directory point routing. Monotone indexed seeks
+                // skip holes without decoding intervening document values.
+                var keys: [64][]const u8 = undefined;
+                var key_count: usize = 0;
+                for (requests) |request| if (request.ranges.len != 0) {
+                    keys[key_count] = request.key;
+                    key_count += 1;
+                };
+                if (chooseMultiGetPlan(keys[0..key_count], .snapshot) == .cursor) {
+                    return self.getRangesFromSortedCursor(requests, control);
+                }
                 var work = PointReadScratch.init(self.parent.backend);
                 defer work.deinit();
                 var temporary: @This() = .{ .parent = self.parent, .allocator = work.allocator(), .last_l0_group_index = self.last_l0_group_index };
@@ -3720,6 +3733,39 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                         temporary.last_l0_group_index = hint;
                     }
                     self.getRangesUsing(&temporary, request.key, request.ranges, request.output) catch |err| return work.failure(err);
+                }
+            }
+            fn getRangesFromSortedCursor(self: *@This(), requests: []const @import("../value_ranges.zig").Request, control: @import("../value_ranges.zig").ReadControl) !void {
+                var work = PointReadScratch.init(self.parent.backend);
+                defer work.deinit();
+                return self.copySortedCursorRanges(work.allocator(), requests, control) catch |err| return work.failure(err);
+            }
+            fn copySortedCursorRanges(self: *@This(), scratch: Allocator, requests: []const @import("../value_ranges.zig").Request, control: @import("../value_ranges.zig").ReadControl) !void {
+                const p = self.parent;
+                var namespace = p.namespace;
+                namespace.own_source_point_results = false;
+                namespace.borrow_local_point_results = true;
+                namespace.transient_point_result = true;
+                var cursor = try MergeCursor(@TypeOf(p.backend.*), State).initView(scratch, p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, namespace, false);
+                defer cursor.close();
+                const stats = disableCursorScanValueStats(&cursor);
+                defer restoreCursorScanValueStats(&cursor, stats);
+                for (requests) |request| {
+                    if (request.ranges.len == 0) continue;
+                    try control.check();
+                    p.backend.recordPointGet();
+                    const entry = (try cursor.seekAtOrAfter(request.key)) orelse return error.NotFound;
+                    if (!std.mem.eql(u8, entry.key, request.key)) return error.NotFound;
+                    // Consume borrowed bytes before the next cursor movement.
+                    const Owner = @This();
+                    const Copy = struct {
+                        owner: *Owner,
+                        bytes: []const u8,
+                        pub fn read(ctx: @This(), start: usize, len: usize) ![]const u8 {
+                            return copyPointValue(ctx.owner.parent.backend, ctx.owner.allocator, &ctx.owner.held_values, ctx.bytes[start..][0..len]);
+                        }
+                    };
+                    try @import("../value_ranges.zig").read(entry.value.len, request.ranges, request.output, Copy{ .owner = self, .bytes = entry.value });
                 }
             }
             pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {

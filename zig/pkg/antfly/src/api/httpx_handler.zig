@@ -4526,6 +4526,21 @@ pub const AntflyApiHandler = struct {
             codec_limit: usize = inference_gateway.source_media.max_typed_codec_bytes,
             verified_output: []@import("antfly_inference_execution_context").VerifiedMedia = &.{},
             fn retain(self: *@This(), a: std.mem.Allocator, reference: inference_gateway.source_media.Reference, url: []const u8) !@import("antfly_inference_execution_context").VerifiedMedia {
+                const cached_codec: ?inference_gateway.source_media.Verified = cached: {
+                    while (!self.codec_mutex.tryLock()) std.atomic.spinLoopHint();
+                    defer self.codec_mutex.unlock();
+                    for (self.codecs.items) |item| {
+                        if (item.bytes == reference.byte_length and std.mem.eql(u8, &item.digest, reference.sha256) and std.mem.eql(u8, item.mime, reference.mime_type)) break :cached item;
+                    }
+                    break :cached null;
+                };
+                if (cached_codec) |checked| if (inference_gateway.source_media.matchesVerifiedUrl(reference, url, checked)) {
+                    // The actual source bytes equal an already verified codec.
+                    // Authorization/revision checks still run in hit(), and a
+                    // stricter pixel claim remains independently enforceable.
+                    if (checked.pixels > reference.max_pixels) return error.InferenceRequestTooLarge;
+                    return .{ .url = try std.fmt.allocPrint(a, "antfly-verified:{s}:{s}", .{ checked.mime, checked.digest }), .bytes = checked.data, .mime_type = checked.mime, .logical_url_bytes = url.len, .pixels = checked.pixels };
+                };
                 const allocator = self.backing.allocator();
                 const checked = try inference_gateway.source_media.verifyInfoRetained(a, reference, url, allocator);
                 var adopted = false;
@@ -21490,4 +21505,36 @@ test "httpx inference gateway typed producer validates revisions and policy befo
     consumer.seen = 0;
     try std.testing.expectError(error.Forbidden, consumer.hit("row", source, null));
     try std.testing.expectEqual(@as(usize, 1), payloads.codecs.items.len);
+}
+
+test "httpx inference gateway codec equality reuses verification without trusting digest hints" {
+    const a = std.testing.allocator;
+    const Source = inference_gateway.source_media;
+    const Payloads = AntflyApiHandler.GatewaySources.MediaPayloads;
+    const encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7S8AAAAASUVORK5CYII=";
+    const url = "data:image/png;base64," ++ encoded;
+    var bytes: [68]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&bytes, encoded);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    var reference: Source.Reference = .{ .table = "docs", .document_id = "a", .field = "image", .revision_field = "revision", .revision = "r1", .sha256 = &hex, .mime_type = "image/png", .byte_length = bytes.len, .max_pixels = 1 };
+    var measured = std.testing.FailingAllocator.init(a, .{});
+    const owner = try a.create(Payloads);
+    owner.* = .{ .allocator = a, .backing = .{ .backing = measured.allocator() } };
+    defer Payloads.release(owner);
+    const first = try owner.retain(a, reference, url);
+    defer a.free(first.url);
+    const allocated = measured.allocated_bytes;
+    reference.document_id = "b";
+    const second = try owner.retain(a, reference, url);
+    defer a.free(second.url);
+    try std.testing.expectEqual(first.bytes.ptr, second.bytes.ptr);
+    try std.testing.expectEqual(allocated, measured.allocated_bytes);
+    reference.max_pixels = 0;
+    try std.testing.expectError(error.InferenceRequestTooLarge, owner.retain(a, reference, url));
+    reference.max_pixels = 1;
+    var forged = url.*;
+    forged[40] = if (forged[40] == 'A') 'B' else 'A';
+    try std.testing.expectError(error.InferenceSourceMismatch, owner.retain(a, reference, &forged));
 }

@@ -207,13 +207,31 @@ pub const MediaEncoding = struct {
     bytes: []const u8,
     content_type: []const u8 = "application/json",
     owned: bool = false,
+    segments: ?httpx.attachment_envelope.EncodedSegments = null,
+    metadata: ?[]u8 = null,
     pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        if (self.segments) |*segments| segments.deinit();
+        if (self.metadata) |metadata| a.free(metadata);
         if (self.owned) a.free(self.bytes);
         self.* = .{ .bytes = &.{} };
     }
 };
 pub fn encodeVerifiedGenerate(a: std.mem.Allocator, temporary: std.mem.Allocator, body: []const u8, existing: ?[]const httpx.attachment_envelope.Attachment, media: []const VerifiedMedia) !MediaEncoding {
-    if (media.len == 0) return if (existing) |items| .{ .bytes = try httpx.attachment_envelope.encodeAlloc(a, body, items), .content_type = httpx.attachment_envelope.content_type, .owned = true } else .{ .bytes = body };
+    return encodeVerifiedGenerateMode(a, temporary, body, existing, media, false);
+}
+/// Replayable segments borrow immutable codec bytes until the synchronous
+/// invocation completes. Only compact rewritten metadata and framing are owned.
+pub fn encodeVerifiedGenerateSegments(a: std.mem.Allocator, temporary: std.mem.Allocator, body: []const u8, existing: ?[]const httpx.attachment_envelope.Attachment, media: []const VerifiedMedia) !MediaEncoding {
+    return encodeVerifiedGenerateMode(a, temporary, body, existing, media, true);
+}
+fn encodeEnvelope(a: std.mem.Allocator, body: []const u8, items: []const httpx.attachment_envelope.Attachment, segmented: bool) !MediaEncoding {
+    return if (segmented)
+        .{ .bytes = &.{}, .segments = try httpx.attachment_envelope.encodeSegmentsAlloc(a, body, items), .content_type = httpx.attachment_envelope.content_type }
+    else
+        .{ .bytes = try httpx.attachment_envelope.encodeAlloc(a, body, items), .content_type = httpx.attachment_envelope.content_type, .owned = true };
+}
+fn encodeVerifiedGenerateMode(a: std.mem.Allocator, temporary: std.mem.Allocator, body: []const u8, existing: ?[]const httpx.attachment_envelope.Attachment, media: []const VerifiedMedia, segmented: bool) !MediaEncoding {
+    if (media.len == 0) return if (existing) |items| try encodeEnvelope(a, body, items, segmented) else .{ .bytes = body };
     var arena = std.heap.ArenaAllocator.init(temporary);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -251,9 +269,12 @@ pub fn encodeVerifiedGenerate(a: std.mem.Allocator, temporary: std.mem.Allocator
             changed = true;
         }
     };
-    if (!changed) return if (existing) |items| .{ .bytes = try httpx.attachment_envelope.encodeAlloc(a, body, items), .content_type = httpx.attachment_envelope.content_type, .owned = true } else .{ .bytes = body };
-    const metadata = try std.json.Stringify.valueAlloc(scratch, value, .{});
-    return .{ .bytes = try httpx.attachment_envelope.encodeAlloc(a, metadata, attachments.items), .content_type = httpx.attachment_envelope.content_type, .owned = true };
+    if (!changed) return if (existing) |items| try encodeEnvelope(a, body, items, segmented) else .{ .bytes = body };
+    const metadata = try std.json.Stringify.valueAlloc(if (segmented) a else scratch, value, .{});
+    errdefer if (segmented) a.free(metadata);
+    var result = try encodeEnvelope(a, metadata, attachments.items, segmented);
+    if (segmented) result.metadata = metadata;
+    return result;
 }
 
 test "httpx inference gateway verified media encodes native attachments without rewriting tools or detail" {
@@ -389,4 +410,29 @@ test "httpx inference gateway framed aliases retain one logical attachment per o
     const parts = parsed.value.object.get("messages").?.array.items[0].object.get("content").?.array.items;
     try std.testing.expectEqualStrings("attachment:0", parts[0].object.get("data").?.string);
     try std.testing.expectEqualStrings("attachment:1", parts[1].object.get("data").?.string);
+}
+
+test "httpx inference gateway segmented verified generation borrows codecs beyond metadata allocator capacity" {
+    const a = std.testing.allocator;
+    const codec = try a.alloc(u8, 1024 * 1024);
+    defer a.free(codec);
+    @memset(codec, 7);
+    var storage: [65536]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"verified\"}}]}],\"opaque\":18446744073709551617}";
+    const media = [_]VerifiedMedia{.{ .url = "verified", .bytes = codec, .mime_type = "image/png" }};
+    var encoded = try encodeVerifiedGenerateSegments(fixed.allocator(), fixed.allocator(), body, null, &media);
+    defer encoded.deinit(fixed.allocator());
+    try std.testing.expectEqual(@as(usize, 0), encoded.bytes.len);
+    const segments = encoded.segments.?.segments;
+    try std.testing.expectEqual(@as([*]const u8, codec.ptr), segments[segments.len - 1].ptr);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.metadata.?, "18446744073709551617") != null);
+    const flattened = try std.mem.concat(a, u8, segments);
+    defer a.free(flattened);
+    var frame = try httpx.attachment_envelope.parseAlloc(a, flattened, .{});
+    defer frame.deinit();
+    try std.testing.expectEqualSlices(u8, codec, frame.attachments[0].data);
+    var original = try encodeVerifiedGenerate(a, a, body, null, &media);
+    defer original.deinit(a);
+    try std.testing.expectEqualSlices(u8, original.bytes, flattened);
 }
