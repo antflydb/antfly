@@ -187,6 +187,22 @@ def _exercise_lake_writer(call, secret, tmp_path, admin):
     )
     status, result = call("POST", f"/tables/{table}/lake/changes", deleted, writer)
     assert status == 202 and result["wal_lsn"] > accepted["wal_lsn"], result
+    status, removed = call(
+        "POST",
+        f"/tables/{table}/query",
+        {
+            "full_text_search": {"match_all": {}},
+            "filter_query": {"term": {"path": "/id", "value": 7}},
+            "read_requirements": {
+                "visibility": "accepted",
+                "after_write": result["read_receipt"],
+                "wait_ms": 5000,
+            },
+        },
+        writer,
+    )
+    assert status == 200, removed
+    assert removed["responses"][0]["hits"]["hits"] == [], removed
     return deleted, result["wal_lsn"]
 
 
