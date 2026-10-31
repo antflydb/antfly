@@ -5612,7 +5612,16 @@ test "highlight streaming indexing preserves native postings source positions an
         const tokens = (try stored.tokens(a, try column.fingerprint(a, &analysis_mod.default_analyzer), .none)).?;
         defer tokens.deinit();
         try std.testing.expectEqual(expected.len, tokens.items.len);
-        for (expected, tokens.items) |left, right| {
+        // The source codec returns term-grouped occurrences; position, rather
+        // than array order, is the independent source-order identity.
+        const seen = try a.alloc(bool, expected.len);
+        defer a.free(seen);
+        @memset(seen, false);
+        for (tokens.items) |right| {
+            try std.testing.expect(right.position < expected.len);
+            try std.testing.expect(!seen[right.position]);
+            seen[right.position] = true;
+            const left = expected[right.position];
             try std.testing.expectEqualStrings(left.term, right.term);
             try std.testing.expectEqual(left.position, right.position);
             try std.testing.expectEqual(left.start_byte, right.start_byte);

@@ -253,5 +253,6 @@ test "highlight streaming capture matches the materialized codec and refunds fau
     };
     try Check.run(std.testing.allocator, false);
     try Check.run(std.testing.allocator, true);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{false});
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Check.run, .{false});
 }
