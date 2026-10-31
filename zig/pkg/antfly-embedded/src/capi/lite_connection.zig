@@ -164,7 +164,7 @@ pub const PreparedPublication = struct {
             self.owner.publication_stats.refused +|= 1;
             self.owner.publication_stats.generated_refused +|= 1;
         }
-        var lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
+        var lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
         defer lease.close();
         const database = try self.current();
         // Namespace and catalog are stable under the owner fence. The native
@@ -294,7 +294,7 @@ pub const PreparedPublication = struct {
             self.owner.publication_stats.refused +|= 1;
             self.owner.publication_stats.replay_refused +|= 1;
         }
-        var lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
+        var lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
         defer lease.close();
         const database = try self.current();
         // Computed resolver effects must explicitly carry their read set.
@@ -343,7 +343,7 @@ pub const PreparedPublication = struct {
             self.owner.publication_stats.refused +|= 1;
             self.owner.publication_stats.generated_refused +|= 1;
         }
-        var lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
+        var lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
         errdefer lease.close();
         const database = try self.current();
         if (fence) |expected| {
@@ -365,7 +365,7 @@ pub const PreparedPublication = struct {
         self.owner.gate.mutex.lockUncancelable(io);
         defer self.owner.gate.mutex.unlock(io);
         if (self.owner.stopping.load(.acquire)) return error.Canceled;
-        var path_lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
+        var path_lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
         defer path_lease.close();
         const database = try self.current();
         var lease = try ProducerLease.init(alloc, database.core.store, fence.lease_key);
@@ -629,6 +629,7 @@ pub const Owner = struct {
     // debug Io cannot spawn tasks; this lazy pool supplies exactly the lock
     // waiter and its deadline timer, and is shared by compatible connections.
     path_lock_io: std.Io.Threaded,
+    test_maintenance_wait_ns: if (h.builtin.is_test) ?i96 else void = if (h.builtin.is_test) null else {},
     stopping: std.atomic.Value(bool) = .init(false),
     // One graph walk per owner. Admission waits without the foreground gate;
     // the worker only try-locks under that gate and yields to an active proof.
@@ -873,6 +874,26 @@ pub const Owner = struct {
         self.wake.set(h.handleLockIo());
     }
 
+    /// Caller holds the owner gate. Captures and validated publications need
+    /// turns alongside foreground writers, otherwise a continuously occupied
+    /// kernel queue prevents index replay from ever acquiring its lease.
+    /// Reclamation and detached-proof reacquisition remain nonblocking.
+    fn acquireMaintenancePathLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
+        if (self.stopping.load(.acquire)) return error.Canceled;
+        const io = h.handleLockIo();
+        if (native.lockWriterPathWithIo(alloc, io, self.path)) |held| return held else |err| {
+            if (err != error.WouldBlock and err != error.FileBusy) return err;
+            const budget = if (h.builtin.is_test) self.test_maintenance_wait_ns orelse std.time.ns_per_s else std.time.ns_per_s;
+            var held = native.waitPathLockWithIo(alloc, self.path_lock_io.io(), self.path, true, std.Io.Clock.awake.now(io).nanoseconds + budget) catch |wait_err| switch (wait_err) {
+                error.FileNotFound, error.ConcurrencyUnavailable => return err,
+                else => return wait_err,
+            };
+            errdefer held.close();
+            if (self.stopping.load(.acquire)) return error.Canceled;
+            return held;
+        }
+    }
+
     fn hasPendingReplay(database: *h.db_mod.DB) !bool {
         if (database.hasPendingGraphReplacements()) return true;
         const target = database.core.nextDerivedSequence();
@@ -949,7 +970,7 @@ pub const Owner = struct {
         // output forever without advancing its durable watermark.
         if (scope == .index) if (root.maintenance_publication) |p| if (p.index_inputs_changed) return error.EnrichmentWaitCanceled;
         if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
-        var lease = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| switch (err) {
+        var lease = (if (scope == .reclamation) native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) else self.acquireMaintenancePathLeaseAssumeLocked()) catch |err| switch (err) {
             error.FileBusy, error.WouldBlock => return error.EnrichmentWaitCanceled,
             else => return err,
         };
@@ -1157,7 +1178,7 @@ pub const Owner = struct {
         // sources and publish lease metadata, so yield before even capturing
         // a runtime. The gate protects this flag through the capture boundary.
         if (self.allocator_verification_active) return true;
-        var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
+        var lease = try self.acquireMaintenancePathLeaseAssumeLocked();
         var lease_held = true;
         defer if (lease_held) lease.close();
         const foreground = try self.refresh();
@@ -1458,7 +1479,7 @@ pub const Owner = struct {
         // Keep the scheduled storage turn pending while foreground admission
         // proves the tip; even its runtime refresh can publish index leases.
         if (self.allocator_verification_active) return false;
-        var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
+        var lease = try self.acquireMaintenancePathLeaseAssumeLocked();
         var lease_held = true;
         defer if (lease_held) lease.close();
         const foreground = try self.refresh();
@@ -3559,6 +3580,20 @@ test "capi native allocator proof path admission uses its bounded concurrent exe
     var acquired = try connection.acquire();
     acquired.close();
     connection.gate.mutex.unlock(io);
+}
+
+test "capi native allocator proof maintenance capture joins the bounded lease queue" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("queued-maintenance-admission", 1000, .batch);
+    defer fixture.deinit();
+    const owner = fixture.connection.owner;
+    owner.test_maintenance_wait_ns = 30 * std.time.ns_per_ms;
+    defer owner.test_maintenance_wait_ns = null;
+    var held = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), fixture.path);
+    const turn = owner.maintenanceTurn();
+    held.close();
+    try std.testing.expectError(error.FileBusy, turn);
+    try std.testing.expect(owner.path_lock_io.worker_threads.load(.acquire) != null);
 }
 
 test "capi native allocator proof live commits carry a checked peer certificate" {
