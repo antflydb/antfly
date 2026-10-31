@@ -73,41 +73,26 @@ pub fn validate(r: Request) !void {
     const k = try std.math.mul(usize, try std.math.mul(usize, r.rows, r.key_heads), 256 * 4);
     const regions = [_]buffer.DeviceBuffer{ r.query_gate, r.key, r.query_weight, r.key_weight, r.positions, r.query_out, r.key_out, r.gate_out };
     const lengths = [_]usize{ try std.math.mul(usize, q, 2), k, 256 * 4, 256 * 4, r.rows * 3 * 4, q, k, q };
-    var ends: [8]u64 = undefined;
-    for (regions, lengths, 0..) |region, length, index| {
-        if (region.ptr == 0 or region.ptr & 3 != 0 or region.len < length) return error.InvalidShape;
-        ends[index] = try std.math.add(u64, region.ptr, length);
-    }
-    // Read-only inputs may alias one another; each output must be disjoint
-    // from every input and every other output.
-    for (5..8) |i| for (0..i) |j| {
-        if (regions[i].ptr < ends[j] and regions[j].ptr < ends[i]) return error.InvalidShape;
-    };
+    try buffer.validateRegions(8, regions, lengths, @splat(4), 5);
 }
 
+// Historical device entry names are compatibility ABI, not model-specific ownership.
+const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("attention_inputs_partial_mrope_f32.ptx") ++ "\x00", .{
+    .prepare = "lighton_qk_norm_partial_mrope_gate",
+});
+
 pub const Module = struct {
-    module: driver.CUmodule = null,
-    function: driver.CUfunction = null,
+    program: Program = .{},
     calls: usize = 0,
 
     pub fn init(self: *Module, ctx: *context.CudaContext) !void {
-        if (self.module != null) return;
-        try ctx.makeCurrent();
-        var module: driver.CUmodule = null;
-        const image = @embedFile("lighton_attention_inputs.ptx") ++ "\x00";
-        try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&module, image.ptr, 0, null, null));
-        errdefer _ = ctx.driver.fns.cuModuleUnload(module);
-        var function: driver.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, "lighton_qk_norm_partial_mrope_gate"));
-        self.module = module;
-        self.function = function;
+        // Keep the qualified cached hit free of extra context/driver calls.
+        if (self.program.module != null) return;
+        try self.program.init(ctx);
     }
 
     pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
-        if (self.module != null) {
-            ctx.makeCurrent() catch return;
-            _ = ctx.driver.fns.cuModuleUnload(self.module);
-        }
+        self.program.deinitChecked(ctx) catch return;
         self.* = .{};
     }
 
@@ -131,13 +116,13 @@ pub const Module = struct {
             .epsilon = r.epsilon,
         };
         var args = [_]?*anyopaque{&p};
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.function, @intCast(r.query_heads + r.key_heads), @intCast(r.rows), 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.program.function(.prepare), @intCast(r.query_heads + r.key_heads), @intCast(r.rows), 1, 256, 1, 1, 0, ctx.stream, &args, null));
         ctx.noteKernelLaunch();
         self.calls += 1;
     }
 };
 
-test "LightOnOCR3 fused attention input preflight rejects truncated aliased and unsupported regions" {
+test "CUDA partial M-RoPE input preflight rejects truncated aliased and unsupported regions" {
     const valid = Request{
         .query_gate = .{ .ptr = 0x10000, .len = 8 * 512 * 4 },
         .key = .{ .ptr = 0x20000, .len = 2 * 256 * 4 },

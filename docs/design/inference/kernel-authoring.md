@@ -27,6 +27,11 @@ The agent-facing rules are in `zig/pkg/inference/src/ops/AGENTS.md`.
 | CPU online attention rows | `linalg.attention.updateOnlineRow` | Conditional/scalar/SIMD maxima, empty-tile handling, rescale guards, vector width and statistic read/store order |
 | Quantized Metal matrix phases | `ANTFLY_MSL_QUANT_SWIZZLE16`, `ANTFLY_MSL_MATRIX_4X1_*`, `ANTFLY_MSL_MATRIX_4X2_*` | Swizzle groups, scalar/vector acquisition, unroll and SIMD barriers, M32/M64 right-operand advance, output pitch and scratch publication |
 | Wide CPU segment GEMM | `native.WideSegmentAttentionGemm` | 512-query BLAS tile, explicit key reuse; model admission remains in adapters |
+| F32 attention input normalization and partial M-RoPE | `src/ops/cuda/attention_inputs_f32.zig` | Separate Q/K norms, gate extraction, coordinate axes and partial rotary width |
+| BF16 encoder block phases | `src/ops/cuda/encoder_block_bf16.zig` | BF16/F32 publication boundaries, image segmentation, normalization and rotary schedules |
+| BF16 projection epilogues | `src/ops/cuda/projection_epilogues_bf16.zig`, `prototypes/projection_dot_bias_bf16.py` | SM121 tiles, explicit FP32 bias rounding, GELU versus residual epilogue and input/output precision |
+| BF16 projection with top-1 reduction | `src/ops/cuda/projection_top1_bf16.zig` | Fixed K1024/N248320 schedule, suppression policy, two-stage reduction and 32768/16-byte shared memory |
+| Embedded CUDA program ownership | `src/ops/cuda/embedded_module.zig` | Transactional entry lookup, lazy per-image ownership and direct caller-owned launches |
 | Dense projection admission | `dense_projection_policy.zig` | Workload, rows, output width, quant layout and packed-expert exclusion |
 
 Paths above are relative to `zig/pkg/inference`; Metal helpers live under

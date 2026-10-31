@@ -163,6 +163,39 @@ pub const DeviceBuffer = struct {
     }
 };
 
+/// Validate byte regions before driver access. Read-only regions may alias;
+/// every nonempty output must be disjoint from inputs and earlier outputs.
+/// Alignment is static ABI metadata; lengths describe actual used bytes.
+pub inline fn validateRegions(comptime count: usize, regions: [count]DeviceBuffer, lengths: [count]usize, comptime alignment: [count]u64, comptime first_write: usize) !void {
+    comptime std.debug.assert(first_write <= count);
+    var ends: [count]u64 = undefined;
+    inline for (regions, lengths, alignment, 0..) |region, length, align_bytes, i| {
+        if (length != 0 and (region.ptr == 0 or align_bytes == 0 or region.ptr % align_bytes != 0 or region.len < length)) return error.InvalidShape;
+        ends[i] = try std.math.add(u64, region.ptr, length);
+    }
+    inline for (first_write..count) |written| {
+        if (lengths[written] != 0) {
+            inline for (0..written) |other| {
+                if (lengths[other] != 0 and regions[written].ptr < ends[other] and regions[other].ptr < ends[written]) return error.InvalidShape;
+            }
+        }
+    }
+}
+
+test "CUDA region admission permits readonly aliases and rejects output overlap overflow and truncation" {
+    var regions = [_]DeviceBuffer{ .{ .ptr = 4096, .len = 64 }, .{ .ptr = 4096, .len = 64 }, .{}, .{ .ptr = 8192, .len = 64 } };
+    const lengths = [4]usize{ 64, 64, 0, 64 };
+    try validateRegions(4, regions, lengths, @splat(4), 3);
+    regions[3].ptr = 4100;
+    try std.testing.expectError(error.InvalidShape, validateRegions(4, regions, lengths, @splat(4), 3));
+    regions[3].ptr = 8192;
+    regions[0].len = 63;
+    try std.testing.expectError(error.InvalidShape, validateRegions(4, regions, lengths, @splat(4), 3));
+    regions[0].len = 64;
+    regions[0].ptr = std.math.maxInt(u64) - 3;
+    try std.testing.expectError(error.Overflow, validateRegions(4, regions, lengths, @splat(4), 3));
+}
+
 test "CUDA physical OOM releases its reservation and permits a later allocation" {
     const Mock = struct {
         var oom: bool = true;

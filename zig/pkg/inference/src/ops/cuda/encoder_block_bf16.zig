@@ -22,20 +22,6 @@ const buffer = @import("buffer.zig");
 const cublas = @import("cublaslt.zig");
 const cudnn = @import("cudnn_sdpa.zig");
 
-pub const Precision = enum {
-    f32,
-    bf16_vision,
-
-    pub fn resolve(raw: ?[]const u8) !Precision {
-        return if (raw) |value| std.meta.stringToEnum(Precision, value) orelse error.InvalidLightOnPrecisionProfile else .f32;
-    }
-
-    pub fn resolveWithAttention(raw: ?[]const u8, attention_enabled: bool) !Precision {
-        const selected = try resolve(raw);
-        return if (attention_enabled) selected else .f32;
-    }
-};
-
 pub const Layout = struct {
     offsets: [9]usize,
     lengths: [9]usize,
@@ -91,39 +77,35 @@ fn disjoint(a: buffer.DeviceBuffer, a_bytes: usize, b: buffer.DeviceBuffer, b_by
     if (a.ptr == 0 or b.ptr == 0 or a.ptr < b_end and b.ptr < a_end) return error.InvalidShape;
 }
 
+// Historical device entry names are compatibility ABI, not model-specific ownership.
+const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("encoder_block_phases_bf16.ptx") ++ "\x00", .{
+    .norm = "lighton_bf16_vision_norm",
+    .add = "lighton_bf16_vision_add",
+    .gelu = "lighton_bf16_vision_gelu",
+    .qkv_rope = "lighton_bf16_vision_qkv_rope",
+});
+
 pub const Module = struct {
-    module: driver.CUmodule = null,
-    functions: [4]driver.CUfunction = @splat(null),
+    program: Program = .{},
     blocks: usize = 0,
-    up: @import("lighton_vision_gemm.zig").Module = .{},
-    down: @import("lighton_vision_gemm.zig").DownModule = .{},
+    up: @import("projection_epilogues_bf16.zig").Module = .{},
+    down: @import("projection_epilogues_bf16.zig").DownModule = .{},
 
     pub fn init(self: *Module, ctx: *context.CudaContext) !void {
-        if (self.module != null) return;
-        try ctx.makeCurrent();
-        var module: driver.CUmodule = null;
-        const image = @embedFile("lighton_vision_bf16.ptx") ++ "\x00";
-        try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&module, image.ptr, 0, null, null));
-        errdefer _ = ctx.driver.fns.cuModuleUnload(module);
-        var functions: [4]driver.CUfunction = @splat(null);
-        inline for (.{ "lighton_bf16_vision_norm", "lighton_bf16_vision_add", "lighton_bf16_vision_gelu", "lighton_bf16_vision_qkv_rope" }, 0..) |name, index|
-            try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&functions[index], module, name));
-        self.module = module;
-        self.functions = functions;
+        // Keep the qualified cached hit free of extra context/driver calls.
+        if (self.program.module != null) return;
+        try self.program.init(ctx);
     }
 
     pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
         self.up.deinit(ctx);
         self.down.deinit(ctx);
-        if (self.module != null) {
-            ctx.makeCurrent() catch return;
-            _ = ctx.driver.fns.cuModuleUnload(self.module);
-        }
+        self.program.deinitChecked(ctx) catch return;
         self.* = .{};
     }
 
-    fn launch(self: *Module, ctx: *context.CudaContext, function: usize, grid: usize, args: []?*anyopaque) !void {
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.functions[function], @intCast(grid), 1, 1, 256, 1, 1, 0, ctx.stream, args.ptr, null));
+    fn launch(self: *Module, ctx: *context.CudaContext, function: Program.Entry, grid: usize, args: []?*anyopaque) !void {
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.program.function(function), @intCast(grid), 1, 1, 256, 1, 1, 0, ctx.stream, args.ptr, null));
         ctx.noteKernelLaunch();
     }
 
@@ -133,7 +115,7 @@ pub const Module = struct {
         var h: u32 = @intCast(hidden);
         var eps = epsilon;
         var args = [_]?*anyopaque{ &p[0], &p[1], &p[2], &p[3], &r, &h, &eps };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.functions[0], @intCast(rows), 1, 1, 128, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.program.function(.norm), @intCast(rows), 1, 1, 128, 1, 1, 0, ctx.stream, &args, null));
         ctx.noteKernelLaunch();
     }
 
@@ -141,7 +123,7 @@ pub const Module = struct {
         var p = [3]u64{ output.ptr, a.ptr, b.ptr };
         var n: u32 = @intCast(count);
         var args = [_]?*anyopaque{ &p[0], &p[1], &p[2], &n };
-        try self.launch(ctx, 1, (count + 255) / 256, &args);
+        try self.launch(ctx, .add, (count + 255) / 256, &args);
     }
 
     /// All scratch is supplied by the caller and retained through the last
@@ -194,23 +176,23 @@ pub const Module = struct {
         var dim: u32 = 64;
         var theta = r.theta;
         var args = [_]?*anyopaque{ &p[0], &p[1], &p[2], &p[3], &p[4], &rows, &heads, &dim, &theta };
-        try self.launch(ctx, 3, (r.rows * r.hidden / 2 + 255) / 256, &args);
+        try self.launch(ctx, .qkv_rope, (r.rows * r.hidden / 2 + 255) / 256, &args);
         if (!try attention.executeVision(key, s[2].ptr, s[3].ptr, s[4].ptr, s[5].ptr, if (workspace_bytes == 0) 0 else vendor_workspace.ptr)) return error.CudnnFailure;
         // QKV is dead after RoPE; reuse its first H rows for the projection.
         const projected = buffer.DeviceBuffer{ .ptr = s[1].ptr, .len = h_bytes, .borrowed = true };
         try blas.matmulBf16WeightBiasBf16Out(ctx, projected, s[5], w[4], w[5], gemm_workspace, r.rows, r.hidden, r.hidden);
         try self.add(ctx, s[6], r.input, projected, r.rows * r.hidden);
         try self.norm(ctx, s[0], s[6], w[6], w[7], r.rows, r.hidden, r.epsilon);
-        if (r.fused_mlp and @import("lighton_vision_gemm.zig").supported(ctx.info.compute_major, ctx.info.compute_minor, r.rows, r.hidden, r.intermediate)) {
+        if (r.fused_mlp and @import("projection_epilogues_bf16.zig").supported(ctx.info.compute_major, ctx.info.compute_minor, r.rows, r.hidden, r.intermediate)) {
             try self.up.run(ctx, .{ .input = s[0], .weight = w[8], .bias = w[9], .output = s[7], .rows = r.rows, .hidden = r.hidden, .wide = r.intermediate, .round_before_gelu = true });
         } else {
             try blas.matmulBf16WeightBiasBf16Out(ctx, s[7], s[0], w[8], w[9], gemm_workspace, r.rows, r.hidden, r.intermediate);
             var gelu = [2]u64{ s[7].ptr, s[7].ptr };
             var count: u32 = @intCast(r.rows * r.intermediate);
             var gelu_args = [_]?*anyopaque{ &gelu[0], &gelu[1], &count };
-            try self.launch(ctx, 2, (r.rows * r.intermediate + 255) / 256, &gelu_args);
+            try self.launch(ctx, .gelu, (r.rows * r.intermediate + 255) / 256, &gelu_args);
         }
-        if (r.fused_mlp and @import("lighton_vision_gemm.zig").supportedDown(ctx.info.compute_major, ctx.info.compute_minor, r.rows, r.hidden, r.intermediate, true)) {
+        if (r.fused_mlp and @import("projection_epilogues_bf16.zig").supportedDown(ctx.info.compute_major, ctx.info.compute_minor, r.rows, r.hidden, r.intermediate, true)) {
             try self.down.run(ctx, .{ .input = s[7], .weight = w[10], .bias = w[11], .residual = s[6], .output = r.output, .rows = r.rows, .hidden = r.hidden, .wide = r.intermediate, .bf16_io = true });
         } else {
             try blas.matmulBf16WeightBiasBf16Out(ctx, s[0], s[7], w[10], w[11], gemm_workspace, r.rows, r.intermediate, r.hidden);
@@ -230,10 +212,4 @@ test "LightOnOCR3 BF16 vision layout keeps aligned disjoint scratch and bounded 
     try std.testing.expectError(error.InvalidShape, Layout.init(65537, 1024, 4096, 0));
     try std.testing.expectError(error.InvalidShape, Layout.init(1, 1024, 3072, 0));
     try std.testing.expectError(error.Overflow, Layout.init(1, 1024, 4096, std.math.maxInt(usize)));
-    try std.testing.expectEqual(Precision.f32, try Precision.resolve(null));
-    try std.testing.expectEqual(Precision.bf16_vision, try Precision.resolve("bf16_vision"));
-    try std.testing.expectError(error.InvalidLightOnPrecisionProfile, Precision.resolve("bf16"));
-    try std.testing.expectEqual(Precision.f32, try Precision.resolveWithAttention("bf16_vision", false));
-    try std.testing.expectEqual(Precision.bf16_vision, try Precision.resolveWithAttention("bf16_vision", true));
-    try std.testing.expectError(error.InvalidLightOnPrecisionProfile, Precision.resolveWithAttention("typo", false));
 }

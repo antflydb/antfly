@@ -19,7 +19,7 @@ const context = @import("ops/cuda/context.zig");
 const buffer = @import("ops/cuda/buffer.zig");
 const cublas = @import("ops/cuda/cublaslt.zig");
 const cudnn = @import("ops/cuda/cudnn_sdpa.zig");
-const vision = @import("ops/cuda/lighton_vision_bf16.zig");
+const vision = @import("ops/cuda/encoder_block_bf16.zig");
 const Packet = extern struct {
     input: u64,
     output: u64,

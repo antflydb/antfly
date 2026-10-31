@@ -13,13 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exact-boundary LightOn vision up projection and GELU, Triton 3.7.1/SM121.
+"""Exact-boundary BF16 projection and GELU, Triton 3.7.1/SM121.
 No FP8/FP4, no split-K, FP32 tensor-core accumulation and original bias values.
 """
 
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
+from projection_dot_bias_bf16 import dot_bias
 
 
 @triton.jit(do_not_specialize=["rows"], do_not_specialize_on_alignment=["rows"])
@@ -36,34 +37,7 @@ def lighton_vision_up(
     BN: tl.constexpr,
     BK: tl.constexpr,
 ):
-    m = tl.program_id(0) * BM + tl.arange(0, BM)
-    n = tl.program_id(1) * BN + tl.arange(0, BN)
-    kk = tl.arange(0, BK)
-    acc = tl.full((BM, BN), 0, tl.float32)
-    for block in range(tl.cdiv(K, BK)):
-        k = block * BK + kk
-        a = tl.load(
-            w + m[:, None] * K + k[None, :],
-            (m[:, None] < N) & (k[None, :] < K),
-            other=0,
-        )
-        b = tl.load(
-            x + n[None, :] * K + k[:, None],
-            (n[None, :] < rows) & (k[:, None] < K),
-            other=0,
-        )
-        acc = tl.dot(a, b, acc)
-    bv = tl.load(bias + m, m < N, other=0).to(tl.float32)
-    # Prevent moving bias into the tensor-core accumulator: the original
-    # operator publishes a separately rounded FP32 sum before activation.
-    value = tl.inline_asm_elementwise(
-        "add.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
-        args=[acc, bv[:, None]],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    m, n, value = dot_bias(x, w, bias, rows, K, N, BM, BN, BK)
     if ROUND_BEFORE:
         value = value.to(tl.bfloat16, fp_downcast_rounding="rtne").to(tl.float32)
     t = 0.7978845608028654 * (value + ((0.044715 * value) * value) * value)
@@ -125,7 +99,7 @@ def generate(output, libdevice_path):
             meta = compiled.metadata
             assert meta.shared == 24576 and meta.num_warps == 4 and meta.num_ctas == 1
             assert meta.global_scratch_size == 0 and meta.profile_scratch_size == 0
-            name = f"lighton_vision_up_{hidden}_{'bf16' if rounded else 'f32'}.ptx"
+            name = f"projection_gelu_sm121_k{hidden}_n{wide}_bias_{'bf16' if rounded else 'f32'}.ptx"
             data = compiled.asm["ptx"].encode()
             (output / name).write_bytes(data)
             records.append(
@@ -136,7 +110,7 @@ def generate(output, libdevice_path):
                     threads=128,
                 )
             )
-    (output / "lighton_vision_up_manifest.json").write_text(
+    (output / "projection_gelu_bf16_manifest.json").write_text(
         json.dumps(
             dict(
                 triton=triton.__version__,

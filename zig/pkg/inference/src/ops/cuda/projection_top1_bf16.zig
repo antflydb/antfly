@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Fused 0.8B head projection/top1. F32 input is rounded to BF16 exactly
+//! Fused static K1024/N248320 projection/top1. F32 input is rounded to BF16 exactly
 //! as in the ordinary projection; no full vocabulary logits are materialized.
 //! All buffers belong to the caller and contain actual request rows only.
 const std = @import("std");
@@ -42,38 +42,28 @@ pub fn validate(r: Request) !void {
     const regions = [_]buffer.DeviceBuffer{ r.input, r.weight, r.suppress, r.partial, r.indices, r.output };
     const lengths = [_]usize{ r.rows * 1024 * 4, 248320 * 1024 * 2, try std.math.mul(usize, r.suppress_count, 4), r.rows * tiles * 4, r.rows * tiles * 4, r.rows * 4 };
     const alignment = [_]u64{ 4, 16, 4, 16, 16, 4 };
-    var ends: [6]u64 = undefined;
-    for (regions, lengths, alignment, 0..) |region, length, align_bytes, i| {
-        if (length != 0 and (region.ptr == 0 or region.ptr % align_bytes != 0 or region.len < length)) return error.InvalidShape;
-        ends[i] = try std.math.add(u64, region.ptr, length);
-    }
-    for (3..6) |written| for (0..written) |other| {
-        if (lengths[other] != 0 and regions[written].ptr < ends[other] and regions[other].ptr < ends[written]) return error.InvalidShape;
-    };
+    try buffer.validateRegions(6, regions, lengths, alignment, 3);
 }
 
+// These historical device entries are retained compatibility ABI names.
+const Programs = @import("embedded_module.zig").EmbeddedPrograms(.{
+    .partial = .{ .image = @embedFile("projection_top1_bf16_k1024_n248320_partial.ptx") ++ "\x00", .entry = "lighton_head_top1_partial" },
+    .finish = .{ .image = @embedFile("projection_top1_bf16_k1024_n248320_finish.ptx") ++ "\x00", .entry = "lighton_head_top1_finish" },
+});
+
 pub const Module = struct {
-    modules: [2]driver.CUmodule = @splat(null),
-    functions: [2]driver.CUfunction = @splat(null),
+    programs: Programs = .{},
     calls: usize = 0,
 
     pub fn init(self: *Module, ctx: *context.CudaContext) !void {
-        if (self.modules[1] != null) return;
-        try ctx.makeCurrent();
+        if (self.programs.modules[1] != null) return;
         errdefer self.deinit(ctx);
-        const images = [_][]const u8{ @embedFile("lighton_head_top1_partial.ptx") ++ "\x00", @embedFile("lighton_head_top1_finish.ptx") ++ "\x00" };
-        const names = [_][:0]const u8{ "lighton_head_top1_partial", "lighton_head_top1_finish" };
-        for (images, names, 0..) |image, name, i| {
-            try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&self.modules[i], image.ptr, 0, null, null));
-            try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&self.functions[i], self.modules[i], name.ptr));
-        }
+        try self.programs.init(ctx, .partial);
+        try self.programs.init(ctx, .finish);
     }
 
     pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
-        ctx.makeCurrent() catch return;
-        for (self.modules) |module| if (module != null) {
-            _ = ctx.driver.fns.cuModuleUnload(module);
-        };
+        self.programs.deinitChecked(ctx) catch return;
         self.* = .{};
     }
 
@@ -87,16 +77,16 @@ pub const Module = struct {
         // The pinned generator asserts both hidden ABI scratch sizes are zero.
         var scratch: u64 = 0;
         var first = [_]?*anyopaque{ &p[0], &p[1], &p[2], &p[3], &p[4], &rows, &count, &scratch, &scratch };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.functions[0], tiles, 1, 1, 256, 1, 1, 32768, ctx.stream, &first, null));
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(.partial), tiles, 1, 1, 256, 1, 1, 32768, ctx.stream, &first, null));
         ctx.noteKernelLaunch();
         var last = [_]?*anyopaque{ &p[2], &p[3], &p[5], &scratch, &scratch };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.functions[1], @intCast(r.rows), 1, 1, 128, 1, 1, 16, ctx.stream, &last, null));
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(.finish), @intCast(r.rows), 1, 1, 128, 1, 1, 16, ctx.stream, &last, null));
         ctx.noteKernelLaunch();
         self.calls += 1;
     }
 };
 
-test "LightOnOCR3 fused head bounds alignment and scratch ownership" {
+test "CUDA BF16 projection top1 bounds alignment and scratch ownership" {
     const valid = Request{ .input = .{ .ptr = 0x100004, .len = 7 * 1024 * 4 }, .weight = .{ .ptr = 0x10000000, .len = 248320 * 1024 * 2 }, .partial = .{ .ptr = 0x40000000, .len = 7 * tiles * 4 }, .indices = .{ .ptr = 0x50000000, .len = 7 * tiles * 4 }, .suppress = .{}, .output = .{ .ptr = 0x60000004, .len = 7 * 4 }, .rows = 7, .suppress_count = 0 };
     try validate(valid);
     inline for (.{ "input", "weight", "partial", "indices", "output" }) |field| {

@@ -185,13 +185,20 @@ library and checker on that CUDA host with PyTorch, Transformers, safetensors
 and cuDNN available. This helper is not linked into serving binaries.
 
 ```sh
-mkdir -p zig-out
+mkdir -p zig-out .zig-cache/qualification
+python3 - <<'PYOPTS'
+from pathlib import Path
+Path(".zig-cache/qualification/options.zig").write_text(
+    'pub const enable_cuda = true;\n'
+    'pub const cuda_artifacts = "fatbin";\n')
+PYOPTS
 zig build-lib -dynamic -fPIC -OReleaseFast -lc \
   -target aarch64-linux.7.0...7.0-gnu.2.39 \
   -mcpu cortex_a725+aes+sha2+sha3+sm4-perfmon-spe \
-  --dep antfly_platform \
-  -Mroot=zig/pkg/inference/src/lighton_vision_bf16_qualification.zig \
+  --dep antfly_platform --dep build_options \
+  -Mroot=zig/pkg/inference/src/encoder_block_bf16_qualification.zig \
   -Mantfly_platform=zig/lib/platform/src/root.zig \
+  -Mbuild_options=.zig-cache/qualification/options.zig \
   --cache-dir .zig-cache/local --global-cache-dir .zig-cache/global \
   -femit-bin=zig-out/libvision.so
 python3 zig/pkg/inference/scripts/lightonocr3/check_cuda_lighton_bf16_vision.py \
@@ -206,11 +213,11 @@ PTX on a CUDA build host with the pinned NVCC version in the manifest:
 
 ```sh
 nvcc -ptx -arch=sm_80 -O3 --fmad=false -std=c++17 \
-  zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision_bf16.cu \
-  -o zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.ptx
+  zig/pkg/inference/src/ops/cuda/prototypes/encoder_block_phases_bf16.cu \
+  -o zig/pkg/inference/src/ops/cuda/encoder_block_phases_bf16.ptx
 python3 - <<'PYGEN'
 from pathlib import Path
-p = Path("zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.ptx")
+p = Path("zig/pkg/inference/src/ops/cuda/encoder_block_phases_bf16.ptx")
 p.write_bytes(p.read_bytes().rstrip() + b"\n")
 PYGEN
 ```
@@ -220,15 +227,15 @@ manifest and normalize its final newline before building:
 
 ```sh
 nvcc --ptx -arch=compute_75 -O3 --fmad=false -std=c++17 \
-  zig/pkg/inference/src/ops/cuda/prototypes/lighton_attention_inputs.cu \
-  -o zig/pkg/inference/src/ops/cuda/lighton_attention_inputs.ptx
+  zig/pkg/inference/src/ops/cuda/prototypes/attention_inputs_partial_mrope_f32.cu \
+  -o zig/pkg/inference/src/ops/cuda/attention_inputs_partial_mrope_f32.ptx
 python3 - <<'PYGEN'
 from pathlib import Path
-p = Path("zig/pkg/inference/src/ops/cuda/lighton_attention_inputs.ptx")
+p = Path("zig/pkg/inference/src/ops/cuda/attention_inputs_partial_mrope_f32.ptx")
 p.write_bytes(p.read_bytes().rstrip() + b"\n")
 PYGEN
 python3 zig/pkg/inference/scripts/lightonocr3/check_cuda_lighton_attention_inputs.py \
-  --runtime-root . --ptx zig/pkg/inference/src/ops/cuda/lighton_attention_inputs.ptx \
+  --runtime-root . --ptx zig/pkg/inference/src/ops/cuda/attention_inputs_partial_mrope_f32.ptx \
   --model-08 "$MODEL_08" --model-4b "$MODEL_4B" --output "$NEW_REPORT_JSON"
 ```
 
@@ -241,7 +248,7 @@ Python nor Triton. PTX 9.0 targets the qualified driver. From the repository roo
 
 ```sh
 TRITON_CACHE_DIR="$PWD/.zig-cache/triton-vision" python3 \
-  zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision_gemm.py \
+  zig/pkg/inference/src/ops/cuda/prototypes/projection_gelu_bf16.py \
   --libdevice /usr/local/cuda-13.0/nvvm/libdevice/libdevice.10.bc \
   --output zig/pkg/inference/src/ops/cuda
 ```
@@ -255,17 +262,17 @@ serving requires neither Python nor Triton. Generate outside tracked source path
 
 ```sh
 TRITON_CACHE_DIR="$PWD/.zig-cache/triton-ocr" python3 \
-  zig/pkg/inference/src/ops/cuda/prototypes/lighton_head.py \
+  zig/pkg/inference/src/ops/cuda/prototypes/projection_top1_bf16.py \
   --output .zig-cache/generated-lighton-head
 cp .zig-cache/generated-lighton-head/*.ptx zig/pkg/inference/src/ops/cuda/
 TRITON_CACHE_DIR="$PWD/.zig-cache/triton-ocr" python3 \
-  zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision_down.py \
+  zig/pkg/inference/src/ops/cuda/prototypes/projection_residual_bf16.py \
   --output .zig-cache/generated-lighton-down
 cp .zig-cache/generated-lighton-down/*.ptx zig/pkg/inference/src/ops/cuda/
 python3 zig/pkg/inference/scripts/lightonocr3/check_cuda_lighton_head.py \
   --model-dir "$MODEL_08" \
-  --partial-ptx zig/pkg/inference/src/ops/cuda/lighton_head_top1_partial.ptx \
-  --finish-ptx zig/pkg/inference/src/ops/cuda/lighton_head_top1_finish.ptx \
+  --partial-ptx zig/pkg/inference/src/ops/cuda/projection_top1_bf16_k1024_n248320_partial.ptx \
+  --finish-ptx zig/pkg/inference/src/ops/cuda/projection_top1_bf16_k1024_n248320_finish.ptx \
   --output "$NEW_REPORT_JSON"
 ```
 
@@ -273,3 +280,8 @@ The head uses 256 threads/32 KiB shared memory plus a small reduction; vision do
 uses 128 threads/48 KiB. Both generators assert zero global/profile scratch. The
 existing fused-vision control selects the original path when disabled;
 `ANTFLY_CUDA_DISABLE_LIGHTON_FUSED_HEAD=1` restores dense head projection/argmax.
+
+Canonical native owners and producers now use operation/layout/precision names.
+Historical device symbols and the original qualification JSON retain their
+compatibility names. The top1 finish generator requires exactly 16 shared bytes,
+matching the serving launch, rather than accepting a larger unrelated ceiling.

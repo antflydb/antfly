@@ -130,13 +130,14 @@ def generate(output):
         assert (
             meta.shared == 32768
             if fn is lighton_head_top1_partial
-            else meta.shared <= 4096
+            else meta.shared == 16
         )
         data = compiled.asm["ptx"].encode()
-        (output / (fn.__name__ + ".ptx")).write_bytes(data)
+        name = "projection_top1_bf16_k1024_n248320_" + ("partial" if fn is lighton_head_top1_partial else "finish") + ".ptx"
+        (output / name).write_bytes(data)
         records.append(
             dict(
-                file=fn.__name__ + ".ptx",
+                file=name,
                 sha256=hashlib.sha256(data).hexdigest(),
                 shared=meta.shared,
                 threads=meta.num_warps * 32,

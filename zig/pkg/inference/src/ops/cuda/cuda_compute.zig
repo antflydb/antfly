@@ -2247,6 +2247,21 @@ const OcrTempScanProfile = struct {
     }
 };
 
+// Model-facing compatibility labels stay in the adapter, outside native programs.
+const EncoderPrecisionProfile = enum {
+    f32,
+    bf16_vision,
+
+    pub fn resolve(raw: ?[]const u8) !EncoderPrecisionProfile {
+        return if (raw) |value| std.meta.stringToEnum(EncoderPrecisionProfile, value) orelse error.InvalidLightOnPrecisionProfile else .f32;
+    }
+
+    pub fn resolveWithAttention(raw: ?[]const u8, attention_enabled: bool) !EncoderPrecisionProfile {
+        const selected = try resolve(raw);
+        return if (attention_enabled) selected else .f32;
+    }
+};
+
 pub const CudaCompute = struct {
     /// Cache only immutable, resident checkpoint norm weights. The ordinary
     /// addScalar operation remains valid for mutable request tensors.
@@ -2316,7 +2331,7 @@ pub const CudaCompute = struct {
     pub fn lightOnBf16VisionBlock(cb: *const ops.ComputeBackend, input_ct: CT, weights: [12]CT, positions: []const u32, rows: usize, hidden: usize, intermediate: usize, batch: usize, eps: f32, theta: f32) !?CT {
         if (!lightOnBf16VisionEnabled(cb)) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        const compact = @import("lighton_vision_bf16.zig");
+        const compact = @import("encoder_block_bf16.zig");
         _ = try compact.Layout.init(rows, hidden, intermediate, 0);
         if (batch == 0 or batch > 16 or rows % batch != 0 or rows / batch > 4096 or positions.len != try checkedMul(rows, 2)) return error.InvalidShape;
         if (!std.math.isFinite(eps) or eps <= 0 or !std.math.isFinite(theta) or theta <= 0) return error.InvalidShape;
@@ -2458,7 +2473,7 @@ pub const CudaCompute = struct {
             const cb = self.computeBackend();
             const input = tensorFromCt(hidden);
             const weight = tensorFromCt(head);
-            const fused = @import("lighton_head.zig");
+            const fused = @import("projection_top1_bf16.zig");
             if (!self.lighton_fused_head_disabled and fused.supported(self.ctx.info.compute_major, self.ctx.info.compute_minor, burst.rows, burst.hidden, burst.vocab) and
                 weight.dtype == .bf16 and weight.quant_type == null and !weight.strict_resident_training and
                 !input.strict_resident_training and !self.resident_training_cache and self.lazy_host_store == null and
@@ -3195,7 +3210,7 @@ pub const CudaCompute = struct {
         const dst = tensorFromCt(output).buffer;
         const blas = &(self.cublaslt orelse return null);
         try self.lighton_vision_fused.norm(&self.ctx, .{ normalized.ptr, input.buffer.ptr, tensors[0].buffer.ptr, tensors[1].buffer.ptr }, @intCast(rows), @intCast(dim), eps);
-        if (@import("lighton_vision_gemm.zig").supported(self.ctx.info.compute_major, self.ctx.info.compute_minor, rows, dim, hidden)) {
+        if (@import("projection_epilogues_bf16.zig").supported(self.ctx.info.compute_major, self.ctx.info.compute_minor, rows, dim, hidden)) {
             try self.lighton_vision_up.run(&self.ctx, .{ .input = normalized, .weight = tensors[2].buffer, .bias = tensors[3].buffer, .output = activated, .rows = rows, .hidden = dim, .wide = hidden, .round_before_gelu = false });
         } else {
             var projected = try allocDeviceBuffer(self, wide * 4);
@@ -3209,7 +3224,7 @@ pub const CudaCompute = struct {
             };
             try self.lighton_vision_fused.gelu(&self.ctx, .{ activated.ptr, projected.ptr, tensors[3].buffer.ptr }, @intCast(wide), @intCast(hidden));
         }
-        if (@import("lighton_vision_gemm.zig").supportedDown(self.ctx.info.compute_major, self.ctx.info.compute_minor, rows, dim, hidden, false)) {
+        if (@import("projection_epilogues_bf16.zig").supportedDown(self.ctx.info.compute_major, self.ctx.info.compute_minor, rows, dim, hidden, false)) {
             try self.lighton_vision_down.run(&self.ctx, .{ .input = activated, .weight = tensors[4].buffer, .bias = tensors[5].buffer, .residual = input.buffer, .output = dst, .rows = rows, .hidden = dim, .wide = hidden, .bf16_io = false });
         } else {
             blas.matmulBf16WeightF32Out(&self.ctx, dst, activated, tensors[4].buffer, cublasLtWorkspace(self), rows, hidden, dim) catch |err| switch (err) {
@@ -4085,13 +4100,13 @@ pub const CudaCompute = struct {
     lighton_norm_weight_cache_hits: usize = 0,
     lighton_norm_weight_cache_misses: usize = 0,
     lighton_vision_fused: @import("vision_fusions.zig").Module = .{},
-    lighton_vision_up: @import("lighton_vision_gemm.zig").Module = .{},
-    lighton_vision_down: @import("lighton_vision_gemm.zig").DownModule = .{},
-    lighton_head: @import("lighton_head.zig").Module = .{},
+    lighton_vision_up: @import("projection_epilogues_bf16.zig").Module = .{},
+    lighton_vision_down: @import("projection_epilogues_bf16.zig").DownModule = .{},
+    lighton_head: @import("projection_top1_bf16.zig").Module = .{},
     lighton_fused_head_disabled: bool = false,
-    lighton_precision: @import("lighton_vision_bf16.zig").Precision = .f32,
-    lighton_vision_bf16: @import("lighton_vision_bf16.zig").Module = .{},
-    lighton_attention_inputs: @import("lighton_attention_inputs.zig").Module = .{},
+    lighton_precision: EncoderPrecisionProfile = .f32,
+    lighton_vision_bf16: @import("encoder_block_bf16.zig").Module = .{},
+    lighton_attention_inputs: @import("attention_inputs_f32.zig").Module = .{},
     florence_bart_ffn_enabled: bool = false,
     florence_bart_ffn_calls: usize = 0,
     florence_fused_append_enabled: bool = false,
@@ -5229,7 +5244,7 @@ pub const CudaCompute = struct {
             .florence_channel_tc_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_CHANNEL_TC"),
             .florence_fused_bias_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_BIAS"),
             .florence_fused_depthwise_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_DEPTHWISE"),
-            .lighton_precision = try @import("lighton_vision_bf16.zig").Precision.resolveWithAttention(platform.env.getenv("ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE"), platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_VISION_CUDNN", true)),
+            .lighton_precision = try EncoderPrecisionProfile.resolveWithAttention(platform.env.getenv("ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE"), platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_VISION_CUDNN", true)),
             .lighton_fused_vision_mlp_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_MLP"),
             .lighton_fused_vision_qkv_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_QKV"),
             .lighton_norm_weight_cache_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE"),
@@ -35090,7 +35105,7 @@ test "LightOnOCR3 CUDA fused vision MLP preserves the original BF16 boundaries a
             try std.testing.expectError(error.InvalidTensorShape, CudaCompute.lightOnVisionMlp(&cb, input, weights, rows, dim, hidden, 0));
         }
         try std.testing.expectEqual(@as(usize, 4), compute.lighton_vision_fused.calls);
-        const expected_down_calls: usize = if (@import("lighton_vision_gemm.zig").supportedDown(compute.ctx.info.compute_major, compute.ctx.info.compute_minor, 8192, dim, hidden, false)) 2 else 0;
+        const expected_down_calls: usize = if (@import("projection_epilogues_bf16.zig").supportedDown(compute.ctx.info.compute_major, compute.ctx.info.compute_minor, 8192, dim, hidden, false)) 2 else 0;
         try std.testing.expectEqual(expected_down_calls, compute.lighton_vision_down.calls);
     }
 }
@@ -37404,4 +37419,13 @@ test "LightOnOCR3 CUDA fused head matches dense projection with suppressed ties 
         try std.testing.expectEqualSlices(f32, values, unchanged);
     }
     try std.testing.expectEqual(@as(usize, 6), compute.lighton_head.calls);
+}
+
+test "CUDA encoder precision profile preserves model-facing compatibility labels" {
+    try std.testing.expectEqual(EncoderPrecisionProfile.f32, try EncoderPrecisionProfile.resolve(null));
+    try std.testing.expectEqual(EncoderPrecisionProfile.bf16_vision, try EncoderPrecisionProfile.resolve("bf16_vision"));
+    try std.testing.expectError(error.InvalidLightOnPrecisionProfile, EncoderPrecisionProfile.resolve("bf16"));
+    try std.testing.expectEqual(EncoderPrecisionProfile.f32, try EncoderPrecisionProfile.resolveWithAttention("bf16_vision", false));
+    try std.testing.expectEqual(EncoderPrecisionProfile.bf16_vision, try EncoderPrecisionProfile.resolveWithAttention("bf16_vision", true));
+    try std.testing.expectError(error.InvalidLightOnPrecisionProfile, EncoderPrecisionProfile.resolveWithAttention("typo", false));
 }

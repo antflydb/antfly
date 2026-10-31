@@ -17,6 +17,7 @@
 
 import triton
 import triton.language as tl
+from projection_dot_bias_bf16 import dot_bias
 
 
 @triton.jit(do_not_specialize=["rows"], do_not_specialize_on_alignment=["rows"])
@@ -34,33 +35,7 @@ def lighton_vision_down(
     BK: tl.constexpr,
     BF16_IO: tl.constexpr,
 ):
-    m = tl.program_id(0) * BM + tl.arange(0, BM)
-    n = tl.program_id(1) * BN + tl.arange(0, BN)
-    kk = tl.arange(0, BK)
-    acc = tl.full((BM, BN), 0, tl.float32)
-    for block in range(tl.cdiv(K, BK)):
-        k = block * BK + kk
-        a = tl.load(
-            w + m[:, None] * K + k[None, :],
-            (m[:, None] < N) & (k[None, :] < K),
-            other=0,
-        )
-        b = tl.load(
-            x + n[None, :] * K + k[:, None],
-            (n[None, :] < rows) & (k[:, None] < K),
-            other=0,
-        )
-        acc = tl.dot(a, b, acc)
-
-    bv = tl.load(bias + m, m < N, other=0).to(tl.float32)
-    value = tl.inline_asm_elementwise(
-        "add.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
-        args=[acc, bv[:, None]],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    m, n, value = dot_bias(x, w, bias, rows, K, N, BM, BN, BK)
     if BF16_IO:
         value = value.to(tl.bfloat16, fp_downcast_rounding="rtne").to(tl.float32)
     rv = tl.load(
@@ -121,7 +96,7 @@ def generate(output):
             meta = compiled.metadata
             assert meta.global_scratch_size == 0 and meta.profile_scratch_size == 0
             assert meta.num_ctas == 1 and meta.shared == 49152 and meta.num_warps == 4
-            name = f"lighton_vision_down_{hidden}_{'bf16' if bf16 else 'f32'}.ptx"
+            name = f"projection_residual_sm121_k{wide}_n{hidden}_io_{'bf16' if bf16 else 'f32'}.ptx"
             data = compiled.asm["ptx"].encode()
             (output / name).write_bytes(data)
             records.append(

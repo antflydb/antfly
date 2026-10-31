@@ -183,20 +183,22 @@ def source_ledger(args):
                                       text=True).splitlines()
     added = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard',
                                      'zig/pkg/inference/src'], cwd=root, text=True).splitlines()
+    baseline = subprocess.check_output(['git', 'ls-tree', '-r', '--name-only', args.revision,
+                                        '--', 'zig/pkg/inference/src'], cwd=root, text=True).splitlines()
     receipt = {'baseline_revision': args.revision, 'files': [], 'authored': {}, 'generated': {}}
     totals = {kind: [0, 0, 0, 0] for kind in ('authored', 'generated')}
     def regions(data):
         authored, generated = [], []
-        inside = False
+        depth = 0
         for line in data.splitlines(keepends=True):
-            if re.match(rb'\s*// quant-kernel-codegen:begin', line):
-                inside = True
-            (generated if inside else authored).append(line)
-            if re.match(rb'\s*// quant-kernel-codegen:end', line):
-                inside = False
+            if re.match(rb'\s*// (?:quant-kernel|tile)-codegen:begin', line):
+                depth += 1
+            (generated if depth else authored).append(line)
+            if re.match(rb'\s*// (?:quant-kernel|tile)-codegen:end', line):
+                depth = max(0, depth - 1)
         return {'authored': b''.join(authored), 'generated': b''.join(generated)}
-    for name in sorted(set(tracked + added)):
-        if Path(name).suffix not in {'.zig', '.m', '.cu', '.cuh', '.h', '.metal'}:
+    for name in sorted(set(baseline + tracked + added)):
+        if Path(name).suffix not in {'.zig', '.m', '.cu', '.cuh', '.h', '.metal', '.py', '.ptx'}:
             continue
         old = subprocess.run(['git', 'show', args.revision + ':' + name], cwd=root,
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
@@ -204,7 +206,7 @@ def source_ledger(args):
         new = current.read_bytes() if current.is_file() else b''
         if old == new:
             continue
-        if '/generated/' in name:
+        if '/generated/' in name or Path(name).suffix == '.ptx':
             parts = ({'authored': b'', 'generated': old}, {'authored': b'', 'generated': new})
         else:
             parts = (regions(old), regions(new))
