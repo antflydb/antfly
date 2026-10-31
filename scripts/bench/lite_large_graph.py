@@ -33,12 +33,13 @@ import hashlib
 import json
 import os
 import random
+import resource
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from lite_contention import measurement_stats, sdk
+from lite_contention import measurement_stats, percentile, sdk
 
 
 def emit(**row):
@@ -204,6 +205,63 @@ def run(args):
                 proof_failures=after["allocator_proof_failures"]
                 - before["allocator_proof_failures"],
             )
+        if args.warm_iterations:
+            # Exclude opening, initial proofs, and foreign handoff from the
+            # steady-writer cost. Both mutations warm their namespace first.
+            db.batch_json(
+                {"inserts": {"warm-measured": {"nonce": run_nonce, "sequence": -1}}}
+            )
+            db.sql(
+                f"INSERT INTO large_proof_numbers (n, _id) VALUES (7, 'warm-{sql_key}-setup')"
+            )
+            for name in ("batch", "sql"):
+                before = measurement_stats(db)
+                usage_before = resource.getrusage(resource.RUSAGE_SELF)
+                samples = []
+                began = time.monotonic()
+                for sequence in range(args.warm_iterations):
+                    started_ns = time.monotonic_ns()
+                    if name == "batch":
+                        db.batch_json(
+                            {
+                                "inserts": {
+                                    "warm-measured": {
+                                        "nonce": run_nonce,
+                                        "sequence": sequence,
+                                    }
+                                }
+                            }
+                        )
+                    else:
+                        db.sql(
+                            f"INSERT INTO large_proof_numbers (n, _id) VALUES (7, 'warm-{sql_key}-{sequence}')"
+                        )
+                    samples.append(time.monotonic_ns() - started_ns)
+                wall_seconds = time.monotonic() - began
+                usage_after = resource.getrusage(resource.RUSAGE_SELF)
+                after = measurement_stats(db)
+                proof_walks = (
+                    after["allocator_proof_walks"] - before["allocator_proof_walks"]
+                )
+                if proof_walks != 0:
+                    raise RuntimeError(
+                        f"warm {name} unexpectedly repeated an allocator proof"
+                    )
+                emit(
+                    kind="warm_operation",
+                    operation=name,
+                    status="ok",
+                    calls=args.warm_iterations,
+                    wall_seconds=wall_seconds,
+                    calls_per_second=args.warm_iterations / wall_seconds,
+                    p50_ns=percentile(samples, 50),
+                    p95_ns=percentile(samples, 95),
+                    max_ns=max(samples),
+                    cpu_seconds=(usage_after.ru_utime + usage_after.ru_stime)
+                    - (usage_before.ru_utime + usage_before.ru_stime),
+                    proof_walks=proof_walks,
+                    timing_scope="single writer after batch and SQL warmup; no foreign publications",
+                )
         integrity = db.check()
         if not isinstance(integrity, dict) or integrity.get("valid") is not True:
             raise RuntimeError(f"integrity failed: {integrity}")
@@ -216,6 +274,15 @@ def run(args):
             rows = db.sql("SELECT n FROM large_proof_numbers WHERE _id=$1", [sql_key])[
                 "rows"
             ]
+            assert len(rows) == 1 and int(rows[0][0]) == 7
+        if args.warm_iterations:
+            measured = db.lookup("warm-measured")
+            assert measured["nonce"] == run_nonce
+            assert measured["sequence"] == args.warm_iterations - 1
+            rows = db.sql(
+                "SELECT n FROM large_proof_numbers WHERE _id=$1",
+                [f"warm-{sql_key}-{args.warm_iterations - 1}"],
+            )["rows"]
             assert len(rows) == 1 and int(rows[0][0]) == 7
         assert (
             hashlib.sha256(db.lookup("seed-0")["payload"].encode()).hexdigest()
@@ -247,6 +314,12 @@ if __name__ == "__main__":
         parser.add_argument("--directory", required=True)
         parser.add_argument("--records", type=int, default=12288)
         parser.add_argument(
+            "--warm-iterations",
+            type=int,
+            default=0,
+            help="also measure steady batch and SQL writes after excluding initial proof work",
+        )
+        parser.add_argument(
             "--reuse-fixture",
             action="store_true",
             help="resume this synthetic fixture without reseeding",
@@ -260,6 +333,8 @@ if __name__ == "__main__":
         arguments = parser.parse_args()
         if arguments.certified_handoff and arguments.foreign_library:
             parser.error("--certified-handoff cannot use --foreign-library")
+        if arguments.warm_iterations < 0:
+            parser.error("--warm-iterations must be nonnegative")
         if arguments.records < 16:
             parser.error("records must be at least 16")
         run(arguments)
