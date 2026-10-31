@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.create_embeddings_index_request_type import CreateEmbeddingsIndexRequestType
+from ..models.dense_index_algorithm import DenseIndexAlgorithm
 from ..models.derived_coverage_policy import DerivedCoveragePolicy
 from ..models.distance_metric import DistanceMetric
 from ..models.index_publication_policy import IndexPublicationPolicy
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     from ..models.enrichment_config import EnrichmentConfig
     from ..models.google_embedder_config import GoogleEmbedderConfig
     from ..models.index_execution_config import IndexExecutionConfig
+    from ..models.leann_index_config import LeannIndexConfig
     from ..models.ollama_embedder_config import OllamaEmbedderConfig
     from ..models.open_ai_embedder_config import OpenAIEmbedderConfig
     from ..models.open_router_embedder_config import OpenRouterEmbedderConfig
@@ -69,6 +71,12 @@ class CreateEmbeddingsIndexRequest:
         distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
             models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
             product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
+        algorithm (DenseIndexAlgorithm | Unset): Dense vector index algorithm (dense only). "hbc" (default) keeps
+            quantized codes plus full-precision rerank data. "leann" keeps only a pruned proximity graph and compact codes
+            (about 5% of the raw vectors) and recomputes exact distances for a few candidates per query from each document's
+            stored embedding, trading query-time work for index size. LEANN indexes do not yet support shard splits or
+            native index backups.
+        leann (LeannIndexConfig | Unset): Tuning for algorithm=leann dense indexes. All fields are optional.
         mem_only (bool | Unset): Whether to use in-memory only storage (dense only)
         embedder (AntflyEmbedderConfig | BedrockEmbedderConfig | CloudflareEmbedderConfig | CohereEmbedderConfig |
             GoogleEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig | OpenRouterEmbedderConfig | Unset |
@@ -100,6 +108,8 @@ class CreateEmbeddingsIndexRequest:
     source_artifact_name: str | Unset = UNSET
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
+    algorithm: DenseIndexAlgorithm | Unset = UNSET
+    leann: LeannIndexConfig | Unset = UNSET
     mem_only: bool | Unset = UNSET
     embedder: (
         AntflyEmbedderConfig
@@ -176,6 +186,14 @@ class CreateEmbeddingsIndexRequest:
         if not isinstance(self.distance_metric, Unset):
             distance_metric = self.distance_metric.value
 
+        algorithm: str | Unset = UNSET
+        if not isinstance(self.algorithm, Unset):
+            algorithm = self.algorithm.value
+
+        leann: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.leann, Unset):
+            leann = self.leann.to_dict()
+
         mem_only = self.mem_only
 
         embedder: dict[str, Any] | Unset
@@ -249,6 +267,10 @@ class CreateEmbeddingsIndexRequest:
             field_dict["template"] = template
         if distance_metric is not UNSET:
             field_dict["distance_metric"] = distance_metric
+        if algorithm is not UNSET:
+            field_dict["algorithm"] = algorithm
+        if leann is not UNSET:
+            field_dict["leann"] = leann
         if mem_only is not UNSET:
             field_dict["mem_only"] = mem_only
         if embedder is not UNSET:
@@ -277,6 +299,7 @@ class CreateEmbeddingsIndexRequest:
         from ..models.enrichment_config import EnrichmentConfig
         from ..models.google_embedder_config import GoogleEmbedderConfig
         from ..models.index_execution_config import IndexExecutionConfig
+        from ..models.leann_index_config import LeannIndexConfig
         from ..models.ollama_embedder_config import OllamaEmbedderConfig
         from ..models.open_ai_embedder_config import OpenAIEmbedderConfig
         from ..models.open_router_embedder_config import OpenRouterEmbedderConfig
@@ -341,6 +364,20 @@ class CreateEmbeddingsIndexRequest:
             distance_metric = UNSET
         else:
             distance_metric = DistanceMetric(_distance_metric)
+
+        _algorithm = d.pop("algorithm", UNSET)
+        algorithm: DenseIndexAlgorithm | Unset
+        if isinstance(_algorithm, Unset):
+            algorithm = UNSET
+        else:
+            algorithm = DenseIndexAlgorithm(_algorithm)
+
+        _leann = d.pop("leann", UNSET)
+        leann: LeannIndexConfig | Unset
+        if isinstance(_leann, Unset):
+            leann = UNSET
+        else:
+            leann = LeannIndexConfig.from_dict(_leann)
 
         mem_only = d.pop("mem_only", UNSET)
 
@@ -468,6 +505,8 @@ class CreateEmbeddingsIndexRequest:
             source_artifact_name=source_artifact_name,
             template=template,
             distance_metric=distance_metric,
+            algorithm=algorithm,
+            leann=leann,
             mem_only=mem_only,
             embedder=embedder,
             chunker=chunker,

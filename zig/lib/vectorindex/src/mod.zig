@@ -63,6 +63,7 @@ comptime {
         _ = @import("compact_subgroups.zig");
         _ = @import("search_results.zig");
         _ = @import("search_runtime.zig");
+        _ = @import("leann.zig");
     }
 }
 pub const posting_wal = @import("posting_wal.zig");
@@ -76,6 +77,9 @@ pub const hbc_index = @import("hbc_index.zig");
 pub const spfresh_index = @import("spfresh_index.zig");
 pub const hbc_transfer = @import("hbc_transfer.zig");
 pub const hbc_debug = @import("hbc_debug.zig");
+/// LEANN low-storage graph index (arXiv:2506.08276). Standalone; not yet
+/// selectable as a table index. See zig/LEANN.md.
+pub const leann = @import("leann.zig");
 
 pub const HBCConfig = types.HBCConfig;
 pub const CentroidDirectoryMode = types.HBCConfig.CentroidDirectoryMode;

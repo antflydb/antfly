@@ -39955,6 +39955,65 @@ components:
       description: Distance metric for the vector index (dense only). Use "cosine" for models trained
         with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product
         similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
+    DenseIndexAlgorithm:
+      x-go-type-skip-optional-pointer: true
+      type: string
+      enum:
+        - hbc
+        - leann
+      default: hbc
+      description: Dense vector index algorithm (dense only). "hbc" (default) keeps quantized codes plus
+        full-precision rerank data. "leann" keeps only a pruned proximity graph and compact codes (about
+        5% of the raw vectors) and recomputes exact distances for a few candidates per query from each
+        document's stored embedding, trading query-time work for index size. LEANN indexes do not yet
+        support shard splits or native index backups.
+    LeannIndexConfig:
+      type: object
+      additionalProperties: false
+      description: Tuning for algorithm=leann dense indexes. All fields are optional.
+      properties:
+        max_degree:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 4
+          maximum: 128
+          default: 30
+          description: Graph degree cap M. Most nodes keep M/5 neighbors after pruning; hubs keep up to
+            M.
+        quantizer:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - rabitq
+            - pq
+          default: rabitq
+          description: Compact code used to steer the graph walk. "rabitq" (default) carries error bounds,
+            so only candidates that can still reach the top k are recomputed. "pq" follows the LEANN paper's
+            fixed rerank ratio; prefer it only for very low dimensions (below about 64).
+        search_ef:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          maximum: 4096
+          default: 0
+          description: Beam width for searches. 0 picks the default for the quantizer (512 for rabitq,
+            64 for pq).
+        bound_scale:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: float
+          minimum: 0
+          maximum: 8
+          default: 1.0
+          description: Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates
+            and loses fewer true neighbors.
+        batch_size:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          maximum: 1024
+          default: 0
+          description: Candidates recomputed per batch. 0 uses k.
     IndexExecutionConfig:
       type: object
       additionalProperties: false
@@ -39970,8 +40029,9 @@ components:
     EmbeddingsIndexConfig:
       type: object
       description: Unified configuration for embeddings indexes. When sparse is true, creates a sparse
-        vector index (SPLADE inverted index). When sparse is false (default), creates a dense HBC vector
-        index. For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
+        vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index;
+        `algorithm` selects HBC (default) or LEANN. For dense indexes, dimension can be omitted if an
+        embedder is configured — it will be auto-detected.
       x-antfly-mutually-exclusive:
         - - sources
           - external
@@ -40059,6 +40119,11 @@ components:
             old.
         distance_metric:
           $ref: '#/components/schemas/DistanceMetric'
+        algorithm:
+          $ref: '#/components/schemas/DenseIndexAlgorithm'
+        leann:
+          $ref: '#/components/schemas/LeannIndexConfig'
+          description: LEANN tuning (dense only; requires algorithm=leann).
         mem_only:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -42670,6 +42735,10 @@ components:
           type: string
         distance_metric:
           $ref: '#/components/schemas/DistanceMetric'
+        algorithm:
+          $ref: '#/components/schemas/DenseIndexAlgorithm'
+        leann:
+          $ref: '#/components/schemas/LeannIndexConfig'
         mem_only:
           type: boolean
         embedder:

@@ -389,6 +389,9 @@ pub const ManagedDbOpenOptions = struct {
     /// workerless open, then reopen with the live HA gate before publishing the
     /// DB to any cache or caller.
     reconcile_for_replicated_apply: bool = false,
+    /// Raft data groups: LEANN graphs change only through leader-planned
+    /// records committed to the log.
+    leann_replication: bool = false,
     inference_api_url: ?[]const u8 = null,
     remote_capability_cache: ?*remote_capabilities.Cache = null,
     replication_write_gate: ?db_mod.ReplicationWriteGate = null,
@@ -623,6 +626,12 @@ pub fn managedIndexBackends(
     return .{ .dense_native_migration_policy_source = source };
 }
 
+fn managedIndexBackendsFor(open_options: ManagedDbOpenOptions) @TypeOf((db_mod.OpenOptions{}).index_backends) {
+    var out = managedIndexBackends(open_options.dense_native_migration_policy_source);
+    out.leann_replication = open_options.leann_replication;
+    return out;
+}
+
 pub fn prepareManagedSchemaBeforeIndexLoad(
     alloc: std.mem.Allocator,
     mode: ManagedDbOpenMode,
@@ -735,13 +744,14 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                     resolved.transaction_recovery = .{ .enabled = false };
                     resolved.text_merge = .{ .enabled = false };
                     resolved.index_backends.dense_native_migration_policy_source = open_options.dense_native_migration_policy_source;
+                    resolved.index_backends.leann_replication = open_options.leann_replication;
                     break :resolve_options resolved;
                 }
 
                 const base: db_mod.OpenOptions = .{
                     .lsm_cache = cache,
                     .hbc_cache = vector_cache,
-                    .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                    .index_backends = managedIndexBackendsFor(open_options),
                     .lsm_root_generation = root_generation,
                     .resource_manager = manager,
                     .backend_runtime = runtime,
@@ -765,7 +775,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .{
                             .lsm_cache = cache,
                             .hbc_cache = vector_cache,
-                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .index_backends = managedIndexBackendsFor(open_options),
                             .lsm_root_generation = root_generation,
                             .resource_manager = manager,
                             .backend_runtime = runtime,
@@ -785,7 +795,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .{
                             .lsm_cache = cache,
                             .hbc_cache = vector_cache,
-                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .index_backends = managedIndexBackendsFor(open_options),
                             .lsm_root_generation = root_generation,
                             .resource_manager = manager,
                             .backend_runtime = runtime,
@@ -812,7 +822,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .{
                             .lsm_cache = cache,
                             .hbc_cache = vector_cache,
-                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .index_backends = managedIndexBackendsFor(open_options),
                             .lsm_root_generation = root_generation,
                             .resource_manager = manager,
                             .backend_runtime = runtime,
@@ -833,7 +843,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                     .startup_catch_up => .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
-                        .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                        .index_backends = managedIndexBackendsFor(open_options),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
                         .backend_runtime = runtime,
@@ -876,7 +886,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .{
                             .lsm_cache = cache,
                             .hbc_cache = vector_cache,
-                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .index_backends = managedIndexBackendsFor(open_options),
                             .lsm_root_generation = root_generation,
                             .resource_manager = manager,
                             .backend_runtime = runtime,
@@ -900,7 +910,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .{
                             .lsm_cache = cache,
                             .hbc_cache = vector_cache,
-                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .index_backends = managedIndexBackendsFor(open_options),
                             .lsm_root_generation = root_generation,
                             .resource_manager = manager,
                             .backend_runtime = runtime,
@@ -923,7 +933,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .{
                             .lsm_cache = cache,
                             .hbc_cache = vector_cache,
-                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .index_backends = managedIndexBackendsFor(open_options),
                             .lsm_root_generation = root_generation,
                             .resource_manager = manager,
                             .backend_runtime = runtime,
@@ -943,7 +953,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .{
                             .lsm_cache = cache,
                             .hbc_cache = vector_cache,
-                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .index_backends = managedIndexBackendsFor(open_options),
                             .lsm_root_generation = root_generation,
                             .resource_manager = manager,
                             .backend_runtime = runtime,
@@ -962,7 +972,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .{
                             .lsm_cache = cache,
                             .hbc_cache = vector_cache,
-                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .index_backends = managedIndexBackendsFor(open_options),
                             .lsm_root_generation = root_generation,
                             .resource_manager = manager,
                             .backend_runtime = runtime,
@@ -982,7 +992,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .{
                             .lsm_cache = cache,
                             .hbc_cache = vector_cache,
-                            .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
+                            .index_backends = managedIndexBackendsFor(open_options),
                             .lsm_root_generation = root_generation,
                             .resource_manager = manager,
                             .backend_runtime = runtime,

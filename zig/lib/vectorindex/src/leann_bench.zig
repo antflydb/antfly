@@ -1,0 +1,357 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! LEANN recall / recomputation benchmark.
+//!
+//!   zig run -OReleaseFast lib/vectorindex/src/leann_bench.zig -- \
+//!       [--data PREFIX] [--n 100000] [--queries 200] [--dims 64] \
+//!       [--metric l2|cosine|ip] [--m 30] [--efc 128] [--quantizer pq|rabitq|both] \
+//!       [--unpruned 1] [--cost FILE]
+//!
+//! --cost names a measured embedder cost curve: one "batch_size milliseconds"
+//! pair per line (see scripts/leann_embed_cost.py). When given, the bench
+//! reports modeled embedding time per query, interpolating each recompute
+//! call's cost from the curve.
+//!
+//! PREFIX names two files, PREFIX.train.f32 and PREFIX.test.f32, each a
+//! little-endian u32 row count and u32 dimension followed by row-major f32s.
+//! Without --data the benchmark uses Gaussian clusters.
+
+const std = @import("std");
+const leann = @import("leann.zig");
+const Allocator = std.mem.Allocator;
+
+const Args = struct {
+    data: ?[]const u8 = null,
+    n: usize = 100_000,
+    queries: usize = 200,
+    dims: usize = 64,
+    metric: leann.Metric = .l2_squared,
+    m: u32 = 30,
+    efc: u32 = 128,
+    quantizer: ?leann.Quantizer = null,
+    unpruned: bool = false,
+    cost: ?[]const u8 = null,
+};
+
+/// Embedder cost curve: milliseconds per call at measured batch sizes,
+/// linearly interpolated (and extrapolated from the last two points).
+const CostCurve = struct {
+    sizes: []f64,
+    ms: []f64,
+
+    fn at(self: CostCurve, b: usize) f64 {
+        const x: f64 = @floatFromInt(b);
+        const n = self.sizes.len;
+        if (n == 1) return self.ms[0] * x / self.sizes[0];
+        var i: usize = 1;
+        while (i < n - 1 and self.sizes[i] < x) i += 1;
+        const x0 = self.sizes[i - 1];
+        const x1 = self.sizes[i];
+        const t = (x - x0) / (x1 - x0);
+        return @max(self.ms[i - 1] + t * (self.ms[i] - self.ms[i - 1]), 0);
+    }
+};
+
+/// EmbeddingSource that serves stored vectors and adds the modeled cost of
+/// each call.
+const CostSource = struct {
+    inner: leann.SliceEmbeddingSource,
+    curve: ?CostCurve,
+    modeled_ms: f64 = 0,
+
+    fn source(self: *CostSource) leann.EmbeddingSource {
+        return .{ .ctx = self, .recompute_fn = recompute };
+    }
+
+    fn recompute(ctx: *anyopaque, ids: []const u32, out: []f32) anyerror!void {
+        const self: *CostSource = @ptrCast(@alignCast(ctx));
+        if (self.curve) |c| self.modeled_ms += c.at(ids.len);
+        return self.inner.source().recompute(ids, out);
+    }
+};
+
+const Matrix = struct {
+    rows: usize,
+    dims: usize,
+    data: []f32,
+
+    fn row(self: Matrix, i: usize) []const f32 {
+        return self.data[i * self.dims ..][0..self.dims];
+    }
+};
+
+pub fn main(init: std.process.Init) !void {
+    var gpa_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer _ = gpa_state.deinit();
+    const alloc = gpa_state.allocator();
+    const io = init.io;
+
+    var stdout_buffer: [16 * 1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    const out = &stdout_writer.interface;
+    defer out.flush() catch {};
+
+    var args = Args{};
+    var it = std.process.Args.Iterator.init(init.minimal.args);
+    _ = it.skip();
+    while (it.next()) |flag| {
+        const value = it.next() orelse return error.MissingValue;
+        if (std.mem.eql(u8, flag, "--data")) {
+            args.data = value;
+        } else if (std.mem.eql(u8, flag, "--n")) {
+            args.n = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--queries")) {
+            args.queries = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--dims")) {
+            args.dims = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--m")) {
+            args.m = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--efc")) {
+            args.efc = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--quantizer")) {
+            args.quantizer = if (std.mem.eql(u8, value, "pq")) .pq else if (std.mem.eql(u8, value, "rabitq")) .rabitq else null;
+        } else if (std.mem.eql(u8, flag, "--unpruned")) {
+            args.unpruned = std.mem.eql(u8, value, "1");
+        } else if (std.mem.eql(u8, flag, "--cost")) {
+            args.cost = value;
+        } else if (std.mem.eql(u8, flag, "--metric")) {
+            args.metric = if (std.mem.eql(u8, value, "cosine")) .cosine else if (std.mem.eql(u8, value, "ip")) .inner_product else .l2_squared;
+        } else return error.UnknownFlag;
+    }
+
+    var train: Matrix = undefined;
+    var test_set: Matrix = undefined;
+    if (args.data) |prefix| {
+        train = try loadMatrix(alloc, io, prefix, "train", args.n);
+        test_set = try loadMatrix(alloc, io, prefix, "test", args.queries);
+    } else {
+        train = try synthetic(alloc, args.n, args.dims, 1);
+        test_set = try synthetic(alloc, args.queries, args.dims, 2);
+    }
+    defer alloc.free(train.data);
+    defer alloc.free(test_set.data);
+    const dims = train.dims;
+    const k = 10;
+
+    try out.print("dataset rows={d} dims={d} queries={d} metric={s} M={d} efC={d}\n", .{ train.rows, dims, test_set.rows, @tagName(args.metric), args.m, args.efc });
+    try out.flush();
+
+    const truth = try groundTruth(alloc, train, test_set, args.metric, k);
+    defer alloc.free(truth);
+
+    var curve: ?CostCurve = null;
+    defer if (curve) |c| {
+        alloc.free(c.sizes);
+        alloc.free(c.ms);
+    };
+    if (args.cost) |path| {
+        curve = try loadCost(alloc, io, path);
+        try out.print("embedder cost curve:", .{});
+        for (curve.?.sizes, curve.?.ms) |b, m| try out.print(" b={d}:{d:.1}ms", .{ b, m });
+        try out.print("\n", .{});
+    }
+    var src = CostSource{ .inner = .{ .vectors = train.data, .dims = dims }, .curve = curve };
+    const raw_bytes = train.rows * dims * @sizeOf(f32);
+
+    const Variant = struct { quantizer: leann.Quantizer, prune: bool };
+    var variants: [4]Variant = undefined;
+    var nv: usize = 0;
+    for ([_]leann.Quantizer{ .pq, .rabitq }) |qz| {
+        if (args.quantizer != null and args.quantizer.? != qz) continue;
+        variants[nv] = .{ .quantizer = qz, .prune = true };
+        nv += 1;
+        if (args.unpruned) {
+            variants[nv] = .{ .quantizer = qz, .prune = false };
+            nv += 1;
+        }
+    }
+
+    for (variants[0..nv]) |variant| {
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        var index = try leann.Index.build(alloc, .{ .dims = @intCast(dims), .metric = args.metric, .quantizer = variant.quantizer, .max_degree = args.m, .ef_construction = args.efc, .prune = variant.prune }, train.data);
+        defer index.deinit();
+        const build_ms = @as(f64, @floatFromInt(t0.untilNow(io, .awake).nanoseconds)) / 1e6;
+        const bytes = try index.serialize(alloc);
+        defer alloc.free(bytes);
+        const gs = index.graphStats();
+        try out.print("\n== {s} {s} graph: build {d:.1}s, avg degree {d:.2}, max {d}, hubs {d}, levels {d}, upper nodes {d}, repaired {d}, index {d:.2} MiB = {d:.1}% of raw f32 ({d:.2} MiB)\n", .{
+            @tagName(variant.quantizer),
+            if (variant.prune) "pruned" else "unpruned",
+            build_ms / 1000,
+            gs.avg_degree,
+            gs.max_degree,
+            gs.hubs,
+            gs.max_level,
+            gs.upper_nodes,
+            index.repaired,
+            mib(bytes.len),
+            100 * @as(f64, @floatFromInt(bytes.len)) / @as(f64, @floatFromInt(raw_bytes)),
+            mib(raw_bytes),
+        });
+        try out.print("{s:<22} {s:>5} {s:>9} {s:>12} {s:>9} {s:>9} {s:>11}\n", .{ "mode", "ef", "recall@10", "recomputed/q", "batches/q", "cpu ms/q", "embed ms/q" });
+        try out.flush();
+
+        const Mode = struct { name: []const u8, opts: leann.SearchOptions };
+        const pq_modes = [_]Mode{
+            .{ .name = "plain", .opts = .{ .two_level = false } },
+            .{ .name = "two-level a=0.1", .opts = .{ .rerank = .ratio, .rerank_ratio = 0.1 } },
+            .{ .name = "two-level+batch16", .opts = .{ .rerank = .ratio, .rerank_ratio = 0.1, .batch_size = 16 } },
+            .{ .name = "two-level+batch64", .opts = .{ .rerank = .ratio, .rerank_ratio = 0.3, .batch_size = 64 } },
+        };
+        const rq_modes = [_]Mode{
+            .{ .name = "two-level a=0.1", .opts = .{ .rerank = .ratio, .rerank_ratio = 0.1 } },
+            .{ .name = "bounds s=0.5", .opts = .{ .rerank = .bounds, .bound_scale = 0.5 } },
+            .{ .name = "bounds s=1", .opts = .{ .rerank = .bounds, .bound_scale = 1 } },
+            .{ .name = "bounds s=1.5", .opts = .{ .rerank = .bounds, .bound_scale = 1.5 } },
+            .{ .name = "bounds s=2", .opts = .{ .rerank = .bounds, .bound_scale = 2 } },
+            .{ .name = "bounds s=1 batch32", .opts = .{ .rerank = .bounds, .bound_scale = 1, .batch_size = 32 } },
+        };
+        const modes: []const Mode = if (variant.quantizer == .pq) &pq_modes else &rq_modes;
+        for (modes) |mode| {
+            const pq_efs = [_]u32{ 16, 32, 64, 128, 256 };
+            // The estimate-only walk costs no recomputation, so wider beams
+            // are cheap for bound-driven search.
+            const bound_efs = [_]u32{ 32, 64, 128, 256, 512, 1024 };
+            const efs: []const u32 = if (mode.opts.rerank == .bounds) &bound_efs else &pq_efs;
+            for (efs) |ef| {
+                var opts = mode.opts;
+                opts.k = k;
+                opts.ef = ef;
+                var hits: usize = 0;
+                var recomputed: u64 = 0;
+                var batches: u64 = 0;
+                src.modeled_ms = 0;
+                const s0 = std.Io.Timestamp.now(io, .awake);
+                for (0..test_set.rows) |qi| {
+                    var resp = try index.search(alloc, src.source(), test_set.row(qi), opts);
+                    defer resp.deinit(alloc);
+                    recomputed += resp.stats.recomputed;
+                    batches += resp.stats.batches;
+                    const gt = truth[qi * k ..][0..k];
+                    for (resp.results) |r| {
+                        if (std.mem.indexOfScalar(u32, gt, r.id) != null) hits += 1;
+                    }
+                }
+                const ns = s0.untilNow(io, .awake).nanoseconds;
+                const nq: f64 = @floatFromInt(test_set.rows);
+                try out.print("{s:<22} {d:>5} {d:>9.3} {d:>12.1} {d:>9.1} {d:>9.3} {d:>11.1}\n", .{
+                    mode.name,
+                    ef,
+                    @as(f64, @floatFromInt(hits)) / (nq * k),
+                    @as(f64, @floatFromInt(recomputed)) / nq,
+                    @as(f64, @floatFromInt(batches)) / nq,
+                    @as(f64, @floatFromInt(ns)) / 1e6 / nq,
+                    src.modeled_ms / nq,
+                });
+                try out.flush();
+            }
+        }
+    }
+}
+
+fn loadCost(alloc: Allocator, io: std.Io, path: []const u8) !CostCurve {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20));
+    defer alloc.free(raw);
+    var sizes = std.ArrayListUnmanaged(f64).empty;
+    errdefer sizes.deinit(alloc);
+    var ms = std.ArrayListUnmanaged(f64).empty;
+    errdefer ms.deinit(alloc);
+    var lines = std.mem.tokenizeScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        var fields = std.mem.tokenizeAny(u8, line, " \t,");
+        const b = fields.next() orelse continue;
+        const m = fields.next() orelse return error.InvalidCost;
+        try sizes.append(alloc, try std.fmt.parseFloat(f64, b));
+        try ms.append(alloc, try std.fmt.parseFloat(f64, m));
+    }
+    if (sizes.items.len == 0) return error.InvalidCost;
+    return .{ .sizes = try sizes.toOwnedSlice(alloc), .ms = try ms.toOwnedSlice(alloc) };
+}
+
+fn mib(n: usize) f64 {
+    return @as(f64, @floatFromInt(n)) / (1024 * 1024);
+}
+
+fn loadMatrix(alloc: Allocator, io: std.Io, prefix: []const u8, part: []const u8, limit: usize) !Matrix {
+    const path = try std.fmt.allocPrint(alloc, "{s}.{s}.f32", .{ prefix, part });
+    defer alloc.free(path);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(8 * 1024 * 1024 * 1024));
+    defer alloc.free(raw);
+    if (raw.len < 8) return error.InvalidData;
+    const rows_all = std.mem.readInt(u32, raw[0..4], .little);
+    const dims = std.mem.readInt(u32, raw[4..8], .little);
+    const rows = @min(rows_all, limit);
+    if (raw.len < 8 + @as(usize, rows_all) * dims * 4) return error.InvalidData;
+    const data = try alloc.alloc(f32, rows * dims);
+    @memcpy(std.mem.sliceAsBytes(data), raw[8..][0 .. data.len * 4]);
+    return .{ .rows = rows, .dims = dims, .data = data };
+}
+
+fn synthetic(alloc: Allocator, rows: usize, dims: usize, stream: u64) !Matrix {
+    var centers_rng = std.Random.DefaultPrng.init(99);
+    const clusters = 64;
+    const centers = try alloc.alloc(f32, clusters * dims);
+    defer alloc.free(centers);
+    for (centers) |*c| c.* = centers_rng.random().floatNorm(f32) * 3;
+    var prng = std.Random.DefaultPrng.init(stream);
+    const rand = prng.random();
+    const data = try alloc.alloc(f32, rows * dims);
+    for (0..rows) |i| {
+        const c = rand.uintLessThan(usize, clusters);
+        for (0..dims) |j| data[i * dims + j] = centers[c * dims + j] + rand.floatNorm(f32);
+    }
+    return .{ .rows = rows, .dims = dims, .data = data };
+}
+
+fn groundTruth(alloc: Allocator, train: Matrix, queries: Matrix, metric: leann.Metric, k: usize) ![]u32 {
+    const truth = try alloc.alloc(u32, queries.rows * k);
+    const dists = try alloc.alloc(f32, k);
+    defer alloc.free(dists);
+    const qbuf = try alloc.alloc(f32, train.dims);
+    defer alloc.free(qbuf);
+    const rbuf = try alloc.alloc(f32, train.dims);
+    defer alloc.free(rbuf);
+    for (0..queries.rows) |qi| {
+        @memcpy(qbuf, queries.row(qi));
+        if (metric == .cosine) normalize(qbuf);
+        const ids = truth[qi * k ..][0..k];
+        @memset(dists, std.math.inf(f32));
+        @memset(ids, 0);
+        for (0..train.rows) |i| {
+            @memcpy(rbuf, train.row(i));
+            if (metric == .cosine) normalize(rbuf);
+            const d = leann.distance(metric, qbuf, rbuf);
+            if (d >= dists[k - 1]) continue;
+            var pos = k - 1;
+            while (pos > 0 and dists[pos - 1] > d) : (pos -= 1) {
+                dists[pos] = dists[pos - 1];
+                ids[pos] = ids[pos - 1];
+            }
+            dists[pos] = d;
+            ids[pos] = @intCast(i);
+        }
+    }
+    return truth;
+}
+
+fn normalize(v: []f32) void {
+    var s: f32 = 0;
+    for (v) |x| s += x * x;
+    const n = @sqrt(s);
+    if (n == 0) return;
+    for (v) |*x| x.* /= n;
+}
