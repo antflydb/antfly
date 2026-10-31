@@ -418,3 +418,19 @@ test('owner snapshot decoded rows reuse the captured root and cannot poison a la
  try{await retry(store,tx=>tx.put('value',2));}finally{release();}
  assert.equal(await old,1);assert.equal(await store.ownerRead(tx=>tx.get('value')),2);assert.equal(store.rows.get('value').value,2);
 });
+test('cold owner reads authenticate fresh state without acquiring write ownership',async()=>{
+ const bucket=new Bucket(),actor='b'.repeat(64),env={DATABASE:bucket,ANTFLY_INCARNATION:'cold-owner-read',COORDINATOR_BACKEND:'r2',RESIDENT_SERVING:'true',RESIDENT_MVCC:'true',METADATA_ROOT_BACKEND:'bounded-journal',INLINE_METADATA_ROOTS:'true',COMMITS:{idFromName:()=>({toString:()=>actor})}};
+ const authority=await openAuthority(env,'r2-bounded'),first=storeFor(bucket,{exclusiveOwnerId:actor});first.configureAuthority(authority.descriptor);await retry(first,tx=>tx.put('value',1));
+ const raw=createR2Transport({database:bucket});let puts=0;
+ const fresh=storeFor(bucket,{exclusiveOwnerId:actor,transport:async(request,body)=>{if(request.op==='put')puts++;return raw(request,body);}});fresh.configureAuthority(authority.descriptor);
+ assert.equal(await fresh.ownerRead(tx=>tx.get('value')),1);assert.equal(puts,0);assert.equal(fresh.acquired,false);
+ await retry(fresh,tx=>tx.put('value',2));assert.ok(puts>0);assert.equal(await fresh.ownerRead(tx=>tx.get('value')),2);
+});
+test('cold snapshot admission discards its result when a writer takes over',async()=>{
+ const bucket=new Bucket(),actor='c'.repeat(64),env={DATABASE:bucket,ANTFLY_INCARNATION:'cold-write-race',COORDINATOR_BACKEND:'r2',RESIDENT_SERVING:'true',RESIDENT_MVCC:'true',METADATA_ROOT_BACKEND:'bounded-journal',INLINE_METADATA_ROOTS:'true',COMMITS:{idFromName:()=>({toString:()=>actor})}};
+ const authority=await openAuthority(env,'r2-bounded'),first=storeFor(bucket,{exclusiveOwnerId:actor});first.configureAuthority(authority.descriptor);await retry(first,tx=>tx.put('value',1));
+ const fresh=storeFor(bucket,{exclusiveOwnerId:actor});fresh.configureAuthority(authority.descriptor);let atRead,release,runs=0;const ready=new Promise(r=>atRead=r),gate=new Promise(r=>release=r);
+ const pending=fresh.ownerRead(async tx=>{const value=await tx.get('value');if(++runs===1){atRead();await gate;}return value;});await ready;
+ try{await retry(fresh,tx=>tx.put('value',2));}finally{release();}
+ assert.equal(await pending,2);assert.equal(runs,2);assert.equal(await fresh.ownerRead(tx=>tx.get('value')),2);
+});

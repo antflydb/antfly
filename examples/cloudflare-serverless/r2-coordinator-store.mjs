@@ -196,7 +196,7 @@ export class R2CoordinatorStore {
     if(names.some(name=>!map.has(name)))return null;
     return new Map([...map].map(([key,value])=>[key,value==null?undefined:JSON.parse(value,(_,v)=>v&&Object.keys(v).length===1&&typeof v.__antfly_utf8==="string"?utf8.encode(v.__antfly_utf8):v&&Object.keys(v).length===1&&Array.isArray(v.__antfly_bytes)?Uint8Array.from(v.__antfly_bytes):v)]));
   }
-  async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background,deadlineMs:outerDeadlineMs=Infinity,readKeys,readPrefix,ownerCurrent=false}={}){
+  async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background,deadlineMs:outerDeadlineMs=Infinity,readKeys,readPrefix,ownerCurrent=false,ownerCold=false}={}){
     if(this.ownerReady)await this.ownerReady;
     if(ownerCurrent&&(!this.ownerMvcc||!this.acquired||this.recovering||this.ioDrain||!this.state))throw Error("ReadSnapshotNeedsAdmission");
     if(ownerCurrent&&(readKeys||readPrefix))throw Error("InvalidOwnerSnapshotProjection");
@@ -239,7 +239,7 @@ export class R2CoordinatorStore {
       }finally{
         proofPermit?.();this.snapshotReaders--;
         if(outcome==="ok"&&(this.clock()>=deadlineMs||proofPermit&&performance.now()>=monotonicDeadline))outcome="error";
-        try{this.onMetrics?.({event:"antfly.coordinator_snapshot",trace_id:traceId,trace_ids:traceIds,outcome,owned,owner_current:ownerCurrent,proof_prefetch:!!proofPermit,proof_prefetch_reserved_bytes:proofPermit?proofPrefetchBytes:0,...capsuleMetrics,elapsed_ms:performance.now()-started,operations:usedOperations,transferred_bytes:usedBytes,physical_r2:physical});}catch{}
+        try{this.onMetrics?.({event:"antfly.coordinator_snapshot",trace_id:traceId,trace_ids:traceIds,outcome,owned,owner_current:ownerCurrent,owner_cold:ownerCold,proof_prefetch:!!proofPermit,proof_prefetch_reserved_bytes:proofPermit?proofPrefetchBytes:0,...capsuleMetrics,elapsed_ms:performance.now()-started,operations:usedOperations,transferred_bytes:usedBytes,physical_r2:physical});}catch{}
       }
       })();
     };
@@ -333,6 +333,16 @@ export class R2CoordinatorStore {
   }
   async ownerRead(run,{deadlineMs=this.clock()+30000,traceId}={}){
     if(!this.ownerServing)throw Error("ResidentServingOwnerRequired");
+    if(this.ownerMvcc&&!this.acquired&&!this.running&&!this.recovering&&!this.ioDrain&&!this.pending.length){
+      const admission=this.writeAdmission??0n;
+      try{
+        const result=await this.readOnly(run,{ownerCold:true,traceId,deadlineMs});
+        // Fresh observation is sufficient for reads before write takeover. A
+        // concurrent write admission invalidates this result even if it fails.
+        if((this.writeAdmission??0n)!==admission||this.acquired||this.running||this.recovering||this.ioDrain||this.pending.length)throw Error("ReadSnapshotNeedsAdmission");
+        return result;
+      }catch(error){if(!/^ReadSnapshotNeeds(?:Admission|Pin)$/.test(error.message))throw error;}
+    }
     if(this.ownerMvcc)try{return await this.readOnly(run,{ownerCurrent:true,traceId,deadlineMs});}catch(error){if(!/^ReadSnapshotNeeds(?:Admission|Pin)$/.test(error.message))throw error;}
     const reservedOperations=1024-254,reservedBytes=24*1024*1024,ioBudget={operations:reservedOperations,bytes:reservedBytes};
     for(let attempt=0;attempt<4;attempt++)try{
@@ -352,6 +362,7 @@ export class R2CoordinatorStore {
     return this.enqueue({run,priority,traceId,deadlineMs,ioBudget});
   }
   enqueue(input) {
+    if(input.kind!=="owner_read")this.writeAdmission=(this.writeAdmission??0n)+1n;
     if(this.requiresExclusiveOwner&&!this.ownerServing)return Promise.reject(Error("ResidentServingOwnerRequired"));
     if(this.ioDrain)return Promise.reject(new Error("CoordinatorRecovering"));
     if(this.pending.length>=64)return Promise.reject(new Error("CoordinatorCommitBusy"));

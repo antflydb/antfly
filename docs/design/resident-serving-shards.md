@@ -395,7 +395,7 @@ Fresh namespaces can select authority protocol `serialized-owner-v2`. Reads
 capture the last confirmed immutable metadata root without waiting for a
 concurrent write's storage acknowledgement. Unacknowledged durable prefixes are
 not visible through an independent latest-read observer: reader admission goes
-through the owner. Native fencing and recovery remain mandatory on reconstruction.
+through the owner. A cold read uses fresh native authenticated observation without taking write ownership. Any concurrent write admission invalidates its result and forces owner re-admission, even if that write fails. Native fencing and recovery remain mandatory before write takeover.
 A v1 adapter rejects the v2 descriptor. No in-place migration is implemented.
 
 Decoded metadata is reusable only at the exact captured revision, epoch and
@@ -425,7 +425,7 @@ Generation mismatch ignores it. Native checksum/domain validation, captured
 leases, ranges, conditions and response budgets still apply. Existing covering
 point leaves supply small document bodies; there is no second mutable database
 or parallel document format. A published point can avoid manifest/root round
-trips after owner admission, while truly cold ownership still requires recovery.
+trips after owner admission, while truly cold write ownership still requires recovery.
 
 Immutable miss coalescing matches exact namespace/bucket/key/range/condition/
 version/response-budget identities. Its registry holds at most four flights and
@@ -458,3 +458,5 @@ unchanged hosted availability/memory gate, including historical SQLITE_NOMEM.
 At a fixed 100 ms mandatory object GET latency, an 86 ms truly cold target is
 impossible. Reducing serial dependencies helps; claims must separate warm cache,
 worker reconstruction, ownership recovery and physically cold object reads.
+
+Cold reconstruction originally acquired ownership for reads and regressed to 1,416 ms p95 versus 336 ms for control. That failed report is retained. The subsequent read-only reconstruction path avoids write takeover until a write arrives; a monotonic admission counter and root checks prevent a concurrent write from exposing an unconfirmed prefix through that path.
