@@ -61,7 +61,9 @@ export class R2CommitCoordinator extends DurableObject {
     if(env.ANTFLY_TENANTS){const binding=env.COMMITS;env=tenantEnvs(env).find(candidate=>binding.idFromName(candidate.ANTFLY_INCARNATION).equals(ctx.id));if(!env)throw new Error("UnknownTenant");}
     this.env = env;
     if(env.RESIDENT_SERVING==="true")enableOwnerReads();
-    const instanceId=crypto.randomUUID(),owner=actorOwner(ctx.id.toString(),env.WORKER_VERSION?.id,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION);
+    // A stable provider ID routes requests, but a new native term must fence
+    // late external PUTs from a terminated instance before resident reads start.
+    const instanceId=crypto.randomUUID(),owner=env.RESIDENT_SERVING==="true"?undefined:actorOwner(ctx.id.toString(),env.WORKER_VERSION?.id,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION);
     this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{readBatch:env.NATIVE_METADATA_READ_BATCH!=="false",owner,exclusiveOwnerId:ctx.id.toString(),inlineReadSet:env.INLINE_METADATA_ROOTS==="true"?inlineReadSet(env.ANTFLY_INCARNATION):undefined,remoteCache:edgeCacheForEnv(env,{background:promise=>ctx.waitUntil(promise)}),kernel:metadataKernel,readKernel:readObservationKernel(),cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics(),actor_instance_id:instanceId}));}});
     if(env.REPLAY_COST_CHECKPOINTS==="true"&&this.store.idleCheckpoint)this.store.idleCheckpoint.replayCost=()=>({bytes:this.store.replayBytes??0,waves:Math.ceil(Math.min(64,Math.max(0,(this.store.state?.revision??0)-this.store.idleCheckpoint.last))/4)});
     this.serviceStore = Object.create(this.store);
@@ -71,7 +73,7 @@ export class R2CommitCoordinator extends DurableObject {
     this.maintenance=new MaintenanceTickets(this.maintenanceStore);
     this.journal = new R2CollectionJournal(this.maintenanceStore);
     this.authorityAdmission=new AuthorityAdmission(async()=>{if(this.store.ownerReady)await this.store.ownerReady;return openAuthority(env,coordinatorAuthorityMode(env));});
-    if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.actor_started",role:"writer",actor_id:ctx.id.toString(),actor_instance_id:instanceId,version:env.WORKER_VERSION?.id,owner_identity:owner?"actor-version":"ephemeral",...kernelMetrics()}));
+    if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.actor_started",role:"writer",actor_id:ctx.id.toString(),actor_instance_id:instanceId,version:env.WORKER_VERSION?.id,owner_identity:env.RESIDENT_SERVING==="true"?"instance-term":owner?"actor-version":"ephemeral",...kernelMetrics()}));
   }
   async ensureAuthority(){if(!this.authority){const authority=await this.authorityAdmission.get();this.store.configureAuthority(authority.descriptor);this.authority??=authority;}return this.authority;}
   async lookupResident(input,{trace_id}={}) {

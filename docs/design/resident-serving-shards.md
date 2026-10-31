@@ -58,8 +58,14 @@ write adapter must validate this descriptor before mutating the namespace.
 Cloudflare's adapter derives the owner ID from the COMMITS namespace and logical
 partition name, then checks the actual actor ID at owner admission. A different
 actor or runtime generation is rejected before native acquisition. Code versions
-and eviction/reconstruction can retain the same provider actor ID; reconstruction
-must still recover/fence native state before serving. This relies on the
+and eviction/reconstruction can retain the same provider actor ID. Resident
+instances nevertheless use a fresh random native owner term on every physical
+construction. Native recovery seals the predecessor epoch before serving. This
+is mandatory: provider instance uniqueness alone does not prevent an old
+in-flight object PUT from arriving after a crash. A racing old PUT either wins
+before takeover and is recovered, or loses to the native seal; it cannot appear
+behind an admitted new owner cut. The stable actor/version native identity used
+by ordinary fresh-probing adapters is not used for resident serving. This relies on the
 provider's unique serialized actor guarantee, not a self-declared cache TTL.
 Direct low-level writers that bypass deployment authority are unsupported in
 this mode, as are mixed old/new adapters. Credentials must limit access to

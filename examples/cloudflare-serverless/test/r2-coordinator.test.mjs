@@ -376,3 +376,16 @@ test('resident recovery continuations keep one admission budget and never replay
  for(const failure of ['SQLITE_NOMEM','CoordinatorRecovering']){attempts=0;store.enqueue=async()=>{attempts++;store.recovering=failure==='SQLITE_NOMEM';throw Error(failure);};await assert.rejects(store.ownerRead(()=>1),new RegExp(failure));assert.equal(attempts,1);}
  attempts=0;store.enqueue=async()=>{attempts++;store.recovering=true;throw Error('CoordinatorRecovering');};await assert.rejects(store.ownerRead(()=>1),/CoordinatorRecovering/);assert.equal(attempts,4);store.ioDrain=Promise.resolve();attempts=0;await assert.rejects(store.ownerRead(()=>1),/CoordinatorRecovering/);assert.equal(attempts,1);
 });
+test('resident reconstruction seals out a terminated instance whose journal PUT arrives late',async()=>{
+ const bucket=new Bucket(),actor='d'.repeat(64),env={DATABASE:bucket,ANTFLY_INCARNATION:'resident-late-put',COORDINATOR_BACKEND:'r2',METADATA_ROOT_BACKEND:'bounded-journal',INLINE_METADATA_ROOTS:'true',RESIDENT_SERVING:'true',COMMITS:{idFromName:()=>({toString:()=>actor})}};
+ const authority=await openAuthority(env,'r2-bounded'),raw=createR2Transport({database:bucket});let paused=false,notify,release;const atPut=new Promise(r=>notify=r),held=new Promise(r=>release=r);
+ const old=storeFor(bucket,{exclusiveOwnerId:actor,transport:async(request,body)=>{if(paused&&request.op==='put'&&/\/epochs\/[^/]+\/[0-9]+\.json$/.test(request.key)){paused=false;notify();await held;}return raw(request,body);}});old.configureAuthority(authority.descriptor);
+ await retry(old,tx=>tx.put('value',1));paused=true;
+ const late=old.transaction(tx=>tx.put('value',2));late.catch(()=>{});await atPut;
+ try{
+  const next=storeFor(bucket,{exclusiveOwnerId:actor});next.configureAuthority(authority.descriptor);assert.notDeepEqual(next.owner,old.owner,'each physical instance requires a fresh native owner term');
+  assert.equal(await next.ownerRead(tx=>tx.get('value')),1);release();await assert.rejects(late);
+  assert.equal(await next.ownerRead(tx=>tx.get('value')),1,'a delayed old PUT must not appear behind an admitted owner cut');
+  await retry(next,tx=>tx.put('value',3));assert.equal(await next.ownerRead(tx=>tx.get('value')),3);
+ }finally{release();await Promise.allSettled([late]);}
+});
