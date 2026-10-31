@@ -1072,7 +1072,9 @@ from .inference_memory_config import InferenceMemoryConfig
 from .inference_model_backend import InferenceModelBackend
 from .inference_model_info import InferenceModelInfo
 from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
+from .inference_model_info_compatibility import InferenceModelInfoCompatibility
 from .inference_model_info_dense_output import InferenceModelInfoDenseOutput
+from .inference_model_info_error import InferenceModelInfoError
 from .inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
 from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 from .inference_model_instance import InferenceModelInstance
@@ -2137,6 +2139,7 @@ from .relational_unique_constraint import RelationalUniqueConstraint
 from .relational_unique_constraint_origin import RelationalUniqueConstraintOrigin
 from .rename_catalog_resource_request import RenameCatalogResourceRequest
 from .repair_issue_list_request import RepairIssueListRequest
+from .repair_remaining_failure import RepairRemainingFailure
 from .repair_run_request import RepairRunRequest
 from .repair_run_request_control import RepairRunRequestControl
 from .repair_target import RepairTarget
@@ -3591,7 +3594,9 @@ __all__ = (
     "InferenceModelBackend",
     "InferenceModelInfo",
     "InferenceModelInfoChunkingLimits",
+    "InferenceModelInfoCompatibility",
     "InferenceModelInfoDenseOutput",
+    "InferenceModelInfoError",
     "InferenceModelInfoInferenceCapabilities",
     "InferenceModelInfoQualifiedLimits",
     "InferenceModelInstance",
@@ -4440,6 +4445,7 @@ __all__ = (
     "RelationalUniqueConstraintOrigin",
     "RenameCatalogResourceRequest",
     "RepairIssueListRequest",
+    "RepairRemainingFailure",
     "RepairRunRequest",
     "RepairRunRequestControl",
     "RepairTarget",

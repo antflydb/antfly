@@ -707,7 +707,9 @@ pub fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []cons
     defer allocator.free(models);
 
     for (models) |m| {
-        print("{s:<12} {s}\n", .{ @tagName(m.kind), m.name });
+        if (m.load_error) |err| {
+            print("{s:<12} {s}  unusable: {s}\n", .{ @tagName(m.kind), m.name, @errorName(err) });
+        } else print("{s:<12} {s}\n", .{ @tagName(m.kind), m.name });
     }
 }
 
