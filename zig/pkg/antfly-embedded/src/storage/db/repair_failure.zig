@@ -22,6 +22,8 @@ const std = @import("std");
 
 const transient_names = [_][]const u8{
     "ResourceTemporarilyUnavailable",
+    "InferenceCapacityUnavailable",
+    "QueueFull",
     "EnrichmentRetryInProgress",
     "InferenceCapabilitiesStale",
     "RemoteDocumentFetchFailed",
@@ -51,6 +53,21 @@ pub fn isTransient(err: anyerror) bool {
     return isTransientName(@errorName(err));
 }
 
+/// The transient failures that refused to admit work, so the request never
+/// ran. They don't spend a document's attempt budget. Other transient failures
+/// (rate limits, timeouts) still do, so a lasting outage eventually parks as
+/// repair debt instead of retrying forever.
+pub fn isAdmissionRefusalName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "ResourceTemporarilyUnavailable") or
+        std.mem.eql(u8, name, "InferenceCapacityUnavailable") or
+        std.mem.eql(u8, name, "QueueFull")) return true;
+    return std.mem.endsWith(u8, name, "Busy") or std.mem.endsWith(u8, name, "TemporarilyUnavailable");
+}
+
+pub fn isAdmissionRefusal(err: anyerror) bool {
+    return isAdmissionRefusalName(@errorName(err));
+}
+
 /// Retries for one document within one operator repair pass, including the
 /// first attempt.
 pub const repair_transient_max_attempts: u32 = 4;
@@ -68,6 +85,8 @@ pub const transient_hint = "temporary failure; run repair again";
 /// The next step for an operator, keyed by the recorded error name.
 pub fn hint(name: []const u8) []const u8 {
     if (isTransientName(name)) return transient_hint;
+    if (std.mem.eql(u8, name, "MemoryBudgetExceeded"))
+        return "the request can never fit the configured inference memory budget; raise --inference-scratch-budget-mb (or the other inference memory budget flags) or use a smaller model, then run repair again";
     if (std.mem.eql(u8, name, "ModelNotFound") or std.mem.eql(u8, name, "UnknownModel"))
         return "pull the model named in the index's enrichment config with `antfly inference pull <owner/model>`, then run repair again";
     if (std.mem.eql(u8, name, "source_document_missing"))
@@ -230,4 +249,20 @@ test "repair failure counts source documents once per error across consumers and
     try std.testing.expectEqual(@as(u64, 2), groups[0].count);
     try std.testing.expectEqual(@as(u64, 4), groups[0].max_attempts);
     try std.testing.expectEqual(@as(u64, 1), groups[1].count);
+}
+
+test "a budget that can never fit is permanent and names the flag" {
+    try std.testing.expect(!isTransientName("MemoryBudgetExceeded"));
+    try std.testing.expect(std.mem.indexOf(u8, hint("MemoryBudgetExceeded"), "--inference-scratch-budget-mb") != null);
+    try std.testing.expect(isTransientName("ResourceTemporarilyUnavailable"));
+}
+
+test "admission refusals are the transient failures that never ran" {
+    for ([_][]const u8{ "ResourceTemporarilyUnavailable", "InferenceCapacityUnavailable", "QueueFull", "AppleNativeBusy" }) |name| {
+        try std.testing.expect(isAdmissionRefusalName(name));
+        try std.testing.expect(isTransientName(name));
+    }
+    try std.testing.expect(!isAdmissionRefusalName("EmbedRateLimited"));
+    try std.testing.expect(!isAdmissionRefusalName("Timeout"));
+    try std.testing.expect(!isAdmissionRefusalName("MemoryBudgetExceeded"));
 }

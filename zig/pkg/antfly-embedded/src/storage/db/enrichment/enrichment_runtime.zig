@@ -2221,6 +2221,9 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.RequiredMediaOutputFailed,
         error.DocumentModelRevisionMismatch,
         error.DocumentBudgetExhausted,
+        // The request's estimate exceeds the configured inference budget;
+        // contention surfaces as ResourceTemporarilyUnavailable instead.
+        error.MemoryBudgetExceeded,
         error.InvalidDocumentCheckpoint,
         error.InvalidDocumentSource,
         error.InvalidDocumentSelection,
@@ -2348,6 +2351,22 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         // budget and are parked for repair if that budget is exhausted.
         else => .retryable_request,
     };
+}
+
+/// The shared repair/enrichment classification decides which retryable
+/// failures leave a document's attempt budget untouched.
+fn enrichmentFailureSparesAttemptBudget(err: anyerror) bool {
+    return types.repair_failure.isAdmissionRefusal(err);
+}
+
+test "transient refusals do not spend the enrichment attempt budget" {
+    try std.testing.expect(enrichmentFailureSparesAttemptBudget(error.ResourceTemporarilyUnavailable));
+    // Rate limits are transient but bounded, so outages park as repair debt.
+    try std.testing.expect(!enrichmentFailureSparesAttemptBudget(error.EmbedRateLimited));
+    try std.testing.expect(!enrichmentFailureSparesAttemptBudget(error.MemoryBudgetExceeded));
+    // A request that can never fit the configured budget is permanent.
+    try std.testing.expect(!isRetryableEnrichmentError(error.MemoryBudgetExceeded));
+    try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
 }
 
 pub fn isRetryableEnrichmentError(err: anyerror) bool {
@@ -5974,6 +5993,9 @@ const UnsupportedEnrichmentRuntime = struct {
     retry_after_hint_ms: u64 = 0,
     retry_failure_fingerprint: u64 = 0,
     retry_failure_count: u32 = 0,
+    /// Transient refusals of the current failure identity. They pace the
+    /// back-off but never spend `retry_failure_count`'s attempt budget.
+    transient_retry_count: u32 = 0,
     terminal_failure_min_sequence: u64 = 0,
     terminal_failure_max_sequence: u64 = 0,
     active_failure_fingerprint: u64 = 0,
@@ -6504,6 +6526,9 @@ const PlatformEnrichmentRuntime = struct {
     retry_after_hint_ms: u64 = 0,
     retry_failure_fingerprint: u64 = 0,
     retry_failure_count: u32 = 0,
+    /// Transient refusals of the current failure identity. They pace the
+    /// back-off but never spend `retry_failure_count`'s attempt budget.
+    transient_retry_count: u32 = 0,
     terminal_failure_min_sequence: u64 = 0,
     terminal_failure_max_sequence: u64 = 0,
     active_failure_fingerprint: u64 = 0,
@@ -7303,13 +7328,19 @@ const PlatformEnrichmentRuntime = struct {
         if (self.retry_failure_fingerprint != self.active_failure_fingerprint) {
             self.retry_failure_fingerprint = self.active_failure_fingerprint;
             self.retry_failure_count = 0;
+            self.transient_retry_count = 0;
         }
-        if (!awaiting_publication) self.retry_failure_count +|= 1;
+        // Admission refusals never ran the request: back off, but keep the
+        // document's attempt budget for work that actually failed.
+        const transient = !awaiting_publication and enrichmentFailureSparesAttemptBudget(err);
+        if (!awaiting_publication) {
+            if (transient) self.transient_retry_count +|= 1 else self.retry_failure_count +|= 1;
+        }
         // A normal ordered acknowledgement wait is not a provider failure.
         // In particular, many census pages must not exponentially delay one
         // another or inherit an earlier provider's backoff hint.
         const retry_ordinal = if (awaiting_publication) 0 else if (scope == .request)
-            self.retry_failure_count
+            self.retry_failure_count +| self.transient_retry_count
         else
             self.consecutive_retry_count;
         const delay_ms = workerRetryDelayWithHintMs(retry_ordinal, if (awaiting_publication) 0 else self.retry_after_hint_ms);
