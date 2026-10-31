@@ -79,7 +79,9 @@ native R2 recovery. A checkpoint failure cannot revoke an already accepted R2
 write; it remains visible in diagnostics and invalidates qualification. The
 scheduler does not retry checkpoint exceptions automatically, and busy admission
 is bounded to four checks within ten seconds. A future write can schedule another
-attempt. The owner never installs a clean checkpoint concurrently with a write.
+attempt. The owner never installs a clean checkpoint concurrently with a write. Scheduling
+tracks a host-local dirty generation, so ownership/checkpoint work that leaves
+the native metadata revision unchanged can still become clean after quiescence.
 
 Before every local PUT/sync, the in-memory confirmed-dirty latch is cleared.
 Only successful synchronization confirms it. This matters when a clean PUT took

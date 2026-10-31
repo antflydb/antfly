@@ -76,7 +76,7 @@ export class R2CoordinatorStore {
   }
   configureDurableCheckpoint(){
     if(!this.durableBootstrap||!this.background||this.durableCheckpoint)return;
-    this.durableCheckpoint=new IdleCheckpoint({clock:this.clock,revision:()=>this.state?.revision??0,delay:1000,retryDelay:1000,maxAttempts:4,shouldRetry:()=>false,
+    this.durableCheckpoint=new IdleCheckpoint({clock:this.clock,revision:()=>this.durableBootstrap.generation??0,delay:1000,retryDelay:1000,maxAttempts:4,shouldRetry:()=>false,
       isIdle:()=>this.acquired&&!this.running&&!this.pending.length&&!this.recovering&&!this.ioDrain&&!this.freezeRequested&&performance.now()-(this.durableBootstrap.lastActivity??0)>=1000,
       checkpoint:options=>this.flushDurableCheckpoint(options),background:this.background,onError:error=>{try{this.onMetrics?.({event:"antfly.durable_checkpoint_error",error_message:String(error.message??error).slice(0,2048)});}catch{}}});
   }
@@ -442,9 +442,9 @@ export class R2CoordinatorStore {
       if(this.pending[0]?.kind==="durable_checkpoint"){
         const item=this.pending.shift();completed.push(item);
         if(this.freezeRequested||!this.acquired||this.recovering||this.ioDrain||!this.state){item.result={done:false,revision:this.state?.revision??0};return completed;}
-        if(this.durableBootstrap.entry?.dirty===false){item.result={done:true,revision:this.state.revision};return completed;}
+        if(this.durableBootstrap.entry?.dirty===false){item.result={done:true,revision:this.durableBootstrap.generation??0,native_revision:this.state.revision};return completed;}
         await this.durableBootstrap.finish(this.state,(action,extra)=>this.servingCodec(action,extra));checkDurableDeadline();
-        item.result={done:true,revision:this.state.revision};return completed;
+        item.result={done:true,revision:this.durableBootstrap.generation??0,native_revision:this.state.revision};return completed;
       }
       // Commit-only native plans expose no read result before append. A warm
       // retained root is authenticated by append's before/after floor and seal

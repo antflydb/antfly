@@ -58,7 +58,7 @@ test('compressed bootstrap carries bounded native routing headers with the manif
 
 test('dirty intervals coalesce intents but uncertain clean durability requires a new intent',async()=>{
  const s=storage(),b=new DurableServingBootstrap(s,env,owner);await b.adopt(authority);
- await b.begin();await b.begin();assert.deepEqual(s.writes,['intent','sync']);
+ await b.begin();await b.begin();assert.equal(b.generation,2);assert.deepEqual(s.writes,['intent','sync']);
  const sync=s.sync;s.sync=async()=>{throw Error('UncertainCleanSync');};
  await assert.rejects(b.finish({owner:[]},async()=>({serving_capsule:'native'})),/UncertainCleanSync/);
  assert.equal(s.value.dirty,false);assert.equal(b.dirtyConfirmed,false);
