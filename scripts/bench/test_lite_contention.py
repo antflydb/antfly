@@ -215,6 +215,12 @@ class ContentionReportTests(unittest.TestCase):
         result = results.get_nowait()
         self.assertEqual(result["status"], "error")
         self.assertIn("close failed", result["diagnostic"])
+        self.assertEqual(result["completed_workload"]["successful_calls"], 1)
+        self.assertEqual(result["completed_workload"]["busy_calls"], 0)
+        self.assertEqual(
+            result["completed_workload"]["last_write"],
+            {"key": "worker-4-0", "sequence": 0},
+        )
         self.assertTrue(results.empty())
 
     def test_cli_fails_for_unexpected_baseline_error(self):

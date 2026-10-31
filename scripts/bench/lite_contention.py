@@ -236,6 +236,7 @@ def seed(
 
 def native_worker(config, index, ready, start, results, finish=None):
     announced = False
+    completed_workload = None
     try:
         af = sdk(config["library"])
         with af.open(
@@ -267,6 +268,15 @@ def native_worker(config, index, ready, start, results, finish=None):
                     busy.append(time.perf_counter_ns() - began_call)
                 sequence += 1
             ended = time.monotonic()
+            # Preserve measured progress if a later diagnostic or close fails.
+            # The terminal result remains an error and cannot pass qualification.
+            completed_workload = {
+                "started": began,
+                "ended": ended,
+                "successful_calls": len(success),
+                "busy_calls": len(busy),
+                "last_write": last_write,
+            }
             # Diagnostics can acquire admission and run proofs. Wait until every
             # timed call has finished before allowing these reads.
             if finish is not None:
@@ -340,6 +350,7 @@ def native_worker(config, index, ready, start, results, finish=None):
             "index": index,
             "status": "error",
             "diagnostic": traceback.format_exc(),
+            "completed_workload": completed_workload,
         }
         if not announced:
             ready.put(failure)

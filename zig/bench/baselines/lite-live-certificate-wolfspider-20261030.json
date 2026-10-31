@@ -25903,13 +25903,237 @@
         1048576
       ],
       "cold_tree_hash_work": "one hash per tree node",
+      "commit": "28488b5d8b",
       "counter_chunk_items": 256,
       "focused_capi_tests_passed": 4,
       "implementation": "AFACERT2 chunked canonical Merkle digest; changed counter/pending chunks update at most 64 trie branches. Cold admission independently rebuilds the complete digest. Legacy clean-close AFACERT1 remains compatible.",
       "maximum_branches_per_chunk": 64,
       "maximum_measured_hash_operations_for_one_counter_change": 66,
       "native_component_tests_passed": 46,
-      "optimized_cost_comparison": "pending",
+      "optimized_cost_comparison": {
+        "iterations_per_operation": 32,
+        "library_sha256": "8fad7c6cd246a4152ef3c2c7a91e347e0483284d4e23e9039493e907c5693d69",
+        "results": [
+          {
+            "exit": 0,
+            "implementation": "guard",
+            "library_sha256": "64a5ab91f0c5958e0ceeaf66389cb2eb80016bf91d04499358f0c7532d295a0d",
+            "samples": [
+              {
+                "calls": 32,
+                "calls_per_second": 1409.6968297108751,
+                "cpu_seconds": 0.014546000000000003,
+                "kind": "warm_operation",
+                "max_ns": 1750625,
+                "operation": "batch",
+                "p50_ns": 566750,
+                "p95_ns": 1623667,
+                "proof_walks": 0,
+                "status": "ok",
+                "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+                "wall_seconds": 0.022699916269630194
+              },
+              {
+                "calls": 32,
+                "calls_per_second": 1046.26163146682,
+                "cpu_seconds": 0.022982000000000002,
+                "kind": "warm_operation",
+                "max_ns": 2548709,
+                "operation": "sql",
+                "p50_ns": 521625,
+                "p95_ns": 2408000,
+                "proof_walks": 0,
+                "status": "ok",
+                "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+                "wall_seconds": 0.03058508411049843
+              }
+            ],
+            "size": "small"
+          },
+          {
+            "exit": 0,
+            "implementation": "flat",
+            "library_sha256": "1121162742d05e22c9ce0ef9762968796633bdedffd735ead44eba9d6db200c8",
+            "samples": [
+              {
+                "calls": 32,
+                "calls_per_second": 1706.0790411683333,
+                "cpu_seconds": 0.010596999999999995,
+                "kind": "warm_operation",
+                "max_ns": 782833,
+                "operation": "batch",
+                "p50_ns": 591458,
+                "p95_ns": 708667,
+                "proof_walks": 0,
+                "status": "ok",
+                "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+                "wall_seconds": 0.018756458070129156
+              },
+              {
+                "calls": 32,
+                "calls_per_second": 1682.885667790501,
+                "cpu_seconds": 0.011965000000000003,
+                "kind": "warm_operation",
+                "max_ns": 760625,
+                "operation": "sql",
+                "p50_ns": 595500,
+                "p95_ns": 740375,
+                "proof_walks": 0,
+                "status": "ok",
+                "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+                "wall_seconds": 0.019014957826584578
+              }
+            ],
+            "size": "small"
+          },
+          {
+            "exit": 0,
+            "implementation": "merkle",
+            "library_sha256": "8fad7c6cd246a4152ef3c2c7a91e347e0483284d4e23e9039493e907c5693d69",
+            "samples": [
+              {
+                "calls": 32,
+                "calls_per_second": 1685.005050787155,
+                "cpu_seconds": 0.010852,
+                "kind": "warm_operation",
+                "max_ns": 719583,
+                "operation": "batch",
+                "p50_ns": 614333,
+                "p95_ns": 716750,
+                "proof_walks": 0,
+                "status": "ok",
+                "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+                "wall_seconds": 0.018991040997207165
+              },
+              {
+                "calls": 32,
+                "calls_per_second": 1617.254065629291,
+                "cpu_seconds": 0.012630999999999976,
+                "kind": "warm_operation",
+                "max_ns": 850208,
+                "operation": "sql",
+                "p50_ns": 628083,
+                "p95_ns": 785666,
+                "proof_walks": 0,
+                "status": "ok",
+                "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+                "wall_seconds": 0.019786625169217587
+              }
+            ],
+            "size": "small"
+          },
+          {
+            "exit": 0,
+            "implementation": "guard",
+            "library_sha256": "64a5ab91f0c5958e0ceeaf66389cb2eb80016bf91d04499358f0c7532d295a0d",
+            "samples": [
+              {
+                "calls": 32,
+                "calls_per_second": 1451.9797612933012,
+                "cpu_seconds": 0.013140999999999181,
+                "kind": "warm_operation",
+                "max_ns": 1419000,
+                "operation": "batch",
+                "p50_ns": 675208,
+                "p95_ns": 843250,
+                "proof_walks": 0,
+                "status": "ok",
+                "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+                "wall_seconds": 0.022038874682039022
+              },
+              {
+                "calls": 32,
+                "calls_per_second": 1758.2820393371524,
+                "cpu_seconds": 0.011852999999999447,
+                "kind": "warm_operation",
+                "max_ns": 959208,
+                "operation": "sql",
+                "p50_ns": 528083,
+                "p95_ns": 760875,
+                "proof_walks": 0,
+                "status": "ok",
+                "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+                "wall_seconds": 0.018199583049863577
+              }
+            ],
+            "size": "large"
+          },
+          {
+            "exit": 0,
+            "implementation": "flat",
+            "library_sha256": "1121162742d05e22c9ce0ef9762968796633bdedffd735ead44eba9d6db200c8",
+            "samples": [
+              {
+                "calls": 32,
+                "calls_per_second": 262.8430300678843,
+                "cpu_seconds": 0.10858999999999996,
+                "kind": "warm_operation",
+                "max_ns": 4098375,
+                "operation": "batch",
+                "p50_ns": 3788750,
+                "p95_ns": 3957417,
+                "proof_walks": 0,
+                "status": "ok",
+                "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+                "wall_seconds": 0.12174566695466638
+              },
+              {
+                "calls": 32,
+                "calls_per_second": 262.2206604117303,
+                "cpu_seconds": 0.108815,
+                "kind": "warm_operation",
+                "max_ns": 4061750,
+                "operation": "sql",
+                "p50_ns": 3838250,
+                "p95_ns": 3956500,
+                "proof_walks": 0,
+                "status": "ok",
+                "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+                "wall_seconds": 0.12203462515026331
+              }
+            ],
+            "size": "large"
+          },
+          {
+            "exit": 0,
+            "implementation": "merkle",
+            "library_sha256": "8fad7c6cd246a4152ef3c2c7a91e347e0483284d4e23e9039493e907c5693d69",
+            "samples": [
+              {
+                "calls": 32,
+                "calls_per_second": 1192.7188254518207,
+                "cpu_seconds": 0.01563899999999996,
+                "kind": "warm_operation",
+                "max_ns": 996959,
+                "operation": "batch",
+                "p50_ns": 831667,
+                "p95_ns": 951000,
+                "proof_walks": 0,
+                "status": "ok",
+                "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+                "wall_seconds": 0.02682945830747485
+              },
+              {
+                "calls": 32,
+                "calls_per_second": 1257.0874604955154,
+                "cpu_seconds": 0.01569699999999996,
+                "kind": "warm_operation",
+                "max_ns": 1018458,
+                "operation": "sql",
+                "p50_ns": 797041,
+                "p95_ns": 979459,
+                "proof_walks": 0,
+                "status": "ok",
+                "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+                "wall_seconds": 0.025455667171627283
+              }
+            ],
+            "size": "large"
+          }
+        ],
+        "scope": "single writer after batch and SQL warmup; all samples have zero proof walks; complete contention/frozen/full-unit acceptance remains separate",
+        "status": "passed"
+      },
       "pending_chunk_ids": 64,
       "warm_sql_cache_retention_regression": "passed with background worker stopped; repeated SQL inserts retain root and ledger and bounded digest work"
     },
@@ -25918,6 +26142,55 @@
       "commit": "aae20a43cc",
       "regression": "peer holds turn, pending storage and nonzero namespace cursor; all three regression conditions preserve backoff",
       "status": "fixed and pushed"
+    },
+    "qualification_progress": {
+      "aggregate_unit_gate": "pending",
+      "frozen_import": "seven of fifteen imported; eighth running; no errors in completed imports",
+      "full_capi": "running",
+      "indexed_contention_passed": {
+        "processes": [
+          1,
+          8,
+          16,
+          32
+        ],
+        "repeats_each": 3,
+        "workers_without_success": 0
+      },
+      "library_sha256": "8fad7c6cd246a4152ef3c2c7a91e347e0483284d4e23e9039493e907c5693d69",
+      "live_index_checks_passed": true,
+      "live_index_checks_processes": [
+        1,
+        8,
+        32
+      ],
+      "optimization": "fast",
+      "ten_minute_soak": "running",
+      "unindexed_32_process_failure": {
+        "barrier_failures": 28,
+        "busy_read_failures": 4,
+        "busy_read_retry_window_seconds": 30,
+        "stage": "final pending_work_stats diagnostic reads after timed workload",
+        "status": "unresolved; qualification failed; timed progress not retained by this harness version"
+      },
+      "unindexed_contention_passed": {
+        "processes": [
+          8,
+          16
+        ],
+        "repeats_each": 2,
+        "workers_without_success": 0
+      }
+    },
+    "raw_log_sha256": {
+      "library-merkle-final-fast.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "library-merkle-final-fast.log": "1aedab423d7a916e1a817eddec1ab0c5389ac3d44ab04a4cef4ef6b0e27f269a",
+      "smoke-merkle-final-fast.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "smoke-merkle-final-fast.log": "c83c4efec7f7eaa7a741bab26bb7a3aeb6ea7cbeb7c5d37bc82b9e666385c344",
+      "warm-merkle-fast-v1-driver.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "warm-merkle-fast-v1-driver.log": "ace0731512c19eed22a0a2d3d897ade7a0a3b4145253f7a96db7ce54682aacf0",
+      "warm-merkle-fast-v1-summary.json": "ce80183cda3a847544f2d25f05e3d142b6a543e2883d8f329f7cc7fc19e32b48",
+      "warm-merkle-fast-v1.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
     },
     "runtime_source_sha256": {
       "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "14b4c4eba1b2eb2129fc28d1f043602ab44ab047f7d0456d8b7f3bcdb06bf867",
