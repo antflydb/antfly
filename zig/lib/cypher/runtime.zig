@@ -8693,11 +8693,24 @@ const Engine = struct {
         const legacy = arguments.len == 1 and arguments[0] == null;
         const request: backend_mod.CountInput = .{ .arguments = if (legacy) &.{} else arguments, .node = node, .predicate = operation.predicate, .source = self.source, .parameters = self.parameters, .max_examined = self.limits.scanned_anchors -| self.stats.scanned_anchors, .max_work = remainingWork(self), .memory_bytes = self.limits.memory_bytes };
         if (!@import("owner_count.zig").eligible(request)) return null;
-        const label = self.graph.label(node.labels[0]) orelse return null;
-        const result = (try read(self.backend.ptr, self.a, label.table, request)) orelse return null;
-        try result.validateFor(request.max_examined, request.arguments.len);
-        self.stats.scanned_anchors += result.examined;
-        if (!result.complete) return null;
+        var tables: std.StringHashMapUnmanaged(void) = .empty;
+        for (self.graph.labels) |label| if (@import("owner_count.zig").permitsTable(self.graph, request, label.table)) try tables.put(self.a, label.table, {});
+        if (tables.count() == 0) return null;
+        const totals = try self.a.alloc(usize, request.arguments.len);
+        @memset(totals, 0);
+        var result: backend_mod.CountResult = .{ .count = 0, .counts = totals, .examined = 0 };
+        var iterator = tables.keyIterator();
+        while (iterator.next()) |table| {
+            var demand = request;
+            demand.max_examined = self.limits.scanned_anchors -| self.stats.scanned_anchors;
+            demand.max_work = remainingWork(self);
+            const part = (try read(self.backend.ptr, self.a, table.*, demand)) orelse return null;
+            try part.validateFor(demand.max_examined, demand.arguments.len);
+            self.stats.scanned_anchors += part.examined;
+            if (!part.complete) return null;
+            result.count = std.math.add(usize, result.count, part.count) catch return error.CypherNumericOverflow;
+            for (totals, part.counts) |*total, partial| total.* = std.math.add(usize, total.*, partial) catch return error.CypherNumericOverflow;
+        }
         const values = try self.a.alloc(v.Value, calls.items.len);
         for (values, 0..) |*value, index| value.* = .{ .integer = std.math.cast(i64, if (legacy) result.count else result.counts[index]) orelse return error.CypherNumericOverflow };
         const previous = self.aggregate_overrides;

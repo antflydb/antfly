@@ -20,6 +20,8 @@ const v = root.value;
 const A = std.mem.Allocator;
 const definition: root.catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{.{ .name = "R", .stored_type = "R", .index = "links", .source_label = "D", .target_label = "D" }} };
 const Fixture = struct {
+    graph: root.catalog.Graph = definition,
+    bound_labels: usize = 0,
     nodes: [33]v.Node = undefined,
     properties: [33][2]v.Entry = undefined,
     edges: [32]v.Relationship = undefined,
@@ -41,7 +43,10 @@ const Fixture = struct {
         }
         for (&self.edges, 0..) |*edge, i| edge.* = .{ .identity = .{ .table = "docs", .key = try std.fmt.allocPrint(a, "r{d}", .{i}) }, .index = "links", .type = "R", .source = self.nodes[i].identity, .target = self.nodes[if (i < 16) i + 16 else 32].identity };
     }
-    fn bind(_: *anyopaque, _: A, _: root.catalog.Graph) !void {}
+    fn bind(ptr: *anyopaque, _: A, graph: root.catalog.Graph) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.bound_labels = graph.labels.len;
+    }
     fn check(_: *anyopaque) !void {}
     fn setWork(ptr: *anyopaque, work: ?b.Work) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -98,7 +103,7 @@ const Fixture = struct {
         self.counts += 1;
         const work = self.work;
         defer self.work = work;
-        return @import("owner_count.zig").run(a, self.backend(), definition, table, input, work);
+        return @import("owner_count.zig").run(a, self.backend(), self.graph, table, input, work);
     }
     fn backend(self: *@This()) b.Backend {
         return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = check, .scan = scan, .scan_where = filtered, .get = get, .expand = expand, .expand_many = expandMany, .count_nodes = countNodes, .set_work = setWork } };
@@ -613,4 +618,82 @@ test "owner COUNT scoped predicates retain scalar failures and constraint order"
         try std.testing.expectError(failure, root.runtime.ownerCountMatches(a, fixture.backend(), definition, input, &fixture.nodes[0], null));
         try std.testing.expectError(failure, root.runtime.execute(a, fixture.backend(), definition, &compiled, &.{}, .{}));
     }
+}
+
+test "owner COUNT nullness demands merge with actual value consumers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "n.value IS NULL",                     "n.value IS NOT NULL", "NOT (n.value IS NULL)",
+        "n.value IS NOT NULL AND n.value > 0", "n.value.x IS NULL",
+    }, [_]usize{ 1, 1, 1, 0, 0 }) |predicate, expected| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, try std.fmt.allocPrint(a, "MATCH(n:D) WHERE {s} RETURN count(n.value)", .{predicate}), .{}, &diagnostic);
+        defer compiled.deinit();
+        const operation = compiled.query.clauses[0].operation.match;
+        const projection = (try @import("owner_count.zig").Projection.init(a, definition, .{ .node = operation.paths[0].nodes[0], .predicate = operation.predicate, .arguments = &.{compiled.query.clauses[1].operation.project.value.items[0].expression.value.call.args[0]} })).?;
+        try std.testing.expectEqual(expected, projection.presence.len);
+    }
+}
+
+test "owner COUNT label membership is table local and does not duplicate overlaps" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const graph: root.catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{
+        .{ .name = "D", .table = "docs" },
+        .{ .name = "A", .table = "docs", .predicate = &.{.{ .name = "start", .value = .{ .boolean = true } }} },
+    }, .relationships = &.{} };
+    for ([_][]const u8{ "", ":D:A", ":A:A", ":D" }, [_]i64{ 33, 16, 16, 33 }) |labels, expected| {
+        var fixture: Fixture = .{ .graph = graph };
+        try fixture.init(a);
+        var channel: Fixture.Channel = .{ .fixture = &fixture, .owner = .{ .backend = fixture.backend(), .graph = graph, .table = "docs" } };
+        var client: root.rpc.Client = .{ .channel = .{ .ptr = &channel, .call = Fixture.Channel.invoke }, .incarnation = 1, .revision = 1 };
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, try std.fmt.allocPrint(a, "MATCH(n{s}) RETURN count(n.value)", .{labels}), .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try root.runtime.execute(a, client.backend(), graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(expected, result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(usize, 1), fixture.counts);
+        try std.testing.expectEqual(@as(usize, 0), fixture.rpc_scans);
+        try std.testing.expectEqual(graph.labels.len, fixture.bound_labels);
+        try std.testing.expectEqual(@as(usize, 33), result.stats.scanned_anchors);
+    }
+}
+
+test "unlabeled owner COUNT reduces unique tables under one anchor budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const graph: root.catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{
+        .{ .name = "D", .table = "docs" }, .{ .name = "Alias", .table = "docs" }, .{ .name = "O", .table = "other" },
+    }, .relationships = &.{} };
+    var fixtures = [_]Fixture{ .{ .graph = graph, .range_end = 16 }, .{ .graph = graph, .range_end = 16 } };
+    var channels: [2]Fixture.Channel = undefined;
+    var clients: [2]root.rpc.Client = undefined;
+    var snapshots: [2]root.distributed.Snapshot = undefined;
+    const targets = [_]root.distributed.Target{ .{ .table = "docs", .table_id = 1, .group_id = 1 }, .{ .table = "other", .table_id = 2, .group_id = 2 } };
+    for (&fixtures, &channels, &clients, &snapshots, targets) |*fixture, *channel, *client, *snapshot, target| {
+        try fixture.init(a);
+        for (&fixture.nodes) |*node| node.identity.table = target.table;
+        channel.* = .{ .fixture = fixture, .owner = .{ .backend = fixture.backend(), .graph = graph, .table = target.table } };
+        client.* = .{ .channel = .{ .ptr = channel, .call = Fixture.Channel.invoke }, .incarnation = 1, .revision = 1 };
+        snapshot.* = .{ .backend = client.backend(), .ptr = fixture, .validate = Fixture.check, .close = undefined };
+    }
+    var set: root.distributed.ReadSet = .{ .a = a, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &fixtures, .checkpoint = Fixture.check, .admit = undefined, .capture = undefined } };
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(a, "MATCH(n) RETURN count(n.value)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try root.runtime.execute(a, set.backend(), graph, &compiled, &.{}, .{ .scanned_anchors = 32 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 32), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(usize, 32), result.stats.scanned_anchors);
+    for (fixtures) |fixture| {
+        try std.testing.expectEqual(@as(usize, 1), fixture.counts);
+        try std.testing.expectEqual(@as(usize, 0), fixture.rpc_scans);
+        try std.testing.expectEqual(graph.labels.len, fixture.bound_labels);
+    }
+    try std.testing.expectError(error.CypherAnchorBudgetExceeded, root.runtime.execute(a, set.backend(), graph, &compiled, &.{}, .{ .scanned_anchors = 31 }));
 }

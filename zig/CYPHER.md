@@ -5081,3 +5081,70 @@ Predicate/visibility count qualification (`56e4ac1dd4`, `445d7655e1`):
 
 `origin/main` was fetched before these changes and was already included through
 `f91c9c0e46`; no additional merge or generated API changes were required.
+
+### Sparse counts, nullness demand, and logical-label coverage
+
+Owner COUNT now shares the relational sparse/composite candidate planner with
+ordinary MATCH. Once that planner has certified a disjoint set of index domains,
+the admitted read session visits borrowed rows directly. The count consumer owns
+physical-progress accounting across every domain and applies the original scalar
+predicate after retained visibility and graph membership. Duplicate and NULL IN
+operands keep the existing planner's exact domain semantics; unsupported access
+proofs retain the ordinary fallback. Storage callbacks preserve their named error
+boundary when the query and storage owners are independently compiled.
+
+Property demand distinguishes values from nullness. A direct `IS NULL` or
+`IS NOT NULL` observer can share COUNT's validated true/NULL projection. A second
+consumer that compares or otherwise observes the property's value upgrades that
+field to an actual-value dependency. Nested property access retains the enclosing
+value. JSON syntax, duplicate-key, depth, and numeric validation still run on
+borrowed spans before any nullness sentinel reaches the evaluator.
+
+An owner reduction is scoped to one physical table rather than one logical
+label. Explicit labels require their conjunction; unlabeled MATCH uses the union
+of catalog memberships. The coordinator visits each unique table once, combines
+counts with checked arithmetic, and shares the remaining anchor/work budget
+across tables and their distributed owners. The portable fallback authenticates
+the original catalog and gives only its evaluator a temporary table-local view;
+the retained backend's catalog binding outlives that view.
+
+Regression coverage includes overlapping and repeated labels, a two-table
+unlabeled reduction, shared anchor exhaustion, nullness/value-demand conflicts,
+wide escaped properties, indexed singleton and multi-value IN, OR, duplicate/NULL
+operands, row filters, hidden scalar failures, and physical scan ceilings. The
+core suite passes 536 tests, including 13 focused Debug owner-count cases.
+
+Qualification of these count shapes:
+
+- The 536-test Cypher suite passes in ReleaseFast; all 13 focused Debug owner
+  count tests pass. Borrowed projection validation, graph/scan callback transport,
+  and native error-identity checks pass independently.
+- The complete CPU Debug CLI builds successfully (69/69 steps, Metal disabled).
+  All four authenticated performance campaigns pass against that executable:
+  SQL plans/overlays, producer visibility, and document/relational wide counts.
+- On the 32-row fixture with sixteen escaped 512 KiB strings, the following
+  query-budget peaks and physical-anchor counts are measured in CPU Debug:
+
+| Shape | Storage | Memory bytes | Physical anchors |
+| --- | --- | ---: | ---: |
+| `WHERE n.id IN ['n1'] RETURN count(n.body)` | relational | 44,306 | 1 |
+| `WHERE n.id IN ['n1','n3'] RETURN count(n.body)` | relational | 45,972 | 2 |
+| `WHERE n.id='n1' OR n.id='n3' RETURN count(n.body)` | relational | 33,108 | 2 |
+| `WHERE n.body IS NOT NULL RETURN count(n.body)` | document | 14,824 | 32 |
+| `WHERE n.body IS NOT NULL RETURN count(n.body)` | relational | 12,409 | 32 |
+| `MATCH(n) RETURN count(n.body)` | document | 14,824 | 32 |
+| `MATCH(n) RETURN count(n.body)` | relational | 12,419 | 32 |
+| `MATCH(n:D:A) RETURN count(n.body)` | document | 16,040 | 32 |
+| `MATCH(n:D:A) RETURN count(n.body)` | relational | 16,022 | 32 |
+
+All listed shapes pass a 1 MiB ceiling. Relational row-filter cases also pass at
+1 MiB. Document row filters are qualified at the established 8 MiB budget for
+per-record visibility evaluation; a separate plain-count control also exceeds
+1 MiB with that filter, independently
+of IN. These measurements qualify allocation/work bounds, not latency speedups
+between Debug and the earlier optimized baseline.
+
+The merge includes `origin/main` at `ef13a4ae03`. Its retained-cut test conflict
+keeps cold-cache admission pressure and pinned-cut validity checks without an
+allocator-dependent peak assertion. The focused retained-cut regression passes
+with no leaks (56/56 build steps).

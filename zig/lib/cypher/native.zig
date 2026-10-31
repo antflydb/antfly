@@ -367,8 +367,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             defer arena.deinit();
             const temporary = arena.allocator();
             const projection = (try @import("owner_count.zig").Projection.init(temporary, graph, input)) orelse return null;
-            const label = graph.label(input.node.labels[0]) orelse return error.UnknownGraphLabel;
-            if (!std.mem.eql(u8, label.table, table)) return error.Forbidden;
+            if (!@import("owner_count.zig").permitsTable(graph, input, table)) return error.Forbidden;
             const Visitor = @typeInfo(@TypeOf(DB.visitCypherDocuments)).@"fn".param_types[5].?;
             const Entry = @typeInfo(@FieldType(Visitor, "visit")).pointer.child;
             const RowEntry = @typeInfo(Entry).@"fn".param_types[1].?;
@@ -437,7 +436,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         return error.CypherInvalidDocument;
                     } orelse return;
                     var membership = fold.adapter.valueWork(scratch);
-                    if (!try fold.adapter.graph.?.admits(counted_node, fold.input.node.labels[0], &membership)) return;
+                    if (!try @import("owner_count.zig").admits(fold.adapter.graph.?, fold.input, counted_node, &membership)) return;
                     if (!try @import("runtime.zig").ownerCountMatches(scratch, fold.adapter.backend(), fold.adapter.graph.?, fold.input, counted_node, fold.adapter.work)) return;
                     try charge(fold, fold.projection.arguments.len);
                     fold.count += 1;
@@ -470,9 +469,20 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .filter_query_json = if (fold.stored) authorization.filter_query_json else "", .include_documents = true, .limit = @intCast(input.max_examined + 1) });
             if (opts.relational_query) |*query| {
                 const filters = try @import("runtime.zig").ownerCountFilters(temporary, self.backend(), graph, input, self.work);
-                // Sparse union domains retain the established index planner;
-                // replacing them with a primary scan would lose bounded seeks.
-                for (filters) |filter| if (filter.op == .in) return null;
+                // Share the complete sparse/composite candidate planner, but
+                // consume its admitted domains without materializing pages.
+                const sparse = for (filters) |filter| {
+                    if (filter.op == .in) break true;
+                } else false;
+                if (sparse) {
+                    if (comptime @hasDecl(DB, "RelationalReadSession") and @hasDecl(DB.RelationalReadSession, "visitCypherRows")) {
+                        const streamed = try scanPlanned(self, temporary, table, filters, null, input.max_examined + 1, false, true, .{ .borrow_documents = true, .context = &fold, .visit = Fold.visit, .progress = Fold.progress });
+                        if (streamed == null) return null;
+                        const result: b.CountResult = .{ .count = fold.count, .counts = try a.dupe(usize, counts), .examined = fold.examined };
+                        try result.validateFor(input.max_examined, input.arguments.len);
+                        return result;
+                    } else return null;
+                }
                 var schema = acquireSchema(db) orelse return error.SchemaVersionChanged;
                 defer schema.release();
                 const Query = @TypeOf(query.*);
@@ -524,7 +534,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             var quota: @import("budget.zig") = .{ .backing = b.reclaimingAllocator(a), .limit = 1 << 20 };
             var arena = std.heap.ArenaAllocator.init(quota.allocator());
             defer arena.deinit();
-            const page = (scanPlanned(ptr, arena.allocator(), table, filters, null, limit + 1, false, true) catch |err| {
+            const page = (scanPlanned(ptr, arena.allocator(), table, filters, null, limit + 1, false, true, null) catch |err| {
                 if (err == error.OutOfMemory and quota.exhausted) return .{ .page = .{ .items = &.{} }, .complete = false };
                 if (err == error.RelationalRowResultTooLarge) return .{ .page = .{ .items = &.{} }, .complete = false };
                 return err;
@@ -851,7 +861,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 return .{ .items = &.{} };
             };
             if (comptime @hasDecl(DB, "openRelationalReadSession") and @hasDecl(DB, "cypherDocumentScanOptions")) {
-                if (comptime @hasDecl(DB.RelationalReadSession, "seekPrefix")) return scanPlanned(ptr, a, table, filters, encoded, limit, index_only, false);
+                if (comptime @hasDecl(DB.RelationalReadSession, "seekPrefix")) return scanPlanned(ptr, a, table, filters, encoded, limit, index_only, false, null);
             }
             return scanLegacy(ptr, a, table, filters, encoded, limit, index_only);
         }
@@ -1096,7 +1106,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 else => false,
             };
         }
-        fn scanPlanned(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize, comptime index_only: bool, comptime probe: bool) anyerror!WhereResult(index_only) {
+        const ScanVisitor = if (@hasDecl(DB, "visitCypherDocuments")) @typeInfo(@TypeOf(DB.visitCypherDocuments)).@"fn".param_types[5].? else void;
+        fn scanPlanned(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize, comptime index_only: bool, comptime probe: bool, visitor: ?ScanVisitor) anyerror!WhereResult(index_only) {
             if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return null;
             if (comptime !@hasDecl(DB.RelationalReadSession, "seekPrefix")) return null;
             const planning = for (filters) |filter| {
@@ -1115,7 +1126,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 return .{ .items = &.{} };
             };
             const authority = try self.readAuthorization(temporary, table);
-            var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authority.deadline_ns, .row_policy_principal_proof = authority.proof, .row_policy_database = authority.database, .include_documents = true, .limit = @intCast(limit) });
+            var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authority.deadline_ns, .row_policy_principal_proof = authority.proof, .row_policy_database = authority.database, .include_documents = true, .limit = @intCast(if (visitor != null) @min(limit, 4096) else limit) });
+            if (visitor != null and self.authority.project_stored != null) opts.filter_query_json = authority.filter_query_json;
             if (opts.relational_query == null) return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
             var schema = acquireSchema(db) orelse return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
             defer schema.release();
@@ -1446,6 +1458,24 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     const next = try std.json.Stringify.valueAlloc(a, PropertyCursor{ .planned = true, .index = session.reader.index.?.name, .schema_version = session.reader.active.version(), .domain_filter = if (domain) |d| d.filter else null, .domain_length = if (domain) |d| d.total else 0, .prefix_filters = prefix_filters, .prefix_lengths = prefix_lengths }, .{});
                     return .{ .items = &.{}, .examined = 0, .next = next, .seek_window = .{ .filter = if (domain) |d| d.filter else null, .prefix_filters = try a.dupe(usize, prefix_filters) } };
                 }
+                if (comptime !index_only and @hasDecl(DB, "RelationalReadSession") and @hasDecl(DB.RelationalReadSession, "visitCypherRows")) if (visitor) |sink| {
+                    // Planning has certified disjoint branches before any row
+                    // is observed. The fold charges physical progress and owns
+                    // the global anchor ceiling across every branch.
+                    if (encoded != null or planning) return null;
+                    if (domain) |d| if (d.values.len != d.total) return null;
+                    const total = branchCount(plan.*, domains.items, false);
+                    for (0..total) |branch| {
+                        if (self.work) |work| try work.charge(work.ptr, 1);
+                        if (domain != null) {
+                            branchPrefix(plan, domains.items, branch, 0, false);
+                            try session.seekPrefix(plan.prefix, null);
+                        }
+                        try session.visitCypherRows(a, limit, sink);
+                    }
+                    try checkpoint(ptr);
+                    return .{ .items = &.{} };
+                };
                 var nodes: std.ArrayList(*const v.Node) = .empty;
                 var examined: usize = 0;
                 var count: usize = 0;

@@ -50,16 +50,48 @@ pub fn argument(expr: *const ast.Expr, alias: ?[]const u8) bool {
 pub fn eligible(input: b.CountInput) bool {
     if (input.arguments.len > b.max_count_arguments) return false;
     for (input.arguments) |expr| if (expr) |value| if (!argument(value, input.node.alias)) return false;
-    if (input.node.labels.len != 1) return false;
     for (input.node.properties) |property| if (!expression(property.value, input.node.alias)) return false;
     if (input.predicate) |predicate| if (!expression(predicate, input.node.alias)) return false;
     return true;
 }
+/// A request is table-local even when its logical pattern has no label or
+/// several labels. The coordinator visits each physical table only once.
+pub fn permitsTable(graph: catalog.Graph, input: b.CountInput, table: []const u8) bool {
+    if (input.node.labels.len == 0) {
+        for (graph.labels) |label| if (std.mem.eql(u8, label.table, table)) return true;
+        return false;
+    }
+    for (input.node.labels) |name| {
+        const label = graph.label(name) orelse return false;
+        if (!std.mem.eql(u8, label.table, table)) return false;
+    }
+    return true;
+}
+pub fn admits(graph: catalog.Graph, input: b.CountInput, node: *const @import("value.zig").Node, work: *@import("value_work.zig").Work) !bool {
+    if (input.node.labels.len == 0) {
+        for (graph.labels) |label| if (try graph.admits(node, label.name, work)) return true;
+        return false;
+    }
+    for (input.node.labels) |name| if (!try graph.admits(node, name, work)) return false;
+    return true;
+}
+fn alreadyBound(_: *anyopaque, _: std.mem.Allocator, _: catalog.Graph) !void {}
 pub fn run(a: std.mem.Allocator, backend: b.Backend, graph: catalog.Graph, table: []const u8, input: b.CountInput, work: ?b.Work) !?b.CountResult {
     if (!eligible(input)) return null;
-    const label = graph.label(input.node.labels[0]) orelse return error.UnknownGraphLabel;
-    if (!std.mem.eql(u8, label.table, table)) return error.Forbidden;
+    if (!permitsTable(graph, input, table)) return error.Forbidden;
+    // The portable owner fallback must never scan another physical owner.
+    var local = graph;
+    var labels: std.ArrayList(catalog.Label) = .empty;
+    defer labels.deinit(a);
+    for (graph.labels) |label| if (std.mem.eql(u8, label.table, table)) try labels.append(a, label);
+    local.labels = labels.items;
+    local.relationships = &.{};
+    // Authenticate the original catalog, then keep the backend bound to it.
+    // The evaluator's table-local view must not replace a retained adapter's
+    // catalog with a temporary slice that dies when this reduction returns.
+    try backend.vtable.bind(backend.ptr, a, graph);
     var callbacks = backend.vtable.*;
+    callbacks.bind = alreadyBound;
     callbacks.count_nodes = null;
     callbacks.startup_work = null;
     const count: ast.Expr = .{ .span = .{}, .value = .{ .call = .{ .name = "count", .args = &.{}, .star = true } } };
@@ -90,7 +122,7 @@ pub fn run(a: std.mem.Allocator, backend: b.Backend, graph: catalog.Graph, table
     };
     var compiled: @import("compiler.zig").Compiled = .{ .arena = .init(a), .query = .{ .source = input.source, .clauses = &clauses }, .parameters = &.{} };
     defer compiled.deinit();
-    var result = try @import("runtime.zig").executeWithWork(a, .{ .ptr = backend.ptr, .vtable = &callbacks }, graph, &compiled, input.parameters, .{ .scanned_anchors = input.max_examined, .intermediate_states = input.max_work, .memory_bytes = input.memory_bytes }, work);
+    var result = try @import("runtime.zig").executeWithWork(a, .{ .ptr = backend.ptr, .vtable = &callbacks }, local, &compiled, input.parameters, .{ .scanned_anchors = input.max_examined, .intermediate_states = input.max_work, .memory_bytes = input.memory_bytes }, work);
     defer result.deinit();
     if (result.rows.len != 1 or result.rows[0].len != items.len or result.rows[0][0] != .integer or result.rows[0][0].integer < 0) return error.CypherInvalidBackendPage;
     const counts = try a.alloc(usize, input.arguments.len);
@@ -104,28 +136,34 @@ pub fn run(a: std.mem.Allocator, backend: b.Backend, graph: catalog.Graph, table
     return out;
 }
 
-/// Preserve actual values observed by membership and predicates. Only properties
-/// observed exclusively by direct COUNT arguments may use a nullness sentinel.
+/// Preserve actual values observed by membership and value-sensitive predicates.
+/// Direct COUNT arguments and nullness predicates may share a checked sentinel.
 pub const Projection = struct {
     fields: []const []const u8,
     presence: []const []const u8,
     arguments: []const Argument,
     pub const Argument = union(enum) { field: []const u8, present: bool };
-    fn dependencies(a: std.mem.Allocator, expr: *const ast.Expr, values: *std.StringHashMapUnmanaged(void)) !bool {
+    fn dependencies(a: std.mem.Allocator, expr: *const ast.Expr, values: *std.StringHashMapUnmanaged(void), fields: *std.StringHashMapUnmanaged(void)) !bool {
         return switch (expr.value) {
             .literal, .parameter => true,
             .property => |p| if (p.base.value == .variable) add: {
                 try values.put(a, p.name, {});
                 break :add true;
-            } else try dependencies(a, p.base, values),
-            .unary => |u| try dependencies(a, u.operand, values),
-            .binary => |op| try dependencies(a, op.left, values) and try dependencies(a, op.right, values),
+            } else try dependencies(a, p.base, values, fields),
+            .unary => |u| nullness: {
+                if ((u.op == .is_null or u.op == .is_not_null) and u.operand.value == .property and u.operand.value.property.base.value == .variable) {
+                    try fields.put(a, u.operand.value.property.name, {});
+                    break :nullness true;
+                }
+                break :nullness try dependencies(a, u.operand, values, fields);
+            },
+            .binary => |op| try dependencies(a, op.left, values, fields) and try dependencies(a, op.right, values, fields),
             .comparison => |chain| all: {
-                for (chain.operands) |operand| if (!try dependencies(a, operand, values)) break :all false;
+                for (chain.operands) |operand| if (!try dependencies(a, operand, values, fields)) break :all false;
                 break :all true;
             },
             .list => |items| all: {
-                for (items) |item| if (!try dependencies(a, item, values)) break :all false;
+                for (items) |item| if (!try dependencies(a, item, values, fields)) break :all false;
                 break :all true;
             },
             // Whole entities and extension expressions keep the ordinary path.
@@ -142,9 +180,9 @@ pub const Projection = struct {
         };
         for (input.node.properties) |property| {
             try values.put(a, property.name, {});
-            if (!try dependencies(a, property.value, &values)) return null;
+            if (!try dependencies(a, property.value, &values, &fields)) return null;
         }
-        if (input.predicate) |predicate| if (!try dependencies(a, predicate, &values)) return null;
+        if (input.predicate) |predicate| if (!try dependencies(a, predicate, &values, &fields)) return null;
         var dependencies_ = values.keyIterator();
         while (dependencies_.next()) |name| try fields.put(a, name.*, {});
         const arguments = try a.alloc(Argument, input.arguments.len);

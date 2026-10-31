@@ -395,6 +395,7 @@ pub const VTable = struct {
     relationalReaderLookupSqlBatch: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, documents: []const []const u8, layout: *const @import("../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) Outcome(@import("db/relational_rows.zig").Reader.Hydrated),
     relationalReaderLookupTypedRow: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?*const @import("../sql/catalog.zig").Row.TypedLayout) Outcome(?@import("db/relational_rows.zig").Row),
     relationalSessionDeinit: *const fn (session: *@import("db/relational_read_session.zig").Session) Outcome(void),
+    relationalSessionVisitCypherRows: *const fn (*@import("db/relational_read_session.zig").Session, Allocator, usize, types.ScanVisitor) Outcome(void),
     relationalSessionSeekPrefix: *const fn (*@import("db/relational_read_session.zig").Session, []const std.json.Value, ?[]const u8) Outcome(void),
     relationalReaderSeekPrefix: *const fn (*@import("db/relational_rows.zig").Reader, []const @import("db/relational_rows.zig").Value, ?[]const u8) Outcome(void),
     relationalSessionCheckpoint: *const fn (session: *const @import("db/relational_read_session.zig").Session) Outcome(void),

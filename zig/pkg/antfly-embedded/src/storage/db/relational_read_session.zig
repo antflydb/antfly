@@ -64,6 +64,15 @@ pub const Session = struct {
         try session.checkpoint();
     }
 
+    /// Consume the selected index domain through borrowed projections. Policy
+    /// and cancellation leases remain owned by this admitted read session.
+    pub fn visitCypherRows(session: *Session, alloc: Allocator, limit: usize, visitor: types.ScanVisitor) !void {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionVisitCypherRows", .{ session, alloc, limit, visitor });
+        try session.checkpoint();
+        try RelationalRows.visitCypherRows(&session.reader, alloc, null, limit, visitor);
+        try session.checkpoint();
+    }
+
     pub fn rangeProofs(session: *Session, alloc: Allocator) ![]@import("../range_protection.zig").Proof {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionRangeProofs", .{ session, alloc });
         try session.checkpoint();

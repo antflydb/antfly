@@ -1616,6 +1616,30 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
         )
         count("D", admin, (32, 16))
         count("A", admin, (16, 8))
+        # With no unconditional label, an unlabeled pattern is a union of
+        # predicate memberships. Overlapping labels must not double count.
+        call(
+            f"/graphs/{prefix}_union",
+            {
+                "labels": [
+                    {"name": "A", "table": prefix, "where": {"tenant": "acme"}},
+                    {"name": "One", "table": prefix, "where": {"id": "n1"}},
+                ],
+                "relationships": [],
+            },
+        )
+        union = call(
+            f"/graphs/{prefix}_union/query",
+            {
+                "query": "MATCH(n) RETURN count(*),count(n.body)",
+                "limits": {"memory_bytes": 1 << 20, "scanned_anchors": 32},
+            },
+        )
+        assert union["rows"] == [
+            [{"type": "integer", "value": "16"}, {"type": "integer", "value": "8"}]
+        ], union
+        assert union["stats"]["scanned_anchors"] == 32, union
+
         if relational:
             indexed_label = call(
                 f"/graphs/{prefix}/query",
@@ -1699,6 +1723,11 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
                 ("n:D", "WHERE n.tenant='acme'", 8),
                 ("n:D {tenant:'acme'}", "", 8),
                 ("n:D", "WHERE n.missing IS NULL", bodies),
+                ("n:D", "WHERE n.body IS NOT NULL", bodies),
+                ("n:D", "WHERE n.body IS NULL", 0),
+                ("n", "", bodies),
+                ("n:D:A", "", 8),
+                ("n:A:A", "", 8),
             ):
                 for memory in (1 << 20, 4 << 20) if session is admin else (8 << 20,):
                     bounded = call(
@@ -1714,6 +1743,24 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
                     ], bounded
                     assert bounded["stats"]["memory_bytes"] < memory, bounded
                     assert bounded["stats"]["scanned_anchors"] == 32, bounded
+                    if (
+                        session is admin
+                        and memory == 1 << 20
+                        and (pattern != "n:D" or "n.body IS" in predicate)
+                    ):
+                        print(
+                            json.dumps(
+                                {
+                                    "storage": "relational"
+                                    if relational
+                                    else "document",
+                                    "pattern": pattern,
+                                    "predicate": predicate,
+                                    "stats": bounded["stats"],
+                                },
+                                sort_keys=True,
+                            )
+                        )
             # A predicate observing the count input must see its actual value,
             # rather than the nullness sentinel used by other count statements.
             observed = call(
@@ -1738,6 +1785,70 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
             },
         )
         assert residual["rows"] == [[{"type": "integer", "value": "1"}]], residual
+        # Sparse index candidates retain the bounded projection and exact
+        # membership semantics, including duplicate and NULL operands.
+        for predicate, expected, anchors in (
+            ("n.id IN ['n1']", 1, 1),
+            ("n.id IN ['n1','n3']", 2, 2),
+            ("n.id='n1' OR n.id='n3'", 2, 2),
+            ("n.id IN ['n1','n1',null]", 1, 1),
+            ("n.id IN []", 0, 0),
+            ("n.id IN [null]", 0, 0),
+        ):
+            for session in (admin, reader):
+                visible = expected if session is admin else min(expected, 1)
+                # Document policies retain their existing per-record filter
+                # workspace. Typed relational policies also fit at one MiB.
+                memory = 8 << 20 if session is reader and not relational else 1 << 20
+                result = call(
+                    f"/graphs/{prefix}/query",
+                    {
+                        "query": f"MATCH (n:D) WHERE {predicate} RETURN count(n.body)",
+                        "limits": {
+                            "memory_bytes": memory,
+                            "scanned_anchors": max(1, anchors) if relational else 32,
+                        },
+                    },
+                    session=session,
+                )
+                assert result["rows"] == [
+                    [{"type": "integer", "value": str(visible)}]
+                ], result
+                assert result["stats"]["memory_bytes"] < memory, result
+                if relational:
+                    assert result["stats"]["scanned_anchors"] <= anchors, result
+                if session is admin:
+                    print(
+                        json.dumps(
+                            {
+                                "storage": "relational" if relational else "document",
+                                "predicate": predicate,
+                                "stats": result["stats"],
+                            },
+                            sort_keys=True,
+                        )
+                    )
+        null_rows = call(
+            f"/graphs/{prefix}/query",
+            {
+                "query": "MATCH(n:D) WHERE n.body IS NULL RETURN count(*)",
+                "limits": {"memory_bytes": 1 << 20},
+            },
+        )
+        assert null_rows["rows"] == [[{"type": "integer", "value": "16"}]], null_rows
+        if relational:
+            exceeded = admin.post(
+                base + f"/graphs/{prefix}/query",
+                json={
+                    "query": "MATCH(n:D) WHERE n.id IN ['n1','n3'] RETURN count(n.body)",
+                    "limits": {"memory_bytes": 1 << 20, "scanned_anchors": 1},
+                },
+                timeout=45,
+            )
+            assert exceeded.status_code == 429, exceeded.text
+            assert exceeded.json()["code"] == "CypherAnchorBudgetExceeded", (
+                exceeded.text
+            )
         # An effective filter that admits no rows must not evaluate a hidden
         # row's scalar predicate. Progress still accounts for all candidates.
         call(
@@ -1755,6 +1866,20 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
         )
         assert hidden["rows"] == [[{"type": "integer", "value": "0"}]], hidden
         assert hidden["stats"]["scanned_anchors"] == 32, hidden
+        sparse_hidden = call(
+            f"/graphs/{prefix}/query",
+            {
+                "query": "MATCH(n:D) WHERE n.id IN ['n1','n3'] AND 1/0=0 RETURN count(n.body)",
+                "limits": {"memory_bytes": (1 if relational else 8) << 20},
+            },
+            session=reader,
+        )
+        assert sparse_hidden["rows"] == [[{"type": "integer", "value": "0"}]], (
+            sparse_hidden
+        )
+        assert sparse_hidden["stats"]["scanned_anchors"] == (2 if relational else 32), (
+            sparse_hidden
+        )
     finally:
         reader.close()
         admin.close()

@@ -877,6 +877,10 @@ fn relationalSessionDeinit(session: *@import("db/relational_read_session.zig").S
     return .{ .value = session.deinit() };
 }
 
+fn relationalSessionVisitCypherRows(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, limit: usize, visitor: types.ScanVisitor) engine.Outcome(void) {
+    session.visitCypherRows(alloc, limit, visitor) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = {} };
+}
 fn relationalSessionSeekPrefix(session: *@import("db/relational_read_session.zig").Session, values: []const std.json.Value, after: ?[]const u8) engine.Outcome(void) {
     session.seekPrefix(values, after) catch |err| return .{ .failure = .init(@errorName(err)) };
     return .{ .value = {} };
