@@ -1100,6 +1100,7 @@ const LocalStandaloneMetadata = struct {
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .create_table = createTable,
                 .replace_table_definition = replaceTableDefinition,
+                .replication_sources_supported = replicationSourcesSupported,
                 .get_lake_index_lifecycle = if (durable) getLakeIndexLifecycle else null,
                 .mutate_lake_index_lifecycle = if (durable) mutateLakeIndexLifecycle else null,
                 .publish_vector_migration_table = publishVectorMigrationTable,
@@ -3187,8 +3188,18 @@ const LocalStandaloneMetadata = struct {
         }
     }
 
+    /// HA's mirrored primary rejects replication sources outright: CDC needs
+    /// single-writer catalog ownership, which a hot-standby primary does
+    /// not have (see cdcOwned()). Table creation, managed-source
+    /// replacement, and managed-source status all read this same boolean so
+    /// none of them can drift from the others and silently accept a
+    /// configuration that will never replicate.
+    fn haRejectsReplicationSources(self: *const LocalStandaloneMetadata) bool {
+        return self.hot_standby_catalog_server != null;
+    }
+
     fn deriveCreatedTableRecord(self: *LocalStandaloneMetadata, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !antfly.metadata.TableRecord {
-        if (self.hot_standby_catalog_server != null) {
+        if (self.haRejectsReplicationSources()) {
             if (req.replication_sources_json) |sources| {
                 if (!std.mem.eql(u8, sources, "[]")) return error.HACatalogReplicationSourcesUnsupported;
             }
@@ -3424,6 +3435,13 @@ const LocalStandaloneMetadata = struct {
         if (!antfly.metadata.table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
         if (current.storage_migration != null and !antfly.metadata.table_manager.tableDefinitionsEqual(current.*, replacement))
             return error.TableTransitionActive;
+        // Table creation rejects replication sources on an HA primary
+        // (deriveCreatedTableRecord); a definition replacement — the path
+        // `POST .../sources/managed` uses — must reject the same way, or an
+        // HA primary can be talked into a configuration that never
+        // replicates while reporting itself as configured.
+        if (self.haRejectsReplicationSources() and !std.mem.eql(u8, replacement.replication_sources_json, "[]"))
+            return error.HACatalogReplicationSourcesUnsupported;
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(self.alloc, replacement.indexes_json);
         try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(self.alloc, replacement.indexes_json);
         var mutation = try self.beginCatalogMutationLocked();
@@ -3432,6 +3450,13 @@ const LocalStandaloneMetadata = struct {
         mutation.compare_and_replace_table = replacement.table_id;
         self.epoch +|= 1;
         try mutation.commit(self);
+    }
+
+    /// The managed-sources status capability `sources/managed` reports so
+    /// one HTTP handler doesn't need its own copy of the HA rejection rule.
+    fn replicationSourcesSupported(ptr: *anyopaque) anyerror!bool {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        return !self.haRejectsReplicationSources();
     }
 
     fn publishVectorMigrationTable(ptr: *anyopaque, expected: antfly.metadata.TableRecord, replacement: antfly.metadata.TableRecord) !void {
@@ -9469,6 +9494,86 @@ test "standalone cdc accepts Postgres replication sources" {
     const empty_sources = try alloc.dupe(u8, "[]");
     defer alloc.free(empty_sources);
     try LocalStandaloneMetadata.createTable(&metadata, alloc, "empty_sources", .{ .replication_sources_json = empty_sources });
+}
+
+/// A minimal standalone metadata bound to an HA hot-standby primary, with no
+/// lifecycle store or data server: enough to reach the HA capability checks
+/// before any lock contention or durable-catalog write would need a fuller
+/// harness.
+fn haBoundStandaloneMetadataForTest(alloc: std.mem.Allocator, backend_runtime: *antfly.db.background_runtime.BackendRuntime, server: *antfly.data.runtime.DataServer) !LocalStandaloneMetadata {
+    server.hot_standby_public_gate_state = .{};
+    server.hot_standby_mutation_barrier = .{};
+    server.hot_standby_state_mutex = .unlocked;
+    return .{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, "unused-catalog"),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime,
+        .hot_standby_catalog_server = server,
+    };
+}
+
+test "standalone cdc HA catalog rejects replication sources at create and on managed-source replacement" {
+    const alloc = std.testing.allocator;
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var server: antfly.data.runtime.DataServer = undefined;
+    var metadata = try haBoundStandaloneMetadataForTest(alloc, backend_runtime.ptr(), &server);
+    defer metadata.deinit();
+    try std.testing.expect(!metadata.cdcOwned());
+
+    const sources = "[{\"type\":\"postgres\",\"dsn\":\"${secret:pg}\",\"postgres_table\":\"public.tickets\"}]";
+    const owned_sources = try alloc.dupe(u8, sources);
+    defer alloc.free(owned_sources);
+
+    // Table creation already rejected this (pre-dating this PR's fixes);
+    // this locks it in now that the same boolean backs every call site.
+    try std.testing.expectError(
+        error.HACatalogReplicationSourcesUnsupported,
+        LocalStandaloneMetadata.createTable(&metadata, alloc, "tickets", .{ .replication_sources_json = owned_sources }),
+    );
+
+    // `POST .../sources/managed` calls replaceTableDefinition directly,
+    // bypassing createTable's checks entirely before this fix. Seed the
+    // table straight into the projection: this test is only about the
+    // rejection, which returns before any durable commit is attempted, so
+    // it does not need a full create round-trip against this minimal,
+    // otherwise-undefined HA data server.
+    const existing = antfly.public_api.tables.deriveTableRecord("plain", .{});
+    try metadata.manager.upsertTable(existing);
+    var replacement = existing;
+    replacement.replication_sources_json = owned_sources;
+    try std.testing.expectError(
+        error.HACatalogReplicationSourcesUnsupported,
+        LocalStandaloneMetadata.replaceTableDefinition(&metadata, existing, replacement),
+    );
+}
+
+test "standalone cdc managed-source status reports cdc_supported false only for an HA catalog" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var standalone_metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://127.0.0.1:8080", ".", path, backend.ptr(), null, .local);
+    defer standalone_metadata.deinit();
+    try std.testing.expect(try standalone_metadata.statusSource().replicationSourcesSupported());
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var server: antfly.data.runtime.DataServer = undefined;
+    var ha_metadata = try haBoundStandaloneMetadataForTest(alloc, backend_runtime.ptr(), &server);
+    defer ha_metadata.deinit();
+    try std.testing.expect(!(try ha_metadata.statusSource().replicationSourcesSupported()));
 }
 
 test "standalone table storage defaults persist without migrating legacy tables" {

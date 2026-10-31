@@ -9254,7 +9254,13 @@ pub const AntflyApiHandler = struct {
         const binding = (try self.resolvePublicTableBinding(ctx, name, &identity)) orelse return ctx.response.build();
         defer binding.deinit(ctx.allocator);
         const module = @import("managed_sources.zig");
-        const bytes = (if (mutate) module.configure(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity), (try ctx.body()) orelse "") else module.status(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity))) catch |err| return jsonErrorResponse(ctx, @import("lake_catalog_http.zig").errorStatus(err), @errorName(err));
+        const bytes = (if (mutate) module.configure(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity), (try ctx.body()) orelse "") else module.status(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity))) catch |err| {
+            // Same typed rejection table creation uses: an HA primary never
+            // replicates, so this reports it the same way regardless of
+            // which endpoint tripped over the restriction.
+            if (err == error.HACatalogReplicationSourcesUnsupported) return respondJsonErrorBody(ctx, 400, ha_catalog_replication_sources_unsupported_body);
+            return jsonErrorResponse(ctx, @import("lake_catalog_http.zig").errorStatus(err), @errorName(err));
+        };
         defer ctx.allocator.free(bytes);
         try ctx.setHeader("content-type", "application/json");
         _ = ctx.response.body(bytes);

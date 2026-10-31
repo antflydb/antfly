@@ -73,13 +73,20 @@ pub fn status(a: A, server: *api.ApiHttpServer, physical: []const u8, bound_id: 
     var progress: std.ArrayList(@import("../metadata/table_manager.zig").ReplicationSourceStatusRecord) = .empty;
     defer progress.deinit(a);
     for (snapshot.replication_source_statuses) |record| if (record.table_id == table.table_id) try progress.append(a, record);
-    // Cluster and standalone (directory-backed and Lite) both run CDC.
+    // Cluster and standalone (directory-backed and Lite) both run CDC; a
+    // standalone instance bound to an HA hot-standby primary does not, and
+    // must say so rather than reporting itself as configured.
+    const cdc_supported = try server.source.replicationSourcesSupported();
     return std.json.Stringify.valueAlloc(a, .{
         .table_id = table.table_id,
         .sources_hash = &hash,
         .replication_sources = sources.value,
         .progress = progress.items,
-        .cdc_supported = true,
+        .cdc_supported = cdc_supported,
+        .cdc_unsupported_reason = if (cdc_supported)
+            ""
+        else
+            "replication sources require a cluster; this is a hot-standby catalog",
     }, .{});
 }
 
