@@ -1,0 +1,49 @@
+name: Docs and design approval
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
+permissions:
+  contents: read
+jobs:
+  approve:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type == 'User'
+    runs-on: arc-antfly-standard-runtime
+    timeout-minutes: 5
+    # This environment must allow only the main branch (no tags or PR refs).
+    # Store the App key here, never as a repository or organization secret.
+    environment: docs-design-approval
+    concurrency:
+      group: docs-design-approval-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # pull_request_target SHA is trusted base code, never the PR head.
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - name: Create scoped approval App token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        id: approval-app
+        with:
+          app-id: ${{ vars.DOCS_APPROVAL_APP_ID }}
+          private-key: ${{ secrets.DOCS_APPROVAL_APP_PRIVATE_KEY }}
+          owner: antflydb
+          repositories: antfly
+          # GitHub counts App approvals only with repository write access.
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          REVIEWER_LOGIN: ${{ steps.approval-app.outputs.app-slug }}[bot]
+        with:
+          github-token: ${{ steps.approval-app.outputs.token }}
+          script: |
+            const {main} = require('./.github/scripts/docs-design-approval.cjs');
+            await main({github, context, core, reviewerLogin: process.env.REVIEWER_LOGIN});

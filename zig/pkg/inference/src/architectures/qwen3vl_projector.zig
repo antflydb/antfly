@@ -1773,6 +1773,26 @@ fn visionBlockActivation(cb: *const ComputeBackend, cfg: Config, input: CT) !CT 
     return (try cb.geluExact(input)) orelse try cb.gelu(input);
 }
 
+fn tryLightOnBf16VisionBlock(cb: *const ComputeBackend, weights: *WeightCache, cfg: Config, input: CT, positions: []const u32, rows: usize, layer: usize, image_batch: usize) !?CT {
+    if (comptime !build_options.enable_cuda) return null;
+    const Cuda = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+    if (!cfg.is_qwen35 or cfg.deepstack_len != 0 or !cfg.block_gelu_tanh or !Cuda.lightOnBf16VisionEnabled(cb)) return null;
+    const keys = [_][]const u8{ "ln1.weight", "ln1.bias", "attn_qkv.weight", "attn_qkv.bias", "attn_out.weight", "attn_out.bias", "ln2.weight", "ln2.bias", "ffn_up.weight", "ffn_up.bias", "ffn_down.weight", "ffn_down.bias" };
+    var tensors: [12]CT = undefined;
+    var name: [128]u8 = undefined;
+    for (keys, 0..) |key, index| {
+        const full = try std.fmt.bufPrint(&name, "v.blk.{d}.{s}", .{ layer, key });
+        tensors[index] = switch (index) {
+            2 => try weights.linear(full, cfg.vision_hidden, 3 * cfg.vision_hidden),
+            4 => try weights.linear(full, cfg.vision_hidden, cfg.vision_hidden),
+            8 => try weights.linear(full, cfg.vision_hidden, cfg.intermediate),
+            10 => try weights.linear(full, cfg.intermediate, cfg.vision_hidden),
+            else => try weights.weight(full),
+        };
+    }
+    return Cuda.lightOnBf16VisionBlock(cb, input, tensors, positions, rows, cfg.vision_hidden, cfg.intermediate, image_batch, cfg.layer_norm_eps, cfg.rope_theta);
+}
+
 fn encoderBlock(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1784,6 +1804,7 @@ fn encoderBlock(
     layer: usize,
     image_batch: usize,
 ) !CT {
+    if (try tryLightOnBf16VisionBlock(cb, weights, cfg, input_ct, positions, token_count, layer, image_batch)) |compact| return compact;
     var resident_scope = try ResidentVisionScope.begin(cb, cfg, input_ct);
     defer resident_scope.deinit();
     const input = resident_scope.input;
@@ -1814,11 +1835,12 @@ fn encoderBlock(
     defer if (normed1) |normalized| cb.free(normalized);
     const ln1_ns = profileLap(profile, &stage_started_at);
     failed_stage = "attention";
-    const attn = (visionAttention(cb, allocator, weights, cfg, normed1 orelse input, positions, token_count, layer, image_batch, projected_qkv) catch |zig017_err| {
+    var attention_has_residual = false;
+    const attn = (visionAttention(cb, allocator, weights, cfg, normed1 orelse input, positions, token_count, layer, image_batch, projected_qkv, input, &attention_has_residual) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
     });
-    defer cb.free(attn);
+    defer if (!attention_has_residual) cb.free(attn);
     // Attention has submitted every QKV consumer. Release its borrowed input
     // before the MLP starts so fusion does not extend the large QKV lifetime.
     if (projected_qkv) |projected| {
@@ -1827,7 +1849,7 @@ fn encoderBlock(
     }
     const attention_ns = profileLap(profile, &stage_started_at);
     failed_stage = "attention_residual";
-    const residual1 = (cb.add(input, attn) catch |zig017_err| {
+    const residual1 = if (attention_has_residual) attn else (cb.add(input, attn) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
     });
@@ -1915,6 +1937,8 @@ fn visionAttention(
     layer: usize,
     image_batch: usize,
     projected_qkv: ?CT,
+    residual: CT,
+    residual_fused: *bool,
 ) !CT {
     var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
@@ -1939,6 +1963,14 @@ fn visionAttention(
         if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionAttention(cb, qkv, positions, image_batch, token_count, cfg.head_count, cfg.headDim(), cfg.rope_theta)) |attended| {
             defer cb.free(attended);
             const attention_ns = profileLap(profile, &stage_started_at);
+            if (cfg.is_qwen35) {
+                const output_weight = try weights.linear(try std.fmt.bufPrint(&buf, "v.blk.{d}.attn_out.weight", .{layer}), cfg.vision_hidden, cfg.vision_hidden);
+                const output_bias = try weights.weight(try std.fmt.bufPrint(&buf, "v.blk.{d}.attn_out.bias", .{layer}));
+                if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionOutputResidual(cb, attended, output_weight, output_bias, residual, token_count, cfg.vision_hidden)) |output| {
+                    residual_fused.* = true;
+                    return output;
+                }
+            }
             const out_prefix = try std.fmt.bufPrint(&buf, "v.blk.{d}.attn_out", .{layer});
             const output = try linearNamed(cb, allocator, weights, attended, out_prefix, token_count, cfg.vision_hidden, cfg.vision_hidden);
             if (profile) std.debug.print("qwen3vl-vision-fused-attention-profile: layer={d} qkv_ms={d:.3} attention_ms={d:.3} out_ms={d:.3}\n", .{ layer, @as(f64, @floatFromInt(qkv_ns)) / std.time.ns_per_ms, @as(f64, @floatFromInt(attention_ns)) / std.time.ns_per_ms, @as(f64, @floatFromInt(profileLap(profile, &stage_started_at))) / std.time.ns_per_ms });
@@ -2111,6 +2143,10 @@ fn layerNormNamed(
     defer allocator.free(bias_name);
     const weight = try weights.weight(weight_name);
     const bias = try weights.weight(bias_name);
+    if (comptime build_options.enable_cuda) if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionBf16ToF32(cb, input)) |expanded| {
+        defer cb.free(expanded);
+        return cb.layerNorm(expanded, weight, bias, dim, eps);
+    };
     return cb.layerNorm(input, weight, bias, dim, eps);
 }
 
