@@ -113,6 +113,22 @@ pub fn captureSelected(db: anytype, a: A, fence: anytype, names: []const []const
     }
     return .{ .byte_range = byte_range, .row_policy_phase = phase, .row_policy_generation = policy_generation, .row_policy_catalog_epoch = policy_epoch, .a = a, .primary = primary, .indexes = indexes, .population_upper_bound = population, .schema_version = if (schema) |view| view.version() else 0, .now = now, .graphs = try graphs.toOwnedSlice(a) };
 }
+/// Synchronous projection over the same retained primary/index/policy cut as
+/// scan(). Relational readers enforce policy and TTL before exposing a borrow.
+pub fn visit(db: anytype, a: A, cut: *Snapshot, from: []const u8, to: []const u8, input: types.ScanOptions, visitor: types.ScanVisitor) !void {
+    var schema = db.core.acquireSchemaView();
+    defer if (schema) |*view| view.release();
+    if ((if (schema) |view| view.version() else 0) != cut.schema_version) return error.CatalogGenerationChanged;
+    if (schema == null or schema.?.storageMode() != .relational)
+        return db.scanVisitAtCypherSnapshot(a, from, to, input, visitor, cut);
+    var opts = input;
+    opts.sql_document_preimage = true;
+    var facade: Database(@TypeOf(db.*)) = .{ .source = db, .core = db.core, .cut = cut.* };
+    const session = try facade.openRelationalReadSession(a, from, to, opts);
+    defer session.deinit();
+    try @import("relational_rows.zig").visitCypherRows(&session.reader, a, db.backend_runtime.io(), opts.limit, visitor);
+    try session.checkpoint();
+}
 pub fn scan(db: anytype, a: A, cut: *Snapshot, from: []const u8, to: []const u8, input: types.ScanOptions) !types.ScanResult {
     var schema = db.core.acquireSchemaView();
     defer if (schema) |*view| view.release();
@@ -358,6 +374,9 @@ pub fn Database(comptime DB: type) type {
         }
         pub fn cypherGraphIndexIdentity(self: *@This(), a: A, name: []const u8) !?cypher.catalog.IndexIdentity {
             return self.source.cypherGraphIndexIdentity(a, name);
+        }
+        pub fn visitCypherDocuments(self: *@This(), a: A, from: []const u8, to: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) !void {
+            return self.source.visitCypherPinnedDocuments(a, &self.cut, from, to, opts, visitor);
         }
         pub fn scan(self: *@This(), a: A, from: []const u8, to: []const u8, opts: types.ScanOptions) !types.ScanResult {
             return self.source.scanCypherPinnedSnapshot(a, &self.cut, from, to, opts);

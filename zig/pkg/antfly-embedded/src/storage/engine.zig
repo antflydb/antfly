@@ -82,6 +82,8 @@ pub const VTable = struct {
     getCypherPinnedDocuments: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const []const u8, types.ScanOptions) Outcome([]?types.LookupResult),
     captureCypherSelectedSnapshot: *const fn (*DB, Allocator, *const DB.StatementReadFence, []const []const u8, u64, types.CancellationToken) Outcome(DB.CypherPinnedSnapshot),
     captureCypherPinnedSnapshot: *const fn (*DB, Allocator, *const DB.StatementReadFence, @import("cypher").catalog.Graph, []const u8) Outcome(DB.CypherPinnedSnapshot),
+    visitCypherDocuments: *const fn (*DB, Allocator, []const u8, []const u8, types.ScanOptions, types.ScanVisitor) Outcome(void),
+    visitCypherPinnedDocuments: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, types.ScanOptions, types.ScanVisitor) Outcome(void),
     scanCypherPinnedSnapshot: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot, []const u8, []const u8, types.ScanOptions) Outcome(types.ScanResult),
     cypherAdjacencyRoutes: *const fn (*DB, Allocator) Outcome([]const @import("cypher").backend.AdjacencyRoute),
     cypherPinnedAdjacencyRoutes: *const fn (*DB, Allocator, *DB.CypherPinnedSnapshot) Outcome([]const @import("cypher").backend.AdjacencyRoute),

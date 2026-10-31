@@ -848,3 +848,53 @@ test "aggregate borrowing expires source addresses at each row while retaining o
     try std.testing.expectEqual(@as(u8, 'x'), saved.list[0].string[0]);
     try std.testing.expectEqual(@as(u8, 'y'), fresh.string[0]);
 }
+
+/// Validate the Cypher value domain without constructing a Value. String chunks
+/// remain borrowed, including escaped strings, and container memory is O(depth).
+/// The caller supplies the depth of this value inside the projected document.
+pub fn validateJsonSlice(a: std.mem.Allocator, raw: []const u8, base_depth: usize) !void {
+    var scanner = std.json.Scanner.initCompleteInput(a, raw);
+    defer scanner.deinit();
+    var depth = base_depth;
+    while (true) {
+        const token = try scanner.next();
+        switch (token) {
+            .object_begin, .array_begin => {
+                if (depth > 64) return error.CypherValueDepthExceeded;
+                depth += 1;
+            },
+            .object_end, .array_end => depth -= 1,
+            .number => |number| {
+                if (depth > 64) return error.CypherValueDepthExceeded;
+                if (std.mem.indexOfAny(u8, number, ".eE") == null) {
+                    _ = std.fmt.parseInt(i64, number, 10) catch return error.CypherNumericOverflow;
+                } else {
+                    const parsed = std.fmt.parseFloat(f64, number) catch return error.CypherNumericOverflow;
+                    if (!std.math.isFinite(parsed)) return error.CypherNumericOverflow;
+                }
+            },
+            .end_of_document => break,
+            else => if (depth > 64) return error.CypherValueDepthExceeded,
+        }
+    }
+}
+
+test "count nullness validation streams escaped strings and preserves numeric and depth failures" {
+    const a = std.testing.allocator;
+    const text = try a.alloc(u8, (1 << 20) + 2);
+    defer a.free(text);
+    @memset(text, 'x');
+    text[0] = '"';
+    @memcpy(text[1..7], "\\u0041");
+    text[text.len - 1] = '"';
+    try validateJsonSlice(a, text, 1);
+    for ([_][]const u8{ "null", "false", "0", "[]", "{}", "[null,false,{\"n\":1e2}]" }) |json| try validateJsonSlice(a, json, 1);
+    try std.testing.expectError(error.CypherNumericOverflow, validateJsonSlice(a, "9223372036854775808", 1));
+    try std.testing.expectError(error.CypherNumericOverflow, validateJsonSlice(a, "{\"n\":1e999}", 1));
+    var deep: [131]u8 = undefined;
+    @memset(deep[0..65], '[');
+    deep[65] = '0';
+    @memset(deep[66..], ']');
+    try std.testing.expectError(error.CypherValueDepthExceeded, validateJsonSlice(a, &deep, 1));
+    try std.testing.expectError(error.SyntaxError, validateJsonSlice(a, "[1,]", 1));
+}

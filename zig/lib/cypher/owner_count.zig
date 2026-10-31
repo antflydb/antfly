@@ -103,3 +103,56 @@ pub fn run(a: std.mem.Allocator, backend: b.Backend, graph: catalog.Graph, table
     try out.validateFor(input.max_examined, input.arguments.len);
     return out;
 }
+
+/// A nullness projection is licensed only for direct node properties. Predicates,
+/// inline constraints and nested property evaluation retain the ordinary planner
+/// and evaluator, including their index seeks and scalar error ordering.
+pub const Projection = struct {
+    fields: []const []const u8,
+    presence: []const []const u8,
+    arguments: []const Argument,
+    pub const Argument = union(enum) { field: []const u8, present: bool };
+    pub fn init(a: std.mem.Allocator, graph: catalog.Graph, input: b.CountInput) !?Projection {
+        if (!eligible(input) or input.predicate != null or input.node.properties.len != 0) return null;
+        var fields: std.StringHashMapUnmanaged(void) = .empty;
+        var values: std.StringHashMapUnmanaged(void) = .empty;
+        for (graph.labels) |label| for (label.predicate) |entry| {
+            try fields.put(a, entry.name, {});
+            try values.put(a, entry.name, {});
+        };
+        const arguments = try a.alloc(Argument, input.arguments.len);
+        for (input.arguments, arguments) |expr, *out| {
+            const value = expr orelse {
+                out.* = .{ .present = true };
+                continue;
+            };
+            out.* = switch (value.value) {
+                .literal => |literal| .{ .present = literal != .null },
+                .parameter => |name| parameter: {
+                    for (input.parameters) |entry| if (std.mem.eql(u8, name, entry.name)) break :parameter .{ .present = entry.value != .null };
+                    // Missing parameters are diagnosed by the scalar evaluator,
+                    // even if the source happens to be empty.
+                    return null;
+                },
+                .variable => .{ .present = true },
+                .property => |property| property: {
+                    if (property.base.value != .variable) return null;
+                    try fields.put(a, property.name, {});
+                    break :property .{ .field = property.name };
+                },
+                else => return null,
+            };
+        }
+        const names = try a.alloc([]const u8, fields.count());
+        var presence: std.ArrayList([]const u8) = .empty;
+        var iterator = fields.keyIterator();
+        for (names) |*name| {
+            name.* = iterator.next().?.*;
+            // Native projection syntax must never reinterpret a literal name.
+            if (name.len == 0) return null;
+            for (name.*) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return null;
+            if (!values.contains(name.*)) try presence.append(a, name.*);
+        }
+        return .{ .fields = names, .presence = presence.items, .arguments = arguments };
+    }
+};

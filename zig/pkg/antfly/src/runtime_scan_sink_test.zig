@@ -81,3 +81,21 @@ test "scan sink local calls retain private consumer errors" {
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+const CountDocument = @import("antfly_local_sources").storage_db_types.BorrowedScanDocument;
+extern fn scan_sink_test_count_document(*CountDocument, *errors.Status) callconv(.c) void;
+test "scan sink count projection preserves optional values and named failures across archives" {
+    var status: errors.Status = .ok;
+    var document: CountDocument = undefined;
+    scan_sink_test_count_document(&document, &status);
+    try std.testing.expect((try document.countProjection(std.testing.allocator, &.{"body"})).?.bool);
+    try std.testing.expect(!(try document.countProjection(std.testing.allocator, &.{})).?.bool);
+    for ([_]anyerror{ error.OutOfMemory, error.CypherNumericOverflow, error.CypherValueDepthExceeded, error.Forbidden, error.DeadlineExceeded }) |failure| {
+        status = errors.statusFromError(failure);
+        try std.testing.expectError(failure, document.countProjection(std.testing.allocator, &.{"body"}));
+    }
+    // Older producers retain the optional fallback without dispatching a
+    // callback index that their independently compiled archive does not own.
+    document.count_projection_fn = null;
+    try std.testing.expect(try document.countProjection(std.testing.allocator, &.{"body"}) == null);
+}

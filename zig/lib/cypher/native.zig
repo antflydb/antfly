@@ -268,7 +268,11 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             return (try (v.Value{ .node = &projected }).clone(a)).node;
         }
         fn fullNode(self: *Self, a: A, table: []const u8, key: []const u8, json: []const u8) !?*const v.Node {
-            const value = try v.Value.fromJson(a, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }));
+            if (comptime @hasDecl(DB, "cypherDocumentKeyAllowed")) if (!DB.cypherDocumentKeyAllowed(key)) return null;
+            return self.fullNodeValue(a, table, key, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }));
+        }
+        fn fullNodeValue(self: *Self, a: A, table: []const u8, key: []const u8, input: std.json.Value) !?*const v.Node {
+            const value = try v.Value.fromJson(a, input);
             if (value != .map) return error.CypherInvalidDocument;
             const result = try a.create(v.Node);
             result.* = .{ .identity = .{ .table = try a.dupe(u8, table), .key = try a.dupe(u8, key) }, .properties = try v.entityProperties(a, value.map) };
@@ -337,7 +341,107 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 self.work = work;
                 self.read_fields = fields;
             }
+            if (try self.streamingCount(a, table, input)) |result| return result;
             return @import("owner_count.zig").run(a, self.backend(), self.graph orelse return null, table, input, work);
+        }
+        fn streamingCount(self: *Self, a: A, table: []const u8, input: b.CountInput) !?b.CountResult {
+            if (comptime !@hasDecl(DB, "visitCypherDocuments")) return null;
+            if (!self.authority.storage_projection or !self.authority.ordered_projection or input.max_examined >= std.math.maxInt(u32)) return null;
+            const graph = self.graph orelse return null;
+            var quota: @import("budget.zig") = .{ .backing = b.reclaimingAllocator(a), .limit = input.memory_bytes };
+            return self.streamingCountBudget(a, table, input, graph, &quota) catch |err| {
+                if (err == error.OutOfMemory and quota.exhausted) return error.CypherMemoryBudgetExceeded;
+                return err;
+            };
+        }
+        fn streamingCountBudget(self: *Self, a: A, table: []const u8, input: b.CountInput, graph: root.catalog.Graph, quota: *@import("budget.zig")) !?b.CountResult {
+            if (comptime !@hasDecl(DB, "visitCypherDocuments")) return null;
+            var arena = std.heap.ArenaAllocator.init(quota.allocator());
+            defer arena.deinit();
+            const temporary = arena.allocator();
+            const projection = (try @import("owner_count.zig").Projection.init(temporary, graph, input)) orelse return null;
+            const label = graph.label(input.node.labels[0]) orelse return error.UnknownGraphLabel;
+            if (!std.mem.eql(u8, label.table, table)) return error.Forbidden;
+            const Visitor = @typeInfo(@TypeOf(DB.visitCypherDocuments)).@"fn".param_types[5].?;
+            const Entry = @typeInfo(@FieldType(Visitor, "visit")).pointer.child;
+            const RowEntry = @typeInfo(Entry).@"fn".param_types[1].?;
+            const Fold = struct {
+                adapter: *Self,
+                projection: @import("owner_count.zig").Projection,
+                input: b.CountInput,
+                table: []const u8,
+                quota: *@import("budget.zig"),
+                parent: ?b.Work,
+                meter: b.Meter,
+                count: usize = 0,
+                examined: usize = 0,
+                counts: []usize,
+                fn charge(ptr: *anyopaque, amount: usize) !void {
+                    const fold: *@This() = @ptrCast(@alignCast(ptr));
+                    const local = fold.meter.work();
+                    try local.charge(local.ptr, amount);
+                    if (fold.parent) |parent| try parent.charge(parent.ptr, amount);
+                }
+                fn value(ptr: *anyopaque, item: v.Value) !void {
+                    const fold: *@This() = @ptrCast(@alignCast(ptr));
+                    var row = std.heap.ArenaAllocator.init(fold.quota.allocator());
+                    defer row.deinit();
+                    var evaluator: @import("value_work.zig").Work = .{ .a = row.allocator(), .ptr = fold, .charge = charge };
+                    try evaluator.output(item);
+                }
+                fn visit(ptr: ?*anyopaque, entry: RowEntry) !void {
+                    const fold: *@This() = @ptrCast(@alignCast(ptr.?));
+                    try checkpoint(fold.adapter);
+                    if (fold.examined >= fold.input.max_examined) return error.CypherAnchorBudgetExceeded;
+                    fold.examined += 1;
+                    try charge(fold, 1 + fold.projection.arguments.len);
+                    // Scans account for physical progress but share point-read
+                    // admission: receipts and reserved rows are never nodes.
+                    if (comptime @hasDecl(DB, "cypherDocumentKeyAllowed")) if (!DB.cypherDocumentKeyAllowed(entry.id)) return;
+                    var row = std.heap.ArenaAllocator.init(fold.quota.allocator());
+                    defer row.deinit();
+                    const scratch = row.allocator();
+                    const counted_node = candidate: {
+                        if (entry.document_stream) |document| if (try document.countProjection(scratch, fold.projection.presence)) |projected|
+                            break :candidate try fold.adapter.fullNodeValue(scratch, fold.table, entry.id, projected);
+                        // Providers without the optional borrowed projection
+                        // retain ordinary JSON validation and scalar semantics.
+                        if (entry.document_json) |json| break :candidate try fold.adapter.fullNode(scratch, fold.table, entry.id, json);
+                        if (entry.document_stream) |document| {
+                            var output = std.Io.Writer.Allocating.init(scratch);
+                            try output.writer.writeAll("{\"_id\":null");
+                            try document.writeFields(&output.writer);
+                            try output.writer.writeByte('}');
+                            break :candidate try fold.adapter.fullNode(scratch, fold.table, entry.id, output.written());
+                        }
+                        return error.CypherInvalidDocument;
+                    } orelse return;
+                    var membership = fold.adapter.valueWork(scratch);
+                    if (!try fold.adapter.graph.?.admits(counted_node, fold.input.node.labels[0], &membership)) return;
+                    fold.count += 1;
+                    for (fold.projection.arguments, fold.counts) |argument_value, *count| {
+                        const present = switch (argument_value) {
+                            .present => |present| present,
+                            .field => |field| (try membership.property(.{ .node = counted_node }, field)) != .null,
+                        };
+                        if (present) count.* += 1;
+                    }
+                    try checkpoint(fold.adapter);
+                }
+            };
+            const counts = try temporary.alloc(usize, input.arguments.len);
+            @memset(counts, 0);
+            var fold: Fold = .{ .adapter = self, .projection = projection, .input = input, .table = table, .quota = quota, .parent = self.work, .meter = .{ .a = quota.allocator(), .backend = self.backend(), .limit = input.max_work }, .counts = counts };
+            self.work = .{ .ptr = &fold, .charge = Fold.charge, .value = Fold.value };
+            self.read_fields = projection.fields;
+            const db = try self.selected(table);
+            const authorization = try self.readAuthorization(temporary, table);
+            const opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(input.max_examined + 1) });
+            try db.visitCypherDocuments(quota.allocator(), "", "", opts, .{ .borrow_documents = true, .context = &fold, .visit = Fold.visit });
+            try checkpoint(self);
+            const result: b.CountResult = .{ .count = fold.count, .counts = try a.dupe(usize, counts), .examined = fold.examined };
+            try result.validateFor(input.max_examined, input.arguments.len);
+            return result;
         }
         fn probeWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?b.Probe {
             if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return null;

@@ -515,3 +515,24 @@ test "owner COUNT residual failures and unsafe arguments keep evaluation semanti
         if (case.pushed) try std.testing.expectEqual(@as(usize, 0), fixture.rpc_scans);
     }
 }
+
+test "owner COUNT nullness projection retains label values and declines fallible paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const graph: root.catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs", .predicate = &.{.{ .name = "tenant", .value = .{ .string = "acme" } }} }}, .relationships = &.{} };
+    const alias: root.ast.Expr = .{ .span = .{}, .value = .{ .variable = "n" } };
+    const body: root.ast.Expr = .{ .span = .{}, .value = .{ .property = .{ .base = &alias, .name = "body" } } };
+    const tenant: root.ast.Expr = .{ .span = .{}, .value = .{ .property = .{ .base = &alias, .name = "tenant" } } };
+    const nested: root.ast.Expr = .{ .span = .{}, .value = .{ .property = .{ .base = &body, .name = "x" } } };
+    var input: b.CountInput = .{ .node = .{ .span = .{}, .alias = "n", .labels = &.{"D"}, .properties = &.{} }, .arguments = &.{ null, &body, &tenant } };
+    const projection = (try @import("owner_count.zig").Projection.init(a, graph, input)).?;
+    try std.testing.expectEqual(@as(usize, 2), projection.fields.len);
+    try std.testing.expectEqual(@as(usize, 1), projection.presence.len);
+    try std.testing.expectEqualStrings("body", projection.presence[0]);
+    input.arguments = &.{&nested};
+    try std.testing.expect(try @import("owner_count.zig").Projection.init(a, graph, input) == null);
+    input.arguments = &.{&body};
+    input.predicate = &tenant;
+    try std.testing.expect(try @import("owner_count.zig").Projection.init(a, graph, input) == null);
+}

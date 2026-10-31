@@ -28193,6 +28193,18 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("getCypherPinnedDocuments", .{ self, alloc, cut, keys, opts });
         return @import("cypher_pinned_read.zig").getMany(self, alloc, cut, keys, opts);
     }
+    pub fn visitCypherPinnedDocuments(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("visitCypherPinnedDocuments", .{ self, alloc, cut, from, to, opts, visitor });
+        return @import("cypher_pinned_read.zig").visit(self, alloc, cut, from, to, opts, visitor);
+    }
+    pub fn visitCypherDocuments(self: *DB, alloc: Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("visitCypherDocuments", .{ self, alloc, from, to, opts, visitor });
+        if (!opts.isRelational()) return self.scanVisit(alloc, from, to, opts, visitor);
+        const session = try self.openRelationalReadSession(alloc, from, to, opts);
+        defer session.deinit();
+        try @import("relational_rows.zig").visitCypherRows(&session.reader, alloc, self.backend_runtime.io(), opts.limit, visitor);
+        try session.checkpoint();
+    }
     pub fn scanCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) !types.ScanResult {
         if (comptime storage_engine.enabled) return storage_engine.call("scanCypherPinnedSnapshot", .{ self, alloc, cut, from, to, opts });
         return @import("cypher_pinned_read.zig").scan(self, alloc, cut, from, to, opts);

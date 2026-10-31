@@ -126,6 +126,12 @@ fn captureCypherSelectedSnapshot(self: *DB, alloc: Allocator, fence: *const DB.S
 fn captureCypherPinnedSnapshot(self: *DB, alloc: Allocator, fence: *const DB.StatementReadFence, graph: @import("cypher").catalog.Graph, table: []const u8) engine.Outcome(DB.CypherPinnedSnapshot) {
     return .{ .value = self.captureCypherPinnedSnapshot(alloc, fence, graph, table) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn visitCypherDocuments(self: *DB, alloc: Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) engine.Outcome(void) {
+    return .{ .value = self.visitCypherDocuments(alloc, from, to, opts, visitor) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn visitCypherPinnedDocuments(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) engine.Outcome(void) {
+    return .{ .value = self.visitCypherPinnedDocuments(alloc, cut, from, to, opts, visitor) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn scanCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) engine.Outcome(types.ScanResult) {
     return .{ .value = self.scanCypherPinnedSnapshot(alloc, cut, from, to, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

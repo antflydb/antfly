@@ -29,7 +29,61 @@ pub const Context = struct {
         json_fields: []const u8,
     },
     pub fn borrow(self: *@This()) @import("../types.zig").BorrowedScanDocument {
-        return .{ .context = self, .write_fields_fn = writeFields };
+        return .{ .context = self, .write_fields_fn = writeFields, .count_projection_fn = countProjection };
+    }
+    fn isPresence(fields: []const []const u8, name: []const u8) bool {
+        for (fields) |field| if (std.mem.eql(u8, field, name)) return true;
+        return false;
+    }
+    fn rawValue(a: std.mem.Allocator, raw: []const u8, presence: bool) !std.json.Value {
+        if (presence) {
+            const trimmed = std.mem.trim(u8, raw, " \r\n\t");
+            if (trimmed.len != 0 and (trimmed[0] == '{' or trimmed[0] == '[')) {
+                const JsonView = @import("json_view.zig").View;
+                var view = JsonView.init(a, raw);
+                const selector: @import("json_projection_plan.zig").Selector = .{ .prepared = true };
+                try view.prepareProjectionWithOptions(&selector, .all, .any_container, .{ .defer_fanout = true });
+            }
+            try @import("cypher").value.validateJsonSlice(a, raw, 1);
+            return if (std.mem.eql(u8, std.mem.trim(u8, raw, " \r\n\t"), "null")) .null else .{ .bool = true };
+        }
+        return std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .parse_numbers = false });
+    }
+    fn countProjection(ptr: ?*anyopaque, a: std.mem.Allocator, presence: []const []const u8) !?std.json.Value {
+        const self: *@This() = @ptrCast(@alignCast(ptr orelse return error.InvalidArgument));
+        var result = std.json.ObjectMap.empty;
+        switch (self.value) {
+            .document => |v| {
+                if (v.plan.include_all or v.plan.passthrough) return null;
+                for (v.plan.paths) |path| if (path.parts.len != 1) return null;
+                const JsonView = @import("json_view.zig").View;
+                var view = JsonView.init(a, v.raw);
+                // Keep the ordinary scan's syntax and duplicate-key checks;
+                // count-only values are validated separately in Cypher's domain.
+                try view.prepareProjectionWithOptions(v.plan.selector, .all, .object_only, .{ .defer_fanout = true });
+                for (v.plan.paths) |path| {
+                    const name = path.parts[0];
+                    if (try view.field(&view.root, name)) |node| try result.put(a, name, try rawValue(a, node.raw, isPresence(presence, name)));
+                }
+            },
+            .row => |v| {
+                if (v.plan.paths.len != 0) return null;
+                if (v.plan.base.schema_version != v.row.table_schema.version) return error.RelationalRowSchemaMismatch;
+                for (v.plan.base.ordinals) |ordinal| {
+                    const column = v.row.table_schema.relational_columns[ordinal];
+                    const cell = (try v.row.findCell(ordinal)) orelse continue;
+                    const value: std.json.Value = if (cell.is_null) .null else if (cell.is_json)
+                        try rawValue(a, cell.value.bytes_val, isPresence(presence, column.name))
+                    else if (isPresence(presence, column.name) and (column.column_type == .string or column.column_type == .blob or column.column_type == .geoshape))
+                        .{ .bool = true }
+                    else
+                        try codec.borrowedJsonValueFromCellAlloc(a, column, cell);
+                    try result.put(a, column.name, value);
+                }
+            },
+            else => return null,
+        }
+        return .{ .object = result };
     }
     fn writeFields(ptr: ?*anyopaque, destination: native_writer.Borrow) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr orelse return error.InvalidArgument));
@@ -124,6 +178,76 @@ test "public graph metric borrowed wire full row producers avoid reconstruction 
         try std.testing.expectEqual(@as(usize, 0), budget.live);
         var failed = std.Io.Writer.fixed(&.{});
         try std.testing.expectError(error.WriteFailed, context.borrow().writeFields(&failed));
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+}
+
+test "public graph metric borrowed wire owner COUNT validates wide values without materializing payloads" {
+    const a = std.testing.allocator;
+    var raw = std.Io.Writer.Allocating.init(a);
+    defer raw.deinit();
+    try raw.writer.writeAll("{\"tenant\":\"acme\",\"body\":\"\\u0041");
+    try raw.writer.splatByteAll('x', 2 << 20);
+    try raw.writer.writeAll("\",\"zero\":0,\"false\":false,\"array\":[],\"object\":{},\"nil\":null}");
+    var plan = (try document.SpanProjectionPlan.init(a, .{ .fields = &.{ "tenant", "body", "zero", "false", "array", "object", "nil", "missing" }, .include_all_fields = false })).?;
+    defer plan.deinit();
+    var budget: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 32 << 10 };
+    {
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        var context: Context = .{ .scratch = arena.allocator(), .value = .{ .document = .{ .raw = raw.written(), .plan = &plan } } };
+        const value = (try context.borrow().countProjection(arena.allocator(), &.{ "body", "zero", "false", "array", "object", "nil", "missing" })).?;
+        try std.testing.expectEqualStrings("acme", value.object.get("tenant").?.string);
+        for ([_][]const u8{ "body", "zero", "false", "array", "object" }) |field| try std.testing.expect(value.object.get(field).?.bool);
+        try std.testing.expect(value.object.get("nil").? == .null);
+        try std.testing.expect(value.object.get("missing") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    for ([_][]const u8{ "{\"body\":1e999}", "{\"body\":9223372036854775808}" }) |invalid| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var context: Context = .{ .scratch = arena.allocator(), .value = .{ .document = .{ .raw = invalid, .plan = &plan } } };
+        try std.testing.expectError(error.CypherNumericOverflow, context.borrow().countProjection(arena.allocator(), &.{"body"}));
+    }
+}
+
+test "public graph metric borrowed wire owner COUNT validates relational JSON spans within bounded scratch" {
+    const a = std.testing.allocator;
+    const schema = @import("../../schema.zig");
+    const columns = [_]schema.RelationalColumn{
+        .{ .name = "body", .path = "body", .column_type = .json, .is_json = true, .json_kind = .any },
+    };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try Plan.init(a, table, &layout, &.{"body"});
+    defer plan.deinit();
+    var raw = std.Io.Writer.Allocating.init(a);
+    defer raw.deinit();
+    try raw.writer.writeAll("{\"nested\":\"\\u0041");
+    try raw.writer.splatByteAll('x', 2 << 20);
+    try raw.writer.writeAll("\"}");
+    for ([_][]const u8{ raw.written(), "null", "false", "0", "[]", "{}", "{\"x\":1e999}", "{\"x\":0,\"x\":1}" }) |json| {
+        // Construct checksum-valid fixtures directly, including noncanonical
+        // escapes and invalid semantic domains, to exercise read validation.
+        const bytes = try codec.serializePreparedOrdinal(a, 1, &columns, &.{.{ .ordinal = 0, .path = "body", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = json } }}, @splat(0));
+        defer a.free(bytes);
+        const row = try codec.ordinalRowViewTrusted(bytes, table, &layout);
+        var budget: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 32 << 10 };
+        {
+            var arena = std.heap.ArenaAllocator.init(budget.allocator());
+            defer arena.deinit();
+            var context: Context = .{ .scratch = arena.allocator(), .value = .{ .row = .{ .plan = plan, .row = row } } };
+            const result = context.borrow().countProjection(arena.allocator(), &.{"body"});
+            if (std.mem.indexOf(u8, json, "1e999") != null) {
+                try std.testing.expectError(error.CypherNumericOverflow, result);
+            } else if (std.mem.eql(u8, json, "{\"x\":0,\"x\":1}")) {
+                try std.testing.expectError(error.DuplicateField, result);
+            } else {
+                const value = (try result).?.object.get("body").?;
+                if (std.mem.eql(u8, json, "null")) try std.testing.expect(value == .null) else try std.testing.expect(value.bool);
+            }
+        }
         try std.testing.expectEqual(@as(usize, 0), budget.live);
     }
 }

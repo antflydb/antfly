@@ -1511,3 +1511,160 @@ def test_authenticated_cypher_producer_visibility_uses_bounded_scratch():
         reader.close()
         admin.close()
         server.stop()
+
+
+@pytest.mark.parametrize("relational", [False, True], ids=["document", "relational"])
+def test_authenticated_cypher_count_nullness_streams_wide_properties(relational):
+    """COUNT keeps source payloads borrowed on both owner storage paths."""
+    binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+    if not Path(binary).exists():
+        pytest.skip("native Antfly binary is unavailable")
+    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port(), pgwire=True)
+    prefix = "cypher_count_" + uuid.uuid4().hex
+    admin = requests.Session()
+    admin.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+    reader = requests.Session()
+    reader.auth = (prefix + "_reader", uuid.uuid4().hex)
+    base = server.api_url.rstrip("/")
+
+    def call(path, body=None, *, method="POST", session=admin):
+        deadline = time.monotonic() + 60
+        while True:
+            response = session.request(
+                method,
+                (server.url if path.startswith("/auth/") else base) + path,
+                json=body,
+                timeout=45,
+            )
+            if response.status_code != 503 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        assert response.status_code in (200, 201, 202, 204), (
+            path,
+            response.status_code,
+            response.text,
+            server.log_path.read_text()[-4000:],
+        )
+        return response.json() if response.content else None
+
+    def count(label, session, expected):
+        result = call(
+            f"/graphs/{prefix}/query",
+            {
+                "query": f"MATCH (n:{label}) RETURN count(*),count(n),count(n.body),"
+                "count(n.missing),count($p),count(n.body)+count(*)",
+                "parameters": {"p": False},
+                "limits": {"memory_bytes": 8 << 20},
+            },
+            session=session,
+        )
+        rows, bodies = expected
+        assert result["complete"] is True, result
+        assert result["rows"] == [
+            [
+                {"type": "integer", "value": str(value)}
+                for value in (rows, rows, bodies, 0, rows, bodies + rows)
+            ]
+        ], result
+        assert result["stats"]["memory_bytes"] < 8 << 20, result
+        return result
+
+    try:
+        if relational:
+            call(
+                "/sql",
+                {
+                    "statement": f"CREATE TABLE {prefix} (id TEXT, tenant TEXT, body TEXT)"
+                },
+            )
+        else:
+            call(f"/tables/{prefix}", {"num_shards": 1})
+        for start in range(0, 32, 4):
+            call(
+                f"/tables/{prefix}/batch",
+                {
+                    "inserts": {
+                        f"n{i}": {
+                            "id": f"n{i}",
+                            "tenant": "acme" if i % 4 < 2 else "other",
+                            "body": ('escaped\\"\n' + "x" * (512 << 10))
+                            if i % 2
+                            else None,
+                        }
+                        for i in range(start, start + 4)
+                    },
+                    "sync_level": "full_index",
+                },
+            )
+        call(
+            f"/graphs/{prefix}",
+            {
+                "labels": [
+                    {"name": "D", "table": prefix},
+                    {"name": "A", "table": prefix, "where": {"tenant": "acme"}},
+                ],
+                "relationships": [],
+            },
+        )
+        count("D", admin, (32, 16))
+        count("A", admin, (16, 8))
+        measured = call(
+            f"/graphs/{prefix}/query",
+            {
+                "query": "MATCH (n:D) RETURN count(n.body)",
+                "limits": {"memory_bytes": 8 << 20, "scanned_anchors": 32},
+            },
+        )
+        assert measured["rows"] == [[{"type": "integer", "value": "16"}]], measured
+        print(
+            json.dumps(
+                {
+                    "count_storage": "relational" if relational else "document",
+                    "stats": measured["stats"],
+                },
+                sort_keys=True,
+            )
+        )
+        for limits, code in (
+            ({"scanned_anchors": 31}, "CypherAnchorBudgetExceeded"),
+            ({"intermediate_states": 1}, "CypherStateBudgetExceeded"),
+        ):
+            rejected = admin.post(
+                base + f"/graphs/{prefix}/query",
+                json={
+                    "query": "MATCH (n:D) RETURN count(n.body)",
+                    "limits": {"memory_bytes": 8 << 20, **limits},
+                },
+                timeout=45,
+            )
+            assert rejected.status_code == 429, rejected.text
+            assert rejected.json().get("code") == code, rejected.text
+        call(
+            f"/auth/v1/users/{reader.auth[0]}",
+            {
+                "password": reader.auth[1],
+                "initial_policies": [
+                    {"resource_type": "graph", "resource": prefix, "type": "read"},
+                    {"resource_type": "table", "resource": prefix, "type": "read"},
+                ],
+            },
+        )
+        call(
+            f"/auth/v1/users/{reader.auth[0]}/row-filters/{prefix}",
+            {"term": {"tenant": "acme"}},
+            method="PUT",
+        )
+        count("D", reader, (16, 8))
+        # Predicates retain the ordinary evaluator and any available index plan.
+        residual = call(
+            f"/graphs/{prefix}/query",
+            {
+                "query": "MATCH (n:D) WHERE n.id='n1' RETURN count(n.body)",
+                "limits": {"memory_bytes": 8 << 20},
+            },
+        )
+        assert residual["rows"] == [[{"type": "integer", "value": "1"}]], residual
+    finally:
+        reader.close()
+        admin.close()
+        server.stop()

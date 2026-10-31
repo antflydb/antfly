@@ -4927,3 +4927,42 @@ production source changes for the retry. Compilation uses the documented
 process-local `MallocLargeCache=0` workaround; public tests use the normal
 runtime allocator environment. The earlier enrichment owner-loss campaign
 remains outside this qualification.
+
+Owner COUNT now has a synchronous storage fold for mandatory single-node scans
+whose arguments are direct properties, scalar literals, parameters or the bound
+node. The projection distinguishes fields needed as values for graph label
+predicates from fields needed only for nullness. Count-only document properties
+are validated through JSON spans and represented as true/null inside the trusted
+fold; false, zero and empty containers remain present. Large escaped strings
+never become graph Values. Relational TEXT cells stay borrowed, and JSON cells
+use the same span validator. Each row's projection and membership scratch is
+reclaimed before the next row; only the bounded count vector survives the scan.
+
+Both durable owner cuts and embedded statement cuts expose the fold through
+private named storage callbacks. Relational visitation shares the existing
+reader's retained primary/index roots, historical schema bindings, TTL clock
+and row-policy filter, before exposing a synchronous row borrow. The ordinary
+scan/HTTP metadata contract is unchanged. Providers without the optional count
+projection retain per-row ordinary JSON conversion. Numeric overflow, JSON
+syntax/duplicate checks and Cypher depth limits remain enforced. Count-only
+representations never escape as public node properties or owner RPC rows.
+
+The fold requires certified storage and value-preserving authority projection.
+Opaque providers, selector-ambiguous literal property names, nested property
+expressions, inline constraints and predicates retain the existing evaluator and
+its indexed access paths. All rows and count arguments consume owner work;
+source and membership allocations remain inside the statement memory ceiling.
+The public regression exercises document and relational storage with 32 rows,
+half containing 512 KiB escaped strings, at an 8 MiB memory limit, including
+nullable/missing counts, combined output expressions, logical labels, effective
+row filters and predicate fallback. Both storage modes fail with
+CypherMemoryBudgetExceeded on the preceding implementation.
+
+Portable read-only queries expose the owner count callback directly; write
+queries retain their transaction overlay. The portable hosted regression also
+creates a relationship and verifies that ordinary scans and COUNT see only
+user nodes afterward. Native scan conversion and the streaming fold now apply
+`cypherDocumentKeyAllowed`, matching point reads before decoding or admitting a
+reserved record. Such scanned records still contribute to physical progress
+and work accounting. This fixes a post-write reserved-record count mismatch
+caught by the new portable regression; its Debug run passes the 8 MiB limit.

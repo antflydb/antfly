@@ -495,6 +495,40 @@ test "embedded api Cypher catalog and writes share portable retained graph value
     const status = try api.graphWriteStatusJson(a, "00112233445566778899aabbccddeeff");
     defer a.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"disposition\":\"committed\"") != null);
+    const identities = try api.cypherJson(a, "knowledge", "{\"query\":\"MATCH (n:Document) RETURN antfly.documentKey(n)\"}");
+    defer a.free(identities);
+    var identity_rows = try std.json.parseFromSlice(std.json.Value, a, identities, .{});
+    defer identity_rows.deinit();
+    const node_rows = identity_rows.value.object.get("rows").?.array.items;
+    if (node_rows.len != 2) std.debug.print("portable graph node identities: {s}\n", .{identities});
+    try std.testing.expectEqual(@as(usize, 2), node_rows.len);
+    // The portable host must expose owner COUNT as well as row reads. Wide
+    // count-only values stay borrowed at its retained cut, including hosted IO.
+    const body = try a.alloc(u8, 512 << 10);
+    defer a.free(body);
+    @memset(body, 'x');
+    for (0..8) |batch_number| {
+        var batch_arena = std.heap.ArenaAllocator.init(a);
+        defer batch_arena.deinit();
+        const scratch = batch_arena.allocator();
+        var inserts = std.json.ObjectMap.empty;
+        for (0..4) |offset| {
+            const number = batch_number * 4 + offset;
+            var fields = std.json.ObjectMap.empty;
+            try fields.put(scratch, "body", if (number % 2 == 0) .null else .{ .string = body });
+            try inserts.put(scratch, try std.fmt.allocPrint(scratch, "n{d}", .{number}), .{ .object = fields });
+        }
+        const payload = try std.json.Stringify.valueAlloc(scratch, .{ .inserts = std.json.Value{ .object = inserts }, .sync_level = "full_index" }, .{});
+        const written = try api.batchJson(a, payload);
+        a.free(written);
+    }
+    const counted = try api.cypherJson(a, "knowledge", "{\"query\":\"MATCH (n:Document) RETURN count(*),count(n.body),count(n.missing)\",\"limits\":{\"memory_bytes\":8388608}}");
+    defer a.free(counted);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, counted, .{});
+    defer parsed.deinit();
+    const counts = parsed.value.object.get("rows").?.array.items[0].array.items;
+    for (counts, [_][]const u8{ "34", "16", "0" }) |value, expected| try std.testing.expectEqualStrings(expected, value.object.get("value").?.string);
+    try std.testing.expect(parsed.value.object.get("stats").?.object.get("memory_bytes").?.integer < 8 << 20);
 }
 
 test "embedded api round-trips batch lookup scan and search over memory-backed durable lsm" {

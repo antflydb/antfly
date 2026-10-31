@@ -24,6 +24,9 @@ const Database = struct {
     name: []const u8,
     document_json: ?[]const u8 = null,
     core: Core = .{},
+    pub fn cypherDocumentKeyAllowed(key: []const u8) bool {
+        return !std.mem.startsWith(u8, key, "_internal_");
+    }
     pub fn hasRetainedQueryCut(db: *const @This()) bool {
         return db.open_mode == .query_readonly;
     }
@@ -330,4 +333,17 @@ test "native pair seeks preserve parallel cross-table identities and self-loop d
         }
         try std.testing.expectEqual(@as(usize, if (self_loop) 1 else 2), total);
     }
+}
+
+test "native node scans reject host reserved identities before JSON decoding" {
+    var docs: Database = .{ .name = "docs" };
+    var authority: Authority = .{};
+    var native: Native = .{ .tables = &.{.{ .name = "docs", .db = &docs }}, .authority = authority.callbacks(), .ttl_now_ns = 1 };
+    const backend = native.backend();
+    var selected = graph;
+    selected.labels = graph.labels[0..1];
+    selected.relationships = &.{};
+    try backend.vtable.bind(backend.ptr, std.testing.allocator, selected);
+    try std.testing.expect(try native.node(std.testing.allocator, "docs", "_internal_receipt", "not JSON") == null);
+    try std.testing.expect(try backend.vtable.get(backend.ptr, std.testing.allocator, .{ .table = "docs", .key = "_internal_receipt" }) == null);
 }

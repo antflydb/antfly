@@ -35,3 +35,14 @@ fn write(raw: ?*anyopaque, _: []const u8) !void {
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+const CountDocument = @import("antfly_local_sources").storage_db_types.BorrowedScanDocument;
+export fn scan_sink_test_count_document(out: *CountDocument, failure: *errors.Status) callconv(.c) void {
+    out.* = .{ .context = failure, .write_fields_fn = unusedFields, .count_projection_fn = countProjection };
+}
+fn unusedFields(_: ?*anyopaque, _: CountDocument.WriterBorrow) !void {}
+fn countProjection(raw: ?*anyopaque, _: @import("std").mem.Allocator, presence: []const []const u8) !?@import("std").json.Value {
+    const failure: *const errors.Status = @ptrCast(@alignCast(raw.?));
+    if (!failure.isOk()) return errors.errorFromStatus(failure.*);
+    return .{ .bool = presence.len != 0 };
+}
