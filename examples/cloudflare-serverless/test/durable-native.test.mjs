@@ -52,3 +52,14 @@ test('an intent durability deadline cannot advance accepted R2 metadata',async()
  await assert.rejects(store.transaction(tx=>tx.put('value',9),{deadlineMs:clock()+10000}),/DeadlineExceeded/);assert.equal(f.calls(),before);assert.equal(f.local.value.dirty,true);
  const recovered=await f.reopen();assert.equal(await recovered.ownerRead(tx=>tx.get('value')),1);
 });
+test('accepted writes survive a dirty restart and clean checkpoint sync serializes the next writer',async()=>{
+ const f=await fixture(),store=await f.reopen();await store.transaction(tx=>tx.put('value',1));assert.equal(f.local.value.dirty,true);
+ const restarted=await f.reopen();assert.equal(await restarted.ownerRead(tx=>tx.get('value')),1);await restarted.transaction(tx=>tx.put('value',1));
+ let atSync,release;const ready=new Promise(r=>atSync=r),held=new Promise(r=>release=r);
+ f.local.sync=async function(){if(!this.value.dirty){atSync();await held;}};
+ const checkpoint=restarted.flushDurableCheckpoint();await ready;const before=f.calls();
+ const write=restarted.transaction(tx=>tx.put('value',2));
+ try{await new Promise(r=>setTimeout(r,10));assert.equal(f.calls(),before);assert.equal(f.local.value.dirty,false);}finally{release();}
+ await checkpoint;await write;assert.equal(f.local.value.dirty,true);
+ const recovered=await f.reopen();assert.equal(await recovered.ownerRead(tx=>tx.get('value')),2);
+});
