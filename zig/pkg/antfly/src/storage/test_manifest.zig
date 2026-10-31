@@ -89,6 +89,7 @@ comptime {
 
     _ = @import("antfly_local_sources").storage_document_mutation_revision;
     _ = @import("antfly_local_sources").storage_db_graph_edge_types;
+    _ = @import("antfly_local_sources").storage_db_repair_failure;
     _ = @import("antfly_local_sources").storage_source_authority;
     _ = @import("antfly_local_sources").storage_db_apply_receipts;
     _ = @import("antfly_local_sources").storage_db_durable_outbox;

@@ -1638,6 +1638,11 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    const standalone_replication_sources_unsupported_body =
+        "{\"error\":\"REPLICATION_SOURCES_REQUIRE_CLUSTER\",\"message\":\"" ++ @import("managed_sources.zig").standalone_unsupported_message ++ "\"}";
+    const ha_catalog_replication_sources_unsupported_body =
+        "{\"error\":\"REPLICATION_SOURCES_REQUIRE_CLUSTER\",\"message\":\"Postgres CDC replication sources are not supported with a hot-standby catalog; run a cluster to use CDC\"}";
+
     fn respondJsonErrorBody(ctx: *httpx.Context, status: u16, body: []const u8) !httpx.Response {
         _ = ctx.status(status);
         try ctx.setHeader("content-type", "application/json");
@@ -8272,6 +8277,8 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("initial foreign key generations require coordinated parent-owner publication; create the table without foreign keys, then add them through a schema update");
                 },
                 error.ObjectTablePlacementUnsupported => return textResponse(ctx, 400, "object tables do not accept num_shards or replication sources"),
+                error.StandaloneReplicationSourcesUnsupported => return respondJsonErrorBody(ctx, 400, standalone_replication_sources_unsupported_body),
+                error.HACatalogReplicationSourcesUnsupported => return respondJsonErrorBody(ctx, 400, ha_catalog_replication_sources_unsupported_body),
                 error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => {
                     _ = ctx.status(400);
                     return ctx.text("vector_store requires a fresh local single-shard standalone table without replication");
@@ -9250,7 +9257,10 @@ pub const AntflyApiHandler = struct {
         const binding = (try self.resolvePublicTableBinding(ctx, name, &identity)) orelse return ctx.response.build();
         defer binding.deinit(ctx.allocator);
         const module = @import("managed_sources.zig");
-        const bytes = (if (mutate) module.configure(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity), (try ctx.body()) orelse "") else module.status(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity))) catch |err| return jsonErrorResponse(ctx, @import("lake_catalog_http.zig").errorStatus(err), @errorName(err));
+        const bytes = (if (mutate) module.configure(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity), (try ctx.body()) orelse "") else module.status(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity))) catch |err| {
+            if (err == error.StandaloneReplicationSourcesUnsupported) return respondJsonErrorBody(ctx, 400, standalone_replication_sources_unsupported_body);
+            return jsonErrorResponse(ctx, @import("lake_catalog_http.zig").errorStatus(err), @errorName(err));
+        };
         defer ctx.allocator.free(bytes);
         try ctx.setHeader("content-type", "application/json");
         _ = ctx.response.body(bytes);
@@ -19875,7 +19885,7 @@ test "httpx inference gateway deployment disable fences public routes but preser
     defer internal.deinit(a);
     try std.testing.expectEqual(@as(u16, 200), internal.status);
     try std.testing.expectEqual(@as(usize, 1), target.calls);
-    try std.testing.expectEqual(@import("kernel_abi.zig").AuthorizationDecision.forbidden, try server.authorizeInferenceRequest(.{}, .write));
+    try std.testing.expectEqual(@import("kernel_abi.zig").AuthorizationDecision.public_inference_disabled, try server.authorizeInferenceRequest(.{}, .write));
     try std.testing.expectEqual(@import("kernel_abi.zig").AuthorizationDecision.allowed, try server.authorizeInferenceRequest(.{}, .read));
     var request = try httpx.Request.init(a, .GET, "/ai/v1/models");
     defer request.deinit();

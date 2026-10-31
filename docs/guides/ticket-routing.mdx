@@ -96,6 +96,8 @@ curl -X PUT http://127.0.0.1:8080/db/v1/secrets/pg_dsn \
 
 Antfly has built-in change data capture. A `replication_sources` block on the table subscribes it to Postgres logical replication, and a semantic index in the same call makes every ticket retrievable the moment it lands:
 
+CDC needs cluster mode; `antfly standalone` rejects `replication_sources`. [Stream PostgreSQL into Antfly](/docs/guides/cdc-replication#before-you-start) shows how to run a local cluster.
+
 ```bash
 curl -X POST http://127.0.0.1:8080/db/v1/tables/tickets \
   -u "admin:${ANTFLY_ADMIN_PASSWORD}" \

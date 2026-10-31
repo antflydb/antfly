@@ -53,6 +53,19 @@ Antfly running, PostgreSQL 14 or later with `wal_level = logical` (15 or later o
 SHOW wal_level;  -- logical
 ```
 
+CDC runs in cluster mode. `antfly standalone` doesn't run it yet: it rejects `replication_sources` with `REPLICATION_SOURCES_REQUIRE_CLUSTER`, and with `--storage-engine lite` it keeps them only as declarations for a later import into a cluster. On one machine, start a metadata process and a data process instead. Both need the same [internal service credential](/docs/secrets):
+
+```bash
+export ANTFLY_INTERNAL_SERVICE_SECRET="$(openssl rand -hex 32)"
+export ANTFLY_INTERNAL_SERVICE_ISSUER=local-cluster
+antfly metadata --raft-port 9017 --api-port 9018 --data-dir ./antfly-cluster/metadata &
+antfly data --api-port 8080 --raft-port 9021 --health-port 4201 \
+  --metadata-api http://127.0.0.1:9018 --node-id 2 --store-id 2 \
+  --data-dir ./antfly-cluster/data &
+```
+
+The data process serves the API at `http://127.0.0.1:8080`, so the commands below are unchanged.
+
 ## Build It
 
 ### 1. Turn On Logical Replication
