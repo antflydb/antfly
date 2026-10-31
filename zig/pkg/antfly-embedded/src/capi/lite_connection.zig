@@ -651,6 +651,7 @@ pub const Owner = struct {
     // other processes cannot open unverified index runtimes during its proof.
     maintenance_turn_lease: ?std.Io.File = null,
     maintenance_turn_references: usize = 0,
+    maintenance_turn_deferred: bool = false,
     // Replay can move the checkpoint on every turn. Give physical storage a
     // fresh capture between such turns instead of always servicing a stale
     // pre-replay snapshot that reclamation must correctly refuse.
@@ -1235,10 +1236,13 @@ pub const Owner = struct {
         // continue using their short path-writer leases during computation.
         const turn_io = h.handleLockIo();
         self.gate.mutex.lockUncancelable(turn_io);
+        self.maintenance_turn_deferred = false;
         const retained = self.retainMaintenanceTurnAssumeLocked() catch |err| {
+            self.maintenance_turn_deferred = true;
             self.gate.mutex.unlock(turn_io);
             return err;
         };
+        if (!retained) self.maintenance_turn_deferred = true;
         self.gate.mutex.unlock(turn_io);
         if (!retained) return true;
         defer {
@@ -1638,6 +1642,9 @@ pub const Owner = struct {
     }
 
     fn maintenanceWaitMillis(self: *Owner, pending: bool) i64 {
+        // Pending storage and a mid-round cursor normally run immediately,
+        // but neither can progress while a peer owns the background turn.
+        if (self.maintenance_turn_deferred) return 100;
         // A mid-round cursor normally advances immediately. While admission
         // owns the proof lane, that same cursor cannot advance; do not spin
         // through path leases, marker scans and the foreground gate at zero delay.
@@ -3711,10 +3718,15 @@ test "issue1015 issue1431 native background turns coordinate across independent 
     owner.test_before_maintenance_capture = .{ .ptr = &probe, .notify = Probe.capture };
     defer owner.test_before_maintenance_capture = null;
     const peer = (try owner.acquireMaintenanceTurnGuard()).?;
+    owner.maintenance_storage_pending = true;
+    owner.maintenance_table_cursor = 1;
     const deferred = owner.maintenanceTurn();
     peer.close(h.handleLockIo());
     try std.testing.expect(try deferred);
     try std.testing.expectEqual(@as(usize, 0), probe.captures);
+    try std.testing.expectEqual(@as(i64, 100), owner.maintenanceWaitMillisForTest(true));
+    owner.maintenance_storage_pending = false;
+    owner.maintenance_table_cursor = 0;
     _ = try owner.maintenanceTurn();
     try std.testing.expectEqual(@as(usize, 1), probe.captures);
 }
