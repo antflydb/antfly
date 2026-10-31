@@ -5997,7 +5997,9 @@ pub const DB = struct {
         if (opts.transaction_recovery.enabled) {
             try self.initOptionalTransactionRuntime(opts.transaction_recovery);
         }
-        try self.initOptionalTextMergeRuntime(opts.text_merge);
+        var text_merge = opts.text_merge;
+        text_merge.manual_producer_assistance = !opts.start_optional_runtime_workers;
+        try self.initOptionalTextMergeRuntime(text_merge);
         try self.initOptionalSparseCompactionRuntime(opts.sparse_compaction);
         try self.initOptionalGraphMetricRuntime(opts.graph_metric_maintenance);
     }
@@ -120243,6 +120245,74 @@ test "db text merge producer admission isolates quarantined dimensions" {
         byte_runtime.acquireProducerPermit("healthy", 0, 1),
     );
     oversized_disk_permit.release();
+}
+
+test "db manual text producers merge capacity without optional workers" {
+    const alloc = std.testing.allocator;
+    text_merge_runtime_mod.test_manual_merge_delay_ms.store(150, .release);
+    defer text_merge_runtime_mod.test_manual_merge_delay_ms.store(0, .release);
+    var runtime_owner = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime_owner.deinit();
+    var path_tmp = try TestDirectory.init("manual-text-admission");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime_owner.ptr(),
+        .executor = .{ .backend = .manual },
+        .start_optional_runtime_workers = false,
+        .text_merge = .{
+            .enabled = true,
+            .max_pending_segments = 12,
+            .resume_pending_segments = 6,
+            .max_pending_bytes = 0,
+            .backpressure_max_wait_ms = 100,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!runtime.isStarted());
+    for (0..30) |i| {
+        var key_buffer: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "doc:{d}", .{i});
+        const fields = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "manual merge admission" }};
+        const docs = [_]introducer_mod.TextDocument{.{
+            .id = key,
+            .stored_data = "{}",
+            .text_fields = &fields,
+            .doc_ordinal = @intCast(i + 1),
+        }};
+        _ = try db.indexTextKernelDocuments("ft_v1", &docs);
+        try std.testing.expect(db.core.index_manager.textActiveSegmentCountSnapshot("ft_v1") <= 12);
+    }
+    try std.testing.expect(!runtime.isStarted());
+    try std.testing.expect(runtime.stats().backpressure_events > 0);
+    try std.testing.expectEqual(@as(u64, 0), runtime.stats().backpressure_timeouts);
+    try std.testing.expect(db.core.index_manager.textMergeStatsSnapshot().completed_merges > 0);
+    {
+        // Work held by a different turn cannot be serviced by this producer.
+        // Assistance must retain the bounded refusal instead of spinning.
+        var held = (try db.core.index_manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+        defer held.deinit(alloc);
+        defer db.core.index_manager.cancelTextMergeTask(&held);
+        try std.testing.expectError(error.TextMergeBackpressureTimeout, runtime.acquireProducerPermit("ft_v1", 6, 0));
+    }
+    {
+        // A shared resource refusal signals admission but frees no capacity.
+        // It must back off rather than consume a core until the deadline.
+        text_merge_runtime_mod.test_task_failure_error = error.ResourceBudgetExceeded;
+        defer text_merge_runtime_mod.test_task_failure_error = error.PersistentDescriptorAdmissionExhausted;
+        text_merge_runtime_mod.test_execute_admission_failures_remaining.store(1000, .release);
+        defer text_merge_runtime_mod.test_execute_admission_failures_remaining.store(0, .release);
+        try std.testing.expectError(error.TextMergeBackpressureTimeout, runtime.acquireProducerPermit("ft_v1", 6, 0));
+        try std.testing.expect(text_merge_runtime_mod.test_execute_admission_failures_remaining.load(.acquire) >= 990);
+    }
+    var result = try db.searchTextKernel(alloc, "ft_v1", .{
+        .term = .{ .field = "body", .term = "manual" },
+    }, .{ .limit = 40 });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 30), result.hits.len);
 }
 
 test "db text kernel admits natural segments below hard segment limit" {

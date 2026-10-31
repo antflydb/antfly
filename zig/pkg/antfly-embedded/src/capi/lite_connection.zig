@@ -155,6 +155,39 @@ pub const PreparedPublication = struct {
         return database;
     }
 
+    /// Storage publication only needs identity/catalog and physical-input
+    /// fences. Opening a named table here reloads every index under the owner
+    /// gate, once per output file, and can strand foreground admission.
+    fn validateStorageCurrent(self: *@This()) !void {
+        if (self.shadow_scopes.len != 0 or self.resolver_dependency != null) {
+            _ = try self.current();
+            return;
+        }
+        const root = try self.owner.refresh();
+        if (Owner.needsOutcomeReconciliation(root)) return error.EnrichmentWaitCanceled;
+        try @import("sql_commit.zig").recover(root);
+        try @import("sql_ddl.zig").recover(root);
+        if (std.mem.eql(u8, self.name, "default")) {
+            if (root.db.root_incarnation != self.incarnation or !std.meta.eql(root.db.core.identity_namespace, self.identity)) return error.EnrichmentSourceChanged;
+        } else {
+            try @import("tables.zig").loadCatalog(root);
+            const id = root.embedded_table_records.get(self.name) orelse return error.EnrichmentSourceChanged;
+            const identity: @TypeOf(self.identity) = .{ .table_id = id, .shard_id = id, .range_id = id };
+            if (!std.meta.eql(identity, self.identity)) return error.EnrichmentSourceChanged;
+            const namespace = try @import("../storage/lite/embedded_catalog.zig").namespaceAlloc(alloc, id);
+            defer alloc.free(namespace);
+            const incarnation = try root.owned_lite_backend.?.existingRootIncarnation(namespace);
+            if (incarnation == null or incarnation.? != self.incarnation) return error.EnrichmentSourceChanged;
+        }
+        try (self.catalog orelse return error.EnrichmentSourceChanged).verify(root);
+        const live_file = &root.owned_lite_backend.?.native_docstore.?.file;
+        try live_file.inheritAllocatorVerification(&self.snapshot_root.owned_lite_backend.?.native_docstore.?.file);
+        if (!live_file.free_pages_verified) {
+            self.owner.publication_stats.allocator_refusals +|= 1;
+            return error.EnrichmentWaitCanceled;
+        }
+    }
+
     fn commit(ptr: *anyopaque, batch: GeneratedBatch, promotions: Promotions, deletes: []const []const u8, guards: SourceGuards, fence: ?WriteFence) !@typeInfo(@typeInfo(std.meta.Child(@FieldType(PublicationPort, "commit"))).@"fn".return_type.?).error_union.payload {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const io = h.handleLockIo();
@@ -757,7 +790,7 @@ pub const Owner = struct {
             certified = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             if (try certified.?.inheritAllocatorCertificate()) {
                 options.allocator_verification_owner = &certified.?;
-            } else if (certified.?.header.indexed_reclamation) {
+            } else if (certified.?.header.indexed_reclamation and !try self.unindexedRuntimeOpen(&certified.?)) {
                 retained_turn = try self.retainMaintenanceTurnAssumeLocked();
                 if (!retained_turn) return error.FileBusy;
             }
@@ -802,6 +835,58 @@ pub const Owner = struct {
         }
         self.collectRetired();
         return replacement;
+    }
+
+    /// Unverified index opens must not publish reader leases into a peer's
+    /// proof. An explicitly empty index catalog opens no such readers. Inspect
+    /// it through a read-only store so diagnostics need not serialize behind
+    /// every owner's full graph walk after allocator-only housekeeping.
+    fn unindexedRuntimeOpen(self: *Owner, tip: *native.NativeFile) !bool {
+        var backend = try h.lite_backend.Handle.open(alloc, self.path, .{
+            .read_only = true,
+            .externally_locked = true,
+            .io = h.handleLockIo(),
+        });
+        defer backend.deinit();
+        const store = backend.native_docstore orelse return false;
+        if (!std.meta.eql(store.file.header, tip.header) or
+            (try store.file.file.stat(store.file.runtime())).inode != (try tip.file.stat(tip.runtime())).inode) return false;
+        // Initializing a missing root is a mutation, even with no indexes.
+        if (try backend.existingRootIncarnation("root") == null) return false;
+        var read = try store.beginRead();
+        defer read.abort();
+        const indexes = @import("../storage/db/catalog/index_manager.zig");
+        inline for (.{
+            .{ "\x00\x00__metadata__:indexes", indexes.deserializeCatalog, true },
+            .{ "\x00\x00__metadata__:enrichments", @import("../storage/db/catalog/enrichment_catalog.zig").deserializeCatalog, false },
+            .{ "\x00\x00__metadata__:resolvers", @import("../storage/db/catalog/resolver_catalog.zig").deserializeCatalog, false },
+        }) |catalog| {
+            const data = read.getOwned(alloc, catalog[0]) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (data) |bytes| {
+                defer alloc.free(bytes);
+                const configs = catalog[1](alloc, bytes) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return false,
+                };
+                defer {
+                    for (configs) |*config| config.deinit(alloc);
+                    alloc.free(configs);
+                }
+                if (configs.len != 0) return false;
+            } else if (catalog[2]) return false;
+        }
+        // Recovering an unfinished graph build can write cleanup metadata at
+        // open even after its index has been removed. Keep that path guarded.
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const row = cursor.seekAtOrAfter(indexes.graph_replacement_build_prefix) catch |err| switch (err) {
+            error.NotFound => return true,
+            else => return err,
+        };
+        return !std.mem.startsWith(u8, row.key, indexes.graph_replacement_build_prefix);
     }
 
     fn loadedIndexInputsUnchanged(root: *h.Handle, before: *native.NativeFile, after: *native.NativeFile) !bool {
@@ -1011,7 +1096,7 @@ pub const Owner = struct {
         if (!std.meta.eql(probe.header, file.header)) {
             if (scope == .reclamation) return error.EnrichmentWaitCanceled;
             const publication = root.maintenance_publication orelse return error.EnrichmentWaitCanceled;
-            _ = try publication.current();
+            try publication.validateStorageCurrent();
             // Rebase before opening a primary transaction as well as before
             // publishing immutable index bytes. Lease acquisition and replay
             // checkpoints must not require a quiet interval between capture
@@ -3785,6 +3870,76 @@ test "issue1015 issue1431 unverified peer opens yield to a detached proof turn" 
     try std.testing.expectEqual(@as(usize, 0), peer_owner.maintenance_turn_references);
 }
 
+test "issue1431 unindexed diagnostics do not wait for a peer allocator proof" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |unindexed| {
+        var fixture = try AdmissionFollowupFixture.init("unindexed-proof-diagnostic", 1000, .batch);
+        defer fixture.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+        const owner = fixture.connection.owner;
+        const io = h.handleLockIo();
+        {
+            var lease = try fixture.connection.acquire();
+            defer {
+                lease.close();
+                owner.gate.mutex.unlock(io);
+            }
+            try owner.current.?.db.addIndex(.{ .name = "proof-index", .kind = .full_text, .config_json = "{}" });
+            if (unindexed) try std.testing.expect(try owner.current.?.db.deleteIndex("proof-index"));
+        }
+        var expected: native.Header = undefined;
+        {
+            var lease = try native.lockWriterPathWithIo(alloc, io, fixture.path);
+            defer lease.close();
+            var foreign = try native.NativeFile.openWithIo(alloc, io, fixture.path, .{ .externally_locked = true, .no_sync = true });
+            defer foreign.close();
+            try foreign.putCatalogRecord("unsealed-status-tip", "peer proof in progress");
+            expected = foreign.header;
+            try std.testing.expect(!try foreign.inheritAllocatorCertificate());
+        }
+        owner.gate.mutex.lockUncancelable(io);
+        const retained = owner.retainMaintenanceTurnAssumeLocked();
+        owner.gate.mutex.unlock(io);
+        try std.testing.expect(try retained);
+        var held = true;
+        defer if (held) {
+            owner.gate.mutex.lockUncancelable(io);
+            owner.releaseMaintenanceTurnAssumeLocked();
+            owner.gate.mutex.unlock(io);
+        };
+        const peer = try open(fixture.path, .{ .profile = .native, .no_sync = false, .busy_timeout_ms = 0 }, false);
+        const peer_id = api.publishHandle(peer) catch |err| {
+            h.closeHandle(peer);
+            return err;
+        };
+        defer api.antfly_db_close(peer_id);
+        const peer_owner = peer.lite_connection.?.owner;
+        peer_owner.stopping.store(true, .release);
+        peer_owner.wake.set(io);
+        peer_owner.worker.?.join();
+        peer_owner.worker = null;
+        peer_owner.stopping.store(false, .release);
+        peer_owner.verification_cancel.requested.store(false, .release);
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&out);
+        try std.testing.expectEqual(if (unindexed) h.capi.ErrorCode.ok else h.capi.ErrorCode.busy, api.antfly_db_pending_work_stats_json(peer_id, &out));
+        try std.testing.expectEqual(@as(u64, 0), peer_owner.publication_stats.allocator_proof_walks);
+        {
+            var probe = try native.NativeFile.openWithIo(alloc, io, fixture.path, .{ .read_only = true, .internal_reader = true });
+            defer probe.close();
+            try std.testing.expect(std.meta.eql(expected, probe.header));
+        }
+        // The diagnostic exception grants no allocation authority.
+        const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("after-read"), .value = .fromSlice("{}"), .is_delete = false }};
+        try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_batch(peer_id, &writes, writes.len, null, 0, 0, 0));
+        owner.gate.mutex.lockUncancelable(io);
+        owner.releaseMaintenanceTurnAssumeLocked();
+        owner.gate.mutex.unlock(io);
+        held = false;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(peer_id, &writes, writes.len, null, 0, 0, 0));
+    }
+}
+
 test "issue1015 issue1431 warm SQL retains the incremental allocator digest" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("warm-sql-digest", 1000, .sql);
@@ -3806,6 +3961,54 @@ test "issue1015 issue1431 warm SQL retains the incremental allocator digest" {
         try std.testing.expect(root.owned_lite_backend.?.native_docstore.?.file.ledger == ledger);
         try std.testing.expect(ledger.digestWork() - before < 1000);
     }
+}
+
+test "capi native allocator proof issue1362 storage publication fences a named table without opening its indexes" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("publication-metadata-only", 1000, .sql);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.sql));
+    const owner = fixture.connection.owner;
+    const root = owner.current.?;
+    const database = try @import("tables.zig").get(root, "numbers");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var catalog = try PublicationCatalog.capture(arena.allocator(), root, database);
+    defer catalog.deinit();
+    var publication: PreparedPublication = .{
+        .owner = owner,
+        .name = "numbers",
+        .identity = database.core.identity_namespace,
+        .incarnation = database.root_incarnation,
+        .catalog = &catalog,
+        .index_prefix = "unused/",
+        .snapshot_root = root,
+        .snapshot_database = database,
+        .source_read = null,
+        .relational_rows = false,
+    };
+    // Keep the detached database alive, but remove it from the serving cache.
+    // The old validation path would reopen it and publish index-reader leases.
+    const removed = root.embedded_tables.fetchRemove("numbers").?;
+    defer root.embedded_tables.put(root.alloc, removed.key, removed.value) catch unreachable;
+    const header = root.owned_lite_backend.?.native_docstore.?.file.header;
+    try publication.validateStorageCurrent();
+    try std.testing.expect(!root.embedded_tables.contains("numbers"));
+    try std.testing.expectEqualDeep(header, root.owned_lite_backend.?.native_docstore.?.file.header);
+    const id = root.embedded_table_records.getPtr("numbers").?;
+    const original_id = id.*;
+    id.* += 1;
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent());
+    id.* = original_id;
+    publication.incarnation +%= 1;
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent());
+    publication.incarnation -%= 1;
+    var txn = try database.core.store.beginWriteTxn();
+    errdefer txn.abort();
+    try txn.put(keys.public_schema_json_key, "{\"changed\":true}");
+    try txn.commit();
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent());
+    try std.testing.expect(!root.embedded_tables.contains("numbers"));
 }
 
 test "capi native allocator proof live commits carry a checked peer certificate" {

@@ -39,6 +39,10 @@ pub const Config = struct {
     // Bound producer latency when a source is corrupt, quarantined, or owned
     // by a stuck worker. FD admission remains the final safety boundary.
     backpressure_max_wait_ms: u64 = 5_000,
+    /// Owners without optional workers must drive a merge before waiting for
+    /// producer capacity. Productive merges renew their no-progress budget;
+    /// the total elapsed work is still included in backpressure telemetry.
+    manual_producer_assistance: bool = false,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
 };
 
@@ -52,6 +56,7 @@ pub const BackpressureOutcome = enum {
 };
 
 pub var test_block_after_task_begin: std.atomic.Value(bool) = .init(false);
+pub var test_manual_merge_delay_ms: std.atomic.Value(u64) = .init(0);
 pub var test_task_begin_entered: std.atomic.Value(bool) = .init(false);
 pub var test_release_after_task_begin: std.atomic.Value(bool) = .init(false);
 pub var test_stop_entered: std.atomic.Value(bool) = .init(false);
@@ -637,13 +642,14 @@ const PlatformTextMergeRuntime = struct {
             return error.TextPublicationExceedsSegmentLimit;
 
         const started_ns = self.backpressureNowNs();
+        var wait_started_ns = started_ns;
         var recorded_wait = false;
         var waiter = ProducerAdmissionWaiter{ .index_name = index_name };
         defer self.removeProducerAdmissionWaiter(&waiter);
         defer if (recorded_wait) self.recordBackpressureElapsed(started_ns);
         self.notify();
         while (true) {
-            if (self.backpressureExpired(started_ns)) {
+            if (self.backpressureExpired(wait_started_ns)) {
                 self.recordBackpressureTerminal(.timed_out);
                 return error.TextMergeBackpressureTimeout;
             }
@@ -664,7 +670,7 @@ const PlatformTextMergeRuntime = struct {
                 }
                 const wait_epoch = self.producer_wait_epoch.load(.acquire);
                 self.mutex.unlock(io);
-                if (!try self.waitForProducerAdmissionChange(wait_epoch, started_ns)) {
+                if (!try self.waitForProducerAdmissionChange(wait_epoch, wait_started_ns)) {
                     if (self.isAdmissionClosed()) return error.TextMergeRuntimeShutdown;
                     self.recordBackpressureTerminal(.timed_out);
                     return error.TextMergeBackpressureTimeout;
@@ -760,7 +766,39 @@ const PlatformTextMergeRuntime = struct {
                 recorded_wait = true;
             }
             self.mutex.unlock(io);
-            if (!try self.waitForProducerAdmissionChange(snapshot_wait_epoch, started_ns)) {
+            if (self.config.manual_producer_assistance) {
+                if (!try self.runOnce()) {
+                    // Failed execution can signal admission without freeing
+                    // capacity. Waiting on the pre-attempt epoch would return
+                    // immediately and busy-spin on the same resource refusal.
+                    const max_wait_ns = std.math.mul(u64, self.config.backpressure_max_wait_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+                    const elapsed_ns = self.backpressureNowNs() -| wait_started_ns;
+                    if (elapsed_ns >= max_wait_ns) continue;
+                    const retry_ns = std.math.mul(u64, @max(1, self.config.idle_interval_ms), std.time.ns_per_ms) catch std.math.maxInt(u64);
+                    try io.sleep(.fromNanoseconds(@intCast(@min(retry_ns, max_wait_ns - elapsed_ns))), .awake);
+                    continue;
+                }
+                if (builtin.is_test) {
+                    const delay_ms = test_manual_merge_delay_ms.load(.acquire);
+                    if (delay_ms != 0) try io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake);
+                }
+                lockApplyShared(self.apply_mutex);
+                const segments_after = self.index_manager.textActiveSegmentCountSnapshot(index_name);
+                const heap_after = if (!request_bytes_admissible)
+                    self.index_manager.textMergeStatsSnapshot().pending_heap_bytes
+                else
+                    stats_snapshot.pending_heap_bytes;
+                self.apply_mutex.unlockShared();
+                // A manual owner has no worker to make progress during a
+                // sleep. Credit only a reduction in a blocked dimension, not
+                // stale tasks or merges for an unrelated index. One slow but
+                // successful merge must not make the next capacity check fail.
+                if ((!segments_admissible and segments_after < active_segments) or
+                    (!request_bytes_admissible and heap_after < stats_snapshot.pending_heap_bytes))
+                    wait_started_ns = self.backpressureNowNs();
+                continue;
+            }
+            if (!try self.waitForProducerAdmissionChange(snapshot_wait_epoch, wait_started_ns)) {
                 if (self.isAdmissionClosed()) return error.TextMergeRuntimeShutdown;
                 self.recordBackpressureTerminal(.timed_out);
                 return error.TextMergeBackpressureTimeout;

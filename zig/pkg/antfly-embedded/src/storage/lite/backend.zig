@@ -386,6 +386,24 @@ pub const Handle = struct {
     }
 
     fn durableRootIncarnationLocked(self: *Handle, namespace: []const u8) !u128 {
+        if (try self.existingRootIncarnation(namespace)) |incarnation| return incarnation;
+        const store = self.native_docstore.?;
+        if (store.read_only) return 0;
+        var entropy: [@sizeOf(u128)]u8 = undefined;
+        try store.file.runtime().randomSecure(&entropy);
+        var incarnation = std.mem.readInt(u128, &entropy, .little);
+        if (incarnation == 0) incarnation = 1;
+        var encoded: [@sizeOf(u128)]u8 = undefined;
+        std.mem.writeInt(u128, &encoded, incarnation, .little);
+        const key = try std.mem.concat(self.allocator, u8, &.{ root_incarnation_catalog_prefix, namespace });
+        defer self.allocator.free(key);
+        try store.putCatalogRecord(key, &encoded);
+        return incarnation;
+    }
+
+    /// Read a namespace's durable identity without opening its indexes or
+    /// upgrading a legacy artifact. Publication admission must never create it.
+    pub fn existingRootIncarnation(self: *Handle, namespace: []const u8) !?u128 {
         std.debug.assert(self.engine == .native_single_file);
         const store = self.native_docstore.?;
         const key = try std.fmt.allocPrint(
@@ -402,19 +420,7 @@ pub const Handle = struct {
             if (incarnation == 0) return error.InvalidLiteRootIncarnation;
             return incarnation;
         }
-        // A legacy artifact opened read-only cannot publish its identity yet.
-        // It remains unavailable until one writer performs the rolling-format
-        // upgrade; query-only opens must not invent a process-local token.
-        if (store.read_only) return 0;
-
-        var entropy: [@sizeOf(u128)]u8 = undefined;
-        try store.file.runtime().randomSecure(&entropy);
-        var incarnation = std.mem.readInt(u128, &entropy, .little);
-        if (incarnation == 0) incarnation = 1;
-        var encoded: [@sizeOf(u128)]u8 = undefined;
-        std.mem.writeInt(u128, &encoded, incarnation, .little);
-        try store.putCatalogRecord(key, &encoded);
-        return incarnation;
+        return null;
     }
 
     /// Permanently maps an existing embedded root database to a standalone

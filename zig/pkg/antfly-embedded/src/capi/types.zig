@@ -526,6 +526,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.WouldBlock,
         error.WriterLocked,
         error.FileBusy,
+        error.TextMergeBackpressureTimeout,
         error.LiteRetirementBacklogExceeded,
         error.SourceFileChanged,
         error.PortableImportPublicationInProgress,
@@ -600,6 +601,8 @@ test "unauthenticated Lite access to an RLS table is a nonretryable capability e
 test "bounded Lite retirement admission is retryable while uncertain publication is not" {
     try std.testing.expectEqual(ErrorCode.busy, mapError(error.LiteRetirementBacklogExceeded));
     try std.testing.expectEqual(ErrorCode.busy, mapError(error.FileBusy));
+    try std.testing.expectEqual(ErrorCode.busy, mapError(error.TextMergeBackpressureTimeout));
+    try std.testing.expectEqualStrings("TextMergeBackpressureTimeout", std.mem.span(lastErrorDetail()));
     inline for (.{ error.DurabilityOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.CommitDecisionUnknown }) |err| {
         try std.testing.expectEqual(ErrorCode.outcome_unknown, mapError(err));
     }

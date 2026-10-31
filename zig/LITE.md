@@ -1175,6 +1175,13 @@ compact generation independently of routine reuse. See the
 [reclamation design](../docs/design/lite-reclamation.md) for policy options,
 storage admission, format encoding, memory costs, and qualification.
 
+Background shrink assessments and generation copies use coordinated snapshots.
+Their fences retain both data and allocator metadata, allowing the same owner
+to consume already-free pages while a scan runs. Other processes still see the
+shared inode lock, and an unrecognized publication prevents its suspension.
+Unpublished standalone images retain whole-inode protection until their roots
+are published.
+
 Native connection owners publish checked allocator handoff certificates inside
 their existing commits, so another writer can validate the current ownership
 metadata without repeating a graph walk after each peer publication. Both
@@ -1184,7 +1191,9 @@ that path so sealing does not perpetuate retirement work. Clean-close certificat
 remain compatible with older runtimes. Live seals use a cached chunked Merkle
 digest: warm updates hash changed chunks and bounded trie paths, while a cold
 ledger load constructs the cache once. This adds catalog writes without another
-checkpoint publication or durability barrier per transaction.
+checkpoint publication or durability barrier per transaction. Pending-retirement
+maps periodically rehash at cleanup boundaries, with the sweep amortized over
+prior removals, so missing-ID lookups do not degrade after long retirement churn.
 Contended path leases join a cancelable kernel lock wait using a bounded,
 owner-scoped executor. Missing read-only sidecars and executor exhaustion retain
 short randomized retries, capped at four milliseconds. The configured busy
@@ -1200,10 +1209,19 @@ inode, checkpoint and immutable index inputs. Background path-lease waits are
 capped at five seconds per acquisition. Like other coordination inodes, the sidecar
 must remain in place while any process may have the database open. Refused turns
 back off for 100 ms, including during an otherwise immediate namespace round.
+An initialized root with an explicitly empty index catalog, no configured
+enrichments or resolvers, and no graph-build recovery work can reopen without
+that turn: it publishes no index readers. This lets diagnostics observe its
+current tip during a peer's proof. Mutations still require allocator admission.
 
 Full-text catch-up treats `CapacityUnavailable` and `CapacityObservationStale` as
 recoverable admission failures, with bounded backoff and persisted progress after
-successful retry. These changes require a rebuilt native library; they do not
+successful retry. Owners that drive replay without optional workers run synchronous
+merges when text-publication admission is blocked. A reduction in the blocked
+segment or heap-byte dimension renews their no-progress wait budget; unrelated or
+stale work does not. Total merge time remains visible in backpressure telemetry.
+Owners with background merge workers retain their existing wait budget.
+These changes require a rebuilt native library; they do not
 change SDK request schemas or the public C ABI.
 
 Small records in multi-key transactions share immutable record pages. A tagged
