@@ -17,8 +17,10 @@
 """Exercise allocator proofs on a fresh, multi-GB retained document graph.
 
 The large fixture drops the default text index to isolate storage traversal.
-Foreign writers exit without close to prevent clean-close certificates from
-turning proof measurements into certificate checks. Only fresh synthetic paths
+Foreign writers exit without close. When the measured runtime publishes live
+certificates, use --foreign-library with a legacy writer to keep these mutations
+uncertified and require an actual graph walk. Use --certified-handoff to measure
+checked live handoff instead and require zero repeated graph walks. Fresh paths
 are created. Use the contract suite for deterministic proof-over-deadline and
 cancellation coverage; this program reports actual observed proof duration.
 """
@@ -31,12 +33,13 @@ import hashlib
 import json
 import os
 import random
+import resource
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from lite_contention import measurement_stats, sdk
+from lite_contention import measurement_stats, percentile, sdk
 
 
 def emit(**row):
@@ -123,8 +126,8 @@ def run(args):
             )
         if "large_proof_numbers" not in db.list_tables():
             db.sql("CREATE TABLE large_proof_numbers (n BIGINT)")
-        sql_key = "measured-" + str(time.time_ns())
-        before = measurement_stats(db)
+        run_nonce = time.time_ns()
+        sql_key = "measured-" + str(run_nonce)
         emit(
             kind="seeded",
             file_bytes=database.stat().st_size,
@@ -133,7 +136,12 @@ def run(args):
             stats=db.stats(),
         )
         operations = (
-            ("batch", lambda: db.batch_json({"inserts": {"measured": {"value": 1}}})),
+            (
+                "batch",
+                lambda: db.batch_json(
+                    {"inserts": {"measured": {"value": 1, "nonce": run_nonce}}}
+                ),
+            ),
             (
                 "sql",
                 lambda: db.sql(
@@ -150,34 +158,45 @@ def run(args):
                     sys.executable,
                     __file__,
                     "_foreign",
-                    args.library,
+                    args.foreign_library or args.library,
                     str(database),
                     str(sequence),
                 ],
                 check=True,
                 timeout=300,
             )
+            before = measurement_stats(db)
             began = time.monotonic()
             value = operation()
             elapsed = time.monotonic() - began
+            after = measurement_stats(db)
             if name == "read":
                 assert (
                     hashlib.sha256(value["payload"].encode()).hexdigest()
                     == first_digest
                 )
+            if name == "sql":
+                rows = db.sql(
+                    "SELECT n FROM large_proof_numbers WHERE _id=$1", [sql_key]
+                )["rows"]
+                assert len(rows) == 1 and int(rows[0][0]) == 7
             assert db.lookup("foreign")["sequence"] == sequence
-            after = measurement_stats(db)
-            if (
-                name != "read"
-                and after["allocator_proof_walks"] <= before["allocator_proof_walks"]
-            ):
-                raise RuntimeError(f"{name} did not exercise an allocator proof")
+            proof_walks = (
+                after["allocator_proof_walks"] - before["allocator_proof_walks"]
+            )
+            if name != "read":
+                if args.certified_handoff and proof_walks != 0:
+                    raise RuntimeError(f"{name} repeated a proof after checked handoff")
+                if not args.certified_handoff and proof_walks <= 0:
+                    raise RuntimeError(f"{name} did not exercise an allocator proof")
             emit(
                 kind="operation",
                 operation=name,
+                sql_key=sql_key if name == "sql" else None,
                 status="ok",
                 busy_timeout_seconds=5,
-                proof_required=name != "read",
+                proof_required=name != "read" and not args.certified_handoff,
+                certificate_expected=name != "read" and args.certified_handoff,
                 elapsed_seconds=elapsed,
                 proof_walks=after["allocator_proof_walks"]
                 - before["allocator_proof_walks"],
@@ -186,14 +205,85 @@ def run(args):
                 proof_failures=after["allocator_proof_failures"]
                 - before["allocator_proof_failures"],
             )
-            before = after
+        if args.warm_iterations:
+            # Exclude opening, initial proofs, and foreign handoff from the
+            # steady-writer cost. Both mutations warm their namespace first.
+            db.batch_json(
+                {"inserts": {"warm-measured": {"nonce": run_nonce, "sequence": -1}}}
+            )
+            db.sql(
+                f"INSERT INTO large_proof_numbers (n, _id) VALUES (7, 'warm-{sql_key}-setup')"
+            )
+            for name in ("batch", "sql"):
+                before = measurement_stats(db)
+                usage_before = resource.getrusage(resource.RUSAGE_SELF)
+                samples = []
+                began = time.monotonic()
+                for sequence in range(args.warm_iterations):
+                    started_ns = time.monotonic_ns()
+                    if name == "batch":
+                        db.batch_json(
+                            {
+                                "inserts": {
+                                    "warm-measured": {
+                                        "nonce": run_nonce,
+                                        "sequence": sequence,
+                                    }
+                                }
+                            }
+                        )
+                    else:
+                        db.sql(
+                            f"INSERT INTO large_proof_numbers (n, _id) VALUES (7, 'warm-{sql_key}-{sequence}')"
+                        )
+                    samples.append(time.monotonic_ns() - started_ns)
+                wall_seconds = time.monotonic() - began
+                usage_after = resource.getrusage(resource.RUSAGE_SELF)
+                after = measurement_stats(db)
+                proof_walks = (
+                    after["allocator_proof_walks"] - before["allocator_proof_walks"]
+                )
+                if proof_walks != 0:
+                    raise RuntimeError(
+                        f"warm {name} unexpectedly repeated an allocator proof"
+                    )
+                emit(
+                    kind="warm_operation",
+                    operation=name,
+                    status="ok",
+                    calls=args.warm_iterations,
+                    wall_seconds=wall_seconds,
+                    calls_per_second=args.warm_iterations / wall_seconds,
+                    p50_ns=percentile(samples, 50),
+                    p95_ns=percentile(samples, 95),
+                    max_ns=max(samples),
+                    cpu_seconds=(usage_after.ru_utime + usage_after.ru_stime)
+                    - (usage_before.ru_utime + usage_before.ru_stime),
+                    proof_walks=proof_walks,
+                    timing_scope="single writer after batch and SQL warmup; no foreign publications",
+                )
         integrity = db.check()
         if not isinstance(integrity, dict) or integrity.get("valid") is not True:
             raise RuntimeError(f"integrity failed: {integrity}")
         emit(kind="integrity", status="ok", result=integrity)
     with af.open(database, busy_timeout=5.0) as db:
         if "batch" in args.operations:
-            assert db.lookup("measured")["value"] == 1
+            measured = db.lookup("measured")
+            assert measured["value"] == 1 and measured["nonce"] == run_nonce
+        if "sql" in args.operations:
+            rows = db.sql("SELECT n FROM large_proof_numbers WHERE _id=$1", [sql_key])[
+                "rows"
+            ]
+            assert len(rows) == 1 and int(rows[0][0]) == 7
+        if args.warm_iterations:
+            measured = db.lookup("warm-measured")
+            assert measured["nonce"] == run_nonce
+            assert measured["sequence"] == args.warm_iterations - 1
+            rows = db.sql(
+                "SELECT n FROM large_proof_numbers WHERE _id=$1",
+                [f"warm-{sql_key}-{args.warm_iterations - 1}"],
+            )["rows"]
+            assert len(rows) == 1 and int(rows[0][0]) == 7
         assert (
             hashlib.sha256(db.lookup("seed-0")["payload"].encode()).hexdigest()
             == first_digest
@@ -212,8 +302,23 @@ if __name__ == "__main__":
     else:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--library", required=True)
+        parser.add_argument(
+            "--foreign-library",
+            help="legacy setup writer that leaves an uncertified tip on unclean exit",
+        )
+        parser.add_argument(
+            "--certified-handoff",
+            action="store_true",
+            help="use the measured runtime as setup writer and require no repeated proof",
+        )
         parser.add_argument("--directory", required=True)
         parser.add_argument("--records", type=int, default=12288)
+        parser.add_argument(
+            "--warm-iterations",
+            type=int,
+            default=0,
+            help="also measure steady batch and SQL writes after excluding initial proof work",
+        )
         parser.add_argument(
             "--reuse-fixture",
             action="store_true",
@@ -226,6 +331,10 @@ if __name__ == "__main__":
             default=["batch", "sql", "read"],
         )
         arguments = parser.parse_args()
+        if arguments.certified_handoff and arguments.foreign_library:
+            parser.error("--certified-handoff cannot use --foreign-library")
+        if arguments.warm_iterations < 0:
+            parser.error("--warm-iterations must be nonnegative")
         if arguments.records < 16:
             parser.error("records must be at least 16")
         run(arguments)

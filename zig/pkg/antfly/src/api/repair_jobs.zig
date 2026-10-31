@@ -534,7 +534,9 @@ pub const Store = struct {
             (total.failed != 0 or total.unsupported != 0 or total.missing_source_docs != 0));
         total.next_cursor = pass.next_cursor;
 
-        const retryable_in_progress = previous.control == null and pass.in_progress != 0 and pass.failed == 0 and pass.unsupported == 0 and pass.missing_source_docs == 0;
+        // A failed source or shard must not finish the job while another
+        // rebuild or provider submission still has work in progress.
+        const retryable_in_progress = previous.control == null and pass.in_progress != 0;
         // A successful pause/cancel intentionally leaves repair debt. Job
         // completion describes the control traversal, not index readiness.
         const failed_debt = if (previous.control != null)
@@ -2166,4 +2168,25 @@ test "cancelling a control traversal stops without issuing inverse controls" {
         defer alloc.free(stale.encoded);
         try std.testing.expect(!stale.started);
     }
+}
+
+test "repair job waits for pending work despite failed documents" {
+    const a = std.testing.allocator;
+    var store = Store.init(a, .{});
+    defer store.deinit();
+    var result = try runOnePassForTest(a, &store, .{ .target = "index", .index = "dv_a" }, .{ .failed = 1, .in_progress = 1, .indexes_degraded_after = 1, .unresolved = 2, .debt_remaining = true });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("queued", result.value.phase);
+    try std.testing.expect(!isTerminalPhase(result.value.phase));
+    const begin = try store.beginAdvance(a, result.value);
+    defer a.free(begin.encoded);
+    var running = try std.json.parseFromSlice(JobState, a, begin.encoded, .{});
+    defer running.deinit();
+    const updated = try store.recordPass(a, running.value, .{});
+    defer a.free(updated);
+    var finished = try std.json.parseFromSlice(JobState, a, updated, .{});
+    defer finished.deinit();
+    try std.testing.expectEqualStrings("completed_with_failures", finished.value.phase);
+    try std.testing.expectEqual(@as(u64, 0), finished.value.result.in_progress);
+    try std.testing.expectEqual(@as(u64, 1), finished.value.result.failed);
 }

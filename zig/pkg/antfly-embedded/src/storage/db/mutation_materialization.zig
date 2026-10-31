@@ -4940,6 +4940,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const kind_key = try artifactRepairIssueKindKeyForIssueAlloc(ctx.alloc, issue);
             defer ctx.alloc.free(kind_key);
+            const failure_key = try internal_keys.artifactRepairEnrichmentFailureKeyAlloc(ctx.alloc, issue.index_name, issue_key);
+            defer ctx.alloc.free(failure_key);
             var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
             var borrowed_write_count: usize = 0;
             defer {
@@ -4956,6 +4958,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             try deletes.append(ctx.alloc, issue_key);
             try deletes.append(ctx.alloc, kind_key);
+            try deletes.append(ctx.alloc, failure_key);
             if (issue.reason == .enrichment_failed) {
                 try appendEnrichmentTerminalFailureMarkerDeletesForIssue(
                     ctx.alloc,
@@ -11239,6 +11242,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 generation_error,
                 generation_attempts,
             );
+            // Deferred repair publishes its outcome as a newer generation.
+            // A previous synchronous repair error must not override that new
+            // diagnosis in summaries. Re-observing the same generation does
+            // not supersede a repair attempt made after its original failure.
+            if (reason == .enrichment_failed and sequence > issue.sequence and
+                generation_error.len != 0 and issue.last_error.len != 0)
+            {
+                ctx.alloc.free(@constCast(issue.last_error));
+                issue.last_error = "";
+            }
             issue.artifact_kind = artifact_kind;
             issue.sequence = sequence;
             issue.reason = reason;
@@ -11875,15 +11888,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer alloc.free(kind_key);
             const encoded = try encodeArtifactRepairIssueValueAlloc(alloc, issue);
             defer alloc.free(encoded);
-            if (!new_issue) {
-                var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-                defer writes.deinit(alloc);
-                try writes.append(alloc, .{ .key = key, .value = encoded });
-                try writes.append(alloc, .{ .key = kind_key, .value = encoded });
-                try writes.appendSlice(alloc, extra_writes);
-                try store.putBatch(writes.items, extra_deletes);
-                return;
-            }
+            const failure_key = try internal_keys.artifactRepairEnrichmentFailureKeyAlloc(alloc, issue.index_name, key);
+            defer alloc.free(failure_key);
 
             var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
             var borrowed_write_count: usize = 0;
@@ -11900,12 +11906,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             try writes.append(alloc, .{ .key = key, .value = encoded });
+            borrowed_write_count = writes.items.len;
             try writes.append(alloc, .{ .key = kind_key, .value = encoded });
+            borrowed_write_count = writes.items.len;
+            if (issue.reason == .enrichment_failed)
+                try writes.append(alloc, .{ .key = failure_key, .value = encoded })
+            else
+                try deletes.append(alloc, failure_key);
             borrowed_write_count = writes.items.len;
             try writes.appendSlice(alloc, extra_writes);
             borrowed_write_count = writes.items.len;
             try deletes.appendSlice(alloc, extra_deletes);
-            try appendArtifactRepairSummaryDirtyForStore(alloc, store, &writes, &deletes, &owned_delete_keys);
+            if (new_issue) try appendArtifactRepairSummaryDirtyForStore(alloc, store, &writes, &deletes, &owned_delete_keys);
             try store.putBatch(writes.items, deletes.items);
         }
 
