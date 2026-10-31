@@ -403,11 +403,15 @@ owner. A snapshot read can populate the existing bounded decoded-row cache only
 if that root remains current after its native read completes. A read paused
 across a commit cannot seed the newer root with stale data.
 
-Shared execution retains the existing 64 MiB writer-isolate total: writes keep
-48 MiB; point reads and metadata observation share the existing 16 MiB observation
-pool. Small points reserve 8 MiB; explicit capacity promotion reserves 16 MiB.
-The same pool is counted once in aggregate metrics. Transcript permits stay at
-two. Sharing can still cause head-of-line delay and is not evidence of 10x gains.
+Shared execution retains the existing 64 MiB writer-isolate total in one
+memory-admitted pool. Metadata observation and small points reserve 8 MiB;
+compact write/point jobs reserve 16 MiB and full modules reserve 32 MiB. Up to
+eight slots share that total, including retained idle hosts. The scheduler
+reclaims idle variants before admission, retains commit priority and aging,
+and counts the aliased pool exactly once in aggregate metrics. Observation
+adapters select the actual 8 MiB module, never an undercharged compact module.
+Transcript permits stay at two. Earlier fixed 48/16 and 32/16/16 partitions are
+retained in failed exploratory reports. Sharing is not evidence of 10x gains.
 
 Cohorts have at most 16 pending members / 64 KiB inputs and two active groups.
 One native session serves up to 16 points, with independent visibility errors.
