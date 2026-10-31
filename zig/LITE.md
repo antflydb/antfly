@@ -1175,6 +1175,13 @@ compact generation independently of routine reuse. See the
 [reclamation design](../docs/design/lite-reclamation.md) for policy options,
 storage admission, format encoding, memory costs, and qualification.
 
+Background shrink assessments and generation copies use coordinated snapshots.
+Their fences retain both data and allocator metadata, allowing the same owner
+to consume already-free pages while a scan runs. Other processes still see the
+shared inode lock, and an unrecognized publication prevents its suspension.
+Unpublished standalone images retain whole-inode protection until their roots
+are published.
+
 Native connection owners publish checked allocator handoff certificates inside
 their existing commits, so another writer can validate the current ownership
 metadata without repeating a graph walk after each peer publication. Both

@@ -149,6 +149,56 @@ test "lite empty write commits preserve checkpoints and release writer admission
     try std.testing.expectEqualStrings("progress", try read.get("after"));
 }
 
+test "issue1362 background assessments preserve same-owner page reuse" {
+    const Hook = struct {
+        store: *Store,
+        calls: usize = 0,
+        fn notify(ptr: *anyopaque, phase: Store.MaintenancePhase) !void {
+            if (phase != .assessment) return;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const before = (try self.store.file.allocatorStats()).?.reused_pages;
+            const value: [8192]u8 = @splat('w');
+            for (0..16) |i| {
+                var key: [40]u8 = undefined;
+                try self.store.file.putDocument(try std.fmt.bufPrint(&key, "during-assessment-{d}", .{i}), &value);
+            }
+            try std.testing.expect((try self.store.file.allocatorStats()).?.reused_pages > before);
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "assessment-reuse.aflite");
+    defer a.free(path);
+    var coordinator = native.ReaderCoordinator.init(a, std.testing.io);
+    defer coordinator.deinit();
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    store.file.reader_coordinator = &coordinator;
+    const value: [8192]u8 = @splat('v');
+    try store.file.putDocument("keep", "kept");
+    for (0..128) |i| {
+        var key: [32]u8 = undefined;
+        try store.file.putDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+    }
+    for (0..128) |i| {
+        var key: [32]u8 = undefined;
+        try store.file.deleteDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+    }
+    _ = try store.file.reclaimPages(8192);
+    try std.testing.expect((try store.file.allocatorStats()).?.reusable_pages > 64);
+    store.maintenance_policy = try reclamation.Policy.init(.{ .minimum_reclaim_bytes = 4096, .assessment_bytes = 4096, .amplification = 1024 });
+    var hook: Hook = .{ .store = &store };
+    store.test_maintenance_hook = .{ .ptr = &hook, .notify = Hook.notify };
+    defer store.test_maintenance_hook = null;
+    try store.maintainOnce(true);
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
 test "lite reclamation stale quota estimates expire after roots shrink" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2099,8 +2149,7 @@ pub const Store = struct {
                 }
             }
             if (cached_stats == null) {
-                snapshot = try native.NativeFile.openWithIo(self.allocator, self.file.runtime(), self.file.path, .{ .read_only = true, .resource_manager = self.resource_manager });
-                snapshot.?.header = self.file.header;
+                snapshot = try self.file.captureFullReadSnapshot();
                 snapshot.?.page_cache_policy = .metadata_only;
             }
             self.maintenance_running = true;
@@ -2402,9 +2451,8 @@ pub const Store = struct {
                 return error.FileBusy;
             }
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
-            var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = self.file.no_sync, .resource_manager = self.resource_manager });
+            var snapshot = try self.file.captureFullReadSnapshot();
             snapshot.page_cache_policy = .metadata_only;
-            snapshot.header = self.file.header;
             snapshot.vacuum_target_indexed = self.file.vacuum_target_indexed;
             self.file.change_capture = &capture;
             break :blk snapshot;
@@ -2592,14 +2640,12 @@ pub const Store = struct {
     fn takeResidualVacuumChangesAssumeLocked(self: *Store, capture: *native.ChangeCapture, changes: *native.ChangeCapture) !native.NativeFile {
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
-        const io = self.file.runtime();
         if (capture.overflow) {
             std.log.warn("lite vacuum gave up: change capture overflowed before catch-up captured={d} key_bytes={d}", .{ capture.count, capture.key_bytes });
             return error.FileBusy;
         }
-        var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = true, .resource_manager = self.resource_manager });
+        var snapshot = try self.file.captureFullReadSnapshot();
         snapshot.page_cache_policy = .metadata_only;
-        snapshot.header = self.file.header;
         std.mem.swap(native.ChangeCapture, changes, capture);
         return snapshot;
     }

@@ -34,6 +34,8 @@ pub const Coordinator = struct {
         file: std.Io.File,
         inode: u64,
         sequence: u64,
+        /// Full graph scans also retain allocator/recovery metadata pages.
+        metadata: bool = false,
         poisoned: bool = false,
         suspended: bool = false,
     };
@@ -60,6 +62,12 @@ pub const Coordinator = struct {
     /// The descriptor already holds its kernel shared lock. Registration may
     /// wait for a writer, which then treats this unregistered lock as external.
     pub fn register(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
+        return self.registerWithScope(file, inode, sequence, tip, false);
+    }
+    pub fn registerFull(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
+        return self.registerWithScope(file, inode, sequence, tip, true);
+    }
+    fn registerWithScope(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8, metadata: bool) !*Fence {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const fence = try self.allocator.create(Fence);
@@ -68,7 +76,7 @@ pub const Coordinator = struct {
         // while an external writer promoted retirement. A delayed old reader
         // must never become eligible merely by arriving after that detection.
         const stale = if (self.known) |known| known.inode != inode or !std.mem.eql(u8, &known.tip, &tip) else false;
-        fence.* = .{ .file = file, .inode = inode, .sequence = sequence, .poisoned = stale };
+        fence.* = .{ .file = file, .inode = inode, .sequence = sequence, .metadata = metadata, .poisoned = stale };
         try self.readers.append(self.allocator, fence);
         _ = self.references.fetchAdd(1, .monotonic);
         if (self.known == null) self.known = .{ .inode = inode, .tip = tip };
@@ -89,6 +97,10 @@ pub const Coordinator = struct {
     /// restoration after exclusive reuse. Do not retain mutex across caller
     /// allocations: reclaiming an idle artifact may unregister its descriptor.
     pub fn begin(self: *Coordinator, inode: u64, tip: [32]u8, reuse: bool) ?u64 {
+        return self.beginWithMetadata(inode, tip, reuse).data;
+    }
+    pub const Frontier = struct { data: ?u64 = null, metadata: ?u64 = null };
+    pub fn beginWithMetadata(self: *Coordinator, inode: u64, tip: [32]u8, reuse: bool) Frontier {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.windows += 1;
@@ -100,10 +112,11 @@ pub const Coordinator = struct {
             }
         }
         self.known = .{ .inode = inode, .tip = tip };
-        var frontier: ?u64 = null;
+        var frontier: Frontier = .{};
         var can_suspend = reuse;
         for (self.readers.items) |fence| if (fence.inode == inode) {
-            frontier = @min(frontier orelse fence.sequence, fence.sequence);
+            frontier.data = @min(frontier.data orelse fence.sequence, fence.sequence);
+            if (fence.metadata) frontier.metadata = @min(frontier.metadata orelse fence.sequence, fence.sequence);
             can_suspend = can_suspend and !fence.poisoned;
         };
         if (can_suspend and self.windows == 1) for (self.readers.items) |fence| if (fence.inode == inode) {
