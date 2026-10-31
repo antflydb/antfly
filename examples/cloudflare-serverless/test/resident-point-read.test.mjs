@@ -51,3 +51,10 @@ test('an oversized immutable response fails the original request without retry o
  const kernel=pool();let calls=0;
  await assert.rejects(lookup(kernel,key('b'),{raw:async()=>{calls++;return{body:new Uint8Array(17)};}}),/ObjectIoBudgetExceeded/);assert.equal(calls,1);assert.equal(pointDependencyMetrics(kernel).point_dependency_active,0);assert.equal(pointDependencyMetrics(kernel).point_dependency_bytes,0);
 });
+test('completed immutable bytes serve another reader before the first native replay resumes',async()=>{
+ const kernel=pool(),cache=new Map();let calls=0,admissions=0,continueReplay,replayReady;const gate=new Promise(r=>continueReplay=r),ready=new Promise(r=>replayReady=r);
+ const readThrough=async request=>{if(cache.has(request.key))return cache.get(request.key);calls++;const value={body:Uint8Array.of(7)};cache.set(request.key,value);return value;};
+ let complete=false;const first=lookup(kernel,key('b'),{raw:readThrough,cache,acquire:async run=>{if(++admissions===2){replayReady();await gate;}return kernel.withHost(run);}}).then(value=>{complete=true;return value;});await ready;
+ assert.equal(complete,false);assert.equal(kernel.reservedBytes,0);assert.deepEqual(await lookup(kernel,key('b'),{raw:readThrough,cache}),Uint8Array.of(7));assert.equal(calls,1);
+ continueReplay();assert.deepEqual(await first,Uint8Array.of(7));assert.equal(pointDependencyMetrics(kernel).point_dependency_bytes,0);
+});

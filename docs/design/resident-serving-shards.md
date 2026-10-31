@@ -169,7 +169,10 @@ safety does not increase resource ceilings.
 With the existing `NATIVE_POINT_CONTINUATIONS=true` option, resident lookups use
 the common WASM host's `withPointReadDependencies` scheduler. Cache lookup stays
 outside the dependency wrapper: completed immutable hits execute immediately.
-A physical immutable miss unwinds the native call before starting external I/O,
+The load transport rechecks and populates the completed-byte cache before native
+replay, so a queued miss can reuse bytes another caller already fetched. It never
+shares an in-flight promise across request contexts. A physical immutable miss
+unwinds the native call before starting external I/O,
 then resumes against the same captured cut and original lifetime. It creates no
 fresh authority, extends no pin and retains no native pointers.
 
