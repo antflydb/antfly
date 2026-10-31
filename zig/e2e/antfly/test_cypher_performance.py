@@ -1639,14 +1639,15 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
                 sort_keys=True,
             )
         )
-        for limits, code in (
-            ({"scanned_anchors": 31}, "CypherAnchorBudgetExceeded"),
-            ({"intermediate_states": 1}, "CypherStateBudgetExceeded"),
+        for label, limits, code in (
+            ("D", {"scanned_anchors": 31}, "CypherAnchorBudgetExceeded"),
+            ("A", {"scanned_anchors": 31}, "CypherAnchorBudgetExceeded"),
+            ("D", {"intermediate_states": 1}, "CypherStateBudgetExceeded"),
         ):
             rejected = admin.post(
                 base + f"/graphs/{prefix}/query",
                 json={
-                    "query": "MATCH (n:D) RETURN count(n.body)",
+                    "query": f"MATCH (n:{label}) RETURN count(n.body)",
                     "limits": {"memory_bytes": 8 << 20, **limits},
                 },
                 timeout=45,

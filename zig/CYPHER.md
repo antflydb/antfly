@@ -4975,3 +4975,14 @@ public relational regression requires an indexed virtual label to count one
 wide property within one scanned anchor, preventing a full-table scan regression.
 Every visited record consumes scan work; count argument work is charged only
 for admitted members, after label and policy checks.
+
+Relational count visitation reports each physical candidate through a named
+progress callback before TTL, policy and predicate evaluation. Rejected rows
+therefore consume scan/work budget even when no node value is produced. The
+fold uses these reports instead of counting only emitted rows; document
+providers retain per-entry accounting. A portable relational regression proves
+that a one-anchor budget fails on a three-candidate scan with one matching row,
+while a three-anchor budget returns the correct count. Progress budget and
+authority failures are also checked across independently compiled archives.
+The scan callback ABI fixture uses the contract-only storage profile, allowing
+these checks to run without compiling unrelated storage implementations.

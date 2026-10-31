@@ -375,6 +375,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 meter: b.Meter,
                 count: usize = 0,
                 examined: usize = 0,
+                progress_reported: bool = false,
                 counts: []usize,
                 fn charge(ptr: *anyopaque, amount: usize) !void {
                     const fold: *@This() = @ptrCast(@alignCast(ptr));
@@ -389,12 +390,23 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     var evaluator: @import("value_work.zig").Work = .{ .a = row.allocator(), .ptr = fold, .charge = charge };
                     try evaluator.output(item);
                 }
+                fn account(fold: *@This(), examined: usize) !void {
+                    try checkpoint(fold.adapter);
+                    if (examined > fold.input.max_examined -| fold.examined) return error.CypherAnchorBudgetExceeded;
+                    fold.examined += examined;
+                    try charge(fold, examined);
+                }
+                fn progress(ptr: ?*anyopaque, examined: usize) !void {
+                    const fold: *@This() = @ptrCast(@alignCast(ptr.?));
+                    fold.progress_reported = true;
+                    try fold.account(examined);
+                }
                 fn visit(ptr: ?*anyopaque, entry: RowEntry) !void {
                     const fold: *@This() = @ptrCast(@alignCast(ptr.?));
                     try checkpoint(fold.adapter);
-                    if (fold.examined >= fold.input.max_examined) return error.CypherAnchorBudgetExceeded;
-                    fold.examined += 1;
-                    try charge(fold, 1);
+                    // Typed readers report physical candidates before filters;
+                    // plain document providers retain per-entry accounting.
+                    if (!fold.progress_reported) try fold.account(1);
                     // Scans account for physical progress but share point-read
                     // admission: receipts and reserved rows are never nodes.
                     if (comptime @hasDecl(DB, "cypherDocumentKeyAllowed")) if (!DB.cypherDocumentKeyAllowed(entry.id)) return;
@@ -459,7 +471,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 query.conditions = conditions.items;
                 query.auto_index = true;
             };
-            try db.visitCypherDocuments(quota.allocator(), "", "", opts, .{ .borrow_documents = true, .context = &fold, .visit = Fold.visit });
+            try db.visitCypherDocuments(quota.allocator(), "", "", opts, .{ .borrow_documents = true, .context = &fold, .visit = Fold.visit, .progress = Fold.progress });
             try checkpoint(self);
             const result: b.CountResult = .{ .count = fold.count, .counts = try a.dupe(usize, counts), .examined = fold.examined };
             try result.validateFor(input.max_examined, input.arguments.len);

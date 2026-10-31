@@ -939,6 +939,7 @@ pub const Reader = struct {
                 if (std.mem.order(u8, kv.key, self.upper) != .lt) break;
             }
             result.records_examined += 1;
+            if (visitor) |sink| try sink.reportProgress(1);
             var scratch = std.heap.ArenaAllocator.init(alloc);
             defer scratch.deinit();
             const temporary = scratch.allocator();
@@ -1143,6 +1144,10 @@ pub fn visitCypherRows(reader: *Reader, alloc: Allocator, io: ?std.Io, limit: us
     const Counting = struct {
         target: @import("types.zig").ScanVisitor,
         delivered: *usize,
+        fn progress(ptr: ?*anyopaque, examined: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try self.target.reportProgress(examined);
+        }
         fn visit(ptr: ?*anyopaque, entry: @import("types.zig").ScanVisitEntry) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             try self.target.visitEntry(entry);
@@ -1152,7 +1157,7 @@ pub fn visitCypherRows(reader: *Reader, alloc: Allocator, io: ?std.Io, limit: us
     var counting: Counting = .{ .target = visitor, .delivered = &delivered };
     while (delivered < limit) {
         if (reader.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
-        var page = try reader.nextPageFormat(alloc, io, .{ .rows = @min(128, limit - delivered), .output_bytes = 16 << 20 }, false, .{ .borrow_documents = true, .context = &counting, .visit = Counting.visit });
+        var page = try reader.nextPageFormat(alloc, io, .{ .rows = @min(128, limit - delivered), .output_bytes = 16 << 20 }, false, .{ .borrow_documents = true, .context = &counting, .visit = Counting.visit, .progress = Counting.progress });
         defer page.deinit();
         if (!page.more) break;
     }

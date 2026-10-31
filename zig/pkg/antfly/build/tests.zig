@@ -1119,7 +1119,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = scan_sink_provider_mod,
     });
     antfly_imports.configureRuntimeContracts(scan_sink_provider.root_module);
-    antfly_imports.storage_boundary.configureSources(scan_sink_provider.root_module, false, false);
+    antfly_imports.storage_boundary.configureSources(scan_sink_provider.root_module, true, false);
     const scan_sink_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test.zig"),
         .target = target,
@@ -1127,7 +1127,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     antfly_imports.configureRuntimeContracts(scan_sink_provider.root_module);
     antfly_imports.configureRuntimeContracts(scan_sink_test_mod);
-    antfly_imports.storage_boundary.configureSources(scan_sink_test_mod, false, false);
+    antfly_imports.storage_boundary.configureSources(scan_sink_test_mod, true, false);
     scan_sink_test_mod.linkLibrary(scan_sink_provider);
     const scan_sink_tests = b.addTest(.{
         .root_module = scan_sink_test_mod,
@@ -1236,6 +1236,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "embedded api round-trips batch lookup scan and search over memory-backed durable lsm",
             "embedded api Cypher catalog and writes share portable retained graph values",
+            "embedded api Cypher relational counts account for rejected storage candidates",
             "embedded api hosted profile drains derived indexing without native runtimes",
             "embedded api hosted profile persists text index across reopen over storage",
             "embedded api createLite provisions default full text index",
@@ -1248,7 +1249,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_embedded_api_tests = addFilteredTestRunArtifact(b, embedded_api_tests);
     const portable_cypher_tests = b.addTest(.{
         .root_module = embedded_api_mod,
-        .filters = &.{"embedded api Cypher catalog and writes"},
+        .filters = &.{ "embedded api Cypher catalog and writes", "embedded api Cypher relational counts" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("embedded-cypher-test", "Qualify the portable single-source graph host")

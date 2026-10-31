@@ -1501,3 +1501,34 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         try std.testing.expect(std.mem.indexOf(u8, hybrid_after, "\"doc:vec:a\"") != null);
     }
 }
+
+test "embedded api Cypher relational counts account for rejected storage candidates" {
+    const a = std.testing.allocator;
+    var storage = support.lsm_storage.MemoryStorage.init(a);
+    defer storage.deinit();
+    var api = try Api.openHosted(a, "/portable-relational-count", .{ .db = .{ .storage = storage.storage(), .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } } } });
+    defer api.close();
+    const schema = try api.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"body":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    defer a.free(schema);
+    const batch = try api.batchJson(a,
+        \\{"inserts":{"a":{"id":"a","tenant":"keep","body":"present"},"b":{"id":"b","tenant":"skip","body":"present"},"c":{"id":"c","tenant":"skip","body":"present"}},"sync_level":"full_index"}
+    );
+    defer a.free(batch);
+    const definition = try api.graphCatalogJson(a,
+        \\{"action":"put","name":"g","definition":{"labels":[{"name":"Keep","table":"docs","where":{"tenant":"keep"}}],"relationships":[]}}
+    );
+    defer a.free(definition);
+    try std.testing.expectError(error.CypherAnchorBudgetExceeded, api.cypherJson(a, "g",
+        \\{"query":"MATCH (n:Keep) RETURN count(n.body)","limits":{"memory_bytes":8388608,"scanned_anchors":1}}
+    ));
+    const result = try api.cypherJson(a, "g",
+        \\{"query":"MATCH (n:Keep) RETURN count(n.body)","limits":{"memory_bytes":8388608,"scanned_anchors":3}}
+    );
+    defer a.free(result);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("1", parsed.value.object.get("rows").?.array.items[0].array.items[0].object.get("value").?.string);
+    try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("stats").?.object.get("scanned_anchors").?.integer);
+}

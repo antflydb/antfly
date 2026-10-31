@@ -46,3 +46,9 @@ fn countProjection(raw: ?*anyopaque, _: @import("std").mem.Allocator, presence: 
     if (!failure.isOk()) return errors.errorFromStatus(failure.*);
     return .{ .bool = presence.len != 0 };
 }
+
+const ScanVisitor = @import("antfly_local_sources").storage_db_types.ScanVisitor;
+export fn scan_sink_test_report_progress(visitor: *const ScanVisitor, examined: usize) callconv(.c) errors.Status {
+    visitor.reportProgress(examined) catch |err| return errors.statusFromError(err);
+    return .ok;
+}

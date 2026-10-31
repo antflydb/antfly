@@ -99,3 +99,25 @@ test "scan sink count projection preserves optional values and named failures ac
     document.count_projection_fn = null;
     try std.testing.expect(try document.countProjection(std.testing.allocator, &.{"body"}) == null);
 }
+
+const ScanVisitor = @import("antfly_local_sources").storage_db_types.ScanVisitor;
+extern fn scan_sink_test_report_progress(*const ScanVisitor, usize) callconv(.c) errors.Status;
+test "scan sink physical progress preserves budget and authority failures across archives" {
+    const Counter = struct {
+        examined: usize = 0,
+        failure: ?anyerror,
+        fn visit(_: ?*anyopaque, _: @import("antfly_local_sources").storage_db_types.ScanVisitEntry) !void {}
+        fn progress(ptr: ?*anyopaque, examined: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.examined += examined;
+            if (self.failure) |failure| return failure;
+        }
+    };
+    for ([_]?anyerror{ null, error.CypherAnchorBudgetExceeded, error.CypherStateBudgetExceeded, error.Forbidden, error.DeadlineExceeded }) |failure| {
+        var counter: Counter = .{ .failure = failure };
+        const visitor: ScanVisitor = .{ .context = &counter, .visit = Counter.visit, .progress = Counter.progress };
+        const status = scan_sink_test_report_progress(&visitor, 17);
+        try std.testing.expectEqual(@as(usize, 17), counter.examined);
+        if (failure) |expected| try std.testing.expectEqual(expected, errors.errorFromStatus(status)) else try std.testing.expect(status.isOk());
+    }
+}
