@@ -464,3 +464,66 @@ impossible. Reducing serial dependencies helps; claims must separate warm cache,
 worker reconstruction, ownership recovery and physically cold object reads.
 
 Cold reconstruction originally acquired ownership for reads and regressed to 1,416 ms p95 versus 336 ms for control. That failed report is retained. The subsequent read-only reconstruction path avoids write takeover until a write arrives; a monotonic admission counter and root checks prevent a concurrent write from exposing an unconfirmed prefix through that path.
+
+### Final v3 local results and evidence
+
+Production JavaScript is `d823b5a75b`; native source is unchanged after
+`6b5ef4547c`. Measurement `a951cf64f1` corrects admission I/O accumulation when a
+cold snapshot is discarded and re-admitted. Original reports are retained.
+All comparisons below use the same current native modules on both sides and
+50 ms injected binding latency. The baseline is the current-module flags-off
+profile, not the approved fixed hosted control. The two protocols use fresh,
+compatible isolated namespaces and identical logical keys.
+
+| Profile | Baseline read/write p95 | V3 read/write p95 |
+| --- | ---: | ---: |
+| Warm burst, 64 documents/tenant | 466 / 215 ms | 110 / 218 ms |
+| Warm burst, 512 documents/tenant | 458 / 220 ms | 176 / 262 ms |
+| Warm offered, 8 reads/s | 124 / 130 ms | 22 / 136 ms |
+| Warm offered, 32 reads/s | 133 / 135 ms | 18 / 136 ms |
+| Mixed after reconstruction, 64 documents/tenant | 475 / 581 ms | 704 / 845 ms |
+| Mixed after reconstruction, 512 documents/tenant | 493 / 598 ms | 697 / 847 ms |
+
+Separate first-read reconstruction p95 is **344 vs 469 ms** at 64 documents,
+and **500 vs 862 ms** at 512 documents (baseline vs v3). This includes fresh
+metadata admission; a one-GET covering data path does not eliminate metadata
+or ownership costs. V3 improves warmed bursts about **4.2x / 2.6x** and the
+32 reads/s profile about **7.4x**, with a large-burst write regression and cold
+regressions. There is no universal 10x result, qualified rollout profile, or
+hosted gate pass. Competing local builds were present, each final profile has
+one paired order, and different profiles are not interchangeable repetitions.
+
+Independent primary audit: **12 correct cases / 1,152 measured reads / 280
+writes / 48 separate reconstruction reads**. Including the earlier cold
+attribution runs: **16 cases / 1,536 reads / 408 writes / 96 reconstruction
+reads**. It verifies source/experiment/native/bundle hashes, individual sample
+p95/counts, physical group member coverage, terminal I/O/reservations and role
+memory ceilings. Cohorts count physical native frames once; logical reads are
+counted independently.
+
+Final verification passes **562 Node checks, 49 focused native checks** (three
+live-provider checks skip), the real-workerd v1/v2 owner lifecycle checks,
+request-owned flight/cohort integration and one mail integration. The full
+workerd first stage passed 48/49 with an export burst failure; all four export
+tests passed on isolated rerun. The subsequent seven serving/RPC/continuation
+checks passed, and the corrected cold and final unified-pool v2 fixtures each
+passed separately. The original export failure remains in evidence. These
+reruns are reported explicitly rather than claiming an uninterrupted green suite.
+
+Full WASM SHA-256:
+`06d8fcf8ce316d768bf211552323423c2985595a69cff39bb41bfe4186558966`.
+Sealed evidence is
+`dist/qualification/burst-v3-sealed-1793467455651/evidence.json`:
+**2,113 artifacts / 3,517,717,933 bytes**, manifest SHA-256
+`84c3255e0d5f48c3d06774ec08f3ccd92523727f71ef85139170eb0e9ccf8756`.
+The source archives, native test executables, frozen modules, all attempts and
+independent audits are local. All seven corrected predecessor closures reverify
+unchanged. Their historical availability gaps and invalid nested self-summary
+remain explicit; the recursive audit's initial rejection of that invalid older
+summary is preserved. Credentials were excluded before reading/hashing.
+
+Cold metadata admission, first-write ownership takeover, incremental native
+overlay installation cost, stronger repetitions without competing builds and
+live whole-window qualification remain work. Historical `SQLITE_NOMEM` is not
+resolved by these local results. All new flags remain opt-in; the original
+hosted resource, error, duration and latency thresholds are unchanged.
