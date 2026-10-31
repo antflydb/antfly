@@ -79,6 +79,15 @@ identifier names so native aggregate initializers stay literal. For this form of
 source sharing, freeze and compare the complete native compiler inputs byte for
 byte; shrinking the authored phase copies does not shrink the emitted kernels.
 
+Paged split attention uses the static admission policies in
+`native/metal_attention_gqa_split.zig`: extend those stage/merge instances for
+an admitted layout instead of copying the kernels into a model owner. Dense
+F32/F16/BF16 scalar/reduction exports share `metal_phases.dense_rows`; keep the
+weight storage type explicit so the original precision overload is retained.
+CUDA's online-softmax family retains distinct shared-half and register-F32
+probability publication. Sharing a template does not permit merging those
+rounding or scratch-lifetime contracts.
+
 The portable causal stencil is compiled directly as CUDA and stringified as MSL.
 It is not a runtime interpreter. Protect emitted source from host SDK macros and
 reserved shader identifiers. Separate-product rounding has an explicit CUDA

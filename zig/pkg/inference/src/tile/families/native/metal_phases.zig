@@ -138,3 +138,14 @@ pub const boundary = .{
     .segment_tensor_publish = encoded(phases.segment_tensor_publish),
     .attention_row_maximum = encoded(phases.attention_row_maximum),
 };
+
+/// One scalar/reduction export pair for F32, F16 and BF16 weight storage.
+pub const dense_rows =
+    \\kernel void {{scalar_name}}(device const float *input [[buffer(0)]], device const {{weight_type}} *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+    \\    uint total = p.rows * p.out_dim; if (gid >= total) return; termite_dense_scalar(input, weight, bias, output, p.in_dim, p.out_dim, gid / p.out_dim, gid % p.out_dim);
+    \\}
+    \\kernel void {{reduce_name}}(device const float *input [[buffer(0)]], device const {{weight_type}} *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], threadgroup float *partials [[threadgroup(0)]], ushort lane [[thread_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+    \\    if (tg.x >= p.out_dim || tg.y >= p.rows) return; termite_dense_reduce(input, weight, bias, output, partials, p.in_dim, p.out_dim, tg.y, tg.x, lane);
+    \\}
+    \\
+;

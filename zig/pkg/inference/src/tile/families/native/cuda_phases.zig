@@ -15,7 +15,30 @@
 
 //! Exact numerical and ownership phases shared before CUDA compilation.
 
+const program = @import("../../native_program.zig");
+
 pub const attention = .{
+    .online_softmax_shared_half = program.render(online_softmax, .{ .probability_store = "                probabilities[row * N + lane + j * 32u] = __float2half_rn(p);" }),
+    .online_softmax_register_f32 = program.render(online_softmax, .{ .probability_store = "                staged_probabilities[g][j] = p;" }),
+    .dense_gqa_parameters =
+    \\    float* dst,
+    \\    const float* q,
+    \\    const float* k,
+    \\    const float* v,
+    \\    const unsigned char* attn_or_mask,
+    \\    const float* bias,
+    \\    unsigned int batch,
+    \\    unsigned int q_seq_len,
+    \\    unsigned int kv_seq_len,
+    \\    unsigned int num_heads,
+    \\    unsigned int num_kv_heads,
+    \\    unsigned int head_dim,
+    \\    unsigned int query_position_offset,
+    \\    unsigned int kv_position_offset,
+    \\    unsigned int sliding_window,
+    \\    unsigned int total_sequence_len,
+    \\    unsigned int mask_len,
+    ,
     .visible_key_window =
     \\    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
     \\        unsigned int visible = query_pos - kv_position_offset + 1u;
@@ -27,6 +50,7 @@ pub const attention = .{
     \\                if (key_start > key_end) key_start = key_end;
     \\            }
     \\        }
+    \\    }
     ,
     .tensor_attention_tile =
     \\    const unsigned int tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
@@ -180,3 +204,25 @@ pub const projection = .{
     \\                    }
     ,
 };
+
+// Publication precision and storage remain properties of the static schedule.
+const online_softmax =
+    \\            for (unsigned int shift = 16u; shift; shift >>= 1u)
+    \\                next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift));
+    \\            next_max = fmaxf(maximum[row], __shfl_sync(0xffffffffu, next_max, 0u));
+    \\            const float a = isfinite(maximum[row]) ? __expf(maximum[row] - next_max) : 0.0f;
+    \\            float sum = 0.0f;
+    \\            #pragma unroll
+    \\            for (unsigned int j = 0u; j < 2u; ++j) {
+    \\                const float p = isfinite(next_max) ? __expf(values[j] - next_max) : 0.0f;
+    \\{{probability_store}}
+    \\                sum += p;
+    \\            }
+    \\            for (unsigned int shift = 16u; shift; shift >>= 1u)
+    \\                sum += __shfl_down_sync(0xffffffffu, sum, shift);
+    \\            if (lane == 0u) {
+    \\                alpha[row] = a;
+    \\                denominator[row] = denominator[row] * a + sum;
+    \\                maximum[row] = next_max;
+    \\            }
+;

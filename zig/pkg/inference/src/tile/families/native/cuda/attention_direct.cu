@@ -555,23 +555,7 @@ extern "C" __global__ void termite_channel_apply_f32(
 }
 // native-program:entry termite_gqa_attention_f32
 extern "C" __global__ void termite_gqa_attention_f32(
-    float* dst,
-    const float* q,
-    const float* k,
-    const float* v,
-    const unsigned char* attn_or_mask,
-    const float* bias,
-    unsigned int batch,
-    unsigned int q_seq_len,
-    unsigned int kv_seq_len,
-    unsigned int num_heads,
-    unsigned int num_kv_heads,
-    unsigned int head_dim,
-    unsigned int query_position_offset,
-    unsigned int kv_position_offset,
-    unsigned int sliding_window,
-    unsigned int total_sequence_len,
-    unsigned int mask_len,
+{{dense_gqa_parameters}}
     unsigned int bias_mode
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -639,7 +623,6 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_fast_f32(ANTF
     unsigned int key_end = 0u;
     unsigned int query_pos = query_position_offset;
 {{visible_key_window}}
-    }
 
     unsigned int heads_per_group = num_heads / num_kv_heads;
     unsigned int kv_head = head / heads_per_group;
@@ -680,7 +663,6 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_fast_f32(ANT
     unsigned int key_start = 0u;
     unsigned int key_end = 0u;
 {{visible_key_window}}
-    }
 
     unsigned int heads_per_group = num_heads / num_kv_heads;
     unsigned int kv_head = head / heads_per_group;
@@ -1776,24 +1758,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
                 values[j] = valid ? scores[row * N + n] * 0.125f : -INFINITY;
                 next_max = fmaxf(next_max, values[j]);
             }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift));
-            next_max = fmaxf(maximum[row], __shfl_sync(0xffffffffu, next_max, 0u));
-            const float a = isfinite(maximum[row]) ? __expf(maximum[row] - next_max) : 0.0f;
-            float sum = 0.0f;
-            #pragma unroll
-            for (unsigned int j = 0u; j < 2u; ++j) {
-                const float p = isfinite(next_max) ? __expf(values[j] - next_max) : 0.0f;
-                probabilities[row * N + lane + j * 32u] = __float2half_rn(p);
-                sum += p;
-            }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                sum += __shfl_down_sync(0xffffffffu, sum, shift);
-            if (lane == 0u) {
-                alpha[row] = a;
-                denominator[row] = denominator[row] * a + sum;
-                maximum[row] = next_max;
-            }
+{{online_softmax_shared_half}}
         }
         __syncthreads();
         for (unsigned int i = tid; i < M * D; i += T) output[i] *= alpha[i / D];
@@ -2159,24 +2124,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
                 values[j] = valid ? shared_scores[row * S + n] * 0.125f : -INFINITY;
                 next_max = fmaxf(next_max, values[j]);
             }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift));
-            next_max = fmaxf(maximum[row], __shfl_sync(0xffffffffu, next_max, 0u));
-            const float a = isfinite(maximum[row]) ? __expf(maximum[row] - next_max) : 0.0f;
-            float sum = 0.0f;
-            #pragma unroll
-            for (unsigned int j = 0u; j < 2u; ++j) {
-                const float p = isfinite(next_max) ? __expf(values[j] - next_max) : 0.0f;
-                staged_probabilities[g][j] = p;
-                sum += p;
-            }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                sum += __shfl_down_sync(0xffffffffu, sum, shift);
-            if (lane == 0u) {
-                alpha[row] = a;
-                denominator[row] = denominator[row] * a + sum;
-                maximum[row] = next_max;
-            }
+{{online_softmax_register_f32}}
         }
         // Half probabilities alias the lower half of shared score storage.
         // No writer may reuse it before every warp has read all of its rows.

@@ -22,49 +22,37 @@ pub const source_0 =
         \\           TERMITE_MSL_ABI_PAGED_GQA_SPLIT_STAGE(termite_paged_attention_kv_decode_gqa_split_stage)
         \\
         ,
-        program.metal(
-            \\    const uint qi = tg.x; const uint kv_h = tg.y; const uint split = tg.z; const uint hd = p.head_dim; const uint split_count = schedule.split_count;
-            \\    const bool legacy_geometry = p.num_heads == 8u && (p.num_kv_heads == 1u || p.num_kv_heads == 2u) && ((hd == 256u && p.sliding_window == 512u) || (hd == 512u && p.sliding_window == 0u)); const bool a4b_geometry = p.num_heads == 16u && ((p.num_kv_heads == 8u && hd == 256u && p.sliding_window == 1024u) || (p.num_kv_heads == 2u && hd == 512u && p.sliding_window == 0u));
-            \\    if (p.kv_tokens == 0u || schedule.max_splits == 0u || schedule.max_splits > 32u || schedule.key_chunk != 32u || schedule.reduce_simdgroups != 8u || split_count == 0u || split_count != min(schedule.max_splits, 1u + (p.kv_tokens - 1u) / schedule.key_chunk) || qi >= p.q_len || kv_h >= p.num_kv_heads || split >= split_count || p.q_len == 0u || p.q_len > 2u || p.format != 3u || p.v_element_bytes != 2u || p.page_size == 0u || (p.page_size & 7u) != 0u || (!legacy_geometry && !a4b_geometry) || p.key_row_bytes != 2u * p.num_kv_heads * hd || p.v_row_stride != p.num_kv_heads * hd || p.has_sinks != 0u || p.softcap != 0.0f) return;
-            \\    termite_paged_gqa_split_stage_body(q, encoded_key, v_bytes, block_table, partial_o, p, schedule, shmem, tid, lane, sgitg, qi, kv_h, split, hd, split_count);
-            \\}
+        program.metal(program.render(
+            \\{{windowed_stage}}
             \\// Stage 2 merges split-local (O,S,M) with the global stable softmax.
             \\// Split is innermost so every SIMD lane reads one coalesced float4.
             \\
-        ),
+        , .{ .windowed_stage = splitBody(split_stage, "tg.x", split_policy.windowed) })),
 
         \\           TERMITE_MSL_ABI_PAGED_GQA_SPLIT_REDUCE(termite_paged_attention_kv_decode_gqa_split_reduce)
         \\
         ,
-        program.metal(
-            \\    const uint qi = tg.x; const uint h = tg.y; const uint hd = p.head_dim; const uint split_count = schedule.split_count; const bool legacy_geometry = p.num_heads == 8u && (p.num_kv_heads == 1u || p.num_kv_heads == 2u) && ((hd == 256u && p.sliding_window == 512u) || (hd == 512u && p.sliding_window == 0u)); const bool a4b_geometry = p.num_heads == 16u && ((p.num_kv_heads == 8u && hd == 256u && p.sliding_window == 1024u) || (p.num_kv_heads == 2u && hd == 512u && p.sliding_window == 0u)); if (p.kv_tokens == 0u || schedule.max_splits == 0u || schedule.max_splits > 32u || schedule.key_chunk != 32u || schedule.reduce_simdgroups != 8u || split_count == 0u || split_count != min(schedule.max_splits, 1u + (p.kv_tokens - 1u) / schedule.key_chunk) || qi >= p.q_len || h >= p.num_heads || p.q_len == 0u || p.q_len > 2u || (!legacy_geometry && !a4b_geometry)) return;
-            \\    termite_paged_gqa_split_reduce_body(partial_o, output, p, schedule, lane, sgitg, qi, h, hd, split_count);
-            \\}
+        program.metal(program.render(
+            \\{{windowed_reduce}}
             \\
-        ),
+        , .{ .windowed_reduce = splitBody(split_reduce, "tg.x", split_policy.windowed) })),
 
         \\           // Qualified OCR global attention reuses the staged SIMD matrix algorithm.
         \\           TERMITE_MSL_ABI_PAGED_GQA_SPLIT_STAGE(termite_lightonocr3_gqa_split_stage)
         \\
         ,
-        program.metal(
-            \\    const uint qi = tg.x; const uint kv_h = tg.y; const uint split = tg.z; const uint hd = p.head_dim; const uint split_count = schedule.split_count;
-            \\    const bool lightonocr3_geometry = p.q_len == 1u && hd == 256u && p.sliding_window == 0u && ((p.num_heads == 8u && p.num_kv_heads == 2u) || (p.num_heads == 16u && p.num_kv_heads == 4u));
-            \\    if (p.kv_tokens == 0u || p.kv_tokens > 16384u || schedule.max_splits == 0u || schedule.max_splits > 32u || schedule.key_chunk != 32u || schedule.reduce_simdgroups != 8u || split_count == 0u || split_count != min(schedule.max_splits, 1u + (p.kv_tokens - 1u) / schedule.key_chunk) || qi >= p.q_len || kv_h >= p.num_kv_heads || split >= split_count || p.q_len == 0u || p.q_len != 1u || p.format != 3u || p.v_element_bytes != 2u || p.page_size == 0u || (p.page_size & 7u) != 0u || !lightonocr3_geometry || p.key_row_bytes != 2u * p.num_kv_heads * hd || p.v_row_stride != p.num_kv_heads * hd || p.has_sinks != 0u || p.softcap != 0.0f) return;
-            \\    termite_paged_gqa_split_stage_body(q, encoded_key, v_bytes, block_table, partial_o, p, schedule, shmem, tid, lane, sgitg, qi, kv_h, split, hd, split_count);
-            \\}
+        program.metal(program.render(
+            \\{{global_stage}}
             \\// Stage 2 merges split-local (O,S,M) with the global stable softmax.
             \\// Split is innermost so every SIMD lane reads one coalesced float4.
             \\
-        ),
+        , .{ .global_stage = splitBody(split_stage, "tg.x", split_policy.global_f16_h256) })),
 
         \\           TERMITE_MSL_ABI_PAGED_GQA_SPLIT_REDUCE(termite_lightonocr3_gqa_split_reduce)
         \\
         ,
-        program.metal(
-            \\    const uint qi = tg.x; const uint h = tg.y; const uint hd = p.head_dim; const uint split_count = schedule.split_count; const bool lightonocr3_geometry = p.q_len == 1u && hd == 256u && p.sliding_window == 0u && ((p.num_heads == 8u && p.num_kv_heads == 2u) || (p.num_heads == 16u && p.num_kv_heads == 4u)); if (p.kv_tokens == 0u || p.kv_tokens > 16384u || schedule.max_splits == 0u || schedule.max_splits > 32u || schedule.key_chunk != 32u || schedule.reduce_simdgroups != 8u || split_count == 0u || split_count != min(schedule.max_splits, 1u + (p.kv_tokens - 1u) / schedule.key_chunk) || qi >= p.q_len || h >= p.num_heads || p.q_len == 0u || p.q_len != 1u || !lightonocr3_geometry) return;
-            \\    termite_paged_gqa_split_reduce_body(partial_o, output, p, schedule, lane, sgitg, qi, h, hd, split_count);
-            \\}
+        program.metal(program.render(
+            \\{{global_reduce}}
             \\struct termite_lighton_batch_row {
             \\    device const float *q;
             \\    device const uchar *k;
@@ -82,20 +70,14 @@ pub const source_0 =
             \\    device const float *q=row.q; device const uchar *encoded_key=row.k; device const uchar *v_bytes=row.v;
             \\    device const uint *block_table=row.blocks; device float4 *partial_o=row.partial_o;
             \\
-            \\    const uint qi = 0u; const uint kv_h = tg.y; const uint split = tg.z; const uint hd = p.head_dim; const uint split_count = schedule.split_count;
-            \\    const bool lightonocr3_geometry = p.q_len == 1u && hd == 256u && p.sliding_window == 0u && ((p.num_heads == 8u && p.num_kv_heads == 2u) || (p.num_heads == 16u && p.num_kv_heads == 4u));
-            \\    if (p.kv_tokens == 0u || p.kv_tokens > 16384u || schedule.max_splits == 0u || schedule.max_splits > 32u || schedule.key_chunk != 32u || schedule.reduce_simdgroups != 8u || split_count == 0u || split_count != min(schedule.max_splits, 1u + (p.kv_tokens - 1u) / schedule.key_chunk) || qi >= p.q_len || kv_h >= p.num_kv_heads || split >= split_count || p.q_len == 0u || p.q_len != 1u || p.format != 3u || p.v_element_bytes != 2u || p.page_size == 0u || (p.page_size & 7u) != 0u || !lightonocr3_geometry || p.key_row_bytes != 2u * p.num_kv_heads * hd || p.v_row_stride != p.num_kv_heads * hd || p.has_sinks != 0u || p.softcap != 0.0f) return;
-            \\    termite_paged_gqa_split_stage_body(q, encoded_key, v_bytes, block_table, partial_o, p, schedule, shmem, tid, lane, sgitg, qi, kv_h, split, hd, split_count);
-            \\}
+            \\{{batch_stage}}
             \\kernel void termite_lightonocr3_gqa_batch_reduce(constant termite_lighton_batch_row *rows [[buffer(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
             \\    constant termite_lighton_batch_row &row=rows[tg.x];
             \\    constant termite_metal_paged_attention_params &p=row.params;
             \\    constant termite_metal_decode_gqa_split_params &schedule=row.schedule;
             \\    device const float4 *partial_o=row.partial_o; device float4 *output=row.output;
             \\
-            \\    const uint qi = 0u; const uint h = tg.y; const uint hd = p.head_dim; const uint split_count = schedule.split_count; const bool lightonocr3_geometry = p.q_len == 1u && hd == 256u && p.sliding_window == 0u && ((p.num_heads == 8u && p.num_kv_heads == 2u) || (p.num_heads == 16u && p.num_kv_heads == 4u)); if (p.kv_tokens == 0u || p.kv_tokens > 16384u || schedule.max_splits == 0u || schedule.max_splits > 32u || schedule.key_chunk != 32u || schedule.reduce_simdgroups != 8u || split_count == 0u || split_count != min(schedule.max_splits, 1u + (p.kv_tokens - 1u) / schedule.key_chunk) || qi >= p.q_len || h >= p.num_heads || p.q_len == 0u || p.q_len != 1u || !lightonocr3_geometry) return;
-            \\    termite_paged_gqa_split_reduce_body(partial_o, output, p, schedule, lane, sgitg, qi, h, hd, split_count);
-            \\}
+            \\{{batch_reduce}}
             \\// Codec state is exact: Polar4 has no residual projection plane.
             \\struct termite_polar4_span_codec {
             \\    struct State {};
@@ -206,5 +188,45 @@ pub const source_0 =
             \\    }
             \\}
             \\
-        ),
+        , .{ .batch_stage = splitBody(split_stage, "0u", split_policy.global_f16_h256), .global_reduce = splitBody(split_reduce, "tg.x", split_policy.global_f16_h256), .batch_reduce = splitBody(split_reduce, "0u", split_policy.global_f16_h256) })),
     });
+
+// Static admission policies preserve historical shader symbols and local names.
+const split_policy = .{
+    .windowed = .{
+        .geometry = "const bool legacy_geometry = p.num_heads == 8u && (p.num_kv_heads == 1u || p.num_kv_heads == 2u) && ((hd == 256u && p.sliding_window == 512u) || (hd == 512u && p.sliding_window == 0u)); const bool a4b_geometry = p.num_heads == 16u && ((p.num_kv_heads == 8u && hd == 256u && p.sliding_window == 1024u) || (p.num_kv_heads == 2u && hd == 512u && p.sliding_window == 0u));",
+        .token_limit = "",
+        .query_limit = "> 2u",
+        .reject_geometry = "(!legacy_geometry && !a4b_geometry)",
+    },
+    .global_f16_h256 = .{
+        .geometry = "const bool lightonocr3_geometry = p.q_len == 1u && hd == 256u && p.sliding_window == 0u && ((p.num_heads == 8u && p.num_kv_heads == 2u) || (p.num_heads == 16u && p.num_kv_heads == 4u));",
+        .token_limit = "p.kv_tokens > 16384u || ",
+        .query_limit = "!= 1u",
+        .reject_geometry = "!lightonocr3_geometry",
+    },
+};
+
+const split_stage =
+    \\    const uint qi = {{query}}; const uint kv_h = tg.y; const uint split = tg.z; const uint hd = p.head_dim; const uint split_count = schedule.split_count;
+    \\    {{geometry}}
+    \\    if (p.kv_tokens == 0u || {{token_limit}}schedule.max_splits == 0u || schedule.max_splits > 32u || schedule.key_chunk != 32u || schedule.reduce_simdgroups != 8u || split_count == 0u || split_count != min(schedule.max_splits, 1u + (p.kv_tokens - 1u) / schedule.key_chunk) || qi >= p.q_len || kv_h >= p.num_kv_heads || split >= split_count || p.q_len == 0u || p.q_len {{query_limit}} || p.format != 3u || p.v_element_bytes != 2u || p.page_size == 0u || (p.page_size & 7u) != 0u || {{reject_geometry}} || p.key_row_bytes != 2u * p.num_kv_heads * hd || p.v_row_stride != p.num_kv_heads * hd || p.has_sinks != 0u || p.softcap != 0.0f) return;
+    \\    termite_paged_gqa_split_stage_body(q, encoded_key, v_bytes, block_table, partial_o, p, schedule, shmem, tid, lane, sgitg, qi, kv_h, split, hd, split_count);
+    \\}
+;
+
+const split_reduce =
+    \\    const uint qi = {{query}}; const uint h = tg.y; const uint hd = p.head_dim; const uint split_count = schedule.split_count; {{geometry}} if (p.kv_tokens == 0u || {{token_limit}}schedule.max_splits == 0u || schedule.max_splits > 32u || schedule.key_chunk != 32u || schedule.reduce_simdgroups != 8u || split_count == 0u || split_count != min(schedule.max_splits, 1u + (p.kv_tokens - 1u) / schedule.key_chunk) || qi >= p.q_len || h >= p.num_heads || p.q_len == 0u || p.q_len {{query_limit}} || {{reject_geometry}}) return;
+    \\    termite_paged_gqa_split_reduce_body(partial_o, output, p, schedule, lane, sgitg, qi, h, hd, split_count);
+    \\}
+;
+
+fn splitBody(comptime source: []const u8, comptime query: []const u8, comptime policy: anytype) []const u8 {
+    return program.render(source, .{
+        .query = query,
+        .geometry = policy.geometry,
+        .token_limit = policy.token_limit,
+        .query_limit = policy.query_limit,
+        .reject_geometry = policy.reject_geometry,
+    });
+}
