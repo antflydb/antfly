@@ -39,6 +39,9 @@ pub const Config = struct {
     // Bound producer latency when a source is corrupt, quarantined, or owned
     // by a stuck worker. FD admission remains the final safety boundary.
     backpressure_max_wait_ms: u64 = 5_000,
+    /// Owners without optional workers must drive a merge before waiting for
+    /// producer capacity. No worker can otherwise wake their admission wait.
+    manual_producer_assistance: bool = false,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
 };
 
@@ -760,6 +763,7 @@ const PlatformTextMergeRuntime = struct {
                 recorded_wait = true;
             }
             self.mutex.unlock(io);
+            if (self.config.manual_producer_assistance and try self.runOnce()) continue;
             if (!try self.waitForProducerAdmissionChange(snapshot_wait_epoch, started_ns)) {
                 if (self.isAdmissionClosed()) return error.TextMergeRuntimeShutdown;
                 self.recordBackpressureTerminal(.timed_out);
