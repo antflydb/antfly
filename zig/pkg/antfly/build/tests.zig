@@ -459,6 +459,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "SQL pgwire native", "SQL stateless fallback" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const managed_sources_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"managed source"} });
+    b.step("antfly-api-managed-sources-test", "Run managed CDC source configuration and status contracts").dependOn(&addFilteredTestRunArtifact(b, managed_sources_tests).step);
     b.step("antfly-api-sql-native-cells-test", "Verify native SQL result cells and retained-read requirements")
         .dependOn(&addFilteredTestRunArtifact(b, sql_native_cells_tests).step);
     const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");

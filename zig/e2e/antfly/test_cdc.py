@@ -212,6 +212,83 @@ def _metadata_admin_base_url(stateful_api) -> str:
     return ""
 
 
+def _is_standalone(stateful_api) -> bool:
+    return getattr(stateful_api, "mode", "cluster") == "standalone"
+
+
+def _require_cluster(stateful_api, reason: str) -> None:
+    # Standalone has no metadata admin API, so scenarios that drive the
+    # internal create, reseed, or cutover admin routes stay cluster-only.
+    if _is_standalone(stateful_api):
+        pytest.skip(f"cluster-only CDC scenario: {reason}")
+
+
+def _public_replication_status_records(stateful_api) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    try:
+        tables = stateful_api._check(stateful_api._request("GET", "/tables"))
+    except (requests.RequestException, AssertionError):
+        return records
+    for table in tables if isinstance(tables, list) else []:
+        name = table.get("name") if isinstance(table, dict) else None
+        if not name:
+            continue
+        response = stateful_api._request("GET", f"/tables/{name}/sources/managed")
+        if response.status_code != 200:
+            continue
+        progress = response.json().get("progress")
+        if isinstance(progress, list):
+            records.extend(record for record in progress if isinstance(record, dict))
+    return records
+
+
+def _status_counters_from_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Standalone has no metadata status endpoint; derive its CDC counters from
+    the same status records the public managed-sources API returns."""
+
+    def count(predicate) -> int:
+        return sum(1 for record in records if predicate(record))
+
+    def max_of(field: str) -> int:
+        return max((int(record.get(field, 0) or 0) for record in records), default=0)
+
+    lag_max = max_of("lag_millis")
+    return {
+        "projected_replication_source_statuses_streaming": count(
+            lambda r: r.get("phase") == "streaming"
+        ),
+        "projected_replication_source_statuses_with_consecutive_failures": count(
+            lambda r: int(r.get("consecutive_failures", 0) or 0) > 0
+        ),
+        "projected_replication_source_consecutive_failures_max": max_of(
+            "consecutive_failures"
+        ),
+        "projected_replication_source_lag_millis_max": lag_max,
+        "projected_replication_source_observed_lag_millis_max": lag_max,
+        "projected_replication_source_statuses_with_source_commit_timestamp": count(
+            lambda r: int(r.get("last_source_commit_at_ms", 0) or 0) > 0
+        ),
+        "projected_replication_source_last_change_applied_at_ms_max": max_of(
+            "last_change_applied_at_ms"
+        ),
+        "projected_replication_source_statuses_exact_cutover": count(
+            lambda r: int(r.get("cutover_authority_id", 0) or 0) != 0
+        ),
+        "projected_replication_source_statuses_non_exact_cutover": count(
+            lambda r: int(r.get("cutover_authority_id", 0) or 0) == 0
+        ),
+        "projected_replication_source_statuses_exported_snapshot": count(
+            lambda r: r.get("cutover_mode") == "exported_snapshot"
+        ),
+        "projected_replication_source_statuses_with_success_timestamp": count(
+            lambda r: int(r.get("last_success_at_ms", 0) or 0) > 0
+        ),
+        "projected_replication_source_statuses_with_change_timestamp": count(
+            lambda r: int(r.get("last_change_applied_at_ms", 0) or 0) > 0
+        ),
+    }
+
+
 def _metadata_admin_snapshot(stateful_api) -> str:
     base_url = _metadata_admin_base_url(stateful_api)
     if not base_url:
@@ -253,7 +330,7 @@ def _metadata_replication_statuses(stateful_api) -> str:
 def _metadata_replication_status_records(stateful_api) -> list[dict[str, Any]]:
     base_url = _metadata_admin_base_url(stateful_api)
     if not base_url:
-        return []
+        return _public_replication_status_records(stateful_api)
     try:
         response = requests.get(
             f"{base_url}/metadata/v1/admin/snapshot",
@@ -285,6 +362,10 @@ def _metadata_replication_status_records_for_source(
 def _metadata_status(stateful_api) -> dict[str, Any]:
     base_url = _metadata_admin_base_url(stateful_api)
     if not base_url:
+        if _is_standalone(stateful_api):
+            return _status_counters_from_records(
+                _public_replication_status_records(stateful_api)
+            )
         return {}
     try:
         response = requests.get(f"{base_url}/metadata/v1/status", timeout=5)
@@ -398,6 +479,11 @@ def _create_table_public(
 def _create_table_via_metadata_admin(
     stateful_api, table_name: str, payload: dict[str, Any]
 ) -> None:
+    if _is_standalone(stateful_api):
+        # Standalone has no internal metadata route; the public create runs
+        # the same catalog derivation against its single local owner.
+        _create_table_public(stateful_api, table_name, payload)
+        return
     base_url = _metadata_admin_base_url(stateful_api)
     if not base_url:
         raise AssertionError(
@@ -424,6 +510,12 @@ def _create_table_via_metadata_admin(
 
 
 def _metadata_table_id(stateful_api, table_name: str) -> int | None:
+    if _is_standalone(stateful_api):
+        public_tables = stateful_api._check(stateful_api._request("GET", "/tables"))
+        for public_table in public_tables:
+            if public_table.get("name") == table_name:
+                return int(public_table["table_id"])
+        return None
     payload = _metadata_admin_snapshot_json(stateful_api)
     for table in payload.get("tables", []):
         if isinstance(table, dict) and table.get("name") == table_name:
@@ -484,6 +576,7 @@ def cdc_stateful_api(request, pg_cdc_source):
             self.s = session
             self.url = base_url.rstrip("/")
             self._server = server_ref
+            self.mode = mode
 
         def _raise_request_error(self, err: requests.RequestException) -> None:
             raise_request_error_with_logs(err, self._server)
@@ -1375,6 +1468,7 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
 def test_stateful_postgres_cdc_exact_cutover_isolates_preexisting_logical_slot(
     stateful_api, pg_cdc_source
 ):
+    _require_cluster(stateful_api, "drives exact-cutover admin state")
     table_name = f"cdc_existing_slot_docs_{time.time_ns()}"
     _run_psql(
         f"create publication {pg_cdc_source['publication_name']} for table {pg_cdc_source['table_name']};"
@@ -1526,6 +1620,7 @@ def test_stateful_postgres_cdc_exact_cutover_isolates_preexisting_logical_slot(
 def test_stateful_postgres_cdc_required_exact_cutover_isolates_logical_name_collision(
     stateful_api, pg_cdc_source
 ):
+    _require_cluster(stateful_api, "drives exact-cutover admin state")
     table_name = f"cdc_exact_cutover_docs_{time.time_ns()}"
     _run_psql(
         f"create publication {pg_cdc_source['publication_name']} for table {pg_cdc_source['table_name']};"
@@ -1631,6 +1726,7 @@ def test_stateful_postgres_cdc_required_exact_cutover_isolates_logical_name_coll
 def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
     stateful_api, pg_cdc_source
 ):
+    _require_cluster(stateful_api, "uses the metadata reseed admin route")
     table_name = f"cdc_reseed_exact_cutover_docs_{time.time_ns()}"
     _run_psql(
         f"create publication {pg_cdc_source['publication_name']} for table {pg_cdc_source['table_name']};"
@@ -1790,6 +1886,7 @@ def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
 def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_terminal(
     stateful_api, pg_cdc_source
 ):
+    _require_cluster(stateful_api, "inspects metadata admin status")
     table_name = f"cdc_recovery_docs_{time.time_ns()}"
     create_payload = {
         "num_shards": 1,
@@ -1923,27 +2020,48 @@ def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_
     ), f"slot loss was not surfaced explicitly\n{failed_statuses!r}"
 
 
-def test_standalone_rejects_postgres_replication_sources():
-    # Standalone does not run the CDC coordinators, so it must refuse a source
-    # it would otherwise accept and never ingest.
+def test_standalone_accepts_postgres_replication_sources(pg_cdc_source):
+    # Standalone runs the CDC coordinators: a source is accepted, reports
+    # cdc_supported, and its snapshot row arrives. The parametrized
+    # cdc_stateful_api fixture runs the full scenarios against standalone too.
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    if not os.path.exists(binary):
+        pytest.skip(f"Public API binary not found: {binary}")
     server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    table_name = f"cdc_standalone_{time.time_ns()}"
     try:
         response = requests.post(
-            server.api_url + "/tables/tickets",
+            f"{server.api_url}/tables/{table_name}",
             json={
                 "replication_sources": [
                     {
                         "type": "postgres",
-                        "dsn": "postgres://antfly:secret@127.0.0.1:5432/support",
-                        "postgres_table": "public.tickets",
+                        "dsn": _pg_dsn(),
+                        "postgres_table": pg_cdc_source["table_name"],
+                        "key_template": "id",
+                        "slot_name": pg_cdc_source["slot_name"],
+                        "publication_name": pg_cdc_source["publication_name"],
                     }
                 ]
             },
             timeout=30,
         )
-        assert response.status_code == 400, response.text
-        assert response.json()["error"] == "REPLICATION_SOURCES_REQUIRE_CLUSTER"
-        assert requests.post(server.api_url + "/tables/plain", json={}, timeout=30).ok
+        assert response.status_code == 200, response.text
+
+        def snapshot_arrived():
+            doc = requests.get(
+                server.api_url + lookup_key_path(table_name, "user-1"), timeout=30
+            )
+            return doc.status_code == 200 and doc.json().get("name") == "Alice"
+
+        assert wait_until(snapshot_arrived, timeout_s=60, interval_s=0.5), (
+            "snapshot row never arrived"
+        )
+        managed = requests.get(
+            f"{server.api_url}/tables/{table_name}/sources/managed", timeout=30
+        ).json()
+        assert managed["cdc_supported"] is True, managed
+        assert managed["progress"], managed
+        assert managed["progress"][0]["last_error"] == "", managed
     finally:
         server.stop()
