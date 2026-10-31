@@ -2221,6 +2221,9 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.RequiredMediaOutputFailed,
         error.DocumentModelRevisionMismatch,
         error.DocumentBudgetExhausted,
+        // The request's estimate exceeds the configured inference budget;
+        // contention surfaces as ResourceTemporarilyUnavailable instead.
+        error.MemoryBudgetExceeded,
         error.InvalidDocumentCheckpoint,
         error.InvalidDocumentSource,
         error.InvalidDocumentSelection,
@@ -2348,6 +2351,22 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         // budget and are parked for repair if that budget is exhausted.
         else => .retryable_request,
     };
+}
+
+/// The shared repair/enrichment classification decides which retryable
+/// failures leave a document's attempt budget untouched.
+fn enrichmentFailureSparesAttemptBudget(err: anyerror) bool {
+    return types.repair_failure.isAdmissionRefusal(err);
+}
+
+test "transient refusals do not spend the enrichment attempt budget" {
+    try std.testing.expect(enrichmentFailureSparesAttemptBudget(error.ResourceTemporarilyUnavailable));
+    // Rate limits are transient but bounded, so outages park as repair debt.
+    try std.testing.expect(!enrichmentFailureSparesAttemptBudget(error.EmbedRateLimited));
+    try std.testing.expect(!enrichmentFailureSparesAttemptBudget(error.MemoryBudgetExceeded));
+    // A request that can never fit the configured budget is permanent.
+    try std.testing.expect(!isRetryableEnrichmentError(error.MemoryBudgetExceeded));
+    try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
 }
 
 pub fn isRetryableEnrichmentError(err: anyerror) bool {
@@ -2519,19 +2538,47 @@ fn retryBudgetAllowsYield(consecutive_retry_count: u32, max_attempts: u32) bool 
     return @as(u64, consecutive_retry_count) +| 1 < @max(max_attempts, 1);
 }
 
-fn activeRequestRetryBudgetAllowsYield(runtime: *EnrichmentRuntime) bool {
+/// Admission refusals never ran the request, so `enrichmentFailureSparesAttemptBudget`
+/// keeps them off the document's attempt budget (`retry_failure_count`). Left
+/// unbounded, a request permanently over the configured resource budget (for
+/// example, one that will never fit under `--inference-scratch-budget-mb` for
+/// any concurrent caller) would wait for admission forever instead of
+/// surfacing as repair debt. This ceiling is independent of
+/// `worker_retry_max_attempts` and deliberately generous: ordinary admission
+/// contention clears in a handful of backoffs.
+const admission_wait_max_attempts: u32 = 1000;
+
+fn admissionWaitBudgetAllowsYield(waited_attempts: u32) bool {
+    return retryBudgetAllowsYield(waited_attempts, admission_wait_max_attempts);
+}
+
+/// The budget an error should be checked against: the document's durable
+/// attempt budget for work that actually ran, or the separate, much larger
+/// admission-wait ceiling for admission refusals that never did. Keeping the
+/// yield decision and `recordRetryableError`'s accounting on the same
+/// `enrichmentFailureSparesAttemptBudget` classification is what lets an
+/// admission refusal retry past `worker_retry_max_attempts`.
+fn requestRetryBudgetAllows(prior_attempts: u32, max_attempts: u32, spares_attempt_budget: bool) bool {
+    return if (spares_attempt_budget)
+        admissionWaitBudgetAllowsYield(prior_attempts)
+    else
+        retryBudgetAllowsYield(prior_attempts, max_attempts);
+}
+
+fn activeRequestRetryBudgetAllowsYield(runtime: *EnrichmentRuntime, err: anyerror) bool {
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
     if (runtime.active_failure_fingerprint == 0) {
         runtime.retry_error_has_request_identity = false;
         return true;
     }
+    const spares_attempt_budget = enrichmentFailureSparesAttemptBudget(err);
     const prior_attempts = requestPriorAttempts(
         runtime.active_failure_fingerprint,
         runtime.retry_failure_fingerprint,
-        runtime.retry_failure_count,
+        if (spares_attempt_budget) runtime.transient_retry_count else runtime.retry_failure_count,
     );
-    const allows_yield = retryBudgetAllowsYield(prior_attempts, runtime.config.worker_retry_max_attempts);
+    const allows_yield = requestRetryBudgetAllows(prior_attempts, runtime.config.worker_retry_max_attempts, spares_attempt_budget);
     runtime.retry_error_has_request_identity = allows_yield;
     return allows_yield;
 }
@@ -2543,16 +2590,17 @@ fn activeRequestRetryBudgetAllowsYield(runtime: *EnrichmentRuntime) bool {
 /// `FailureScope`, and the lane boundary (`LanePipeline`) installs the
 /// failing lane's identity once, on the scanner thread, right before the
 /// error reaches the supervisor.
-fn requestRetryBudgetAllowsYieldFor(runtime: *EnrichmentRuntime, fingerprint: u64) bool {
+fn requestRetryBudgetAllowsYieldFor(runtime: *EnrichmentRuntime, fingerprint: u64, err: anyerror) bool {
     if (fingerprint == 0) return true;
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
+    const spares_attempt_budget = enrichmentFailureSparesAttemptBudget(err);
     const prior_attempts = requestPriorAttempts(
         fingerprint,
         runtime.retry_failure_fingerprint,
-        runtime.retry_failure_count,
+        if (spares_attempt_budget) runtime.transient_retry_count else runtime.retry_failure_count,
     );
-    return retryBudgetAllowsYield(prior_attempts, runtime.config.worker_retry_max_attempts);
+    return requestRetryBudgetAllows(prior_attempts, runtime.config.worker_retry_max_attempts, spares_attempt_budget);
 }
 
 /// `shouldYieldRequestError` for an explicit identity; see
@@ -2562,7 +2610,7 @@ fn shouldYieldRequestErrorFor(runtime: *EnrichmentRuntime, fingerprint: u64, err
     return switch (enrichmentErrorDisposition(err)) {
         .fatal_worker => true,
         .terminal_request => false,
-        .retryable_request => requestRetryBudgetAllowsYieldFor(runtime, fingerprint),
+        .retryable_request => requestRetryBudgetAllowsYieldFor(runtime, fingerprint, err),
     };
 }
 
@@ -2671,12 +2719,18 @@ fn workerLoopRetryScopeIfAllowed(runtime: *EnrichmentRuntime, err: anyerror) ?Wo
         runtime.active_failure_fingerprint != 0;
     runtime.retry_error_has_request_identity = false;
     if (request_owned) {
+        // Re-derive the same budget shouldYieldRequestError already admitted
+        // this request against, using the same admission-refusal exemption,
+        // so this recheck cannot reject a request that was already granted
+        // another attempt (which would stop the whole worker via recordError
+        // instead of just parking the document).
+        const spares_attempt_budget = enrichmentFailureSparesAttemptBudget(err);
         const request_prior_attempts = requestPriorAttempts(
             runtime.active_failure_fingerprint,
             runtime.retry_failure_fingerprint,
-            runtime.retry_failure_count,
+            if (spares_attempt_budget) runtime.transient_retry_count else runtime.retry_failure_count,
         );
-        return if (retryBudgetAllowsYield(request_prior_attempts, runtime.config.worker_retry_max_attempts))
+        return if (requestRetryBudgetAllows(request_prior_attempts, runtime.config.worker_retry_max_attempts, spares_attempt_budget))
             .request
         else
             null;
@@ -2710,7 +2764,7 @@ fn shouldYieldRequestError(runtime: *EnrichmentRuntime, err: anyerror) bool {
         // the supervisor ceiling.
         // Pipeline failures have no request identity and must never consume a
         // document budget or be converted into terminal document coverage.
-        .retryable_request => activeRequestRetryBudgetAllowsYield(runtime),
+        .retryable_request => activeRequestRetryBudgetAllowsYield(runtime, err),
     };
 }
 
@@ -2996,10 +3050,159 @@ test "worker retry preserves only an explicitly authorized request identity" {
     };
 
     runtime.active_failure_fingerprint = 1234;
-    try std.testing.expect(activeRequestRetryBudgetAllowsYield(&runtime));
+    try std.testing.expect(activeRequestRetryBudgetAllowsYield(&runtime, error.EmbedRateLimited));
     try std.testing.expect(runtime.retry_error_has_request_identity);
     try std.testing.expect(workerLoopRetryBudgetAllowsYield(&runtime, error.EmbedRateLimited));
     try std.testing.expectEqual(@as(u64, 1234), runtime.active_failure_fingerprint);
+    try std.testing.expect(!runtime.retry_error_has_request_identity);
+}
+
+test "admission refusals retry past worker_retry_max_attempts without parking" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    runtime.active_failure_fingerprint = 55;
+    // A plain attempt-budget check (prior_attempts=0, max_attempts=1) would
+    // already deny this: 0 + 1 < 1 is false. The admission exemption must
+    // still let the very first refusal yield.
+    try std.testing.expect(shouldYieldRequestError(&runtime, error.ResourceTemporarilyUnavailable));
+    try std.testing.expect(runtime.retry_error_has_request_identity);
+
+    runtime.retry_failure_fingerprint = runtime.active_failure_fingerprint;
+    var refusal: u32 = 0;
+    while (refusal < 10) : (refusal += 1) {
+        runtime.transient_retry_count = refusal;
+        try std.testing.expect(shouldYieldRequestError(&runtime, error.ResourceTemporarilyUnavailable));
+        // Admission refusals never spend retry_failure_count, so once
+        // admission frees up the request still has its full attempt budget.
+        try std.testing.expectEqual(@as(u32, 0), runtime.retry_failure_count);
+    }
+}
+
+test "admission refusal on the final allowed attempt still yields" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    runtime.active_failure_fingerprint = 77;
+    runtime.retry_failure_fingerprint = 77;
+    // The document's ordinary attempt budget is already exhausted: the next
+    // non-admission attempt under this identity would park.
+    try std.testing.expect(!retryBudgetAllowsYield(runtime.retry_failure_count, runtime.config.worker_retry_max_attempts));
+    try std.testing.expect(!shouldYieldRequestError(&runtime, error.EmbedRateLimited));
+    try std.testing.expect(!runtime.retry_error_has_request_identity);
+
+    // An admission refusal under the same identity is exempt from that
+    // exhausted budget: the request never ran, so it still yields instead of
+    // parking the document.
+    try std.testing.expect(shouldYieldRequestError(&runtime, error.ResourceTemporarilyUnavailable));
+    try std.testing.expect(runtime.retry_error_has_request_identity);
+}
+
+test "shouldYieldRequestErrorFor applies the same admission exemption as the active identity check" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    const fingerprint: u64 = 202;
+    runtime.retry_failure_fingerprint = fingerprint;
+    // A non-admission transient error has nothing left to spend.
+    try std.testing.expect(!shouldYieldRequestErrorFor(&runtime, fingerprint, error.EmbedRateLimited));
+    // An admission refusal for the same identity is still exempt.
+    try std.testing.expect(shouldYieldRequestErrorFor(&runtime, fingerprint, error.ResourceTemporarilyUnavailable));
+}
+
+test "worker loop retry recheck applies the same admission exemption as the inline check" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    // As if shouldYieldRequestError already admitted this exact request.
+    runtime.active_failure_fingerprint = 101;
+    runtime.retry_failure_fingerprint = 101;
+    runtime.retry_error_has_request_identity = true;
+    try std.testing.expectEqual(
+        WorkerRetryScope.request,
+        workerLoopRetryScopeIfAllowed(&runtime, error.ResourceTemporarilyUnavailable).?,
+    );
+}
+
+test "the admission-wait budget is bounded so a permanently refused request eventually parks" {
+    try std.testing.expect(admissionWaitBudgetAllowsYield(admission_wait_max_attempts - 2));
+    try std.testing.expect(!admissionWaitBudgetAllowsYield(admission_wait_max_attempts - 1));
+
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    runtime.active_failure_fingerprint = 88;
+    runtime.retry_failure_fingerprint = 88;
+    runtime.transient_retry_count = admission_wait_max_attempts - 1;
+    // Even an admission refusal eventually parks once the much larger,
+    // independent admission-wait ceiling is spent: a request permanently
+    // over the configured resource budget cannot wait for admission forever.
+    try std.testing.expect(!shouldYieldRequestError(&runtime, error.ResourceTemporarilyUnavailable));
     try std.testing.expect(!runtime.retry_error_has_request_identity);
 }
 
@@ -5974,6 +6177,9 @@ const UnsupportedEnrichmentRuntime = struct {
     retry_after_hint_ms: u64 = 0,
     retry_failure_fingerprint: u64 = 0,
     retry_failure_count: u32 = 0,
+    /// Transient refusals of the current failure identity. They pace the
+    /// back-off but never spend `retry_failure_count`'s attempt budget.
+    transient_retry_count: u32 = 0,
     terminal_failure_min_sequence: u64 = 0,
     terminal_failure_max_sequence: u64 = 0,
     active_failure_fingerprint: u64 = 0,
@@ -6504,6 +6710,9 @@ const PlatformEnrichmentRuntime = struct {
     retry_after_hint_ms: u64 = 0,
     retry_failure_fingerprint: u64 = 0,
     retry_failure_count: u32 = 0,
+    /// Transient refusals of the current failure identity. They pace the
+    /// back-off but never spend `retry_failure_count`'s attempt budget.
+    transient_retry_count: u32 = 0,
     terminal_failure_min_sequence: u64 = 0,
     terminal_failure_max_sequence: u64 = 0,
     active_failure_fingerprint: u64 = 0,
@@ -7303,13 +7512,19 @@ const PlatformEnrichmentRuntime = struct {
         if (self.retry_failure_fingerprint != self.active_failure_fingerprint) {
             self.retry_failure_fingerprint = self.active_failure_fingerprint;
             self.retry_failure_count = 0;
+            self.transient_retry_count = 0;
         }
-        if (!awaiting_publication) self.retry_failure_count +|= 1;
+        // Admission refusals never ran the request: back off, but keep the
+        // document's attempt budget for work that actually failed.
+        const transient = !awaiting_publication and enrichmentFailureSparesAttemptBudget(err);
+        if (!awaiting_publication) {
+            if (transient) self.transient_retry_count +|= 1 else self.retry_failure_count +|= 1;
+        }
         // A normal ordered acknowledgement wait is not a provider failure.
         // In particular, many census pages must not exponentially delay one
         // another or inherit an earlier provider's backoff hint.
         const retry_ordinal = if (awaiting_publication) 0 else if (scope == .request)
-            self.retry_failure_count
+            self.retry_failure_count +| self.transient_retry_count
         else
             self.consecutive_retry_count;
         const delay_ms = workerRetryDelayWithHintMs(retry_ordinal, if (awaiting_publication) 0 else self.retry_after_hint_ms);

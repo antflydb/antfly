@@ -1616,6 +1616,25 @@ pub const max_ordered_embedding_media_parts_per_item: usize = 32;
 const max_chunk_results = lib_chunker.max_chunk_results;
 const max_chunk_target_tokens = lib_chunker.max_chunk_target_tokens;
 const max_chunk_audio_window_ms = lib_chunker.max_chunk_audio_window_ms;
+/// An explicit scratch budget caps the GLiNER boundary encoder's device
+/// ceiling so the run (host working memory, encoder and head) fits within it.
+/// Without an explicit budget, or when the budget cannot hold even the head
+/// and working memory, the configured ceiling is kept and admission decides.
+fn glinerBoundaryEncoderCeiling(configured: usize, explicit_scratch_limit: usize, working_bytes: usize, head_bytes: usize) usize {
+    if (explicit_scratch_limit == 0) return configured;
+    const reserved = std.math.add(usize, working_bytes, head_bytes) catch return configured;
+    if (explicit_scratch_limit <= reserved) return configured;
+    return @min(configured, explicit_scratch_limit - reserved);
+}
+
+test "GLiNER boundary encoder ceiling respects an explicit scratch budget" {
+    const mib: usize = 1024 * 1024;
+    try std.testing.expectEqual(2048 * mib, glinerBoundaryEncoderCeiling(2048 * mib, 0, 64 * mib, 256 * mib));
+    try std.testing.expectEqual(1728 * mib, glinerBoundaryEncoderCeiling(2048 * mib, 2048 * mib, 64 * mib, 256 * mib));
+    try std.testing.expectEqual(2048 * mib, glinerBoundaryEncoderCeiling(2048 * mib, 8192 * mib, 64 * mib, 256 * mib));
+    try std.testing.expectEqual(2048 * mib, glinerBoundaryEncoderCeiling(2048 * mib, 128 * mib, 64 * mib, 256 * mib));
+}
+
 const default_read_admission_max_tokens: usize = 256;
 const max_read_tokens: usize = 8192;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
@@ -11446,8 +11465,18 @@ pub const Node = struct {
             var device_lease: ?runtime.tier.memory.AdmissionLease = null;
             defer if (device_lease) |*owned| owned.release();
             if (backend == .metal or backend == .cuda) {
+                // An explicit scratch budget caps the encoder ceiling instead
+                // of refusing every request; the profile keeps the declared one.
+                const encoder_ceiling = glinerBoundaryEncoderCeiling(
+                    execution_options.device.max_encoder_device_bytes,
+                    self.config.generation_budget_overrides.scratch_limit_bytes,
+                    working_bytes,
+                    execution_options.device.head.max_device_bytes,
+                );
+                var ceiling_options = execution_options;
+                ceiling_options.device.max_encoder_device_bytes = encoder_ceiling;
                 if (workspace_plan) |plan| {
-                    request_options.device.max_encoder_device_bytes = try plan.requestEncoderLimit(execution_options.device.max_encoder_device_bytes);
+                    request_options.device.max_encoder_device_bytes = try plan.requestEncoderLimit(encoder_ceiling);
                     request_options.profile_encoder_device_limit = execution_options.device.max_encoder_device_bytes;
                 } else if (reference_encoder_bytes) |needed| {
                     // Size the encoder owner to this request instead of the
@@ -11460,7 +11489,7 @@ pub const Node = struct {
                 // borrowed workspace, which the controller owns through a
                 // separate persistent lease. The reference path has none, so
                 // its run reserves only what this request plans to use.
-                const run_device_bytes = if (workspace_plan == null) request_device_bytes else try boundary_executor.deviceScratchUpperBound(execution_options);
+                const run_device_bytes = if (workspace_plan == null) request_device_bytes else try boundary_executor.deviceScratchUpperBound(ceiling_options);
                 const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                     self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu)),
                     self.config.generation_budget_overrides.scratch_limit_bytes,
