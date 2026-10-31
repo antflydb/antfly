@@ -528,7 +528,10 @@ pub const Store = struct {
         total.controls_applied +|= pass.controls_applied;
         total.limit = pass.limit;
         total.has_more = pass.has_more;
-        total.debt_remaining = pass.debt_remaining;
+        // A later page may succeed while documents on an earlier page still
+        // failed. Keep that outcome when the traversal reaches its last page.
+        total.debt_remaining = pass.debt_remaining or (previous.control == null and
+            (total.failed != 0 or total.unsupported != 0 or total.missing_source_docs != 0));
         total.next_cursor = pass.next_cursor;
 
         const retryable_in_progress = previous.control == null and pass.in_progress != 0 and pass.failed == 0 and pass.unsupported == 0 and pass.missing_source_docs == 0;
@@ -537,7 +540,7 @@ pub const Store = struct {
         const failed_debt = if (previous.control != null)
             pass.failed != 0 or pass.unsupported != 0 or pass.missing_source_docs != 0
         else
-            pass.debt_remaining;
+            total.debt_remaining;
         const phase: JobPhase = if (previous.cancel_requested)
             .cancelled
         else if (pass.has_more or retryable_in_progress)
@@ -595,7 +598,7 @@ pub const Store = struct {
             .attempt_id = previous.attempt_id,
             .table_name = previous.table_name,
             .phase = phaseString(final_phase),
-            .repair_status = repairStatusForPhase(final_phase, pass.has_more, pass.debt_remaining),
+            .repair_status = repairStatusForPhase(final_phase, total.has_more, total.debt_remaining),
             .target = previous.target,
             .control = previous.control,
             .repair_id = previous.repair_id,
@@ -1468,6 +1471,37 @@ test "repair job with documents still failing completes with failures, not faile
     });
     defer control.deinit();
     try std.testing.expectEqualStrings("failed", control.value.phase);
+}
+
+test "repair job retains failures from earlier enrichment pages" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+    var cursor = "artifact-cursor".*;
+    var first = try runOnePassForTest(alloc, &store, .{ .target = "index", .index = "knowledge", .limit = 1 }, .{
+        .scanned = 1,
+        .failed = 1,
+        .unresolved = 1,
+        .has_more = true,
+        .debt_remaining = true,
+        .next_cursor = &cursor,
+    });
+    defer first.deinit();
+    try std.testing.expectEqualStrings("queued", first.value.phase);
+    try std.testing.expectEqualStrings("artifact-cursor", first.value.cursor.?);
+    const begin = try store.beginAdvance(alloc, first.value);
+    defer alloc.free(begin.encoded);
+    var running = try std.json.parseFromSlice(JobState, alloc, begin.encoded, .{});
+    defer running.deinit();
+    const updated = try store.recordPass(alloc, running.value, .{ .scanned = 1, .repaired = 1 });
+    defer alloc.free(updated);
+    var finished = try std.json.parseFromSlice(JobState, alloc, updated, .{});
+    defer finished.deinit();
+    try std.testing.expectEqualStrings("completed_with_failures", finished.value.phase);
+    try std.testing.expect(finished.value.result.debt_remaining);
+    try std.testing.expectEqual(@as(u64, 1), finished.value.result.failed);
+    try std.testing.expectEqual(@as(u64, 1), finished.value.result.repaired);
+    try validateJobState(finished.value);
 }
 
 test "plain repair after a finished job starts a fresh job" {

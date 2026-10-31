@@ -329,9 +329,10 @@ pub const ReadingPipeline = struct {
                 // envelope can never fit, the batched decoder's KV cache needs
                 // only one logits row per step.
                 if (!self.florenceIncrementalRetryEligible(err)) return err;
-                allocator.free(out);
                 logReadBatchMode("native_incremental_retry", image_datas, @errorName(err));
-                return .{ .results = try self.readBatchNativeFlorenceChunked(image_datas), .mode = .native, .native_batches = 1 };
+                const results = try self.readBatchNativeFlorenceChunked(image_datas);
+                allocator.free(out);
+                return .{ .results = results, .mode = .native, .native_batches = 1 };
             };
             return .{ .results = out, .mode = .serial };
         }
