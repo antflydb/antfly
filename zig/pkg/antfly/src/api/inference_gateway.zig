@@ -279,7 +279,7 @@ pub fn view(server: anytype) !gateway.View {
 }
 
 pub fn disabledResponse(ctx: *httpx.Context) !httpx.Response {
-    return ctx.status(403).json(.{ .@"error" = .{ .code = "PublicInferenceDisabled", .type = "permission_error", .message = "Public inference is disabled for this deployment" } });
+    return ctx.status(403).json(.{ .@"error" = .{ .code = "PublicInferenceDisabled", .type = "permission_error", .message = "Public inference is disabled on this deployment; set public_inference.enabled in the server config" } });
 }
 
 const InvocationState = struct {

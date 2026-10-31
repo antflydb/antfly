@@ -8478,7 +8478,7 @@ pub const ApiHttpServer = struct {
         request: AuthenticatedRequest,
         permission: kernel_abi.InferencePermission,
     ) !kernel_abi.AuthorizationDecision {
-        if (permission == .write and !self.publicInferenceEnabled()) return .forbidden;
+        if (permission == .write and !self.publicInferenceEnabled()) return .public_inference_disabled;
         if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null and
             request.trusted_principal == null)
             return .allowed;
@@ -28823,6 +28823,42 @@ test "internal service credentials cannot authorize public inference routes" {
         kernel_abi.AuthorizationDecision.forbidden,
         try server.authorizeInferenceRequest(.{ .trusted_principal = token }, .write),
     );
+}
+
+test "httpx inference gateway authorization tells disabled public inference apart from missing permission" {
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const secret = "inference-policy-test-secret";
+    const now_seconds: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = secret,
+        .issuer = "cluster-a",
+        .subject = "node:7",
+    }, now_seconds);
+    defer alloc.free(token);
+    for ([_]struct { config: []const u8, expected: kernel_abi.AuthorizationDecision }{
+        // The deployment fence runs first and names itself.
+        .{ .config = "{\"public_inference\":{\"enabled\":false}}", .expected = .public_inference_disabled },
+        // With the fence open, a caller without inference write stays forbidden.
+        .{ .config = "{\"public_inference\":{\"enabled\":true}}", .expected = .forbidden },
+    }) |case| {
+        var config = try common_config.Config.parseFromSlice(alloc, case.config);
+        defer config.deinit();
+        var server = ApiHttpServer.init(alloc, .{
+            .node_config = &config,
+            .trusted_principal_secret = secret,
+            .trusted_principal_issuer = "cluster-a",
+        }, FakeSource.iface(), null, null);
+        defer server.deinit();
+        try std.testing.expectEqual(case.expected, try server.authorizeInferenceRequest(.{ .trusted_principal = token }, .write));
+    }
 }
 
 test "api http server validates dedicated internal service runtime credentials" {
