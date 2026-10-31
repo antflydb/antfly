@@ -7,6 +7,12 @@ combined metadata projections and byte-based dependency admission.
 `serialized-owner-v3` namespace protocol. Both remain opt-in. This is an
 implementation design, not a declaration that the latency or hosted gates pass.
 
+These flags extend a compatible resident configuration. Graph scheduling also
+requires `NATIVE_POINT_CONTINUATIONS=true` and cohort discovery uses
+`RESIDENT_READ_COHORTS=true`; committed header reuse uses
+`RESIDENT_BOOTSTRAP=true`. The measured complete flag sets are defined in
+`examples/cloudflare-serverless/qualification/read-state-latency.mjs`.
+
 ## Native cold read plan
 
 Publication preparation compresses the existing bounded manifest/facts-root
@@ -30,7 +36,7 @@ frontier; the host never guesses keys or treats unknown metadata as absence.
 Visibility errors remain per member; integrity and resource failures fail the
 operation. Bodies and oversized results retain the existing individual path.
 
-Physical response admission has the previous two-transcript aggregate budget:
+Detached dependency response admission has the previous two-transcript aggregate budget:
 200 KiB, now charged by response size rather than two fixed permits. Scheduling
 uses bounded request-owned timer/data tickets, fairness between namespaces and
 aging for larger requests. At most four loader tasks per query run concurrently.
@@ -57,7 +63,9 @@ metadata state. It carries a checksum and validated native root. The checksum
 is corruption detection, not a freshness proof. The provider-local commit
 protocol grants read admission. Import restores no append certificate, MAC key,
 clock anchor or acquired writer flag. An explicit module capability must exist
-before the adapter can activate, avoiding a partial write on incompatible WASM.
+before accepted metadata mutations. Namespace authority and a local dirty record
+may already have been provisioned; incompatible modules fail closed and require
+a compatible redeployment or a fresh namespace, rather than automatic rollback.
 
 The record states are:
 
@@ -165,3 +173,110 @@ The provider storage contract requires ordered writes and a durability barrier
 under the exclusive owner. Cloudflare documents [storage output gates](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/)
 and the [storage API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/).
 Native capsules do not manufacture those guarantees for another provider.
+
+## Final local measurements
+
+Production JavaScript: `eced42c73e`; native source: `72bc259849`; measurement
+harness: `eeedd57e3a`. The final 36 cases are independently audited: **7,680
+measured reads, 2,304 writes and 144 separate reconstruction reads**, with exact
+bodies and latest/minimum-fence checks. Both execution orders use four tenants,
+64/512 documents per tenant and 50 ms injected binding latency. The incumbent
+and candidates share the same current native modules; this is not the approved
+fixed hosted control. CLI labels are `serving-v3` (prior resident implementation,
+namespace protocol v2), `serving-v4` (cold pipeline, protocol v2), and
+`serving-durable` (cold pipeline plus protocol v3).
+
+The table shows ranges between the two execution orders. Warm/mixed/offered
+cells contain **read / write** p95. Startup-inclusive cold cells contain only
+first-read p95.
+
+| Profile, p95 in ms | Existing resident | Cold pipeline | Pipeline + durable bootstrap |
+| --- | ---: | ---: | ---: |
+| Startup-inclusive cold, 64 docs/tenant | 813–928 | 646–696 | 563–629 |
+| Startup-inclusive cold, 512 docs/tenant | 1315–1473 | 727–1511 | 768–957 |
+| Mixed after cold start, 64 docs/tenant | 656–708 / 804–842 | 657–663 / 821–824 | 181–187 / 415–430 |
+| Mixed after cold start, 512 docs/tenant | 913–932 / 828–860 | 729–772 / 767–828 | 237–238 / 377–394 |
+| Warm burst, 64 docs/tenant, 32 writes | 114–116 / 245–263 | 60 / 212–230 | 110–124 / 246–258 |
+| Warm burst, 512 docs/tenant, 32 writes | 110–176 / 234–244 | 58–61 / 236–246 | 59–108 / 227–228 |
+| Warm burst, 512 docs/tenant, 128 writes | 151–155 / 221–222 | 156–168 / 228–233 | 156–157 / 217–228 |
+| Offered 32 reads/s, 512 reads + 128 writes | 22–31 / 128–131 | 20 / 126 | 19–20 / 125–126 |
+
+The original short 512-document warm burst showed a write regression before
+try-only admission (237–241 ms versus 199–220 ms). It remains in the evidence.
+The final matrix repeats that exact short profile as well as the longer profile;
+the latter also changes working-set coverage and publication frequency and is
+not a substitute for the short-profile check. These small paired experiments do
+not establish statistical non-regression or a production throughput SLO.
+
+`--cold-startup` makes the first timed API requests initialize local workerd:
+there is no delay-setting control RPC after reconstruction. The harness checks
+that each durable owner has a confirmed clean record before restarting it.
+Worker-emulator startup is included, so this is not a forecast of actual
+Cloudflare cold-start latency. The 144 cold samples are cohort members across
+multiple variants and corpora, not 100 independent candidate Worker boots.
+Dirty reconstruction remains ordinary R2 recovery and has no equivalent speed
+claim. A universal **10× cold-read improvement is not established**.
+
+Earlier application-cold measurements at `e8c69e8a4d` excluded some runtime
+startup by configuring delay first: resident-to-durable p95 was 434–457 →
+167–200 ms at 64 documents and 775–779 → 292–295 ms at 512. Those results are
+kept separately. The final large-corpus cold traces prove three native-emitted
+dependencies in one discovery frontier; byte admission still bounds their
+physical overlap.
+
+Audits recompute percentiles from individual samples, verify source/experiment,
+module and bundle hashes, check complete owner-admission attribution, original
+memory/reservation bounds and settled I/O, and reject recovered resource,
+storage or checkpoint failures and matching raw runtime errors. Unrelated local
+native builds remained active; machine-context snapshots are preserved. Gate
+thresholds and the original 64 MiB native role ceiling are unchanged.
+
+Validation: **581 Node tests pass**. The full workerd suite (58 checks) and mail
+integration passed before the final try-only refinement; the complete durable
+workerd fixture then passed again after that refinement. It covers real expiry,
+both collectors, large bodies, concurrent mutations, restart and retirement with
+a held R2 PUT. **49 focused native tests pass; three live-provider tests skip**.
+The native source/modules did not change after that run. Environment-interrupted
+validation attempts and all failed prototypes remain preserved.
+
+Evidence: `dist/qualification/cold-v4-sealed-1793489495127/evidence.json`, **1,772 artifacts / 8,277,652,730 bytes**,
+SHA-256 `96da5cd3cf696d5e1e526e203d7a83f6b0819c988a021d6f98ab0f99fe303b50`. It includes source archives, native modules/test
+executables, reports, failed attempts and audit scripts. Eight corrected
+predecessor closures reverify unchanged; historical gaps and the invalid nested
+self-summary are not requalified. Credentials are excluded.
+
+## Remaining qualification and cold costs
+
+The three-node frontier is already discovered together. Attribute remaining
+cost separately to runtime startup, provider-local state loading/capsule import,
+first native execution/promotion, kernel admission and physical object reads
+before changing the storage layout again. Reusing a validated bootstrap across
+native replay steps is another bounded CPU optimization to profile. Physical
+storage RTT remains a lower bound for missing blocks.
+
+Actual Cloudflare startup and scale qualification, the original paired long
+trials with complete whole-window diagnostics, independent physical-cold samples,
+and the historical live `SQLITE_NOMEM` remain open. No Cloudflare resources or
+credentials were created for these experiments. The new durable owner adapter
+is Cloudflare-specific; other providers need the explicit equivalent ownership,
+ordered-storage and durability contract before trusting native capsules for
+latest reads. S3/GCS performance is not qualified by these local trials.
+
+## Reproduce locally
+
+After building the example, run from `examples/cloudflare-serverless` with a
+new output directory for every run:
+
+```sh
+node qualification/read-state-latency.mjs --twofold \
+  --only=serving-v3,serving-v4,serving-durable \
+  --documents=64 --rounds=8 --delay=50 --setup-delay=0 \
+  --strong-latest --cold-restart --cold-startup \
+  --out=dist/qualification/cold-repeat-UNIQUE
+```
+
+Use a different output directory with `--reverse` for the other order. For the
+large cold corpus use `--documents=512 --cold-ids=1,137,273`. Replace the cold
+flags with `--resident-warmup` for a warm burst; use 8 and 32 rounds to retain
+both short and long write-tail profiles. Offered-load profiles add
+`--offered-reads=512 --offered-rps=32 --offered-write-every=4`.
