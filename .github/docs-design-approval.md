@@ -32,6 +32,14 @@ stale-review dismissal, code-owner review outside the exception, up-to-date
 branches and conversation resolution remain required. There is no automatic
 merge or automatic database deployment.
 
+Changed paths come from a comparison pinned to the immutable base/head commit
+SHAs. File modes and rename origins are checked against the comparison's merge
+base and inspected head. PR-number file listings are never used: a branch moving
+A → B → A cannot substitute a different commit's file list. Automatic approval is
+limited to at most 299 changed files; GitHub caps comparison files at 300, so
+responses at that boundary, incomplete responses and truncated trees require
+human review.
+
 ## Approval credential and activation
 
 Keep Antfly's **Allow GitHub Actions to create and approve pull requests** setting

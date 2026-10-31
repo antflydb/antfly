@@ -1,7 +1,7 @@
 'use strict';
 
 // Trusted metadata-only policy. Never load this file or execute code from a PR.
-const MARKER = '<!-- docs-design-exception:v2 -->';
+const MARKER = '<!-- docs-design-exception:v3 -->';
 const REPOSITORY = 'antflydb/antfly';
 
 function allowedPath(path) {
@@ -21,7 +21,7 @@ function eligible(pr) {
 
 function validateFiles(pr, files, trees) {
   if (!Number.isInteger(pr.changed_files) || pr.changed_files < 1 ||
-      pr.changed_files >= 3000 || files.length !== pr.changed_files) return false;
+      pr.changed_files >= 300 || files.length !== pr.changed_files) return false;
   if (new Set(files.map(f => f.filename)).size !== files.length) return false;
   if (trees.some(tree => tree.truncated || !Array.isArray(tree.tree))) return false;
   const [base, head] = trees.map(tree => new Map(tree.tree.map(item => [item.path, item])));
@@ -47,11 +47,23 @@ async function main({github, context, core, reviewerLogin}) {
     ...context.repo, username: pr.user.login,
   });
   if (!['write', 'maintain', 'admin'].includes(access.permission)) throw new Error('PR author does not have repository write access.');
-  const files = await github.paginate(github.rest.pulls.listFiles, {...args, per_page: 100});
-  const trees = await Promise.all([pr.base.sha, pr.head.sha].map(async tree_sha =>
+  // PR file listings follow a mutable branch. Compare immutable SHAs instead,
+  // so an A -> B -> A force-push cannot substitute B's allowed paths for A's.
+  // GitHub returns at most 300 files on page one; the boundary fails closed.
+  const {data: comparison} = await github.rest.repos.compareCommitsWithBasehead({
+    ...context.repo, basehead: `${pr.base.sha}...${pr.head.sha}`, per_page: 1, page: 1,
+  });
+  if (comparison.base_commit?.sha !== pr.base.sha ||
+      !/^[a-f0-9]{40}$/.test(comparison.merge_base_commit?.sha || '') ||
+      !Array.isArray(comparison.files) || comparison.files.length >= 300 || comparison.truncated) {
+    throw new Error('Incomplete or mismatched immutable commit comparison; human review required.');
+  }
+  const files = comparison.files;
+  // Deleted/renamed paths belong to the merge base, not a newer base-branch tip.
+  const trees = await Promise.all([comparison.merge_base_commit.sha, pr.head.sha].map(async tree_sha =>
     (await github.rest.git.getTree({...context.repo, tree_sha, recursive: '1'})).data));
   if (!validateFiles(pr, files, trees)) return core.notice('Human review required: changed files are outside the exception.');
-  // Fetch again after pagination/tree reads. Never approve a newer, uninspected head.
+  // Fetch again after comparison/tree reads. Never approve a newer, uninspected head.
   const current = await getPR();
   if (!eligible(current) || current.head.sha !== pr.head.sha || current.base.sha !== pr.base.sha ||
       current.changed_files !== pr.changed_files || current.user.login !== pr.user.login) throw new Error('PR changed during inspection; retry on the latest event.');

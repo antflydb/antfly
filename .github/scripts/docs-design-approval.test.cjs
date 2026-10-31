@@ -11,6 +11,8 @@ function fixture() {
   const files = [{filename: 'docs/guide.md', status: 'modified'}];
   const blob = {path: 'docs/guide.md', mode: '100644', type: 'blob'};
   const trees = [{tree: [{...blob}]}, {tree: [{...blob}]}];
+  const comparison = {base_commit: {sha: pr.base.sha}, merge_base_commit: {sha: pr.base.sha}, files};
+  const comparisons = [], treeReads = [];
   const reviews = [], approvals = [], notices = [];
   let permission = 'write', reads = 0;
   const permissionLookups = [];
@@ -20,20 +22,25 @@ function fixture() {
         reads++;
         return {data: structuredClone(pr)};
       },
-      listFiles: async () => files,
+      listFiles: async () => {throw new Error('Mutable PR file enumeration is forbidden');},
       listReviews: async () => reviews,
       createReview: async args => approvals.push(args),
     },
-    repos: {getCollaboratorPermissionLevel: async args => {
+    repos: {compareCommitsWithBasehead: async args => {
+      comparisons.push(args); return {data: structuredClone(comparison)};
+    }, getCollaboratorPermissionLevel: async args => {
       permissionLookups.push(args.username); return {data: {permission}};
     }},
-    git: {getTree: async args => ({data: trees[args.tree_sha === pr.base.sha ? 0 : 1]})},
+    git: {getTree: async args => {
+      treeReads.push(args.tree_sha);
+      return {data: trees[args.tree_sha === comparison.merge_base_commit.sha ? 0 : 1]};
+    }},
   }, paginate: async (method, args) => method(args)};
   const context = {repo: {owner: 'antflydb', repo: 'antfly'}, eventName: 'pull_request_target',
     payload: {pull_request: {number: 7}}};
   const core = {notice: message => notices.push(message)};
   const reviewerLogin = 'antfly-docs-approver[bot]';
-  return {pr, files, trees, reviews, approvals, notices, permissionLookups, github, context,
+  return {pr, files, trees, comparison, comparisons, treeReads, reviews, approvals, notices, permissionLookups, github, context,
     run: () => main({github, context, core, reviewerLogin}),
     setPermission: value => {permission = value;}, getReads: () => reads};
 }
@@ -135,7 +142,7 @@ test('readers, triagers, outsiders and revoked writers cannot receive approval',
 });
 
 test('API errors fail closed', async () => {
-  const f = fixture(); f.github.rest.pulls.listFiles = async () => {throw new Error('API failure');};
+  const f = fixture(); f.github.rest.repos.compareCommitsWithBasehead = async () => {throw new Error('API failure');};
   await assert.rejects(f.run(), /API failure/); assert.equal(f.approvals.length, 0);
 });
 
@@ -207,4 +214,84 @@ test('configuration and runtime-only PRs require human review', async () => {
     for (const tree of f.trees) tree.tree[0].path = filename;
     await f.run(); assert.equal(f.approvals.length, 0, filename);
   }
+});
+
+
+test('immutable SHA comparison rejects the A -> B -> A file-list substitution', async () => {
+  const f = fixture();
+  const unsafeHead = f.pr.head.sha;
+  const base = f.pr.base.sha;
+  const temporaryHead = 'c'.repeat(40);
+  const unsafePath = 'backend/dangerous-change.go';
+  f.comparison.files = [{filename: unsafePath, status: 'modified'}];
+  for (const tree of f.trees) tree.tree.push({path: unsafePath, type: 'blob', mode: '100644'});
+  const original = f.github.rest.repos.compareCommitsWithBasehead;
+  let mutableFileReads = 0;
+  f.github.rest.pulls.listFiles = async () => {
+    mutableFileReads++;
+    f.pr.head.sha = temporaryHead;
+    try {
+      return [{filename: 'docs/guide.md', status: 'modified'}];
+    } finally {
+      f.pr.head.sha = unsafeHead;
+    }
+  };
+  f.github.rest.repos.compareCommitsWithBasehead = async args => {
+    // Both PR snapshots show A, while the live branch briefly points to B.
+    f.pr.head.sha = temporaryHead;
+    try {
+      assert.equal(args.basehead, `${base}...${unsafeHead}`);
+      return await original(args);
+    } finally {
+      f.pr.head.sha = unsafeHead;
+    }
+  };
+  await f.run();
+  assert.equal(f.approvals.length, 0);
+  assert.equal(mutableFileReads, 0);
+});
+
+test('comparison is pinned to both snapshot SHAs and uses page one', async () => {
+  const f = fixture(); await f.run();
+  assert.equal(f.comparisons.length, 1);
+  assert.equal(f.comparisons[0].basehead, `${f.pr.base.sha}...${f.pr.head.sha}`);
+  assert.equal(f.comparisons[0].page, 1);
+  assert.equal(f.approvals.length, 1);
+});
+
+test('missing, mismatched or truncated comparisons never approve', async () => {
+  for (const mutate of [
+    f => {f.comparison.base_commit.sha = 'd'.repeat(40);},
+    f => {delete f.comparison.base_commit;},
+    f => {delete f.comparison.merge_base_commit;},
+    f => {f.comparison.merge_base_commit.sha = 'main';},
+    f => {delete f.comparison.files;},
+    f => {f.comparison.truncated = true;},
+    f => {f.comparison.files = Array.from({length: 300}, () => ({filename: 'docs/guide.md', status: 'modified'}));},
+    f => {f.pr.changed_files = 2;},
+  ]) {
+    const f = fixture(); mutate(f);
+    await f.run().catch(error => assert.match(error.message, /immutable commit comparison/));
+    assert.equal(f.approvals.length, 0);
+  }
+});
+
+test('299-file comparisons can approve, 300-file comparisons require review', async () => {
+  for (const count of [299, 300]) {
+    const f = fixture(); f.pr.changed_files = count;
+    f.comparison.files = Array.from({length: count}, (_, i) => ({filename: `docs/page-${i}.md`, status: 'added'}));
+    f.trees[1].tree = f.comparison.files.map(file => ({path: file.filename, mode: '100644', type: 'blob'}));
+    await f.run().catch(error => assert.match(error.message, /immutable commit comparison/));
+    assert.equal(f.approvals.length, count < 300 ? 1 : 0);
+  }
+});
+
+test('rename source is checked in the immutable merge-base tree', async () => {
+  const f = fixture();
+  f.comparison.merge_base_commit.sha = 'e'.repeat(40);
+  f.files[0].status = 'renamed'; f.files[0].previous_filename = 'docs/old.md';
+  f.trees[0].tree[0].path = 'docs/old.md';
+  await f.run();
+  assert.deepEqual(f.treeReads, [f.comparison.merge_base_commit.sha, f.pr.head.sha]);
+  assert.equal(f.approvals.length, 1);
 });
