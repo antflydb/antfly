@@ -300,7 +300,7 @@ test "serverless native read plan reusable preparation removes repeated immutabl
     artifacts.upload_scope = try @import("../artifacts/store.zig").UploadScope.forPublication(domain, 1, std.testing.io);
     var reads: u64 = 4 * 1024 * 1024;
     var writes: u64 = reads;
-    var pages = PageStore{ .domain = domain, .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var pages = PageStore{ .domain = domain, .attempt = artifacts.upload_scope.?.attempt, .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
     const doc = @import("materializer.zig").Document{ .doc_id = @constCast("one"), .body = @constCast("{\"text\":\"reused\"}"), .last_lsn = 1, .last_timestamp_ns = 1 };
     const ref = try @import("../build/document_facts_builder.zig").publishAlloc(a, &pages, null, &.{doc}, null, .{}, "{}", 1);
     defer @import("../build/builder.zig").freeArtifactRef(a, ref);

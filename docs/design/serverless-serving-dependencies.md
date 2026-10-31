@@ -160,3 +160,7 @@ or named entrypoints; it can require up to 15 minutes of analysis. Thus an app
 fetch placement experiment and Durable Object location hints are separate
 controls. A short single-location probe cannot establish the benefit of Smart
 Placement for the RPC path.
+
+Final counter collection also drains all tenants’ checkpoint and physical writer
+lifetimes. Recovered background failures remain in the fixture history and
+invalidate the case; this wait is outside measured request latencies.
