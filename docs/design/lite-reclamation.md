@@ -348,6 +348,13 @@ result. Reclamation admission never rebases across an external publication.
 These fences allow the certificate catalog root to advance without reopening
 the database runtime and creating another set of leases.
 
+Contended path-lease admission uses randomized short sleeps, capped at four
+milliseconds. Long synchronized polling intervals let a hot writer repeatedly
+reacquire between other processes' attempts. The shorter staggered retries
+improve access to those brief unlock windows while retaining the original
+admission deadline and cancellation behavior. Qualification records CPU cost
+as well as progress for every writer.
+
 Opening an immutable artifact publishes an inode-local lease alias. These
 metadata-only commits have their own allocation policy. Mixed groups retain
 ordinary authored-write validation and batching. An unbounded owner with an

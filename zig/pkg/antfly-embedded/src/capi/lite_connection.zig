@@ -1762,8 +1762,16 @@ pub const Connection = struct {
                 const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
                 if (remaining <= 0) return error.FileBusy;
                 if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| hook.notify(hook.ptr);
-                try io.sleep(.fromNanoseconds(@min(backoff, remaining)), .awake);
-                backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
+                // A hot peer can reacquire between long polling intervals.
+                // Short, staggered retries give waiting processes a chance at
+                // brief unlock windows without synchronizing their wakeups.
+                var entropy: [4]u8 = undefined;
+                io.random(&entropy);
+                const floor = @divTrunc(backoff, 2);
+                const spread: u32 = @intCast(backoff - floor + 1);
+                const delay = floor + @as(i96, std.mem.readInt(u32, &entropy, .little) % spread);
+                try io.sleep(.fromNanoseconds(@min(delay, remaining)), .awake);
+                backoff = @min(backoff * 2, 4 * std.time.ns_per_ms);
             }
         }
     }

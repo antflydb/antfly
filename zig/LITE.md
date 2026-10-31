@@ -1183,6 +1183,9 @@ changed state retains the full-proof path. Allocator-only cleanup also retains
 that path so sealing does not perpetuate retirement work. Clean-close certificates
 remain compatible with older runtimes. This adds metadata hashing and catalog writes,
 without another checkpoint publication or durability barrier per transaction.
+Contended path leases use short randomized retries, capped at four milliseconds,
+to give other processes more chances between repeated peer publications. The
+configured busy timeout still bounds contention waiting.
 
 Small records in multi-key transactions share immutable record pages. A tagged
 reference identifies a physical page and a validated record offset; large
