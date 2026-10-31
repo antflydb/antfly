@@ -1356,10 +1356,9 @@ test "external lake private metadata streams one bounded reduction under a live 
             try std.testing.expectEqualSlices(u8, &value, record.value);
         }
         try std.testing.expectEqual(@as(usize, 4096), count);
-        // The single reducer avoids intermediate page trees and retains
-        // bounded merge inputs in reusable extents.
-        try std.testing.expect(manager.written_bytes > 0);
-        try std.testing.expect(manager.written_bytes < manager.max_bytes);
+        // Cumulative merge writes exceed the live quota. Consumed inputs
+        // are recycled in shared extents instead of accumulating on disk.
+        try std.testing.expect(manager.written_bytes > manager.max_bytes);
         try std.testing.expect(manager.peak_bytes <= manager.max_bytes);
         try std.testing.expect(manager.peak_files < 8);
     }
