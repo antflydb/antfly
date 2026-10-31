@@ -27,10 +27,11 @@ export class NativeReadPlans {
 
 // Preparation owns no authority-bearing transport and returns its WASM slot
 // before waiting for fresh admission.
-export function withNativeReadPreparation(transport,{onMetrics=()=>{}}={}){
+export function withNativeReadPreparation(transport,{onMetrics=()=>{},manifestKey}={}){
+ if(manifestKey!=null&&!/^antfly\/manifests\/[^/]+\/manifests\/[1-9][0-9]{0,19}\.bin$/.test(manifestKey))throw Error('InvalidImmutableManifestKey');
  return async(request,body)=>{
   if(request.op==='bucket_exists'&&request.bucket==='database')return transport(request,body);
-  if(!['get','head'].includes(request.op)||request.bucket!=='database'||!/^antfly\/artifacts\/(sha256\/[a-f0-9]{2}\/[a-f0-9]{62}|graph\/[a-f0-9]{64}\/[a-f0-9]{32}\/[a-f0-9]{64})$/.test(request.key??''))throw new ObjectStoreError(3,'immutable read preparation only');
+  if(!['get','head'].includes(request.op)||request.bucket!=='database'||!(manifestKey!=null&&request.key===manifestKey||/^antfly\/artifacts\/(sha256\/[a-f0-9]{2}\/[a-f0-9]{62}|graph\/[a-f0-9]{64}\/[a-f0-9]{32}\/[a-f0-9]{64})$/.test(request.key??'')))throw new ObjectStoreError(3,'immutable read preparation only');
   onMetrics({native_read_plan_prepared_reads:1});return transport(request,body);
  };
 }

@@ -30,8 +30,11 @@ pub const Plan = struct {
 
     pub fn fromSession(session: *Live) ?Plan {
         const published = session.published orelse return null;
-        for (published.manifest.artifacts) |ref| if (ref.kind == .document_facts) return .{
-            .domain = PageStore.namespaceDomain(published.manifest.namespace),
+        return fromManifest(published.manifest);
+    }
+    pub fn fromManifest(manifest: @import("../manifest/mod.zig").Manifest) ?Plan {
+        for (manifest.artifacts) |ref| if (ref.kind == .document_facts) return .{
+            .domain = PageStore.namespaceDomain(manifest.namespace),
             .source = ref,
         };
         return null;

@@ -273,3 +273,17 @@ for(const continuations of[false,true])test(`deferred WAL fold finalization pres
  const final=JSON.parse(text.decode((await f.store().transaction(tx=>tx.get(f.keys.wal))).body));assert.equal(final.latest_lsn,2);assert.equal(final.deferred_tail,undefined);
  assert.equal((await f.host.request(f.req("lookup",{doc_id:"later"}))).body,'{"text":"durable later"}');
 });
+
+test("publication read headers prepare before HEAD without acquiring authority or retaining a live view",async()=>{
+ const f=await fixture();await f.mutate("headers");const initial=await f.begin(),{prepared}=await f.prepare(initial),batch=prepared.batch();
+ const head=batch.writes.find(([key])=>key===f.keys.head),version=text.decode(head[1].body).trim(),calls=[];
+ const{withNativeReadPreparation}=await import('../native-read-plan.mjs');const raw=createR2Transport({database:f.bucket});
+ const transport=withNativeReadPreparation(async(req,body)=>{calls.push(req);return raw(req,body);},{manifestKey:`antfly/manifests/protocol/manifests/${version}.bin`});
+ const host=await instantiateHost(module,transport,{clock:f.clock});assert.equal(host.immutablePreparationABI,1);
+ const result=await host.request(f.req('lookup',{doc_id:'',native_read_plan_mode:true,native_immutable_manifest_version:version}));
+ assert.equal(result.__read_headers_prepared,true);assert.ok(result.__read_spent_bytes>0);assert.equal(result.visibility,undefined);
+ assert.ok(calls.some(r=>r.key===`antfly/manifests/protocol/manifests/${version}.bin`));assert.ok(calls.every(r=>r.op==='get'||r.op==='bucket_exists'));
+ assert.equal(text.decode((await f.store().transaction(tx=>tx.get(f.keys.head))).body).trim(),'0');
+ await assert.rejects(host.request(f.req('lookup',{doc_id:'headers',native_read_plan_mode:true,native_immutable_manifest_version:version})),/InvalidNativeReadPlan/);
+ await f.finish(batch);assert.equal((await f.host.request(f.req('lookup',{doc_id:'headers'}))).body,JSON.stringify({text:'durable headers'}));
+});

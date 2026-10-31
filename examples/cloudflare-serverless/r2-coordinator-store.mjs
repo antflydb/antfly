@@ -388,7 +388,9 @@ export class R2CoordinatorStore {
       // checks, then linearized by its immutable conditional journal slot.
       // Stale slots fail closed and force ordinary recovery before a retry.
       const warmCommit=this.pending[0]?.kind==="commit_wal"&&this.pending[0].nativePlan&&this.acquired&&!this.recovering&&this.state?.next<64&&(this.rootBackend!=="conditional"||this.rootCursor?.revision!=null);
-      const warmOwnerRead=this.pending[0]?.kind==="owner_read"&&this.ownerServing&&this.acquired&&!this.recovering&&this.state&&!this.needsWriteRefresh();
+      // In descriptor-v2 mode the live provider instance owns the confirmed
+      // state. Expired append certificates are renewed by writers, not readers.
+      const warmOwnerRead=this.pending[0]?.kind==="owner_read"&&this.ownerServing&&this.acquired&&!this.recovering&&this.state;
       const recovered = warmCommit||warmOwnerRead?{state:this.state,base:this.base,page_prefix:this.pagePrefix,has_more:false}:await this.trace.span("recovery",()=>this.native({action: "begin"}));
       beginMs=performance.now()-started;
       if(this.acquired&&hex(recovered.state.owner)!==hex(this.owner))throw new Error("ImmutableLogFenced");

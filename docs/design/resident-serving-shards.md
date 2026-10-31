@@ -53,7 +53,10 @@ serving latest reads from a retained root without a fresh end probe.
 It requires the bounded-journal backend, inline metadata roots and an R2
 coordinator. Creation uses the existing create-only publication. Existing format-1
 namespaces reject activation; old adapters reject format 2. Every compatible
-write adapter must validate this descriptor before mutating the namespace.
+write adapter must validate this descriptor before mutating the namespace. The
+resident HTTP adapter rejects native coordinator/publication/collector protocol
+operations; application requests cannot bypass the owner through those internal
+entrypoints, including when a runtime binding is misconfigured.
 
 Cloudflare's adapter derives the owner ID from the COMMITS namespace and logical
 partition name, then checks the actual actor ID at owner admission. A different
@@ -93,9 +96,14 @@ the flag is not an online format downgrade. Automatic owner rebind is forbidden.
 Owner reads enter the same bounded queue as metadata/WAL commits. They have their
 original request deadline, execute as individual read-only callbacks and capture
 only committed state. The warm path skips journal rediscovery only when the
-owner contract is active, state is acquired and not recovering, and the existing
-25-second refresh guard is satisfied. Cold/recovering/expired paths run normal
-native recovery. At most four pre-callback recovery continuations share the
+owner contract is active, state is acquired and not recovering or uncertain.
+The currently live provider instance plus its confirmed native state supplies
+read authority. A native append certificate is not a serving lease: its expiry
+must not force repeated storage discovery on reads, especially when a queued
+Cloudflare request has a frozen clock older than a recent proof anchor. Readers
+neither renew that certificate nor use it to authorize writes. The existing
+25-second write refresh guard and native append proof checks remain unchanged.
+Cold/recovering/uncertain paths run normal native recovery. At most four pre-callback recovery continuations share the
 original request deadline and the existing 254-operation / 8 MiB read-admission
 allowance. Draining I/O, resource errors and callback failures are not retried.
 Clocks and certificates are never extended in JavaScript.
@@ -128,6 +136,33 @@ those linear-memory reservations. Point capacity promotion retains one aggregate
 I/O budget and the original read view. Publication/building remains in the builder
 role. Resident reads do not add an unbounded execution pool. Contention with commits is measured rather than hidden
 by increasing memory or queue ceilings.
+
+## Publication read readiness
+
+Before publishing HEAD, the resident owner can opportunistically prepare the
+new immutable manifest and document-facts routing headers in a free point lane.
+A dedicated native ABI constructs no live session, visibility result or pin.
+The transport permits only that exact immutable manifest and immutable artifact
+names; mutable metadata, writes and admission barriers are forbidden. Native
+validation checks the manifest version, namespace domain, checksums and routing
+pages. A namespace without document facts reports that nothing was prepared.
+
+Preparation runs outside the metadata sequencing queue, with no authority and
+no reusable request context. It leaves a lane for interactive readers and skips
+when the pool is busy or the original small read capacity is insufficient. Host
+responses are bounded before copying into WASM. Unexpected transport, integrity,
+resource and memory errors propagate; they are not treated as cache misses.
+The prepared bytes use the existing bounded immutable cache, preserving protected
+foreground blocks. This warms headers, not every body or every routing leaf.
+The guarded publication still validates the native lease and applies the normal
+atomic HEAD/offset/receipt commit. Preparation I/O is charged against the same
+parent finalization budget and deadline, rather than creating another allowance.
+
+Keyed compaction checks its receipt before preparation: an already completed
+receipt can survive collection of its old manifest. The final transaction checks
+the receipt again. The preliminary read conservatively reserves the entire
+254-operation / 8 MiB admission allowance inside the old parent budget, so replay
+safety does not increase resource ceilings.
 
 ## Partitioning and replicas
 

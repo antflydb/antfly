@@ -389,3 +389,10 @@ test('resident reconstruction seals out a terminated instance whose journal PUT 
   await retry(next,tx=>tx.put('value',3));assert.equal(await next.ownerRead(tx=>tx.get('value')),3);
  }finally{release();await Promise.allSettled([late]);}
 });
+test('live resident read authority does not renew an expired append certificate',async()=>{
+ const bucket=new Bucket(),actor='e'.repeat(64),env={DATABASE:bucket,ANTFLY_INCARNATION:'resident-proof-expiry',COORDINATOR_BACKEND:'r2',METADATA_ROOT_BACKEND:'bounded-journal',INLINE_METADATA_ROOTS:'true',RESIDENT_SERVING:'true',COMMITS:{idFromName:()=>({toString:()=>actor})}};
+ const authority=await openAuthority(env,'r2-bounded'),raw=createR2Transport({database:bucket});let now=Date.now(),calls=0;
+ const store=storeFor(bucket,{exclusiveOwnerId:actor,clock:()=>now,transport:async(...args)=>{calls++;return raw(...args);}});store.configureAuthority(authority.descriptor);await retry(store,tx=>tx.put('value',7));const proof=structuredClone(store.journalProof);now+=31000;store.rows.clear();store.rowBytes=0;calls=0;
+ assert.equal(store.needsWriteRefresh(),true);assert.equal(await store.ownerRead(tx=>tx.get('value')),7);assert.equal(calls,0);assert.deepEqual(store.journalProof,proof);assert.equal(store.needsWriteRefresh(),true);
+ await retry(store,tx=>tx.put('value',8));assert.ok(calls>0);assert.ok(store.journalProof.anchor.wall_ms>proof.anchor.wall_ms);assert.equal(await store.ownerRead(tx=>tx.get('value')),8);
+});

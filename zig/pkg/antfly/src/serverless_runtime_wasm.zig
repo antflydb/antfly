@@ -46,6 +46,10 @@ fn prepareServingScope(bucket: []const u8, prefix: []const u8) void {
     }
 }
 
+export fn antfly_host_immutable_preparation_abi() u32 {
+    return 1;
+}
+
 export fn antfly_host_resident_read_abi() u32 {
     return 1;
 }
@@ -202,6 +206,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         native_read_prepare: ?[16]u8 = null,
         native_read_reuse: bool = false,
         resident_cut: ?[32]u8 = null,
+        native_immutable_manifest_version: ?[]const u8 = null,
         native_read_yield: bool = false,
         native_read_resume: ?[16]u8 = null,
         native_read_spent_bytes: u64 = 0,
@@ -266,6 +271,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     const parsed = try std.json.parseFromSlice(Request, a, raw, .{});
     defer parsed.deinit();
     const req = parsed.value;
+    if (req.native_immutable_manifest_version != null and (req.op != .lookup or !req.native_read_plan_mode or req.doc_id.len != 0 or req.resident_cut != null or req.native_read_plan != null or req.native_read_prepare != null or req.native_read_resume != null or req.native_read_spent_bytes != 0)) return error.InvalidNativeReadPlan;
     if (req.resident_cut != null and (req.op != .lookup or req.cursor != null or req.native_read_plan_mode)) return error.InvalidResidentRead;
     if (req.limit > 100 or (req.limit == 0 and (req.op == .list or req.op == .search))) return error.QueryCandidateBudgetExceeded;
     const filter = @import("serverless/query/live_filter.zig").Filter{ .alloc = a, .clauses = req.filters };
@@ -310,6 +316,24 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     var object_manifests = try @import("serverless/manifest/object_store.zig").ObjectStore.initWithClient(a, data_client, req.bucket, manifest_prefix);
     var manifests = object_manifests.manifestStore();
     defer manifests.deinit();
+    // Authority-free publication preparation reads only immutable bytes. It
+    // cannot create a live view, pin, visibility result or reusable ticket.
+    if (req.native_immutable_manifest_version) |text| {
+        if (text.len == 0 or text.len > 20 or text[0] == '0') return error.InvalidNativeReadPlan;
+        for (text) |c| if (c < '0' or c > '9') return error.InvalidNativeReadPlan;
+        const version = std.fmt.parseInt(u64, text, 10) catch return error.InvalidNativeReadPlan;
+        var manifest = try manifests.getAllocWithCancellation(req.namespace, version, cancellation);
+        defer manifest.deinit(a);
+        if (manifest.version != version) return error.InvalidNativeReadPlan;
+        const plan = @import("serverless/query/read_plan.zig").Plan.fromManifest(manifest) orelse return std.json.Stringify.valueAlloc(a, .{ .__read_headers_prepared = false, .__read_spent_bytes = 0 }, .{});
+        var remaining: u64 = 512 * 1024;
+        var no_writes: u64 = 0;
+        var pages = @import("serverless/graph_segment/page_store.zig").PageStore{ .domain = @import("serverless/graph_segment/page_store.zig").PageStore.namespaceDomain(req.namespace), .artifacts = &artifacts, .cancellation = cancellation, .remaining_read_bytes = &remaining, .remaining_write_bytes = &no_writes };
+        var prepared = try plan.prepare(a, req.namespace, "", &pages);
+        defer prepared.deinit(a);
+        try cancellation.check();
+        return std.json.Stringify.valueAlloc(a, .{ .__read_headers_prepared = true, .__read_spent_bytes = 512 * 1024 - remaining }, .{});
+    }
     const progress_prefix = try std.fmt.allocPrint(a, "{s}/progress", .{req.prefix});
     defer a.free(progress_prefix);
     var object_progress = try @import("serverless/catalog/object_progress_store.zig").ObjectProgressStore.initWithClient(a, data_client, req.bucket, progress_prefix);

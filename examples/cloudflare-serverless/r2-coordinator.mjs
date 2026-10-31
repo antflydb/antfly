@@ -15,6 +15,8 @@
 
 import {bindReadLease,readLeaseRemaining} from "../../zig/lib/objectstore/wasm/read-view-lease.mjs";
 import {withReadView} from "./read-view.mjs";
+import {ObjectStoreError} from "../../zig/lib/objectstore/wasm/r2.mjs";
+import {withNativeReadPreparation} from "./native-read-plan.mjs";
 import {withPointReadLane} from "./point-read-lane.mjs";
 import {reserveIoBranch} from "./io-branch.mjs";
 import {immutableReadWave} from "../../zig/lib/objectstore/wasm/immutable-read-wave.mjs";
@@ -164,6 +166,16 @@ export class R2CommitCoordinator extends DurableObject {
   }
   async finalizeCompaction(id,batch,result,readHints){
     const identity=await this.compactionIdentity(id),keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
+    let prepared={};
+    if(this.env.RESIDENT_SERVING==="true"){
+      await this.ensureAuthority();
+      const deadlineMs=Date.now()+30000;
+      const prior=await this.store.ownerRead(tx=>readCompactionReceipt(tx,identity),{deadlineMs});
+      // Reserve the complete read-admission allowance in the original parent
+      // budget. A completed receipt may outlive its collected manifest.
+      const limits={deadlineMs,ioBudget:{operations:254,bytes:8*1024*1024}};
+      prepared=prior?.state==="complete"?limits:await this.prepareResidentPublication(batch,limits);
+    }
     return this.transaction(tx=>finishCompactionReceipt(tx,identity,batch,result,async receipt=>{
       await this.nativePublication(tx,"publication_validate",batch?.lease);
       const entries=await publicationSnapshot(tx,keys);
@@ -174,10 +186,38 @@ export class R2CommitCoordinator extends DurableObject {
       if(receipt.published!==Boolean(written))throw Error("InvalidCompactionResult");
       if(written)writeReadHints(tx,this.env.ANTFLY_INCARNATION,version,readHints);
       if(!(await this.nativePublication(tx,"publication_release",batch.lease)).released)throw Error("WorkLeaseLost");
-    }),{priority:"maintenance"});
+    }),{priority:"maintenance",...prepared});
+  }
+  async prepareResidentPublication(batch,limits={}){
+    if(this.env.RESIDENT_SERVING!=="true")return{};
+    await this.ensureAuthority();
+    const head=batch?.writes?.find(([key])=>key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`);
+    if(!head)return limits;
+    const version=new TextDecoder().decode(head[1].body).trim();
+    if(!/^[1-9][0-9]{0,19}$/.test(version)||BigInt(version)>18446744073709551615n)throw Error("InvalidPublicationVersion");
+    const ioBudget=limits.ioBudget??{operations:0,bytes:0},deadlineMs=limits.deadlineMs??Date.now()+30000,physical={};let metrics,capacity=false,supported=false;
+    // Opportunistic immutable preparation leaves a lane for actual reads and
+    // runs outside the metadata sequencing queue. No current view is invented.
+    if(residentKernel.reservedBytes||residentKernel.pending.length)return{ioBudget,deadlineMs};
+    const cache=this.store.dataCache.wrap(instrumentTransport(createR2Transport({database:this.env.DATABASE}),physical),this.env.ANTFLY_INCARNATION,{preserveProtected:true});
+    const immutable=withNativeReadPreparation(cache,{manifestKey:`antfly/manifests/${this.env.ANTFLY_INCARNATION}/manifests/${version}.bin`});
+    const transport=async(request,body)=>{
+      try{return await immutable({...request,...(['get','head'].includes(request.op)?{max_response_bytes:Math.min(128*1024,request.max_response_bytes??128*1024)}:{})},body);}
+      catch(error){if(error instanceof ObjectStoreError&&error.status===4&&/^(?:object|cached) response exceeds budget$/.test(error.message))capacity=true;throw error;}
+    };
+    let result;
+    try{
+      result=await withPointReadLane(residentKernel,host=>{
+        if(host.immutablePreparationABI!==1)return;
+        supported=true;
+        return host.request({op:"lookup",doc_id:"",native_read_plan_mode:true,native_immutable_manifest_version:version,bucket:"database",prefix:"antfly",namespace:this.env.ANTFLY_INCARNATION},{transport,background:p=>this.ctx.waitUntil(p),deadlineMs,maxOperations:254,maxTransferBytes:1024*1024,onMetrics:sample=>{metrics=sample;ioBudget.operations+=sample.operations;ioBudget.bytes+=sample.transferred_bytes;},onIoSettled:sample=>{if(this.env.LOG_METRICS==="true")console.log(JSON.stringify(sample));}});
+      },{tryOnly:true,preparationOnly:true,fairKey:this.env.ANTFLY_INCARNATION,priority:"maintenance",deadlineMs,kernelVariant:"compact",memoryReservationBytes:16*1024*1024});
+    }catch(error){if(!(capacity&&error?.message==="ObjectIoBudgetExceeded"))throw error;}
+    finally{if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.resident_publication_prewarm",supported,prepared:result?.__read_headers_prepared===true,capacity_skip:capacity,...metrics,physical,...kernelMetrics()}));}
+    return{ioBudget,deadlineMs};
   }
   async finalizePublication(batch,observation,readHints){
-    const keys=await publicationKeys(this.env.ANTFLY_INCARNATION,batch?.format===3);
+    const keys=await publicationKeys(this.env.ANTFLY_INCARNATION,batch?.format===3),prepared=await this.prepareResidentPublication(batch);
     const result=await this.transaction(async tx=>{
       await this.nativePublication(tx,"publication_validate",batch?.lease);
       const entries=await publicationSnapshot(tx,keys);
@@ -195,7 +235,7 @@ export class R2CommitCoordinator extends DurableObject {
         if(next!==current)tx.put("__antfly_publication_budget",next);
       }
       return{committed:true};
-    },{priority:"maintenance"});
+    },{priority:"maintenance",...prepared});
     const head=batch.writes.find(([key])=>key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`);
     if(head)this.store.setReadHints(this.env.ANTFLY_INCARNATION,new TextDecoder().decode(head[1].body).trim(),readHints);
     return result;

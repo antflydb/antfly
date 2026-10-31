@@ -34,6 +34,7 @@ export {R2ReadRuntime,R2BuildRuntime} from "./runtime-actors.mjs";
 export { R2CommitCoordinator } from "./r2-coordinator.mjs";
 export { CommitCoordinator } from "./coordinator.mjs";
 const localRuntime=createRuntime(),appReadRuntime=createRuntime({kernel:readerKernel,sharedCache,resources:()=>({...kernelMetrics(),...directReadViews.metrics()}),pointReadLanes:true,readViews:directReadViews});
+const residentPublicOperations=new Set([...readOperations,"mutate","publish","compact","compact_status","enrich","reindex","collect","collect_metadata","migrate_coordinator","prune_checkpoints"]);
 let admitted=0,readerCursor=0;const ingressBudget=new IngressBudget();
 async function run(env,input,signal,collection,trace,direct=false,backgroundTasks){
  let timer;
@@ -136,6 +137,7 @@ export default {
         if (!env.AI_MODEL?.startsWith("@cf/") || !env.AI_GATEWAY) return new Response("AI model and gateway are not configured", { status: 503 });
         return Response.json(await env.AI.run(env.AI_MODEL, args, { gateway: { id: env.AI_GATEWAY } }));
       }
+      if(env.RESIDENT_SERVING==="true"&&!residentPublicOperations.has(args?.op))throw Error("RuntimeCapabilityUnsupported");
       if (args.op === "prune_checkpoints") return Response.json(await pruneEmbeddingCheckpoints(env));
       if(args.op==="compact_status"){
         if(env.COORDINATOR_BACKEND!=="r2")throw Error("CompactionReceiptsRequireR2");

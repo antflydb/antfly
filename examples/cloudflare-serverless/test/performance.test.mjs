@@ -986,3 +986,13 @@ test('app observers preserve resident authority policy and isolate provider owne
  const original=views.get(env);assert.equal(views.get(env),original);assert.equal(created[0].RESIDENT_SERVING,'true');assert.equal(created[0].COORDINATOR_BACKEND,'r2');assert.equal(created[0].COMMITS,commits);assert.equal(Object.hasOwn(created[0],'API_TOKEN'),false);
  assert.equal(views.get({...env,COMMITS:{idFromName:commits.idFromName}}),original);assert.notEqual(views.get({...env,COMMITS:{idFromName:()=>({toString:()=>'b'.repeat(64)})}}),original);assert.notEqual(views.get({...env,RESIDENT_SERVING:'false'}),original);
 });
+
+test('publication preparation permits exactly its immutable manifest and rejects all other metadata',async()=>{
+ const{withNativeReadPreparation}=await import('../native-read-plan.mjs');const calls=[],key='antfly/manifests/docs/manifests/42.bin';
+ const transport=withNativeReadPreparation(async req=>{calls.push(req);return{};},{manifestKey:key});
+ await transport({op:'get',bucket:'database',key});
+ for(const denied of['antfly/manifests/docs/manifests/41.bin','antfly/manifests/other/manifests/42.bin','antfly/progress/docs/HEAD'])await assert.rejects(transport({op:'get',bucket:'database',key:denied}),/immutable read preparation only/);
+ await assert.rejects(transport({op:'put',bucket:'database',key}),/immutable read preparation only/);
+ assert.throws(()=>withNativeReadPreparation(()=>{},{manifestKey:'antfly/progress/docs/HEAD'}),/InvalidImmutableManifestKey/);
+ assert.equal(calls.length,1);
+});
