@@ -2676,3 +2676,73 @@ raw-log hashes. Apache boundary (2,345 source files), license, formatting and
 whitespace checks pass. `make gc` skipped cleanup after detecting native build
 activity. Real-provider retention qualification remains deferred; the external
 142,577-row HN fixture remains unavailable on this machine.
+
+## Publication quota residency
+
+The [retained observation](publication-residency-v1-observation.json) qualifies
+runtime `a6985c62686d5510b2b02d770c1bf2d2144b5e90`, with main
+`5a7e547b7adb51e5c7c666680a1695b7755b0adf` merged cleanly. That main update
+changes only the documentation approval workflow; the qualified runtime tree
+remains unchanged. Runtime ABI **80** fences the shared allocator contract;
+reader protocol **97** and persisted formats remain unchanged.
+
+Native publication previously inserted an opaque `WorkingSetAllocator`, which
+kept spill readers on the four-root/64-KiB fallback even after public SQL host
+admission was fixed. The adapter now delegates to a shared platform refundable
+quota owner. Required growth can reclaim idle spill roots through stable
+round-robin hooks, without replacing allocation paths or changing the build cap.
+Reclamation skips busy owners, acquires known deallocation locks without waiting,
+and reuses held locks only for refundable teardown. Pins survive eviction.
+An arena hidden below the quota remains conservative. Existing backing-OOM and
+configured-limit error classification remain distinct. Coordinator teardown
+checks that every quota allocation and residency hook has retired.
+
+The review's controlled native probe changes from **adaptive=false, zero hooks**
+to **adaptive=true, one hook** with the real publication wrapper. Permanent
+regressions exercise the direct wrapper, nested statement/host/quota chains,
+independent managers, shared locks, pinned borrowers, busy caches, arena backings,
+and genuine backing failure. A page-allocator-only single-threaded native probe
+also passes; the full WASM bundle was not built.
+
+[publication_residency.py](publication_residency.py) measures the actual
+coordinator through the public HTTP API and real Parquet/FsStore. Each invocation
+uses fresh server storage, with 8,192 rows, an interleaved ordering key and eight
+128-byte string columns. Timing starts at table creation and ends at the first
+queryable index revision, polled every 25 ms. Server startup, fixture encoding
+and complete SQL result validation are excluded. After publication, bounded
+ordered SQL pages verify every row and all ten columns. OS file caches remain
+warm; this is not an empty-cache or cloud result. Run alternating before/after
+invocations without overlapping task-owned builds, E2E or cleanup.
+
+Six alternating pairs of those real coordinator builds have median wall time
+**6,150.843 → 5,400.294 ms**, a **12.2% latency reduction (1.139×)**,
+with no slower candidate pair. Every run verifies all 8,192 rows and ten columns
+in tightly bounded 64-row SQL intervals, and all result, fixture, configuration
+and runner digests match. The readiness guard requires the complete target
+revision. An initial broader SQL validation request exceeded its work limit;
+that incomplete run is excluded, and all timing pairs were restarted with the
+bounded validator. Both frozen CLIs are Debug builds. Task-owned builds, E2E and
+cleanup finished before timing; other host activity was uncontrolled.
+
+The same final Debug native test executable compares fixed and adaptive spill
+policies through the publication quota/lock chain, with **32 MiB post-finish
+headroom** and the same **33,594,433-byte** limit. Six alternating Snappy pairs
+have median drain thread CPU **954.724 → 112.284 ms (8.50×)**, with no slower
+candidate. Spill drain reads fall **70,618,654 → 5,166,118 bytes**, payload reads
+**8,192 → 512**, and writes remain **12,043,408 bytes**. Tracked live peak rises
+**403,053 → 13,829,101 bytes** within the identical cap. Every sorted key and
+all eight ordinal-tagged 128-byte values are checked. Setup/add and Sort.finish
+are excluded; first page advancement and full drain are included. The native
+fixture uses a 4-KiB sort workspace; the complete coordinator runner uses
+production defaults. The drain result is separate from complete publication
+latency and does not establish RSS, cloud, HTTP-query or archive-scale gains.
+
+Final qualification passes **351 shared and 92 API checks**, with no failures,
+skips or leaks, and **50 real Parquet/Iceberg E2E cases in 393.86 seconds**.
+The frozen ABI 80 CLI SHA-256 is
+`c3006a4bada5558bc3df766d397eccc8bb642577db3208f8a432586027d60bac`.
+The observation records exact commands, native executable identity, source and
+raw-log hashes. Apache boundary (2,345 source files), license, Zig formatting,
+Python formatting/lint and whitespace checks pass. `make gc` skipped cleanup
+after detecting native build activity. Real-provider retention qualification
+remains deferred; the external 142,577-row HN fixture remains unavailable.
