@@ -1002,6 +1002,7 @@ fn artifactRepairRunRequestForShard(
         .repair_attempt_id = req.repair_attempt_id,
         .repair_job_created_at_ms = req.repair_job_created_at_ms,
         .repair_cancel_base_uri = req.repair_cancel_base_uri,
+        .operator_initiated = req.operator_initiated,
     };
 }
 

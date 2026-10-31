@@ -73,6 +73,11 @@ pub const JobPhase = enum {
     queued,
     running,
     succeeded,
+    /// The job ran every pass, but some documents still fail. Their errors
+    /// are in the repair issues; running repair again retries them.
+    completed_with_failures,
+    /// The job itself broke: an invalid request, a stale control fence, or
+    /// an unsupported control outcome.
     failed,
     cancelled,
 };
@@ -113,7 +118,46 @@ pub const JobState = struct {
     created_at_millis: u64,
     last_updated_at_millis: u64,
     expires_at_millis: u64,
+    /// Rendered only, never persisted: documents that still fail, grouped by
+    /// error code from the current repair issues. Present on finished
+    /// non-control jobs.
+    remaining_failures: ?[]const RemainingFailure = null,
+    /// True when more issues exist than the summary scanned.
+    remaining_failures_truncated: ?bool = null,
 };
+
+/// One group of documents that still fail, with the operator's next step.
+pub const RemainingFailure = struct {
+    error_code: []const u8,
+    count: u64,
+    /// Highest repair attempt count among the group's documents.
+    attempts: u64,
+    transient: bool,
+    hint: []const u8,
+};
+
+pub const RemainingFailures = struct {
+    groups: []const RemainingFailure = &.{},
+    truncated: bool = false,
+};
+
+/// Groups listed repair issues for a response. Allocates in `arena`, which
+/// must outlive the rendered response; strings borrow from `issues`.
+pub fn remainingFailuresAlloc(arena: std.mem.Allocator, issues: []const db_mod.types.ArtifactRepairIssue, truncated: bool) !RemainingFailures {
+    const groups = try db_mod.types.repair_failure.groupIssuesAlloc(arena, issues);
+    const out = try arena.alloc(RemainingFailure, groups.len);
+    for (groups, out) |group, *slot| slot.* = .{
+        .error_code = group.error_code,
+        .count = group.count,
+        .attempts = group.max_attempts,
+        .transient = group.transient,
+        .hint = if (group.transient)
+            try std.fmt.allocPrint(arena, "retried within {d} repair attempt(s); run repair again", .{@max(group.max_attempts, 1)})
+        else
+            group.hint,
+    };
+    return .{ .groups = out, .truncated = truncated };
+}
 
 pub const BeginAdvanceResult = struct {
     encoded: []u8,
@@ -499,7 +543,9 @@ pub const Store = struct {
         else if (pass.has_more or retryable_in_progress)
             .queued
         else if (failed_debt)
-            .failed
+            // Remaining document failures are a repair outcome, not a broken
+            // job. A control job that leaves failed debt did break.
+            if (previous.control == null) .completed_with_failures else .failed
         else
             .succeeded;
         const last_error: ?[]const u8 = if (phase == .cancelled) "cancel_requested" else if (phase == .failed) "repair_debt_remaining" else null;
@@ -1135,6 +1181,7 @@ pub fn phaseString(phase: JobPhase) []const u8 {
         .queued => "queued",
         .running => "running",
         .succeeded => "succeeded",
+        .completed_with_failures => "completed_with_failures",
         .failed => "failed",
         .cancelled => "cancelled",
     };
@@ -1178,6 +1225,7 @@ fn validateJobState(state: JobState) !void {
 
 pub fn isTerminalPhase(phase: []const u8) bool {
     return std.mem.eql(u8, phase, phaseString(.succeeded)) or
+        std.mem.eql(u8, phase, phaseString(.completed_with_failures)) or
         std.mem.eql(u8, phase, phaseString(.failed)) or
         std.mem.eql(u8, phase, phaseString(.cancelled));
 }
@@ -1211,6 +1259,7 @@ pub fn validateStartRequest(req: StartRequest) !void {
 pub fn repairStatusForPhase(phase: JobPhase, has_more: bool, debt_remaining: bool) []const u8 {
     return switch (phase) {
         .succeeded => "complete",
+        .completed_with_failures => "debt_remaining",
         .failed => if (debt_remaining) "debt_remaining" else "stopped",
         .cancelled => "stopped",
         .queued, .running => if (has_more or debt_remaining) "in_progress" else "in_progress",
@@ -1365,6 +1414,119 @@ test "table repair job records bounded pass and continuation" {
     try std.testing.expectEqualStrings("queued", parsed_update.value.phase);
     try std.testing.expectEqualStrings("cursor-1", parsed_update.value.cursor.?);
     try std.testing.expectEqual(@as(u64, 2), parsed_update.value.result.repaired);
+}
+
+fn runOnePassForTest(alloc: std.mem.Allocator, store: *Store, req: StartRequest, pass: db_mod.types.ArtifactRepairResult) !std.json.Parsed(JobState) {
+    const started = try store.startJob(alloc, "docs", req);
+    defer alloc.free(started);
+    var parsed_start = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_start.deinit();
+    const begin = try store.beginAdvance(alloc, parsed_start.value);
+    defer alloc.free(begin.encoded);
+    var parsed_running = try std.json.parseFromSlice(JobState, alloc, begin.encoded, .{ .ignore_unknown_fields = true });
+    defer parsed_running.deinit();
+    const updated = try store.recordPass(alloc, parsed_running.value, pass);
+    defer alloc.free(updated);
+    return try std.json.parseFromSlice(JobState, alloc, updated, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+}
+
+test "repair job with documents still failing completes with failures, not failed" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+
+    var finished = try runOnePassForTest(alloc, &store, .{ .target = "index", .index = "knowledge" }, .{
+        .scanned = 2,
+        .failed = 2,
+        .unresolved = 2,
+        .debt_remaining = true,
+    });
+    defer finished.deinit();
+    try std.testing.expectEqualStrings("completed_with_failures", finished.value.phase);
+    try std.testing.expectEqualStrings("debt_remaining", finished.value.repair_status);
+    try std.testing.expect(finished.value.last_error == null);
+    try std.testing.expect(isTerminalPhase(finished.value.phase));
+    try validateJobState(finished.value);
+
+    // A job that cannot run stays failed.
+    const started = try store.startJob(alloc, "docs", .{ .target = "index", .index = "knowledge" });
+    defer alloc.free(started);
+    var parsed_start = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_start.deinit();
+    const broken = try store.markPhase(alloc, parsed_start.value, .failed, "InvalidArgument");
+    defer alloc.free(broken);
+    var parsed_broken = try std.json.parseFromSlice(JobState, alloc, broken, .{ .ignore_unknown_fields = true });
+    defer parsed_broken.deinit();
+    try std.testing.expectEqualStrings("failed", parsed_broken.value.phase);
+    try std.testing.expectEqualStrings("InvalidArgument", parsed_broken.value.last_error.?);
+
+    // A control traversal that leaves failed debt did break.
+    var control = try runOnePassForTest(alloc, &store, .{ .target = "index", .index = "knowledge", .control = .pause_automatic }, .{
+        .scanned = 1,
+        .failed = 1,
+        .debt_remaining = true,
+    });
+    defer control.deinit();
+    try std.testing.expectEqualStrings("failed", control.value.phase);
+}
+
+test "plain repair after a finished job starts a fresh job" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+    for ([_]bool{ true, false }) |with_failures| {
+        var first = try runOnePassForTest(alloc, &store, .{ .target = "index", .index = "knowledge" }, .{
+            .scanned = 1,
+            .failed = @intFromBool(with_failures),
+            .debt_remaining = with_failures,
+        });
+        defer first.deinit();
+        try std.testing.expect(isTerminalPhase(first.value.phase));
+        const again = try store.startJob(alloc, "docs", .{ .target = "index", .index = "knowledge" });
+        defer alloc.free(again);
+        var parsed_again = try std.json.parseFromSlice(JobState, alloc, again, .{ .ignore_unknown_fields = true });
+        defer parsed_again.deinit();
+        try std.testing.expect(parsed_again.value.job_id > first.value.job_id);
+        try std.testing.expectEqualStrings("queued", parsed_again.value.phase);
+        try std.testing.expect(parsed_again.value.cursor == null);
+    }
+}
+
+test "rendered remaining failures are never persisted in job state" {
+    const alloc = std.testing.allocator;
+    var state = JobState{
+        .job_id = 1,
+        .table_name = "docs",
+        .phase = "completed_with_failures",
+        .repair_status = "debt_remaining",
+        .target = "index",
+        .limit = 100,
+        .created_at_millis = 1,
+        .last_updated_at_millis = 1,
+        .expires_at_millis = 2,
+    };
+    const issues = [_]db_mod.types.ArtifactRepairIssue{
+        .{ .reason = .enrichment_failed, .generation_error = "ModelNotFound", .generation_attempts = 1 },
+        .{ .reason = .enrichment_failed, .generation_error = "ModelNotFound", .attempts = 2 },
+        .{ .reason = .enrichment_failed, .generation_error = "EmbedRateLimited", .attempts = 3 },
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const remaining = try remainingFailuresAlloc(arena.allocator(), &issues, false);
+    try std.testing.expectEqual(@as(usize, 2), remaining.groups.len);
+    try std.testing.expectEqual(@as(u64, 2), remaining.groups[0].count);
+    try std.testing.expect(std.mem.indexOf(u8, remaining.groups[0].hint, "antfly inference pull") != null);
+    try std.testing.expect(remaining.groups[1].transient);
+    try std.testing.expect(std.mem.indexOf(u8, remaining.groups[1].hint, "3 repair attempt(s); run repair again") != null);
+
+    state.remaining_failures = remaining.groups;
+    const rendered = try std.json.Stringify.valueAlloc(alloc, state, .{ .emit_null_optional_fields = false });
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"remaining_failures\"") != null);
+    state.remaining_failures = null;
+    const persisted = try encodeState(alloc, state);
+    defer alloc.free(persisted);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "remaining_failures") == null);
 }
 
 test "forced index repair job dispatches force only once" {

@@ -7125,6 +7125,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.table_catalog.",
             "storage.db.resolution_handoff.",
             "storage.db.resolution_runtime.",
+            "storage.db.repair_failure.",
             "storage.db.root_identity.",
             "storage.db.root_signing_identity.",
             "storage.db.snapshot_admission.",

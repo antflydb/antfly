@@ -8816,6 +8816,29 @@ export interface components {
              */
             limit: number;
             result: components["schemas"]["TableRepairRunResult"];
+            /** @description Documents that still fail after this pass, grouped by error code with the next step. Omitted for control passes. */
+            remaining_failures?: components["schemas"]["RepairRemainingFailure"][];
+            /** @description Whether more repair issues exist than the summary scanned. */
+            remaining_failures_truncated?: boolean;
+        };
+        /** @description A group of documents whose repair still fails with the same error. */
+        RepairRemainingFailure: {
+            /** @description Error recorded for the documents, for example `ModelNotFound`. */
+            error_code: string;
+            /**
+             * Format: uint64
+             * @description Number of documents in this group.
+             */
+            count: number;
+            /**
+             * Format: uint64
+             * @description Highest repair attempt count among the group's documents.
+             */
+            attempts: number;
+            /** @description Whether the error is temporary (admission refusal, rate limit). Repair retries these within a job; running repair again usually succeeds. */
+            transient: boolean;
+            /** @description What to do next. */
+            hint: string;
         };
         /** @description Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair. */
         TableRepairJobStartRequest: {
@@ -8882,10 +8905,14 @@ export interface components {
             /** @description Table being repaired. */
             table_name: string;
             /**
-             * @description Lifecycle phase of the repair job.
+             * @description Lifecycle phase of the repair job. `completed_with_failures` means every
+             *     pass ran but some documents still fail; `remaining_failures` says why
+             *     and what to do, and running repair again retries them. `failed` means
+             *     the job itself could not run, for example an invalid request or a
+             *     stale control fence.
              * @enum {string}
              */
-            phase: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+            phase: "queued" | "running" | "succeeded" | "completed_with_failures" | "failed" | "cancelled";
             /**
              * @description User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
              * @enum {string}
@@ -8936,6 +8963,10 @@ export interface components {
              * @description Unix epoch milliseconds when the job is eligible for cleanup.
              */
             expires_at_millis: number;
+            /** @description Documents that still fail, grouped by error code with the next step. Present on finished repair jobs that are not controls, read from the current repair issues. */
+            remaining_failures?: components["schemas"]["RepairRemainingFailure"][];
+            /** @description Whether more repair issues exist than the summary scanned. */
+            remaining_failures_truncated?: boolean;
         };
         DocumentArtifactReprocessResponse: {
             /**
