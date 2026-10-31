@@ -338,3 +338,21 @@ No new cloud resources or credentials were created. The unchanged hosted gate,
 complete live whole-window diagnostics, historical `SQLITE_NOMEM`, three paired
 hour-long trials, physical-cold samples and live provider latency qualification
 remain open. Local successes and injected late errors do not satisfy those gates.
+
+### Sealed resident evidence
+
+Local evidence is `examples/cloudflare-serverless/dist/qualification/resident-sealed-1793435256615/evidence.json`:
+**1,166 independently verified artifacts / 3,667,630,615 bytes**, SHA-256
+`b227200623841be6424ab347cb3ab1f50dc2348082cee802409ab98a21dbbace`.
+It preserves exact final/measured/native source archives, frozen modules and
+native test binaries, all 74 correct final cases, integration logs, failed
+prechecks, interrupted earlier matrices and negative prototype bundles.
+The independent matrix audit verifies 7,872 measured reads / 1,792 writes.
+
+All six preceding corrected closures reverify unchanged, including 1,344, 224
+and 27 recorded window references in the earlier local/hosted/memory closures.
+The earlier invalid self-summary and historical availability gap remain explicit.
+Initial prototype/intermediate precheck sources or raw modules overwritten before
+archiving are not promoted to exact final evidence. Credentials and post-write
+summaries were excluded before reading/hashing. Production, measurement and
+rollout/qualification limitations above remain unchanged.
