@@ -88,6 +88,13 @@ CUDA's online-softmax family retains distinct shared-half and register-F32
 probability publication. Sharing a template does not permit merging those
 rounding or scratch-lifetime contracts.
 
+Q4/Q8 paired-activation and fixed-row projection helper definitions belong to
+their generated specialization families. Their shared dual-dot phases retain
+explicit dense U32 versus routed U64 indexing and full/tail scopes. Keep these
+width and schedule contracts when adding an instance. Before removing a
+computed helper fragment, inspect both its generator consumers and references
+in the complete native bundle plus recursively included project headers.
+
 The portable causal stencil is compiled directly as CUDA and stringified as MSL.
 It is not a runtime interpreter. Protect emitted source from host SDK macros and
 reserved shader identifiers. Separate-product rounding has an explicit CUDA

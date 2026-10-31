@@ -2709,10 +2709,6 @@ const helper_termite_q6k_quant_i32 = SourceFragment{
     .name = "termite_q6k_quant_i32",
     .recipe = q6_recipe.component(q6_recipe.integer_component.?),
 };
-const helper_termite_q6k_scale_f32 = SourceFragment{
-    .name = "termite_q6k_scale_f32",
-    .recipe = q6_recipe.component(q6_recipe.scale_component.?),
-};
 const helper_termite_q6k_sub_scale_f32 = SourceFragment{
     .name = "termite_q6k_sub_scale_f32",
     .recipe = quant_recipe.q6SubblockScale(),
@@ -2740,7 +2736,6 @@ pub const runtime_shared_helpers = [_]SourceFragment{
     helper_termite_q4k_min,
     helper_termite_q6k_value,
     helper_termite_q6k_quant_i32,
-    helper_termite_q6k_scale_f32,
     helper_termite_q6k_sub_scale_f32,
     helper_termite_decoder_activation_f32,
     helper_half_bits_to_float,

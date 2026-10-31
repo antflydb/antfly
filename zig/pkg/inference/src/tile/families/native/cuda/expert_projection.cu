@@ -41,10 +41,7 @@ extern "C" __global__ void termite_gemma4_a4b_q4_0_gate_up_rows_q8_1_f32(ANTFLY_
         for (unsigned int c = 0u; c < cols; ++c) {
             const unsigned int col = col_tile + c;
             if (col < out_dim) {
-                const unsigned char* gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
-                const unsigned char* up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
-                gate_acc[c] += termite_q4_0_q8_1_partial_mmvq2(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-                up_acc[c] += termite_q4_0_q8_1_partial_mmvq2(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+{{q4q8_pair_dot_u64_inner}}
             }
         }
     }

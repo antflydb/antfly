@@ -70,6 +70,7 @@ pub const source_1 = program.join(&.{
 });
 
 pub const source_2 = program.join(&.{
+    program.render(fixed_row_program, cuda_phases.projection),
     program.render(program_1, .{ .name = "termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn", .literal_0 = "8u" }),
 
     \\
@@ -122,5 +123,61 @@ pub const source_7 =
     \\extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile8(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
     \\    termite_q4_0_qkv_projection_impl<8u, 8u>(dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
     \\}
+    \\
+;
+
+// Static native helper owned alongside its specialization exports.
+const fixed_row_program =
+    \\template<unsigned int Warps>
+    \\__device__ __forceinline__ void termite_e4b_ffn_pair_impl(float* dst,
+    \\    const unsigned char* q8_input,
+    \\    const unsigned char* weight_gate,
+    \\    const unsigned char* weight_up,
+    \\    unsigned int activation){
+    \\    const unsigned int cols = 4u;
+    \\    const unsigned int row_blocks = 80u;
+    \\    unsigned int col_tile = blockIdx.x * cols;
+    \\    unsigned int tid = threadIdx.x;
+    \\    unsigned int lane = tid & 31u;
+    \\    unsigned int warp = tid >> 5;
+    \\    __shared__ float gate_partial[4][Warps];
+    \\    __shared__ float up_partial[4][Warps];
+    \\    float gate_acc[4];
+    \\    float up_acc[4];
+    \\    #pragma unroll
+    \\    for (unsigned int c = 0; c < cols; ++c) {
+    \\        gate_acc[c] = 0.0f;
+    \\        up_acc[c] = 0.0f;
+    \\    }
+    \\
+    \\    unsigned int iqs = (tid & 1u) * 2u;
+    \\    for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
+    \\        const unsigned char* q8_bp = q8_input + block * 36u;
+    \\#include "../kernels/q4_a4b_q8_acquire.cuh"
+    \\
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0u; c < cols; ++c) {
+    \\            unsigned int col = col_tile + c;
+    \\{{q4q8_pair_dot_u32_full}}
+    \\        }
+    \\    }
+    \\
+    \\{{q4q8_pair_warp_fixed}}
+    \\    __syncthreads();
+    \\    if (tid == 0u) {
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0; c < cols; ++c) {
+    \\            float gate_y = 0.0f;
+    \\            float up_y = 0.0f;
+    \\            #pragma unroll
+    \\            for (unsigned int w = 0; w < Warps; ++w) {
+    \\                gate_y += gate_partial[c][w];
+    \\                up_y += up_partial[c][w];
+    \\            }
+    \\            dst[col_tile + c] = termite_decoder_activation_f32(gate_y, activation) * up_y;
+    \\        }
+    \\    }
+    \\}
+    \\
     \\
 ;

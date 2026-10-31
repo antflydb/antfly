@@ -429,23 +429,12 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile8(AN
         for (unsigned int c = 0u; c < 8u; ++c) {
             unsigned int col = col_tile + c;
             if (col < out_dim) {
-                const unsigned char* gate_bp = weight_gate + (col * row_blocks + block) * 18u;
-                const unsigned char* up_bp = weight_up + (col * row_blocks + block) * 18u;
-                gate_acc[c] += termite_q4_0_q8_1_partial_mmvq2(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-                up_acc[c] += termite_q4_0_q8_1_partial_mmvq2(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+{{q4q8_pair_dot_u32_inner}}
             }
         }
     }
 
-    #pragma unroll
-    for (unsigned int c = 0; c < 8u; ++c) {
-        float gate_sum = termite_warp_reduce_sum(gate_acc[c]);
-        float up_sum = termite_warp_reduce_sum(up_acc[c]);
-        if (lane == 0u && warp < 4u) {
-            gate_partial[c][warp] = gate_sum;
-            up_partial[c][warp] = up_sum;
-        }
-    }
+{{q4q8_pair_warp_tile8}}
     __syncthreads();
     if (tid == 0u) {
         #pragma unroll

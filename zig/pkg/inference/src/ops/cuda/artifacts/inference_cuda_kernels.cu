@@ -299,20 +299,6 @@ __device__ __forceinline__ int termite_q6k_quant_i32(const unsigned char *block,
     return v37;
 }
 
-__device__ __forceinline__ float termite_q6k_scale_f32(const unsigned char *block, int lane) {
-    int v0 = lane;
-    int v1 = 4;
-    int v2 = int(unsigned(v0) >> v1);
-    int v3 = 208;
-    float v4 = antfly_half_le_to_float(block + v3);
-    int v5 = 192;
-    int v6 = v5 + v2;
-    int v7 = int(((const signed char *)block)[v6]);
-    float v8 = float(v7);
-    float v9 = v4 * v8;
-    return v9;
-}
-
 __device__ __forceinline__ float termite_q6k_sub_scale_f32(const unsigned char *block, int lane) {
     int v0 = lane;
     int v1 = 208;
@@ -10350,6 +10336,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_f32_tile4_w4(
 }
 // tile-codegen:end projection.direct.11 family
 
+// tile-codegen:begin quant_cuda.pair_activation_q8_1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 template<unsigned int Warps>
 __device__ __forceinline__ void termite_q4_0_pair_activation_q8_1_tile4_impl(
     float* dst,
@@ -10438,7 +10425,6 @@ __device__ __forceinline__ void termite_q4_0_pair_activation_q8_1_tile4_impl(
     }
 }
 
-// tile-codegen:begin quant_cuda.pair_activation_q8_1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile4(ANTFLY_CUDA_Q8_INPUT_PAIR_ACTIVATION_PARAMS) {
     termite_q4_0_pair_activation_q8_1_tile4_impl<4u>(dst, q8_input, weight_gate, weight_up, rows, in_dim, out_dim, activation);
 }
@@ -10706,6 +10692,7 @@ extern "C" __global__ void termite_gemma4_a4b_combine_rows_f32(
 }
 // tile-codegen:end expert.projection.direct.3 family
 
+// tile-codegen:begin quant_cuda.q4_0_projections.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 template<unsigned int Warps>
 __device__ __forceinline__ void termite_e4b_ffn_pair_impl(float* dst,
     const unsigned char* q8_input,
@@ -10768,7 +10755,6 @@ __device__ __forceinline__ void termite_e4b_ffn_pair_impl(float* dst,
     }
 }
 
-// tile-codegen:begin quant_cuda.q4_0_projections.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn(
     float* dst,
     const unsigned char* q8_input,

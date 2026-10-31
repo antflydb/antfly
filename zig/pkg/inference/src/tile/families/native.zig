@@ -113,7 +113,7 @@ pub const regions = r.regions(&.{
     r.cudaSourceFamily("attention.direct", program.render(@embedFile("native/cuda/attention_direct.cu"), cuda_phases.attention)),
     r.cudaSourceFamily("convolution.direct", @embedFile("native/cuda/convolution.cu")),
     r.cudaSourceFamily("elementwise.direct", @embedFile("native/cuda/elementwise_direct.cu")),
-    r.cudaSourceFamily("expert.projection.direct", @embedFile("native/cuda/expert_projection.cu")),
+    r.cudaSourceFamily("expert.projection.direct", program.render(@embedFile("native/cuda/expert_projection.cu"), cuda_phases.projection)),
     r.cudaSourceFamily("kv.storage.direct", @embedFile("native/cuda/kv_storage.cu")),
     r.cudaSourceFamily("normalization.direct", @embedFile("native/cuda/normalization_direct.cu")),
     r.cudaSourceFamily("projection.direct", program.render(@embedFile("native/cuda/projection_direct.cu"), cuda_phases.projection)),

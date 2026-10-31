@@ -101,6 +101,13 @@ pub const attention = .{
 };
 
 pub const projection = .{
+    .q4q8_pair_dot_u32_inner = program.render(q4q8_pair_dot, .{ .indent = "                ", .index_cast = "" }),
+    .q4q8_pair_dot_u64_inner = program.render(q4q8_pair_dot, .{ .indent = "                ", .index_cast = "(size_t)" }),
+    .q4q8_pair_dot_u32_tail = program.render(q4q8_pair_dot, .{ .indent = "                    ", .index_cast = "" }),
+    .q4q8_pair_dot_u32_full = program.render(q4q8_pair_dot, .{ .indent = "            ", .index_cast = "" }),
+    .q4q8_pair_warp_tile8 = program.render(q4q8_pair_warp, .{ .cols = "8u", .warps = "4u" }),
+    .q4q8_pair_warp_tile4 = program.render(q4q8_pair_warp, .{ .cols = "4u", .warps = "Warps" }),
+    .q4q8_pair_warp_fixed = program.render(q4q8_pair_warp, .{ .cols = "cols", .warps = "Warps" }),
     .pair_projection_tile =
     \\    unsigned int global = blockIdx.x;
     \\    unsigned int row = global / tiles_per_row;
@@ -225,4 +232,23 @@ const online_softmax =
     \\                denominator[row] = denominator[row] * a + sum;
     \\                maximum[row] = next_max;
     \\            }
+;
+
+const q4q8_pair_dot =
+    \\{{indent}}const unsigned char* gate_bp = weight_gate + ({{index_cast}}col * row_blocks + block) * 18u;
+    \\{{indent}}const unsigned char* up_bp = weight_up + ({{index_cast}}col * row_blocks + block) * 18u;
+    \\{{indent}}gate_acc[c] += termite_q4_0_q8_1_partial_mmvq2(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+    \\{{indent}}up_acc[c] += termite_q4_0_q8_1_partial_mmvq2(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+;
+
+const q4q8_pair_warp =
+    \\    #pragma unroll
+    \\    for (unsigned int c = 0; c < {{cols}}; ++c) {
+    \\        float gate_sum = termite_warp_reduce_sum(gate_acc[c]);
+    \\        float up_sum = termite_warp_reduce_sum(up_acc[c]);
+    \\        if (lane == 0u && warp < {{warps}}) {
+    \\            gate_partial[c][warp] = gate_sum;
+    \\            up_partial[c][warp] = up_sum;
+    \\        }
+    \\    }
 ;
