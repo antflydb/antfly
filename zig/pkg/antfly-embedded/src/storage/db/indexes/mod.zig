@@ -122,3 +122,59 @@ pub const Indexes = struct {
         return shadow.indexes_path;
     }
 };
+
+test "db shadow index manager backfills split-off range and ignores parent-range live writes after split" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
+    try db.addIndex(.{
+        .name = "graph_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+            .{ .key = "doc:z", .value = "{\"title\":\"zeta\"}" },
+        },
+        .graph_writes = &.{
+            .{ .index_name = "graph_v1", .source = "doc:z", .target = "doc:y", .edge_type = "cites", .weight = 1.0 },
+        },
+        .sync_level = .full_index,
+    });
+
+    try db.indexes.createSplitShadow("doc:m", "");
+    try std.testing.expect(db.indexes.split_shadow != null);
+    try std.testing.expect(db.indexes.splitShadowDir().len > 0);
+    try std.testing.expectEqual(@as(u32, 1), db.indexes.split_shadow.?.manager.textIndex("ft_v1").?.snapshot().liveDocCount());
+
+    try db.core.shard_manager.prepareSplit("doc:m");
+    try db.core.shard_manager.split(0, "doc:m");
+    db.core.index_manager.updateRange(db.core.shard_manager.getByteRange());
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"bravo\"}" }},
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expectEqual(@as(u64, 1), db.indexes.split_shadow.?.next_ticket);
+    try std.testing.expectEqual(db.indexes.split_shadow.?.next_ticket, db.indexes.split_shadow.?.applied_ticket);
+    try std.testing.expect(!db.indexes.split_shadow.?.repair_required);
+    try std.testing.expectEqual(@as(u32, 1), db.indexes.split_shadow.?.manager.textIndex("ft_v1").?.snapshot().liveDocCount());
+
+    try db.indexes.closeSplitShadow();
+    try std.testing.expectEqualStrings("", db.indexes.splitShadowDir());
+}

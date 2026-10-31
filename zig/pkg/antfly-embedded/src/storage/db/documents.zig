@@ -795,3 +795,512 @@ pub const Documents = struct {
         }
     }
 };
+
+test "db portable import target rejects active in-memory bulk leases" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try std.testing.expect(try db.isPortableImportTargetEmpty(alloc));
+
+    try db.documents.beginPrimaryStoreAutoBulkIngest();
+    try std.testing.expectError(error.WriterLocked, db.isPortableImportTargetEmpty(alloc));
+    db.documents.abortPrimaryStoreAutoBulkIngest();
+    try std.testing.expect(try db.isPortableImportTargetEmpty(alloc));
+
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    try std.testing.expectError(error.PortableRuntimeActivationPending, db.beginBulkIngestSession());
+    try std.testing.expectEqual(@as(u32, 0), db.async_context.dense_admission.external_sessions.load(.acquire));
+    try std.testing.expect(!db.documents.bulk_ingest.session.active);
+    db.async_context.portable_runtime_activation_pending.store(false, .release);
+
+    try db.beginBulkIngestSession();
+    try std.testing.expectError(error.WriterLocked, db.isPortableImportTargetEmpty(alloc));
+    db.abortBulkIngestSession();
+    try std.testing.expect(try db.isPortableImportTargetEmpty(alloc));
+
+    try db.batch(.{ .writes = &.{.{
+        .key = "doc:durable-target-state",
+        .value = "{\"title\":\"permanently nonempty\"}",
+    }} });
+    try db.documents.beginPrimaryStoreAutoBulkIngest();
+    defer db.documents.abortPrimaryStoreAutoBulkIngest();
+    // Permanent target state takes precedence over transient activity so API
+    // clients receive invalid_argument rather than entering a futile retry loop.
+    try std.testing.expect(!(try db.isPortableImportTargetEmpty(alloc)));
+}
+
+test "db primary auto bulk leaves dense replay active while session is open" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try db.documents.beginPrimaryStoreAutoBulkIngest();
+    errdefer db.documents.abortPrimaryStoreAutoBulkIngest();
+    try std.testing.expectEqual(@as(u32, 0), db.async_context.dense_admission.external_sessions.load(.acquire));
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1.0,0.0,0.0]}}" }},
+        .sync_level = .write,
+    });
+
+    const target_sequence = db.core.nextDerivedSequence();
+    try db.executor.waitForAll(target_sequence);
+
+    const stats = try db.stats(alloc);
+    defer db_mod.types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].doc_count);
+    try std.testing.expectEqual(target_sequence, stats.indexes[0].replay_applied_sequence);
+
+    try db.documents.finishPrimaryStoreAutoBulkIngest(.{ .compact = false });
+}
+
+test "db dense auto bulk finish wakes weak-sync replay and publishes visibility after catch-up" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try db.core.saveProjectionCheckpoint("dense_idx", .{ .status = .rebuilding });
+
+    const HookCtx = struct {
+        mutex: *std.Io.Mutex,
+        changed_db: ?*DB,
+        publish_calls: u64 = 0,
+        status_calls: u64 = 0,
+        status_calls_after_wal_checkpoint: u64 = 0,
+        publish_blocking_calls: u64 = 0,
+        publish_blocking_while_applied_sequence_locked: u64 = 0,
+        publish_blocking_with_clean_checkpoint: u64 = 0,
+        publish_blocking_checkpoint_applied: u64 = 0,
+        publish_blocking_checkpoint_clean: bool = false,
+        invalidate_calls: u64 = 0,
+
+        fn onChange(ptr: *anyopaque, event: db_mod.QueryVisibilityEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.mutex.lockUncancelable(std.testing.io);
+            defer self.mutex.unlock(std.testing.io);
+            switch (event.change) {
+                .status => {
+                    self.publish_calls += 1;
+                    self.status_calls += 1;
+                    if (self.changed_db) |hook_db| {
+                        if (hook_db.core.denseIndex("dense_idx")) |entry| if (entry.index.snapshotLsmMaintenanceStats()) |stats| {
+                            const checkpoint = hook_db.core.index_manager.denseProjectionCheckpointMetadata("dense_idx") orelse return;
+                            if (checkpoint.applied_sequence >= 4 and
+                                stats.mutable_entries == 0 and
+                                stats.immutable_memtables == 0 and
+                                stats.wal_checkpoint_current_segment > 0 and
+                                stats.wal_checkpoint_lag_segments == 0)
+                            {
+                                self.status_calls_after_wal_checkpoint += 1;
+                            }
+                        };
+                    }
+                },
+                .publish, .publish_consistent => self.publish_calls += 1,
+                .publish_blocking => {
+                    self.publish_calls += 1;
+                    self.publish_blocking_calls += 1;
+                    if (self.changed_db) |hook_db| {
+                        if (hook_db.async_context.applied_sequence_mutex.tryLock()) {
+                            hook_db.async_context.applied_sequence_mutex.unlock();
+                        } else {
+                            self.publish_blocking_while_applied_sequence_locked += 1;
+                        }
+                        if (hook_db.core.index_manager.denseProjectionCheckpointMetadata("dense_idx")) |checkpoint| {
+                            self.publish_blocking_checkpoint_applied = checkpoint.applied_sequence;
+                            self.publish_blocking_checkpoint_clean = checkpoint.status == .clean;
+                            if (checkpoint.status == .clean and checkpoint.applied_sequence >= 4) {
+                                self.publish_blocking_with_clean_checkpoint += 1;
+                            }
+                        }
+                    }
+                },
+                .invalidate => self.invalidate_calls += 1,
+                .activity, .target_advanced, .index_repair_pending, .index_repair_cleared, .index_repair_progress => {},
+            }
+        }
+    };
+    var hook_mutex: std.Io.Mutex = .init;
+    var hook_ctx = HookCtx{ .mutex = &hook_mutex, .changed_db = &db };
+    db.setQueryVisibilityHook(.{
+        .ptr = &hook_ctx,
+        .on_change = HookCtx.onChange,
+    });
+
+    try db.documents.beginDenseAutoBulkIngest();
+    errdefer db.documents.abortDenseAutoBulkIngest();
+
+    inline for (.{ "write", "propose", "write", "propose" }, 0..) |level, i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+        defer alloc.free(key);
+        const value = try std.fmt.allocPrint(
+            alloc,
+            "{{\"_embeddings\":{{\"dense_idx\":[{d}.0,0.0,0.0]}}}}",
+            .{i + 1},
+        );
+        defer alloc.free(value);
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = db_mod.types.parsePublicSyncLevelText(level).?,
+        });
+    }
+
+    // Finish the implicit bulk publish, but hold the deferred executor wake so
+    // the test can prove the replay catch-up itself publishes fresh visibility.
+    try db.documents.finishDenseAutoBulkIngestInternal(.{ .compact = false }, false);
+    hook_mutex.lockUncancelable(std.testing.io);
+    hook_ctx = .{ .mutex = &hook_mutex, .changed_db = &db };
+    hook_mutex.unlock(std.testing.io);
+
+    db_mod.flushDeferredExternalBulkExecutorNotification(db.async_context, db.executor);
+    try db.executor.waitForAll(4);
+    // Replay completion schedules native publication; its clean visibility
+    // edge is delivered by maintenance, not synchronously by the executor.
+    const deadline = db_mod.monotonicTimeNs() +| 10 * std.time.ns_per_s;
+    var observed: HookCtx = undefined;
+    while (true) {
+        hook_mutex.lockUncancelable(std.testing.io);
+        observed = hook_ctx;
+        hook_mutex.unlock(std.testing.io);
+        if (observed.publish_blocking_with_clean_checkpoint > 0) break;
+        if (db_mod.monotonicTimeNs() >= deadline) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+
+    try std.testing.expect(observed.publish_calls > 0);
+    try std.testing.expect(observed.publish_blocking_calls > 0);
+    try std.testing.expectEqual(@as(u64, 0), observed.publish_blocking_while_applied_sequence_locked);
+    try std.testing.expectEqual(@as(u64, 4), observed.publish_blocking_checkpoint_applied);
+    try std.testing.expect(observed.publish_blocking_checkpoint_clean);
+    try std.testing.expect(observed.publish_blocking_with_clean_checkpoint > 0);
+    try std.testing.expectEqual(@as(u64, 0), observed.invalidate_calls);
+    const stats = try db.stats(alloc);
+    defer db_mod.types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].replay_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].replay_target_sequence);
+    try std.testing.expectEqualStrings("clean", stats.indexes[0].projection_checkpoint_status);
+
+    const persisted_status = (try db.loadIndexStatusSnapshot(alloc, "dense_idx")).?;
+    try std.testing.expectEqual(@as(u64, 4), persisted_status.doc_count);
+    try std.testing.expectEqual(@as(u64, 4), try db.core.loadAppliedSequence(alloc, "dense_idx"));
+}
+
+test "db dense auto bulk finish wakes current replay target if deferred wake is absent" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try db.documents.beginDenseAutoBulkIngest();
+    errdefer db.documents.abortDenseAutoBulkIngest();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1.0,0.0,0.0]}}" },
+        },
+        .sync_level = .write,
+    });
+
+    const target_sequence = db.core.nextDerivedSequence();
+    try std.testing.expect(target_sequence > 0);
+    db.async_context.dense_admission.deferred_sequence.store(0, .release);
+
+    try db.documents.finishDenseAutoBulkIngest(.{ .compact = false });
+    try db.executor.waitForAll(target_sequence);
+
+    const stats = try db.stats(alloc);
+    defer db_mod.types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(target_sequence, stats.indexes[0].replay_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].doc_count);
+}
+
+test "db dense auto bulk replays packed external embedding strings" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try db_mod.TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try db.documents.beginDenseAutoBulkIngest();
+    errdefer db.documents.abortDenseAutoBulkIngest();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":\"AACAPwAAAAAAAAAA\"}}" },
+            .{ .key = "doc:b", .value = "{\"_embeddings\":{\"dense_idx\":\"AAAAAAAAAAAAAIA/\"}}" },
+        },
+        .sync_level = .write,
+    });
+
+    const target_sequence = db.core.nextDerivedSequence();
+    try db.documents.finishDenseAutoBulkIngest(.{ .compact = false });
+    try db.executor.waitForAll(target_sequence);
+
+    const stats = try db.stats(alloc);
+    defer db_mod.types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 2), stats.indexes[0].doc_count);
+}
+
+test "public graph metric borrowed wire captured document authority survives writes and window retirement" {
+    const a = std.testing.allocator;
+    var directory = try db_mod.TestDirectory.init("pinned-content-authority");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    const padding = try a.alloc(u8, 16 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'x');
+    const original = try std.fmt.allocPrint(a, "{{\"padding\":\"{s}\"}}", .{padding});
+    defer a.free(original);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = original }} });
+    var pinned = try db.core.store.beginReadTxn();
+    defer pinned.abort();
+    var schema = db.core.acquireSchemaView();
+    defer if (schema) |*view| view.release();
+    // Mutation occurs after capture, exactly as it can after a dense query
+    // releases apply-shared. Every retired window must fork the old cut.
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }} });
+    const hits = try a.alloc(db_mod.types.SearchHit, 65);
+    @memset(hits, .{ .id = &.{} });
+    var result: db_mod.types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = 65 };
+    defer result.deinit();
+    for (hits) |*hit| hit.id = try a.dupe(u8, "doc");
+    try db.documents.attachDistributedAuthorityAtSnapshot(a, .{ .include_stored = false, .document_authority_mode = .candidates, .document_authority_group = 11 }, &result, &pinned, schema);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(original, &digest, .{});
+    for (hits) |hit| {
+        try std.testing.expectEqualSlices(u8, &digest, &hit.document_authority.?.digest);
+        try std.testing.expect(hit.stored_data == null);
+    }
+    std.debug.print("PINNED_CONTENT_AUTHORITY rows=65 retired_windows=1 old_digest_preserved=65\n", .{});
+}
+
+test "public graph metric borrowed wire content migration fences edits abort deletion and restart" {
+    const a = std.testing.allocator;
+    const revision = @import("../document_mutation_revision.zig");
+    var directory = try db_mod.TestDirectory.init("content-migration");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"n\":1}" }, .{ .key = "b", .value = "{\"n\":2}" }, .{ .key = "c", .value = "{\"n\":3}" } } });
+    const ka = try db_mod.internal_keys.documentKeyAlloc(a, "a");
+    defer a.free(ka);
+    const kb = try db_mod.internal_keys.documentKeyAlloc(a, "b");
+    defer a.free(kb);
+    const kc = try db_mod.internal_keys.documentKeyAlloc(a, "c");
+    defer a.free(kc);
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        for ([_][]const u8{ ka, kb, kc }) |key| try write.delete(&revision.contentKey(revision.keyForPhysical(key).?));
+        try write.commit();
+    }
+    // This fixture exercises fencing within one page. A real 2 ms clock may
+    // yield before b/c under load; deadline pagination is tested separately.
+    const Clock = struct {
+        pub fn now(_: @This()) u64 {
+            return 0;
+        }
+    };
+    var prepared = (try revision.BackfillPage.prepareWithClock(a, db.core.store, false, Clock{})).?;
+    defer prepared.deinit();
+    // The publisher must skip records modified/deleted after hashing.
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":4}" }}, .deletes = &.{"c"} });
+    {
+        var write = try db.core.store.beginWriteTxn();
+        defer write.abort();
+        try std.testing.expectEqual(@as(usize, 1), try prepared.stage(&write));
+    }
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try revision.loadContent(&read, kb)) == null);
+    }
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        try std.testing.expectEqual(@as(usize, 1), try prepared.stage(&write));
+        try write.commit();
+    }
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try revision.loadContent(&read, kb)) != null);
+        try std.testing.expect((try revision.loadContent(&read, kc)) == null);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash("{\"n\":4}", &digest, .{});
+        try std.testing.expectEqualSlices(u8, &digest, &(try revision.loadContent(&read, ka)).?.digest);
+    }
+    {
+        var stale = try db.core.store.beginWriteTxn();
+        defer stale.abort();
+        try std.testing.expectError(error.DocumentAuthorityCursorChanged, prepared.stage(&stale));
+    }
+    try std.testing.expect(try db.documents.advanceAuthorityBackfillPage());
+    try std.testing.expect(!db.documents.authority.backfill_active.load(.acquire));
+    // Simulate a revision-aware older writer that cannot refresh our cache.
+    var expected_revision: u64 = undefined;
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        expected_revision = (try revision.load(&write, revision.keyForPhysical(kb).?)) + 1;
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, expected_revision, .little);
+        try write.write.?.put(kb, "{\"n\":5}");
+        try write.put(&revision.keyForPhysical(kb).?, &bytes);
+        try write.commit();
+    }
+    const hits = try a.alloc(db_mod.types.SearchHit, 1);
+    hits[0] = .{ .id = try a.dupe(u8, "b") };
+    var result: db_mod.types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = 1 };
+    defer result.deinit();
+    var schema_view = db.core.acquireSchemaView();
+    defer if (schema_view) |*view| view.release();
+    try db.documents.attachDistributedAuthorityAtSnapshot(a, .{ .include_stored = false, .document_authority_mode = .candidates, .document_authority_group = 11 }, &result, null, schema_view);
+    try std.testing.expect(db.documents.authority.repairs.pending.load(.acquire));
+    try std.testing.expect(!db.documents.authority.backfill_requested.load(.acquire));
+    try std.testing.expect((try revision.BackfillPage.prepare(a, db.core.store, false)) == null);
+    const sequence = db.core.nextDerivedSequence();
+    for (0..16) |_| {
+        if (try db.documents.advanceAuthorityBackfillPage()) break;
+    }
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const cached = (try revision.loadContent(&read, kb)).?;
+        try std.testing.expectEqual(expected_revision, cached.revision);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash("{\"n\":5}", &digest, .{});
+        try std.testing.expectEqualSlices(u8, &digest, &cached.digest);
+        try std.testing.expectEqual(sequence, db.core.nextDerivedSequence());
+    }
+    try std.testing.expect(!db.documents.authority.repairs.pending.load(.acquire));
+    try std.testing.expect(!db.documents.authority.backfill_active.load(.acquire));
+    try std.testing.expect((try revision.BackfillPage.prepare(a, db.core.store, false)) == null);
+    std.debug.print("CONTENT_MIGRATION stale_and_deleted_skipped=2 aborted_publish_visible=0 logical_rewrites=0\n", .{});
+}
+
+test "public graph metric borrowed wire hydration preserves exact output policy through opaque allocators" {
+    const a = std.testing.allocator;
+    const counters = @import("../lite/test_allocator.zig");
+    var directory = try db_mod.TestDirectory.init("hydration-output-policy");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
+    defer db.close();
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"items\":[");
+    for (0..4096) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("0.123456789");
+    }
+    try input.writer.writeAll("]}");
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = input.written() }} });
+    var peaks: [2]usize = undefined;
+    var expected: ?[]u8 = null;
+    defer if (expected) |body| a.free(body);
+    for (0..2) |mode| {
+        var counted: counters.BudgetAllocator = .{ .backing = a };
+        var output = std.heap.ArenaAllocator.init(counted.allocator());
+        defer output.deinit();
+        // Force the growth behavior of overlapping writers, even in this
+        // deterministic serial fixture. The opaque wrapper cannot be unwrapped.
+        var wrapped: counters.NoResizeAllocator = .{ .backing = output.allocator() };
+        const owner = wrapped.allocator();
+        const hits = try a.alloc(db_mod.types.SearchHit, 32);
+        @memset(hits, .{ .id = &.{} });
+        var result: db_mod.types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = 32 };
+        defer result.deinit();
+        for (hits) |*hit| hit.id = try a.dupe(u8, "doc");
+        try db.documents.attachDistributedAuthorityAtSnapshot(a, .{
+            .include_stored = false,
+            .fields = &.{"items"},
+            .include_all_fields = false,
+            .document_authority_mode = .hydrate,
+            .document_authority_group = 11,
+            .document_output_allocator = owner,
+            .document_output_exact = mode == 1,
+        }, &result, null, null);
+        for (hits) |hit| {
+            if (expected == null) expected = try a.dupe(u8, hit.stored_data.?);
+            try std.testing.expectEqualStrings(expected.?, hit.stored_data.?);
+        }
+        peaks[mode] = counted.peak;
+        std.debug.print("HYDRATION_OUTPUT exact={} body_bytes={d} retained={d}\n", .{ mode == 1, expected.?.len * hits.len, counted.live });
+    }
+    try std.testing.expect(peaks[1] < peaks[0] * 3 / 4);
+    // Refusing the publication copy must retire the temporary encoding while
+    // preserving ownership of bodies already attached to earlier hits.
+    for ([_]usize{ 0, 3 }) |fail_index| {
+        var refused = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        const hits = try a.alloc(db_mod.types.SearchHit, 8);
+        @memset(hits, .{ .id = &.{} });
+        var result: db_mod.types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = 8 };
+        defer result.deinit();
+        for (hits) |*hit| hit.id = try a.dupe(u8, "doc");
+        try std.testing.expectError(error.OutOfMemory, db.documents.attachDistributedAuthorityAtSnapshot(a, .{
+            .include_stored = false,
+            .fields = &.{"items"},
+            .include_all_fields = false,
+            .document_authority_mode = .hydrate,
+            .document_authority_group = 11,
+            .document_output_allocator = refused.allocator(),
+            .document_output_exact = true,
+        }, &result, null, null));
+        for (hits, 0..) |hit, i| try std.testing.expectEqual(i < fail_index, hit.stored_data != null);
+    }
+}

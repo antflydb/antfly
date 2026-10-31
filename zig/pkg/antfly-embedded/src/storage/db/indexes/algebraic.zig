@@ -29,7 +29,6 @@ pub const AlgebraicIndexes = struct {
         return parent.dbPtr();
     }
 
-
     pub fn attachHllMaintenanceLane(self: *AlgebraicIndexes) !void {
         const db = self.dbPtr();
         const owner_id = try db.backend_runtime.allocOwnerId();
@@ -37,3 +36,50 @@ pub const AlgebraicIndexes = struct {
         db.core.index_manager.attachHllMaintenance(db.backend_runtime.durable_jobs, owner_id);
     }
 };
+
+test "db open borrows shared backend runtime" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try db_mod.background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
+    defer runtime.deinit();
+
+    var first_path_tmp = try db_mod.TestDirectory.init("db");
+    defer first_path_tmp.cleanup();
+    const first_path = first_path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(first_path);
+
+    var second_path_tmp = try db_mod.TestDirectory.init("db");
+    defer second_path_tmp.cleanup();
+    const second_path = second_path_tmp.path().ptr;
+    defer db_mod.cleanupTempDir(second_path);
+
+    var first = try DB.open(alloc, std.mem.span(first_path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+    });
+    defer first.close();
+
+    var second = try DB.open(alloc, std.mem.span(second_path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+    });
+    defer second.close();
+
+    try std.testing.expectEqual(runtime.ptr(), first.backend_runtime);
+    try std.testing.expectEqual(runtime.ptr(), second.backend_runtime);
+    try std.testing.expect(first.owned_backend_runtime == null);
+    try std.testing.expect(second.owned_backend_runtime == null);
+    try std.testing.expect(first.backend_owner_id != 0);
+    try std.testing.expect(second.backend_owner_id != 0);
+    try std.testing.expect(first.backend_owner_id != second.backend_owner_id);
+    // Each DB owns a backend lane, a repair/cleanup lane, and an algebraic HLL
+    // maintenance lane. Generation retirement uses the runtime-wide cleanup
+    // owner instead.
+    try std.testing.expectEqual(
+        second.indexes.algebraic.hll_owner_id + 1,
+        try runtime.ptr().allocOwnerId(),
+    );
+}

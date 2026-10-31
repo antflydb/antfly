@@ -546,3 +546,127 @@ pub const Query = struct {
         }
     }
 };
+
+test "db query capture seals outside mutation fences and retains the selected generation" {
+    for ([_]bool{ false, true }) |missing_summary| {
+        const alloc = std.testing.allocator;
+        var directory = try db_mod.TestDirectory.init("query-seal-admission");
+        defer directory.cleanup();
+        const path = std.mem.span(directory.path().ptr);
+        defer db_mod.cleanupTempDir(directory.path().ptr);
+        const pins = try std.fmt.allocPrint(alloc, "{s}.query-pins", .{path});
+        defer alloc.free(pins);
+        defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+        var db = try DB.open(alloc, path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+            .start_index_workers = false,
+            .start_optional_runtime_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        const cut = @import("../native_query_cut.zig");
+        const empty_id: [64]u8 = @splat('c');
+        var empty_request: cut.Request = .{ .id = &empty_id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+        // A foreground reader/maintenance owner can retain catalog admission
+        // throughout capture. No exclusive reader drain is needed for pins.
+        try std.testing.expect(db.beginPublishedDenseSearch());
+        try db.captureQueryCut(empty_request, .none);
+        db.endPublishedDenseSearch();
+        empty_request.create = false;
+        {
+            var empty = try db.query.openCut(empty_request, .none);
+            defer empty.close();
+            var empty_hits = try empty.search(alloc, .{ .full_text = .{ .match = .{ .field = "body", .text = "original" } }, .include_stored = false });
+            defer empty_hits.deinit();
+            try std.testing.expectEqual(@as(usize, 0), empty_hits.hits.len);
+        }
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\"}" }}, .sync_level = .full_index });
+        if (missing_summary) {
+            try db.core.store.putBatch(&.{}, &.{db_mod.internal_keys.identity_visibility_summary_key[0..]});
+            db.core.identity_visibility.summary = null;
+        }
+        const Probe = struct {
+            db: *DB,
+            replace_index: bool,
+            released: bool = false,
+            failure: ?anyerror = null,
+            fn admitted(_: *anyopaque) void {}
+            fn materialize(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                // Fail without blocking if a regression retains any fence. Only
+                // run synchronous writes after proving admission is available.
+                if (!self.db.core.tryLockApplyExclusive()) return;
+                self.db.core.unlockApply();
+                var capture = self.db.core.snapshot_admission.tryAcquireCapture() orelse return;
+                capture.release();
+                var replay = self.db.core.snapshot_replay_admission.tryAcquireCapture() orelse return;
+                replay.release();
+                if (!self.db.local_execution.index_structural_mutation_mutex.tryLock()) return;
+                self.db.local_execution.index_structural_mutation_mutex.unlock();
+                if (self.db.indexCatalogBarrierActive()) return;
+                self.released = true;
+                self.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"replacement\"}" }}, .sync_level = .full_index }) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                _ = self.db.runLsmMaintenanceStepBestEffort() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                // Catalog admission requires its maintained summary. The
+                // missing-summary variant exercises conservative reads only.
+                if (!self.replace_index) return;
+                const removed = self.db.deleteIndex("text") catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                if (!removed) {
+                    self.failure = error.TestExpectedEqual;
+                    return;
+                }
+                var drained = false;
+                for (0..1000) |_| {
+                    const progress = self.db.advanceGeneratedArtifactCleanupPage("text") catch |err| {
+                        self.failure = err;
+                        return;
+                    };
+                    if (progress == .idle) {
+                        drained = true;
+                        break;
+                    }
+                    if (progress == .busy) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                }
+                if (!drained) {
+                    self.failure = error.TestCleanupDidNotComplete;
+                    return;
+                }
+                self.db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" }) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+            }
+        };
+        var probe = Probe{ .db = &db, .replace_index = !missing_summary };
+        DB.test_snapshot_fence_hook = .{ .ptr = &probe, .after_capture_admission = Probe.admitted, .before_artifact_materialize = Probe.materialize };
+        defer DB.test_snapshot_fence_hook = null;
+        const id: [64]u8 = @splat('b');
+        var request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+        try db.captureQueryCut(request, .none);
+        if (probe.failure) |err| return err;
+        try std.testing.expect(probe.released);
+        request.create = false;
+        var retained = try db.query.openCut(request, .none);
+        defer retained.close();
+        if (missing_summary) try std.testing.expect(try db_mod.doc_identity.visibilitySummaryFromStore(retained.core.store) == null);
+        const old = (try retained.get(alloc, "doc")).?;
+        defer alloc.free(old);
+        try std.testing.expect(std.mem.indexOf(u8, old, "original") != null);
+        const current = (try db.get(alloc, "doc")).?;
+        defer alloc.free(current);
+        try std.testing.expect(std.mem.indexOf(u8, current, "replacement") != null);
+        var old_hits = try retained.search(alloc, .{ .full_text = .{ .match = .{ .field = "body", .text = "original" } }, .include_stored = false });
+        defer old_hits.deinit();
+        try std.testing.expectEqual(@as(usize, 1), old_hits.hits.len);
+    }
+}
