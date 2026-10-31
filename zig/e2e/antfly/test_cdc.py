@@ -26,6 +26,7 @@ import requests
 from conftest import (
     ANTFLY_PUBLIC_API_ROOT,
     DEFAULT_ANTFLY_BIN,
+    StandaloneAntflyServer,
     StatefulAntflyServer,
     internal_service_headers,
     lookup_key_path,
@@ -443,12 +444,15 @@ def _metadata_table_id(stateful_api, table_name: str) -> int | None:
     return None
 
 
-@pytest.fixture(scope="function")
-def cdc_stateful_api(pg_cdc_source):
+@pytest.fixture(scope="function", params=["cluster", "standalone"])
+def cdc_stateful_api(request, pg_cdc_source):
     # Keep the provider fixture alive until after the managed server stops so
     # its exact-cutover slots are inactive and can be removed deterministically.
     del pg_cdc_source
+    mode = request.param
     base_url = os.environ.get("ANTFLY_STATEFUL_URL")
+    if base_url and mode == "standalone":
+        pytest.skip("ANTFLY_STATEFUL_URL selects one external server")
     server = None
     default_root = os.environ.get("ANTFLY_STATEFUL_API_ROOT")
     if not base_url:
@@ -458,7 +462,10 @@ def cdc_stateful_api(pg_cdc_source):
         if not os.path.exists(binary):
             pytest.skip(f"Public API binary not found: {binary}")
         port = find_free_port()
-        server = StatefulAntflyServer(binary, "127.0.0.1", port)
+        if mode == "standalone":
+            server = StandaloneAntflyServer(binary, "127.0.0.1", port)
+        else:
+            server = StatefulAntflyServer(binary, "127.0.0.1", port)
         base_url = server.url
         if default_root is None and os.path.basename(binary) == "antfly":
             default_root = ANTFLY_PUBLIC_API_ROOT

@@ -5137,6 +5137,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"system catalog standalone relation coordinator"},
     });
     b.step("antfly-standalone-pgwire-ddl-test", "Run standalone relation publication and guarded DDL tests").dependOn(&addFilteredTestRunArtifact(b, standalone_ddl_tests).step);
+    const standalone_cdc_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"standalone cdc"},
+    });
+    b.step("antfly-standalone-cdc-test", "Run standalone PostgreSQL CDC scheduling and status tests").dependOn(&addFilteredTestRunArtifact(b, standalone_cdc_tests).step);
 
     // This filter set boots the real CLI/standalone and Lite server paths
     // (HA, hot-standby, Lite adoption, ...), which reach the real
