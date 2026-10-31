@@ -17,7 +17,10 @@ const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
 const http = @import("antfly_runtime_abi").http_abi;
 
-pub const version: u32 = 6;
+// Version 8 separates logical attachment slots from unique binary payloads.
+// Workers use an exact startup version check; an explicitly configured older
+// executable must fail before the parent can advertise this operation to it.
+pub const version: u32 = 8;
 // Only options are JSON metadata. The application payload is carried raw.
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
@@ -150,11 +153,26 @@ pub const provider_attachment_limits = attachments.Limits{
     .max_total_attachment_bytes = @import("antfly_inference_worker_rpc").max_body_bytes - 24 - 1024 * 1024 - 1024 * (16 + 1024),
 };
 
+/// Binary generation preserves the previous HTTP attachment metadata ceiling
+/// for both typed messages and canonical JSON. Other operations keep their
+/// existing raster limits.
+/// Admission still checks the actual complete envelope against the RPC cap.
+pub fn providerLimits(operation: c_int) attachments.Limits {
+    if (operation == @backingInt(bridge.ProviderOperation.generate_json_with_attachments) or operation == @backingInt(bridge.ProviderOperation.generate_messages_with_attachments)) return .{
+        .max_metadata_bytes = (attachments.Limits{}).max_metadata_bytes,
+        .max_attachments = provider_attachment_limits.max_attachments,
+        .max_mime_bytes = provider_attachment_limits.max_mime_bytes,
+        .max_total_attachment_bytes = @import("antfly_inference_worker_rpc").max_body_bytes,
+    };
+    return provider_attachment_limits;
+}
+
 pub fn constrainCapabilities(capabilities: anytype) @TypeOf(capabilities) {
     var result = capabilities;
-    const limit = @min(result.attachment_payload_max_bytes orelse provider_attachment_limits.max_total_attachment_bytes, provider_attachment_limits.max_total_attachment_bytes);
+    const limits = if (result.task == .generate) providerLimits(@backingInt(bridge.ProviderOperation.generate_json_with_attachments)) else provider_attachment_limits;
+    const limit = @min(result.attachment_payload_max_bytes orelse limits.max_total_attachment_bytes, limits.max_total_attachment_bytes);
     result.attachment_payload_max_bytes = limit;
-    result.attachment_metadata_max_bytes = @min(result.attachment_metadata_max_bytes orelse provider_attachment_limits.max_metadata_bytes, provider_attachment_limits.max_metadata_bytes);
+    result.attachment_metadata_max_bytes = @min(result.attachment_metadata_max_bytes orelse limits.max_metadata_bytes, limits.max_metadata_bytes);
     const envelope_limit = @import("antfly_inference_worker_rpc").max_body_bytes;
     result.attachment_envelope_max_bytes = @min(result.attachment_envelope_max_bytes orelse envelope_limit, envelope_limit);
     result.batch.max_encoded_media_bytes = @min(result.batch.max_encoded_media_bytes orelse limit, limit);
@@ -180,6 +198,42 @@ pub const Provider = struct {
     deadline_ns: ?u64,
     numeric: bool,
     attachment_refs: []const AttachmentRef,
+    /// Empty means identity mapping. Otherwise each logical slot names one
+    /// unique payload. Reference indices and model message indices stay intact.
+    payload_slots: []const usize = &.{},
+
+    pub fn jsonStringify(self: Provider, stream: *std.json.Stringify) std.json.Stringify.Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(Provider).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "payload_slots")) {
+                if (self.payload_slots.len != 0) {
+                    try stream.objectField(name);
+                    try stream.write(self.payload_slots);
+                }
+            } else {
+                try stream.objectField(name);
+                try stream.write(@field(self, name));
+            }
+        }
+        try stream.endObject();
+    }
+
+    pub fn expandPayloads(self: Provider, arena: std.mem.Allocator, unique: []const attachments.Attachment) ![]bridge.ProviderBinaryPayload {
+        const limits = providerLimits(self.operation);
+        const count = if (self.payload_slots.len == 0) unique.len else self.payload_slots.len;
+        if (count > limits.max_attachments or unique.len > count) return error.InvalidInput;
+        var used: [1024]bool = @splat(false);
+        const payloads = try arena.alloc(bridge.ProviderBinaryPayload, count);
+        for (payloads, 0..) |*payload, i| {
+            const slot = if (self.payload_slots.len == 0) i else self.payload_slots[i];
+            if (slot >= unique.len) return error.InvalidInput;
+            used[slot] = true;
+            payload.* = .{ .bytes = .init(unique[slot].data), .content_type = .init(unique[slot].mime_type) };
+        }
+        for (used[0..unique.len]) |present| if (!present) return error.InvalidInput;
+        for (self.attachment_refs) |ref| if (ref.attachment_index >= count) return error.InvalidInput;
+        return payloads;
+    }
 };
 
 /// Only descriptors enter JSON; image/raster bytes remain borrowed segments.
@@ -190,27 +244,58 @@ pub const ProviderInput = struct {
     pub fn init(arena: std.mem.Allocator, context: *const bridge.ProviderInvokeContext) !ProviderInput {
         if ((context.binary_payloads == null and context.binary_payloads_len != 0) or
             (context.attachment_refs == null and context.attachment_refs_len != 0)) return error.InvalidInput;
-        if (context.binary_payloads_len > provider_attachment_limits.max_attachments) return error.BodyTooLarge;
-        if (context.binary_payloads_len > 0 and context.request_json.len > provider_attachment_limits.max_metadata_bytes) return error.BodyTooLarge;
-        const payloads = try arena.alloc(attachments.Attachment, context.binary_payloads_len);
+        const limits = providerLimits(context.operation);
+        if (context.binary_payloads_len > limits.max_attachments) return error.BodyTooLarge;
+        if (context.binary_payloads_len > 0 and context.request_json.len > limits.max_metadata_bytes) return error.BodyTooLarge;
+        const Key = struct { ptr: usize, len: usize, mime: []const u8 };
+        const Hash = struct {
+            pub fn hash(_: @This(), key: Key) u64 {
+                var h = std.hash.Wyhash.init(0);
+                h.update(std.mem.asBytes(&key.ptr));
+                h.update(std.mem.asBytes(&key.len));
+                h.update(key.mime);
+                return h.final();
+            }
+            pub fn eql(_: @This(), a: Key, b: Key) bool {
+                return a.ptr == b.ptr and a.len == b.len and std.mem.eql(u8, a.mime, b.mime);
+            }
+        };
+        var identities: std.HashMapUnmanaged(Key, usize, Hash, 80) = .empty;
+        defer identities.deinit(arena);
+        var payloads: std.ArrayList(attachments.Attachment) = .empty;
+        defer payloads.deinit(arena);
+        try payloads.ensureTotalCapacityPrecise(arena, context.binary_payloads_len);
+        var single_slot: [1]usize = undefined;
+        const slots = if (context.binary_payloads_len <= 1) single_slot[0..context.binary_payloads_len] else try arena.alloc(usize, context.binary_payloads_len);
         var payload_bytes: usize = 0;
-        for (payloads, 0..) |*payload, i| {
+        for (slots, 0..) |*slot, i| {
             const source = context.binary_payloads.?[i];
-            if (source.content_type.len > provider_attachment_limits.max_mime_bytes) return error.BodyTooLarge;
-            payload_bytes = std.math.add(usize, payload_bytes, source.bytes.len) catch return error.BodyTooLarge;
-            if (payload_bytes > provider_attachment_limits.max_total_attachment_bytes) return error.BodyTooLarge;
-            payload.* = .{ .mime_type = source.content_type.slice(), .data = source.bytes.slice() };
+            if (source.content_type.len > limits.max_mime_bytes) return error.BodyTooLarge;
+            if (slots.len == 1) {
+                if (source.bytes.len > limits.max_total_attachment_bytes) return error.BodyTooLarge;
+                slot.* = 0;
+                payloads.appendAssumeCapacity(.{ .mime_type = source.content_type.slice(), .data = source.bytes.slice() });
+                continue;
+            }
+            const entry = try identities.getOrPutContext(arena, .{ .ptr = @intFromPtr(source.bytes.ptr), .len = source.bytes.len, .mime = source.content_type.slice() }, .{});
+            if (!entry.found_existing) {
+                payload_bytes = std.math.add(usize, payload_bytes, source.bytes.len) catch return error.BodyTooLarge;
+                if (payload_bytes > limits.max_total_attachment_bytes) return error.BodyTooLarge;
+                entry.value_ptr.* = payloads.items.len;
+                try payloads.append(arena, .{ .mime_type = source.content_type.slice(), .data = source.bytes.slice() });
+            }
+            slot.* = entry.value_ptr.*;
         }
         const refs = try arena.alloc(AttachmentRef, context.attachment_refs_len);
         for (refs, 0..) |*ref, i| {
             const source = context.attachment_refs.?[i];
-            if (source.attachment_index >= payloads.len) return error.InvalidInput;
+            if (source.attachment_index >= slots.len) return error.InvalidInput;
             ref.* = .{ .attachment_index = source.attachment_index, .item_index = source.item_index, .item_id = source.item_id.slice(), .source_fingerprint = source.source_fingerprint.slice(), .page_number = if (source.has_page_number != 0) source.page_number else null };
         }
-        if (try attachments.encodedSize(context.request_json.slice(), payloads) > @import("antfly_inference_worker_rpc").max_body_bytes) return error.BodyTooLarge;
+        if (try attachments.encodedSize(context.request_json.slice(), payloads.items) > @import("antfly_inference_worker_rpc").max_body_bytes) return error.BodyTooLarge;
         return .{
-            .options = .{ .operation = context.operation, .deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null, .numeric = context.out_numeric_result != null, .attachment_refs = refs },
-            .body = try attachments.encodeSegmentsAlloc(arena, context.request_json.slice(), payloads),
+            .options = .{ .operation = context.operation, .deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null, .numeric = context.out_numeric_result != null, .attachment_refs = refs, .payload_slots = if (payloads.items.len == slots.len) &.{} else slots },
+            .body = try attachments.encodeSegmentsAlloc(arena, context.request_json.slice(), payloads.items),
         };
     }
 };
@@ -415,4 +500,196 @@ test "native checkpoint worker streaming stays limited to exact POST resume rout
         try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/generate/context/checkpoint"));
         try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/chat/completions"));
     }
+}
+
+test "inference worker canonical generation requires the matching startup protocol" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var handle: ?*anyopaque = null;
+    var create: Create = .{
+        .data_dir = "fixture",
+        .models_dir = null,
+        .ml_dir = null,
+        .host_limit_bytes = 4096,
+        .backend_limit_bytes = 4096,
+        .combined_limit_bytes = 4096,
+        .kv_limit_bytes = 4096,
+        .scratch_limit_bytes = 4096,
+        .process_memory_limit_bytes = 4096,
+        .process_memory_limit_provenance = .explicit,
+        .preload = &.{},
+        .keep_alive = null,
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 1,
+        .content_security_json = null,
+        .s3_credentials_json = null,
+        .runtime_config_json = "{}",
+    };
+    create.protocol_version = version - 1;
+    try std.testing.expectError(error.UnsupportedVersion, create.toContext(a, &io, &handle));
+    create.protocol_version = version;
+    const context = try create.toContext(a, &io, &handle);
+    defer if (context.preload_ptr) |ptr| a.free(ptr[0..context.preload_len]);
+    try std.testing.expectEqual(bridge.abi_version, context.abi_version);
+}
+
+test "inference worker canonical generation metadata admission preserves legacy capacity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var response_handle: ?*anyopaque = null;
+    var response: bridge.String = undefined;
+    var dummy: u8 = 0;
+    var png: [68]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&png, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7S8AAAAASUVORK5CYII=");
+    const payloads = [_]bridge.ProviderBinaryPayload{.{ .bytes = .init(&png), .content_type = .init("image/png") }};
+    const refs = [_]bridge.ProviderAttachmentRef{.{ .attachment_index = 0, .item_index = 0 }};
+    const metadata = try a.alloc(u8, 2 * 1024 * 1024);
+    @memset(metadata, 'a');
+    const prefix = "{\"model\":\"fixture\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"";
+    const suffix = "\"},{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"attachment:0\"}]}]}";
+    @memcpy(metadata[0..prefix.len], prefix);
+    @memcpy(metadata[metadata.len - suffix.len ..], suffix);
+    var context: bridge.ProviderInvokeContext = .{
+        .abi_version = bridge.abi_version,
+        .handle = &dummy,
+        .operation = @backingInt(bridge.ProviderOperation.generate_json_with_attachments),
+        .request_json = .init(metadata),
+        .deadline_ns = 0,
+        .has_deadline = 0,
+        .out_response_handle = &response_handle,
+        .out_response_json = &response,
+        .binary_payloads = &payloads,
+        .binary_payloads_len = 1,
+        .attachment_refs = &refs,
+        .attachment_refs_len = refs.len,
+    };
+    const input = try ProviderInput.init(a, &context);
+    const body = try std.mem.concat(a, u8, input.body.segments);
+    var parsed = try attachments.parseAlloc(a, body, providerLimits(context.operation));
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(metadata, parsed.metadata);
+    context.operation = @backingInt(bridge.ProviderOperation.generate_messages_with_attachments);
+    _ = try ProviderInput.init(a, &context);
+    context.operation = @backingInt(bridge.ProviderOperation.embed_dense_rasters);
+    try std.testing.expectError(error.BodyTooLarge, ProviderInput.init(a, &context));
+    context.operation = @backingInt(bridge.ProviderOperation.generate_json_with_attachments);
+    context.request_json.len = providerLimits(context.operation).max_metadata_bytes + 1;
+    // Admission checks lengths before touching oversized caller buffers.
+    try std.testing.expectError(error.BodyTooLarge, ProviderInput.init(a, &context));
+}
+
+test "inference worker shared payload table preserves logical slots and rejects malformed maps" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var response_handle: ?*anyopaque = null;
+    var response: bridge.String = undefined;
+    var dummy: u8 = 0;
+    const bytes = try a.alloc(u8, 1024 * 1024);
+    @memset(bytes, 123);
+    var payloads: [8]bridge.ProviderBinaryPayload = @splat(.{ .bytes = .init(bytes), .content_type = .init("image/png") });
+    const refs = [_]bridge.ProviderAttachmentRef{.{ .attachment_index = 7, .item_index = 4, .item_id = .init("authorized-reference") }};
+    const context: bridge.ProviderInvokeContext = .{
+        .abi_version = bridge.abi_version,
+        .handle = &dummy,
+        .operation = @backingInt(bridge.ProviderOperation.generate_json_with_attachments),
+        .request_json = .init("{}"),
+        .deadline_ns = 0,
+        .has_deadline = 0,
+        .out_response_handle = &response_handle,
+        .out_response_json = &response,
+        .binary_payloads = &payloads,
+        .binary_payloads_len = payloads.len,
+        .attachment_refs = &refs,
+        .attachment_refs_len = refs.len,
+    };
+    const input = try ProviderInput.init(a, &context);
+    const slab = try std.mem.concat(a, u8, input.body.segments);
+    // One payload's bytes plus framing, rather than eight megabytes.
+    try std.testing.expect(slab.len < bytes.len + 1024);
+    var decoded = try attachments.parseAlloc(a, slab, providerLimits(context.operation));
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.attachments.len);
+    const options = try std.json.parseFromSliceLeaky(Provider, a, try std.json.Stringify.valueAlloc(a, input.options, .{}), .{});
+    const expanded = try options.expandPayloads(a, decoded.attachments);
+    try std.testing.expectEqual(@as(usize, 8), expanded.len);
+    for (expanded) |payload| {
+        try std.testing.expectEqual(expanded[0].bytes.ptr, payload.bytes.ptr);
+        try std.testing.expectEqualStrings(bytes, payload.bytes.slice());
+    }
+    try std.testing.expectEqual(@as(usize, 7), options.attachment_refs[0].attachment_index);
+    var invalid = options;
+    invalid.payload_slots = &.{1};
+    try std.testing.expectError(error.InvalidInput, invalid.expandPayloads(a, decoded.attachments));
+    invalid.payload_slots = &.{};
+    try std.testing.expectError(error.InvalidInput, invalid.expandPayloads(a, decoded.attachments));
+    invalid = options;
+    const two = try a.dupe(attachments.Attachment, &.{ decoded.attachments[0], decoded.attachments[0] });
+    try std.testing.expectError(error.InvalidInput, invalid.expandPayloads(a, two));
+    // Representation identity includes MIME; sharing never changes its meaning.
+    payloads[7].content_type = .init("image/jpeg");
+    const distinct = try ProviderInput.init(a, &context);
+    const mixed = try std.mem.concat(a, u8, distinct.body.segments);
+    var mixed_decoded = try attachments.parseAlloc(a, mixed, providerLimits(context.operation));
+    defer mixed_decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), mixed_decoded.attachments.len);
+}
+
+test "inference worker shared codec transfer benchmark" {
+    if (!@import("antfly_platform").env.getenvBool("ANTFLY_BENCH_SOURCE_MEDIA")) return error.SkipZigTest;
+    var corpus = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer corpus.deinit();
+    const a = corpus.allocator();
+    const size = 1024 * 1024;
+    const distinct = try a.alloc([]const u8, 8);
+    for (distinct, 0..) |*bytes, i| {
+        const data = try a.alloc(u8, size);
+        @memset(data, @intCast(i));
+        bytes.* = data;
+    }
+    for ([_]usize{ 1, 2, 8 }) |count| for (0..7) |round| for (0..2) |slot| {
+        const shared = (if (round % 2 == 0) slot else 1 - slot) == 1;
+        var measured = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{});
+        const started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        var wire_bytes: usize = 0;
+        for (0..16) |_| {
+            var arena = std.heap.ArenaAllocator.init(measured.allocator());
+            defer arena.deinit();
+            const temp = arena.allocator();
+            const payloads = try temp.alloc(bridge.ProviderBinaryPayload, count);
+            const refs = try temp.alloc(bridge.ProviderAttachmentRef, count);
+            for (payloads, refs, 0..) |*payload, *ref, i| {
+                payload.* = .{ .bytes = .init(distinct[if (shared) 0 else i]), .content_type = .init("image/png") };
+                ref.* = .{ .attachment_index = i, .item_index = i };
+            }
+            var response_handle: ?*anyopaque = null;
+            var response: bridge.String = undefined;
+            var dummy: u8 = 0;
+            const input = try ProviderInput.init(temp, &.{
+                .abi_version = bridge.abi_version,
+                .handle = &dummy,
+                .operation = @backingInt(bridge.ProviderOperation.generate_json_with_attachments),
+                .request_json = .init("{}"),
+                .deadline_ns = 0,
+                .has_deadline = 0,
+                .out_response_handle = &response_handle,
+                .out_response_json = &response,
+                .binary_payloads = payloads.ptr,
+                .binary_payloads_len = count,
+                .attachment_refs = refs.ptr,
+                .attachment_refs_len = count,
+            });
+            const metadata = try std.json.Stringify.valueAlloc(temp, input.options, .{});
+            const slab = try std.mem.concat(temp, u8, input.body.segments);
+            wire_bytes = slab.len + metadata.len;
+            const options = try std.json.parseFromSliceLeaky(Provider, temp, metadata, .{});
+            var decoded = try attachments.parseAlloc(temp, slab, providerLimits(options.operation));
+            defer decoded.deinit();
+            const logical = try options.expandPayloads(temp, decoded.attachments);
+            for (logical, 0..) |payload, i| try std.testing.expectEqualStrings(distinct[if (shared) 0 else i], payload.bytes.slice());
+        }
+        try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+        std.debug.print("antfly_bench_worker_media codec_bytes={d} references={d} round={d} mode={s} iterations=16 ns={d} allocated_bytes={d} wire_bytes={d}\n", .{ size, count, round, if (shared) "shared" else "distinct", std.Io.Clock.awake.now(std.testing.io).nanoseconds - started, measured.allocated_bytes, wire_bytes });
+    };
 }

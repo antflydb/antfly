@@ -71,6 +71,7 @@ const ExecutionOptions = struct {
     operation: ?[]const u8 = null,
     attachments: ?[]const httpx.attachment_envelope.Attachment = null,
     source_port: ?source_media.Port = null,
+    verified_media: []const @import("antfly_inference_execution_context").VerifiedMedia = &.{},
     authorization: ?[]const u8 = null,
     attempt_observer: ?httpx.AttemptObserver = null,
 };
@@ -392,7 +393,18 @@ fn executeBounded(server: anytype, ctx: *httpx.Context, task: gateway.Task, back
     var execution = options;
     execution.attachments = payload.attachments;
     const request = payload.value;
-    try source_media.resolve(a, request, execution.source_port);
+    const Policy = struct {
+        server: @TypeOf(server),
+        task: gateway.Task,
+        fn retain(raw: *anyopaque, value: Json) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return retainVerifiedForNative(self.server, self.task, value);
+        }
+    };
+    var policy = Policy{ .server = server, .task = task };
+    var media_lease = try source_media.resolveForExecution(a, request, execution.source_port, .{ .ptr = &policy, .retain = Policy.retain, .typed_payloads = if (server.antfly_provider) |provider| provider.accepts_verified_media_handles else false });
+    execution.verified_media = media_lease.verified;
+    defer media_lease.deinit();
     if (request != .object) return error.InvalidInferenceRequest;
     if (try generatedSelector(task, request)) |model| return executeGenerated(server, ctx, task, a, request, model, execution);
     var effective = request;
@@ -407,6 +419,41 @@ fn executeBounded(server: anytype, ctx: *httpx.Context, task: gateway.Task, back
     const target = try named.resolve(task, model, raw_models);
     if (target == .configured and target.configured.chain) return executeChain(server, ctx, a, request, named, target.configured.name, execution);
     return executeResolved(server, ctx, task, a, effective, named, target, null, false, 1, execution);
+}
+
+// A request-local allocation decision only. Model errors and every source
+// authorization/content check still follow their established execution path.
+fn retainVerifiedForNative(server: anytype, task: gateway.Task, request: Json) bool {
+    if (request != .object) return false;
+    // Raw generated /decisions envelopes do not advertise binary attachment
+    // transport. Named generated deciders reach the compatible generator below.
+    if ((generatedSelector(task, request) catch return false) != null) return false;
+    const actual = task;
+    const id = if (request.object.get("model")) |v| if (v == .string) v.string else return false else return false;
+    const named = view(server) catch return false;
+    const target = named.resolve(actual, id, &.{}) catch return false;
+    switch (target) {
+        .local, .connection => return false,
+        .configured => |binding| {
+            if (binding.chain) return false;
+            if (actual == .generate) {
+                const cfg = named.providers.getGeneratorConfig(binding.name) catch return false;
+                return cfg.provider == .antfly and cfg.url.len == 0 and cfg.rate_limit == null and server.antfly_provider != null;
+            }
+            if (actual == .decide and server.antfly_provider != null) {
+                // The decision runtime resolves its configured default endpoint
+                // before creating a generator. Do not retain codec buffers if
+                // that route will use a remote JSON transport instead.
+                if (server.cfg.node_config) |config| if (config.inference.api_url) |url| {
+                    if (url.len != 0) return false;
+                };
+                const cfg = named.providers.getDeciderConfig(binding.name) catch return false;
+                const generator = cfg.generator orelse return false;
+                return cfg.decision_method == .generated and generator.provider == .antfly and generator.url.len == 0 and generator.rate_limit == null;
+            }
+            return false;
+        },
+    }
 }
 
 fn generatedSelector(task: gateway.Task, request: Json) !?[]const u8 {
@@ -615,7 +662,8 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
     defer if (caller_owns_admission) server.releaseInference();
     var client = httpx.Client.initWithConfig(a, server.inferenceIo(), .{ .keep_alive = false });
     defer client.deinit();
-    const executor = executorFor(server, ctx, &client, named, generator_override);
+    var executor = executorFor(server, ctx, &client, named, generator_override);
+    executor.context.verified_media = execution_options.verified_media;
     const name = target.configured.name;
     switch (task) {
         .generate => {
@@ -1605,8 +1653,10 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
     var transport = bridge.Outbound{ .context = ctx };
     const observed = observation.stream(transport.stream());
     var guard = tasks.FallbackSink{ .downstream = observed };
-    const encoded = try payloads.encodeMetadata(ctx.allocator, body, options.attachments);
-    defer if (options.attachments != null) ctx.allocator.free(encoded);
+    const execution_context = @import("antfly_inference_execution_context");
+    var framed = try execution_context.encodeVerifiedGenerateSegments(ctx.allocator, ctx.allocator, body, options.attachments, options.verified_media);
+    defer framed.deinit(ctx.allocator);
+    const encoded = framed.bytes;
     var owned_client: ?httpx.Client = null;
     defer if (owned_client) |*client| client.deinit();
     const client: ?*httpx.Client = if (owner == .target) null else if (std.mem.eql(u8, operation, "read"))
@@ -1615,7 +1665,7 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
         owned_client = httpx.Client.initWithConfig(ctx.allocator, server.inferenceIo(), .{ .keep_alive = false });
         break :blk &owned_client.?;
     };
-    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = if (options.attachments != null) httpx.attachment_envelope.content_type else "application/json", .attempt_observer = observeAttempt(ctx, options.attempt_observer) }) catch |err| {
+    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = framed.content_type, .body_segments = if (framed.segments) |segments| segments.segments else null, .attempt_observer = observeAttempt(ctx, options.attempt_observer) }) catch |err| {
         if (transport.started or guard.committed) return error.InferenceResponseCommitted;
         return guard.failure orelse err;
     };
@@ -1660,7 +1710,10 @@ fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, a
     try headers.append(a, .{ "X-Antfly-Inference-Attempts-Remaining", "1" });
     try headers.append(a, .{ "X-Antfly-Inference-Timeout-Ms", timeout_header });
     if (authorization) |value| try headers.append(a, .{ "Authorization", value });
-    const encoded = try payloads.encodeMetadata(a, body, execution_options.attachments);
+    const execution_context = @import("antfly_inference_execution_context");
+    var rendered = try execution_context.materializeVerifiedJson(a, body, execution_options.verified_media);
+    defer rendered.deinit(a);
+    const encoded = try payloads.encodeMetadata(a, rendered.bytes, execution_options.attachments);
     defer if (execution_options.attachments != null) a.free(encoded);
     try headers.append(a, .{ "Content-Type", if (execution_options.attachments != null) httpx.attachment_envelope.content_type else "application/json" });
     const options = httpx.RequestOptions{
@@ -2053,5 +2106,32 @@ test "httpx inference gateway timeout outcomes distinguish admission send proof 
         try std.testing.expectEqual(phase == 0, failure.get("retryable").?.bool);
         const submitted = failure.get("upstream_submitted").?;
         if (phase == 1) try std.testing.expect(submitted == .null) else try std.testing.expectEqual(phase == 2, submitted.bool);
+    }
+}
+
+test "httpx inference gateway retains verified bytes only for the effective linked route" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const decider = try std.json.parseFromSliceLeaky(Json, arena.allocator(), "{\"model\":\"deciders/vision\"}", .{});
+    const generator = try std.json.parseFromSliceLeaky(Json, arena.allocator(), "{\"model\":\"generators/vision\"}", .{});
+    const Config = sources.common_config.Config;
+    const Server = struct { cfg: struct { node_config: ?*Config }, antfly_provider: ?u8 = 1 };
+    for ([_]struct { config: []const u8, linked_decision: bool }{
+        .{ .config = "{}", .linked_decision = true },
+        .{ .config = "{\"inference\":{\"api_url\":\"http://remote.invalid\"}}", .linked_decision = false },
+    }) |case| {
+        var config = try Config.parseFromSlice(a, case.config);
+        defer config.deinit();
+        try config.registry.registerDeciderConfig("vision", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only });
+        try config.registry.registerGeneratorConfig("vision", .{ .provider = .antfly, .model = "vision", .url = "" });
+        var server = Server{ .cfg = .{ .node_config = &config } };
+        try std.testing.expectEqual(case.linked_decision, retainVerifiedForNative(&server, .decide, decider));
+        // The generation executor deliberately gives a linked callback
+        // precedence over its default endpoint; keep that distinction.
+        try std.testing.expect(retainVerifiedForNative(&server, .generate, generator));
+        server.antfly_provider = null;
+        try std.testing.expect(!retainVerifiedForNative(&server, .decide, decider));
+        try std.testing.expect(!retainVerifiedForNative(&server, .generate, generator));
     }
 }

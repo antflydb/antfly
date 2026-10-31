@@ -239,12 +239,19 @@ pub const Cursor = struct {
 /// copy the current pending overlay; cursor fallbacks use their cursor view.
 pub const RangeRequest = @import("value_ranges.zig").Request;
 pub const ValueRange = @import("value_ranges.zig").Range;
+pub const ReadControl = @import("value_ranges.zig").ReadControl;
+/// Ownership and physical work differ: a cursor can copy selected spans while
+/// still reading a complete value. Unknown adapters retain conservative costs.
+pub const RangeReadMode = enum(u8) { full_value, selected_copy, selected_read };
 pub const ReadScope = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
     const VTable = struct {
+        /// Only copied range results remain scope-owned. Engine/cache and the
+        /// cursor's current borrowed value have their own bounded owners.
+        range_read_mode: ?RangeReadMode = null,
         get_ranges_many: ?*const fn (*anyopaque, []const RangeRequest) anyerror!void = null,
         get_ranges: ?*const fn (*anyopaque, []const u8, []const ValueRange, [][]const u8) anyerror!void = null,
         get_range: ?*const fn (*anyopaque, []const u8, u64, usize) anyerror![]const u8 = null,
@@ -264,18 +271,37 @@ pub const ReadScope = struct {
         visit_prepared_scores: ?*const fn (*anyopaque, *@import("prepared_score_plan.zig").PreparedScorePlan, backend_types.CompleteScoreSink) anyerror!void = null,
         get_many_sorted_scores: ?*const fn (*anyopaque, []const []const u8, []?f64) anyerror!void = null,
         get_into: ?*const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 = null,
+        get_ranges_many_controlled: ?*const fn (*anyopaque, []const RangeRequest, ReadControl) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     /// Sorted document keys share one index traversal on capable backends.
     pub fn getRangesMany(self: *@This(), requests: []const RangeRequest) !void {
+        return self.getRangesManyControlled(requests, .{});
+    }
+    /// Capable engines retain one batch owner and poll before each whole-value
+    /// read. Legacy adapters keep their bounded-batch or per-key fallback.
+    pub fn getRangesManyControlled(self: *@This(), requests: []const RangeRequest, control: ReadControl) !void {
         if (requests.len > 64) return error.InvalidBatch;
         if (requests.len == 0) return;
         for (requests, 0..) |request, i| {
             if (request.ranges.len != request.output.len or request.ranges.len > @import("value_ranges.zig").maximum_ranges) return error.InvalidBatch;
             if (i != 0 and std.mem.order(u8, requests[i - 1].key, request.key) == .gt) return error.InvalidBatch;
         }
-        if (self.vtable.get_ranges_many) |read| return BoundaryAbi.call("get_ranges_many", self.boundary_dispatch, read, .{ self.ptr, requests });
-        for (requests) |request| try self.getRanges(request.key, request.ranges, request.output);
+        try control.check();
+        if (self.vtable.get_ranges_many_controlled) |read| return BoundaryAbi.call("get_ranges_many_controlled", self.boundary_dispatch, read, .{ self.ptr, requests, control });
+        if (self.vtable.get_ranges_many) |read| {
+            if (control.poll == null or self.rangeReadMode() == .selected_read)
+                return BoundaryAbi.call("get_ranges_many", self.boundary_dispatch, read, .{ self.ptr, requests });
+            for (requests) |request| {
+                try control.check();
+                try BoundaryAbi.call("get_ranges_many", self.boundary_dispatch, read, .{ self.ptr, @as([]const RangeRequest, &.{request}) });
+            }
+            return;
+        }
+        for (requests) |request| {
+            try control.check();
+            try self.getRanges(request.key, request.ranges, request.output);
+        }
     }
     pub fn getRanges(self: *@This(), key: []const u8, ranges: []const ValueRange, output: [][]const u8) !void {
         if (ranges.len != output.len or ranges.len > @import("value_ranges.zig").maximum_ranges) return error.InvalidBatch;
@@ -287,8 +313,18 @@ pub const ReadScope = struct {
             out.* = bytes[@intCast(range.offset)..][0..range.length];
         }
     }
-    pub fn supportsRange(self: *const @This()) bool {
+    /// Legacy range-capable adapters keep their existing planning hint. New
+    /// selected-copy adapters must not enlarge physical-I/O windows: their
+    /// copied output is small, but each point read still visits a whole value.
+    pub fn supportsSelectedRangeIo(self: *const @This()) bool {
+        if (self.vtable.range_read_mode) |mode| return mode == .selected_read;
         return self.vtable.get_range != null;
+    }
+    pub fn rangeReadMode(self: *const @This()) RangeReadMode {
+        return self.vtable.range_read_mode orelse .full_value;
+    }
+    pub fn retainsSelectedRanges(self: *const @This()) bool {
+        return self.rangeReadMode() != .full_value;
     }
     pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
         const read_range = self.vtable.get_range orelse return error.Unsupported;
@@ -434,6 +470,10 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getRangesMany(requests);
         }
+        fn getRangesManyControlled(ptr: *anyopaque, requests: []const RangeRequest, control: ReadControl) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.getRangesManyControlled(requests, control);
+        }
         fn getRanges(ptr: *anyopaque, key: []const u8, ranges: []const ValueRange, output: [][]const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getRanges(key, ranges, output);
@@ -531,7 +571,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try a.create(State);
     state.* = .{ .handle = handle, .parent = parent, .admission = admission };
-    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get_ranges_many = if (@hasDecl(@TypeOf(handle), "getRangesMany")) State.getRangesMany else null, .get_ranges = if (@hasDecl(@TypeOf(handle), "getRanges")) State.getRanges else null, .get_range = if (@hasDecl(@TypeOf(handle), "getRange")) State.getRange else null, .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    return .{ .allocator = a, .ptr = state, .vtable = comptime &.{ .range_read_mode = if (@hasDecl(@TypeOf(handle), "range_read_mode")) @TypeOf(handle).range_read_mode else null, .get_ranges_many = if (@hasDecl(@TypeOf(handle), "getRangesMany")) State.getRangesMany else null, .get_ranges_many_controlled = if (@hasDecl(@TypeOf(handle), "getRangesManyControlled")) State.getRangesManyControlled else null, .get_ranges = if (@hasDecl(@TypeOf(handle), "getRanges")) State.getRanges else null, .get_range = if (@hasDecl(@TypeOf(handle), "getRange")) State.getRange else null, .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies
@@ -544,6 +584,31 @@ pub fn cursorReadScope(alloc: Allocator, cursor: Cursor) !ReadScope {
             const entry = (try self.cursor.seekAtOrAfter(key)) orelse return error.NotFound;
             if (!std.mem.eql(u8, entry.key, key)) return error.NotFound;
             return self.scratch.allocator().dupe(u8, entry.value);
+        }
+        pub const range_read_mode = RangeReadMode.selected_copy;
+        pub fn getRanges(self: *@This(), key: []const u8, ranges: []const ValueRange, output: [][]const u8) !void {
+            if (ranges.len != output.len) return error.InvalidBatch;
+            if (ranges.len == 0) return;
+            const entry = (try self.cursor.seekAtOrAfter(key)) orelse return error.NotFound;
+            if (!std.mem.eql(u8, entry.key, key)) return error.NotFound;
+            const Copy = struct {
+                a: Allocator,
+                bytes: []const u8,
+                pub fn read(ctx: @This(), start: usize, len: usize) ![]const u8 {
+                    return ctx.a.dupe(u8, ctx.bytes[start..][0..len]);
+                }
+            };
+            // Cursor bytes are borrowed only until its next move. Copy selected
+            // coalesced spans now, instead of retaining the whole document.
+            try @import("value_ranges.zig").read(entry.value.len, ranges, output, Copy{ .a = self.scratch.allocator(), .bytes = entry.value });
+        }
+        pub fn getRangesMany(self: *@This(), requests: []const RangeRequest) !void {
+            for (requests) |request| try self.getRanges(request.key, request.ranges, request.output);
+        }
+        pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
+            var output: [1][]const u8 = undefined;
+            try self.getRanges(key, &.{.{ .offset = offset, .length = length }}, &output);
+            return output[0];
         }
         pub fn reset(self: *@This()) void {
             self.scratch.reset();
@@ -572,6 +637,8 @@ pub const ReadTxn = struct {
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
+        /// Immutable planning metadata; discovery must not require opening a scope.
+        read_scope_range_mode: ?RangeReadMode = null,
         decoded_results_namespace: ?*const fn (*anyopaque) ?[]const u8 = null,
         can_reuse_decoded_results: ?*const fn (*anyopaque) bool = null,
         abort: *const fn (Allocator, *anyopaque) void,
@@ -630,6 +697,10 @@ pub const ReadTxn = struct {
 
     pub fn forkBorrowedRead(self: *ReadTxn) !ReadTxn {
         return self.forkRead();
+    }
+
+    pub fn readScopeRangeMode(self: *const ReadTxn) ?RangeReadMode {
+        return if (self.vtable.open_read_scope == null) .selected_copy else self.vtable.read_scope_range_mode;
     }
 
     pub fn openReadScope(self: *ReadTxn, alloc: Allocator) !ReadScope {
@@ -1585,6 +1656,18 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
     };
 }
 
+// Capabilities describe the actual returned scope type, not a backing store
+// hidden behind an adapter. Erased/custom scopes remain unknown and conservative.
+fn readScopeModeFor(comptime Handle: type) ?RangeReadMode {
+    if (!@hasDecl(Handle, "openReadScope")) return .selected_copy;
+    const Return = @typeInfo(@TypeOf(Handle.openReadScope)).@"fn".return_type orelse return null;
+    const Scope = switch (@typeInfo(Return)) {
+        .error_union => |value| value.payload,
+        else => Return,
+    };
+    return if (@hasDecl(Scope, "range_read_mode")) Scope.range_read_mode else null;
+}
+
 pub fn readTxnFrom(allocator: Allocator, handle: anytype) !ReadTxn {
     return readTxnFromWithParent(allocator, handle, null);
 }
@@ -1667,7 +1750,10 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
         .allocator = wrapper_box_allocator,
         .ptr = box_ptr,
         .identity = newReadTransactionIdentity(),
-        .vtable = &.{
+        // The type-only helper is explicitly evaluated at compile time. A
+        // runtime initializer would put this escaping table on the stack.
+        .vtable = comptime &.{
+            .read_scope_range_mode = readScopeModeFor(Handle),
             .decoded_results_namespace = if (@hasDecl(Handle, "decodedResultsNamespace")) vt.decodedResultsNamespace else null,
             .can_reuse_decoded_results = if (@hasDecl(Handle, "canReuseDecodedResults")) vt.canReuseDecodedResults else null,
             .abort = vt.abort,
@@ -3427,4 +3513,46 @@ test "foreign replay visitors preserve consumer failures and resume rejected ent
         state.fail_read = false;
     }
     try std.testing.expect(Foreign.calls > 0);
+}
+
+test "logical value cursor range retention copies spans and survives later seeks" {
+    const Fake = struct {
+        bytes: [32768]u8 = undefined,
+        closed: bool = false,
+        fn close(_: Allocator, raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed = true;
+        }
+        fn empty(_: *anyopaque) anyerror!?Entry {
+            return null;
+        }
+        fn seek(raw: *anyopaque, key: []const u8) anyerror!?Entry {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.mem.eql(u8, key, "a") and !std.mem.eql(u8, key, "b")) return null;
+            @memset(&self.bytes, key[0]);
+            return .{ .key = key, .value = &self.bytes };
+        }
+    };
+    var fake: Fake = .{};
+    var storage: [8192]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var scope = try cursorReadScope(fixed.allocator(), .{ .allocator = fixed.allocator(), .ptr = &fake, .vtable = &.{ .close = Fake.close, .first = Fake.empty, .last = Fake.empty, .next = Fake.empty, .prev = Fake.empty, .seek_at_or_after = Fake.seek, .seek_at_or_before = Fake.seek } });
+    defer scope.close();
+    try std.testing.expect(scope.retainsSelectedRanges());
+    try std.testing.expect(!scope.supportsSelectedRangeIo());
+    // The allocator cannot hold even one complete 32 KiB value.
+    const a = try scope.getRange("a", 0, 2);
+    const b = try scope.getRange("b", 32766, 2);
+    try std.testing.expectEqualStrings("aa", a);
+    try std.testing.expectEqualStrings("bb", b);
+    var outputs: [2][1][]const u8 = undefined;
+    try scope.getRangesMany(&.{
+        .{ .key = "a", .ranges = &.{.{ .offset = 4, .length = 3 }}, .output = &outputs[0] },
+        .{ .key = "b", .ranges = &.{.{ .offset = 8, .length = 3 }}, .output = &outputs[1] },
+    });
+    try std.testing.expectEqualStrings("aaa", outputs[0][0]);
+    try std.testing.expectEqualStrings("bbb", outputs[1][0]);
+    try std.testing.expectEqualStrings("aa", a);
+    try std.testing.expectError(error.EndOfStream, scope.getRange("a", 32768, 1));
+    try std.testing.expectError(error.NotFound, scope.getRange("absent", 0, 1));
 }

@@ -3655,6 +3655,125 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 return getFromReadView(p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, &self.last_l0_group_index, &self.read_hint, &self.held_blocks, &self.held_values, self.allocator, p.namespace, key);
             }
 
+            pub const range_read_mode = backend_erased.RangeReadMode.selected_copy;
+
+            // This exact snapshot pins memtables and run generations. Borrow
+            // point values only until their selected spans have been copied;
+            // full get() retains its existing result-ownership contract.
+            fn getRangeValue(self: *@This(), key: []const u8) ![]const u8 {
+                const p = self.parent;
+                var namespace = p.namespace;
+                namespace.own_source_point_results = false;
+                namespace.borrow_local_point_results = true;
+                namespace.transient_point_result = true;
+                p.backend.recordPointGet();
+                return getFromReadView(p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, &self.last_l0_group_index, &self.read_hint, &self.held_blocks, &self.held_values, self.allocator, namespace, key);
+            }
+
+            pub fn getRanges(self: *@This(), key: []const u8, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
+                if (ranges.len != output.len) return error.InvalidBatch;
+                if (ranges.len == 0) return;
+                // Pins and any complete point-result copy belong to one
+                // temporary storage working-set owner, never the output scope.
+                var work = PointReadScratch.init(self.parent.backend);
+                defer work.deinit();
+                var temporary: @This() = .{ .parent = self.parent, .allocator = work.allocator(), .last_l0_group_index = self.last_l0_group_index };
+                defer temporary.close();
+                self.getRangesUsing(&temporary, key, ranges, output) catch |err| return work.failure(err);
+            }
+            fn getRangesUsing(self: *@This(), temporary: *@This(), key: []const u8, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
+                const value = try temporary.getRangeValue(key);
+                self.last_l0_group_index = temporary.last_l0_group_index;
+                const Owner = @This();
+                const Copy = struct {
+                    owner: *Owner,
+                    bytes: []const u8,
+                    pub fn read(ctx: @This(), begin: usize, len: usize) ![]const u8 {
+                        return copyPointValue(ctx.owner.parent.backend, ctx.owner.allocator, &ctx.owner.held_values, ctx.bytes[begin..][0..len]);
+                    }
+                };
+                try @import("../value_ranges.zig").read(value.len, ranges, output, Copy{ .owner = self, .bytes = value });
+            }
+            pub fn getRangesMany(self: *@This(), requests: []const @import("../value_ranges.zig").Request) !void {
+                return self.getRangesManyControlled(requests, .{});
+            }
+            pub fn getRangesManyControlled(self: *@This(), requests: []const @import("../value_ranges.zig").Request, control: @import("../value_ranges.zig").ReadControl) !void {
+                if (requests.len > 64) return error.InvalidBatch;
+                for (requests, 0..) |request, i| {
+                    if (request.ranges.len != request.output.len or request.ranges.len > @import("../value_ranges.zig").maximum_ranges) return error.InvalidBatch;
+                    if (i != 0 and std.mem.order(u8, requests[i - 1].key, request.key) == .gt) return error.InvalidBatch;
+                }
+                if (requests.len == 0) return;
+                try control.check();
+                // Reuse the existing snapshot cost model. Dense sorted keys
+                // share one merge cursor, run indexes and loaded blocks; sparse
+                // keys retain directory point routing. Monotone indexed seeks
+                // skip holes without decoding intervening document values.
+                var keys: [64][]const u8 = undefined;
+                var key_count: usize = 0;
+                for (requests) |request| if (request.ranges.len != 0) {
+                    keys[key_count] = request.key;
+                    key_count += 1;
+                };
+                if (chooseMultiGetPlan(keys[0..key_count], .snapshot) == .cursor) {
+                    return self.getRangesFromSortedCursor(requests, control);
+                }
+                var work = PointReadScratch.init(self.parent.backend);
+                defer work.deinit();
+                var temporary: @This() = .{ .parent = self.parent, .allocator = work.allocator(), .last_l0_group_index = self.last_l0_group_index };
+                defer temporary.close();
+                for (requests) |request| {
+                    if (request.ranges.len == 0) continue;
+                    try control.check();
+                    // Reuse bounded metadata capacity, never a prior value or
+                    // payload pin. Only the numeric L0 hint survives reset.
+                    defer {
+                        const hint = temporary.last_l0_group_index;
+                        temporary.reset();
+                        temporary.last_l0_group_index = hint;
+                    }
+                    self.getRangesUsing(&temporary, request.key, request.ranges, request.output) catch |err| return work.failure(err);
+                }
+            }
+            fn getRangesFromSortedCursor(self: *@This(), requests: []const @import("../value_ranges.zig").Request, control: @import("../value_ranges.zig").ReadControl) !void {
+                var work = PointReadScratch.init(self.parent.backend);
+                defer work.deinit();
+                return self.copySortedCursorRanges(work.allocator(), requests, control) catch |err| return work.failure(err);
+            }
+            fn copySortedCursorRanges(self: *@This(), scratch: Allocator, requests: []const @import("../value_ranges.zig").Request, control: @import("../value_ranges.zig").ReadControl) !void {
+                const p = self.parent;
+                var namespace = p.namespace;
+                namespace.own_source_point_results = false;
+                namespace.borrow_local_point_results = true;
+                namespace.transient_point_result = true;
+                var cursor = try MergeCursor(@TypeOf(p.backend.*), State).initView(scratch, p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, namespace, false);
+                defer cursor.close();
+                const stats = disableCursorScanValueStats(&cursor);
+                defer restoreCursorScanValueStats(&cursor, stats);
+                for (requests) |request| {
+                    if (request.ranges.len == 0) continue;
+                    try control.check();
+                    p.backend.recordPointGet();
+                    const entry = (try cursor.seekAtOrAfter(request.key)) orelse return error.NotFound;
+                    if (!std.mem.eql(u8, entry.key, request.key)) return error.NotFound;
+                    // Consume borrowed bytes before the next cursor movement.
+                    const Owner = @This();
+                    const Copy = struct {
+                        owner: *Owner,
+                        bytes: []const u8,
+                        pub fn read(ctx: @This(), start: usize, len: usize) ![]const u8 {
+                            return copyPointValue(ctx.owner.parent.backend, ctx.owner.allocator, &ctx.owner.held_values, ctx.bytes[start..][0..len]);
+                        }
+                    };
+                    try @import("../value_ranges.zig").read(entry.value.len, request.ranges, request.output, Copy{ .owner = self, .bytes = entry.value });
+                }
+            }
+            pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
+                var output: [1][]const u8 = undefined;
+                try self.getRanges(key, &.{.{ .offset = offset, .length = length }}, &output);
+                return output[0];
+            }
+
             pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
                 if (keys.len != values.len) return error.InvalidBatch;
                 @memset(values, null);
@@ -8921,6 +9040,40 @@ fn getFromRunWithLocalIndex(
     defer if (!transferred) loaded.deinit(backend.allocator);
     if (loaded.entry.tombstone) return error.NotFound;
     if (loaded.final_point_value) return loaded.entry.value;
+    // Selected-range consumers retire the entire point after copying spans.
+    // Transfer one existing lease, including an oversized/cache-denied block,
+    // rather than duplicating its complete value into the temporary allocator.
+    if (namespace.transient_point_result) if (held_blocks) |pins| if (pins.items.len == 0) {
+        if (loaded.local) |payload| {
+            if (backend.options.resource_manager == null or payload.reservation != null) {
+                try pins.append(backend.allocator, .{ .local = payload });
+                transferred = true;
+                return loaded.entry.value;
+            }
+        } else if (loaded.entry.value.len >= 4096 and loaded.entry.value.len >= loaded.bytes.len / 2) {
+            var credit: ?@import("../resource_manager.zig").Reservation = null;
+            var admitted = true;
+            if (backend.options.resource_manager) |manager| {
+                credit = manager.reserveWithoutReclaim(.lsm_read_working_set, loaded.bytes.len + @sizeOf(SharedBytes)) catch |err| fallback: {
+                    if (err != error.ResourceBudgetExceeded) return err;
+                    // Adoption is optional; a compact value copy may still fit.
+                    admitted = false;
+                    break :fallback null;
+                };
+            }
+            if (admitted) {
+                defer if (credit) |*reserved| reserved.release();
+                try pins.ensureUnusedCapacity(backend.allocator, 1);
+                const payload = try SharedBytes.create(backend.allocator, loaded.bytes);
+                payload.reservation = credit;
+                credit = null;
+                payload.result_pins_allowed = false;
+                pins.appendAssumeCapacity(.{ .local = payload });
+                transferred = true;
+                return loaded.entry.value;
+            }
+        }
+    };
     if (namespace.borrow_local_point_results) if (held_blocks) |pins| if (loaded.local) |payload| {
         if (try retainLocalResultPin(backend, payload, pins)) return loaded.entry.value;
     };

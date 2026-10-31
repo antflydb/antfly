@@ -182,6 +182,7 @@ pub const ProviderOperation = enum(c_int) {
     rerank_documents = 22,
     document_read = 23,
     document_extract = 24,
+    generate_json_with_attachments = 25,
 };
 
 pub const ProviderBinaryPayload = extern struct {
@@ -338,6 +339,7 @@ pub const Capability = struct {
     pub const request_admission: u64 = 1 << 3;
     pub const model_pull: u64 = 1 << 4;
     pub const memory_admission: u64 = 1 << 5;
+    pub const structured_attachments: u64 = 1 << 6;
 };
 
 /// One download progress report from `FunctionTable.pull_model`.
@@ -444,12 +446,12 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         Capability.route_manifest |
         Capability.resource_budget |
         Capability.request_admission |
-        Capability.model_pull | Capability.memory_admission;
+        Capability.model_pull | Capability.memory_admission | Capability.structured_attachments;
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     // Provider lifetime includes destruction even though the invoke operations
     // precede route support in the append-only table.
-    if (required_capabilities & Capability.provider != 0)
+    if (required_capabilities & (Capability.provider | Capability.structured_attachments) != 0)
         required = @max(required, functionTableFieldEnd("destroy"));
     if (required_capabilities & Capability.route_manifest != 0)
         required = @max(required, functionTableFieldEnd("destroy_http_response"));

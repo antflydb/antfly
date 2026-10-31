@@ -532,6 +532,45 @@ Evidence:
 - Production HTTP server construction selects the process request allocator
   internally; request-allocator injection is test-only.
 
+### Selected Range Ownership
+
+Read scopes distinguish whole-value retention, selected copies from a complete
+point value, and native selected-range I/O. The native LSM reader and cursor
+adapter copy selected spans; Lite reads selected ranges. Range-shaped methods
+alone do not prove that physical reads or retained buffers are small.
+
+Selected LSM reads use a temporary point-result owner under storage working-set
+admission. Complete values and block pins retire after each document; returned
+spans use the caller's allocation budget and remain valid until scope reset or
+close. Ordinary full-value reads keep their ownership contract. Revision proofs,
+directories and primary bytes come from the same pinned transaction.
+
+The selected-copy point reader borrows pinned memtables and temporarily adopts
+one decoded block instead of copying its complete value. The transient namespace
+hint is excluded from namespace identity and cannot alter the caller's normal
+full-value API. An adopted local block keeps its existing cache or working-set
+reservation, including when it exceeds the cache's admission ceiling. A wide
+uncached owned result can transfer into a temporary shared owner after admission;
+if that optional reservation is denied, the compact-copy fallback remains valid.
+No second payload may join that transient pin owner. Each document copies its
+selected spans before retiring the loan; multi-range reads reuse metadata
+capacity while releasing payloads and pins between documents. Cache admission,
+snapshot/version checks and selected-span authentication remain unchanged.
+
+Projection windows share a bounded plan between admission and execution,
+including explicit selected-read and full-read decisions. Estimates include
+coalesced spans, reconstruction and setup; logical work still charges original
+source sizes. Whole-value readers check cancellation between documents. Native
+selected I/O keeps its bounded batch walk; other scanners retain their existing
+physical-work limits. Scope modes are immutable vtable metadata, not callbacks;
+read transactions expose known scope capabilities before a scope is allocated.
+Tables built from type-only helpers have explicit compile-time storage. Metadata
+fields are excluded from native method dispatch. Copy-backed projection windows admit at most 1 MiB of
+original values as well as bounding selected work; selected I/O can admit by
+selected work alone. Cached plans use pointers so ordinary fallback rows do not
+carry inline range arrays; temporary authority headers stay in a bounded stack
+array. These limits do not bound backend caches or process RSS.
+
 ## Write Contract
 
 `DB.batch()` is document-first.
@@ -1656,3 +1695,17 @@ Qualify native delivery with `e2e/antfly/bench_source_projection.py` using pinne
 baseline/candidate servers. Its certificate-hit counters establish proof reuse,
 not physical disk-read counts. Remaining metadata, frame layout and ordinary
 source fallback still determine physical I/O.
+
+Selected-copy scopes also expose optional cancellation-aware batching. One
+engine scratch owner serves a bounded sorted batch and polls before every
+whole-value read; per-key resets release payload pins and loans while retaining
+bounded metadata capacity. Erased adapters without this capability retain
+per-key polling. The C polling view is borrowed only for the call and carries
+fixed status codes. Failure leaves partial outputs that the caller must discard.
+
+The [batch and physical-read qualification](../docs/design/antfly-grep.md#batch-cancellation-and-structured-native-media-2026-10-30)
+records 32.3% fewer scratch allocations in its persisted-row fixture. Reopened
+storage probes also confirm that selecting 32 bytes currently reads the same
+checksummed/compressed blocks as a full value. Physical I/O improvements require
+separate integrity-preserving evidence; selected output ownership alone cannot
+justify changing physical-byte admission or introducing a persistent format.

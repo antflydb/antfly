@@ -31,14 +31,14 @@ const Allocator = std.mem.Allocator;
 pub fn validateEvidence(cfg: generating.GeneratorConfig, input: @import("../functions/decision_input.zig").Input) !void {
     try input.validate();
     if (input == .text) return;
-    for (input.messages) |message| {
+    for (input.messageItems()) |message| {
         const content = message.object.get("content").?;
         if (content != .array) continue;
         for (content.array.items) |part| {
             if (!std.mem.eql(u8, part.object.get("type").?.string, "input_image")) continue;
             const url = part.object.get("image_url").?.string;
             if (cfg.provider != .openai) {
-                if (!std.mem.startsWith(u8, url, "data:")) return error.UnsupportedInferenceFeature;
+                if (!std.mem.startsWith(u8, url, "data:") and input.mediaFor(url) == null) return error.UnsupportedInferenceFeature;
                 if (part.object.get("detail")) |detail| if (!std.mem.eql(u8, detail.string, "auto")) return error.UnsupportedInferenceFeature;
             }
         }
@@ -154,16 +154,49 @@ pub const Runtime = struct {
     }
 
     pub fn executeEvidence(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig, mode: constrained.Output, schema: Json, instructions: []const u8, batch: constrained.Batch, inputs: []const Json) !constrained.Result {
-        var backend = Backend{ .runtime = self, .cfg = cfg };
-        return constrained.executeEvidence(a, .{ .limits = self.limits, .ptr = &backend, .invoke = Backend.invoke, .checkpoint = Backend.checkpoint, .validate_item = Backend.validateItem }, mode, schema, instructions, batch, inputs);
+        const media = try @import("../functions/decision_input.zig").Input.descriptors(a, if (self.options.request_context) |ctx| ctx.verified_media else &.{});
+        var backend = Backend{ .runtime = self, .cfg = cfg, .media = media };
+        return constrained.executeEvidence(a, .{ .limits = self.limits, .ptr = &backend, .invoke = Backend.invoke, .checkpoint = Backend.checkpoint, .validate_item = Backend.validateItem, .measure_evidence = if (media.len != 0) Backend.measureEvidence else null }, mode, schema, instructions, batch, inputs);
     }
 
     const Backend = struct {
         runtime: *Runtime,
         cfg: generating.GeneratorConfig,
+        media: []const @import("antfly_decisions").evidence.Media = &.{},
         fn checkpoint(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.runtime.options.request_context) |context| try context.check();
+        }
+        fn measureEvidence(ptr: *anyopaque, a: Allocator, value: Json, measure_pixels: bool) !constrained.EvidenceMeasurement {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const input = try @import("../functions/decision_input.zig").Input.fromJsonWithDescriptors(value, self.media);
+            var cost: constrained.EvidenceCost = .{};
+            for (input.messageItems()) |message| {
+                const content = message.object.get("content").?;
+                if (content != .array) continue;
+                for (content.array.items) |part| {
+                    if (!std.mem.eql(u8, part.object.get("type").?.string, "input_image")) continue;
+                    const url = part.object.get("image_url").?.string;
+                    if (input.mediaFor(url)) |media| {
+                        cost.media_parts += 1;
+                        cost.encoded_media_bytes +|= media.bytes.len;
+                        if (measure_pixels) cost.decoded_pixels = std.math.add(u64, cost.decoded_pixels, media.pixels) catch return error.ConstrainedInputTooLarge;
+                    } else {
+                        // Delegate ordinary URLs to the shared codec inspector.
+                        const single = try a.dupe(Json, &.{message});
+                        var one = message;
+                        one.object = try message.object.clone(a);
+                        var parts = content;
+                        parts.array.items = try a.dupe(Json, &.{part});
+                        parts.array.capacity = 1;
+                        try one.object.put(a, "content", parts);
+                        single[0] = one;
+                        const ordinary = try constrained.evidenceCost(a, .{ .array = .{ .items = single, .capacity = 1, .allocator = a, .pointer_stability = .{} } }, measure_pixels);
+                        cost = cost.add(ordinary);
+                    }
+                }
+            }
+            return .{ .cost = cost, .bytes = try input.byteSize(a) };
         }
         fn validateItem(ptr: *anyopaque, a: Allocator, id: usize, value: Json, proof: ?constrained.TokenEvidence) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -200,7 +233,7 @@ pub const Runtime = struct {
             }
             const schema_text = try std.json.Stringify.valueAlloc(a, request.schema, .{});
             const system = try std.fmt.allocPrint(a, "Return one structured result per input item. Preserve the item IDs exactly. The JSON schema is: {s}", .{schema_text});
-            const messages = try constrained.evidenceMessages(a, request, system, cfg.provider == .openai);
+            const messages = try constrained.evidenceMessagesWithBorrowed(a, request, system, cfg.provider == .openai, if (self.runtime.options.request_context) |context| context.verified_media.len != 0 else false);
             var refreshed = false;
             var result = while (true) {
                 const generated = generating.executeChainWithOptions(a, self.runtime.http, &.{.{ .generator = cfg }}, .{

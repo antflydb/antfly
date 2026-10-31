@@ -65,10 +65,17 @@ pub const Batch = struct {
     rows: []logical.Row = &.{},
     start: usize = 0,
     end: usize = 0,
+    profile: bool = false,
+    attempts: usize = 0,
+    admitted: usize = 0,
+    admitted_rows: usize = 0,
+    planned_rows: usize = 0,
+    preflight_rejects: usize = 0,
     pub fn init(a: A) Batch {
-        return .{ .a = a, .arena = .init(a) };
+        return .{ .a = a, .arena = .init(a), .profile = @import("antfly_platform").env.getenvBool("ANTFLY_BENCH_SOURCE_BATCH") };
     }
     pub fn deinit(self: *Batch) void {
+        if (self.profile) std.log.info("antfly_bench_source_batch attempts={d} admitted={d} rows={d} planned_rows={d} preflight_rejects={d}", .{ self.attempts, self.admitted, self.admitted_rows, self.planned_rows, self.preflight_rejects });
         self.arena.deinit();
     }
     pub fn reset(self: *Batch) void {
@@ -77,35 +84,134 @@ pub const Batch = struct {
         self.start = 0;
         self.end = 0;
     }
+    fn pairFits(authorities: []const conditional.Authority) bool {
+        var remaining: u64 = 1024 * 1024;
+        for (authorities) |authority| {
+            const proof = authority.source.proof orelse return false;
+            if (proof.bytes > remaining) return false;
+            remaining -= proof.bytes;
+        }
+        return true;
+    }
     pub fn at(self: *Batch, txn: *@import("../docstore.zig").DocStore.Txn, index: usize, physical: []const []const u8, ids: []const []const u8, authorities: []const conditional.Authority, req: @import("types.zig").SearchRequest, operands: *const OperandPlans) !?logical.Row {
         if (!req.include_all_fields and operands.read_set.len == 0) return null;
         if (index < self.end) return self.rows[index - self.start];
         self.reset();
-        var end = index;
-        var bytes: usize = 0;
-        while (end < ids.len) : (end += 1) {
-            const proof = authorities[end].source.proof orelse break;
-            const count = std.math.cast(usize, proof.bytes) orelse break;
-            if (count > 1024 * 1024 -| bytes) break;
-            bytes += count;
+        const full = req.include_all_fields or operands.full_read or operands.read_set.len > 64;
+        const capacity = @min(ids.len - index, 64);
+        if (capacity < 2) return null;
+        if (self.profile) self.attempts += 1;
+        const first = authorities[index].source.proof orelse return null;
+        // Capability metadata is available before opening a scope. Unsupported
+        // and whole-value adapters keep the original cheap per-row fallback.
+        if (first.bytes > 1024 * 1024 and
+            (full or (if (txn.readScopeRangeMode()) |hint| hint != .selected_read else false)))
+        {
+            if (self.profile) self.preflight_rejects += 1;
+            return null;
         }
-        if (end - index < 2) return null;
-        try @import("query/search_exec.zig").checkSearchRequestDeadline(req);
+        // A single admissible copied value cannot form a batch. Reject the
+        // first two physical values before opening a scope or planning spans.
+        // Unknown capabilities must defer this decision: selected_read may
+        // legitimately admit small spans from much larger physical values.
+        if (full or (if (txn.readScopeRangeMode()) |hint| hint != .selected_read else false)) {
+            if (!pairFits(authorities[index..][0..2])) {
+                if (self.profile) self.preflight_rejects += 1;
+                return null;
+            }
+        }
         const a = self.arena.allocator();
         var scope = try txn.openReadScope(a);
         defer scope.close();
-        const selected = try a.alloc(logical.Authority, end - index);
-        for (authorities[index..end], selected) |authority, *out| out.* = authority.source;
-        const full = req.include_all_fields or operands.full_read or operands.read_set.len > 64;
-        if (full) for (selected) |*authority| {
-            authority.directory = null;
+        // Unsupported adapters may retain entire values behind range-shaped
+        // APIs. Keep whole-document admission unless ownership is explicit.
+        const mode = scope.rangeReadMode();
+        if ((full or mode != .selected_read) and !pairFits(authorities[index..][0..2])) {
+            if (self.profile) self.preflight_rejects += 1;
+            return null;
+        }
+        // A copied span still requires a whole-value read. Reject oversized
+        // copy-backed batches before allocating/planning every remaining row.
+        if (mode != .selected_read) if (authorities[index].source.proof) |proof| {
+            if (proof.bytes > 1024 * 1024) return null;
         };
-        self.rows = try logical.loadPrepared(a, a, &scope, physical[index..end], ids[index..end], if (full) &.{} else operands.read_set, selected);
+        // Used synchronously by loadPrepared; plans/returned rows live in the
+        // arena, while these bounded headers need no allocation or teardown.
+        var selected: [64]logical.Authority = undefined;
+        const selective = !full and mode != .full_value;
+        var end = index;
+        var bytes: usize = 0;
+        var physical_bytes: usize = 0;
+        var ranges: usize = 0;
+        while (end - index < capacity) : (end += 1) {
+            try @import("query/search_exec.zig").checkSearchRequestDeadline(req);
+            var authority = authorities[end].source;
+            const proof = authority.proof orelse break;
+            const original_bytes = std.math.cast(usize, proof.bytes) orelse break;
+            if (mode != .selected_read and original_bytes > 1024 * 1024 -| physical_bytes) break;
+            var count = original_bytes;
+            var range_count: usize = 1;
+            if (full) {
+                authority.directory = null;
+            } else if (selective) {
+                if (authority.directory) |directory| {
+                    if (proof.kind == @import("../internal_keys.zig").primary_kind and proof.bytes >= @import("../document_projection.zig").minimum_bytes) {
+                        if (self.profile) self.planned_rows += 1;
+                        const planned = try logical.Selection.init(a, directory, proof, operands.read_set);
+                        if (planned) |selection| {
+                            const cached = try a.create(logical.Selection);
+                            cached.* = selection;
+                            authority.selection = .{ .selected = cached };
+                            count = selection.work_bytes;
+                            range_count = selection.ranges.len;
+                        } else authority.selection = .full;
+                    }
+                }
+            }
+            if (count > 1024 * 1024 -| bytes or range_count > 256 -| ranges) break;
+            bytes += count;
+            physical_bytes +|= original_bytes;
+            ranges += range_count;
+            selected[end - index] = authority;
+        }
+        if (end - index < 2) return null;
+        var checked: CheckedScope = .{ .upstream = &scope, .mode = mode, .request = &req };
+        self.rows = try logical.loadPrepared(a, a, &checked, physical[index..end], ids[index..end], if (full) &.{} else operands.read_set, selected[0 .. end - index]);
         self.start = index;
         self.end = end;
+        if (self.profile) {
+            self.admitted += 1;
+            self.admitted_rows += end - index;
+        }
         return self.rows[0];
     }
 };
+// Full-value cursor reads can be arbitrarily larger than the copied spans.
+// Check between those reads; native selected I/O keeps its bounded batch walk.
+const CheckedScope = struct {
+    upstream: *@import("../backend_erased.zig").ReadScope,
+    mode: @import("../backend_erased.zig").RangeReadMode,
+    request: *const @import("types.zig").SearchRequest,
+    pub fn getManySorted(self: *@This(), keys: []const []const u8, output: []?[]const u8) !void {
+        try @import("query/search_exec.zig").checkSearchRequestDeadline(self.request.*);
+        try self.upstream.getManySorted(keys, output);
+    }
+    pub fn getRangesMany(self: *@This(), requests: []const @import("../value_ranges.zig").Request) !void {
+        try @import("query/search_exec.zig").checkSearchRequestDeadline(self.request.*);
+        const Poll = struct {
+            fn check(raw: ?*const anyopaque) callconv(.c) u8 {
+                const req: *const @import("types.zig").SearchRequest = @ptrCast(@alignCast(raw orelse return 3));
+                @import("query/search_exec.zig").checkSearchRequestDeadline(req.*) catch |err| return switch (err) {
+                    error.Cancelled => 1,
+                    error.Timeout => 2,
+                };
+                return 0;
+            }
+        };
+        return self.upstream.getRangesManyControlled(requests, .{ .ptr = self.request, .poll = Poll.check });
+    }
+};
+
 pub const Row = struct {
     a: A,
     txn: ?*@import("../docstore.zig").DocStore.Txn,
@@ -406,5 +512,160 @@ test "api query contract native scalar receipts require strict nodes and retain 
         const invalid_source = invalid.source();
         const proof = invalid_source.read_normalized.?(invalid_source.context, "s") catch null;
         try std.testing.expect(proof == null);
+    }
+}
+
+test "api query contract selected copy windows cancel between whole value reads" {
+    const backend = @import("../backend_erased.zig");
+    const Fake = struct {
+        signal: *std.atomic.Value(bool),
+        calls: *usize,
+        count: *usize,
+        pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+            return error.UnexpectedFullRead;
+        }
+        pub fn getRangesMany(self: *@This(), requests: []const @import("../value_ranges.zig").Request) !void {
+            self.calls.* += 1;
+            self.count.* = requests.len;
+            self.signal.store(true, .release);
+        }
+        pub fn close(_: *@This()) void {}
+    };
+    var signal = std.atomic.Value(bool).init(false);
+    var calls: usize = 0;
+    var count: usize = 0;
+    var upstream = try backend.readScopeFrom(std.testing.allocator, Fake{ .signal = &signal, .calls = &calls, .count = &count });
+    defer upstream.close();
+    try std.testing.expectEqual(backend.RangeReadMode.full_value, upstream.rangeReadMode());
+    const request: @import("types.zig").SearchRequest = .{ .cancellation = @import("types.zig").CancellationToken.fromAtomic(&signal) };
+    var checked: CheckedScope = .{ .upstream = &upstream, .mode = .selected_copy, .request = &request };
+    const requests = [_]@import("../value_ranges.zig").Request{
+        .{ .key = "a", .ranges = &.{}, .output = &.{} },
+        .{ .key = "b", .ranges = &.{}, .output = &.{} },
+    };
+    try std.testing.expectError(error.Cancelled, checked.getRangesMany(&requests));
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    signal.store(false, .release);
+    calls = 0;
+    checked.mode = .selected_read;
+    var selected_vtable = upstream.vtable.*;
+    selected_vtable.range_read_mode = .selected_read;
+    upstream.vtable = &selected_vtable;
+    try checked.getRangesMany(&requests);
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "api query contract oversized copy batches use capability metadata without opening scopes" {
+    const backend = @import("../backend_erased.zig");
+    const Fake = struct {
+        fn abort(_: A, _: *anyopaque) void {}
+        fn get(_: *anyopaque, _: []const u8) ![]const u8 {
+            return error.UnexpectedGet;
+        }
+        fn cursor(_: A, _: *anyopaque) !backend.Cursor {
+            return error.UnexpectedCursor;
+        }
+        fn scope(_: A, raw: *anyopaque) !backend.ReadScope {
+            const opens: *usize = @ptrCast(@alignCast(raw));
+            opens.* += 1;
+            return error.UnexpectedScope;
+        }
+    };
+    const a = std.testing.allocator;
+    var opens: usize = 0;
+    var vtable: backend.ReadTxn.VTable = .{
+        .read_scope_range_mode = .selected_copy,
+        .abort = Fake.abort,
+        .get = Fake.get,
+        .open_cursor = Fake.cursor,
+        .open_read_scope = Fake.scope,
+    };
+    var txn: @import("../docstore.zig").DocStore.Txn = .{ .alloc = a, .read = .{ .allocator = a, .ptr = &opens, .vtable = &vtable } };
+    var batch = Batch.init(a);
+    defer batch.deinit();
+    var operands: OperandPlans = .{ .selector = undefined, .read_set = &.{"metadata"} };
+    const authority: conditional.Authority = .{ .source = .{ .proof = .{ .revision = 1, .bytes = 2 * 1024 * 1024, .kind = @import("../internal_keys.zig").primary_kind, .digest = @splat(0) } } };
+    const authorities = [_]conditional.Authority{ authority, authority };
+    const physical = [_][]const u8{ "a", "b" };
+    const request: @import("types.zig").SearchRequest = .{ .include_all_fields = false };
+    try std.testing.expect(try batch.at(&txn, 0, &physical, &physical, &authorities, request, &operands) == null);
+    try std.testing.expectEqual(@as(usize, 0), opens);
+    // Neither individually fits together, so no scope or Selection is needed.
+    var medium = authority;
+    medium.source.proof.?.bytes = 750 * 1024;
+    const pair = [_]conditional.Authority{ medium, medium };
+    try std.testing.expect(try batch.at(&txn, 0, &physical, &physical, &pair, request, &operands) == null);
+    try std.testing.expectEqual(@as(usize, 0), opens);
+    var small = authority;
+    small.source.proof.?.bytes = 32;
+    const mixed = [_]conditional.Authority{ medium, authority, small };
+    const three = [_][]const u8{ "a", "b", "c" };
+    try std.testing.expect(try batch.at(&txn, 0, &three, &three, &mixed, request, &operands) == null);
+    try std.testing.expectEqual(@as(usize, 0), opens);
+    // Unknown capability may be genuinely selective; inspect the actual scope.
+    vtable.read_scope_range_mode = null;
+    try std.testing.expectError(error.UnexpectedScope, batch.at(&txn, 0, &physical, &physical, &pair, request, &operands));
+    try std.testing.expectEqual(@as(usize, 1), opens);
+    opens = 0;
+    // Unknown adapters defer eligibility until their real capability is known.
+    vtable.read_scope_range_mode = null;
+    try std.testing.expectError(error.UnexpectedScope, batch.at(&txn, 0, &physical, &physical, &authorities, request, &operands));
+    try std.testing.expectEqual(@as(usize, 1), opens);
+    opens = 0;
+    const uncertified = [_]conditional.Authority{ .{}, .{} };
+    try std.testing.expect(try batch.at(&txn, 0, &physical, &physical, &uncertified, request, &operands) == null);
+    try std.testing.expectEqual(@as(usize, 0), opens);
+    // Actual selected I/O remains eligible, rather than inheriting a copy cap.
+    vtable.read_scope_range_mode = .selected_read;
+    try std.testing.expectError(error.UnexpectedScope, batch.at(&txn, 0, &physical, &physical, &authorities, request, &operands));
+    try std.testing.expectEqual(@as(usize, 1), opens);
+}
+
+test "api query contract controlled copy batch retains one owner and stops between keys" {
+    const backend = @import("../backend_erased.zig");
+    const Fake = struct {
+        signal: *std.atomic.Value(bool),
+        calls: *usize,
+        rows: *usize,
+        pub const range_read_mode = backend.RangeReadMode.selected_copy;
+        pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+            return error.UnexpectedFullRead;
+        }
+        pub fn getRangesManyControlled(self: *@This(), requests: []const backend.RangeRequest, control: backend.ReadControl) !void {
+            self.calls.* += 1;
+            for (requests) |_| {
+                try control.check();
+                self.rows.* += 1;
+                self.signal.store(true, .release);
+            }
+        }
+        pub fn close(_: *@This()) void {}
+    };
+    var signal = std.atomic.Value(bool).init(false);
+    var calls: usize = 0;
+    var rows: usize = 0;
+    var upstream = try backend.readScopeFrom(std.testing.allocator, Fake{ .signal = &signal, .calls = &calls, .rows = &rows });
+    defer upstream.close();
+    const request: @import("types.zig").SearchRequest = .{ .cancellation = @import("types.zig").CancellationToken.fromAtomic(&signal) };
+    var checked: CheckedScope = .{ .upstream = &upstream, .mode = .selected_copy, .request = &request };
+    const requests = [_]backend.RangeRequest{
+        .{ .key = "a", .ranges = &.{}, .output = &.{} },
+        .{ .key = "b", .ranges = &.{}, .output = &.{} },
+    };
+    try std.testing.expectError(error.Cancelled, checked.getRangesMany(&requests));
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqual(@as(usize, 1), rows);
+    // Admission and private error containment happen before engine invocation.
+    const Poll = struct {
+        fn check(raw: ?*const anyopaque) callconv(.c) u8 {
+            return @as(*const u8, @ptrCast(@alignCast(raw.?))).*;
+        }
+    };
+    for ([_]u8{ 2, 255 }) |code| {
+        const expected = if (code == 2) error.Timeout else error.RuntimeBoundaryFailure;
+        try std.testing.expectError(expected, upstream.getRangesManyControlled(&requests, .{ .ptr = &code, .poll = Poll.check }));
+        try std.testing.expectEqual(@as(usize, 1), calls);
     }
 }

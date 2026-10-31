@@ -41703,7 +41703,7 @@ pub const DB = struct {
                     ranges[slot] = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
                     slot += 1;
                 };
-                const cost = if (scope.supportsRange()) try ranges_mod.retainedBytes(std.math.cast(usize, proof.bytes) orelse return error.InvalidDocumentContentAuthority, ranges) else if (selected_count == 0) 0 else proof.bytes;
+                const cost = if (scope.supportsSelectedRangeIo()) try ranges_mod.retainedBytes(std.math.cast(usize, proof.bytes) orelse return error.InvalidDocumentContentAuthority, ranges) else if (selected_count == 0) 0 else proof.bytes;
                 if (count != 0 and cost > limit -| retained) break;
                 retained +|= std.math.cast(usize, cost) orelse return error.InvalidDocumentContentAuthority;
                 const output = try a.alloc(projection.FieldValue, selected_count);

@@ -32,7 +32,7 @@ pub fn request(a: std.mem.Allocator, io: std.Io, cfg: d.DeciderConfig, input: d.
     var assets = d.jsonObject();
     const Part = struct { header: []const u8, bytes: []const u8 };
     var parts: std.ArrayList(Part) = try .initCapacity(a, input.imageCount());
-    for (input.messages) |message| {
+    for (input.messageItems()) |message| {
         var upstream = d.jsonObject();
         try d.put(a, &upstream, "role", .{ .string = "user" });
         const content = message.object.get("content").?;

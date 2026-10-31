@@ -26354,3 +26354,291 @@ test "lsm cold optimization writer reuses mutable probe metadata across short li
     try std.testing.expectEqual(@as(usize, 0), metadata.alloc_calls - calls);
     metadata.limit = std.math.maxInt(usize);
 }
+
+test "logical value native LSM ranges retain selected copies and release payload pins" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |cache_enabled| {
+        for ([_]usize{ 32768, 1024 * 1024 + 256 }) |size| {
+            var budgets = resource_manager_mod.Options.defaultBudgets();
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_read_working_set)] = .{ .hard_limit_bytes = size + 8192 };
+            var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+            defer manager.deinit(a);
+            var backing = storage_io.MemoryStorage.init(a);
+            defer backing.deinit();
+            var backend = try Backend.open(a, "/selected-range-ownership", .{ .storage = backing.storage(), .resource_manager = &manager, .flush_threshold = 1, .table_block_compression = .none, .local_block_cache_enabled = cache_enabled });
+            defer backend.close();
+            var store = try backend.runtimeStore(a, .{ .name = "docs" });
+            defer store.deinit();
+            const body = try a.alloc(u8, size);
+            defer a.free(body);
+            @memset(body, 'x');
+            var write = try store.beginWrite();
+            try write.put("a", body);
+            const other = try a.dupe(u8, body);
+            defer a.free(other);
+            @memset(other, 'y');
+            try write.put("b", other);
+            try write.commit();
+            var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "docs" });
+            defer read.abort();
+            var result_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 8192 };
+            var scope = try read.openReadScope(result_budget.allocator());
+            defer scope.close();
+            try std.testing.expectEqual(backend_erased.RangeReadMode.selected_copy, @TypeOf(scope).range_read_mode);
+            var metadata_read = try store.beginRead();
+            defer metadata_read.abort();
+            try std.testing.expectEqual(backend_erased.RangeReadMode.selected_copy, metadata_read.readScopeRangeMode().?);
+            const before = backend.snapshotReadStats();
+            const first = try scope.getRange("a", 0, 16);
+            const second = try scope.getRange("b", size - 16, 16);
+            const after = backend.snapshotReadStats();
+            try std.testing.expectEqual(@as(u64, 2), after.point_value_copies - before.point_value_copies);
+            try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+            try std.testing.expectEqual(@as(usize, 0), scope.held_blocks.items.len);
+            try std.testing.expect(scope.held_values.items.len > 0);
+            while (backend.run_block_cache.items.len != 0) {
+                const cached = backend.run_block_cache.items[0];
+                backend.evictCachedRunBlocksForRun(cached.path, cached.run_id);
+            }
+            try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", first);
+            try std.testing.expectEqualStrings("yyyyyyyyyyyyyyyy", second);
+            try std.testing.expectError(error.EndOfStream, scope.getRange("a", size, 1));
+            scope.reset();
+            try std.testing.expect(result_budget.live < 8192);
+        }
+    }
+}
+
+test "logical value native LSM selected memtable reads avoid full copies across mutation" {
+    const a = std.testing.allocator;
+    defer runtime_mod.test_private_read_versions = false;
+    for ([_]bool{ false, true }) |private| {
+        runtime_mod.test_private_read_versions = private;
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@backingInt(resource_manager_mod.Slice.lsm_read_working_set)] = .{ .hard_limit_bytes = 4096 };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer manager.deinit(a);
+        var backing = storage_io.MemoryStorage.init(a);
+        defer backing.deinit();
+        var backend = try Backend.open(a, "/selected-memtable-borrow", .{ .storage = backing.storage(), .resource_manager = &manager, .flush_threshold = 64 * 1024 * 1024 });
+        defer backend.close();
+        const ns: backend_types.Namespace = .{ .name = "docs", .own_source_point_results = true };
+        var store = try backend.runtimeStore(a, ns);
+        defer store.deinit();
+        const body = try a.alloc(u8, 32768);
+        defer a.free(body);
+        @memset(body, 'x');
+        var write = try store.beginWrite();
+        try write.put("a", body);
+        try write.put("b", body);
+        try write.commit();
+        var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, ns);
+        defer read.abort();
+        var scope = try read.openReadScope(a);
+        defer scope.close();
+        var update = try store.beginWrite();
+        try update.put("a", "new");
+        try update.delete("b");
+        try update.commit();
+        const before = backend.snapshotReadStats();
+        const first = try scope.getRange("a", 0, 16);
+        const second = try scope.getRange("b", 32752, 16);
+        const after = backend.snapshotReadStats();
+        try std.testing.expectEqual(@as(u64, 2), after.point_value_copies - before.point_value_copies);
+        try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", first);
+        try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", second);
+        var output: [2][1][]const u8 = undefined;
+        try scope.getRangesMany(&.{
+            .{ .key = "a", .ranges = &.{.{ .offset = 16, .length = 16 }}, .output = &output[0] },
+            .{ .key = "b", .ranges = &.{.{ .offset = 0, .length = 16 }}, .output = &output[1] },
+        });
+        for (output) |value| try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", value[0]);
+        try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", first);
+        // The latest view must not resurrect the deleted row from an older
+        // immutable state, while the original pinned view remains readable.
+        var latest = try runtime_mod.BoundReadTxn(Backend).open(&backend, ns);
+        defer latest.abort();
+        var latest_scope = try latest.openReadScope(a);
+        defer latest_scope.close();
+        try std.testing.expectError(error.NotFound, latest_scope.getRange("b", 0, 1));
+    }
+}
+
+test "logical value native controlled range batches release loans on cancellation and reuse scratch" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |cache_enabled| {
+        const size = 32768;
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@backingInt(resource_manager_mod.Slice.lsm_read_working_set)] = .{ .hard_limit_bytes = size + 8192 };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer manager.deinit(a);
+        var backing = storage_io.MemoryStorage.init(a);
+        defer backing.deinit();
+        var backend = try Backend.open(a, "/controlled-range-owner", .{ .storage = backing.storage(), .resource_manager = &manager, .flush_threshold = 1, .table_block_compression = .none, .local_block_cache_enabled = cache_enabled });
+        defer backend.close();
+        var store = try backend.runtimeStore(a, .{ .name = "docs" });
+        defer store.deinit();
+        const body: [size]u8 = @splat('x');
+        var write = try store.beginWrite();
+        try write.put("a", &body);
+        try write.put("b", &body);
+        try write.commit();
+        var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "docs" });
+        defer read.abort();
+        var scope = try read.openReadScope(a);
+        defer scope.close();
+        var output: [2][1][]const u8 = .{ .{""}, .{""} };
+        const Poll = struct {
+            fn check(raw: ?*const anyopaque) callconv(.c) u8 {
+                const first: *const [1][]const u8 = @ptrCast(@alignCast(raw.?));
+                return @intFromBool(first[0].len != 0);
+            }
+        };
+        const requests = [_]@import("value_ranges.zig").Request{
+            .{ .key = "a", .ranges = &.{.{ .offset = 0, .length = 16 }}, .output = &output[0] },
+            .{ .key = "b", .ranges = &.{.{ .offset = size - 16, .length = 16 }}, .output = &output[1] },
+        };
+        const before = backend.snapshotReadStats();
+        try std.testing.expectError(error.Cancelled, scope.getRangesManyControlled(&requests, .{ .ptr = &output[0], .poll = Poll.check }));
+        try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", output[0][0]);
+        try std.testing.expectEqual(@as(usize, 0), output[1][0].len);
+        try std.testing.expectEqual(@as(u64, 1), backend.snapshotReadStats().point_value_copies - before.point_value_copies);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scope.held_blocks.items.len);
+        // Reuse the same still-pinned snapshot after cancellation. No stale
+        // transient loan or payload from the cancelled key survives.
+        try scope.getRangesManyControlled(&requests, .{});
+        for (output) |row| try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", row[0]);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+    }
+}
+
+test "logical value controlled selected copy batches bound scratch allocations" {
+    const a = std.testing.allocator;
+    var counted = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    var backing = storage_io.MemoryStorage.init(a);
+    defer backing.deinit();
+    var backend = try Backend.open(counted.allocator(), "/controlled-batch-scratch", .{ .storage = backing.storage(), .flush_threshold = 1, .table_block_compression = .none, .local_block_cache_enabled = false });
+    defer backend.close();
+    const ns: backend_types.Namespace = .{ .name = "docs", .own_source_point_results = true };
+    const body: [32768]u8 = @splat('x');
+    var keys: [32][8]u8 = undefined;
+    var key_slices: [32][]const u8 = undefined;
+    var write = try backend.beginWrite();
+    for (&keys, &key_slices, 0..) |*key, *slice, i| {
+        slice.* = try std.fmt.bufPrint(key, "key-{d:0>2}", .{i});
+        try write.put(ns, slice.*, &body);
+    }
+    try write.commit();
+    var txn = try runtime_mod.BoundReadTxn(Backend).open(&backend, ns);
+    defer txn.abort();
+    var scope = try txn.openReadScope(a);
+    defer scope.close();
+    var output: [32][1][]const u8 = undefined;
+    var requests: [32]@import("value_ranges.zig").Request = undefined;
+    for (&requests, &key_slices, &output) |*request, key, *result| request.* = .{ .key = key, .ranges = &.{.{ .offset = 0, .length = 32 }}, .output = result };
+    const Poll = struct {
+        fn check(_: ?*const anyopaque) callconv(.c) u8 {
+            return 0;
+        }
+    };
+    // Warm immutable table/index metadata, then alternate shapes on the same
+    // snapshot and allocator. Outputs are independently released per trial.
+    try scope.getRangesMany(&requests);
+    var calls: [2]usize = .{ 0, 0 };
+    for (0..8) |trial| {
+        const mode = trial % 2;
+        scope.reset();
+        const before = counted.alloc_calls;
+        if (mode == 0) {
+            for (requests) |request| try scope.getRangesMany(&.{request});
+        } else try scope.getRangesManyControlled(&requests, .{ .poll = Poll.check });
+        calls[mode] += counted.alloc_calls - before;
+        for (output) |result| try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", result[0]);
+    }
+    std.debug.print("controlled_batch_scratch documents=32 trials_per_mode=4 one_key_allocations={d} batched_allocations={d}\n", .{ calls[0], calls[1] });
+    try std.testing.expect(calls[1] <= calls[0]);
+}
+
+test "logical value selected physical read amplification profile" {
+    const Hook = struct {
+        var original: *const storage_io.Storage.VTable = undefined;
+        var bytes: usize = 0;
+        var calls: usize = 0;
+        fn read(ptr: *anyopaque, a: Allocator, path: []const u8, offset: u64, len: usize) anyerror![]u8 {
+            const result = try original.read_file_range_alloc(ptr, a, path, offset, len);
+            bytes += result.len;
+            calls += 1;
+            return result;
+        }
+        fn all(ptr: *anyopaque, a: Allocator, path: []const u8, max: usize) anyerror![]u8 {
+            const result = try original.read_file_alloc(ptr, a, path, max);
+            bytes += result.len;
+            calls += 1;
+            return result;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]lsm_table_file.CompressionPolicy{ .none, .snappy_adaptive }) |compression| {
+        for ([_]bool{ false, true }) |entropy| {
+            for ([_]usize{ 32768, 1048576 }) |size| {
+                var backing = storage_io.MemoryStorage.init(a);
+                defer backing.deinit();
+                Hook.original = backing.storage().vtable;
+                var vtable = backing.storage().vtable.*;
+                vtable.read_file_range_alloc = Hook.read;
+                vtable.read_file_alloc = Hook.all;
+                // Force the synchronous observed range-reader path. No mmap,
+                // async reader, trailer shortcut or application block cache
+                // bypasses the counter. This measures engine-cold storage API
+                // traffic, not operating-system cold-cache device traffic.
+                vtable.begin_read_file_range_alloc = null;
+                vtable.begin_read_file_range_alloc_with_runtime = null;
+                vtable.read_file_trailer_alloc = null;
+                vtable.read_file_range_into = null;
+                vtable.read_file_range_at_most_into = null;
+                const storage: storage_io.Storage = .{ .ptr = backing.storage().ptr, .vtable = &vtable };
+                const options: Options = .{ .storage = storage, .flush_threshold = 1, .table_block_compression = compression, .local_block_cache_enabled = false };
+                const body = try a.alloc(u8, size);
+                defer a.free(body);
+                var state: u64 = 0x51eda11;
+                for (body) |*byte| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    byte.* = if (entropy) @truncate(state) else 'x';
+                }
+                {
+                    var writer_backend = try Backend.open(a, "/physical-range-profile", options);
+                    defer writer_backend.close();
+                    var write = try writer_backend.beginWrite();
+                    try write.put(.{ .name = "docs" }, "a", body);
+                    try write.commit();
+                }
+                var physical: [2]usize = undefined;
+                for (0..2) |mode| {
+                    var backend = try Backend.open(a, "/physical-range-profile", options);
+                    defer backend.close();
+                    var txn = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "docs" });
+                    defer txn.abort();
+                    var scope = try txn.openReadScope(a);
+                    defer scope.close();
+                    Hook.bytes = 0;
+                    Hook.calls = 0;
+                    const start = platform_time.monotonicNs();
+                    const result = if (mode == 0) try scope.get("a") else try scope.getRange("a", 0, 32);
+                    const elapsed = platform_time.monotonicNs() - start;
+                    try std.testing.expectEqualSlices(u8, if (mode == 0) body else body[0..32], result);
+                    const stats = backend.snapshotReadStats();
+                    physical[mode] = Hook.bytes;
+                    try std.testing.expect(Hook.calls != 0);
+                    try std.testing.expect(stats.table_block_loads != 0);
+                    std.debug.print("selected_physical_profile compression={s} entropy={} value_bytes={d} mode={s} returned_bytes={d} storage_bytes={d} storage_reads={d} table_block_bytes={d} ns={d}\n", .{ @tagName(compression), entropy, size, if (mode == 0) "full" else "selected_copy", result.len, Hook.bytes, Hook.calls, stats.table_block_bytes, elapsed });
+                }
+                // Selected ownership must never masquerade as reduced I/O:
+                // the current checksummed block format reads identical bytes.
+                try std.testing.expectEqual(physical[0], physical[1]);
+            }
+        }
+    }
+}

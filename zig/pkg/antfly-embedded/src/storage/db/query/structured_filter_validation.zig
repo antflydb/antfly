@@ -34,6 +34,35 @@ pub fn validateStructuredFilterValueAlloc(
     try validateNode(value, 0, &remaining_nodes);
 }
 
+/// Borrow a bounded mandatory ID clause from an already validated filter.
+/// Residual predicates (including named authorization refs) stay opaque. Only
+/// conjunctions and required bool arms are traversed; OR/NOT cannot prove it.
+pub fn mandatoryDocIds(value: std.json.Value, limit: usize) ?[]const std.json.Value {
+    return mandatoryDocIdsAt(value, limit, 0);
+}
+fn mandatoryDocIdsAt(value: std.json.Value, limit: usize, depth: usize) ?[]const std.json.Value {
+    if (depth >= max_tree_depth or value != .object or value.object.count() != 1) return null;
+    if (value.object.get("doc_id")) |node| {
+        const ids = if (node == .object) node.object.get("ids") orelse return null else node;
+        if (ids != .array or ids.array.items.len == 0 or ids.array.items.len > limit) return null;
+        for (ids.array.items) |id| if (id != .string) return null;
+        return ids.array.items;
+    }
+    if (value.object.get("conjuncts")) |children| {
+        if (children == .array) for (children.array.items) |child| {
+            if (mandatoryDocIdsAt(child, limit, depth + 1)) |ids| return ids;
+        };
+    }
+    if (value.object.get("bool")) |boolean| if (boolean == .object) {
+        inline for (.{ "must", "filter" }) |key| if (boolean.object.get(key)) |children| {
+            if (children == .array) for (children.array.items) |child| {
+                if (mandatoryDocIdsAt(child, limit, depth + 1)) |ids| return ids;
+            };
+        };
+    };
+    return null;
+}
+
 fn validateNode(value: std.json.Value, depth: u8, remaining_nodes: *usize) anyerror!void {
     if (depth >= max_tree_depth or remaining_nodes.* == 0) return error.InvalidArgument;
     _ = try pattern_filter_contract.requireSingleRoot(value);
@@ -435,5 +464,23 @@ test "control structured-filter admission rejects ambiguous and malformed values
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
         defer parsed.deinit();
         try std.testing.expectError(error.InvalidArgument, validateStructuredFilterValueAlloc(alloc, parsed.value));
+    }
+}
+
+test "api query contract mandatory routing IDs ignore residual authorization and reject optional negative clauses" {
+    const a = std.testing.allocator;
+    for ([_]struct { text: []const u8, expected: ?[]const u8 }{
+        .{ .text = "{\"conjuncts\":[{\"ref\":\"acl\"},{\"doc_id\":[\"a\",\"b\"]}]}", .expected = "a" },
+        .{ .text = "{\"bool\":{\"filter\":[{\"doc_id\":{\"ids\":[\"a\"]}}],\"must_not\":[{\"doc_id\":[\"b\"]}]}}", .expected = "a" },
+        .{ .text = "{\"bool\":{\"should\":[{\"doc_id\":[\"a\"]},{\"match_all\":{}}]}}", .expected = null },
+        .{ .text = "{\"bool\":{\"must_not\":[{\"doc_id\":[\"a\"]}]}}", .expected = null },
+        .{ .text = "{\"disjuncts\":[{\"doc_id\":[\"a\"]},{\"match_all\":{}}]}", .expected = null },
+    }) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, case.text, .{});
+        defer parsed.deinit();
+        try validateStructuredFilterValueAlloc(a, parsed.value);
+        const ids = mandatoryDocIds(parsed.value, 256);
+        if (case.expected) |expected| try std.testing.expectEqualStrings(expected, ids.?[0].string) else try std.testing.expect(ids == null);
+        if (ids) |values| try std.testing.expect(mandatoryDocIds(parsed.value, values.len - 1) == null);
     }
 }

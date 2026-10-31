@@ -109,7 +109,71 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
 
 /// Caller-owned proof/directory decoded from the SAME pinned read transaction.
 /// No lifetime or cross-request cache: this only reuses a bounded window's work.
-pub const Authority = struct { proof: ?revision.Content = null, directory: ?projection.Directory = null };
+pub const SelectionPlan = union(enum) { unplanned, full, selected: *const Selection };
+pub const Authority = struct {
+    proof: ?revision.Content = null,
+    directory: ?projection.Directory = null,
+    // Request-window plan, derived from this same pinned authority and mask.
+    selection: SelectionPlan = .unplanned,
+};
+/// One range plan shared by window admission and execution. work_bytes bounds
+/// coalesced ranges, reconstruction and per-field working arrays for admission;
+/// actual allocation quotas and backend block/cache limits remain authoritative.
+pub const Selection = struct {
+    fields: []projection.Field,
+    ranges: []ranges_mod.Range,
+    work_bytes: usize,
+    pub fn init(a: A, directory: projection.Directory, proof: revision.Content, roots: []const []const u8) !?Selection {
+        var chosen: [projection.maximum_fields]bool = @splat(false);
+        for (roots) |path| if (directory.resolve(path)) |field| {
+            chosen[field.index] = true;
+        };
+        for (directory.fields) |field| if (chosen[field.index]) {
+            var parent = field.parent;
+            while (parent != projection.no_parent) : (parent = directory.fields[parent].parent) {
+                if (chosen[parent]) {
+                    chosen[field.index] = false;
+                    break;
+                }
+            }
+        };
+        var count: usize = 0;
+        var bytes: u64 = 0;
+        for (directory.fields) |field| if (chosen[field.index]) {
+            count += 1;
+            bytes +|= field.length;
+        };
+        if (bytes >= proof.bytes / 2) return null;
+        const fields = try a.alloc(projection.Field, count);
+        errdefer a.free(fields);
+        const ranges = try a.alloc(ranges_mod.Range, count);
+        errdefer a.free(ranges);
+        var needed: [projection.maximum_fields]bool = @splat(false);
+        var slot: usize = 0;
+        for (directory.fields) |field| if (chosen[field.index]) {
+            fields[slot] = field;
+            ranges[slot] = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
+            slot += 1;
+            var index = field.index;
+            while (true) {
+                needed[index] = true;
+                const parent = directory.fields[index].parent;
+                if (parent == projection.no_parent) break;
+                index = parent;
+            }
+        };
+        const size = std.math.cast(usize, proof.bytes) orelse return error.InvalidDocumentContentAuthority;
+        const retained = try ranges_mod.retainedBytes(size, ranges);
+        // JSON escaping can expand each key byte sixfold. Include container
+        // punctuation and field/range/value headers, with saturating arithmetic.
+        var work = retained +| (std.math.cast(usize, bytes) orelse return error.InvalidDocumentContentAuthority);
+        work +|= 2 + count * (@sizeOf(projection.Field) + @sizeOf(ranges_mod.Range) + @sizeOf([]const u8));
+        for (directory.fields) |field| if (needed[field.index]) {
+            work +|= 6 *| field.name.len +| 6;
+        };
+        return .{ .fields = fields, .ranges = ranges, .work_bytes = work };
+    }
+};
 pub fn loadPrepared(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authorities: []const Authority) ![]Row {
     return loadInternal(false, a, scratch, scope, physical, ids, roots, true, null, authorities);
 }
@@ -199,33 +263,15 @@ fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, ph
             };
         };
         if (directory.version == 1) repair[i] = true;
-        var chosen: [projection.maximum_fields]bool = @splat(false);
-        for (roots) |path| if (directory.resolve(path)) |field| {
-            chosen[field.index] = true;
+        const cached: SelectionPlan = if (authorities) |ready| ready[i].selection else .unplanned;
+        const selection = switch (cached) {
+            .full => continue,
+            .selected => |plan| plan.*,
+            .unplanned => try Selection.init(scratch, directory, proof, roots) orelse continue,
         };
-        // Parent selections subsume descendants. Never fetch/hash overlapping
-        // values twice when predicates request both an object and its members.
-        for (directory.fields) |field| if (chosen[field.index]) {
-            var parent = field.parent;
-            while (parent != projection.no_parent) : (parent = directory.fields[parent].parent) {
-                if (chosen[parent]) {
-                    chosen[field.index] = false;
-                    break;
-                }
-            }
-        };
-        var selected: std.ArrayList(projection.Field) = .empty;
-        var bytes: u64 = 0;
-        for (directory.fields) |field| if (chosen[field.index]) {
-            try selected.append(scratch, field);
-            bytes +|= field.length;
-        };
-        // Range setup should not replace a cheaper complete read.
-        if (bytes >= proof.bytes / 2) continue;
-        const ranges = try scratch.alloc(ranges_mod.Range, selected.items.len);
-        const values = try scratch.alloc([]const u8, selected.items.len);
-        for (ranges, selected.items) |*range, field| range.* = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
-        prepared[prepared_count] = .{ .index = i, .directory = directory, .fields = selected.items, .ranges = ranges, .values = values };
+        const ranges = selection.ranges;
+        const values = try scratch.alloc([]const u8, selection.fields.len);
+        prepared[prepared_count] = .{ .index = i, .directory = directory, .fields = selection.fields, .ranges = ranges, .values = values };
         prepared_count += 1;
         if (ranges.len != 0) {
             requests[request_count] = .{ .key = physical[i], .ranges = ranges, .output = values };
@@ -459,4 +505,68 @@ test "logical value conditional borrowed full rows avoid payload allocation and 
     var owned_bytes: [2048]u8 = undefined;
     var owned = std.heap.FixedBufferAllocator.init(&owned_bytes);
     try std.testing.expectError(error.OutOfMemory, loadPrepared(owned.allocator(), arena.allocator(), &scope, &.{"physical"}, &.{"id"}, &.{"image"}, &.{.{}}));
+}
+
+test "logical value shared selection batches large bodies without full reads" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const padding = try temp.alloc(u8, 32768);
+    @memset(padding, 'x');
+    const body = try std.fmt.allocPrint(temp, "{{\"metadata\":{{\"allowed\":true,\"revision\":\"r1\"}},\"padding\":\"{s}\"}}", .{padding});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    const kind = @import("internal_keys.zig").primary_kind;
+    const proof: revision.Content = .{ .revision = 1, .bytes = body.len, .kind = kind, .digest = digest };
+    const encoded = (try projection.build(temp, body, kind, digest)).?;
+    const directory = (try projection.Directory.open(temp, encoded, proof)).?;
+    const roots: []const []const u8 = &.{ "metadata.allowed", "metadata.revision" };
+    const selection = (try Selection.init(temp, directory, proof, roots)).?;
+    try std.testing.expect(selection.work_bytes < 1024);
+    try std.testing.expectEqual(@as(usize, 2), selection.ranges.len);
+    const overlapping = (try Selection.init(temp, directory, proof, &.{ "metadata", "metadata.allowed" })).?;
+    try std.testing.expectEqual(@as(usize, 1), overlapping.ranges.len);
+    try std.testing.expect(try Selection.init(temp, directory, proof, &.{"padding"}) == null);
+    const missing = (try Selection.init(temp, directory, proof, &.{"absent"})).?;
+    try std.testing.expectEqual(@as(usize, 0), missing.ranges.len);
+    const Mock = struct {
+        bytes: []const u8,
+        calls: usize = 0,
+        full_reads: usize = 0,
+        allow_full: bool = false,
+        pub fn getManySorted(self: *@This(), _: []const []const u8, output: []?[]const u8) !void {
+            if (!self.allow_full) return error.UnexpectedFullRead;
+            self.full_reads += 1;
+            for (output) |*value| value.* = self.bytes;
+        }
+        pub fn getRangesMany(self: *@This(), requests: []const ranges_mod.Request) !void {
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 2), requests.len);
+            for (requests) |request| for (request.ranges, request.output) |range, *value| {
+                value.* = self.bytes[@intCast(range.offset)..][0..range.length];
+            };
+        }
+    };
+    var scope: Mock = .{ .bytes = body };
+    const authority: Authority = .{ .proof = proof, .directory = directory, .selection = .{ .selected = &selection } };
+    const physical_a = try @import("internal_keys.zig").documentKeyAlloc(temp, "a");
+    const physical_b = try @import("internal_keys.zig").documentKeyAlloc(temp, "b");
+    const rows = try loadPrepared(temp, temp, &scope, &.{ physical_a, physical_b }, &.{ "a", "b" }, roots, &.{ authority, authority });
+    try std.testing.expectEqual(@as(usize, 1), scope.calls);
+    for (rows) |row| {
+        try std.testing.expect(row.projected);
+        try std.testing.expectEqualStrings("{\"metadata\":{\"allowed\":true,\"revision\":\"r1\"}}", row.bytes.?);
+    }
+    // A cached full-read choice must not be mistaken for an unplanned mask.
+    scope.allow_full = true;
+    var full = authority;
+    full.selection = .full;
+    const full_rows = try loadPrepared(temp, temp, &scope, &.{ physical_a, physical_b }, &.{ "a", "b" }, roots, &.{ full, full });
+    try std.testing.expectEqual(@as(usize, 1), scope.full_reads);
+    try std.testing.expectEqual(@as(usize, 1), scope.calls);
+    for (full_rows) |row| {
+        try std.testing.expect(!row.projected);
+        try std.testing.expectEqualStrings(body, row.bytes.?);
+    }
 }

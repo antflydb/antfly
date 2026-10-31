@@ -256,6 +256,9 @@ pub const InvocationRequest = struct {
     content_type: []const u8 = "application/json",
     query: ?[]const u8 = null,
     body_source: runtime_http_abi.RequestBodySource = .{},
+    /// Immutable, replayable segments borrowed until the invocation returns.
+    /// Local ABI adapters retain their contiguous-body compatibility contract.
+    body_segments: ?[]const []const u8 = null,
     document_store: @import("antfly_runtime_abi").document_abi.View = .{},
     /// Freeable, invocation-owned transport memory, distinct from request arenas.
     document_allocator: ?Allocator = null,
@@ -294,9 +297,12 @@ pub fn invokeInferenceConnectionWithRequest(
     request: InvocationRequest,
 ) !InvokeResult {
     const resolved = try resolveInferenceConnection(node_config, local_target, connection_id, operation);
+    if (request.body_segments != null and (body.len != 0 or request.body_source.read != null or request.body_source.read_all != null)) return error.ConflictingRequestBodies;
     const durable_remote = request.document_store.configured() and resolved == .remote;
-    if (durable_remote and (method != .post or (!std.mem.eql(u8, operation, "read") and !std.mem.eql(u8, operation, "extract")) or request.body_source.read != null or request.query != null)) return error.UnsupportedInferenceFeature;
+    if (durable_remote and (method != .post or (!std.mem.eql(u8, operation, "read") and !std.mem.eql(u8, operation, "extract")) or request.body_source.read != null or request.body_segments != null or request.query != null)) return error.UnsupportedInferenceFeature;
     if (resolved == .local) {
+        const joined = if (request.body_segments) |segments| try std.mem.concat(alloc, u8, segments) else null;
+        defer if (joined) |bytes| alloc.free(bytes);
         const target = resolved.local;
         if (!target.valid(inference_connection_abi.Capability.streaming_response))
             return error.UnsupportedVersion;
@@ -318,7 +324,7 @@ pub fn invokeInferenceConnectionWithRequest(
             .target_context = target.context,
             .allocator = &abi_alloc,
             .operation = runtime_http_abi.Bytes.init(operation),
-            .body = runtime_http_abi.Bytes.init(body),
+            .body = runtime_http_abi.Bytes.init(joined orelse body),
             .cancellation = cancellation_view,
             .deadline_ns = deadline_ns,
             .stream = stream,
@@ -444,7 +450,8 @@ pub fn invokeInferenceConnectionWithRequest(
             .headers = headers,
             .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .attempt_observer = request.attempt_observer,
-            .borrowed_body = if (request.body_source.read == null) body else null,
+            .borrowed_body = if (request.body_source.read == null and request.body_segments == null) body else null,
+            .borrowed_body_segments = request.body_segments,
             .body_stream = if (request.body_source.read != null) .{ .context = @constCast(&request.body_source), .read = readInvocationBody } else null,
             .timeout_ms = timeout_ms,
             .cancellation = cancellation,
@@ -466,7 +473,8 @@ pub fn invokeInferenceConnectionWithRequest(
         .headers = headers,
         .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
         .attempt_observer = request.attempt_observer,
-        .body = body,
+        .borrowed_body = if (request.body_segments == null) body else null,
+        .borrowed_body_segments = request.body_segments,
         .timeout_ms = timeout_ms,
         .cancellation = cancellation,
         .max_retries = 0,
@@ -2717,4 +2725,25 @@ test "httpx inference gateway reader aliases scope remote credentials and admiss
     try std.testing.expectEqualStrings("revision", explicit.remote.capability_revision.?);
     try std.testing.expectEqual(InferenceAdmissionOwner.caller, try inferenceConnectionAdmissionOwner(&cfg, null, "readers/remote", "read"));
     try std.testing.expectError(error.UnsupportedInferenceOperation, resolveInferenceConnection(&cfg, null, "readers/remote", "generate"));
+}
+
+test "httpx inference gateway segmented local connection preserves contiguous ABI and rejects ambiguous bodies" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn invoke(ctx: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ctx.target_context));
+            if (!std.mem.eql(u8, ctx.body.slice(), "abc\x00def")) return inference_connection_abi.statusFromError(error.InvalidArgument);
+            self.calls += 1;
+            ctx.out_response.* = .{ .status = 204 };
+            return .ok;
+        }
+    };
+    var fake: Fake = .{};
+    const target: LocalInferenceConnectionTarget = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &fake, .invoke = Fake.invoke };
+    var result = try invokeInferenceConnectionWithRequest(std.testing.allocator, null, null, target, null, common_config.local_inference_connection_id, "generate", "", null, inferenceInvocationDeadlineNs(), .{}, .post, .{ .body_segments = &.{ "ab", "", "c\x00", "def" } });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 204), result.status);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectError(error.ConflictingRequestBodies, invokeInferenceConnectionWithRequest(std.testing.allocator, null, null, target, null, common_config.local_inference_connection_id, "generate", "body", null, inferenceInvocationDeadlineNs(), .{}, .post, .{ .body_segments = &.{"abc"} }));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }

@@ -96,12 +96,10 @@ fn prepareRequest(a: A, request: Request) !Encoding {
     errdefer a.destroy(checked);
     checked.* = try Plan.init(a, request);
     errdefer checked.deinit();
-    return .{ .json = try std.json.Stringify.valueAlloc(a, request, .{}), .plan = checked };
+    return .{ .json = try a.dupe(u8, checked.encoded), .plan = checked };
 }
 pub fn decode(a: A, encoded: []const u8) !Plan {
-    var request = try std.json.parseFromSlice(Request, a, encoded, .{});
-    defer request.deinit();
-    return Plan.init(a, request.value);
+    return Plan.initEncoded(a, encoded);
 }
 pub fn selection(a: A, request: Request) !V {
     var output: std.json.ObjectMap = .empty;
@@ -260,6 +258,7 @@ pub const Plan = struct {
     params: V = .null,
     nodes: usize = 0,
     fingerprint: [64]u8 = undefined,
+    encoded: []const u8 = &.{},
 
     pub fn init(backing: A, input: Request) !Plan {
         const arena = try backing.create(std.heap.ArenaAllocator);
@@ -276,10 +275,35 @@ pub const Plan = struct {
         try std.json.Stringify.value(input, .{}, &counter.writer);
         if (counter.fullCount() > 16 * 1024 * 1024) return error.DecisionLimitExceeded;
         const owned = try std.json.Stringify.valueAlloc(a, input, .{});
+        try self.finish(owned, false);
+        return self;
+    }
+    /// Transport decoding owns one byte extent and parses once. Do not round-trip
+    /// an already encoded program through another temporary DOM and serializer.
+    pub fn initEncoded(backing: A, encoded: []const u8) !Plan {
+        if (encoded.len > 16 * 1024 * 1024) return error.DecisionLimitExceeded;
+        const arena = try backing.create(std.heap.ArenaAllocator);
+        arena.* = .init(backing);
+        var self: Plan = .{ .arena = arena };
+        errdefer self.deinit();
+        try self.finish(try self.arena.allocator().dupe(u8, encoded), true);
+        return self;
+    }
+    fn finish(self: *Plan, owned: []const u8, validate: bool) !void {
+        const a = self.arena.allocator();
         const request = try std.json.parseFromSliceLeaky(Request, a, owned, .{});
         if (request.fields.len > 4160 or request.params != .object) return error.InvalidQueryRequest;
+        if (validate) {
+            for (request.fields) |field| try validateInput(a, field);
+            try validateInput(a, request.params);
+        }
         self.params = request.params;
-        var hasher = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).init(&.{});
+        // Transport reuses the one owned input extent. Stream the canonical
+        // parsed-number fingerprint without retaining another payload buffer.
+        self.encoded = owned;
+        // Batch short JSON writes without retaining a payload-sized buffer.
+        var hash_buffer: [4096]u8 = undefined;
+        var hasher = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).init(&hash_buffer);
         try std.json.Stringify.value(request, .{}, &hasher.writer);
         try hasher.writer.flush();
         self.fingerprint = std.fmt.bytesToHex(hasher.hasher.finalResult(), .lower);
@@ -355,7 +379,6 @@ pub const Plan = struct {
             }
         };
         self.unconditional_fields = unconditional.items;
-        return self;
     }
     /// Caller has strictly validated output members and the plan fingerprint.
     /// Nonstandard worker marker placement retains the general wire fallback.
@@ -1135,4 +1158,20 @@ test "api query contract normalized receipts preserve work depth bytes and cance
     };
     var cancelled: Work = .{ .alloc = a };
     try std.testing.expectError(error.QueryCanceled, value.charge(.{ .depth = 3, .wire_bytes = 1024, .checkpoint = Guard.poll }, &cancelled));
+}
+
+test "api query contract canonical transport fingerprint owns encoded input" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const selected = try std.json.parseFromSliceLeaky(V, a, "{\"n\":{\"literal\":1e-400},\"x\":{\"literal\":9007199254740993}}", .{});
+    const encoded = try encodePrepared(a, &.{"body"}, selected, .{ .object = .empty });
+    defer encoded.plan.deinit();
+    var transported = try decode(a, encoded.json);
+    defer transported.deinit();
+    try std.testing.expectEqualStrings(&encoded.plan.fingerprint, &transported.fingerprint);
+    try std.testing.expectEqualStrings(encoded.json, transported.encoded);
+    @memset(encoded.json, 'x');
+    try std.testing.expectEqual(@as(u8, '{'), transported.encoded[0]);
+    try std.testing.expectEqual(@as(usize, 2), transported.bindings.len);
 }

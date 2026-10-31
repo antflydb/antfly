@@ -694,6 +694,12 @@ pub const DocStore = struct {
 
         /// Block-scoped values from this exact snapshot. Close scopes before
         /// aborting the transaction (which also owns the portable-import fence).
+        /// Unknown/write adapters retain conservative batch admission.
+        pub fn readScopeRangeMode(self: *const Txn) ?backend_erased.RangeReadMode {
+            if (self.read) |*read| return read.readScopeRangeMode();
+            return null;
+        }
+
         pub fn openReadScope(self: *Txn, alloc: Allocator) !backend_erased.ReadScope {
             if (self.read) |*read| return read.openReadScope(alloc);
             if (self.write) |*write| return write.openReadScope(alloc);

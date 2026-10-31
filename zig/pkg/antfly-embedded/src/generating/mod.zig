@@ -491,8 +491,16 @@ const BackendState = struct {
         };
     }
 
-    fn chat(ptr: *anyopaque, alloc: std.mem.Allocator, request: lib.ChatRequest) !lib.ChatResponse {
+    fn chat(ptr: *anyopaque, alloc: std.mem.Allocator, original_request: lib.ChatRequest) !lib.ChatResponse {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
+        const media = if (self.request_context) |context| context.verified_media else &.{};
+        var rendered = try @import("../inference/verified_messages.zig").materialize(@import("../sql/memory_budget.zig").reclaimingAllocator(alloc), original_request.messages, media);
+        defer if (rendered) |*value| value.deinit();
+        var body = try execution_context.materializeVerifiedJson(@import("../sql/memory_budget.zig").reclaimingAllocator(alloc), original_request.body_json, media);
+        defer body.deinit(@import("../sql/memory_budget.zig").reclaimingAllocator(alloc));
+        var request = original_request;
+        request.messages = if (rendered) |value| value.messages else original_request.messages;
+        request.body_json = body.bytes;
         var response = try chatResponseWithState(alloc, self, request);
         defer response.deinit();
         var result = lib.ChatResponse{ .allocator = alloc, .status = response.status.code, .body = try alloc.dupe(u8, response.body orelse "") };
@@ -563,8 +571,12 @@ const BackendState = struct {
         if (self.request_context) |context| if (context.submission) |callback| callback.notify(callback.ptr);
     }
 
-    fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
+    fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, original_messages: []const ChatMessage) !GenerateResult {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
+        const accepts_handles = self.provider == .embedded_antfly and self.provider.embedded_antfly.accepts_verified_media_handles;
+        var rendered = if (!accepts_handles) try @import("../inference/verified_messages.zig").materialize(@import("../sql/memory_budget.zig").reclaimingAllocator(alloc), original_messages, if (self.request_context) |context| context.verified_media else &.{}) else null;
+        defer if (rendered) |*value| value.deinit();
+        const messages = if (rendered) |value| value.messages else original_messages;
         if (self.request_context) |context| {
             try context.updateDetail(.executing, 0, 1, model, @tagName(std.meta.activeTag(self.provider)));
             const timeout_ms = try context.remainingTimeoutMs();
@@ -706,7 +718,12 @@ const BackendState = struct {
                 } else false;
                 if (self.require_completion and local.generate_json == null) return error.UnsupportedInferenceFeature;
                 if (local.generate_json != null and (self.require_completion or self.cfg.tools_json != null or self.cfg.tool_choice_json != null or self.cfg.response_format_json != null or has_tool_history)) {
-                    const body = try inference.types.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .termite_native, .{
+                    var adapted = if (local.generate_json_with_attachments != null)
+                        try @import("../inference/verified_messages.zig").prepare(@import("../sql/memory_budget.zig").reclaimingAllocator(alloc), messages, if (self.request_context) |context| context.verified_media else &.{}, true)
+                    else
+                        null;
+                    defer if (adapted) |*value| value.deinit();
+                    const body = try inference.types.chatRequestJsonWithOptionsAlloc(alloc, model, if (adapted) |value| value.messages else messages, .termite_native, .{
                         .response_format_json = self.cfg.response_format_json,
                         .logprobs = self.cfg.logprobs,
                         .top_logprobs = 64,
@@ -724,7 +741,10 @@ const BackendState = struct {
                     });
                     defer alloc.free(body);
                     self.notifyLocalSubmission();
-                    const response = try local.generateJson(alloc, body, self.request_context);
+                    const response = if (adapted) |value|
+                        try local.generateJsonWithAttachments(alloc, body, value.attachments, self.request_context)
+                    else
+                        try local.generateJson(alloc, body, self.request_context);
                     defer alloc.free(response);
                     if (self.usage_observer) |usage_sink| if (provider_limits.responseUsage(response)) |usage| usage_sink.record(usage.input_tokens, usage.output_tokens);
                     break :blk try antfly_provider.Provider.parseGenerationResponse(alloc, response, self.cfg.tools_json, self.cfg.tool_choice_json);
@@ -2085,4 +2105,56 @@ test "generating backend Cloudflare configuration owns routing through parse clo
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "provider registry gateway structured native media borrows codecs and preserves complete generation options" {
+    const a = std.testing.allocator;
+    const url = "data:image/png;base64,aW1hZ2U=";
+    const codec = "image";
+    const Fake = struct {
+        fn legacy(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?RequestContext) ![]u8 {
+            return error.UnexpectedLegacyRoute;
+        }
+        fn generate(raw: *anyopaque, alloc: std.mem.Allocator, body: []const u8, attachments: []const inference.work.Attachment, context: ?RequestContext) ![]u8 {
+            const calls: *usize = @ptrCast(@alignCast(raw));
+            calls.* += 1;
+            try context.?.check();
+            try std.testing.expectEqual(@as(usize, 2), attachments.len);
+            try std.testing.expect(attachments[0].bytes.ptr == codec.ptr);
+            try std.testing.expect(attachments[1].bytes.ptr == codec.ptr);
+            try std.testing.expect(std.mem.indexOf(u8, body, url) == null);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            try std.testing.expectEqual(@as(i64, 37), root.get("max_tokens").?.integer);
+            try std.testing.expect(root.get("tools") != null);
+            try std.testing.expect(root.get("tool_choice") != null);
+            try std.testing.expect(root.get("response_format") != null);
+            const parts = root.get("messages").?.array.items[0].object.get("content").?.array.items;
+            try std.testing.expectEqualStrings("attachment:0", parts[0].object.get("data").?.string);
+            try std.testing.expectEqualStrings("attachment:1", parts[1].object.get("data").?.string);
+            return alloc.dupe(u8, "{\"choices\":[{\"message\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}");
+        }
+    };
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    var calls: usize = 0;
+    var factory = BackendFactory.initWithOptions(a, &client, .{
+        .antfly_provider = .{ .ptr = &calls, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.legacy, .generate_json_with_attachments = Fake.generate },
+        .request_context = .{ .io = std.testing.io, .deadline_ns = null, .verified_media = &.{.{ .url = url, .mime_type = "image/png", .bytes = codec }} },
+        .require_completion = true,
+    });
+    var cfg = GeneratorConfig.fromAntfly(.{ .model = "fixture", .url = "" });
+    cfg.tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"inspect\",\"parameters\":{\"type\":\"object\"}}}]";
+    cfg.tool_choice_json = "\"auto\"";
+    cfg.response_format_json = "{\"type\":\"json_object\"}";
+    cfg.max_tokens = 37;
+    cfg.temperature = 0;
+    var generator = try factory.factory().create(a, cfg);
+    defer generator.deinit();
+    const parts = [_]ContentPart{ .{ .image_url = .{ .url = url } }, .{ .image_url = .{ .url = url } } };
+    var result = try generator.generate(a, "fixture", &.{.{ .role = .user, .content = .{ .parts = &parts } }});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqualStrings("ok", result.content);
 }

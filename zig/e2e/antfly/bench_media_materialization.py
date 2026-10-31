@@ -32,6 +32,24 @@ from test_grep_indexed import logical_process_reader
 from media_fixture import png
 
 
+WORKLOADS = [
+    ("tiny_shared_duplicates", 1, True, True, 4),
+    ("tiny_distinct_unique", 1, False, False, 4),
+    ("medium_shared_duplicates", 64, True, True, 4),
+    ("medium_distinct_unique", 64, False, False, 4),
+    ("crossover_shared_duplicates", 128, True, True, 4),
+    ("crossover_distinct_unique", 128, False, False, 4),
+    ("large_shared_duplicates", 256, True, True, 4),
+    ("large_distinct_unique", 256, False, False, 4),
+    ("large_distinct_duplicates", 256, False, True, 4),
+    ("large_distinct_unique_eight", 256, False, False, 8),
+    ("skewed_distinct_eight", 512, False, False, 8),
+    ("large_512_distinct_unique_eight", 512, False, False, 8),
+    ("large_distinct_repeated_refs", 256, False, False, 4),
+    ("large_512_distinct_repeated_refs", 512, False, False, 4),
+]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -39,6 +57,12 @@ def main():
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--queries-per-phase", type=int, default=5)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--workload",
+        action="append",
+        choices=[case[0] for case in WORKLOADS],
+        help="repeat to select cases; default: all",
+    )
     args = parser.parse_args()
     if args.rounds < 1 or not 1 <= args.queries_per_phase <= 100:
         parser.error("positive rounds and 1..100 queries required")
@@ -49,19 +73,9 @@ def main():
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text(json.dumps({"public_inference": {"enabled": True}}))
     try:
-        for name, size, shared_mask, duplicates, count in [
-            ("tiny_shared_duplicates", 1, True, True, 4),
-            ("tiny_distinct_unique", 1, False, False, 4),
-            ("medium_shared_duplicates", 64, True, True, 4),
-            ("medium_distinct_unique", 64, False, False, 4),
-            ("crossover_shared_duplicates", 128, True, True, 4),
-            ("crossover_distinct_unique", 128, False, False, 4),
-            ("large_shared_duplicates", 256, True, True, 4),
-            ("large_distinct_unique", 256, False, False, 4),
-            ("large_distinct_duplicates", 256, False, True, 4),
-            ("large_distinct_unique_eight", 256, False, False, 8),
-            ("skewed_distinct_eight", 512, False, False, 8),
-        ]:
+        for name, size, shared_mask, duplicates, count in WORKLOADS:
+            if args.workload and name not in args.workload:
+                continue
             documents = {}
             references = []
             for i in range(count):
@@ -94,6 +108,17 @@ def main():
                         },
                     }
                 )
+            if name.endswith("repeated_refs"):
+                # Same row/field, independently checked limits: canonical source
+                # dedup must retain each claim, while storage/output can share.
+                references = [
+                    {
+                        **part,
+                        "source": {**part["source"], "max_pixels": size * size + j},
+                    }
+                    for part in references
+                    for j in range(2 if size == 512 else 4)
+                ]
             request = {"input": [{"role": "user", "content": references}]}
             corpora[name] = hashlib.sha256(
                 json.dumps(documents, sort_keys=True).encode()
@@ -186,6 +211,7 @@ def main():
             )
     report = {
         "schema_version": 1,
+        "driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "scope": "Four/eight authorized table images per request (skewed: one 512x512, seven 64x64), warm storage after ingestion, shared host. Materialization and adaptation end at ModelRequired; no model/provider execution or billing measured. Whole-process CPU and sampled RSS include background work.",
         "platform": platform.platform(),
         "machine": platform.machine(),

@@ -775,7 +775,8 @@ const Child = struct {
                 const provider = try std.json.parseFromSliceLeaky(wire.Provider, arena, envelope.options, .{});
                 diagnostic.operation = provider.operation;
                 diagnostic.has_deadline = provider.deadline_ns != null;
-                var limits = wire.provider_attachment_limits;
+                const operation_limits = wire.providerLimits(provider.operation);
+                var limits = operation_limits;
                 // Text-only calls keep the existing logical JSON body ceiling.
                 limits.max_metadata_bytes = rpc.max_body_bytes;
                 var media = try wire.attachments.parseAlloc(arena, envelope.data, limits);
@@ -783,12 +784,8 @@ const Child = struct {
                 // Metadata borrows the request payload, not the attachment
                 // descriptor allocation freed by media.deinit().
                 diagnostic.request_json = media.metadata;
-                if (media.attachments.len > 0 and media.metadata.len > wire.provider_attachment_limits.max_metadata_bytes) return error.BodyTooLarge;
-                const payloads = try arena.alloc(bridge.ProviderBinaryPayload, media.attachments.len);
-                for (payloads, media.attachments) |*payload, attachment| payload.* = .{
-                    .bytes = .init(attachment.data),
-                    .content_type = .init(attachment.mime_type),
-                };
+                if (media.attachments.len > 0 and media.metadata.len > operation_limits.max_metadata_bytes) return error.BodyTooLarge;
+                const payloads = try provider.expandPayloads(arena, media.attachments);
                 const refs = try arena.alloc(bridge.ProviderAttachmentRef, provider.attachment_refs.len);
                 for (refs, provider.attachment_refs) |*ref, source| {
                     if (source.attachment_index >= payloads.len) return error.InvalidInput;
