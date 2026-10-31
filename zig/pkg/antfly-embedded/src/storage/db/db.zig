@@ -128379,7 +128379,7 @@ test "pending document-unit dense embedding collection releases every failed all
         fn run(alloc: Allocator) !void {
             const Runtime = struct { config: struct { dense_embedder: ?u8 = 1 } = .{} };
             var runtime: Runtime = .{};
-            const db = .{ .enrichment_runtime = @as(?*Runtime, &runtime) };
+            const db = .{ .enrichment = .{ .runtime = @as(?*Runtime, &runtime) } };
             var names = [_][]u8{ @constCast("consumer"), @constCast("second_consumer") };
             var entries = [_]DocumentExtractionEmbeddingView{
                 .{ .name = "embedding", .consumer_indexes = &names },
@@ -128405,7 +128405,7 @@ test "pending document-unit sparse embedding collection releases every failed al
         fn run(alloc: Allocator) !void {
             const Runtime = struct { config: struct { sparse_embedder: ?u8 = 1 } = .{} };
             var runtime: Runtime = .{};
-            const db = .{ .enrichment_runtime = @as(?*Runtime, &runtime) };
+            const db = .{ .enrichment = .{ .runtime = @as(?*Runtime, &runtime) } };
             var names = [_][]u8{ @constCast("consumer"), @constCast("second_consumer") };
             var entries = [_]DocumentExtractionEmbeddingView{
                 .{ .name = "embedding", .consumer_indexes = &names },
@@ -130114,7 +130114,7 @@ test "db document lookup allocation benchmark" {
     const asset_raw: []const u8 = if (fixture == .text_asset_large) &large_asset_text else "projected value";
     const asset_projected = try std.fmt.allocPrint(alloc, "{{\"caption\":{f}}}", .{std.json.fmt(asset_raw, .{})});
     defer alloc.free(asset_projected);
-    if (text_fixture) try db.?.addEnrichment(.{ .name = asset_name, .kind = .asset, .field = "caption", .content_type = "text/plain" });
+    if (text_fixture) try db.?.enrichment.addEnrichment(.{ .name = asset_name, .kind = .asset, .field = "caption", .content_type = "text/plain" });
     const targets = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "text" }};
     const names = try alloc.alloc([544]u8, count);
     defer alloc.free(names);
