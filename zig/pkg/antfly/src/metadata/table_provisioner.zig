@@ -1181,9 +1181,9 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
     const first = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
     try std.testing.expectEqual(@as(usize, 1), first.indexes_added);
     try std.testing.expectEqual(@as(usize, 1), first.indexes_pending);
-    try std.testing.expect(try db.hasPendingIndexRepairIntents(std.testing.allocator));
+    try std.testing.expect(try db.indexes.repair.hasPendingIntents(std.testing.allocator));
 
-    var initial_state = try db.loadIndexRepairState(std.testing.allocator);
+    var initial_state = try db.indexes.repair.loadState(std.testing.allocator);
     defer initial_state.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), initial_state.entries.items.len);
     const repair_id = initial_state.entries.items[0].intent.repair_id;
@@ -1195,7 +1195,7 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
     const second = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
     try std.testing.expectEqual(@as(usize, 0), second.indexes_added);
     try std.testing.expectEqual(@as(usize, 1), second.indexes_pending);
-    var repeated_state = try db.loadIndexRepairState(std.testing.allocator);
+    var repeated_state = try db.indexes.repair.loadState(std.testing.allocator);
     defer repeated_state.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), repeated_state.entries.items.len);
     try std.testing.expectEqual(repair_id, repeated_state.entries.items[0].intent.repair_id);
@@ -1216,12 +1216,12 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
         }
     };
     var deferral = Deferral{};
-    if (inject_activation_deferral) db.shadow_index_repair_hook = .{
+    if (inject_activation_deferral) db.indexes.repair.shadow_hook = .{
         .ptr = &deferral,
         .after_snapshot_build = Deferral.afterSnapshot,
         .after_phase_persisted = Deferral.afterPhase,
     };
-    defer db.shadow_index_repair_hook = null;
+    defer db.indexes.repair.shadow_hook = null;
 
     // This is a functional durability test, not the production 250 ms reader
     // pause SLA. Match the storage repair tests' activation headroom, but still
@@ -1231,7 +1231,7 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
     var repaired = false;
     var observed_retry = false;
     defer if (!repaired) {
-        var state = db.loadIndexRepairState(std.testing.allocator) catch null;
+        var state = db.indexes.repair.loadState(std.testing.allocator) catch null;
         if (state) |*snapshot| {
             defer snapshot.deinit(std.testing.allocator);
             for (snapshot.entries.items) |entry| {
@@ -1244,7 +1244,7 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
         }
     };
     for (0..max_steps) |_| {
-        const step = try db.advanceIndexRepairIntent(std.testing.allocator, repair_id, .{
+        const step = try db.indexes.repair.advanceIntent(std.testing.allocator, repair_id, .{
             .max_activation_pause_ms = 5_000,
         });
         if (step.repaired) {
@@ -1256,7 +1256,7 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
         const retry_delay_ms = step.next_retry_at_ms -| now_ms;
         if (retry_delay_ms != 0) {
             observed_retry = true;
-            var pending_state = try db.loadIndexRepairState(std.testing.allocator);
+            var pending_state = try db.indexes.repair.loadState(std.testing.allocator);
             defer pending_state.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(usize, 1), pending_state.entries.items.len);
             const pending = pending_state.entries.items[0];
@@ -1276,7 +1276,7 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
                 try std.testing.expectEqual(step.next_retry_at_ms, index_stats.index_repair_next_retry_at_ms);
                 // Advancing before the retry time must neither attempt work
                 // nor lose the persisted retry schedule.
-                const early = try db.advanceIndexRepairIntent(std.testing.allocator, repair_id, .{});
+                const early = try db.indexes.repair.advanceIntent(std.testing.allocator, repair_id, .{});
                 try std.testing.expect(early.deferred);
                 try std.testing.expect(!early.attempted);
                 try std.testing.expectEqual(step.next_retry_at_ms, early.next_retry_at_ms);
@@ -1286,7 +1286,7 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
             // The durable deadline is exclusive: one millisecond early still
             // defers, while the next turn at the deadline may attempt work.
             clock.setRealtimeNs((step.next_retry_at_ms - 1) * std.time.ns_per_ms);
-            const early = try db.advanceIndexRepairIntent(std.testing.allocator, repair_id, .{});
+            const early = try db.indexes.repair.advanceIntent(std.testing.allocator, repair_id, .{});
             try std.testing.expect(early.deferred);
             try std.testing.expect(!early.attempted);
             try std.testing.expectEqual(step.next_retry_at_ms, early.next_retry_at_ms);
@@ -1296,7 +1296,7 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
     try std.testing.expect(repaired);
     try std.testing.expectEqual(inject_activation_deferral, deferral.fired);
     if (inject_activation_deferral) try std.testing.expect(observed_retry);
-    try std.testing.expect(!try db.hasPendingIndexRepairIntents(std.testing.allocator));
+    try std.testing.expect(!try db.indexes.repair.hasPendingIntents(std.testing.allocator));
 
     const complete = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
     try std.testing.expectEqual(@as(usize, 0), complete.indexes_added);
@@ -1789,7 +1789,7 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 0), summary.indexes_removed);
             try std.testing.expectEqual(@as(usize, 2), summary.enrichments_removed);
 
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             try std.testing.expectEqual(@as(usize, 2), enrichments.len);
             try std.testing.expect(findEnrichment(enrichments, .asset, "keep_units") != null);
@@ -1969,7 +1969,7 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 1), summary.indexes_pending);
             try std.testing.expect(db.core.index_manager.algebraicIndex("alg") != null);
             try std.testing.expect(db.core.index_manager.repairUnavailable("alg"));
-            try std.testing.expect(try db.hasPendingIndexRepairIntents(std.testing.allocator));
+            try std.testing.expect(try db.indexes.repair.hasPendingIntents(std.testing.allocator));
         }
 
         test "table provisioner extracts public algebraic metadata as internal config" {
@@ -2048,7 +2048,7 @@ fn implementationTests() type {
                 indexes[0].coverage_generation,
             );
 
-            const enrichments = try db.listEnrichments(std.testing.allocator);
+            const enrichments = try db.enrichment.listEnrichments(std.testing.allocator);
             defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, enrichments);
             try std.testing.expectEqual(@as(usize, 1), enrichments.len);
             try std.testing.expectEqualStrings("memory_embed", enrichments[0].name);
@@ -2310,7 +2310,7 @@ fn implementationTests() type {
             defer alloc.free(db_path);
             var db = try db_mod.DB.open(alloc, db_path, .{});
             defer db.close();
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             try std.testing.expectEqual(@as(usize, 2), enrichments.len);
             try std.testing.expectEqualStrings("document_units_v1", enrichments[0].name);
@@ -2455,7 +2455,7 @@ fn implementationTests() type {
             var db = try db_mod.DB.open(alloc, db_path, .{});
             defer db.close();
 
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             const cfg = findEnrichment(enrichments, .chunk, "document_chunks_v1") orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(u32, 256), cfg.chunk_size);
@@ -2528,7 +2528,7 @@ fn implementationTests() type {
             var db = try db_mod.DB.open(alloc, db_path, .{});
             defer db.close();
 
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             try std.testing.expectEqual(@as(usize, 1), enrichments.len);
             try std.testing.expectEqual(.chunk, enrichments[0].kind);
@@ -2577,7 +2577,7 @@ fn implementationTests() type {
             var db = try db_mod.DB.open(alloc, db_path, .{});
             defer db.close();
 
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             try std.testing.expectEqual(@as(usize, 2), enrichments.len);
             try std.testing.expect(findEnrichment(enrichments, .asset, "document_units_v1") != null);
@@ -2641,7 +2641,7 @@ fn implementationTests() type {
             var db = try db_mod.DB.open(alloc, db_path, .{});
             defer db.close();
 
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             try std.testing.expectEqual(@as(usize, 1), enrichments.len);
             try std.testing.expect(findEnrichment(enrichments, .chunk, "document_chunks_v1") != null);
@@ -2731,7 +2731,7 @@ fn implementationTests() type {
                 defer alloc.free(db_path);
                 var db = try db_mod.DB.open(alloc, db_path, .{});
                 defer db.close();
-                db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+                db.backend_runtime.durable_jobs.drainOwner(db.indexes.repair.cleanup_owner_id);
             }
 
             const admitted_summary = try reconcileReplicaRoot(
@@ -2760,7 +2760,7 @@ fn implementationTests() type {
             var db = try db_mod.DB.open(alloc, db_path, .{});
             defer db.close();
 
-            const enrichments = try db.listEnrichments(alloc);
+            const enrichments = try db.enrichment.listEnrichments(alloc);
             defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
             try std.testing.expectEqual(@as(usize, 2), enrichments.len);
             try std.testing.expect(findEnrichment(enrichments, .asset, "document_units_v2") != null);

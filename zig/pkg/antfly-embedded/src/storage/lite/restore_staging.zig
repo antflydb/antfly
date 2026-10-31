@@ -1269,7 +1269,7 @@ test "lite restore staging preserves portable afb schema index and enrichment me
             .ignore_unknown_fields = true,
         });
         defer enrichment.deinit();
-        try source.db.addEnrichment(enrichment.value);
+        try source.db.enrichment.addEnrichment(enrichment.value);
 
         var index = try std.json.parseFromSlice(db_types.IndexConfig, allocator, index_json, .{
             .ignore_unknown_fields = true,
@@ -1569,7 +1569,7 @@ test "lite restore staging accepts aflite input for normal restore" {
             .ignore_unknown_fields = true,
         });
         defer enrichment.deinit();
-        try source.db.addEnrichment(enrichment.value);
+        try source.db.enrichment.addEnrichment(enrichment.value);
 
         for (index_jsons) |index_json| {
             var index = try std.json.parseFromSlice(db_types.IndexConfig, allocator, index_json, .{
@@ -1790,7 +1790,7 @@ test "lite portable backup roundtrips through normal table backup APIs" {
             .ignore_unknown_fields = true,
         });
         defer enrichment.deinit();
-        try source.db.addEnrichment(enrichment.value);
+        try source.db.enrichment.addEnrichment(enrichment.value);
 
         for (index_jsons) |index_json| {
             var index = try std.json.parseFromSlice(db_types.IndexConfig, allocator, index_json, .{
@@ -1849,7 +1849,7 @@ test "lite portable backup roundtrips through normal table backup APIs" {
     _ = try normal_db.rebuildDenseIndexesForTargetCoverage(allocator);
     _ = try normal_db.rebuildSparseIndexesForTargetCoverage(allocator);
     try normal_db.rebuildGraphIndexesForTargetCoverage(allocator);
-    _ = try normal_db.replayGeneratedEnrichmentsFromStoredDocs(allocator);
+    _ = try normal_db.enrichment.replayGeneratedEnrichmentsFromStoredDocs(allocator);
     try normal_db.runUntilIdle();
 
     {
@@ -1909,7 +1909,7 @@ test "lite portable backup roundtrips through normal table backup APIs" {
         try std.testing.expectEqual(@as(usize, 5), indexes.len);
         try std.testing.expect(indexNamed(indexes, full_text_index_defaults.default_full_text_index_name) != null);
 
-        const enrichments = try restored.db.listEnrichments(allocator);
+        const enrichments = try restored.db.enrichment.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
         try std.testing.expectEqual(@as(usize, 1), enrichments.len);
         try std.testing.expectEqualStrings("roundtrip_chunks_v1", enrichments[0].name);

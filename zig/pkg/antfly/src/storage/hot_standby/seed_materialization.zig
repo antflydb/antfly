@@ -945,15 +945,15 @@ test "storage.ha protected owner seed accepts serving program and rejects stale 
                 .range_end = range.end,
             }).digest(),
         };
-        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(pending_bytes, request, .{ .term = 3, .index = 11 })) == null);
-        _ = try db.loadRowPolicyReceipt(1, .pending_install);
+        try std.testing.expect((try db.query.applyReplicatedRowPolicyPublication(pending_bytes, request, .{ .term = 3, .index = 11 })) == null);
+        _ = try db.query.loadRowPolicyReceipt(1, .pending_install);
         var serving = pending;
         serving.phase = .serving_install;
         const serving_bytes = try std.json.Stringify.valueAlloc(alloc, serving, .{});
         defer alloc.free(serving_bytes);
         request.expected_phase = .serving_install;
-        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(serving_bytes, request, .{ .term = 3, .index = 12 })) == null);
-        _ = try db.loadRowPolicyReceipt(1, .serving_install);
+        try std.testing.expect((try db.query.applyReplicatedRowPolicyPublication(serving_bytes, request, .{ .term = 3, .index = 12 })) == null);
+        _ = try db.query.loadRowPolicyReceipt(1, .serving_install);
         active_program = pending;
         active_program.phase = .active;
         try verifyOpenedReplicaRowPolicy(alloc, &db, 7, &.{active_program});

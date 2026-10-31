@@ -197,7 +197,7 @@ pub const ManagedAdmissionScenario = struct {
     }
 
     pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {
-        const pending = try world.fixture.db.hasPendingIndexRepairIntents(allocator);
+        const pending = try world.fixture.db.indexes.repair.hasPendingIntents(allocator);
         const complete = world.materialized and world.deleted;
         // Materialization observes the marker iff deletion has not already
         // committed catalog absence. Both orders converge to the same cleanup.
@@ -955,7 +955,7 @@ pub const ManagedReadinessScenario = struct {
                 return error.ManagedIndexCanonicalWorkerMissing;
             // Admission records bounded repair debt; the repair owner, not
             // the ordinary replay drain, discovers the existing corpus.
-            const result = try self.fixture.db.advanceIndexRepairIntent(
+            const result = try self.fixture.db.indexes.repair.advanceIntent(
                 self.allocator,
                 self.repair_id.?,
                 .{},
@@ -992,7 +992,7 @@ pub const ManagedReadinessScenario = struct {
                     !stats.repair_degraded and
                     stats.doc_count == 1 and
                     self.progressive_partial_hits == 1 and
-                    try self.fixture.db.hasPendingIndexRepairIntents(self.allocator);
+                    try self.fixture.db.indexes.repair.hasPendingIntents(self.allocator);
                 if (!self.progressive_partial_queryable)
                     return error.ManagedIndexProgressiveCheckpointNotQueryable;
             } else {
@@ -1013,13 +1013,13 @@ pub const ManagedReadinessScenario = struct {
                 self.restart_contract_preserved =
                     stats.index_repair_active_generation_serviceable and
                     try self.searchHits() == 1 and
-                    try self.fixture.db.hasPendingIndexRepairIntents(self.allocator);
+                    try self.fixture.db.indexes.repair.hasPendingIntents(self.allocator);
             } else {
                 if (self.searchHits()) |_| {
                     self.restart_contract_preserved = false;
                 } else |err| switch (err) {
                     error.IndexRebuilding => self.restart_contract_preserved =
-                        try self.fixture.db.hasPendingIndexRepairIntents(self.allocator),
+                        try self.fixture.db.indexes.repair.hasPendingIntents(self.allocator),
                     else => return err,
                 }
             }
@@ -1038,13 +1038,13 @@ pub const ManagedReadinessScenario = struct {
                 }
             };
             var token: u8 = 0;
-            const result = try self.fixture.db.advanceIndexRepairIntent(
+            const result = try self.fixture.db.indexes.repair.advanceIntent(
                 self.allocator,
                 self.repair_id.?,
                 .{ .cancel_check = .{ .ptr = &token, .is_requested = Cancel.requested } },
             );
             self.cancellation_deferred = result.deferred and !result.repaired and !result.terminal;
-            self.cancellation_intent_retained = try self.fixture.db.hasPendingIndexRepairIntents(self.allocator);
+            self.cancellation_intent_retained = try self.fixture.db.indexes.repair.hasPendingIntents(self.allocator);
             if (!self.cancellation_deferred or !self.cancellation_intent_retained)
                 return error.ManagedIndexCancellationDidNotRetainRepair;
             self.stage = .converge;
@@ -1058,7 +1058,7 @@ pub const ManagedReadinessScenario = struct {
         pub fn finalize(self: *@This()) !void {
             var repaired = false;
             for (0..64) |_| {
-                const result = try self.fixture.db.advanceIndexRepairIntent(
+                const result = try self.fixture.db.indexes.repair.advanceIntent(
                     self.allocator,
                     self.repair_id.?,
                     .{},
@@ -1079,7 +1079,7 @@ pub const ManagedReadinessScenario = struct {
                 stats.replay_applied_sequence == stats.replay_target_sequence and
                 !stats.backfill_active and
                 !stats.repair_degraded and
-                !try self.fixture.db.hasPendingIndexRepairIntents(self.allocator);
+                !try self.fixture.db.indexes.repair.hasPendingIntents(self.allocator);
             self.final_ready = stats.doc_count == 3 and self.final_hits == 3 and
                 self.replay_converged;
             if (!self.final_ready) return error.ManagedIndexFinalReadinessInvalid;

@@ -240,7 +240,7 @@ pub const DB = struct {
     }
 
     pub fn drainScheduledTextMerges(self: *DB) !void {
-        try self.inner.drainScheduledTextMerges();
+        try self.inner.indexes.text.drainScheduledMerges();
     }
 
     pub fn forceCompactTextIndexes(self: *DB) !void {
@@ -270,7 +270,7 @@ pub const DB = struct {
     }
 
     pub fn listEnrichments(self: *DB, alloc: Allocator) ![]types.EnrichmentConfig {
-        return try self.inner.listEnrichments(alloc);
+        return try self.inner.enrichment.listEnrichments(alloc);
     }
 
     pub fn pendingWorkStats(self: *DB) db_core.PendingWorkStats {
@@ -282,7 +282,7 @@ pub const DB = struct {
     }
 
     pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
-        return try self.inner.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+        return try self.inner.enrichment.replayGeneratedEnrichmentsFromStoredDocs(alloc);
     }
 
     fn requireEmbeddedCatalogOwnership(self: *DB) !void {
@@ -301,12 +301,12 @@ pub const DB = struct {
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
         try self.requireEmbeddedCatalogOwnership();
-        try self.inner.addEnrichment(cfg);
+        try self.inner.enrichment.addEnrichment(cfg);
     }
 
     pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
         try self.requireEmbeddedCatalogOwnership();
-        return try self.inner.deleteEnrichment(kind, name);
+        return try self.inner.enrichment.deleteEnrichment(kind, name);
     }
 
     pub fn setSchema(self: *DB, table_schema: support.schema.TableSchema) !void {

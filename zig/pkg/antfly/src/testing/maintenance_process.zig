@@ -387,11 +387,11 @@ fn prepareDegreeScanBuild(
     });
     defer db.close();
 
-    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "degree", target_generation);
+    var started = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "degree", target_generation);
     defer started.deinit(alloc);
-    const prepare_worker = try db.runGraphMetricPlannedWorkerPageStepAt("graph_idx", "degree", "process-prepare-worker", 1000);
+    const prepare_worker = try db.indexes.graph.runMetricPlannedWorkerPageStepAt("graph_idx", "degree", "process-prepare-worker", 1000);
     if (!prepare_worker.claimed_page or !prepare_worker.completed_page) return error.GraphMetricExpectedPageClaim;
-    const prepare_coordinator = try db.runGraphMetricPlannedCoordinatorStepAt("graph_idx", "degree", 1001);
+    const prepare_coordinator = try db.indexes.graph.runMetricPlannedCoordinatorStepAt("graph_idx", "degree", 1001);
     if (!prepare_coordinator.advanced_phase) return error.GraphMetricUnexpectedPhase;
 }
 
@@ -407,7 +407,7 @@ fn prepareDegreePublishReadyBuild(
     });
     defer db.close();
 
-    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "degree", target_generation);
+    var started = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "degree", target_generation);
     defer started.deinit(alloc);
 
     var now_ms: u64 = 20_000;
@@ -421,11 +421,11 @@ fn prepareDegreePublishReadyBuild(
             else => {},
         }
 
-        const worker_step = try db.runGraphMetricPlannedWorkerPageStepAt("graph_idx", "degree", "process-publish-prep-worker", now_ms);
+        const worker_step = try db.indexes.graph.runMetricPlannedWorkerPageStepAt("graph_idx", "degree", "process-publish-prep-worker", now_ms);
         now_ms += 1;
         if (worker_step.phase == .publish_generation) return;
         if (worker_step.completed_page or !worker_step.claimed_page) {
-            const coordinator_step = try db.runGraphMetricPlannedCoordinatorStepAt("graph_idx", "degree", now_ms);
+            const coordinator_step = try db.indexes.graph.runMetricPlannedCoordinatorStepAt("graph_idx", "degree", now_ms);
             now_ms += 1;
             if (coordinator_step.phase == .publish_generation) return;
         }

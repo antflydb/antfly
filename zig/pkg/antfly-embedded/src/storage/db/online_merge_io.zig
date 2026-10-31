@@ -127,7 +127,7 @@ fn rewriteTailJson(db: *DB, alloc: Allocator, scope: source.Scope, after: u64, o
 }
 
 fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancellation: types.CancellationToken) ![]u8 {
-    _ = try db.advanceArtifactFootprintPage();
+    _ = try db.enrichment.advanceArtifactFootprintPage();
     db.core.lockApplyShared();
     defer db.core.unlockApplyShared();
     var txn = try db.core.store.beginReadTxn();
@@ -351,7 +351,7 @@ test "relational index system online admission facts are unbound read only and r
     // only Raft topology commands; rejected DDL must not alter the catalog.
     try std.testing.expectError(error.IntegrityTopologyBusy, db.addIndex(.{ .name = "graph_after_admit", .kind = .graph, .config_json = "{}" }));
     try std.testing.expectError(error.IntegrityTopologyBusy, db.deleteIndex("text_before_admit"));
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.addEnrichment(.{ .name = "chunks_after_admit", .kind = .chunk, .field = "body", .chunk_size = 8, .chunk_overlap = 2, .full_text_index = true }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.enrichment.addEnrichment(.{ .name = "chunks_after_admit", .kind = .chunk, .field = "body", .chunk_size = 8, .chunk_overlap = 2, .full_text_index = true }));
     try std.testing.expectError(error.IntegrityTopologyBusy, db.addResolver(.{ .name = "resolver_after_admit", .table = "entities", .source_artifact = "relations", .resolution_artifact = "resolved", .key_template = "{{ _entity.label }}", .config_generation = 1 }));
     {
         const indexes = try db.core.listIndexes(alloc);
@@ -409,7 +409,7 @@ test "relational index system online admission facts are unbound read only and r
     try enriched.setSchemaJson(alloc, "{}");
     try enriched.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
     try std.testing.expect((try Fetch.run(&enriched, request)).eligible);
-    try enriched.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 8, .chunk_overlap = 2, .full_text_index = true });
+    try enriched.enrichment.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 8, .chunk_overlap = 2, .full_text_index = true });
     // Full-text is row-derived only when no independently maintained child
     // artifacts/enrichments exist; their presence survives owner restart.
     try std.testing.expect(!(try Fetch.run(&enriched, request)).eligible);
@@ -453,7 +453,7 @@ test "relational index system native source admission rechecks artifact DDL at c
     };
     // The discovery snapshot preceded a separately committed enrichment
     // config. Native admission must see it inside the final serialized cut.
-    try db.addEnrichment(.{ .name = "chunks_before_admit", .kind = .chunk, .field = "body", .chunk_size = 8, .chunk_overlap = 2, .full_text_index = true });
+    try db.enrichment.addEnrichment(.{ .name = "chunks_before_admit", .kind = .chunk, .field = "body", .chunk_size = 8, .chunk_overlap = 2, .full_text_index = true });
     try std.testing.expectError(error.OnlineSourceScopeChanged, db.batch(.{ .online_source = .{ .admit = .{ .scope = scope } } }));
     {
         var read = try db.core.store.beginReadTxn();
@@ -737,7 +737,7 @@ fn sourceStatusJson(db: *DB, alloc: Allocator, scope: source.Scope, cancellation
     // They do not invalidate the already-certified absence of unsupported
     // families. Do not run unrelated maintenance through a prepared source pin.
     if (preliminary == null or preliminary.?.phase == .released)
-        _ = try db.advanceArtifactFootprintPage();
+        _ = try db.enrichment.advanceArtifactFootprintPage();
     // Published certificates are replicated ledger state, not local sidecar
     // availability. Normal tail/status polling performs no filesystem work.
     const certificate = if (preliminary != null and preliminary.?.published_certificate != null)
@@ -889,7 +889,7 @@ fn rowDerivedTransferIndexesAssumeApply(db: *DB, alloc: Allocator, coordinated: 
 }
 
 pub fn requireRowDerivedIndexes(db: *DB, alloc: Allocator) !void {
-    _ = try db.advanceArtifactFootprintPage();
+    _ = try db.enrichment.advanceArtifactFootprintPage();
     db.core.lockApplyShared();
     defer db.core.unlockApplyShared();
     if (!try rowDerivedIndexesAssumeApply(db, alloc)) return error.TableTopologyProtocolUpgradeRequired;

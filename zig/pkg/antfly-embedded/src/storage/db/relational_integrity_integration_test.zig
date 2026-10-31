@@ -228,7 +228,7 @@ test "self-FK dual owner preserves one admission fence across begin stage and ac
         var db = try db_mod.DB.open(alloc, path, options);
         defer db.close();
         try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
-        try std.testing.expect(try db.childGenerationSourcePinsSchemaJson(next_json));
+        try std.testing.expect(try db.recovery.childGenerationSourcePinsSchemaJson(next_json));
         try std.testing.expectError(error.ForeignKeyGenerationPublicationRequired, db.setSchemaJson(alloc, next_json));
         var split = fence;
         split.role = .split_source;
@@ -243,7 +243,7 @@ test "self-FK dual owner preserves one admission fence across begin stage and ac
         var db = try db_mod.DB.open(alloc, path, options);
         defer db.close();
         try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
-        try std.testing.expect(try db.childGenerationSourcePinsSchemaJson(next_json));
+        try std.testing.expect(try db.recovery.childGenerationSourcePinsSchemaJson(next_json));
         try std.testing.expectError(error.GenerationAdmissionActivationRequired, db.applyRelationalTopologyControl(.{ .action = .release, .fence = fence }, null));
         try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 3 });
         try server_test_adapter.applyOrdered(&db, .{ .relational_topology = .{ .action = .activate_child_generation, .fence = fence, .child_generations = &.{transition} } }, .{ .term = 1, .index = 3 });
@@ -252,7 +252,7 @@ test "self-FK dual owner preserves one admission fence across begin stage and ac
         var db = try db_mod.DB.open(alloc, path, options);
         defer db.close();
         try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
-        try std.testing.expect(try db.childGenerationSourcePinsSchemaJson(next_json));
+        try std.testing.expect(try db.recovery.childGenerationSourcePinsSchemaJson(next_json));
         try std.testing.expectError(error.GenerationAdmissionChanged, db.applyRelationalTopologyControl(.{ .action = .cancel, .fence = fence, .child_generations = &.{transition} }, null));
         {
             var read = try db.core.store.beginReadTxn();
@@ -266,7 +266,7 @@ test "self-FK dual owner preserves one admission fence across begin stage and ac
         var db = try db_mod.DB.open(alloc, path, options);
         defer db.close();
         try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
-        try std.testing.expect(try db.childGenerationSourcePinsSchemaJson(next_json));
+        try std.testing.expect(try db.recovery.childGenerationSourcePinsSchemaJson(next_json));
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
         try admission.requireDualInstallReady(&read, fence);
@@ -347,7 +347,7 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
     {
         var reopened = try db_mod.DB.open(alloc, path, options);
         defer reopened.close();
-        try std.testing.expect(try reopened.childGenerationSourcePinsSchemaJson(next_json));
+        try std.testing.expect(try reopened.recovery.childGenerationSourcePinsSchemaJson(next_json));
         {
             var read = try reopened.core.store.beginReadTxn();
             defer read.abort();

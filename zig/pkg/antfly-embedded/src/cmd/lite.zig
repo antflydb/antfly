@@ -329,7 +329,7 @@ fn enrichmentList(allocator: Allocator, io: std.Io, args: *std.process.Args.Iter
     var lite = try openEmbeddedDataSurface(allocator, path, .status_only);
     defer lite.close();
 
-    const configs = try lite.db.listEnrichments(allocator);
+    const configs = try lite.db.enrichment.listEnrichments(allocator);
     defer db_types.freeEnrichmentConfigs(allocator, configs);
     const json = try std.json.Stringify.valueAlloc(allocator, configs, .{});
     defer allocator.free(json);
@@ -353,7 +353,7 @@ fn enrichmentCreate(allocator: Allocator, io: std.Io, args: *std.process.Args.It
     defer lite.close();
     try ensureOfflineRootOnlyOperationSupported(&lite);
 
-    try lite.db.addEnrichment(parsed.value);
+    try lite.db.enrichment.addEnrichment(parsed.value);
     const json = try mutationJson(allocator, "created", parsed.value.name, true);
     defer allocator.free(json);
     writeJsonLine(io, json);
@@ -382,7 +382,7 @@ fn enrichmentDrop(allocator: Allocator, io: std.Io, args: *std.process.Args.Iter
     defer lite.close();
     try ensureOfflineRootOnlyOperationSupported(&lite);
 
-    const removed = try lite.db.deleteEnrichment(resolved_kind, resolved_name);
+    const removed = try lite.db.enrichment.deleteEnrichment(resolved_kind, resolved_name);
     const json = try mutationJson(allocator, "removed", resolved_name, removed);
     defer allocator.free(json);
     writeJsonLine(io, json);
@@ -957,7 +957,7 @@ fn vacuumAflitePath(allocator: Allocator, path: []const u8) !antfly.lite.backend
 fn prepareCompactLite(lite: *LiteDb) !void {
     try lite.db.maintenanceDriver().runUntilIdle();
     try lite.db.forceCompactTextIndexes();
-    try lite.db.drainScheduledTextMerges();
+    try lite.db.indexes.text.drainScheduledMerges();
     try lite.db.sync(true);
     try lite.db.syncIndexes(true);
 }
@@ -1570,7 +1570,7 @@ test "lite schema index and enrichment commands round trip catalogs" {
         try std.testing.expect(indexNamed(indexes, "cmd_ft_body") != null);
         try std.testing.expect(indexNamed(indexes, full_text_index_defaults.default_full_text_index_name) != null);
 
-        const enrichments = try lite.db.listEnrichments(allocator);
+        const enrichments = try lite.db.enrichment.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
         try std.testing.expectEqual(@as(usize, 1), enrichments.len);
         try std.testing.expectEqualStrings("cmd_body_chunks", enrichments[0].name);
@@ -1599,7 +1599,7 @@ test "lite schema index and enrichment commands round trip catalogs" {
         try std.testing.expectEqual(@as(usize, 1), indexes.len);
         try std.testing.expectEqualStrings(full_text_index_defaults.default_full_text_index_name, indexes[0].name);
 
-        const enrichments = try lite.db.listEnrichments(allocator);
+        const enrichments = try lite.db.enrichment.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
         try std.testing.expectEqual(@as(usize, 0), enrichments.len);
     }
@@ -1983,7 +1983,7 @@ test "lite backup output restores schema indexes enrichments and documents" {
         try source.db.setSchemaJson(allocator,
             \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","required":["title"]}}}}
         );
-        try source.db.addEnrichment(.{
+        try source.db.enrichment.addEnrichment(.{
             .name = "body_chunks_v1",
             .kind = .chunk,
             .field = "body",
@@ -2084,7 +2084,7 @@ test "lite backup output restores schema indexes enrichments and documents" {
         try std.testing.expect(saw_graph_index);
         try std.testing.expect(saw_default_index);
 
-        const enrichments = try restored.db.listEnrichments(allocator);
+        const enrichments = try restored.db.enrichment.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
         try std.testing.expectEqual(@as(usize, 1), enrichments.len);
         try std.testing.expectEqualStrings("body_chunks_v1", enrichments[0].name);
@@ -2153,7 +2153,7 @@ test "lite backup output restores schema indexes enrichments and documents" {
         try std.testing.expectEqual(@as(usize, 5), indexes.len);
         try std.testing.expect(indexNamed(indexes, full_text_index_defaults.default_full_text_index_name) != null);
 
-        const enrichments = try imported.db.listEnrichments(allocator);
+        const enrichments = try imported.db.enrichment.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
         try std.testing.expectEqual(@as(usize, 1), enrichments.len);
         try std.testing.expectEqualStrings("body_chunks_v1", enrichments[0].name);
@@ -2766,7 +2766,7 @@ test "lite promote stages portable afb and table manifest" {
             .ignore_unknown_fields = true,
         });
         defer enrichment.deinit();
-        try source.db.addEnrichment(enrichment.value);
+        try source.db.enrichment.addEnrichment(enrichment.value);
 
         var index = try std.json.parseFromSlice(db_types.IndexConfig, allocator, index_json, .{
             .ignore_unknown_fields = true,

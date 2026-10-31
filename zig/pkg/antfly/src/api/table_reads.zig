@@ -12206,7 +12206,7 @@ fn queryDbDetailed(
     var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
     try reads.reads.prepareSearchWithConsistency(group_id, req, consistency);
     if (req.native_query_cut) |cut| {
-        const retained = try db.openQueryCut(cut, req.cancellation orelse .none);
+        const retained = try db.query.openCut(cut, req.cancellation orelse .none);
         owner.deinit();
         owner = .{ .owned = retained };
         db = owner.db();
@@ -30428,7 +30428,7 @@ fn implementationTests() type {
                 .sync_level = .write,
             });
             try db.runUntilIdle();
-            var metric = try db.refreshGraphMetric(alloc, "graph_idx", "degree");
+            var metric = try db.indexes.graph.refreshMetric(alloc, "graph_idx", "degree");
             defer metric.deinit(alloc);
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric.state);
             var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
@@ -33508,7 +33508,7 @@ fn implementationTests() type {
                 .sync_level = .write,
             });
             try left_db.runUntilIdle();
-            var left_status = try left_db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+            var left_status = try left_db.indexes.graph.refreshMetric(alloc, "graph_idx", "manual_degree");
             defer left_status.deinit(alloc);
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, left_status.state);
 
@@ -33526,7 +33526,7 @@ fn implementationTests() type {
                 .sync_level = .write,
             });
             try right_db.runUntilIdle();
-            var right_status = try right_db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+            var right_status = try right_db.indexes.graph.refreshMetric(alloc, "graph_idx", "manual_degree");
             defer right_status.deinit(alloc);
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, right_status.state);
             try std.testing.expectEqual(left_status.published_generation, right_status.published_generation);
@@ -33724,14 +33724,14 @@ fn implementationTests() type {
                 .sync_level = .full_index,
             });
             try left_db.runUntilIdle();
-            var left_status = try left_db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+            var left_status = try left_db.indexes.graph.refreshMetric(alloc, "graph_idx", "manual_degree");
             defer left_status.deinit(alloc);
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, left_status.state);
-            var left_pagerank_status = try left_db.refreshGraphMetric(alloc, "graph_idx", "pagerank");
+            var left_pagerank_status = try left_db.indexes.graph.refreshMetric(alloc, "graph_idx", "pagerank");
             defer left_pagerank_status.deinit(alloc);
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, left_pagerank_status.state);
             try std.testing.expectEqual(left_status.published_generation, left_pagerank_status.published_generation);
-            var left_eigenvector_status = try left_db.refreshGraphMetric(alloc, "graph_idx", "eigenvector");
+            var left_eigenvector_status = try left_db.indexes.graph.refreshMetric(alloc, "graph_idx", "eigenvector");
             defer left_eigenvector_status.deinit(alloc);
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, left_eigenvector_status.state);
             try std.testing.expectEqual(left_status.published_generation, left_eigenvector_status.published_generation);
@@ -33752,15 +33752,15 @@ fn implementationTests() type {
                 .sync_level = .full_index,
             });
             try right_db.runUntilIdle();
-            var right_status = try right_db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+            var right_status = try right_db.indexes.graph.refreshMetric(alloc, "graph_idx", "manual_degree");
             defer right_status.deinit(alloc);
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, right_status.state);
             try std.testing.expectEqual(left_status.published_generation, right_status.published_generation);
-            var right_pagerank_status = try right_db.refreshGraphMetric(alloc, "graph_idx", "pagerank");
+            var right_pagerank_status = try right_db.indexes.graph.refreshMetric(alloc, "graph_idx", "pagerank");
             defer right_pagerank_status.deinit(alloc);
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, right_pagerank_status.state);
             try std.testing.expectEqual(left_status.published_generation, right_pagerank_status.published_generation);
-            var right_eigenvector_status = try right_db.refreshGraphMetric(alloc, "graph_idx", "eigenvector");
+            var right_eigenvector_status = try right_db.indexes.graph.refreshMetric(alloc, "graph_idx", "eigenvector");
             defer right_eigenvector_status.deinit(alloc);
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, right_eigenvector_status.state);
             try std.testing.expectEqual(left_status.published_generation, right_eigenvector_status.published_generation);
@@ -34177,7 +34177,7 @@ fn implementationTests() type {
                 });
                 try dbs[shard_index].runUntilIdle();
                 for (metric_names) |metric_name| {
-                    var status = try dbs[shard_index].refreshGraphMetric(alloc, "graph_idx", metric_name);
+                    var status = try dbs[shard_index].indexes.graph.refreshMetric(alloc, "graph_idx", metric_name);
                     defer status.deinit(alloc);
                     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
                     if (published_generation == 0) {
@@ -34493,7 +34493,7 @@ fn implementationTests() type {
                     .sync_level = .full_index,
                 });
                 try dbs[shard_index].runUntilIdle();
-                var authority_status = try dbs[shard_index].refreshGraphMetric(alloc, "graph_idx", "hits_authority");
+                var authority_status = try dbs[shard_index].indexes.graph.refreshMetric(alloc, "graph_idx", "hits_authority");
                 defer authority_status.deinit(alloc);
                 try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, authority_status.state);
                 var hub_status = try (dbs[shard_index].core.graphIndex("graph_idx") orelse return error.IndexNotFound).index.graphMetricStatus("hits_hub");
@@ -34937,7 +34937,7 @@ fn implementationTests() type {
                 .sync_level = .write,
             });
             try left_db.runUntilIdle();
-            var left_status = try left_db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+            var left_status = try left_db.indexes.graph.refreshMetric(alloc, "graph_idx", "manual_degree");
             defer left_status.deinit(alloc);
 
             var right_db = try db_mod.DB.open(alloc, right_path, .{
@@ -35094,7 +35094,7 @@ fn implementationTests() type {
 
             try std.testing.expectError(error.MetricNotReady, hosted.source().query(alloc, "docs", metric_req, .read_index));
 
-            var right_first = try right_db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+            var right_first = try right_db.indexes.graph.refreshMetric(alloc, "graph_idx", "manual_degree");
             defer right_first.deinit(alloc);
             try std.testing.expectEqual(left_status.published_generation, right_first.published_generation);
             try right_db.batch(.{
@@ -35102,7 +35102,7 @@ fn implementationTests() type {
                 .sync_level = .write,
             });
             try right_db.runUntilIdle();
-            var right_second = try right_db.rebuildGraphMetric(alloc, "graph_idx", "manual_degree");
+            var right_second = try right_db.indexes.graph.rebuildMetric(alloc, "graph_idx", "manual_degree");
             defer right_second.deinit(alloc);
             try std.testing.expect(right_second.published_generation > left_status.published_generation);
 

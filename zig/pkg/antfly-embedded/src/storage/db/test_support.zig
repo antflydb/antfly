@@ -229,7 +229,7 @@ pub fn verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads(
     });
     try db.runDerivedUntil(db.core.nextDerivedSequence());
 
-    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", metric_name);
+    var refreshed = try db.indexes.graph.refreshMetric(alloc, "graph_idx", metric_name);
     defer refreshed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
     const published_generation = refreshed.published_generation;
@@ -265,14 +265,14 @@ pub fn verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads(
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         const target_generation = graph_entry.index.edge_generation;
         try std.testing.expect(target_generation > published_generation);
-        var building = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", metric_name, target_generation);
+        var building = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", metric_name, target_generation);
         defer building.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building.state);
         try std.testing.expectEqual(target_generation, building.building_generation);
         break :blk target_generation;
     };
 
-    var failed = try db.failGraphMetricPlannedBuild(alloc, "graph_idx", metric_name, error.InvalidGraphMetricScore);
+    var failed = try db.indexes.graph.failMetricPlannedBuild(alloc, "graph_idx", metric_name, error.InvalidGraphMetricScore);
     defer failed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed.state);
     try std.testing.expectEqual(published_generation, failed.published_generation);

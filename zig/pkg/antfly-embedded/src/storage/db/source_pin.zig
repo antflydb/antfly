@@ -348,9 +348,9 @@ pub fn reclaimReleased(db: *DB, scope: ledger.Scope) !void {
     };
     if (found.progress.phase != .released) return error.OnlineSourceScopeChanged;
     if (found.progress.local_cleanup_complete) return;
-    _ = db.source_pin_cleanup.epoch.fetchAdd(1, .acq_rel);
+    _ = db.recovery.source_pin_cleanup.epoch.fetchAdd(1, .acq_rel);
     cleanupLocated(db, found) catch |err| {
-        db.recordSourcePinCleanupFailure(err);
+        db.recovery.recordSourcePinCleanupFailure(err);
         return err;
     };
 }
@@ -358,7 +358,7 @@ pub fn reclaimReleased(db: *DB, scope: ledger.Scope) !void {
 /// Startup and admission each perform one time-sliced page, never drain a tree.
 pub fn reconcileReleased(db: *DB) !void {
     _ = reconcileReleasedWithBudget(db, .{}) catch |err| {
-        db.recordSourcePinCleanupFailure(err);
+        db.recovery.recordSourcePinCleanupFailure(err);
         return;
     };
 }
@@ -369,12 +369,12 @@ pub fn reconcileReleasedWithBudget(db: *DB, budget: CleanupBudget) !CleanupWork 
     if (comptime @import("builtin").os.tag == .freestanding) return CleanupWork.init(.failing, budget);
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     var work = CleanupWork.init(io, budget);
-    const epoch = db.source_pin_cleanup.epoch.load(.acquire);
+    const epoch = db.recovery.source_pin_cleanup.epoch.load(.acquire);
     if (epoch == 0) return work;
     // Preserve useful work even when a different slot reports an error: the
     // shared maintenance scheduler must not back off healthy cleanup pages.
     defer if (work.completed_units != 0) {
-        _ = db.source_pin_cleanup.work_units.fetchAdd(@intCast(work.completed_units), .acq_rel);
+        _ = db.recovery.source_pin_cleanup.work_units.fetchAdd(@intCast(work.completed_units), .acq_rel);
     };
     // The common document-only owner pays one bounded read-only startup scan,
     // not directory creation, locking, cursor writes or per-mutation probes.
@@ -453,10 +453,10 @@ pub fn reconcileReleasedWithBudget(db: *DB, budget: CleanupBudget) !CleanupWork 
 }
 
 fn clearCleanupDebt(db: *DB, epoch: u64) void {
-    if (db.source_pin_cleanup.epoch.cmpxchgStrong(epoch, 0, .acq_rel, .acquire) != null) return;
-    db.source_pin_cleanup.error_code.store(0, .release);
-    db.source_pin_cleanup.failure_streak.store(0, .release);
-    db.source_pin_cleanup.next_ns.store(0, .release);
+    if (db.recovery.source_pin_cleanup.epoch.cmpxchgStrong(epoch, 0, .acq_rel, .acquire) != null) return;
+    db.recovery.source_pin_cleanup.error_code.store(0, .release);
+    db.recovery.source_pin_cleanup.failure_streak.store(0, .release);
+    db.recovery.source_pin_cleanup.next_ns.store(0, .release);
 }
 
 fn cleanupLocated(db: *DB, found: ledger.Located) !void {
@@ -682,10 +682,10 @@ test "relational index system source pin interrupted cleanup reserves slot acros
         if (db.sourcePinCleanupStatus().failures != 0) break;
     }
     try std.testing.expectEqualStrings("OnlineSourceCorrupt", db.sourcePinCleanupStatus().last_error.?);
-    db.source_pin_cleanup.next_ns.store(0, .release);
-    const units_before = db.source_pin_cleanup.work_units.load(.acquire);
-    try std.testing.expect(try db.runSourcePinCleanupStep());
-    try std.testing.expect(db.source_pin_cleanup.work_units.load(.acquire) > units_before);
+    db.recovery.source_pin_cleanup.next_ns.store(0, .release);
+    const units_before = db.recovery.source_pin_cleanup.work_units.load(.acquire);
+    try std.testing.expect(try db.recovery.runSourcePinCleanupStep());
+    try std.testing.expect(db.recovery.source_pin_cleanup.work_units.load(.acquire) > units_before);
     // Useful later-slot work keeps the next pass prompt despite the earlier
     // damaged cursor, while zero-progress errors retain exponential backoff.
     try std.testing.expect(db.sourcePinCleanupStatus().next_attempt_ns <= @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_ms);

@@ -72,7 +72,7 @@ pub fn step(db: anytype, command: inventory.Command, context: @import("artifact_
             } else false;
             break exact;
         } else false;
-        if (needed) _ = try db.retryQuarantinedIndexLoad(name, true) else _ = try db.reconcileArtifactDeleteIndex(name, context);
+        if (needed) _ = try db.maintenance.retryQuarantinedIndexLoad(name, true) else _ = try db.reconcileArtifactDeleteIndex(name, context);
         return false;
     }
     // Remove dependent indexes first, then their producers and resolvers.
@@ -95,7 +95,7 @@ pub fn step(db: anytype, command: inventory.Command, context: @import("artifact_
         _ = try db.reconcileArtifactDeleteResolver(current_resolvers[0].name, context);
         return false;
     }
-    const current_enrichments = try db.listEnrichments(alloc);
+    const current_enrichments = try db.enrichment.listEnrichments(alloc);
     defer types.freeEnrichmentConfigs(alloc, current_enrichments);
     const producers = try desiredProducers(alloc, command.catalogs);
     defer freeProducers(alloc, producers);
@@ -104,7 +104,7 @@ pub fn step(db: anytype, command: inventory.Command, context: @import("artifact_
             if (std.mem.eql(u8, producer.name, config.name)) break true;
         } else false;
         if (!wanted) {
-            _ = db.reconcileArtifactDeleteEnrichment(config.kind, config.name, context) catch |err| switch (err) {
+            _ = db.enrichment.reconcileArtifactDeleteEnrichment(config.kind, config.name, context) catch |err| switch (err) {
                 error.EnrichmentInUse => return error.ArtifactCatalogDrift,
                 else => return err,
             };
@@ -123,7 +123,7 @@ pub fn step(db: anytype, command: inventory.Command, context: @import("artifact_
             break std.mem.eql(u8, wanted_bytes, actual_bytes);
         } else false;
         if (!present) {
-            try db.reconcileArtifactAddEnrichment(public, context);
+            try db.enrichment.reconcileArtifactAddEnrichment(public, context);
             return false;
         }
     }

@@ -48,7 +48,7 @@ test "restore input plan stages aflite as portable table restore" {
         defer lite.close();
         const db = &lite.db;
         try db.setSchemaJson(allocator, schema_json);
-        try db.addEnrichment(.{
+        try db.enrichment.addEnrichment(.{
             .name = "restore_input_chunks_v1",
             .kind = .chunk,
             .field = "body",

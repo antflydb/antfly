@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
                 // Keep the deterministic synchronous benchmark from building
                 // an unbounded end-of-load merge backlog. This models the
                 // production merge lane making progress during a long load.
-                try db.drainScheduledTextMerges();
+                try db.indexes.text.drainScheduledMerges();
                 var progress_layout = try db.textIndexLayoutStats(alloc, common.index_name);
                 defer progress_layout.deinit(alloc);
                 try stderr.interface.print(
@@ -129,7 +129,7 @@ pub fn main(init: std.process.Init) !void {
 
     try stderr.interface.print("settling index after {d} documents\n", .{indexed});
     try stderr.interface.flush();
-    db.drainScheduledTextMerges() catch |err| {
+    db.indexes.text.drainScheduledMerges() catch |err| {
         try stderr.interface.print("final merge settlement failed: {s}\n", .{@errorName(err)});
         try stderr.interface.flush();
         return err;

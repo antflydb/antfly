@@ -1478,8 +1478,8 @@ test "db graph metric runtime lease ownership blocks duplicate owners and allows
         try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
     }
 
-    db.graph_metric_runtime = &owner_b;
-    defer db.graph_metric_runtime = null;
+    db.indexes.graph.metrics.runtime = &owner_b;
+    defer db.indexes.graph.metrics.runtime = null;
     {
         const mapped_stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, mapped_stats);
@@ -2268,7 +2268,7 @@ test "db graph metric runtime role planned worker pools reject duplicate worker 
     defer db.close();
 
     const duplicate_workers = [_][]const u8{ "runtime-pool-duplicate", "runtime-pool-duplicate" };
-    try std.testing.expectError(error.InvalidGraphMetricBuildWorker, db.runGraphMetricPlannedMaintenanceForIdle(.{
+    try std.testing.expectError(error.InvalidGraphMetricBuildWorker, db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
         .worker_ids = duplicate_workers[0..],
         .max_rounds = 1,
         .max_metrics_per_round = 1,
@@ -2928,7 +2928,7 @@ test "db graph metric runtime background skips paused metrics" {
         break :blk graph_entry.index.edge_generation;
     };
 
-    var paused = try db.pauseGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    var paused = try db.indexes.graph.pauseMetricMaintenance(alloc, "graph_idx", "degree");
     defer paused.deinit(alloc);
     try std.testing.expect(paused.maintenance_paused);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, paused.state);
@@ -2984,7 +2984,7 @@ test "db graph metric runtime background skips paused metrics" {
         try std.testing.expectEqual(@as(u64, 0), status.published_generation);
     }
 
-    var resumed = try db.resumeGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    var resumed = try db.indexes.graph.resumeMetricMaintenance(alloc, "graph_idx", "degree");
     defer resumed.deinit(alloc);
     try std.testing.expect(!resumed.maintenance_paused);
 
@@ -3064,14 +3064,14 @@ test "db graph metric runtime background idles after synchronously cleaning a sm
         },
     );
     defer runtime.deinit();
-    db.graph_metric_runtime = &runtime;
-    defer db.graph_metric_runtime = null;
+    db.indexes.graph.metrics.runtime = &runtime;
+    defer db.indexes.graph.metrics.runtime = null;
 
     const started_tick = try runtime.runCoordinatorOnce(true);
     try std.testing.expect(started_tick.durableProgressed());
     try std.testing.expectEqual(@as(usize, 1), started_tick.builds_started);
 
-    var failed = try db.failGraphMetricPlannedBuild(alloc, "graph_idx", "degree", error.InvalidGraphMetricBuildManifest);
+    var failed = try db.indexes.graph.failMetricPlannedBuild(alloc, "graph_idx", "degree", error.InvalidGraphMetricBuildManifest);
     defer failed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed.state);
     try std.testing.expect(failed.build_queued);
@@ -3225,7 +3225,7 @@ test "db graph metric runtime background skips paused active planned builds" {
         break :blk .{ status.build_job_id, status.phase };
     };
 
-    var paused = try db.pauseGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    var paused = try db.indexes.graph.pauseMetricMaintenance(alloc, "graph_idx", "degree");
     defer paused.deinit(alloc);
     try std.testing.expect(paused.maintenance_paused);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, paused.state);
@@ -3270,7 +3270,7 @@ test "db graph metric runtime background skips paused active planned builds" {
         try std.testing.expectEqual(@as(u64, 0), status.published_generation);
     }
 
-    var resumed = try db.resumeGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    var resumed = try db.indexes.graph.resumeMetricMaintenance(alloc, "graph_idx", "degree");
     defer resumed.deinit(alloc);
     try std.testing.expect(!resumed.maintenance_paused);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, resumed.state);
@@ -3336,7 +3336,7 @@ test "db graph metric runtime background default starts automatically and drains
         .graph_metric_maintenance = .{ .idle_interval_ms = 100 },
     });
     defer db.close();
-    const runtime = db.graph_metric_runtime orelse return error.GraphMetricRuntimeNotInitialized;
+    const runtime = db.indexes.graph.metrics.runtime orelse return error.GraphMetricRuntimeNotInitialized;
     try std.testing.expect(!runtime.stats().started);
     try std.testing.expect(runtime.stats().lease_owned);
     try std.testing.expect(runtime.config.owner_id.len > 0);
@@ -3408,7 +3408,7 @@ test "db graph metric runtime background default starts automatically and drains
     try std.testing.expect(fresh);
 
     {
-        const runtime_stats = db.graphMetricRuntimeStats();
+        const runtime_stats = db.indexes.graph.metricRuntimeStats();
         try std.testing.expect(runtime_stats.enabled);
         try std.testing.expectEqual(types.GraphMetricRuntimeRole.combined, runtime_stats.role.?);
         try std.testing.expectEqual(std.hash.Wyhash.hash(0, runtime.config.runtime_id), runtime_stats.runtime_id_hash);
@@ -3490,7 +3490,7 @@ test "db graph metric runtime background default parks after last metric removal
         .config_json = "{\"metrics\":{\"rank\":{\"kind\":\"degree\",\"refresh\":\"manual\"}}}",
     };
     try db.addIndex(config);
-    const runtime = db.graph_metric_runtime.?;
+    const runtime = db.indexes.graph.metrics.runtime.?;
     for (0..1_000) |_| {
         if (runtime.stats().has_lease) break;
         yieldToBackground(&db);
@@ -3524,7 +3524,7 @@ test "db graph metric runtime background default publishes pagerank refresh rebu
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
-        previous_owner_hash = db.graph_metric_runtime.?.stats().owner_id_hash;
+        previous_owner_hash = db.indexes.graph.metrics.runtime.?.stats().owner_id_hash;
         try db.addIndex(.{
             .name = "graph_idx",
             .kind = .graph,
@@ -3538,10 +3538,10 @@ test "db graph metric runtime background default publishes pagerank refresh rebu
             .sync_level = .full_index,
         });
         _ = try waitForDefaultMetric(&db, "rank", 0);
-        var refresh = try db.scheduleGraphMetricBuild(alloc, "graph_idx", "manual", false);
+        var refresh = try db.indexes.graph.scheduleMetricBuild(alloc, "graph_idx", "manual", false);
         defer refresh.deinit(alloc);
         const publication = try waitForDefaultMetric(&db, "manual", 0);
-        var rebuild = try db.scheduleGraphMetricBuild(alloc, "graph_idx", "manual", true);
+        var rebuild = try db.indexes.graph.scheduleMetricBuild(alloc, "graph_idx", "manual", true);
         defer rebuild.deinit(alloc);
         previous_publication = try waitForDefaultMetric(&db, "manual", publication);
     }
@@ -3550,17 +3550,17 @@ test "db graph metric runtime background default publishes pagerank refresh rebu
         // request behind. The next ordinary open must resume it automatically.
         var db = try DB.open(alloc, std.mem.span(path), .{ .graph_metric_maintenance = .{ .start_background_loop = false } });
         defer db.close();
-        try std.testing.expect(!db.graph_metric_runtime.?.stats().started);
-        var rebuild = try db.scheduleGraphMetricBuild(alloc, "graph_idx", "manual", true);
+        try std.testing.expect(!db.indexes.graph.metrics.runtime.?.stats().started);
+        var rebuild = try db.indexes.graph.scheduleMetricBuild(alloc, "graph_idx", "manual", true);
         defer rebuild.deinit(alloc);
         try std.testing.expect(rebuild.build_queued);
     }
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
-        try std.testing.expect(previous_owner_hash != db.graph_metric_runtime.?.stats().owner_id_hash);
+        try std.testing.expect(previous_owner_hash != db.indexes.graph.metrics.runtime.?.stats().owner_id_hash);
         _ = try waitForDefaultMetric(&db, "manual", previous_publication);
-        try std.testing.expect(db.graph_metric_runtime.?.stats().has_lease);
+        try std.testing.expect(db.indexes.graph.metrics.runtime.?.stats().has_lease);
     }
 }
 
@@ -3605,12 +3605,12 @@ test "db graph metric runtime background default inherits borrowed clock and dra
     defer backend.deinit();
     const resources = db.core.asyncResources();
     var runtime = try GraphMetricRuntime.init(alloc, resources.store, resources.index_manager, resources.apply_mutex, backend.ptr(), (Config{ .lease_ttl_ms = 1_000 }).forDbOwner());
-    db.graph_metric_runtime = &runtime;
+    db.indexes.graph.metrics.runtime = &runtime;
     defer {
         runtime.beginTeardown();
         _ = sim.cancelAndDrainTasksForTeardown(alloc, 100) catch {};
         runtime.deinit();
-        db.graph_metric_runtime = null;
+        db.indexes.graph.metrics.runtime = null;
     }
     try std.testing.expectEqual(@as(u64, 123), runtime.config.clock.?.nowRealtimeMs());
     try std.testing.expect(runtime.ensureRuntimeLease(runtime.config.clock.?.nowRealtimeMs()));
@@ -3683,19 +3683,19 @@ test "db graph metric runtime background default respects readonly standby and w
     }) |options| {
         var db = try DB.open(alloc, std.mem.span(path), options);
         defer db.close();
-        try std.testing.expect(db.graph_metric_runtime == null);
-        try std.testing.expect(!db.graphMetricRuntimeStats().enabled);
+        try std.testing.expect(db.indexes.graph.metrics.runtime == null);
+        try std.testing.expect(!db.indexes.graph.metricRuntimeStats().enabled);
     }
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtime_workers = false });
     defer db.close();
-    try std.testing.expect(db.graph_metric_runtime != null);
-    try std.testing.expect(!db.graph_metric_runtime.?.stats().started);
+    try std.testing.expect(db.indexes.graph.metrics.runtime != null);
+    try std.testing.expect(!db.indexes.graph.metrics.runtime.?.stats().started);
     try db.addIndex(.{
         .name = "graph_idx",
         .kind = .graph,
         .config_json = "{\"metrics\":{\"rank\":{\"kind\":\"degree\"}}}",
     });
-    try std.testing.expect(!db.graph_metric_runtime.?.stats().started);
+    try std.testing.expect(!db.indexes.graph.metrics.runtime.?.stats().started);
 }
 
 test "db graph metric runtime background open-configured split owners publish degree" {
@@ -3775,9 +3775,9 @@ test "db graph metric runtime background open-configured split owners publish de
             });
             defer coordinator.close();
 
-            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
+            const tick = try coordinator.indexes.graph.metrics.runtime.?.runOnceDetailed();
             coordinator_total.add(tick);
-            const stats = coordinator.graphMetricRuntimeStats();
+            const stats = coordinator.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "open-configured-coordinator"), stats.runtime_id_hash);
@@ -3812,9 +3812,9 @@ test "db graph metric runtime background open-configured split owners publish de
             });
             defer worker_pool.close();
 
-            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
+            const tick = try worker_pool.indexes.graph.metrics.runtime.?.runOnceDetailed();
             worker_total.add(tick);
-            const stats = worker_pool.graphMetricRuntimeStats();
+            const stats = worker_pool.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "open-configured-worker-pool"), stats.runtime_id_hash);
@@ -3850,7 +3850,7 @@ test "db graph metric runtime background open-configured split owners publish de
             });
             defer coordinator.close();
 
-            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
+            const tick = try coordinator.indexes.graph.metrics.runtime.?.runOnceDetailed();
             coordinator_total.add(tick);
             const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
             var status = try graph_entry.index.graphMetricStatus("degree");
@@ -5099,8 +5099,8 @@ test "db graph metric runtime background open-configured pagerank worker pool su
             });
             defer worker_pool.close();
 
-            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
-            const stats = worker_pool.graphMetricRuntimeStats();
+            const tick = try worker_pool.indexes.graph.metrics.runtime.?.runOnceDetailed();
+            const stats = worker_pool.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-worker-owner"), stats.runtime_id_hash);
@@ -5175,8 +5175,8 @@ test "db graph metric runtime background open-configured pagerank worker pool su
             });
             defer coordinator.close();
 
-            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
-            const stats = coordinator.graphMetricRuntimeStats();
+            const tick = try coordinator.indexes.graph.metrics.runtime.?.runOnceDetailed();
+            const stats = coordinator.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-coordinator-owner"), stats.runtime_id_hash);
@@ -5322,8 +5322,8 @@ test "db graph metric runtime background open-configured eigenvector worker pool
             });
             defer worker_pool.close();
 
-            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
-            const stats = worker_pool.graphMetricRuntimeStats();
+            const tick = try worker_pool.indexes.graph.metrics.runtime.?.runOnceDetailed();
+            const stats = worker_pool.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-worker-owner"), stats.runtime_id_hash);
@@ -5398,8 +5398,8 @@ test "db graph metric runtime background open-configured eigenvector worker pool
             });
             defer coordinator.close();
 
-            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
-            const stats = coordinator.graphMetricRuntimeStats();
+            const tick = try coordinator.indexes.graph.metrics.runtime.?.runOnceDetailed();
+            const stats = coordinator.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-coordinator-owner"), stats.runtime_id_hash);
@@ -5542,8 +5542,8 @@ test "db graph metric runtime background open-configured hits worker pool surviv
             });
             defer worker_pool.close();
 
-            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
-            const stats = worker_pool.graphMetricRuntimeStats();
+            const tick = try worker_pool.indexes.graph.metrics.runtime.?.runOnceDetailed();
+            const stats = worker_pool.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-worker-owner"), stats.runtime_id_hash);
@@ -5618,8 +5618,8 @@ test "db graph metric runtime background open-configured hits worker pool surviv
             });
             defer coordinator.close();
 
-            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
-            const stats = coordinator.graphMetricRuntimeStats();
+            const tick = try coordinator.indexes.graph.metrics.runtime.?.runOnceDetailed();
+            const stats = coordinator.indexes.graph.metricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-coordinator-owner"), stats.runtime_id_hash);
@@ -6054,7 +6054,7 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
@@ -6402,7 +6402,7 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
@@ -6749,7 +6749,7 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
@@ -7215,7 +7215,7 @@ test "db graph metric runtime planned scheduler does not auto retry failed graph
     });
     try db.runDerivedUntil(db.core.nextDerivedSequence());
 
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 1, 0, 0);
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
@@ -7224,21 +7224,21 @@ test "db graph metric runtime planned scheduler does not auto retry failed graph
     }
 
     try prepareTopologyForRuntimeTest(&db, "pagerank");
-    const start = try db.runGraphMetricPlannedCoordinatorSweep(.{
+    const start = try db.indexes.graph.runMetricPlannedCoordinatorSweep(.{
         .max_metrics = 8,
         .start_background_builds = true,
     });
     try std.testing.expectEqual(@as(usize, 1), start.builds_started);
     try std.testing.expectEqual(@as(usize, 1), start.active_builds);
 
-    var failed = try db.failGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", error.InvalidGraphMetricBuildManifest);
+    var failed = try db.indexes.graph.failMetricPlannedBuild(alloc, "graph_idx", "pagerank", error.InvalidGraphMetricBuildManifest);
     defer failed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed.state);
     try std.testing.expect(failed.build_queued);
     try std.testing.expectEqualStrings("InvalidGraphMetricBuildManifest", failed.last_error);
     const failed_target_generation = failed.target_edge_generation;
 
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, false, 0, 0, 0, 0);
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(!pending.hasWork());
@@ -7246,7 +7246,7 @@ test "db graph metric runtime planned scheduler does not auto retry failed graph
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    const duplicate = try db.runGraphMetricPlannedCoordinatorSweep(.{
+    const duplicate = try db.indexes.graph.runMetricPlannedCoordinatorSweep(.{
         .max_metrics = 8,
         .start_background_builds = true,
     });
@@ -7278,15 +7278,15 @@ test "db graph metric runtime planned scheduler does not auto retry failed graph
     });
     try db.runDerivedUntil(db.core.nextDerivedSequence());
 
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
-    const retry_new_generation = try db.runGraphMetricPlannedCoordinatorSweep(.{
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 1, 0, 0);
+    const retry_new_generation = try db.indexes.graph.runMetricPlannedCoordinatorSweep(.{
         .max_metrics = 8,
         .start_background_builds = true,
     });
     try std.testing.expectEqual(@as(usize, 0), retry_new_generation.builds_started);
     try std.testing.expect(retry_new_generation.planning_steps > 0);
     try prepareTopologyForRuntimeTest(&db, "pagerank");
-    const admitted = try db.runGraphMetricPlannedCoordinatorSweep(.{ .max_metrics = 8, .start_background_builds = true });
+    const admitted = try db.indexes.graph.runMetricPlannedCoordinatorSweep(.{ .max_metrics = 8, .start_background_builds = true });
     try std.testing.expectEqual(@as(usize, 1), admitted.builds_started);
     {
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
@@ -7334,7 +7334,7 @@ test "db graph metric runtime planned scheduler boundary completes degree by nam
         break :blk graph_entry.index.edge_generation;
     };
 
-    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", target_generation);
+    var started = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "manual_degree", target_generation);
     defer started.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
     try std.testing.expectEqual(target_generation, started.building_generation);
@@ -7344,7 +7344,7 @@ test "db graph metric runtime planned scheduler boundary completes degree by nam
     var published = false;
     while (step_index < 1000) : (step_index += 1) {
         const now_ms: u64 = 1000 + @as(u64, @intCast(step_index)) * 2;
-        const worker_step = try db.runGraphMetricPlannedWorkerPageStepAt("graph_idx", "manual_degree", workers[step_index % workers.len], now_ms);
+        const worker_step = try db.indexes.graph.runMetricPlannedWorkerPageStepAt("graph_idx", "manual_degree", workers[step_index % workers.len], now_ms);
         try std.testing.expect(!worker_step.advanced_phase);
         if (worker_step.completed_build) {
             try std.testing.expect(worker_step.phase == .complete or worker_step.phase == .cleanup_old_generations);
@@ -7352,7 +7352,7 @@ test "db graph metric runtime planned scheduler boundary completes degree by nam
             break;
         }
 
-        const coordinator_step = try db.runGraphMetricPlannedCoordinatorStepAt("graph_idx", "manual_degree", now_ms + 1);
+        const coordinator_step = try db.indexes.graph.runMetricPlannedCoordinatorStepAt("graph_idx", "manual_degree", now_ms + 1);
         if (coordinator_step.completed_build) {
             published = true;
             break;
@@ -7423,12 +7423,12 @@ test "db graph metric runtime planned scheduler sweeps active degree work" {
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         break :blk graph_entry.index.edge_generation;
     };
-    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "degree", target_generation);
+    var started = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "degree", target_generation);
     defer started.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
     try std.testing.expectEqual(target_generation, started.building_generation);
 
-    const start = try db.runGraphMetricPlannedCoordinatorSweep(.{
+    const start = try db.indexes.graph.runMetricPlannedCoordinatorSweep(.{
         .max_metrics = 8,
         .start_background_builds = false,
     });
@@ -7441,12 +7441,12 @@ test "db graph metric runtime planned scheduler sweeps active degree work" {
     var saw_coordinator_publish = false;
     var step_index: usize = 0;
     while (step_index < 1000) : (step_index += 1) {
-        const worker = try db.runGraphMetricPlannedWorkerSweep(.{
+        const worker = try db.indexes.graph.runMetricPlannedWorkerSweep(.{
             .worker_id = workers[step_index % workers.len],
             .max_pages = 1,
         });
         try std.testing.expectEqual(@as(usize, 0), worker.published);
-        const coordinator = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        const coordinator = try db.indexes.graph.runMetricPlannedCoordinatorSweep(.{
             .max_metrics = 8,
             .start_background_builds = false,
         });
@@ -7524,7 +7524,7 @@ test "db graph metric runtime planned scheduler sweeps active pagerank work" {
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         break :blk graph_entry.index.edge_generation;
     };
-    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+    var started = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
     defer started.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
     try std.testing.expectEqual(target_generation, started.building_generation);
@@ -7533,11 +7533,11 @@ test "db graph metric runtime planned scheduler sweeps active pagerank work" {
     var finished = false;
     var step_index: usize = 0;
     while (step_index < 2000) : (step_index += 1) {
-        const worker = try db.runGraphMetricPlannedWorkerSweep(.{
+        const worker = try db.indexes.graph.runMetricPlannedWorkerSweep(.{
             .worker_id = workers[step_index % workers.len],
             .max_pages = 1,
         });
-        const coordinator = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        const coordinator = try db.indexes.graph.runMetricPlannedCoordinatorSweep(.{
             .max_metrics = 8,
             .start_background_builds = false,
         });
@@ -7624,7 +7624,7 @@ test "db graph metric runtime planned paired hits failed planned rebuild preserv
     });
     try db.runDerivedUntil(db.core.nextDerivedSequence());
 
-    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "hits_authority");
+    var refreshed = try db.indexes.graph.refreshMetric(alloc, "graph_idx", "hits_authority");
     defer refreshed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
     const published_generation = refreshed.published_generation;
@@ -7679,14 +7679,14 @@ test "db graph metric runtime planned paired hits failed planned rebuild preserv
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         const target_generation = graph_entry.index.edge_generation;
         try std.testing.expect(target_generation > published_generation);
-        var building = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+        var building = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
         defer building.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building.state);
         try std.testing.expectEqual(target_generation, building.building_generation);
         break :blk target_generation;
     };
 
-    var failed = try db.failGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", error.InvalidGraphMetricScore);
+    var failed = try db.indexes.graph.failMetricPlannedBuild(alloc, "graph_idx", "hits_authority", error.InvalidGraphMetricScore);
     defer failed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed.state);
     try std.testing.expectEqual(published_generation, failed.published_generation);
@@ -7954,12 +7954,12 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
 
-        const initial_tick = try coordinator.runGraphMetricPlannedCoordinatorSweep(.{
+        const initial_tick = try coordinator.indexes.graph.runMetricPlannedCoordinatorSweep(.{
             .max_metrics = 8,
             .start_background_builds = false,
         });
@@ -7981,7 +7981,7 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
                 worker_db.close();
                 profile.mark(.close);
             }
-            const sweep = try worker_db.runGraphMetricPlannedWorkerSweep(.{
+            const sweep = try worker_db.indexes.graph.runMetricPlannedWorkerSweep(.{
                 .worker_id = workers[step_index % workers.len],
                 .max_pages = 1,
             });
@@ -7999,7 +7999,7 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
                 coordinator_db.close();
                 profile.mark(.close);
             }
-            const sweep = try coordinator_db.runGraphMetricPlannedCoordinatorSweep(.{
+            const sweep = try coordinator_db.indexes.graph.runMetricPlannedCoordinatorSweep(.{
                 .max_metrics = 8,
                 .start_background_builds = false,
             });
@@ -8100,7 +8100,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
@@ -8116,7 +8116,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
                 .ttl_cleanup = .{ .enabled = false },
             });
             defer worker_db.close();
-            break :blk try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "pagerank", workers[step_index % workers.len]);
+            break :blk try worker_db.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "pagerank", workers[step_index % workers.len]);
         };
 
         {
@@ -8140,7 +8140,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
                 .ttl_cleanup = .{ .enabled = false },
             });
             defer coordinator_db.close();
-            break :blk try coordinator_db.runGraphMetricPlannedCoordinatorStep("graph_idx", "pagerank");
+            break :blk try coordinator_db.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "pagerank");
         };
 
         {
@@ -8171,9 +8171,9 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
-        const materialized = try coordinator.runGraphMetricPlannedWorkerPageStep("graph_idx", "pagerank", "db-publish-race-materializer");
+        const materialized = try coordinator.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "pagerank", "db-publish-race-materializer");
         try std.testing.expect(materialized.completed_page);
-        const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "pagerank");
+        const publish = try coordinator.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "pagerank");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
         try std.testing.expect(publish.advanced_phase);
 
@@ -8194,7 +8194,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer duplicate_coordinator.close();
 
-        const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "pagerank");
+        const duplicate = try duplicate_coordinator.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "pagerank");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, duplicate.phase);
         try std.testing.expect(!duplicate.advanced_phase);
         try std.testing.expect(!duplicate.published);
@@ -8218,7 +8218,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
 
         var cleanup_finished = false;
         for (0..12) |_| {
-            const cleanup = try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "pagerank", "db-publish-race-cleaner");
+            const cleanup = try worker_db.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "pagerank", "db-publish-race-cleaner");
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, cleanup.phase);
             try std.testing.expect(!cleanup.advanced_phase);
             if (cleanup.published) {
@@ -8311,7 +8311,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
@@ -8327,7 +8327,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
                 .ttl_cleanup = .{ .enabled = false },
             });
             defer worker_db.close();
-            break :blk try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "eigenvector", workers[step_index % workers.len]);
+            break :blk try worker_db.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "eigenvector", workers[step_index % workers.len]);
         };
 
         {
@@ -8351,7 +8351,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
                 .ttl_cleanup = .{ .enabled = false },
             });
             defer coordinator_db.close();
-            break :blk try coordinator_db.runGraphMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
+            break :blk try coordinator_db.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
         };
 
         {
@@ -8382,9 +8382,9 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
-        const materialized = try coordinator.runGraphMetricPlannedWorkerPageStep("graph_idx", "eigenvector", "db-eigenvector-publish-race-materializer");
+        const materialized = try coordinator.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "eigenvector", "db-eigenvector-publish-race-materializer");
         try std.testing.expect(materialized.completed_page);
-        const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
+        const publish = try coordinator.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
         try std.testing.expect(publish.advanced_phase);
 
@@ -8405,7 +8405,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer duplicate_coordinator.close();
 
-        const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
+        const duplicate = try duplicate_coordinator.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, duplicate.phase);
         try std.testing.expect(!duplicate.advanced_phase);
         try std.testing.expect(!duplicate.published);
@@ -8429,7 +8429,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
 
         var cleanup_finished = false;
         for (0..12) |_| {
-            const cleanup = try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "eigenvector", "db-eigenvector-publish-race-cleaner");
+            const cleanup = try worker_db.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "eigenvector", "db-eigenvector-publish-race-cleaner");
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, cleanup.phase);
             try std.testing.expect(!cleanup.advanced_phase);
             if (cleanup.published) {
@@ -8521,7 +8521,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
-        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+        var started = try coordinator.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
         defer started.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
         try std.testing.expectEqual(target_generation, started.building_generation);
@@ -8537,7 +8537,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
                 .ttl_cleanup = .{ .enabled = false },
             });
             defer worker_db.close();
-            break :blk try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "hits_authority", workers[step_index % workers.len]);
+            break :blk try worker_db.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "hits_authority", workers[step_index % workers.len]);
         };
 
         {
@@ -8561,7 +8561,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
                 .ttl_cleanup = .{ .enabled = false },
             });
             defer coordinator_db.close();
-            break :blk try coordinator_db.runGraphMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
+            break :blk try coordinator_db.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
         };
 
         {
@@ -8592,9 +8592,9 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
-        const materialized = try coordinator.runGraphMetricPlannedWorkerPageStep("graph_idx", "hits_authority", "db-hits-publish-race-materializer");
+        const materialized = try coordinator.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "hits_authority", "db-hits-publish-race-materializer");
         try std.testing.expect(materialized.completed_page);
-        const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
+        const publish = try coordinator.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
         try std.testing.expect(publish.advanced_phase);
 
@@ -8622,7 +8622,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer duplicate_coordinator.close();
 
-        const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
+        const duplicate = try duplicate_coordinator.indexes.graph.runMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, duplicate.phase);
         try std.testing.expect(!duplicate.advanced_phase);
         try std.testing.expect(!duplicate.published);
@@ -8653,7 +8653,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
 
         var cleanup_finished = false;
         for (0..12) |_| {
-            const cleanup = try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "hits_authority", "db-hits-publish-race-cleaner");
+            const cleanup = try worker_db.indexes.graph.runMetricPlannedWorkerPageStep("graph_idx", "hits_authority", "db-hits-publish-race-cleaner");
             try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, cleanup.phase);
             try std.testing.expect(!cleanup.advanced_phase);
             if (cleanup.published) {
@@ -8767,7 +8767,7 @@ test "db graph metric runtime planned maintenance drains background pagerank wor
         break :blk graph_entry.index.edge_generation;
     };
 
-    const maintenance = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+    const maintenance = try db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
         .worker_id = "planned-maintenance-pagerank",
         .max_rounds = 200,
         .max_metrics_per_round = 8,
@@ -8892,8 +8892,8 @@ test "db graph metric runtime background drains pagerank through planned mainten
         try std.testing.expect(!drained_stats.last_result.durableProgressed());
     }
 
-    db.graph_metric_runtime = &runtime;
-    defer db.graph_metric_runtime = null;
+    db.indexes.graph.metrics.runtime = &runtime;
+    defer db.indexes.graph.metrics.runtime = null;
     {
         const mapped_stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, mapped_stats);
@@ -8983,7 +8983,7 @@ test "db graph metric runtime planned maintenance reports budget exhaustion and 
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    const first_tick = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+    const first_tick = try db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
         .worker_id = "planned-maintenance-budgeted",
         .max_rounds = 1,
         .max_metrics_per_round = 8,
@@ -9009,7 +9009,7 @@ test "db graph metric runtime planned maintenance reports budget exhaustion and 
     var saw_budget_exhausted = first_tick.budget_exhausted;
     var tick_index: usize = 0;
     while (tick_index < 200) : (tick_index += 1) {
-        const tick = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        const tick = try db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
             .worker_id = "planned-maintenance-budgeted",
             .max_rounds = 1,
             .max_metrics_per_round = 8,
@@ -9034,7 +9034,7 @@ test "db graph metric runtime planned maintenance reports budget exhaustion and 
     // bounded reclamation checkpoint. Drain that independent lifecycle too.
     var maintenance_idle = false;
     for (0..8) |_| {
-        const no_work = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        const no_work = try db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
             .worker_id = "planned-maintenance-budgeted",
             .max_rounds = 1,
             .max_metrics_per_round = 8,
@@ -9132,7 +9132,7 @@ test "db graph metric runtime planned pagerank production budget matches local o
         break :blk graph_entry.index.edge_generation;
     };
 
-    var local_refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "pagerank_local");
+    var local_refreshed = try db.indexes.graph.refreshMetric(alloc, "graph_idx", "pagerank_local");
     defer local_refreshed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, local_refreshed.state);
     try std.testing.expectEqual(target_generation, local_refreshed.published_generation);
@@ -9144,7 +9144,7 @@ test "db graph metric runtime planned pagerank production budget matches local o
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    const first_tick = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+    const first_tick = try db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
         .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
         .max_rounds = 1,
         .max_metrics_per_round = 8,
@@ -9159,7 +9159,7 @@ test "db graph metric runtime planned pagerank production budget matches local o
     var saw_budget_exhausted = first_tick.budget_exhausted;
     var tick_index: usize = 0;
     while (tick_index < 400) : (tick_index += 1) {
-        const tick = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        const tick = try db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
             .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
             .max_rounds = 1,
             .max_metrics_per_round = 8,
@@ -9271,7 +9271,7 @@ test "db graph metric runtime planned eigenvector production budget matches loca
         break :blk graph_entry.index.edge_generation;
     };
 
-    var local_refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "eigenvector_local");
+    var local_refreshed = try db.indexes.graph.refreshMetric(alloc, "graph_idx", "eigenvector_local");
     defer local_refreshed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, local_refreshed.state);
     try std.testing.expectEqual(target_generation, local_refreshed.published_generation);
@@ -9283,7 +9283,7 @@ test "db graph metric runtime planned eigenvector production budget matches loca
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    const first_tick = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+    const first_tick = try db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
         .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
         .max_rounds = 1,
         .max_metrics_per_round = 8,
@@ -9298,7 +9298,7 @@ test "db graph metric runtime planned eigenvector production budget matches loca
     var saw_budget_exhausted = first_tick.budget_exhausted;
     var tick_index: usize = 0;
     while (tick_index < 600) : (tick_index += 1) {
-        const tick = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        const tick = try db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
             .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
             .max_rounds = 1,
             .max_metrics_per_round = 8,
@@ -9435,7 +9435,7 @@ test "db graph metric runtime planned hits production budget matches local oracl
         break :blk graph_entry.index.edge_generation;
     };
 
-    var local_authority_refreshed = try local_db.refreshGraphMetric(alloc, "graph_idx", "hits_authority");
+    var local_authority_refreshed = try local_db.indexes.graph.refreshMetric(alloc, "graph_idx", "hits_authority");
     defer local_authority_refreshed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, local_authority_refreshed.state);
     try std.testing.expectEqual(target_generation, local_authority_refreshed.published_generation);
@@ -9447,7 +9447,7 @@ test "db graph metric runtime planned hits production budget matches local oracl
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    const first_tick = try planned_db.runGraphMetricPlannedMaintenanceForIdle(.{
+    const first_tick = try planned_db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
         .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
         .max_rounds = 1,
         .max_metrics_per_round = 8,
@@ -9462,7 +9462,7 @@ test "db graph metric runtime planned hits production budget matches local oracl
     var saw_budget_exhausted = first_tick.budget_exhausted;
     var tick_index: usize = 0;
     while (tick_index < 800) : (tick_index += 1) {
-        const tick = try planned_db.runGraphMetricPlannedMaintenanceForIdle(.{
+        const tick = try planned_db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
             .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
             .max_rounds = 1,
             .max_metrics_per_round = 8,
@@ -9592,7 +9592,7 @@ test "db graph metric runtime planned maintenance drains background centrality f
         break :blk graph_entry.index.edge_generation;
     };
 
-    const maintenance = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+    const maintenance = try db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
         .worker_id = "planned-maintenance-centrality",
         .max_rounds = 400,
         .max_metrics_per_round = 8,
@@ -9696,7 +9696,7 @@ test "db graph metric runtime planned scheduler sweeps active eigenvector work" 
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         break :blk graph_entry.index.edge_generation;
     };
-    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
+    var started = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
     defer started.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
     try std.testing.expectEqual(target_generation, started.building_generation);
@@ -9705,11 +9705,11 @@ test "db graph metric runtime planned scheduler sweeps active eigenvector work" 
     var finished = false;
     var step_index: usize = 0;
     while (step_index < 2000) : (step_index += 1) {
-        const worker = try db.runGraphMetricPlannedWorkerSweep(.{
+        const worker = try db.indexes.graph.runMetricPlannedWorkerSweep(.{
             .worker_id = workers[step_index % workers.len],
             .max_pages = 1,
         });
-        const coordinator = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        const coordinator = try db.indexes.graph.runMetricPlannedCoordinatorSweep(.{
             .max_metrics = 8,
             .start_background_builds = false,
         });
@@ -9787,7 +9787,7 @@ test "db graph metric runtime planned scheduler sweeps active hits work" {
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         break :blk graph_entry.index.edge_generation;
     };
-    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+    var started = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
     defer started.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
     try std.testing.expectEqual(target_generation, started.building_generation);
@@ -9796,11 +9796,11 @@ test "db graph metric runtime planned scheduler sweeps active hits work" {
     var finished = false;
     var step_index: usize = 0;
     while (step_index < 2000) : (step_index += 1) {
-        const worker = try db.runGraphMetricPlannedWorkerSweep(.{
+        const worker = try db.indexes.graph.runMetricPlannedWorkerSweep(.{
             .worker_id = workers[step_index % workers.len],
             .max_pages = 1,
         });
-        const coordinator = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        const coordinator = try db.indexes.graph.runMetricPlannedCoordinatorSweep(.{
             .max_metrics = 8,
             .start_background_builds = false,
         });
@@ -9982,7 +9982,7 @@ test "db graph metric runtime query freshness distinguishes published stale scor
     });
     try db.runUntilIdle();
 
-    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    var refreshed = try db.indexes.graph.refreshMetric(alloc, "graph_idx", "manual_degree");
     defer refreshed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
 
@@ -10156,7 +10156,7 @@ test "db graph metric runtime query rerank applies published metric scores to se
         .sync_level = .full_index,
     });
 
-    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    var refreshed = try db.indexes.graph.refreshMetric(alloc, "graph_idx", "manual_degree");
     defer refreshed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
 
@@ -10455,7 +10455,7 @@ test "db graph metric runtime query freshness distinguishes stale projection fro
     });
     try db.runUntilIdle();
 
-    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    var refreshed = try db.indexes.graph.refreshMetric(alloc, "graph_idx", "manual_degree");
     defer refreshed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
 
@@ -10657,7 +10657,7 @@ test "db graph metric runtime degree canary gate tracks queued active and capped
     try std.testing.expect(!capped_queued_decision.shouldRunPlanned());
     try std.testing.expectEqual(queued_decision.queued_degree_control_records, capped_queued_decision.queued_degree_control_records);
 
-    const start = try db.runGraphMetricPlannedCoordinatorSweep(.{
+    const start = try db.indexes.graph.runMetricPlannedCoordinatorSweep(.{
         .max_metrics = 8,
         .start_background_builds = true,
     });
@@ -10674,7 +10674,7 @@ test "db graph metric runtime degree canary gate tracks queued active and capped
     try std.testing.expect(!capped_decision.shouldRunPlanned());
     try std.testing.expectEqual(active_decision.control_records, capped_decision.control_records);
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
     try expectDegreeCanaryDecision(db.core.index_manager, .{}, false, 0, 0, 0, 0);
 }
@@ -10767,7 +10767,7 @@ test "db graph metric runtime degree canary runUntilIdle uses planned maintenanc
         try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     var metric_result = try db.search(alloc, .{
@@ -10821,11 +10821,11 @@ test "db graph metric runtime degree canary planned maintenance reports bounded 
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    const decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(db.graph_metric_idle_degree_canary_options);
+    const decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(db.indexes.graph.metrics.idle_degree_canary_options);
     try std.testing.expect(decision.shouldRunPlanned());
     try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued_degree);
 
-    const budgeted = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+    const budgeted = try db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
         .worker_id = "degree-canary-round-budget",
         .max_rounds = 1,
         .max_metrics_per_round = 8,
@@ -10835,7 +10835,7 @@ test "db graph metric runtime degree canary planned maintenance reports bounded 
     try std.testing.expect(budgeted.budget_exhausted);
     try std.testing.expect(budgeted.durableProgressed());
 
-    const resumed = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+    const resumed = try db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
         .worker_id = "degree-canary-round-budget",
         .max_rounds = 200,
         .max_metrics_per_round = 8,
@@ -10937,7 +10937,7 @@ test "db graph metric runtime degree canary runUntilIdle preserves published sco
     });
     try db.runDerivedUntil(db.core.nextDerivedSequence());
 
-    db.graph_metric_idle_planned_options.max_rounds = 1;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 1;
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
 
     var published = try db.search(alloc, .{
@@ -11089,13 +11089,13 @@ test "db graph metric runtime degree canary runUntilIdle fails fast when active 
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    const start = try db.runGraphMetricPlannedCoordinatorSweep(.{
+    const start = try db.indexes.graph.runMetricPlannedCoordinatorSweep(.{
         .max_metrics = 8,
         .start_background_builds = true,
     });
     try std.testing.expectEqual(@as(usize, 1), start.builds_started);
 
-    const decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(db.graph_metric_idle_degree_canary_options);
+    const decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(db.indexes.graph.metrics.idle_degree_canary_options);
     try std.testing.expectEqual(@as(usize, 1), decision.active_degree_builds);
     try std.testing.expect(decision.control_records > decision.max_control_records);
     try std.testing.expect(!decision.shouldRunPlanned());
@@ -11382,7 +11382,7 @@ test "db graph metric runtime operations manual refresh rebuild and delete opera
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, status.state);
     }
 
-    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    var refreshed = try db.indexes.graph.refreshMetric(alloc, "graph_idx", "manual_degree");
     defer refreshed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
     try std.testing.expect(refreshed.published_generation > 0);
@@ -11401,7 +11401,7 @@ test "db graph metric runtime operations manual refresh rebuild and delete opera
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, status.state);
     }
 
-    var rebuilt = try db.rebuildGraphMetric(alloc, "graph_idx", "manual_degree");
+    var rebuilt = try db.indexes.graph.rebuildMetric(alloc, "graph_idx", "manual_degree");
     defer rebuilt.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, rebuilt.state);
     try std.testing.expect(rebuilt.published_generation >= refreshed.published_generation);
@@ -11416,7 +11416,7 @@ test "db graph metric runtime operations manual refresh rebuild and delete opera
     try std.testing.expectEqualStrings("doc:b", top[0].node);
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), top[0].score, 0.001);
 
-    var deleted = try db.deleteGraphMetricMaterialization(alloc, "graph_idx", "manual_degree");
+    var deleted = try db.indexes.graph.deleteMetricMaterialization(alloc, "graph_idx", "manual_degree");
     defer deleted.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.disabled, deleted.state);
     try std.testing.expectEqual(@as(u64, 0), deleted.published_generation);
@@ -11425,7 +11425,7 @@ test "db graph metric runtime operations manual refresh rebuild and delete opera
 
     try std.testing.expectError(error.MetricNotReady, graph_entry.index.graphMetricTopK("manual_degree", 1));
 
-    var refreshed_after_delete = try db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    var refreshed_after_delete = try db.indexes.graph.refreshMetric(alloc, "graph_idx", "manual_degree");
     defer refreshed_after_delete.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed_after_delete.state);
 }
@@ -11462,14 +11462,14 @@ test "db graph metric runtime operations pause and resume controls background ma
 
     try db.runUntilIdle();
 
-    var initial = try db.refreshGraphMetric(alloc, "graph_idx", "degree");
+    var initial = try db.indexes.graph.refreshMetric(alloc, "graph_idx", "degree");
     defer initial.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, initial.state);
     try std.testing.expect(!initial.maintenance_paused);
     const first_generation = initial.published_generation;
     try std.testing.expect(first_generation > 0);
 
-    var paused = try db.pauseGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    var paused = try db.indexes.graph.pauseMetricMaintenance(alloc, "graph_idx", "degree");
     defer paused.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, paused.state);
     try std.testing.expect(paused.maintenance_paused);
@@ -11492,7 +11492,7 @@ test "db graph metric runtime operations pause and resume controls background ma
         try std.testing.expect(!pending.hasWork());
     }
 
-    const planned_while_paused = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+    const planned_while_paused = try db.indexes.graph.runMetricPlannedMaintenanceForIdle(.{
         .worker_id = "paused-degree-worker",
         .max_rounds = 4,
         .max_metrics_per_round = 8,
@@ -11524,7 +11524,7 @@ test "db graph metric runtime operations pause and resume controls background ma
         for (top) |score| try std.testing.expect(!std.mem.eql(u8, score.node, "doc:c"));
     }
 
-    var refreshed_while_paused = try db.refreshGraphMetric(alloc, "graph_idx", "degree");
+    var refreshed_while_paused = try db.indexes.graph.refreshMetric(alloc, "graph_idx", "degree");
     defer refreshed_while_paused.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed_while_paused.state);
     try std.testing.expect(refreshed_while_paused.maintenance_paused);
@@ -11542,7 +11542,7 @@ test "db graph metric runtime operations pause and resume controls background ma
         try std.testing.expectApproxEqAbs(@as(f64, 2.0), top[0].score, 0.001);
     }
 
-    var resumed = try db.resumeGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    var resumed = try db.indexes.graph.resumeMetricMaintenance(alloc, "graph_idx", "degree");
     defer resumed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, resumed.state);
     try std.testing.expect(!resumed.maintenance_paused);
@@ -11575,7 +11575,7 @@ test "db graph metric runtime operations pause and resume controls background ma
         try std.testing.expectApproxEqAbs(@as(f64, 3.0), top[0].score, 0.001);
     }
 
-    var deleted = try db.deleteGraphMetricMaterialization(alloc, "graph_idx", "degree");
+    var deleted = try db.indexes.graph.deleteMetricMaterialization(alloc, "graph_idx", "degree");
     defer deleted.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.disabled, deleted.state);
     try std.testing.expect(!deleted.build_queued);
@@ -11590,7 +11590,7 @@ test "db graph metric runtime operations pause and resume controls background ma
         try std.testing.expectEqual(@as(u64, 0), status.published_generation);
     }
 
-    var reenabled = try db.resumeGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    var reenabled = try db.indexes.graph.resumeMetricMaintenance(alloc, "graph_idx", "degree");
     defer reenabled.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, reenabled.state);
     try std.testing.expect(reenabled.build_queued);
@@ -11637,7 +11637,7 @@ test "db graph metric runtime default gate runUntilIdle can use planned graph me
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 1, 0, 0);
 
     try db.runUntilIdle();
 
@@ -11708,7 +11708,7 @@ test "db graph metric runtime default gate runUntilIdle planned graph metric mai
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     {
-        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.indexes.graph.metrics.idle_auto_options);
         try std.testing.expect(decision.shouldRunPlanned());
         try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
         try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
@@ -11724,7 +11724,7 @@ test "db graph metric runtime default gate runUntilIdle planned graph metric mai
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
     {
         const pending = db.pendingWorkStats().graph_metric;
@@ -11789,7 +11789,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -11799,7 +11799,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
         try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -11867,7 +11867,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     {
-        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.indexes.graph.metrics.idle_auto_options);
         try std.testing.expect(decision.shouldRunPlanned());
         try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
         try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
@@ -11883,7 +11883,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -11953,13 +11953,13 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, false, 0, 0, 0, 1);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     // A bounded tick leaves durable work queued/active, never runs an
     // unlimited fallback. Raising admission/drain limits resumes that work.
-    db.graph_metric_idle_auto_options = .{};
-    db.graph_metric_idle_planned_options = .{};
+    db.indexes.graph.metrics.idle_auto_options = .{};
+    db.indexes.graph.metrics.idle_planned_options = .{};
     try db.runUntilIdle();
 
     {
@@ -12030,7 +12030,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     {
-        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.indexes.graph.metrics.idle_auto_options);
         try std.testing.expect(decision.shouldRunPlanned());
         try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
         try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
@@ -12046,7 +12046,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -12113,7 +12113,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 2, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 2, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -12124,7 +12124,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
         try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -12203,7 +12203,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -12214,7 +12214,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -12280,7 +12280,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -12291,7 +12291,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -12374,11 +12374,11 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         break :blk graph_entry.index.edge_generation;
     };
-    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+    var started = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
     defer started.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
     try std.testing.expectEqual(target_generation, started.building_generation);
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 1, 0, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 1, 0, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -12388,7 +12388,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
         try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -12457,7 +12457,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -12468,7 +12468,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     var metric_result = try db.search(alloc, .{
@@ -12528,7 +12528,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -12538,7 +12538,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
         try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     var metric_result = try db.search(alloc, .{
@@ -12599,7 +12599,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -12610,7 +12610,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     var metric_result = try db.search(alloc, .{
@@ -12671,7 +12671,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 2, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 2, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -12682,7 +12682,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
         try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     var metric_result = try db.search(alloc, .{
@@ -12744,7 +12744,7 @@ test "db graph metric runtime default gate prepares topology while numerical cap
     });
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     const entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
-    var active = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "degree", entry.index.edge_generation);
+    var active = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "degree", entry.index.edge_generation);
     defer active.deinit(alloc);
     const cfg = for (entry.metric_configs) |cfg| {
         if (std.mem.eql(u8, cfg.name, "rank")) break cfg;
@@ -12756,7 +12756,7 @@ test "db graph metric runtime default gate prepares topology while numerical cap
     // Keep the degree job active: only preparation workers are advanced.
     var admitted = false;
     for (0..16) |_| {
-        const sweep = try db.runGraphMetricPlannedCoordinatorSweep(options);
+        const sweep = try db.indexes.graph.runMetricPlannedCoordinatorSweep(options);
         try std.testing.expectEqual(@as(usize, 0), sweep.builds_started);
         if (try entry.index.runGraphMetricTopologyPreparationStep("prepare-at-cap")) {
             admitted = true;
@@ -12768,7 +12768,7 @@ test "db graph metric runtime default gate prepares topology while numerical cap
         if (try entry.index.prepareGraphMetricTopology(cfg, entry.index.edge_generation)) break;
         _ = try entry.index.runGraphMetricTopologyPreparationStep("prepare-at-cap");
     } else return error.TopologyPreparationDidNotSeal;
-    const sweep = try db.runGraphMetricPlannedCoordinatorSweep(options);
+    const sweep = try db.indexes.graph.runMetricPlannedCoordinatorSweep(options);
     try std.testing.expectEqual(@as(usize, 0), sweep.builds_started);
     var waiting = try entry.index.graphMetricStatus("rank");
     defer waiting.deinit(alloc);
@@ -12821,7 +12821,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 1, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 1, 1, 0);
 
     try db.runUntilIdle();
 
@@ -12897,12 +12897,12 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, false, 0, 0, 0, 1);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     // Raising admission/drain limits resumes bounded queued/active work.
-    db.graph_metric_idle_auto_options = .{};
-    db.graph_metric_idle_planned_options = .{};
+    db.indexes.graph.metrics.idle_auto_options = .{};
+    db.indexes.graph.metrics.idle_planned_options = .{};
     try db.runUntilIdle();
 
     {
@@ -12973,12 +12973,12 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, false, 0, 0, 0, 1);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     // Raising admission/drain limits resumes bounded queued/active work.
-    db.graph_metric_idle_auto_options = .{};
-    db.graph_metric_idle_planned_options = .{};
+    db.indexes.graph.metrics.idle_auto_options = .{};
+    db.indexes.graph.metrics.idle_planned_options = .{};
     try db.runUntilIdle();
 
     {
@@ -13050,7 +13050,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     {
-        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.indexes.graph.metrics.idle_auto_options);
         try std.testing.expect(decision.shouldRunPlanned());
         try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
         try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
@@ -13066,7 +13066,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -13133,7 +13133,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -13144,7 +13144,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -13207,9 +13207,9 @@ test "db graph metric runtime default gate standalone HITS lanes use resumable p
             .{ .index_name = "graph_idx", .source = "c", .target = "b", .edge_type = "cites", .weight = 1 },
         }, .sync_level = .write });
         try db.runDerivedUntil(db.core.nextDerivedSequence());
-        try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+        try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 1, 0, 0);
         try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
-        db.graph_metric_idle_planned_options = .{};
+        db.indexes.graph.metrics.idle_planned_options = .{};
         try db.runUntilIdle();
         var status = try db.core.graphIndex("graph_idx").?.index.graphMetricStatus("standalone");
         defer status.deinit(alloc);
@@ -13262,12 +13262,12 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     // Incompatible HITS definitions are independent planned metrics;
     // neither side may suppress the other as though they shared one lifecycle.
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 2, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 0, 2, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     // Raising admission/drain limits resumes bounded queued/active work.
-    db.graph_metric_idle_auto_options = .{};
-    db.graph_metric_idle_planned_options = .{};
+    db.indexes.graph.metrics.idle_auto_options = .{};
+    db.indexes.graph.metrics.idle_planned_options = .{};
     try db.runUntilIdle();
 
     {
@@ -13349,7 +13349,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     {
-        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.indexes.graph.metrics.idle_auto_options);
         try std.testing.expect(decision.shouldRunPlanned());
         try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
         try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
@@ -13365,7 +13365,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -13451,11 +13451,11 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         break :blk graph_entry.index.edge_generation;
     };
-    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "degree", target_generation);
+    var started = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "degree", target_generation);
     defer started.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
     try std.testing.expectEqual(target_generation, started.building_generation);
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 1, 0, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 1, 0, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -13465,7 +13465,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
         try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -13539,11 +13539,11 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         break :blk graph_entry.index.edge_generation;
     };
-    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
+    var started = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
     defer started.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
     try std.testing.expectEqual(target_generation, started.building_generation);
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 1, 0, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 1, 0, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -13553,7 +13553,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
         try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {
@@ -13630,11 +13630,11 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         break :blk graph_entry.index.edge_generation;
     };
-    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+    var started = try db.indexes.graph.ensureMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
     defer started.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
     try std.testing.expectEqual(target_generation, started.building_generation);
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 1, 0, 0, 0);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.indexes.graph.metrics.idle_auto_options, true, 1, 0, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -13644,7 +13644,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
         try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
-    db.graph_metric_idle_planned_options.max_rounds = 200;
+    db.indexes.graph.metrics.idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
 
     {

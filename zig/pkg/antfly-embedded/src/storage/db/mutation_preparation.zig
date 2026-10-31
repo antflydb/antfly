@@ -938,7 +938,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             if (jobs.items.len == 0) return;
             defer clearGeneratedDenseMemoJobs(memo.alloc, jobs);
-            const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
+            const runtime = S.ownerField(self, "enrichment").runtime orelse return;
             const embedder = runtime.config.dense_embedder orelse return;
             const texts = try memo.alloc.alloc([]const u8, jobs.items.len);
             defer memo.alloc.free(texts);
@@ -1043,7 +1043,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             if (jobs.items.len == 0) return;
             defer clearGeneratedSparseMemoJobs(memo.alloc, jobs);
-            const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
+            const runtime = S.ownerField(self, "enrichment").runtime orelse return;
             const embedder = runtime.config.sparse_embedder orelse return;
             const texts = try memo.alloc.alloc([]const u8, jobs.items.len);
             defer memo.alloc.free(texts);
@@ -1258,7 +1258,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var inline_embedding_cleanup = InlineChunkEmbeddingCleanup{};
                 defer inline_embedding_cleanup.deinit(alloc);
 
-                const document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution = if (S.ownerField(self, "enrichment_runtime").*) |runtime|
+                const document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution = if (S.ownerField(self, "enrichment").runtime) |runtime|
                     if (precompute_mode == .all and enrichment_runtime_mod.PrecommitDocumentExecution.useful(generated)) try enrichment_runtime_mod.PrecommitDocumentExecution.create(runtime, generated, (try extracted[i].logicalJson()).?) else null
                 else
                     null;
@@ -1519,7 +1519,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             plan: *const GeneratedBatchWritePlan,
             memo: *GeneratedEmbeddingMemo,
         ) !void {
-            const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
+            const runtime = S.ownerField(self, "enrichment").runtime orelse return;
             const embedder = runtime.config.dense_embedder orelse return;
             var jobs = std.ArrayListUnmanaged(GeneratedDenseMemoJob).empty;
             defer {
@@ -1654,7 +1654,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             plan: *const GeneratedBatchWritePlan,
             memo: *GeneratedEmbeddingMemo,
         ) !void {
-            if (S.ownerField(self, "enrichment_runtime").* == null or S.ownerField(self, "enrichment_runtime").*.?.config.sparse_embedder == null) return;
+            if (S.ownerField(self, "enrichment").runtime == null or S.ownerField(self, "enrichment").runtime.?.config.sparse_embedder == null) return;
             var jobs = std.ArrayListUnmanaged(GeneratedSparseMemoJob).empty;
             defer {
                 clearGeneratedSparseMemoJobs(memo.alloc, &jobs);
@@ -1910,8 +1910,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .backend_runtime = S.ownerField(receiver, "backend_runtime").*,
                 .secret_store = &S.ownerField(receiver, "secret_store").*,
                 .remote_content = &S.ownerField(receiver, "remote_content").*,
-                .shadow = &S.ownerField(receiver, "shadow").*,
-                .transaction_recovery_local_context = &S.ownerField(receiver, "transaction_recovery_local_context").*,
+                .shadow = &S.ownerField(receiver, "indexes").split_shadow,
+                .transaction_recovery_local_context = &S.ownerField(receiver, "recovery").transactions.local_context,
             } else null;
             return prepareRelationalRowsOwned(allocator_guard, io, if (owner) |*view| view else null, writes, validator, table_schema, physical_layout, write_plan, retain_text_roots, preparation_timestamp_ns, rows, durable_rows, restore_timestamps, preserve_logical_values);
         }
@@ -1925,8 +1925,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             backend_runtime: @FieldType(Execution, "backend_runtime"),
             secret_store: *const @FieldType(Execution, "secret_store"),
             remote_content: *const @FieldType(Execution, "remote_content"),
-            shadow: *const @FieldType(Execution, "shadow"),
-            transaction_recovery_local_context: *const @FieldType(Execution, "transaction_recovery_local_context"),
+            shadow: *const @FieldType(@FieldType(Execution, "indexes"), "split_shadow"),
+            transaction_recovery_local_context: *const @FieldType(@import("recovery.zig").Recovery.Transactions, "local_context"),
 
             fn requiresLogicalRoot(self: *const @This()) bool {
                 const shadow = if (S.ownerField(self, "transaction_recovery_local_context").*.*) |context| context.split_shadow else S.ownerField(self, "shadow").*.*;

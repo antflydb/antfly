@@ -121,7 +121,7 @@ test "db graph endpoint cleanup pages HA denied owners reopen and replay without
         try std.testing.expect(try reopened.core.store.hasGraphEndpointCleanup());
         try std.testing.expect(!try engine.test_support.drainStandaloneGraphEndpointCleanup(&reopened));
         try std.testing.expect(!try engine.test_support.runStandaloneGraphEndpointCleanupStep(&reopened));
-        try std.testing.expect((try reopened.prepareGraphEndpointCleanupBatch(alloc)) == null);
+        try std.testing.expect((try reopened.indexes.graph.prepareEndpointCleanupBatch(alloc)) == null);
         const reset = try reopened.core.store.get(alloc, internal_keys.graph_directory_reset_key);
         defer alloc.free(reset);
         try std.testing.expectEqualSlices(u8, &.{0}, reset);
@@ -136,7 +136,7 @@ test "db graph endpoint cleanup pages HA denied owners reopen and replay without
         try std.testing.expect(try reopened.core.store.graphRelationshipRetired(artifact));
         // Idle directory backfill is subject to the same authority gate.
         try std.testing.expect(!try engine.test_support.runStandaloneGraphEndpointCleanupStep(&reopened));
-        try std.testing.expect((try reopened.prepareGraphEndpointCleanupBatch(alloc)) == null);
+        try std.testing.expect((try reopened.indexes.graph.prepareEndpointCleanupBatch(alloc)) == null);
         try std.testing.expect(!try reopened.core.store.graphIncomingDirectoryReady());
     }
 }
@@ -167,7 +167,7 @@ test "db graph endpoint cleanup pages HA promotion requires fresh owner generati
         gate.publishPrimary(&stream, false);
         try std.testing.expect(!try engine.test_support.drainStandaloneGraphEndpointCleanup(&old_owner));
         try std.testing.expect(!try engine.test_support.runStandaloneGraphEndpointCleanupStep(&old_owner));
-        try std.testing.expect((try old_owner.prepareGraphEndpointCleanupBatch(alloc)) == null);
+        try std.testing.expect((try old_owner.indexes.graph.prepareEndpointCleanupBatch(alloc)) == null);
         try std.testing.expect(try old_owner.core.store.hasGraphEndpointCleanup());
     }
     var primary_opts = opts;

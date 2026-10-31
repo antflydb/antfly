@@ -237,7 +237,7 @@ pub fn registerLiteIndexEnrichments(handle: *Handle, config_json: []const u8, ro
         // Record the touch before mutating, so a mid-loop failure still rolls
         // back every enrichment this call may have changed.
         try rollback.willTouchEnrichment(cfg.kind, cfg.name);
-        _ = try handle.database().*.upsertEnrichment(cfg);
+        _ = try handle.database().*.enrichment.upsertEnrichment(cfg);
     }
 }
 
@@ -264,7 +264,7 @@ pub const LiteCatalogRollback = struct {
     touched_resolvers: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub fn init(handle: *Handle) !LiteCatalogRollback {
-        const prior = try handle.database().*.listEnrichments(handle.alloc);
+        const prior = try handle.database().*.enrichment.listEnrichments(handle.alloc);
         errdefer db_mod.types.freeEnrichmentConfigs(handle.alloc, prior);
         return .{
             .handle = handle,
@@ -312,7 +312,7 @@ pub const LiteCatalogRollback = struct {
                 }
                 break :blk null;
             };
-            self.handle.database().*.restoreResolverIdentityWithoutDrain(name, prior) catch |err| {
+            self.handle.database().*.enrichment.restoreResolverIdentityWithoutDrain(name, prior) catch |err| {
                 std.log.warn("AddIndex rollback failed to restore resolver identity {s}: {s}", .{ name, @errorName(err) });
             };
         }
@@ -324,11 +324,11 @@ pub const LiteCatalogRollback = struct {
                 break :blk null;
             };
             if (prior) |cfg| {
-                _ = self.handle.database().*.upsertEnrichment(cfg) catch |err| {
+                _ = self.handle.database().*.enrichment.upsertEnrichment(cfg) catch |err| {
                     std.log.warn("lite AddIndex rollback failed to restore enrichment {s}: {s}", .{ touch.name, @errorName(err) });
                 };
             } else {
-                _ = self.handle.database().*.deleteEnrichment(touch.kind, touch.name) catch |err| {
+                _ = self.handle.database().*.enrichment.deleteEnrichment(touch.kind, touch.name) catch |err| {
                     std.log.warn("lite AddIndex rollback failed to remove enrichment {s}: {s}", .{ touch.name, @errorName(err) });
                 };
             }
@@ -401,7 +401,7 @@ fn registerParsedLiteIndexResolvers(handle: *Handle, configs: []const db_mod.Res
         // invalid later resolver, a label conflict) still restores every
         // earlier insertion or replacement this call made.
         try rollback.willTouchResolver(cfg.name);
-        _ = try handle.database().*.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
+        _ = try handle.database().*.enrichment.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
     }
 }
 
@@ -529,7 +529,7 @@ pub fn liteMergedIndexesJsonAlloc(handle: *Handle) ![]u8 {
 pub fn liteMergedIndexesForDatabaseJsonAlloc(alloc: Allocator, database: *db_mod.DB) ![]u8 {
     const configs = try database.listIndexes(alloc);
     defer db_mod.types.freeIndexConfigs(alloc, configs);
-    const enrichments = try database.listEnrichments(alloc);
+    const enrichments = try database.enrichment.listEnrichments(alloc);
     defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -652,8 +652,8 @@ pub fn refreshLiteManagedEmbeddingRuntimeForDatabase(handle: *Handle, database: 
     defer enrichments.deinit(alloc);
     var cfg = enrichments.takeConfig();
     cfg.enable_without_producers = cfg.enable_without_producers or handle.lite_generated_enrichment_replay;
-    try database.reconfigureEnrichmentRuntime(cfg);
-    database.setResolutionEmbedder(if (database.enrichment_runtime) |runtime| runtime.config.dense_embedder else null);
+    try database.enrichment.reconfigureRuntime(cfg);
+    database.enrichment.setResolutionEmbedder(if (database.enrichment.runtime) |runtime| runtime.config.dense_embedder else null);
 }
 
 pub const stamped_generation_optimistic_attempts = 4;
@@ -2970,7 +2970,7 @@ pub fn openLiteHandleAllocWithSharedInference(
     try refreshLiteManagedEmbeddingRuntime(handle);
     @import("entity_sink.zig").attach(handle, &handle.db);
     try @import("tables.zig").loadCatalog(handle);
-    if (!resolved.externally_locked) handle.database().*.startQuarantineRetryWorkerIfNeeded();
+    if (!resolved.externally_locked) handle.database().*.maintenance.startQuarantineRetryWorkerIfNeeded();
     return handle;
 }
 
@@ -3542,7 +3542,7 @@ pub const LiteCompactReport = struct {
 pub fn prepareLiteCompact(handle: *Handle) !void {
     try handle.database().*.runUntilIdle();
     try handle.database().*.forceCompactTextIndexes();
-    try handle.database().*.drainScheduledTextMerges();
+    try handle.database().*.indexes.text.drainScheduledMerges();
     try handle.database().*.sync(true);
     try handle.database().*.syncIndexes(true);
 }
@@ -3607,7 +3607,7 @@ pub fn antfly_db_replay_generated_enrichments_json(handle_ptr: ?*anyopaque, out_
     }
     defer guard.leave();
     const handle = guard.handle;
-    const replayed = handle.database().*.replayGeneratedEnrichmentsFromStoredDocs(handle.alloc) catch |err| return capi.mapError(err);
+    const replayed = handle.database().*.enrichment.replayGeneratedEnrichmentsFromStoredDocs(handle.alloc) catch |err| return capi.mapError(err);
     out.* = stringifyJson(LiteReplayGeneratedEnrichmentsReport{ .replayed = replayed }) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
@@ -5000,17 +5000,17 @@ fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Valu
     }
     const debt_json = try std.json.Stringify.valueAlloc(a, debt, .{});
     try value.object.put(a, "index_replay_debt", try std.json.parseFromSliceLeaky(std.json.Value, a, debt_json, .{}));
-    const jobs = try database.graphReplacementStatusAlloc(a);
+    const jobs = try database.indexes.graph.replacementStatusAlloc(a);
     defer jobs.deinit();
     var rows: std.ArrayList(std.json.Value) = .empty;
     for (jobs.value) |job| {
-        const upstream = if (database.enrichment_runtime) |runtime| runtime.stats() else db_mod.types.EnrichmentStats{};
+        const upstream = if (database.enrichment.runtime) |runtime| runtime.stats() else db_mod.types.EnrichmentStats{};
         const replaying = job.phase != .failed and !job.producer_replay_complete;
         const waiting = job.phase != .failed and job.producer_replay_target > upstream.applied_sequence;
         const producer_pending = replaying or waiting;
         const blocked_reason: ?[]const u8 = if (replaying) "replaying_producer_sources" else if (waiting) "waiting_for_producer_enrichment" else null;
         // A malformed failed declaration must not hide its retry/error status.
-        const producers = database.graphReplacementProducerNamesAlloc(a, job) catch |err| switch (err) {
+        const producers = database.indexes.graph.replacementProducerNamesAlloc(a, job) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => try a.alloc([]u8, 0),
         };
@@ -5106,7 +5106,7 @@ pub fn antfly_db_run_until_idle_json(
 /// error leaves `out_buf` untouched, matching every other failure path here.
 pub fn writeRunUntilIdleNoProgressDiagnosticIfAny(db: anytype, out_buf: *capi.Buffer, err: anyerror) void {
     if (err != error.RunUntilIdleNoProgress) return;
-    const diagnostic = db.lastRunUntilIdleNoProgressDiagnostic() orelse return;
+    const diagnostic = db.maintenance.lastRunUntilIdleNoProgressDiagnostic() orelse return;
     out_buf.* = stringifyJson(.{
         .index_name = diagnostic.index_name,
         .indexed = diagnostic.indexed,
@@ -5152,7 +5152,7 @@ pub fn antflyDbExtractEnrichmentsJson(
     const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     defer freeOwnedBatchWrites(handle.alloc, writes);
 
-    var result = handle.database().*.extractEnrichments(handle.alloc, writes) catch |err| return capi.mapError(err);
+    var result = handle.database().*.enrichment.extractEnrichments(handle.alloc, writes) catch |err| return capi.mapError(err);
     defer result.deinit(handle.alloc);
 
     var payload = buildJsonExtractEnrichmentsResult(handle.alloc, result) catch |err| return capi.mapErrorContext(err, @src().fn_name);
@@ -5181,7 +5181,7 @@ pub fn antflyDbComputeEnrichmentsJson(
     const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     defer freeOwnedBatchWrites(handle.alloc, writes);
 
-    var result = handle.database().*.computeEnrichments(handle.alloc, writes) catch |err| return capi.mapError(err);
+    var result = handle.database().*.enrichment.computeEnrichments(handle.alloc, writes) catch |err| return capi.mapError(err);
     defer result.deinit(handle.alloc);
 
     var payload = buildJsonComputeEnrichmentsResult(handle.alloc, result) catch |err| return capi.mapErrorContext(err, @src().fn_name);
@@ -5478,7 +5478,7 @@ pub fn antfly_db_list_enrichments_json(
     }
     defer guard.leave();
     const handle = guard.handle;
-    const configs = handle.database().*.listEnrichments(handle.alloc) catch |err| return capi.mapError(err);
+    const configs = handle.database().*.enrichment.listEnrichments(handle.alloc) catch |err| return capi.mapError(err);
     defer db_mod.types.freeEnrichmentConfigs(handle.alloc, configs);
     out_buf.* = stringifyJson(configs) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;
@@ -7654,7 +7654,7 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
         // queries reuse transport/capability/model state. Only construction is locked;
         // invocation contexts share the runtime's synchronized capability cache.
         const producer_handle = if (guard.connection != null) handle.parent_handle orelse handle else handle;
-        const cached_producer = text != null and (guard.connection != null or handle.database().enrichment_runtime == null);
+        const cached_producer = text != null and (guard.connection != null or handle.database().enrichment.runtime == null);
         if (cached_producer) {
             producer_handle.query_producer_mutex.lockUncancelable(handleLockIo());
             defer producer_handle.query_producer_mutex.unlock(handleLockIo());
@@ -7670,7 +7670,7 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
             const bytes = if (cached_producer)
                 plan.produce(alloc, value.string, producer_handle.query_producer.?.producer().withInvocationContext(.{})) catch |err| return capi.mapErrorContext(err, "extracting query text")
             else
-                handle.database().extractResolverQueryAlloc(alloc, cfg.*, value.string, null) catch |err| return capi.mapErrorContext(err, "extracting query text");
+                handle.database().enrichment.extractResolverQueryAlloc(alloc, cfg.*, value.string, null) catch |err| return capi.mapErrorContext(err, "extracting query text");
             if (!guard.resumeQuery(handle_ptr)) {
                 alloc.free(bytes);
                 return capi.mapErrorContext(error.Busy, "query handle closed during extraction; retry");
@@ -7699,7 +7699,7 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
         } else std.json.Stringify.valueAlloc(alloc, extraction.?, .{}) catch |err| return capi.mapError(err);
         defer alloc.free(extracted);
         const candidates = @import("entity_sink.zig").candidateSource(handle);
-        const mention_embedder = handle.database().resolution_embedder;
+        const mention_embedder = handle.database().enrichment.resolution.embedder;
         const suspend_resolution = guard.connection != null and (cfg.adjudicate_json.len > 0 or cfg.name_embedding.len > 0);
         if (suspend_resolution) guard.suspendQuery();
         const computed = @import("../storage/db/resolution_runtime.zig").resolveQueryExtractionWithPolicyAlloc(alloc, configs, cfg, extracted, candidates, mention_embedder, policy_session.loader());
@@ -7770,12 +7770,12 @@ fn curateResolverWithProposals(handle: *Handle, name: []const u8, request_json: 
     } else return error.ResolverNotFound;
     // Resolver policy can precede creation of its destination table.
     const destination = tables.get(root, cfg.table) catch |err| switch (err) {
-        error.UndefinedTable => return source.curateResolverJsonAlloc(handle.alloc, name, request_json),
+        error.UndefinedTable => return source.enrichment.curateResolverJsonAlloc(handle.alloc, name, request_json),
         else => return err,
     };
     if (try @import("resolver_authority.zig").owns(destination, a, cfg.key_template)) return error.ResolverNamespaceCurationRequired;
     var manifest = try proposalManifest(a, destination);
-    if (manifest.queue.proposals.len == 0) return source.curateResolverJsonAlloc(handle.alloc, name, request_json);
+    if (manifest.queue.proposals.len == 0) return source.enrichment.curateResolverJsonAlloc(handle.alloc, name, request_json);
     const was_dirty = manifest.refresh_required;
     try refreshProposalManifest(root, a, cfg.table, &manifest);
     if (manifest.pending_id != null) return error.ResolverCurationConflict;
@@ -8821,7 +8821,7 @@ pub fn antfly_db_drop_resolver_identity(handle_ptr: ?*anyopaque, name: capi.Slic
     const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapError(error.InvalidArgument);
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
-    out.* = guard.handle.database().dropRetiredResolverIdentity(name.bytes()) catch |err| return capi.mapErrorContext(err, "retire all declaring indexes before dropping resolver identity");
+    out.* = guard.handle.database().enrichment.dropRetiredResolverIdentity(name.bytes()) catch |err| return capi.mapErrorContext(err, "retire all declaring indexes before dropping resolver identity");
     return .ok;
 }
 
@@ -8856,7 +8856,7 @@ pub fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, resolver_n
         // Validate the destination before publishing identity state.
         _ = @import("tables.zig").get(handle.parent_handle orelse handle, request.table) catch |err| return capi.mapErrorContext(if (err == error.UndefinedTable) error.NotFound else err, "resolver namespace destination table does not exist");
         const next = curation.namespaceConfig(arena.allocator(), cfg, request) catch |err| return capi.mapErrorContext(err, "mapping every inline alias endpoint and resolver policy key into the destination namespace");
-        _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true, .migrate_namespace = true }) catch |err| return capi.mapErrorContext(err, "updating resolver namespace atomically");
+        _ = handle.database().enrichment.upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true, .migrate_namespace = true }) catch |err| return capi.mapErrorContext(err, "updating resolver namespace atomically");
         return .ok;
     }
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");
@@ -8897,7 +8897,7 @@ pub fn antfly_db_add_index_json(handle_ptr: ?*anyopaque, config_json: capi.Slice
             // its captured inputs. Observe that owner's generation instead;
             // manual/hosted and directory runtimes retain their inline driver.
             const quantum_ms = if (background_owner) 0 else @min(@as(u64, 100), (deadline -| now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
-            database.waitGraphReplacement(name, generation, quantum_ms) catch |err| switch (err) {
+            database.indexes.graph.waitReplacement(name, generation, quantum_ms) catch |err| switch (err) {
                 error.Busy => break :blk true,
                 else => return capi.mapError(err),
             };
@@ -8980,7 +8980,7 @@ fn addIndexJsonRegistered(
     // catalog instead of leaving durably changed producers behind a caller
     // who was told the AddIndex failed.
     {
-        const jobs = handle.database().graphReplacementStatusAlloc(handle.alloc) catch |err| return capi.mapError(err);
+        const jobs = handle.database().indexes.graph.replacementStatusAlloc(handle.alloc) catch |err| return capi.mapError(err);
         defer jobs.deinit();
         for (jobs.value) |job| {
             if (!std.mem.eql(u8, job.name, parsed.value.name)) continue;
@@ -9099,7 +9099,7 @@ pub fn antfly_db_cancel_replacement(
     const out = out_deleted orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = false;
     const handle = guard.handle;
-    out.* = handle.database().*.cancelReplacement(name.bytes()) catch |err| return capi.mapError(err);
+    out.* = handle.database().*.indexes.graph.cancelReplacement(name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -9142,7 +9142,7 @@ pub fn antfly_db_add_enrichment_json(
         .ignore_unknown_fields = true,
     }) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     defer parsed.deinit();
-    handle.database().*.addEnrichment(parsed.value) catch |err| return capi.mapError(err);
+    handle.database().*.enrichment.addEnrichment(parsed.value) catch |err| return capi.mapError(err);
     refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -9166,7 +9166,7 @@ pub fn antfly_db_delete_enrichment(
     out.* = false;
     const handle = guard.handle;
     const kind = parseEnrichmentKind(kind_slice.bytes()) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": unknown enrichment kind");
-    out.* = handle.database().*.deleteEnrichment(kind, name.bytes()) catch |err| return capi.mapError(err);
+    out.* = handle.database().*.enrichment.deleteEnrichment(kind, name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -9567,7 +9567,7 @@ pub fn antfly_db_create_shadow_index_manager(
     }
     defer guard.leave();
     const handle = guard.handle;
-    handle.database().*.createShadowIndexManager(split_key.bytes(), original_range_end.bytes()) catch |err| return capi.mapError(err);
+    handle.database().*.indexes.createSplitShadow(split_key.bytes(), original_range_end.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -9582,7 +9582,7 @@ pub fn antfly_db_close_shadow_index_manager(handle_ptr: ?*anyopaque) callconv(.c
     }
     defer guard.leave();
     const handle = guard.handle;
-    handle.database().*.closeShadowIndexManager() catch |err| return capi.mapError(err);
+    handle.database().*.indexes.closeSplitShadow() catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -9600,7 +9600,7 @@ pub fn antfly_db_get_shadow_index_dir(
     }
     defer guard.leave();
     const handle = guard.handle;
-    const dir = handle.database().*.getShadowIndexDir();
+    const dir = handle.database().*.indexes.splitShadowDir();
     if (dir.len == 0) return capi.mapError(error.NotFound);
     out_buf.* = dupBytes(dir) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;
@@ -10028,8 +10028,8 @@ test "capi resolver invalid inline declarations reject before replay activity or
     const id = try publishHandle(handle);
     defer antfly_db_close(id);
     const database = handle.database();
-    if (database.resolution_runtime == null) try database.initResolutionRuntime();
-    const mutex = &database.resolution_runtime.?.catch_up_mutex;
+    if (database.enrichment.resolution.runtime == null) try database.enrichment.initResolutionRuntime();
+    const mutex = &database.enrichment.resolution.runtime.?.catch_up_mutex;
     try std.testing.expect(mutex.tryLock());
     defer mutex.unlock();
     // Hold replay ownership deterministically. Validation must neither wait
@@ -10049,7 +10049,7 @@ test "capi resolver invalid inline declarations reject before replay activity or
         , .{later});
         defer a.free(request);
         try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_add_index_json(id, .fromSlice(request)));
-        const identities = try database.listResolverIdentities(a);
+        const identities = try database.enrichment.listResolverIdentities(a);
         defer a.free(identities);
         try std.testing.expectEqual(@as(usize, 0), identities.len);
     }
@@ -10083,7 +10083,7 @@ test "capi resolver replacement public waits retain admission generation across 
                     defer guard.leave();
                     if (guard.entry_error != null) return error.TestUnexpectedResult;
                     const database = guard.handle.database();
-                    const jobs = try database.graphReplacementStatusAlloc(guard.handle.alloc);
+                    const jobs = try database.indexes.graph.replacementStatusAlloc(guard.handle.alloc);
                     defer jobs.deinit();
                     try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
                     original_generation = jobs.value[0].generation;
@@ -10858,7 +10858,7 @@ test "capi native memory grouped episodes advance without a waiting write in roo
             const guard = enterHandle(id, .write) orelse return error.TestUnexpectedResult;
             defer guard.leave();
             const database = guard.handle.database();
-            try database.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread_id", .order_by = "ordinal", .segment_by = "turn_id", .field = "text" } });
+            try database.enrichment.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread_id", .order_by = "ordinal", .segment_by = "turn_id", .field = "text" } });
             try database.batch(.{ .writes = &.{.{ .key = "message", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"turn\",\"ordinal\":1,\"text\":\"History episode\"}" }}, .sync_level = .write });
         }
         var published = false;
@@ -10889,7 +10889,7 @@ test "capi native memory grouped episodes advance without a waiting write in roo
             defer guard.leave();
             const owner = (guard.handle.parent_handle orelse guard.handle).lite_scheduling_owner.?;
             const state = try owner.groupSourceState(guard.handle.database());
-            std.debug.print("group background cursor={d} reader={d} mode={s} stopping={} submitted={d} next_definition={d}\n", .{ owner.maintenance_table_cursor, guard.handle.database().core.index_manager.minimum_reader_version.load(.acquire), @tagName(guard.handle.database().open_mode), guard.handle.database().group_source_owner.stopping.load(.acquire), state.submitted, state.next_definition });
+            std.debug.print("group background cursor={d} reader={d} mode={s} stopping={} submitted={d} next_definition={d}\n", .{ owner.maintenance_table_cursor, guard.handle.database().core.index_manager.minimum_reader_version.load(.acquire), @tagName(guard.handle.database().open_mode), guard.handle.database().documents.group_sources.owner.stopping.load(.acquire), state.submitted, state.next_definition });
             const stats = try pendingWorkStatsJson(guard.handle);
             defer std.heap.c_allocator.free(stats.ptr.?[0..stats.len]);
             std.debug.print("group background namespace={d} stats={s}\n", .{ namespace_index, stats.ptr.?[0..stats.len] });

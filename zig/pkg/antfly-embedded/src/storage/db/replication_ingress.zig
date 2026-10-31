@@ -45,7 +45,7 @@ pub fn applyRecord(db: *DB, record: record_mod.RecordView) !void {
                     defer schema.deinit();
                     try db.applyReplicatedSchema(schema.view(), record.lsn);
                 },
-                .row_policy => try db.applyReplicatedRowPolicy(.{
+                .row_policy => try db.query.applyReplicatedRowPolicy(.{
                     .bundle = metadata.value.row_policy_bundle orelse return error.InvalidMetadataMutationPayload,
                     .request = metadata.value.row_policy_request orelse return error.InvalidMetadataMutationPayload,
                     .entry = metadata.value.row_policy_raft_entry orelse return error.InvalidMetadataMutationPayload,

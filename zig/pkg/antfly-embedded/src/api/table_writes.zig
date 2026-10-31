@@ -987,7 +987,7 @@ pub const BoundTableWriteSource = struct {
         });
         defer parsed.deinit();
         if (!std.mem.eql(u8, parsed.value.name, artifact_name)) return error.InvalidEnrichmentConfig;
-        _ = try (try self.activeDb()).upsertEnrichment(parsed.value);
+        _ = try (try self.activeDb()).enrichment.upsertEnrichment(parsed.value);
     }
 
     pub fn deleteArtifactEnrichment(
@@ -1253,13 +1253,13 @@ pub fn deleteArtifactEnrichmentFromDbByName(
     db: *db_mod.DB,
     artifact_name: []const u8,
 ) !bool {
-    const enrichments = try db.listEnrichments(alloc);
+    const enrichments = try db.enrichment.listEnrichments(alloc);
     defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
 
     var deleted = false;
     for (enrichments) |cfg| {
         if (!std.mem.eql(u8, cfg.name, artifact_name)) continue;
-        _ = try db.deleteEnrichment(cfg.kind, artifact_name);
+        _ = try db.enrichment.deleteEnrichment(cfg.kind, artifact_name);
         deleted = true;
     }
     return deleted;

@@ -72,7 +72,7 @@ pub const Owner = struct {
         for (self.cut.cover, 0..) |origin, i| if (origin.group_id == group) {
             if (self.dbs[i] == null) {
                 const cut = try self.cut.forGroup(origin.group_id);
-                self.dbs[i] = try self.carrier.openQueryCut(cut, self.cancellation);
+                self.dbs[i] = try self.carrier.query.openCut(cut, self.cancellation);
             }
             return .{ .ptr = self, .db = &self.dbs[i].?, .release_fn = release };
         };

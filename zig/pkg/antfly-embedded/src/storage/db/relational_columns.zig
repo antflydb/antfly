@@ -521,7 +521,7 @@ fn ColumnBuilder(comptime DBType: type) type {
                             try references.append(scratch, .{ .digest = digest, .bytes = existing.bytes, .retains = 1 });
                         } else {
                             writer.entries = .{ .items = local, .capacity = local.len, .pointer_stability = .{} };
-                            _ = self.db.relational_column_maintenance.payload_encoding_bytes.fetchAdd(raw_bytes, .monotonic);
+                            _ = self.db.indexes.relational.column_maintenance.payload_encoding_bytes.fetchAdd(raw_bytes, .monotonic);
                             const values = try writer.build();
                             const encoded = try checked(scratch, values);
                             reference = .{ .digest = digest, .bytes = encoded.len, .source_rows = @intCast(row_end - row_first) };
@@ -585,13 +585,13 @@ fn ColumnBuilder(comptime DBType: type) type {
                 live = false;
             }
             self.blocks += 1;
-            _ = self.db.relational_column_maintenance.payloads_reused.fetchAdd(shared_count, .monotonic);
-            _ = self.db.relational_column_maintenance.payload_bytes_written.fetchAdd(new_payload_bytes, .monotonic);
-            _ = self.db.relational_column_maintenance.blocks_written.fetchAdd(1, .monotonic);
-            _ = self.db.relational_column_maintenance.rows_written.fetchAdd(self.rows.items.len, .monotonic);
+            _ = self.db.indexes.relational.column_maintenance.payloads_reused.fetchAdd(shared_count, .monotonic);
+            _ = self.db.indexes.relational.column_maintenance.payload_bytes_written.fetchAdd(new_payload_bytes, .monotonic);
+            _ = self.db.indexes.relational.column_maintenance.blocks_written.fetchAdd(1, .monotonic);
+            _ = self.db.indexes.relational.column_maintenance.rows_written.fetchAdd(self.rows.items.len, .monotonic);
             var written: u64 = new_payload_bytes;
             for (writes.items) |write| written +|= write.key.len + write.value.len;
-            _ = self.db.relational_column_maintenance.bytes_written.fetchAdd(written, .monotonic);
+            _ = self.db.indexes.relational.column_maintenance.bytes_written.fetchAdd(written, .monotonic);
             self.rows = .empty;
             self.columns = .empty;
             self.bytes = 0;
@@ -611,7 +611,7 @@ fn ColumnBuilder(comptime DBType: type) type {
 
         fn checkpoint(ptr: ?*anyopaque, key: []const u8) !store_mod.DocStore.ScanAction {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
-            if (self.db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+            if (self.db.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
             const owner_limit = if (@import("builtin").is_test) test_owner_limit orelse 1024 else 1024;
             if (self.owners >= owner_limit or (self.owners != 0 and platform_time.monotonicNs() >= self.deadline_ns)) {
                 self.continuation = (try keys.decodeStoredDocumentRowKeyAlloc(self.alloc, key)).?;
@@ -619,7 +619,7 @@ fn ColumnBuilder(comptime DBType: type) type {
             }
             if (try self.yieldBeforeRow(key)) return .stop;
             self.owners += 1;
-            _ = self.db.relational_column_maintenance.owners_examined.fetchAdd(1, .monotonic);
+            _ = self.db.indexes.relational.column_maintenance.owners_examined.fetchAdd(1, .monotonic);
             return .@"continue";
         }
 
@@ -655,7 +655,7 @@ fn ColumnBuilder(comptime DBType: type) type {
             var view = (try self.db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
             defer view.release();
             try validateOrdinalPages(ordinal_pages, rows.len, view.tableSchema().relational_columns.len);
-            var block = Block{ .alloc = scratch, .scope = &scope, .generation = self.generation, .index = range.block, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stop = &self.db.independent_maintenance.stopping };
+            var block = Block{ .alloc = scratch, .scope = &scope, .generation = self.generation, .index = range.block, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stop = &self.db.maintenance.independent.stopping };
             defer block.deinit();
             var dirty = try read.openCursor();
             defer dirty.close();
@@ -703,7 +703,7 @@ fn ColumnBuilder(comptime DBType: type) type {
                     try self.rows.append(dest, owned);
                     self.bytes +|= @intCast(owned.physical_bytes);
                     self.prepared_bytes +|= @intCast(owned.physical_bytes);
-                    _ = self.db.relational_column_maintenance.covered_rows_read.fetchAdd(1, .monotonic);
+                    _ = self.db.indexes.relational.column_maintenance.covered_rows_read.fetchAdd(1, .monotonic);
                     source_id += 1;
                 }
                 if (self.rows.items.len == max_rows or self.bytes >= 1024 * 1024) {
@@ -780,7 +780,7 @@ fn ColumnBuilder(comptime DBType: type) type {
                                     retained_bytes += payloadCellBytes(cell);
                                 };
                                 if (!reusePartialPayload(decoded.logical_bytes, retained_bytes, entry.value_ptr.partial_fragments)) {
-                                    _ = self.db.relational_column_maintenance.payload_slices_repacked.fetchAdd(1, .monotonic);
+                                    _ = self.db.indexes.relational.column_maintenance.payload_slices_repacked.fetchAdd(1, .monotonic);
                                     continue; // Materialize selected cells below.
                                 }
                             }
@@ -811,7 +811,7 @@ fn ColumnBuilder(comptime DBType: type) type {
                             if (keep) if (maybe_cell) |cell| try self.addCell(remap[i], cell);
                         }
                     }
-                    _ = self.db.relational_column_maintenance.cell_slots_examined.fetchAdd(block.rows.len, .monotonic);
+                    _ = self.db.indexes.relational.column_maintenance.cell_slots_examined.fetchAdd(block.rows.len, .monotonic);
                 }
             }
             @memset(selected, false);
@@ -848,7 +848,7 @@ fn ColumnBuilder(comptime DBType: type) type {
             while (try cells.next()) |cell| try self.addCell(id, cell);
             self.bytes +|= value.len;
             self.prepared_bytes +|= value.len;
-            _ = self.db.relational_column_maintenance.primary_rows_read.fetchAdd(1, .monotonic);
+            _ = self.db.indexes.relational.column_maintenance.primary_rows_read.fetchAdd(1, .monotonic);
         }
 
         fn addCell(self: *@This(), id: u32, cell: codec.Cell) !void {
@@ -985,7 +985,7 @@ fn buildToken(generation: u64, first_block: u64) [16]u8 {
 /// advances with coverage publication, never with staging. Uncovered suffixes
 /// stay on primary scans, including rows predating the dirty directory.
 pub fn rebuild(db: anytype, alloc: alloc_type, force: bool, adaptive: bool) !bool {
-    const maintenance = &db.relational_column_maintenance;
+    const maintenance = &db.indexes.relational.column_maintenance;
     const now = maintenanceNow();
     // Called under the DB's single-maintainer guard. These cheap wake hints
     // avoid even opening a transaction while every known range is deferred.
@@ -1145,7 +1145,7 @@ fn stageCleanup(db: anytype, alloc: alloc_type, read: *store_mod.DocStore.Txn, f
     while (entry) |first| {
         if (!std.mem.startsWith(u8, first.key, dirty_prefix)) break;
         if (to.len != 0 and std.mem.order(u8, first.key[dirty_prefix.len..], to) != .lt) break;
-        if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+        if (db.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
@@ -1202,7 +1202,7 @@ fn drainCleanupWithLimit(db: anytype, alloc: alloc_type, generation: u64, namesp
     var locked = true;
     defer if (locked) db.core.unlockApplyShared();
     if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-    if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+    if (db.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     const token = read.get(cleanup_key) catch |err| switch (err) {
@@ -1221,7 +1221,7 @@ fn drainCleanupWithLimit(db: anytype, alloc: alloc_type, generation: u64, namesp
             locked = true;
         }
         if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-        if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+        if (db.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
         var txn = try db.core.store.beginWriteTxn();
         var live = true;
         defer if (live) txn.abort();
@@ -1244,7 +1244,7 @@ fn drainCleanupWithLimit(db: anytype, alloc: alloc_type, generation: u64, namesp
         if (done) try txn.delete(cleanup_key);
         try txn.commit();
         live = false;
-        _ = db.relational_column_maintenance.dirty_markers_cleared.fetchAdd(cleared, .monotonic);
+        _ = db.indexes.relational.column_maintenance.dirty_markers_cleared.fetchAdd(cleared, .monotonic);
         db.core.unlockApplyShared();
         locked = false;
         if (done or platform_time.monotonicNs() -| started >= 50 * std.time.ns_per_ms) break;
@@ -1352,7 +1352,7 @@ const Selection = struct { id: ?[]const u8 = null, progress: bool = false, timed
 /// Deferred ranges have a durable time index; unchanged waiting work needs no
 /// cursor rewrite. One commit checkpoints all admission decisions in a batch.
 fn selectReady(db: anytype, read: *store_mod.DocStore.Txn, alloc: alloc_type, manifest: Manifest, manifest_bytes: []const u8, store_revision: u64) !Selection {
-    const maintenance = &db.relational_column_maintenance;
+    const maintenance = &db.indexes.relational.column_maintenance;
     const now = maintenanceNow();
     const mutation = read.get(keys.relational_columnar_mutation_key) catch |err| switch (err) {
         error.NotFound => null,
@@ -1867,7 +1867,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     if (queued_candidate == null or !std.mem.startsWith(u8, queued_candidate.?.key, candidate_prefix)) queued_candidate = try candidate_cursor.seekAtOrAfter(candidate_prefix);
     const has_candidate = if (queued_candidate) |entry| std.mem.startsWith(u8, entry.key, candidate_prefix) else false;
     // Deferred dirty rows must not put ready merge/queue-cleanup work to sleep.
-    if (has_candidate) db.relational_column_maintenance.waiting_until_ns.store(0, .release);
+    if (has_candidate) db.indexes.relational.column_maintenance.waiting_until_ns.store(0, .release);
     const merge_turn = bootstrap == null and has_candidate and (!any_dirty or turn % 4 == 3);
     const has_dirty = bootstrap != null or (any_dirty and !merge_turn);
     if (merge_turn) pending_entry = queued_candidate;
@@ -2001,7 +2001,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     const cleanup = try stageCleanup(db, alloc, &read, range.start, builder.continuation orelse range.end, manifest_bytes, token, namespace);
     defer cleanup.deinit(alloc);
     if (comptime @import("builtin").is_test) if (test_before_publish) |hook| try hook.run(hook.context);
-    if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+    if (db.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
     db.core.lockApplyShared();
     locked = true;
     if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
@@ -2074,17 +2074,17 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     const inline_cleared = try cleanup.publish(&publish, &token);
     try publish.commit();
     live = false;
-    for (ranges.items) |old_range| _ = db.relational_column_maintenance.debtSlot(manifest.generation, old_range.block).swap(0, .monotonic);
-    if (bootstrap != null) _ = db.relational_column_maintenance.bootstrap_quanta.fetchAdd(1, .monotonic);
-    db.relational_column_maintenance.waiting_until_ns.store(0, .release);
-    _ = db.relational_column_maintenance.dirty_markers_cleared.fetchAdd(inline_cleared, .monotonic);
+    for (ranges.items) |old_range| _ = db.indexes.relational.column_maintenance.debtSlot(manifest.generation, old_range.block).swap(0, .monotonic);
+    if (bootstrap != null) _ = db.indexes.relational.column_maintenance.bootstrap_quanta.fetchAdd(1, .monotonic);
+    db.indexes.relational.column_maintenance.waiting_until_ns.store(0, .release);
+    _ = db.indexes.relational.column_maintenance.dirty_markers_cleared.fetchAdd(inline_cleared, .monotonic);
     db.core.unlockApplyShared();
     locked = false;
     try finishCleanupQuantum(db, alloc, manifest.generation, namespace);
-    if (empty_range != 0) _ = db.relational_column_maintenance.blocks_written.fetchAdd(empty_range, .monotonic);
-    _ = db.relational_column_maintenance.ranges_compacted.fetchAdd(1, .monotonic);
+    if (empty_range != 0) _ = db.indexes.relational.column_maintenance.blocks_written.fetchAdd(empty_range, .monotonic);
+    _ = db.indexes.relational.column_maintenance.ranges_compacted.fetchAdd(1, .monotonic);
     if (removed_ranges > builder.directory.items.len + retained_suffix + empty_range)
-        _ = db.relational_column_maintenance.ranges_merged.fetchAdd(removed_ranges - builder.directory.items.len - retained_suffix - empty_range, .monotonic);
+        _ = db.indexes.relational.column_maintenance.ranges_merged.fetchAdd(removed_ranges - builder.directory.items.len - retained_suffix - empty_range, .monotonic);
     return true;
 }
 
@@ -2218,7 +2218,7 @@ fn pruneRange(db: anytype, alloc: alloc_type, lower: []const u8, upper: []const 
         }
         fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
-            if (self.db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
+            if (self.db.maintenance.independent.stopping.load(.acquire)) return error.Canceled;
             const scratch = self.arena.allocator();
             if (self.deletes.items.len != 0 and self.bytes +| key.len +| value.len > maintenance_bytes) {
                 self.exhausted = false;
@@ -2257,7 +2257,7 @@ fn pruneRange(db: anytype, alloc: alloc_type, lower: []const u8, upper: []const 
     defer pruner.arena.deinit();
     try db.core.store.scanWithContext(lower, upper, .{}, &pruner, Pruner.visit);
     try pruner.flush();
-    _ = db.relational_column_maintenance.gc_records_deleted.fetchAdd(pruner.deleted, .monotonic);
+    _ = db.indexes.relational.column_maintenance.gc_records_deleted.fetchAdd(pruner.deleted, .monotonic);
     return pruner.deleted != 0 or completion != null;
 }
 
@@ -3031,7 +3031,7 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         };
         const dirty_range = try dirty_ranges.overlaps(alloc, range.start, range.end);
         const read_cost_before = dirty_ranges.read_cost;
-        defer db.relational_column_maintenance.noteRead(manifest.generation, index, dirty_ranges.read_cost -| read_cost_before);
+        defer db.indexes.relational.column_maintenance.noteRead(manifest.generation, index, dirty_ranges.read_cost -| read_cost_before);
         if (dirty_range) {
             if (opts.columnar_stats) |stats| stats.dirty_ranges_read += 1;
         }
@@ -3088,7 +3088,7 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         const plan = if (dirty_range or selected_for_cost) try planRange(txn, scratch, range, from, to, byte_range, opts, &block, candidates[0..rows.len], schema_plan.filter) else RangeScanPlan{ .visibility_complete = true };
         if (plan.primary) {
             if (opts.columnar_stats) |stats| stats.dense_delta_scans += 1;
-            db.relational_column_maintenance.noteRead(manifest.generation, index, source_bytes);
+            db.indexes.relational.column_maintenance.noteRead(manifest.generation, index, source_bytes);
             var selection = RowSelection{ .plan = schema_plan, .rows = rows, .known = known[0..rows.len], .matched = candidates[0..rows.len], .evaluated = selected_for_cost and schema_plan.filter != null };
             // Even an unadmitted historical plan is owned by the active block.
             // Share it with sequential execution instead of recompiling it.

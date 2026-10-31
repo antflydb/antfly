@@ -25,8 +25,8 @@ const callbacks = @import("../storage/db/runtime_callbacks.zig");
 
 pub fn attach(handle: *h.Handle, db: *h.db_mod.DB) void {
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return;
-    db.setResolutionCandidateSource(candidateSource(handle));
-    db.setEntitySink(.{ .ptr = handle, .vtable = &.{ .upsert = upsert, .upsert_batch = upsertBatch, .supports_curation = supportsCuration } });
+    db.enrichment.setResolutionCandidateSource(candidateSource(handle));
+    db.enrichment.setEntitySink(.{ .ptr = handle, .vtable = &.{ .upsert = upsert, .upsert_batch = upsertBatch, .supports_curation = supportsCuration } });
 }
 
 /// Read-only candidate seam also used by ephemeral query resolution.
@@ -45,7 +45,7 @@ fn candidateRevisions(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, 
     defer if (schema) |*view| view.release();
     const time_dependent = if (schema) |view| view.visibilityTtlDurationNs() != 0 else false;
     const hash = @import("antfly_resolver").fingerprint;
-    const embedder = database.resolution_embedder orelse if (database.enrichment_runtime) |runtime| runtime.config.dense_embedder else null;
+    const embedder = database.enrichment.resolution.embedder orelse if (database.enrichment.runtime) |runtime| runtime.config.dense_embedder else null;
     const model_revision: ?[32]u8 = if (embedder) |provider| blk: {
         if (embedding.len == 0) break :blk null;
         const revision = provider.cache_revision_fn orelse break :blk null;
@@ -448,7 +448,7 @@ fn adjudicationProducer(handle: *h.Handle) !@import("../storage/db/enrichment/as
     const cached = if (handle.query_producer) |runtime| runtime.producer() else null;
     handle.query_producer_mutex.unlock(io);
     if (cached) |producer| return producer;
-    if (database.enrichment_runtime) |runtime| if (runtime.config.asset_producer) |producer| return producer;
+    if (database.enrichment.runtime) |runtime| if (runtime.config.asset_producer) |producer| return producer;
     handle.query_producer_mutex.lockUncancelable(io);
     defer handle.query_producer_mutex.unlock(io);
     if (handle.query_producer == null) handle.query_producer = try @import("../asset_producer_runtime.zig").Runtime.createOwned(handle.alloc, io, .{ .antfly_provider = handle.liteAntflyProvider() });
@@ -478,8 +478,8 @@ fn adjudicateBatch(ptr: *anyopaque, a: std.mem.Allocator, requests: []const @imp
 fn embedMentions(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, embedding_name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
     const database = try tables.get(handle, table);
-    if (database.resolution_embedder) |embedder| return embedder.embedDenseBatch(a, embedding_name, texts, dims);
-    if (database.enrichment_runtime) |runtime| if (runtime.config.dense_embedder) |embedder| return embedder.embedDenseBatch(a, embedding_name, texts, dims);
+    if (database.enrichment.resolution.embedder) |embedder| return embedder.embedDenseBatch(a, embedding_name, texts, dims);
+    if (database.enrichment.runtime) |runtime| if (runtime.config.dense_embedder) |embedder| return embedder.embedDenseBatch(a, embedding_name, texts, dims);
     const config = try @import("db.zig").liteMergedIndexesForDatabaseJsonAlloc(handle.alloc, database);
     defer handle.alloc.free(config);
     var embedder = try h.managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(handle.alloc, config, .{ .antfly_provider = handle.liteAntflyProvider(), .io = database.backend_runtime.io(), .source_table = table });
@@ -492,9 +492,9 @@ fn embedMention(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8
     const database = try tables.get(handle, table);
     // The destination owns the canonical embedding space. Reuse its configured
     // provider for mention generation too, including injected runtime providers.
-    if (database.resolution_embedder) |embedder|
+    if (database.enrichment.resolution.embedder) |embedder|
         return embedder.embedDense(allocator, embedding_name, text, dims);
-    if (database.enrichment_runtime) |runtime| if (runtime.config.dense_embedder) |embedder|
+    if (database.enrichment.runtime) |runtime| if (runtime.config.dense_embedder) |embedder|
         return embedder.embedDense(allocator, embedding_name, text, dims);
     const config = try @import("db.zig").liteMergedIndexesForDatabaseJsonAlloc(handle.alloc, database);
     defer handle.alloc.free(config);
@@ -788,7 +788,7 @@ test "capi Lite promotion retains writer admission across coordinator and partic
     const store = handle.owned_lite_backend.?.native_docstore.?;
     store.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
     defer store.writer_admission = null;
-    try handle.db.entity_sink.?.upsertBatch(a, &.{.{ .table = "entities", .key = "person/ada", .doc_json = "{\"canonical_name\":\"Ada\",\"aliases\":[\"Ada\"]}" }});
+    try handle.db.enrichment.promotion.entity_sink.?.upsertBatch(a, &.{.{ .table = "entities", .key = "person/ada", .doc_json = "{\"canonical_name\":\"Ada\",\"aliases\":[\"Ada\"]}" }});
     try std.testing.expectEqual(@as(usize, 0), admission.depth);
     try std.testing.expectEqual(@as(usize, 1), admission.acquisitions);
     var row = (try (try tables.get(handle, "entities")).lookup(a, "person/ada", .{})) orelse return error.TestUnexpectedResult;
@@ -808,7 +808,7 @@ test "capi Lite promotion atomically merges across tables and survives reopen" {
     defer h.closeHandle(handle);
     try tables.create(handle, "entities", "{}", false);
     try tables.create(handle, "events", "{}", false);
-    const sink = handle.db.entity_sink.?;
+    const sink = handle.db.enrichment.promotion.entity_sink.?;
     const entries = [_]callbacks.EntityUpsert{
         .{ .table = "entities", .key = "person/ada", .doc_json = "{\"entity_type\":\"person\",\"canonical_name\":\"Ada\",\"aliases\":[\"Ada\"]}" },
         .{ .table = "events", .key = "event/write", .doc_json = "{\"entity_type\":\"event\",\"canonical_name\":\"Write\",\"aliases\":[\"Write\"]}" },
@@ -855,7 +855,7 @@ test "capi Lite promotion label routes extraction graphs into entity and event d
         \\{"name":"knowledge","type":"graph","source":{"artifact":"kg_v1","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg_v1","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"metrics":{"ppr":{"kind":"pagerank","enabled":true,"damping":0.85}},"edge_types":[{"name":"mentions"},{"name":"works_at"},{"name":"participates_in"},{"name":"uses"}],"resolvers":[{"name":"events","table":"events","source_artifact":"kg_v1","resolution_artifact":"events_resolution_v1","key_template":"event/{{ slug _entity.text }}","labels":["event"],"config_generation":1},{"name":"entities","table":"entities","source_artifact":"kg_v1","resolution_artifact":"entities_resolution_v1","key_template":"entity/{{ slug _entity.text }}","config_generation":1}]}
     ;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(handle_id, .fromSlice(config)));
-    try handle.db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true });
+    try handle.db.enrichment.reconfigureRuntime(.{ .enable_without_producers = true });
     try handle.db.batch(.{ .writes = &.{.{ .key = "doc:a", .value =
         \\{"kg":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"},{"id":"v0","label":"event","text":"Write program","predicate":"write"}],"relations":[{"type":"works_at","source":"e0","target":"e1"},{"type":"participates_in","source":"e0","target":"v0"},{"type":"uses","source":{"text":"Ada Lovelace"},"target":{"text":"Antfly"}},{"type":"uses","source":{"text":"missing"},"target":{"text":"Antfly"}}]}}
     }}, .sync_level = .write });
@@ -996,14 +996,14 @@ test "capi Lite promotion recursively generates a taxonomy in the destination ta
     try tables.create(handle, "entities", "{}", false);
     const entities = try tables.get(handle, "entities");
     try entities.addIndex(.{ .name = "entity_context", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"context\",\"field\":\"context\"}]}" });
-    try entities.addEnrichment(.{ .name = "taxonomy", .kind = .asset, .field = "canonical_name", .neighbor_context = .{ .graph_index = "entity_context", .edge_types = &.{"context"}, .direction = .out }, .content_type = "application/json", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}" });
+    try entities.enrichment.addEnrichment(.{ .name = "taxonomy", .kind = .asset, .field = "canonical_name", .neighbor_context = .{ .graph_index = "entity_context", .edge_types = &.{"context"}, .direction = .out }, .content_type = "application/json", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}" });
     try entities.addIndex(.{ .name = "taxonomy_graph", .kind = .graph, .config_json =
         \\{"sources":[{"artifact":"taxonomy","format":"extraction_graph","mention_edge_type":"mentions"}],"edge_types":[{"name":"mentions"},{"name":"is_a"},{"name":"supersedes","field":"supersedes"}]}
     });
     try entities.addResolver(.{ .name = "parents", .table = "entities", .source_artifact = "taxonomy", .resolution_artifact = "parents_resolved", .key_template = "concept/{{ slug _entity.text }}", .config_generation = 1 });
-    try entities.reconfigureEnrichmentRuntime(.{ .asset_producer = .{ .ptr = &generator, .vtable = &.{ .produce = Generator.produce, .invocation_memory_for_requests = Generator.memory } } });
+    try entities.enrichment.reconfigureRuntime(.{ .asset_producer = .{ .ptr = &generator, .vtable = &.{ .produce = Generator.produce, .invocation_memory_for_requests = Generator.memory } } });
     try entities.batch(.{ .graph_writes = &.{.{ .index_name = "entity_context", .source = "concept/compiler", .target = "concept/programming", .edge_type = "context" }} });
-    try handle.db.entity_sink.?.upsert(a, "entities", "concept/compiler", "{\"entity_type\":\"concept\",\"canonical_name\":\"Compiler\",\"aliases\":[\"Compiler\"]}");
+    try handle.db.enrichment.promotion.entity_sink.?.upsert(a, "entities", "concept/compiler", "{\"entity_type\":\"concept\",\"canonical_name\":\"Compiler\",\"aliases\":[\"Compiler\"]}");
     try runUntilIdle(handle);
     for ([_][]const u8{ "concept/compiler", "concept/software", "concept/computing" }) |key| {
         var row = (try entities.lookup(a, key, .{})) orelse return error.TestExpectedEqual;
@@ -1086,15 +1086,15 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
         }
     };
     var embed_context: Embedder = .{};
-    try entities.addEnrichment(.{ .name = "entity_names", .kind = .embedding, .field = "canonical_name", .vector_space = "names", .expected_dims = 3 });
-    try entities.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = .{ .ptr = &embed_context, .dense_embed_fn = Embedder.embed, .cache_revision_fn = Embedder.revision } });
+    try entities.enrichment.addEnrichment(.{ .name = "entity_names", .kind = .embedding, .field = "canonical_name", .vector_space = "names", .expected_dims = 3 });
+    try entities.enrichment.reconfigureRuntime(.{ .enable_without_producers = true, .dense_embedder = .{ .ptr = &embed_context, .dense_embed_fn = Embedder.embed, .cache_revision_fn = Embedder.revision } });
     const config =
         \\{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{ slug _entity.text }}","candidate_search":"ann","candidate_ann_index":"names","candidate_limit":1,"name_embedding":"mention_names","name_embedding_dims":3,"scorer_json":"{\"comparisons\":[{\"name\":\"embedding\",\"left\":\"name_embedding\",\"right\":\"canonical_embedding\",\"levels\":[{\"when\":\"cosine > 0.9\",\"weight\":8.0},{\"else\":true,\"weight\":-6.0}]}],\"combine\":{\"bias\":-3.0},\"decision\":{\"match\":0.9}}","config_generation":1}]}
     ;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(config)));
     const fake_embedder: @import("../storage/db/enrichment/embedder.zig").DenseEmbedder = .{ .ptr = &embed_context, .dense_embed_fn = Embedder.embed, .cache_revision_fn = Embedder.revision };
-    try handle.db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
-    handle.db.setResolutionEmbedder(fake_embedder);
+    try handle.db.enrichment.reconfigureRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
+    handle.db.enrichment.setResolutionEmbedder(fake_embedder);
     try handle.db.batch(.{ .writes = &.{.{ .key = "claim:seed", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Approval reviewer\"}]}}" }} });
     try runUntilIdle(handle);
     var promoted = (try entities.lookup(a, "concept/approval_reviewer", .{})).?;
@@ -1119,8 +1119,8 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     defer api.antfly_db_close(second_id);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(second_id, .fromSlice(config)));
     const second = try tables.get(handle, "second_source");
-    try second.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
-    second.setResolutionEmbedder(fake_embedder);
+    try second.enrichment.reconfigureRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
+    second.enrichment.setResolutionEmbedder(fake_embedder);
     try second.batch(.{ .writes = &.{.{ .key = "claim:other_table", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Laya reviewer\"}]}}" }} });
     try runUntilIdle(handle);
     try std.testing.expectEqual(before_duplicate, embed_context.mention_calls);
@@ -1194,7 +1194,7 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     try std.testing.expect(embed_context.mention_calls >= 3);
     try std.testing.expect(embed_context.entity_calls >= 1);
     // No vector on the alias row: ANN cannot return it as a candidate.
-    try handle.db.entity_sink.?.upsert(a, "entities", "concept/the_decider", "{\"entity_type\":\"concept\",\"canonical_name\":\"The decider\",\"merged_into\":\"concept/approval_reviewer\"}");
+    try handle.db.enrichment.promotion.entity_sink.?.upsert(a, "entities", "concept/the_decider", "{\"entity_type\":\"concept\",\"canonical_name\":\"The decider\",\"merged_into\":\"concept/approval_reviewer\"}");
     try handle.db.batch(.{ .writes = &.{.{ .key = "claim:alias", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"The decider\"}]}}" }} });
     try runUntilIdle(handle);
     const alias_edges = try graph.getEdges(a, "claim:alias", "mentions", .out);
@@ -1254,7 +1254,7 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     // import -> close -> reopen before the next real scorer change.
     try runUntilIdle(handle);
     {
-        const runtime = handle.db.resolution_runtime.?;
+        const runtime = handle.db.enrichment.resolution.runtime.?;
         try std.testing.expect(runtime.catch_up_mutex.tryLock());
         defer runtime.catch_up_mutex.unlock();
         var deleted: bool = true;
@@ -1287,11 +1287,11 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     defer a.free(reopened_cache);
     try std.testing.expectEqualStrings(cached, reopened_cache);
     const reopened_entities = try tables.get(reopened, "entities");
-    try reopened_entities.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
-    try reopened.db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
-    reopened.db.setResolutionEmbedder(fake_embedder);
+    try reopened_entities.enrichment.reconfigureRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
+    try reopened.db.enrichment.reconfigureRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
+    reopened.db.enrichment.setResolutionEmbedder(fake_embedder);
     // Explicitly install the same provider on the destination used by mentions.
-    reopened_entities.setResolutionEmbedder(fake_embedder);
+    reopened_entities.enrichment.setResolutionEmbedder(fake_embedder);
     const before_reopen_replay = embed_context.mention_calls;
     try updated.value.object.put(a, "name", .{ .string = "knowledge_restored" });
     const restored_scorer = try std.mem.replaceOwned(u8, a, scorer, "0.8", "0.7");
@@ -1560,10 +1560,10 @@ test "capi resolver REVIEW adjudication publishes promotes queries and reopens d
     defer if (opened) h.closeHandle(handle);
     try tables.create(handle, "entities", "{}", false);
     const entities = try tables.get(handle, "entities");
-    try entities.addEnrichment(.{ .name = "description_text", .kind = .asset, .field = "description", .content_type = "text/plain" });
-    try entities.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true });
+    try entities.enrichment.addEnrichment(.{ .name = "description_text", .kind = .asset, .field = "description", .content_type = "text/plain" });
+    try entities.enrichment.reconfigureRuntime(.{ .enable_without_producers = true });
     try entities.batch(.{ .writes = &.{.{ .key = "concept/antfly", .value = "{\"entity_type\":\"concept\",\"canonical_name\":\"Antfly\",\"description\":\"A database\"}" }} });
-    try handle.db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = Fixture.memory } } });
+    try handle.db.enrichment.reconfigureRuntime(.{ .enable_without_producers = true, .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = Fixture.memory } } });
     const policy =
         \\{"decider":{"provider":"antfly","model":"fixture"},"template":"A: {{m.text}} {{m.description}} B: {{c.canonical_name}} {{c.description}}","question":{"type":"choice","name":"same","instructions":"Do these refer to the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"description_inputs":{"candidate_artifact":"description_text"}}
     ;
@@ -1576,7 +1576,7 @@ test "capi resolver REVIEW adjudication publishes promotes queries and reopens d
     const config = try h.db_mod.ResolverConfig.parseValue(a, parsed.value);
     defer config.deinit();
     try handle.db.addResolver(config.value);
-    try handle.db.addEnrichment(.{ .name = "kg", .kind = .asset, .field = "kg", .content_type = "application/json" });
+    try handle.db.enrichment.addEnrichment(.{ .name = "kg", .kind = .asset, .field = "kg", .content_type = "application/json" });
     try handle.db.batch(.{ .writes = &.{.{ .key = "source", .value = "{\"kg\":{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\",\"description\":\"An indexed database\"}]}}" }} });
     try runUntilIdle(handle);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
@@ -1757,7 +1757,7 @@ test "capi resolver config merge config advances revisions and protects key name
             }
             var cfg = configs[0];
             cfg.config_generation = generation;
-            _ = try guard.handle.database().upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false });
+            _ = try guard.handle.database().enrichment.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false });
         }
         fn storedRevision(handle_id: ?*anyopaque, revision: u64) !void {
             try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle_id));
@@ -1789,13 +1789,13 @@ test "capi resolver config merge config advances revisions and protects key name
         }
         var metadata_only = configs[0];
         metadata_only.merge_generation += 100;
-        try std.testing.expectEqual(@import("../storage/db/catalog/index_manager.zig").IndexManager.ResolverUpsertResult.updated_no_backfill, try guard.handle.database().upsertResolverWithResultOptions(metadata_only, .{ .drain_backfill = false }));
+        try std.testing.expectEqual(@import("../storage/db/catalog/index_manager.zig").IndexManager.ResolverUpsertResult.updated_no_backfill, try guard.handle.database().enrichment.upsertResolverWithResultOptions(metadata_only, .{ .drain_backfill = false }));
         var changed = configs[0];
         changed.table = "other";
-        try std.testing.expectError(error.ResolverMergeNamespaceChange, guard.handle.database().upsertResolverWithResultOptions(changed, .{ .drain_backfill = false }));
+        try std.testing.expectError(error.ResolverMergeNamespaceChange, guard.handle.database().enrichment.upsertResolverWithResultOptions(changed, .{ .drain_backfill = false }));
         changed = configs[0];
         changed.key_template = "other/{{ uslug _entity.text }}";
-        try std.testing.expectError(error.ResolverMergeNamespaceChange, guard.handle.database().upsertResolverWithResultOptions(changed, .{ .drain_backfill = false }));
+        try std.testing.expectError(error.ResolverMergeNamespaceChange, guard.handle.database().enrichment.upsertResolverWithResultOptions(changed, .{ .drain_backfill = false }));
     }
     api.antfly_buffer_free(&out);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice("{\"extraction\":{\"entities\":[{\"id\":\"q\",\"label\":\"concept\",\"text\":\"Qwen3\"}]}}"), &out));
@@ -2068,7 +2068,7 @@ test "capi inline resolver ownership migrates legacy declarations and preserves 
         } else {
             var legacy = configs[0];
             legacy.inline_managed = null;
-            try handle.db.restoreResolverIdentityWithoutDrain("concepts", legacy);
+            try handle.db.enrichment.restoreResolverIdentityWithoutDrain("concepts", legacy);
         }
         // Replaying the existing index claims a pre-ownership inline resolver,
         // while an independently registered definition remains independent.
@@ -2231,8 +2231,8 @@ test "capi resolver failed replacement permits portable backup and cancellation"
     try handle.db.batch(.{ .writes = rows.items });
     try runUntilIdle(handle);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(replacement)));
-    _ = try handle.db.advanceGraphReplacement();
-    const jobs = try handle.db.graphReplacementStatusAlloc(a);
+    _ = try handle.db.indexes.graph.advanceReplacement();
+    const jobs = try handle.db.indexes.graph.replacementStatusAlloc(a);
     defer jobs.deinit();
     try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
     var job = jobs.value[0];
@@ -2267,8 +2267,8 @@ test "capi resolver curation repoints restores suppresses and reopens promotion 
     try tables.create(handle, "entities", "{}", false);
     const seeded_entities = try tables.get(handle, "entities");
     try seeded_entities.batch(.{ .writes = &.{ .{ .key = "concept/beta", .value = "{\"canonical_name\":\"Beta\",\"entity_type\":\"concept\",\"aliases\":[\"Beta\"]}" }, .{ .key = "concept/gamma", .value = "{\"canonical_name\":\"Gamma\",\"entity_type\":\"concept\",\"aliases\":[\"Gamma\"]}" } } });
-    try handle.db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true });
-    try handle.db.addEnrichment(.{ .name = "kg", .kind = .asset, .field = "kg", .content_type = "application/json" });
+    try handle.db.enrichment.reconfigureRuntime(.{ .enable_without_producers = true });
+    try handle.db.enrichment.addEnrichment(.{ .name = "kg", .kind = .asset, .field = "kg", .content_type = "application/json" });
     try handle.db.addResolver(.{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}" });
     try handle.db.batch(.{ .writes = &.{.{ .key = "source", .value = "{\"kg\":{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Alpha\"}]}}" }} });
     try runUntilIdle(handle);
@@ -2771,7 +2771,7 @@ test "capi resolver curation fair coalesced projection work survives a continuou
     try std.testing.expectEqual(revision, reopened.db.core.index_manager.getResolver("r-0").?.namespace_curation_generation);
     for (try reopened.db.core.index_manager.listResolverIdentities(scratch)) |cfg| try std.testing.expect(cfg.namespace_curation_generation > 0);
     // A static config edit folds deltas without discarding native ownership.
-    _ = try reopened.db.upsertResolverWithResultOptions(.{ .name = "r-0", .table = "entities", .source_artifact = "r-0", .resolution_artifact = "resolved-0", .key_template = "p-0/{{_key}}", .promote = false, .min_confidence = 0.5 }, .{ .drain_backfill = false, .wait_for_activity = true });
+    _ = try reopened.db.enrichment.upsertResolverWithResultOptions(.{ .name = "r-0", .table = "entities", .source_artifact = "r-0", .resolution_artifact = "resolved-0", .key_template = "p-0/{{_key}}", .promote = false, .min_confidence = 0.5 }, .{ .drain_backfill = false, .wait_for_activity = true });
     const configured = reopened.db.core.index_manager.getResolver("r-0").?;
     try std.testing.expectEqual(revision, configured.namespace_curation_generation);
     try std.testing.expect(configured.namespace_curation_table_id != 0);
@@ -2800,7 +2800,7 @@ test "capi resolver curation shared remote policies acquire persistent ownership
         var profiles: std.StringHashMapUnmanaged(void) = .empty;
         for ([_][]const u8{ "first", "second" }) |name| {
             const cfg = try curation.overlayMetadataCached(scratch, .{ .name = name, .table = "default", .source_artifact = name, .resolution_artifact = try std.fmt.allocPrint(scratch, "{s}-resolved", .{name}), .key_template = "{{_key}}", .promote = false }, .{ .name = name, .table = "default", .key_template = "{{_key}}", .revision = 1, .merges = incoming.merges, .state_json = incoming.curation_json, .shared_projection = incoming, .policy_validated = true, .projection_ref = &incoming.digest, .namespace_owned = true, .authority_table_id = 7 }, &profiles);
-            _ = try root.db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
+            _ = try root.db.enrichment.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
         }
         const first = root.db.core.index_manager.getResolver("first").?;
         const second = root.db.core.index_manager.getResolver("second").?;

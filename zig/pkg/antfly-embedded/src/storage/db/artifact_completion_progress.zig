@@ -958,8 +958,8 @@ test "ordered artifact inventory completion control verifies independent roots b
     defer if (queue.bytes) |bytes| alloc.free(bytes);
     source.local_execution.artifact_publication_dispatcher = .{ .ptr = &queue, .enqueue = Queue.enqueue };
     defer source.local_execution.artifact_publication_dispatcher = null;
-    source.artifact_producer_scheduler.retry_after_ns.store(0, .release);
-    _ = try source.advanceArtifactProducerWorkPage();
+    source.enrichment.artifacts.producer_scheduler.retry_after_ns.store(0, .release);
+    _ = try source.enrichment.advanceArtifactProducerWorkPage();
     var decoded = try @import("artifact_publication_transport_codec.zig").decodeBorrowed(alloc, queue.bytes orelse return error.TestUnexpectedResult);
     defer decoded.deinit();
     try std.testing.expectEqual(.complete_streams, decoded.command.mode);
@@ -979,7 +979,7 @@ test "ordered artifact inventory completion leaves extraction-owned scope pendin
     var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 4 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .producer_json = "{\"type\":\"document_extraction\"}" });
+    try db.enrichment.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .producer_json = "{\"type\":\"document_extraction\"}" });
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
     catalog.binding.effect_protocol = 15;

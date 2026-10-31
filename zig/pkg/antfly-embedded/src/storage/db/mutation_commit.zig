@@ -210,9 +210,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .artifact_cleanup_maybe = resources.artifact_cleanup_maybe,
                 .executor = S.ownerField(self, "executor").*,
                 .io = S.ownerField(self, "backend_runtime").*.io(),
-                .enrichment_runtime = S.ownerField(self, "enrichment_runtime").*,
-                .resolution_runtime = S.ownerField(self, "resolution_runtime").*,
-                .promotion_runtime = S.ownerField(self, "promotion_runtime").*,
+                .enrichment_runtime = S.ownerField(self, "enrichment").runtime,
+                .resolution_runtime = S.ownerField(self, "enrichment").resolution.runtime,
+                .promotion_runtime = S.ownerField(self, "enrichment").promotion.runtime,
                 .async_context = S.ownerField(self, "async_context").*,
                 .relational_base_rows = relationalColumns(self) != null,
                 .table_catalog = &S.ownerField(self, "core").*.table_catalog,
@@ -1748,13 +1748,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 active_profile.identity_delete_keys += @intCast(effective_req.deletes.len);
             }
             const identity_capacity_start_ns = monotonicTimeNs();
-            if (!S.ownerField(self, "bulk_identity").*.enabled or effective_req.deletes.len != 0) {
+            if (!S.ownerField(self, "documents").bulk_ingest.identity.enabled or effective_req.deletes.len != 0) {
                 try self.failIfIdentityOrdinalExhaustedForNewUpserts(write_buffers.identity_upsert_keys.items);
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.identity_capacity_check_ns, identity_capacity_start_ns);
 
             var assume_all_new_identity_upserts = false;
-            if (S.ownerField(self, "bulk_identity").*.enabled and effective_req.deletes.len == 0 and write_buffers.identity_upsert_keys.items.len > 0) {
+            if (S.ownerField(self, "documents").bulk_ingest.identity.enabled and effective_req.deletes.len == 0 and write_buffers.identity_upsert_keys.items.len > 0) {
                 assume_all_new_identity_upserts = try self.rememberBulkIngestAllNewIdentityUpserts(write_buffers.identity_upsert_keys.items);
                 if (!assume_all_new_identity_upserts) self.clearBulkIngestIdentityAllNewLocked();
             }
@@ -2435,7 +2435,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (effective_req.deletes.len != 0) {
                 self.clearBulkIngestIdentityAllNewLocked();
             }
-            if (S.ownerField(self, "bulk_identity").*.enabled and
+            if (S.ownerField(self, "documents").bulk_ingest.identity.enabled and
                 effective_req.deletes.len == 0 and
                 write_buffers.identity_upsert_keys.items.len > 0 and
                 (assume_all_new_identity_upserts or identityUpsertStoreWritesAreNew(write_buffers.identity_upsert_write_indexes.items, overwritten_flags)))
@@ -2447,7 +2447,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     &write_buffers.identity_writes,
                     &write_buffers.identity_visibility_deletes,
                     write_buffers.identity_upsert_keys.items,
-                    &S.ownerField(self, "bulk_identity").*.trusted,
+                    &S.ownerField(self, "documents").bulk_ingest.identity.trusted,
                 );
                 if (!used_trusted_identity_path) self.clearBulkIngestIdentityAllNewLocked();
             }
@@ -3252,7 +3252,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.wait_sync_ns, wait_sync_start_ns);
             if (append_derived_replay) {
-                if (S.ownerField(self, "enrichment_runtime").*) |runtime| {
+                if (S.ownerField(self, "enrichment").runtime) |runtime| {
                     const notify_enrichment_start_ns = monotonicTimeNs();
                     runtime.notifySequence(sequence);
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.notify_enrichment_ns, notify_enrichment_start_ns);
@@ -3290,19 +3290,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
                 // Completion errors happen after commit. Keep this outside the
                 // preparation retry handler so they cannot replay the user batch.
-                try self.finishBatchGraphEndpointCleanup(req, opts);
+                try self.indexes.graph.finishBatchEndpointCleanup(req, opts);
                 return;
             }
         }
 
         pub fn clearActiveIndexRepairsLocked(self: anytype) void {
-            var it = S.ownerField(self, "active_index_repairs").*.keyIterator();
+            var it = S.ownerField(self, "indexes").repair.active.keyIterator();
             while (it.next()) |key_ptr| S.ownerField(self, "alloc").*.free(@constCast(key_ptr.*));
-            S.ownerField(self, "active_index_repairs").*.clearRetainingCapacity();
+            S.ownerField(self, "indexes").repair.active.clearRetainingCapacity();
         }
 
         pub fn clearBulkIngestIdentityAllNewLocked(self: anytype) void {
-            S.ownerField(self, "bulk_identity").*.reset(S.ownerField(self, "alloc").*);
+            S.ownerField(self, "documents").bulk_ingest.identity.reset(S.ownerField(self, "alloc").*);
         }
 
         pub fn clearDurableReplicationOutbox(self: anytype, key: []const u8) !void {
@@ -3700,7 +3700,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn markPrecomputedEnrichmentAppliedForSync(self: anytype, sync_level: types.SyncLevel, sequence: u64) !void {
             if (sync_level != .enrichments or sequence == 0) return;
-            const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
+            const runtime = S.ownerField(self, "enrichment").runtime orelse return;
             const runtime_stats = runtime.stats();
             // A contiguous sequence may still retain a producer that requires
             // committed graph state. Only the replay lane proves no work remains.
@@ -3770,8 +3770,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn notifyResolverReplayRuntimesForced(self: anytype, sequence: u64) void {
-            if (S.ownerField(self, "resolution_runtime").*) |runtime| runtime.notifySequence(sequence);
-            if (S.ownerField(self, "promotion_runtime").*) |runtime| runtime.notifySequence(sequence);
+            if (S.ownerField(self, "enrichment").resolution.runtime) |runtime| runtime.notifySequence(sequence);
+            if (S.ownerField(self, "enrichment").promotion.runtime) |runtime| runtime.notifySequence(sequence);
         }
 
         pub fn pendingRowPolicyReceipt(self: anytype) !?row_policy_bundle_mod.Receipt {
@@ -3790,7 +3790,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn rememberBulkIngestAllNewIdentityUpserts(self: anytype, doc_ids: []const []const u8) !bool {
-            return S.ownerField(self, "bulk_identity").*.remember(S.ownerField(self, "alloc").*, doc_ids);
+            return S.ownerField(self, "documents").bulk_ingest.identity.remember(S.ownerField(self, "alloc").*, doc_ids);
         }
 
         pub fn replicationMutationBarrier(self: anytype) ?*MutationBarrier {
@@ -4246,8 +4246,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Recovery and the serving wrapper share the same ticket/mutex owner.
             // The context is updated under the primary apply fence during split setup
             // and teardown; a copied wrapper must not capture stale split ownership.
-            if (S.ownerField(self, "transaction_recovery_local_context").*) |ctx| return ctx.split_shadow;
-            return S.ownerField(self, "shadow").*;
+            if (S.ownerField(self, "recovery").transactions.local_context) |ctx| return ctx.split_shadow;
+            return S.ownerField(self, "indexes").split_shadow;
         }
 
         pub fn appendNeighborContextHintsToRecord(ctx: *const BatchExecutionContext, record: *change_journal_mod.Record, keys_to_add: []const []const u8) !void {

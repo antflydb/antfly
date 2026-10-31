@@ -125,8 +125,8 @@ test "resolver curation ordered publication wakes detached replay after its dura
     try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write }, .{ .term = 1, .index = 1 }, false);
     const source_key = try keys.artifactNamedPrefixAlloc(scratch, "doc", "asset", "kg");
     try db.core.store.put(source_key, "{}");
-    if (db.resolution_runtime == null) try db.initResolutionRuntime();
-    if (db.promotion_runtime == null) try db.initPromotionRuntime();
+    if (db.enrichment.resolution.runtime == null) try db.enrichment.initResolutionRuntime();
+    if (db.enrichment.promotion.runtime == null) try db.enrichment.initPromotionRuntime();
     var catalog = try db.artifactInventoryCommand(scratch);
     catalog.binding.effect_protocol = 15;
     {
@@ -153,8 +153,8 @@ test "resolver curation ordered publication wakes detached replay after its dura
     const receipt = (try publication.readReceipt(&read, command, source)).?;
     try std.testing.expect(receipt.sequence > before);
     try std.testing.expectEqualStrings(command.mutations[0].value.?, try read.get(output_key));
-    try std.testing.expectEqual(receipt.sequence, db.resolution_runtime.?.stats().target_sequence);
-    try std.testing.expectEqual(receipt.sequence, db.promotion_runtime.?.stats().target_sequence);
+    try std.testing.expectEqual(receipt.sequence, db.enrichment.resolution.runtime.?.stats().target_sequence);
+    try std.testing.expectEqual(receipt.sequence, db.enrichment.promotion.runtime.?.stats().target_sequence);
 }
 
 test "resolver curation catalog protocol follows producer definitions and retains extensions" {

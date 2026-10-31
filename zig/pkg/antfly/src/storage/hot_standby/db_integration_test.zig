@@ -192,7 +192,7 @@ test "storage.hot_standby resolution handoff fence rejects completion after dura
     defer alloc.free(marker_key);
     var pause = PauseBeforePublish{ .io = std.testing.io };
     var probe = WriteProbe{
-        .ctx = db.resolution_append_context.?,
+        .ctx = db.enrichment.resolution.append_context.?,
         .resolution_key = resolution_key,
         .pause = &pause,
     };
@@ -294,11 +294,11 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
         };
         var old_reader = try db.local_execution.row_policy_gate.enterRaw();
         const delayed_scan = try db.openRelationalReadSession(alloc, "", "", .{ .relational_query = .{ .fields = &.{"id"} } });
-        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(bundle_bytes, request, .{ .term = 3, .index = 11 })) == null);
+        try std.testing.expect((try db.query.applyReplicatedRowPolicyPublication(bundle_bytes, request, .{ .term = 3, .index = 11 })) == null);
         try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, db.core.table_catalog.row_policy_phase);
         try std.testing.expectError(error.RowPolicyAuthenticationRequired, db.local_execution.row_policy_gate.enterRaw());
         try std.testing.expectError(error.RowPolicyCatalogChanged, delayed_scan.nextTypedPage(alloc, null, .{}));
-        try std.testing.expectError(error.RowPolicyReadersActive, db.loadRowPolicyReceipt(1, .pending_install));
+        try std.testing.expectError(error.RowPolicyReadersActive, db.query.loadRowPolicyReceipt(1, .pending_install));
         delayed_scan.deinit();
         old_reader.release();
         // The applied marker is already durable; reopening must retain the
@@ -310,19 +310,19 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
         defer db.close();
         try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, db.local_execution.row_policy_gate.currentPhase());
         try std.testing.expectError(error.RowPolicyAuthenticationRequired, db.local_execution.row_policy_gate.enterRaw());
-        const receipt = try db.loadRowPolicyReceipt(1, .pending_install);
+        const receipt = try db.query.loadRowPolicyReceipt(1, .pending_install);
         try std.testing.expectEqual(@as(u64, 3), receipt.applied_term);
         try std.testing.expectEqual(@as(u64, 11), receipt.applied_index);
-        try std.testing.expectEqualDeep(receipt, (try db.applyReplicatedRowPolicyPublication(bundle_bytes, request, .{ .term = 3, .index = 11 })).?);
+        try std.testing.expectEqualDeep(receipt, (try db.query.applyReplicatedRowPolicyPublication(bundle_bytes, request, .{ .term = 3, .index = 11 })).?);
         var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_policies.InstallSnapshot, alloc, bundle_bytes, .{});
         defer parsed.deinit();
         parsed.value.phase = .serving_install;
         const serving_bytes = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
         defer alloc.free(serving_bytes);
         request.expected_phase = .serving_install;
-        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(serving_bytes, request, .{ .term = 3, .index = 12 })) == null);
+        try std.testing.expect((try db.query.applyReplicatedRowPolicyPublication(serving_bytes, request, .{ .term = 3, .index = 12 })) == null);
         try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, db.local_execution.row_policy_gate.currentPhase());
-        const serving_receipt = try db.loadRowPolicyReceipt(1, .serving_install);
+        const serving_receipt = try db.query.loadRowPolicyReceipt(1, .serving_install);
         try std.testing.expectEqual(@as(u64, 12), serving_receipt.applied_index);
         try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, db.local_execution.row_policy_gate.currentPhase());
         try std.testing.expectError(error.NotFound, db.core.store.get(alloc, row_policy_bundle_mod.pending_key));
@@ -365,7 +365,7 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
     var pending_request = request;
     pending_request.expected_phase = .pending_install;
     var follower_reader = try follower.local_execution.row_policy_gate.enterRaw();
-    try std.testing.expect((try follower.applyReplicatedRowPolicyPublication(bundle_bytes, pending_request, .{ .term = 3, .index = 11 })) == null);
+    try std.testing.expect((try follower.query.applyReplicatedRowPolicyPublication(bundle_bytes, pending_request, .{ .term = 3, .index = 11 })) == null);
     try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, follower.local_execution.row_policy_gate.currentPhase());
     var follower_bundle = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_policies.InstallSnapshot, alloc, bundle_bytes, .{});
     defer follower_bundle.deinit();
@@ -373,14 +373,14 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
     const follower_serving_bytes = try std.json.Stringify.valueAlloc(alloc, follower_bundle.value, .{});
     defer alloc.free(follower_serving_bytes);
     pending_request.expected_phase = .serving_install;
-    try std.testing.expect((try follower.applyReplicatedRowPolicyPublication(follower_serving_bytes, pending_request, .{ .term = 3, .index = 12 })) == null);
+    try std.testing.expect((try follower.query.applyReplicatedRowPolicyPublication(follower_serving_bytes, pending_request, .{ .term = 3, .index = 12 })) == null);
     // No receipt probe ran for pending_install on this follower. Catch-up
     // must advance the committed fail-closed intent rather than stall Raft.
-    try std.testing.expectError(error.NotFound, follower.loadRowPolicyReceipt(1, .pending_install));
+    try std.testing.expectError(error.NotFound, follower.query.loadRowPolicyReceipt(1, .pending_install));
     try std.testing.expectError(error.RowPolicyAuthenticationRequired, follower.get(alloc, "row:unseen"));
-    try std.testing.expectError(error.RowPolicyReadersActive, follower.loadRowPolicyReceipt(1, .serving_install));
+    try std.testing.expectError(error.RowPolicyReadersActive, follower.query.loadRowPolicyReceipt(1, .serving_install));
     follower_reader.release();
-    const follower_receipt = try follower.loadRowPolicyReceipt(1, .serving_install);
+    const follower_receipt = try follower.query.loadRowPolicyReceipt(1, .serving_install);
     try std.testing.expectEqual(@as(u64, 12), follower_receipt.applied_index);
     try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, follower.local_execution.row_policy_gate.currentPhase());
 
@@ -398,7 +398,7 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
     {
         var db = try DB.open(alloc, path, options);
         defer db.close();
-        const candidate_receipt = (try db.applyReplicatedRowPolicyPublication(candidate_bytes, candidate_request, .{ .term = 3, .index = 13 })).?;
+        const candidate_receipt = (try db.query.applyReplicatedRowPolicyPublication(candidate_bytes, candidate_request, .{ .term = 3, .index = 13 })).?;
         try std.testing.expectEqual(@as(u64, 13), candidate_receipt.applied_index);
         try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, db.local_execution.row_policy_gate.currentPhase());
         try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_policy_generation);
@@ -428,18 +428,18 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
         const serving_bytes = try std.json.Stringify.valueAlloc(alloc, next_bundle.value, .{});
         defer alloc.free(serving_bytes);
         candidate_request.expected_phase = .serving_disable;
-        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(serving_bytes, candidate_request, .{ .term = 3, .index = 14 })) == null);
+        try std.testing.expect((try db.query.applyReplicatedRowPolicyPublication(serving_bytes, candidate_request, .{ .term = 3, .index = 14 })) == null);
         try std.testing.expectError(error.RowPolicyCatalogChanged, old_reader.checkAt(100));
-        try std.testing.expectError(error.RowPolicyReadersActive, db.loadRowPolicyReceipt(2, .serving_disable));
+        try std.testing.expectError(error.RowPolicyReadersActive, db.query.loadRowPolicyReceipt(2, .serving_disable));
         old_reader.release();
-        _ = try db.loadRowPolicyReceipt(2, .serving_disable);
+        _ = try db.query.loadRowPolicyReceipt(2, .serving_disable);
         try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, db.local_execution.row_policy_gate.currentPhase());
         next_bundle.value.phase = .disabled;
         const disabled_bytes = try std.json.Stringify.valueAlloc(alloc, next_bundle.value, .{});
         defer alloc.free(disabled_bytes);
         candidate_request.expected_phase = .disabled;
-        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(disabled_bytes, candidate_request, .{ .term = 3, .index = 15 })) == null);
-        _ = try db.loadRowPolicyReceipt(2, .disabled);
+        try std.testing.expect((try db.query.applyReplicatedRowPolicyPublication(disabled_bytes, candidate_request, .{ .term = 3, .index = 15 })) == null);
+        _ = try db.query.loadRowPolicyReceipt(2, .disabled);
         try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.disabled, db.local_execution.row_policy_gate.currentPhase());
         var raw = try db.local_execution.row_policy_gate.enterRawRead();
         raw.release();
@@ -502,7 +502,7 @@ test "storage.hot_standby graph retirement seal replays exact Raft receipt and r
     try std.testing.expectError(error.IntegrityTopologyBusy, db.batch(.{
         .graph_writes = &.{.{ .index_name = "links", .source = "a", .target = "b", .edge_type = "related", .weight = 1.0 }},
     }));
-    try std.testing.expectError(error.IntegrityTopologyBusy, db.runGraphMetricMaintenanceForIdle());
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.indexes.graph.runMetricMaintenanceForIdle());
     // The begin intent alone must rehydrate the closed gate before optional
     // graph runtimes start. No seal receipt exists yet, so restart cannot
     // accidentally treat the owner as either unguarded or completed.
@@ -2652,7 +2652,7 @@ test "storage.hot_standby row policy metadata publication replays with its exact
             .range_end = range.end,
         }).digest(),
     };
-    try std.testing.expect((try owner.applyReplicatedRowPolicyPublication(bundle, request, .{ .term = 3, .index = 11 })) == null);
+    try std.testing.expect((try owner.query.applyReplicatedRowPolicyPublication(bundle, request, .{ .term = 3, .index = 11 })) == null);
     try std.testing.expectEqual(@as(u64, 3), primary.lastLsn());
     var policy_entry = (try primary.log.entryAt(alloc, 3)) orelse return error.TestExpectedEqual;
     defer policy_entry.deinit(alloc);
@@ -2662,7 +2662,7 @@ test "storage.hot_standby row policy metadata publication replays with its exact
     try std.testing.expectEqual(@as(u64, 3), try replica.replicationAppliedSequence());
     try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, replica.local_execution.row_policy_gate.currentPhase());
     try std.testing.expectError(error.RowPolicyAuthenticationRequired, replica.get(alloc, "unseen"));
-    const receipt = try replica.loadRowPolicyReceipt(1, .pending_install);
+    const receipt = try replica.query.loadRowPolicyReceipt(1, .pending_install);
     try std.testing.expectEqual(@as(u64, 11), receipt.applied_index);
     try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, replica.local_execution.row_policy_gate.currentPhase());
 
@@ -2672,13 +2672,13 @@ test "storage.hot_standby row policy metadata publication replays with its exact
     const serving_bundle = try std.json.Stringify.valueAlloc(alloc, serving.value, .{});
     defer alloc.free(serving_bundle);
     request.expected_phase = .serving_install;
-    try std.testing.expect((try owner.applyReplicatedRowPolicyPublication(serving_bundle, request, .{ .term = 3, .index = 12 })) == null);
-    _ = try owner.loadRowPolicyReceipt(1, .serving_install);
+    try std.testing.expect((try owner.query.applyReplicatedRowPolicyPublication(serving_bundle, request, .{ .term = 3, .index = 12 })) == null);
+    _ = try owner.query.loadRowPolicyReceipt(1, .serving_install);
     try std.testing.expectEqual(@as(u64, 4), primary.lastLsn());
     var serving_entry = (try primary.log.entryAt(alloc, 4)) orelse return error.TestExpectedEqual;
     defer serving_entry.deinit(alloc);
     try replication_ingress.applyRecord(&replica, serving_entry.record);
-    _ = try replica.loadRowPolicyReceipt(1, .serving_install);
+    _ = try replica.query.loadRowPolicyReceipt(1, .serving_install);
     try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, replica.local_execution.row_policy_gate.currentPhase());
     try std.testing.expectEqual(@as(u64, 4), try replica.replicationAppliedSequence());
 
@@ -2908,19 +2908,19 @@ test "storage.hot_standby db write gate rejects client writes on standby but all
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"client\"}" }},
     }));
     try std.testing.expectError(error.HAReadOnlyStandby, db.beginBulkIngestSession());
-    try std.testing.expectError(error.HAReadOnlyStandby, db.beginDenseAutoBulkIngestSession());
-    try std.testing.expectError(error.HAReadOnlyStandby, db.beginPrimaryStoreAutoBulkIngestSession());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.documents.beginDenseAutoBulkIngest());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.documents.beginPrimaryStoreAutoBulkIngest());
     try std.testing.expectError(
         error.HAReadOnlyStandby,
         db.finishBulkIngestSessionWithOptions(.{}),
     );
     try std.testing.expectError(
         error.HAReadOnlyStandby,
-        db.finishDenseAutoBulkIngestSessionWithOptions(.{}),
+        db.documents.finishDenseAutoBulkIngest(.{}),
     );
     try std.testing.expectError(
         error.HAReadOnlyStandby,
-        db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{}),
+        db.documents.finishPrimaryStoreAutoBulkIngest(.{}),
     );
     try std.testing.expectError(
         error.HAReadOnlyStandby,
@@ -3044,13 +3044,13 @@ test "storage.hot_standby db standby role suppresses mutating background runtime
 
     try std.testing.expect(!db.start_index_workers);
     try std.testing.expect(!db.executor.hasWorkers());
-    try std.testing.expect(db.enrichment_runtime == null);
-    try std.testing.expect(db.resolution_runtime == null);
-    try std.testing.expect(db.promotion_runtime == null);
-    try std.testing.expect(db.ttl_runtime == null);
-    try std.testing.expect(db.transaction_runtime == null);
-    try std.testing.expect(db.text_merge_runtime == null);
-    try std.testing.expect(db.sparse_compaction_runtime == null);
+    try std.testing.expect(db.enrichment.runtime == null);
+    try std.testing.expect(db.enrichment.resolution.runtime == null);
+    try std.testing.expect(db.enrichment.promotion.runtime == null);
+    try std.testing.expect(db.ttl.runtime == null);
+    try std.testing.expect(db.recovery.transactions.runtime == null);
+    try std.testing.expect(db.indexes.text.merge_runtime == null);
+    try std.testing.expect(db.indexes.sparse.compaction_runtime == null);
 }
 
 test "db graph ttl HA carries primary effects and duplicate receipt across reopen" {
@@ -3219,7 +3219,7 @@ test "db graph ttl HA replicates direct expiration and document relational withd
             try std.testing.expectError(error.OutOfMemory, expireDirectGraphTtlCandidateContext(&ttl, candidate));
             try std.testing.expectEqual(before_lsn, stream.lastLsn());
             try std.testing.expect(primary.async_context.primary_replication_append_pending.load(.acquire));
-            try std.testing.expectError(error.ReplicationPublisherUnavailable, primary.addEnrichment(.{ .name = "blocked", .kind = .asset, .field = "title", .content_type = "text/plain" }));
+            try std.testing.expectError(error.ReplicationPublisherUnavailable, primary.enrichment.addEnrichment(.{ .name = "blocked", .kind = .asset, .field = "title", .content_type = "text/plain" }));
             try std.testing.expectError(error.ReplicationPublisherUnavailable, appendDerivedBatchRecordContext(&ttl.batch, .{ .changed_artifact_keys = &.{candidate.artifact_key} }));
             stream.alloc = stream_alloc;
             try primary.batch(.{ .writes = &.{.{ .key = "doc:z", .value = "{\"title\":\"later\"}" }}, .sync_level = .full_index });
@@ -3394,12 +3394,12 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
             };
             if (follower.hasIndex("expected") and follower.core.index_manager.hasRepairUnavailableIndexes()) {
                 saw_pending_repair = true;
-                var repairs = try follower.loadIndexRepairState(alloc);
+                var repairs = try follower.indexes.repair.loadState(alloc);
                 defer repairs.deinit(alloc);
                 follower.local_execution.replication_write_gate = .{ .shared = .{ .state = standby_gate.storageWriteState() } };
                 defer follower.local_execution.replication_write_gate = null;
                 for (repairs.entries.items) |repair| if (repair.intent.phase != .terminal) {
-                    _ = try follower.advanceIndexRepairIntent(alloc, repair.intent.repair_id, .{});
+                    _ = try follower.indexes.repair.advanceIntent(alloc, repair.intent.repair_id, .{});
                 };
             }
             continue;
@@ -3470,8 +3470,8 @@ test "db graph ttl HA retirement preserves different replay progress" {
         var replica = try DB.open(alloc, replica_tmp.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
         defer replica.close();
         for ([_]*DB{ &primary, &replica }) |db| {
-            try db.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
-            try db.addEnrichment(.{ .name = "relations_v2", .kind = .asset, .field = "relations", .content_type = "application/json" });
+            try db.enrichment.addEnrichment(.{ .name = "relations_v1", .kind = .asset, .field = "relations", .content_type = "application/json" });
+            try db.enrichment.addEnrichment(.{ .name = "relations_v2", .kind = .asset, .field = "relations", .content_type = "application/json" });
             try db.addIndex(.{ .name = "g", .kind = .graph, .coverage_generation = 7, .config_json = "{\"ttl\":{\"duration\":\"1h\"},\"max_edges_per_document\":2,\"sources\":[{\"artifact\":\"relations_v1\"},{\"artifact\":\"relations_v2\"}]}" });
             try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }}, .sync_level = .full_index });
         }

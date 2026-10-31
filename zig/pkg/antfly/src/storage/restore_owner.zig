@@ -288,7 +288,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
             null;
         const resume_offset = if (before.value.rewrite) |progress| blk: {
             if (!progress.snapshot_complete or progress.final_cut != null) break :blk 0;
-            target.restore_decoder_cache.retire(env.io);
+            target.recovery.restore.decoder_cache.retire(env.io);
             var transition = try generation.beginProcessExclusiveWithRuntimeAndIo(env.cache_path, env.runtime, env.io);
             defer transition.deinit();
             break :blk try @import("antfly_local_sources").storage_rewrite_tail_spool.resumeOffset(alloc, env.io, env.cache_path, input.scope, progress.sequence);
@@ -312,11 +312,11 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         else => null,
     };
     if (desired) |phase| if (before.value.phase == phase) {
-        target.restore_decoder_cache.retire(env.io);
-        target.rewrite_program_cache.evict(env.io);
-        target.rewrite_tail_cache.mutex.lockUncancelable(env.io);
-        target.rewrite_tail_cache.clear();
-        target.rewrite_tail_cache.mutex.unlock(env.io);
+        target.recovery.restore.decoder_cache.retire(env.io);
+        target.indexes.relational.rewrite_program_cache.evict(env.io);
+        target.indexes.relational.rewrite_tail_cache.mutex.lockUncancelable(env.io);
+        target.indexes.relational.rewrite_tail_cache.clear();
+        target.indexes.relational.rewrite_tail_cache.mutex.unlock(env.io);
         if (phase == .published or phase == .canceled) try releaseSource(alloc, env, input.scope);
         return .{ .phase = phase, .rows = before.value.rows, .receipt = before.value.receipt() };
     };
@@ -330,7 +330,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     if (input.action == .import_page and input.source != null and
         before.value.rewrite != null and before.value.rewrite.?.snapshot_complete)
     {
-        target.restore_decoder_cache.retire(env.io);
+        target.recovery.restore.decoder_cache.retire(env.io);
         return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite };
     }
     if (input.action == .begin and before.value.phase != .reserved) {
@@ -352,22 +352,22 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                 break :import;
             }
             if (input.rewrite_finish) |receipt| {
-                target.restore_decoder_cache.retire(env.io);
+                target.recovery.restore.decoder_cache.retire(env.io);
                 try receipt.validate(input.scope.rewrite.?);
                 var page = try @import("antfly_local_sources").storage_db_relational_rewrite_staging.prepareFinish(target, alloc, input.scope, receipt.cut);
                 defer page.deinit();
                 if (page.batch) |batch| try env.proposer.propose(env.proposer.ptr, batch, context);
-                target.rewrite_program_cache.evict(env.io);
+                target.indexes.relational.rewrite_program_cache.evict(env.io);
                 break :import;
             }
             // Compile once outside generation/frame locks; the lease protects
             // immutable programs across source certification and either page path.
-            var program_lease = if (input.rewrite) |intent| try target.rewrite_program_cache.acquire(env.io, target.alloc, target.core.index_manager.resource_manager, input.scope, intent, context) else null;
+            var program_lease = if (input.rewrite) |intent| try target.indexes.relational.rewrite_program_cache.acquire(env.io, target.alloc, target.core.index_manager.resource_manager, input.scope, intent, context) else null;
             defer if (program_lease) |*lease| lease.deinit();
             const program = if (program_lease) |lease| lease.program() else null;
             try context.ensureActive();
             if (input.rewrite_tail) |chunk| {
-                target.restore_decoder_cache.retire(env.io);
+                target.recovery.restore.decoder_cache.retire(env.io);
                 const progress = before.value.rewrite orelse return error.InvalidRestoreStagingCommand;
                 if (!progress.snapshot_complete or progress.final_cut != null) return error.RestoreStagingInProgress;
                 if (chunk.sequence <= progress.sequence) break :import;
@@ -375,7 +375,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                 // No target apply lock is held during bounded chunk fsync.
                 var transition = try generation.beginProcessExclusiveWithRuntimeAndIo(env.cache_path, env.runtime, env.io);
                 defer transition.deinit();
-                const cache = &target.rewrite_tail_cache;
+                const cache = &target.indexes.relational.rewrite_tail_cache;
                 try cache.mutex.lock(env.io);
                 defer cache.mutex.unlock(env.io);
                 const assembled = @import("antfly_local_sources").storage_rewrite_tail_spool.receive(alloc, env.io, env.cache_path, input.scope, progress.sequence, chunk, cache, target.alloc, target.core.index_manager.resource_manager) catch |err| {
@@ -418,7 +418,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                 }
                 break :import;
             }
-            const cache = &target.restore_decoder_cache;
+            const cache = &target.recovery.restore.decoder_cache;
             const cache_key: @import("antfly_local_sources").storage_restore_decoder_cache.Key = .{
                 .scope = input.scope.digest(),
                 .artifact = input.scope.source_artifact_digest,
@@ -493,11 +493,11 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     var after = (try target.restoreStagingStatus(alloc)) orelse return error.RestoreStagingScopeChanged;
     defer after.deinit();
     if (after.value.phase == .published or after.value.phase == .canceled) {
-        target.restore_decoder_cache.retire(env.io);
-        target.rewrite_program_cache.evict(env.io);
-        target.rewrite_tail_cache.mutex.lockUncancelable(env.io);
-        target.rewrite_tail_cache.clear();
-        target.rewrite_tail_cache.mutex.unlock(env.io);
+        target.recovery.restore.decoder_cache.retire(env.io);
+        target.indexes.relational.rewrite_program_cache.evict(env.io);
+        target.indexes.relational.rewrite_tail_cache.mutex.lockUncancelable(env.io);
+        target.indexes.relational.rewrite_tail_cache.clear();
+        target.indexes.relational.rewrite_tail_cache.mutex.unlock(env.io);
         try releaseSource(alloc, env, input.scope);
     }
     const admission_receipt = if (input.action == .install_generation_admissions) try target.restoreGenerationAdmissionReceipt() else null;
@@ -586,8 +586,8 @@ test "restore owner verified decoder rewrite history compiles once across produc
             if (self.index == self.evict_on_index) {
                 // The page must own all batch values and release its program
                 // lease before proposal. Evict before apply to prove both.
-                try std.testing.expectEqual(@as(usize, 1), self.target.rewrite_program_cache.entry.?.refs.load(.acquire));
-                self.target.rewrite_program_cache.evict(std.testing.io);
+                try std.testing.expectEqual(@as(usize, 1), self.target.indexes.relational.rewrite_program_cache.entry.?.refs.load(.acquire));
+                self.target.indexes.relational.rewrite_program_cache.evict(std.testing.io);
             }
             try @import("server_db_adapter.zig").applyOrdered(&self.target, batch, .{ .term = 1, .index = self.index });
             if (self.lose_reply) {
@@ -637,9 +637,9 @@ test "restore owner verified decoder rewrite history compiles once across produc
         chunk.data = frame.items[chunk.offset..@min(frame.items.len, chunk.offset + 64 * 1024)];
     }
     const elapsed = started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
-    try std.testing.expectEqual(@as(u64, 1), target.rewrite_program_cache.compilations);
-    try std.testing.expect(target.rewrite_program_cache.hits >= 31);
-    try std.testing.expect(target.rewrite_program_cache.entry == null);
+    try std.testing.expectEqual(@as(u64, 1), target.indexes.relational.rewrite_program_cache.compilations);
+    try std.testing.expect(target.indexes.relational.rewrite_program_cache.hits >= 31);
+    try std.testing.expect(target.indexes.relational.rewrite_program_cache.entry == null);
     var status = (try target.restoreStagingStatus(alloc)).?;
     defer status.deinit();
     try std.testing.expectEqual(@as(u64, rows.len), status.value.rows);
@@ -649,9 +649,9 @@ test "restore owner verified decoder rewrite history compiles once across produc
         control.deinit();
     }
     const control_ns = control_start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
-    std.debug.print("\nrewrite production handler: 64 historical schemas, 256 effects / 32 pages, {} compilations / {} hits, {}ms including LSM apply; uncached 32 compilations alone {}ms\n", .{ target.rewrite_program_cache.compilations, target.rewrite_program_cache.hits, @divTrunc(elapsed, std.time.ns_per_ms), @divTrunc(control_ns, std.time.ns_per_ms) });
+    std.debug.print("\nrewrite production handler: 64 historical schemas, 256 effects / 32 pages, {} compilations / {} hits, {}ms including LSM apply; uncached 32 compilations alone {}ms\n", .{ target.indexes.relational.rewrite_program_cache.compilations, target.indexes.relational.rewrite_program_cache.hits, @divTrunc(elapsed, std.time.ns_per_ms), @divTrunc(control_ns, std.time.ns_per_ms) });
     _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .cancel }, .{});
-    try std.testing.expect(target.rewrite_program_cache.entry == null);
+    try std.testing.expect(target.indexes.relational.rewrite_program_cache.entry == null);
 }
 
 test "restore owner verified decoder is reused across pages and terminal cleanup revokes import" {
@@ -769,10 +769,10 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
     try std.testing.expectEqual(.importing, admitted.phase);
     try std.testing.expect(!admitted.rewrite.?.snapshot_complete);
     try std.testing.expectEqual(@as(u64, 1), apply.index);
-    try std.testing.expectEqual(@as(u64, 0), target.rewrite_program_cache.compilations);
+    try std.testing.expectEqual(@as(u64, 0), target.indexes.relational.rewrite_program_cache.compilations);
     var response = try executeResident(alloc, &target, env, request, .{});
     try std.testing.expectEqual(@as(u64, 1), apply.index);
-    try std.testing.expectEqual(@as(u64, 1), target.rewrite_program_cache.compilations);
+    try std.testing.expectEqual(@as(u64, 1), target.indexes.relational.rewrite_program_cache.compilations);
     try std.testing.expectEqual(@as(u64, 0), response.source_next_offset);
     var chunk_count: usize = 0;
     while (response.source_next_offset < descriptor.total_bytes) {
@@ -796,7 +796,7 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
         response = try executeResident(alloc, &target, env, decoded.value, .{});
         try std.testing.expectEqual(bytes.offset + bytes.data.len, response.source_next_offset);
         const replay = try executeResident(alloc, &target, env, decoded.value, .{});
-        try std.testing.expectEqual(@as(u64, 1), target.rewrite_program_cache.compilations);
+        try std.testing.expectEqual(@as(u64, 1), target.indexes.relational.rewrite_program_cache.compilations);
         try std.testing.expectEqual(response.source_next_offset, replay.source_next_offset);
         try std.testing.expectEqual(@as(u64, 0), response.rows);
         if (chunk_count == 0) {
@@ -834,26 +834,26 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
             target_open = true;
             continue;
         };
-        try std.testing.expectEqual(@as(u64, 1), target.rewrite_program_cache.compilations);
+        try std.testing.expectEqual(@as(u64, 1), target.indexes.relational.rewrite_program_cache.compilations);
         if (response.rewrite.?.snapshot_complete) break;
     } else return error.TestUnexpectedResult;
     try std.testing.expect(saw_publication_crash);
     const snapshot_index = apply.index;
-    target.rewrite_program_cache.evict(env.io);
+    target.indexes.relational.rewrite_program_cache.evict(env.io);
     const replay = try executeResident(alloc, &target, env, request, .{});
     try std.testing.expect(replay.rewrite.?.snapshot_complete);
     try std.testing.expectEqual(snapshot_index, apply.index);
-    try std.testing.expectEqual(@as(u64, 1), target.rewrite_program_cache.compilations);
+    try std.testing.expectEqual(@as(u64, 1), target.indexes.relational.rewrite_program_cache.compilations);
     const copied = (try target.get(alloc, "a")).?;
     defer alloc.free(copied);
     try std.testing.expectEqualSlices(u8, document, copied);
     try std.testing.expectEqual(descriptor.total_bytes, response.source_next_offset);
     // Snapshot completion releases the decoder before tail/status takes an
     // exclusive source-generation transition.
-    try std.testing.expect(target.restore_decoder_cache.decoder == null);
+    try std.testing.expect(target.recovery.restore.decoder_cache.decoder == null);
     _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .cancel }, .{});
-    try std.testing.expect(target.rewrite_program_cache.entry == null);
-    try std.testing.expect(target.restore_decoder_cache.decoder == null);
+    try std.testing.expect(target.indexes.relational.rewrite_program_cache.entry == null);
+    try std.testing.expect(target.recovery.restore.decoder_cache.decoder == null);
     try std.testing.expect(!try generation.hasPublishedGenerationReadWithIo(cache_path, std.testing.io));
     try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(alloc, &target, env, request, .{}));
 }
@@ -923,9 +923,9 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
                 // The prepared first row is in flight. A concurrent pressure
                 // callback must not close its source generation until this
                 // proposal returns and the page pin is released.
-                try std.testing.expectEqual(@as(u32, 1), self.target.restore_decoder_cache.active_pages);
-                try std.testing.expectEqual(@as(u64, 0), self.target.restore_decoder_cache.reclaimForTest());
-                try std.testing.expect(self.target.restore_decoder_cache.decoder != null);
+                try std.testing.expectEqual(@as(u32, 1), self.target.recovery.restore.decoder_cache.active_pages);
+                try std.testing.expectEqual(@as(u64, 0), self.target.recovery.restore.decoder_cache.reclaimForTest());
+                try std.testing.expect(self.target.recovery.restore.decoder_cache.decoder != null);
             }
             var batch = request;
             batch.restore_staging_scope = scopeDigest(self.target);
@@ -1002,18 +1002,18 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     // The request arena is gone before the next cached page; only the
     // resident target allocator may own the decoder and its cache key.
     try std.testing.expectEqual(@as(u64, 1), first.rows);
-    const pinned_decoder = target.restore_decoder_cache.decoder orelse return error.TestUnexpectedResult;
+    const pinned_decoder = target.recovery.restore.decoder_cache.decoder orelse return error.TestUnexpectedResult;
     try std.testing.expect(try generation.hasPublishedGenerationReadWithIo(cache_path, std.testing.io));
     var changed_descriptor = scope;
     changed_descriptor.source_descriptor_digest[0] ^= 1;
     try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(alloc, &target, env, .{ .scope = changed_descriptor, .action = .import_page, .source = staged_source }, .{}));
-    try std.testing.expect(target.restore_decoder_cache.decoder == pinned_decoder);
+    try std.testing.expect(target.recovery.restore.decoder_cache.decoder == pinned_decoder);
     // An unavailable repository after page one must not trigger another read.
     var unavailable = source_request;
     unavailable.location = "/does-not-exist/restore-owner-test";
     var last = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .import_page, .source = unavailable, .max_rows = 1 }, .{});
     try std.testing.expectEqual(@as(u64, 2), last.rows);
-    try std.testing.expect(target.restore_decoder_cache.decoder == pinned_decoder);
+    try std.testing.expect(target.recovery.restore.decoder_cache.decoder == pinned_decoder);
     // Owner restart drops the volatile lease; the third page reopens the
     // immutable source and resumes exclusively from the durable target cursor.
     target.close();
@@ -1021,7 +1021,7 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     try std.testing.expect(!try generation.hasPublishedGenerationReadWithIo(cache_path, std.testing.io));
     target = try db.DB.open(alloc, target_path, target_options);
     target_open = true;
-    try std.testing.expect(target.restore_decoder_cache.decoder == null);
+    try std.testing.expect(target.recovery.restore.decoder_cache.decoder == null);
     for (0..5) |_| {
         last = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .import_page, .source = unavailable, .max_rows = 1 }, .{});
         if (last.phase == .imported) break;
@@ -1042,7 +1042,7 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
         return error.TestUnexpectedResult;
     };
     try std.testing.expectEqual(staging.Phase.published, published.phase);
-    try std.testing.expect(target.restore_decoder_cache.decoder == null);
+    try std.testing.expect(target.recovery.restore.decoder_cache.decoder == null);
     try std.testing.expect(!try generation.hasPublishedGenerationReadWithIo(cache_path, std.testing.io));
     const repeated = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .publish }, .{});
     try std.testing.expectEqualSlices(u8, &published.receipt, &repeated.receipt);

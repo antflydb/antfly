@@ -614,7 +614,7 @@ pub fn reconfigureManagedDbEnrichmentRuntime(
     defer enrichments.deinit(db.runtime_alloc);
     // An empty replacement is meaningful: dropping the last managed producer
     // must retire the old provider instead of leaving an unused runtime alive.
-    try db.reconfigureEnrichmentRuntime(enrichments.takeConfig());
+    try db.enrichment.reconfigureRuntime(enrichments.takeConfig());
 }
 
 pub fn managedIndexBackends(
@@ -1083,8 +1083,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
     // than through DB.addIndex(), so managed enrichment replay must be re-armed
     // here for pre-existing documents after an index is added.
     if ((mode == .default or mode == .default_async) and summary.indexes_added > 0) {
-        if (db.enrichment_runtime != null) {
-            _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+        if (db.enrichment.runtime != null) {
+            _ = try db.enrichment.replayGeneratedEnrichmentsFromStoredDocs(alloc);
         }
     }
     return db;
@@ -1692,7 +1692,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
             // the next current-catalog acquisition upgrades it to JSON.
             if (!std.mem.eql(u8, value, "1") and backend_runtime != null) {
                 try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, value, backend_runtime, antfly_provider, null, null, table_name, secret_store, remote_content);
-                try db.resumeEnrichmentRuntimeAfterReconfigure("historical owner reopen", "*");
+                try db.enrichment.resumeRuntimeAfterReconfigure("historical owner reopen", "*");
                 if (installed) |state| state.publish(value);
             }
             return false;
@@ -1708,7 +1708,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
     // exact child install Raft entry. A cold owner must reopen on its durable
     // old schema and index catalog while the child-source fence is active.
     if (schema_json.len > 0) {
-        const pinned = try db.childGenerationSourcePinsSchemaJson(schema_json);
+        const pinned = try db.recovery.childGenerationSourcePinsSchemaJson(schema_json);
         if (pinned) return true;
     }
     // Catch-up may request an owner using an older Raft entry's pinned
@@ -1748,7 +1748,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
         _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{
             .drain_resolver_backfill = false,
         });
-        if (replace) try db.resumeEnrichmentRuntimeAfterReconfigure("owner configuration", "*");
+        if (replace) try db.enrichment.resumeRuntimeAfterReconfigure("owner configuration", "*");
         if (!installed_matches) try persistOwnerCatalogContract(alloc, db, indexes_json);
         if (installed) |state| state.publish(indexes_json);
     }
@@ -1905,7 +1905,7 @@ pub fn reconcileStorageKernelOwnerDb(
     installed: ?*OwnerManagedConfig,
 ) !StorageKernelReconcileResult {
     if (comptime storage_engine.enabled) return storage_engine.call("writeReconcileStorageKernelOwnerDb", .{ alloc, db, table_name, schema_json, indexes_json, target_index_name, advance_index_repair, backend_runtime, antfly_provider, installed });
-    if (schema_json.len > 0 and try db.childGenerationSourcePinsSchemaJson(schema_json))
+    if (schema_json.len > 0 and try db.recovery.childGenerationSourcePinsSchemaJson(schema_json))
         return .{ .state = .busy };
     if (try db.childGenerationSourceDefersOwnerCatalog())
         return .{ .state = .busy };
@@ -1931,7 +1931,7 @@ pub fn reconcileStorageKernelOwnerDb(
         else
             try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, options);
     } else metadata_table_provisioner.IndexReconcileSummary{};
-    if (replace) try db.resumeEnrichmentRuntimeAfterReconfigure("owner reconciliation", target_index_name orelse "*");
+    if (replace) try db.enrichment.resumeRuntimeAfterReconfigure("owner reconciliation", target_index_name orelse "*");
     if (indexes_json.len > 0 and !installed_matches) try persistOwnerCatalogContract(alloc, db, indexes_json);
     if (indexes_json.len > 0) if (installed) |state| state.publish(indexes_json);
 
@@ -1999,7 +1999,7 @@ pub fn repairStorageKernelOwnerDb(
 ) !StorageKernelReconcileResult {
     if (comptime storage_engine.enabled) return storage_engine.call("writeRepairStorageKernelOwnerDb", .{ alloc, db, target_index_name, advance_index_repair, options });
     var result: StorageKernelReconcileResult = .{};
-    var repair_summary = db.indexRepairIntentSummaryForIndex(alloc, target_index_name) catch |err| switch (err) {
+    var repair_summary = db.indexes.repair.intentSummaryForIndex(alloc, target_index_name) catch |err| switch (err) {
         error.DurableIndexRepairStateUnavailable => if (target_index_name != null or advance_index_repair) return err else db_mod.DB.IndexRepairIntentSummary{},
         else => return err,
     };
@@ -2018,7 +2018,7 @@ pub fn repairStorageKernelOwnerDb(
         result.repair_busy = repair.busy;
         result.repair_disk_waits = repair.disk_waits;
         result.next_retry_at_ms = repair.next_retry_at_ms;
-        repair_summary = try db.indexRepairIntentSummaryForIndex(alloc, target_index_name);
+        repair_summary = try db.indexes.repair.intentSummaryForIndex(alloc, target_index_name);
         result.repair_remaining = repair_summary.runnable + repair_summary.paused + repair_summary.terminal;
         result.repair_terminal = repair_summary.terminal;
         result.next_retry_at_ms = repair_summary.earliest_retry_at_ms;
@@ -2179,11 +2179,11 @@ pub fn applyGraphMetricActionToDb(
     action: []const u8,
 ) !db_mod.types.GraphMetricStatus {
     if (comptime storage_engine.enabled) return storage_engine.call("writeApplyGraphMetricActionToDb", .{ alloc, db, index_name, metric_name, action });
-    if (std.mem.eql(u8, action, "refresh")) return try db.scheduleGraphMetricBuild(alloc, index_name, metric_name, false);
-    if (std.mem.eql(u8, action, "rebuild")) return try db.scheduleGraphMetricBuild(alloc, index_name, metric_name, true);
-    if (std.mem.eql(u8, action, "delete")) return try db.deleteGraphMetricMaterialization(alloc, index_name, metric_name);
-    if (std.mem.eql(u8, action, "pause")) return try db.pauseGraphMetricMaintenance(alloc, index_name, metric_name);
-    if (std.mem.eql(u8, action, "resume")) return try db.resumeGraphMetricMaintenance(alloc, index_name, metric_name);
+    if (std.mem.eql(u8, action, "refresh")) return try db.indexes.graph.scheduleMetricBuild(alloc, index_name, metric_name, false);
+    if (std.mem.eql(u8, action, "rebuild")) return try db.indexes.graph.scheduleMetricBuild(alloc, index_name, metric_name, true);
+    if (std.mem.eql(u8, action, "delete")) return try db.indexes.graph.deleteMetricMaterialization(alloc, index_name, metric_name);
+    if (std.mem.eql(u8, action, "pause")) return try db.indexes.graph.pauseMetricMaintenance(alloc, index_name, metric_name);
+    if (std.mem.eql(u8, action, "resume")) return try db.indexes.graph.resumeMetricMaintenance(alloc, index_name, metric_name);
     return error.InvalidGraphMetricAction;
 }
 
@@ -2197,11 +2197,11 @@ pub fn runGraphMetricMaintenanceOrActionJsonAlloc(
 ) ![]u8 {
     if (comptime storage_engine.enabled) return storage_engine.call("writeRunGraphMetricMaintenanceOrActionJsonAlloc", .{ alloc, db, body });
     var parsed = std.json.parseFromSlice(GraphMetricGroupActionRequest, alloc, body, .{ .ignore_unknown_fields = true }) catch
-        return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+        return try db.indexes.graph.runMetricServiceMaintenanceJsonAlloc(alloc, body);
     defer parsed.deinit();
-    const operation = parsed.value.operation orelse return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+    const operation = parsed.value.operation orelse return try db.indexes.graph.runMetricServiceMaintenanceJsonAlloc(alloc, body);
     if (!std.mem.eql(u8, operation, graph_metric_group_action_operation)) {
-        return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+        return try db.indexes.graph.runMetricServiceMaintenanceJsonAlloc(alloc, body);
     }
     if (parsed.value.index_name.len == 0 or parsed.value.metric_name.len == 0 or parsed.value.action.len == 0) {
         return error.InvalidGraphMetricAction;
@@ -2242,7 +2242,7 @@ pub fn reconfigureManagedDbEnrichmentRuntimePaused(
         remote_content,
     );
     defer enrichments.deinit(db.runtime_alloc);
-    try db.reconfigureEnrichmentRuntimePaused(enrichments.takeConfig());
+    try db.enrichment.reconfigureRuntimePaused(enrichments.takeConfig());
 }
 
 pub const PortableCohortSource = struct {

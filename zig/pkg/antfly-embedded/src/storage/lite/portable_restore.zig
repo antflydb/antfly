@@ -69,7 +69,7 @@ pub fn finalizeRestoredLiteDb(allocator: Allocator, db: *db_mod.DB) !void {
     profile.mark(db, "rebuildSparseIndexesForTargetCoverage");
     try db.rebuildGraphIndexesForTargetCoverage(allocator);
     profile.mark(db, "rebuildGraphIndexesForTargetCoverage");
-    _ = try db.replayGeneratedEnrichmentsFromStoredDocs(allocator);
+    _ = try db.enrichment.replayGeneratedEnrichmentsFromStoredDocs(allocator);
     profile.mark(db, "replayGeneratedEnrichmentsFromStoredDocs");
     try db.runUntilIdle();
     profile.mark(db, "runUntilIdle");

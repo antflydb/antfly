@@ -151,12 +151,12 @@ test "db graph runtime repeated split defers behind cleanup without advancing it
     const index = &db.core.index_manager.graphIndex("g").?.index;
     try std.testing.expectEqual(@as(u64, 2), (try index.stats(a)).edge_count);
     // The normal metadata scheduler also services graph-only indexes.
-    try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+    try db.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle();
     try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, second, .{ .term = 1, .index = 2 });
     try std.testing.expectEqualStrings("h", db.getRange().end);
     try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
     try std.testing.expectEqual(@as(u64, 1), (try index.stats(a)).edge_count);
-    try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+    try db.enrichment.runArtifactRepairMetadataMaintenanceUntilIdle();
     try std.testing.expectEqual(@as(u64, 1), index.edge_count);
 }
 
@@ -458,7 +458,7 @@ test "db graph runtime personalized graph metric seeds shape top-k and rerank or
     try std.testing.expect(f_position_hub < f_position_b);
 
     // Global published ranking is dominated by the hub, unlike the seeded one.
-    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "rank");
+    var refreshed = try db.indexes.graph.refreshMetric(alloc, "graph_idx", "rank");
     defer refreshed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
     var global = try db.search(alloc, .{
