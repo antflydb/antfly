@@ -215,6 +215,12 @@ class ContentionReportTests(unittest.TestCase):
         result = results.get_nowait()
         self.assertEqual(result["status"], "error")
         self.assertIn("close failed", result["diagnostic"])
+        self.assertEqual(result["completed_workload"]["successful_calls"], 1)
+        self.assertEqual(result["completed_workload"]["busy_calls"], 0)
+        self.assertEqual(
+            result["completed_workload"]["last_write"],
+            {"key": "worker-4-0", "sequence": 0},
+        )
         self.assertTrue(results.empty())
 
     def test_cli_fails_for_unexpected_baseline_error(self):
@@ -259,6 +265,15 @@ class ContentionReportTests(unittest.TestCase):
         self.assertEqual(result["workers_without_success"], 2)
         self.assertEqual(result["busy_fraction"], 1)
         self.assertEqual(result["successful_calls_per_second"], 0)
+        progressing = {
+            **worker,
+            "success_latency_ns": [30],
+            "admission": admission(30),
+        }
+        partial = bench.aggregate([worker, progressing])
+        self.assertEqual(partial["status"], "starved_workers")
+        self.assertEqual(partial["workers_without_success"], 1)
+        self.assertEqual(partial["successful_calls_per_second"], 1)
 
     def test_unsampled_admission_has_no_latency_even_with_successful_calls(self):
         worker = {

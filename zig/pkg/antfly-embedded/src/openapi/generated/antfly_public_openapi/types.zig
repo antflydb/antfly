@@ -10260,6 +10260,20 @@ pub const RepairIssueListRequest = struct {
     }
 };
 
+/// A group of documents whose repair still fails with the same error.
+pub const RepairRemainingFailure = struct {
+    /// Error recorded for the documents, for example `ModelNotFound`.
+    error_code: []const u8,
+    /// Number of documents in this group.
+    count: u64,
+    /// Highest repair attempt count among the group's documents.
+    attempts: u64,
+    /// Whether the error is temporary (admission refusal, rate limit). Repair retries these within a job; running repair again usually succeeds.
+    transient: bool,
+    /// What to do next.
+    hint: []const u8,
+};
+
 /// Bounded request to run a table repair pass.
 pub const RepairRunRequest = struct {
     target: ?RepairTarget = null,
@@ -16123,7 +16137,7 @@ pub const TableRepairJob = struct {
     attempt_id: u64,
     /// Table being repaired.
     table_name: []const u8,
-    /// Lifecycle phase of the repair job.
+    /// Lifecycle phase of the repair job. `completed_with_failures` means every pass ran but some documents still fail; `remaining_failures` says why and what to do, and running repair again retries them. `failed` means the job itself could not run, for example an invalid request or a stale control fence.
     phase: []const u8,
     /// User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
     repair_status: []const u8,
@@ -16154,6 +16168,10 @@ pub const TableRepairJob = struct {
     last_updated_at_millis: u64,
     /// Unix epoch milliseconds when the job is eligible for cleanup.
     expires_at_millis: u64,
+    /// Documents that still fail, grouped by error code with the next step. Present on finished repair jobs that are not controls, read from the current repair issues.
+    remaining_failures: ?[]const RepairRemainingFailure = null,
+    /// Whether more repair issues exist than the summary scanned.
+    remaining_failures_truncated: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -16177,6 +16195,8 @@ pub const TableRepairJob = struct {
         .{ "created_at_millis", "created_at_millis", false },
         .{ "last_updated_at_millis", "last_updated_at_millis", false },
         .{ "expires_at_millis", "expires_at_millis", false },
+        .{ "remaining_failures", "remaining_failures", true },
+        .{ "remaining_failures_truncated", "remaining_failures_truncated", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -16257,6 +16277,14 @@ pub const TableRepairJob = struct {
         try jw.write(self.last_updated_at_millis);
         try jw.objectField("expires_at_millis");
         try jw.write(self.expires_at_millis);
+        if (self.remaining_failures) |value| {
+            try jw.objectField("remaining_failures");
+            try jw.write(value);
+        }
+        if (self.remaining_failures_truncated) |value| {
+            try jw.objectField("remaining_failures_truncated");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -16337,6 +16365,49 @@ pub const TableRepairRunResponse = struct {
     /// Effective repair limit.
     limit: u32,
     result: TableRepairRunResult,
+    /// Documents that still fail after this pass, grouped by error code with the next step. Omitted for control passes.
+    remaining_failures: ?[]const RepairRemainingFailure = null,
+    /// Whether more repair issues exist than the summary scanned.
+    remaining_failures_truncated: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", false },
+        .{ "target", "target", false },
+        .{ "limit", "limit", false },
+        .{ "result", "result", false },
+        .{ "remaining_failures", "remaining_failures", true },
+        .{ "remaining_failures_truncated", "remaining_failures_truncated", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.objectField("target");
+        try jw.write(self.target);
+        try jw.objectField("limit");
+        try jw.write(self.limit);
+        try jw.objectField("result");
+        try jw.write(self.result);
+        if (self.remaining_failures) |value| {
+            try jw.objectField("remaining_failures");
+            try jw.write(value);
+        }
+        if (self.remaining_failures_truncated) |value| {
+            try jw.objectField("remaining_failures_truncated");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Result of one bounded table repair pass.

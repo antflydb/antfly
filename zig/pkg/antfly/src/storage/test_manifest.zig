@@ -89,6 +89,7 @@ comptime {
 
     _ = @import("antfly_local_sources").storage_document_mutation_revision;
     _ = @import("antfly_local_sources").storage_db_graph_edge_types;
+    _ = @import("antfly_local_sources").storage_db_repair_failure;
     _ = @import("antfly_local_sources").storage_source_authority;
     _ = @import("antfly_local_sources").storage_db_apply_receipts;
     _ = @import("antfly_local_sources").storage_db_durable_outbox;
@@ -393,9 +394,11 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_connection;
     _ = @import("antfly_local_sources").storage_lite_docstore;
     _ = @import("antfly_local_sources").storage_lite_index_storage;
+    _ = @import("antfly_local_sources").storage_lite_ledger_digest;
     _ = @import("antfly_local_sources").storage_lite_artifact_source;
     _ = @import("antfly_local_sources").storage_lite_mod;
     _ = @import("antfly_local_sources").storage_lite_native;
+    _ = @import("antfly_local_sources").storage_lite_path_lock_wait;
     _ = @import("antfly_local_sources").storage_lite_paths;
     _ = @import("antfly_local_sources").storage_lite_read_workspace;
     _ = @import("antfly_local_sources").storage_lite_result_scratch;
