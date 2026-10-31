@@ -144825,3 +144825,62 @@ test "db managed index repair recovers strict progressive admission after provid
     defer remaining.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), remaining.issues.len);
 }
+
+test "db managed index repair summary reports a newer provider failure after reopen" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("review-latest-failure");
+    defer tmp.cleanup();
+    var gated = GateDenseEmbedder{};
+    var db = try DB.open(a, tmp.path(), parkedEnrichmentFailureTestOptions(&gated));
+    defer db.close();
+    try parkEnrichmentFailureForTest(&db);
+    gated.blocked_error = error.ModelNotFound;
+    var prior = try db.repairArtifactIssuesWithRequest(a, .{ .target = .index, .index_name = "dv_a", .operator_initiated = true });
+    defer prior.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), prior.failed);
+    // Re-observing the original generation must retain the newer synchronous
+    // repair diagnosis. Only a new generation may supersede that attempt.
+    {
+        var previous = try db.listArtifactRepairIssuesPage(a, .{ .index_name = "dv_a" });
+        defer previous.deinit(a);
+        const issue = previous.issues[0];
+        try std.testing.expectEqualStrings("ModelNotFound", issue.last_error);
+        const key = try hexToBytesAlloc(a, issue.artifact_key);
+        defer a.free(key);
+        try recordArtifactRepairIssueContextDetailed(db.async_context, issue.artifact_kind, issue.index_name, issue.doc_key, issue.parent_doc_key, issue.unit_id, issue.index_source_artifact_name, issue.source_artifact_name, issue.artifact_name, key, issue.chunk_id, issue.sequence, issue.reason, issue.generation_attempts, issue.generation_error);
+        var repeated = try db.listArtifactRepairIssuesPage(a, .{ .index_name = "dv_a" });
+        defer repeated.deinit(a);
+        try std.testing.expectEqualStrings("ModelNotFound", types.repair_failure.issueErrorCode(repeated.issues[0]));
+    }
+    gated.blocked_error = error.InvalidEmbeddingResponse;
+    const req = types.ArtifactRepairRunRequest{ .target = .index, .index_name = "dv_a", .operator_initiated = true, .repair_job_id = 42, .repair_job_created_at_ms = 100 };
+    const options = types.ArtifactRepairRunOptions{ .defer_durable_index_repair_execution = true };
+    var queued = try db.repairArtifactIssuesWithRequestOptions(a, req, options);
+    defer queued.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), queued.reprocessed);
+    try std.testing.expectError(error.EnrichmentWorkerFailed, db.runUntilIdle());
+    var finished = try db.repairArtifactIssuesWithRequestOptions(a, req, options);
+    defer finished.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), finished.failed);
+    var issues = try db.listArtifactRepairIssuesPage(a, .{ .index_name = "dv_a" });
+    defer issues.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), issues.issues.len);
+    const issue = issues.issues[0];
+    try std.testing.expectEqualStrings("InvalidEmbeddingResponse", issue.generation_error);
+    try std.testing.expectEqualStrings("InvalidEmbeddingResponse", types.repair_failure.issueErrorCode(issue));
+    try std.testing.expectEqualStrings("", issue.last_error);
+    const groups = try types.repair_failure.groupIssuesAlloc(a, issues.issues);
+    defer a.free(groups);
+    try std.testing.expectEqual(@as(usize, 1), groups.len);
+    try std.testing.expectEqualStrings("InvalidEmbeddingResponse", groups[0].error_code);
+    try std.testing.expect(std.mem.indexOf(u8, groups[0].hint, "pull") == null);
+    db.close();
+    db = try DB.open(a, tmp.path(), parkedEnrichmentFailureTestOptions(&gated));
+    var reopened = try db.listArtifactRepairIssuesPage(a, .{ .index_name = "dv_a" });
+    defer reopened.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), reopened.issues.len);
+    try std.testing.expectEqualStrings("InvalidEmbeddingResponse", types.repair_failure.issueErrorCode(reopened.issues[0]));
+    var summary = (try db.indexEnrichmentFailureSummary(a, "dv_a")).?;
+    defer summary.deinit(a);
+    try std.testing.expectEqualStrings("InvalidEmbeddingResponse", types.repair_failure.issueErrorCode(summary.latest));
+}

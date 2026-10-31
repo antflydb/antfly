@@ -11242,6 +11242,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 generation_error,
                 generation_attempts,
             );
+            // Deferred repair publishes its outcome as a newer generation.
+            // A previous synchronous repair error must not override that new
+            // diagnosis in summaries. Re-observing the same generation does
+            // not supersede a repair attempt made after its original failure.
+            if (reason == .enrichment_failed and sequence > issue.sequence and
+                generation_error.len != 0 and issue.last_error.len != 0)
+            {
+                ctx.alloc.free(@constCast(issue.last_error));
+                issue.last_error = "";
+            }
             issue.artifact_kind = artifact_kind;
             issue.sequence = sequence;
             issue.reason = reason;
