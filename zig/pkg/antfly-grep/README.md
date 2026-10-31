@@ -5103,3 +5103,8 @@ still run. The isolated source-preparation fixture allocates 67–97% fewer byte
 eight shared 1 MiB worker payloads use about 87% fewer wire bytes. These scoped
 results exclude model work and do not establish universal query speed, RSS or
 billing improvements. Initial and repeated slower cases remain in the design.
+
+The final merge of main through `0ff73ed56f` rebuilds byte-identical macOS server
+and grep artifacts. Indexed HTTP integration passes 57 tests (7 optional
+profiling skips); native fixture, allocation/wire and Linux VM scopes are
+recorded in the linked design. Full PR CI and required review remain separate.

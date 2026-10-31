@@ -3015,3 +3015,24 @@ these shared-host whole-server timings do not establish universal speed or RSS
 improvements. After qualification, Ruff only wrapped two blocks in the driver;
 an AST-equivalence check records that formatting changed no behavior. Native
 source identities remain unchanged.
+
+
+### Final main integration
+
+After the paired qualification, `origin/main` through `0ff73ed56fb7acfbe4d6a14158f84c4b74c8dadb` was merged
+at `21fd89cacbdd564c644b7026a525652420ec78dc`. The additional main changes are docs, docs-approval policy,
+knowledge-base examples and CUDA artifact packaging; no Zig source changed
+between the paired main and this main. The follow-up implementation is committed
+as `c307be074843fa6cd1e344f6decbad26c0c5548c`. Rebuilt ReleaseFast server and grep binaries are
+**byte-for-byte identical** to the paired candidates above. Real-server indexed
+HTTP qualification again passes **57 tests with 7 opt-in profiling skips**;
+CUDA packaging fixtures pass **5/5** and docs-policy fixtures **22/22**. License
+headers, the 2,340-file Apache boundary, storage-control catalog, Zig formatting
+and Python Ruff lint/format checks pass after the merge. Native source and
+fixture qualification therefore refer to the same unchanged implementation,
+not a newly untested CPU code path. The final merge manifest is
+`output/projection-followup/round3-final-merged-manifest.json` (ignored).
+
+Full PR CI and required human approval remain separate merge requirements;
+local qualification does not bypass them. No raw benchmark reports, logs or
+executables are added to the PR.
