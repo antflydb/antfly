@@ -26,6 +26,8 @@ import requests
 from conftest import (
     ANTFLY_PUBLIC_API_ROOT,
     DEFAULT_ANTFLY_BIN,
+    EMBEDDINGGEMMA2_MODEL,
+    INFERENCE_PUBLIC_API_ROOT,
     StandaloneAntflyServer,
     StatefulAntflyServer,
     internal_service_headers,
@@ -2065,3 +2067,141 @@ def test_standalone_accepts_postgres_replication_sources(pg_cdc_source):
         assert managed["progress"][0]["last_error"] == "", managed
     finally:
         server.stop()
+
+
+@pytest.mark.real_model
+@pytest.mark.parametrize("cdc_stateful_api", ["standalone"], indirect=True)
+def test_standalone_postgres_cdc_snapshot_completes_with_embeddings_index(
+    cdc_stateful_api, pg_cdc_source, embeddinggemma2_model_available
+):
+    # Regression coverage for the snapshot/embedding deadlock: a table with
+    # both Postgres CDC replication_sources and an embeddings index used to
+    # hang forever on its first snapshot. The snapshot backfill opens a
+    # bulk-ingest window for the whole batch loop and applied every batch
+    # inside it waiting for full_index visibility, but the dense embedder's
+    # replay session is admission-gated against that very same open window
+    # (dense_publication_admission.zig) and can never become ready while it
+    # stays open -- and the window never closes because the batch loop is
+    # stuck waiting on it. Standalone-only: the cluster e2e harness has no
+    # inference service and rejects embeddings indexes at create.
+    _ = embeddinggemma2_model_available
+    stateful_api = cdc_stateful_api
+
+    # A cold model load (safetensors parse plus backend init) can take
+    # longer than the ordinary request timeouts used below; warm it before
+    # timing anything that depends on it, the same way the quickstart real-
+    # model tests do.
+    base_url = stateful_api.url.removesuffix(ANTFLY_PUBLIC_API_ROOT)
+    warmup = stateful_api.s.post(
+        f"{base_url}{INFERENCE_PUBLIC_API_ROOT}/embed",
+        json={"model": EMBEDDINGGEMMA2_MODEL, "input": "warmup"},
+        timeout=120,
+    )
+    assert warmup.ok, (warmup.status_code, warmup.text)
+
+    table_name = f"cdc_embeddings_{time.time_ns()}"
+    index_name = "name_idx"
+    create_payload = {
+        "num_shards": 1,
+        "replication_sources": [
+            {
+                "type": "postgres",
+                "dsn": _pg_dsn(),
+                "postgres_table": pg_cdc_source["table_name"],
+                "key_template": "id",
+                "slot_name": pg_cdc_source["slot_name"],
+                "publication_name": pg_cdc_source["publication_name"],
+            }
+        ],
+        "indexes": {
+            index_name: {
+                "type": "embeddings",
+                "template": "{{name}}",
+                "embedder": {
+                    "provider": "antfly",
+                    "model": EMBEDDINGGEMMA2_MODEL,
+                },
+            }
+        },
+    }
+    _create_table_public(stateful_api, table_name, create_payload)
+
+    # Before the fix, this never comes back: the snapshot batch loop is
+    # blocked waiting on enrichment visibility that the open bulk-ingest
+    # window itself prevents.
+    snapshot_doc = wait_until(
+        lambda: _lookup_doc_if(
+            stateful_api,
+            table_name,
+            "user-1",
+            lambda doc: doc.get("name") == "Alice",
+        ),
+        timeout_s=60.0,
+        interval_s=0.5,
+    )
+    assert snapshot_doc is not None, (
+        "CDC snapshot into a table with an embeddings index did not complete\n"
+        f"{_server_logs(stateful_api)}\n"
+        f"{_metadata_replication_statuses(stateful_api)}"
+    )
+
+    def hit_ids(query: str) -> list[str] | None:
+        try:
+            result = stateful_api.query_table(
+                table_name,
+                {
+                    "semantic_search": query,
+                    "indexes": [index_name],
+                    "fields": ["name"],
+                    "limit": 5,
+                },
+            )
+        except requests.RequestException:
+            return None
+        responses = result.get("responses", [])
+        if not responses:
+            return None
+        return [hit.get("_id") for hit in responses[0].get("hits", {}).get("hits", [])]
+
+    # The snapshot row's embedding materializes asynchronously once the
+    # bulk-ingest window closes (it is written and plainly readable
+    # immediately; only the embedding lags). Confirm it actually becomes
+    # searchable, not just written.
+    assert wait_until(
+        lambda: "user-1" in (hit_ids("Alice") or []),
+        timeout_s=30.0,
+        interval_s=0.5,
+    ), (
+        "snapshot-backfilled row never became searchable through the embeddings index\n"
+        f"{_server_logs(stateful_api)}"
+    )
+
+    managed = stateful_api._check(
+        stateful_api._request("GET", f"/tables/{table_name}/sources/managed")
+    )
+    assert managed["cdc_supported"] is True, managed
+    assert managed["progress"][0]["last_error"] == "", managed
+
+    # A streamed insert after the snapshot embeds before the write returns,
+    # same as any other write, because streaming apply never opens a
+    # bulk-ingest window.
+    _run_psql(f"""
+        insert into {pg_cdc_source["table_name"]} (id, name, tier)
+        values ('user-2', 'Bob', 'silver');
+        """)
+
+    assert wait_until(
+        lambda: "user-2" in (hit_ids("Bob") or []),
+        timeout_s=30.0,
+        interval_s=0.5,
+    ), (
+        "streamed insert into a table with an embeddings index never became searchable\n"
+        f"{_server_logs(stateful_api)}"
+    )
+
+    # No `on_delete` configured on this source: a deleted Postgres row
+    # deletes the document by default, since the table is a full mirror.
+    _run_psql(f"delete from {pg_cdc_source['table_name']} where id = 'user-2';")
+    _wait_until_absent(
+        stateful_api, table_name, "user-2", timeout_s=30.0, interval_s=0.25
+    )
