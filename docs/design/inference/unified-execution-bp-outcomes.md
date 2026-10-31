@@ -110,3 +110,39 @@ layout change.
 Receipts, frozen binaries, exact deleted definitions, negative ownership
 controls, image regeneration reports, initial failures and source ledgers are
 retained under `.benchmark-assets/1166/bp-campaign`.
+
+## Final local model timing protocol
+
+The final candidate is built from the implementation in `100f489430`; merging
+main `0ff73ed56f` changes only documentation and examples. No inference or
+kernel source changes after that implementation are included in the timing run.
+
+All seven CPU cases pass AA, AB and reversed BA with the existing per-case
+warmup/measurement counts, 16 balanced arms, and unchanged 1.05 median / 1.10
+p95 limits. Maximum AB ratios are 1.00820 median / 1.01843 p95; BA maxima are
+1.00614 / 1.02432. AA maxima are 1.00357 / 1.00834. The frozen historical main
+baseline is `c8d46b3d47`, with its binary hash retained in the manifest.
+
+Metal uses the already qualified BM branch binary as its baseline. Historical
+main's decoder defect, isolated in the BM report, would invalidate that
+comparison. The independent pinned F64 decoder reference and existing budgets
+remain enabled for both arms. Other cases retain exact-output admission. An
+initial orchestrator was stopped after CPU AA to select this Metal baseline;
+its incomplete CPU AB directory is retained separately from the completed runs.
+There are no affinity or global clock changes, and these are shared-host,
+warmed model measurements rather than whole-server throughput claims.
+
+All eight Metal cases pass AB and reversed BA. Maximum AB ratios are 1.01523
+median / 1.04220 p95; BA maxima are 1.01039 / 1.00296. The initial AA run passes
+seven cases and fails the ONNX case with `FileNotFound`: its external
+`weights.bin` sidecar was missing. Restoring that sidecar from the pinned
+checkpoint tensors and the graph's four scalar constants preserves the complete
+historical output SHA-256 (`6998970d9821c0d949353fcffa632b8d8f8a2f3890c96840a2339c282a41b47f`).
+The unchanged ONNX AA protocol then passes separately. Original failed receipts
+remain intact. Both arms of AB and BA use the restored fixture.
+
+Across CPU and Metal, 720 qualified output processes pass all numerical and
+performance gates, with exact per-case output identity. Combined with the 288
+CUDA processes, this is 1,008 qualified processes and 126 median/p95 timing
+gates. The Metal decoder also retains its independent F64 reference and
+full/chunked-prefill admission. No numerical or timing budget is relaxed.
