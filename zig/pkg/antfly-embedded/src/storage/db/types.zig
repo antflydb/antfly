@@ -4350,9 +4350,10 @@ pub const ArtifactRepairRunOptions = struct {
     /// Installed by the durable owner after admission. Shadow construction
     /// invokes it only at bounded publication/window boundaries.
     capacity_check: ?RepairCapacityCheck = null,
-    /// Managed operator requests persist/enqueue intent work and return
-    /// immediately. Standalone callers leave this false and advance through
-    /// the same state machine synchronously.
+    /// Managed operator requests persist/enqueue generation and enrichment
+    /// work without running providers under the group-operation guard. Polls
+    /// observe the durable replay outcome. Standalone callers leave this false
+    /// and execute their repair pass synchronously.
     defer_durable_index_repair_execution: bool = false,
 
     pub fn cancelled(self: ArtifactRepairRunOptions) bool {

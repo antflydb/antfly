@@ -105,17 +105,31 @@ pub fn issueErrorCode(issue: anytype) []const u8 {
     return @tagName(issue.reason);
 }
 
-/// Groups issues by error code, in first-seen order. Strings borrow from
-/// `issues` and from static hint text; free only the returned slice.
+pub fn sourceDocument(issue: anytype) []const u8 {
+    if (@hasField(@TypeOf(issue), "parent_doc_key")) {
+        if (issue.parent_doc_key.len != 0) return issue.parent_doc_key;
+    }
+    return if (@hasField(@TypeOf(issue), "doc_key")) issue.doc_key else "";
+}
+
+/// Groups issues by error code, counting each source document once per group.
+/// Shared consumers and chunks may contribute multiple issues; all of them
+/// still contribute to max_attempts. Strings borrow from `issues` and static
+/// hint text; free only the returned slice.
 pub fn groupIssuesAlloc(alloc: std.mem.Allocator, issues: anytype) ![]FailureGroup {
     var groups = std.ArrayListUnmanaged(FailureGroup).empty;
     errdefer groups.deinit(alloc);
-    for (issues) |issue| {
+    for (issues, 0..) |issue, i| {
         const code = issueErrorCode(issue);
+        const document = sourceDocument(issue);
+        const duplicate = if (document.len == 0) false else for (issues[0..i]) |earlier| {
+            if (std.mem.eql(u8, code, issueErrorCode(earlier)) and
+                std.mem.eql(u8, document, sourceDocument(earlier))) break true;
+        } else false;
         const attempts: u64 = @max(issue.attempts, issue.generation_attempts);
         for (groups.items) |*group| {
             if (std.mem.eql(u8, group.error_code, code)) {
-                group.count += 1;
+                if (!duplicate) group.count += 1;
                 group.max_attempts = @max(group.max_attempts, attempts);
                 break;
             }
@@ -189,4 +203,31 @@ test "repair failure summary reports the latest permanent repair error" {
     try std.testing.expect(!groups[1].transient);
     try std.testing.expectEqualStrings("source_document_missing", groups[1].error_code);
     try std.testing.expectEqualStrings("ModelNotFound", groups[2].error_code);
+}
+
+test "repair failure counts source documents once per error across consumers and chunks" {
+    const Issue = struct {
+        doc_key: []const u8,
+        parent_doc_key: []const u8 = "",
+        index_name: []const u8 = "a",
+        generation_error: []const u8 = "ModelNotFound",
+        last_error: []const u8 = "",
+        attempts: u64 = 0,
+        generation_attempts: u64 = 1,
+        reason: enum { enrichment_failed } = .enrichment_failed,
+    };
+    const issues = [_]Issue{
+        .{ .doc_key = "doc:a" },
+        .{ .doc_key = "doc:a", .index_name = "b", .attempts = 3 },
+        .{ .doc_key = "chunk:1", .parent_doc_key = "doc:a", .attempts = 4 },
+        .{ .doc_key = "chunk:2", .parent_doc_key = "doc:a" },
+        .{ .doc_key = "doc:b" },
+        .{ .doc_key = "doc:a", .last_error = "InvalidEmbeddingResponse" },
+    };
+    const groups = try groupIssuesAlloc(std.testing.allocator, &issues);
+    defer std.testing.allocator.free(groups);
+    try std.testing.expectEqual(@as(usize, 2), groups.len);
+    try std.testing.expectEqual(@as(u64, 2), groups[0].count);
+    try std.testing.expectEqual(@as(u64, 4), groups[0].max_attempts);
+    try std.testing.expectEqual(@as(u64, 1), groups[1].count);
 }

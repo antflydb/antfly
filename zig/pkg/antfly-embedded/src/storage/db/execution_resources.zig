@@ -2151,6 +2151,10 @@ pub const ArtifactRepairCompletionState = struct {
     epoch: u64 = 0,
     completed_sequence: u64 = 0,
     pending_issues: u64 = 0,
+    /// Operator-submitted replay, observed without executing providers under
+    /// the managed request's group-operation guard. Survives owner restart.
+    queued_sequence: u64 = 0,
+    queued_job_id: u64 = 0,
 };
 
 pub const ManagedIndexBatchApplicability = enum {
