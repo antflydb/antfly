@@ -150,8 +150,8 @@ func verifyChunkPipelineEnrichments(db *embedded.DB, storedChunkVectorsConfig st
 	if dense.SourceArtifactName != chunkArtifact {
 		return drift(denseArtifact, "source_artifact_name", chunkArtifact, dense.SourceArtifactName)
 	}
-	if dense.ExpectedDims != qwen3EmbeddingDims {
-		return drift(denseArtifact, "expected_dims", qwen3EmbeddingDims, dense.ExpectedDims)
+	if dense.ExpectedDims != embeddingDims {
+		return drift(denseArtifact, "expected_dims", embeddingDims, dense.ExpectedDims)
 	}
 	extractor, ok := byName[relationsArtifact]
 	if !ok {

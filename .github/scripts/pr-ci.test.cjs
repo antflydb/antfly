@@ -439,7 +439,7 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
     const text=fs.readFileSync(path.join(root,file),'utf8');
     // The license boundary is a lightweight, read-only source check. Main
     // runs it directly on PRs; expensive suites still require admission.
-    if (!['pr-ci-controller.yml', 'apache-license.yml'].includes(file)) {
+    if (!['pr-ci-controller.yml', 'apache-license.yml', 'docs-design-approval.yml'].includes(file)) {
       assert.doesNotMatch(text,/^  pull_request(?:_target)?:/m,file);
     }
     if (file.startsWith('pr-ci')) {

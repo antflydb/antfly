@@ -52,8 +52,8 @@ const (
 	chunkVectorsIndex   = "chunk_vectors"
 	knowledgeGraphIndex = "knowledge"
 
-	// qwen3EmbeddingDims is the output dimension of Qwen/Qwen3-Embedding-0.6B-GGUF.
-	qwen3EmbeddingDims = 1024
+	// embeddingDims is the default output dimension of EmbeddingGemma 2.
+	embeddingDims = 768
 )
 
 // entityLabels and relationLabels define the GLiNER2.5 extraction schema used
@@ -139,7 +139,7 @@ const (
 )
 
 // chunkVectorsIndexJSON returns the artifact-sourced embeddings index over
-// fixed-size chunks of each section body, embedded with Qwen3. Both
+// fixed-size chunks of each section body, embedded with EmbeddingGemma 2. Both
 // enrichments travel inline on the index that owns them; Lite registers them
 // in dependency order before admitting the index. With no inference URL the
 // producers run on libantfly's embedded runtime.
@@ -172,7 +172,7 @@ func chunkVectorsIndexJSON(embedModel, inferenceURL string, targetTokens, overla
 	config := map[string]any{
 		"type":      "embeddings",
 		"sources":   []map[string]any{{"artifact": denseArtifact}},
-		"dimension": qwen3EmbeddingDims,
+		"dimension": embeddingDims,
 		"embedder": withProviderURL(map[string]any{
 			"provider": "antfly",
 			"model":    embedModel,
@@ -185,7 +185,7 @@ func chunkVectorsIndexJSON(embedModel, inferenceURL string, targetTokens, overla
 				"kind":                 "embedding",
 				"field":                "body",
 				"source_artifact_name": chunkArtifact,
-				"expected_dims":        qwen3EmbeddingDims,
+				"expected_dims":        embeddingDims,
 			},
 		},
 	}
