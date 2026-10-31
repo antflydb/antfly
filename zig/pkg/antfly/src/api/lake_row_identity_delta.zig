@@ -60,7 +60,6 @@ pub const Builder = struct {
         self.pending.encoded_bytes = true;
         for (&self.edits) |*edit| {
             edit.* = Mutations.init(a, manager, pages.store());
-            edit.private_pages.phase = pages.artifacts.io_phase;
         }
         errdefer self.deinit();
         const ma = self.arena.allocator();

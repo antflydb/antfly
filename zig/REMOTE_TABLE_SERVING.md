@@ -2686,3 +2686,28 @@ and payload-sort passes. It remains benchmark-only: the measured reduction in
 reads did not pay for its additional CPU and writes on local spill storage.
 A future planner must qualify the full cost for the actual storage and workload
 before selecting repacking; reduced read counters alone are insufficient.
+
+
+### One private metadata reduction
+
+Row maps, translation maps, text directories, fragment navigation and aggregate
+metadata stage mutations in one byte-bounded external sort. The sort owns the
+memory admission, bounded merge fan-in, shared spill extents, disk quota and
+file quota. A fixed record count no longer closes each small sort and starts a
+second page-tree merge forest. Private staging runs are not durable publication
+checkpoints; the maintenance reducers that actually persist checkpoints retain
+their durable merge forests.
+
+The final merge feeds leased keys and values directly into `page_tree.applySorted`.
+Equal keys are reduced in stable mutation-ordinal order. Ordinary updates select
+the latest mutation; addition-priority updates select the latest addition if one
+exists, otherwise a deletion. This policy applies across every spill run. The
+source retains only a winner and one lookahead lease, including when a key has
+many updates. It releases both on success, cancellation or failure without
+building an owning row DOM or an intermediate authenticated page tree.
+
+The destination still owns authentication, publication I/O accounting, aggregate
+reductions and copy-on-write subtree reuse. Persisted formats and reader/runtime
+protocols are unchanged. No root is returned on partial failure, and the prior
+root remains valid. Raw spill staging does not need a separate artifact I/O phase
+or an addition policy duplicated in a second reducer.
