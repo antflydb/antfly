@@ -320,8 +320,16 @@ test "structured extraction request selects the JSON interface" {
 
 fn runHelpRequested(args: *std.process.Args.Iterator) bool {
     var probe = args.*;
+    var saw_flag = false;
     while (probe.next()) |arg| {
-        if (isHelpArg(arg)) return true;
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+        if (std.mem.startsWith(u8, arg, "-")) {
+            saw_flag = true;
+            continue;
+        }
+        // `help` is a request only before any flag, never a flag value such
+        // as `--models-dir help`.
+        if (!saw_flag and std.mem.eql(u8, arg, "help")) return true;
     }
     return false;
 }
@@ -1482,6 +1490,12 @@ test "inference runtime preserves effective process envelope provenance" {
             inferenceProcessMemoryLimitProvenance(case.source),
         );
     }
+}
+
+test "inference run treats help after a flag as its value" {
+    var argv = [_][*:0]const u8{ "--models-dir", "help" };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expect(!runHelpRequested(&args));
 }
 
 test "inference run detects trailing help without consuming arguments" {
