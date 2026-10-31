@@ -39,6 +39,8 @@ const leann = @import("antfly_vectorindex").leann;
 const search_results = @import("antfly_vectorindex").search_results;
 const search_types = @import("antfly_vectorindex").search_types;
 const vec = @import("antfly_vector").vector;
+const replicated_mod = @import("leann_replicated.zig");
+const replica_mod = @import("leann_replica.zig");
 
 pub const file_name = "leann.store";
 const magic = "LEANNSTR";
@@ -57,6 +59,9 @@ pub const Options = struct {
     /// Rebuild on sync once this fraction of graph nodes is deleted.
     rebuild_deleted_fraction: f64 = 0.2,
     seed: u64 = 42,
+    /// Leader replication: graph changes arrive only as committed records
+    /// (see leann_replicated.zig); local writes just mark keys dirty.
+    replicated: bool = false,
 };
 
 /// Loads the exact stored vector for a vector id. Same shape as the HBC
@@ -99,6 +104,9 @@ pub const LeannStore = struct {
     pending_of: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     loader: ?VectorLoader = null,
     dirty: bool = false,
+    /// Set in replicated mode; the local-mode fields above stay empty.
+    replicated: ?*replicated_mod.ReplicatedState = null,
+    durable_raft_index: u64 = 0,
 
     /// Opens the store kept in `dir_path`, loading its file when present.
     pub fn open(alloc: Allocator, io: std.Io, dir_path: []const u8, opts: Options) !*LeannStore {
@@ -112,6 +120,22 @@ pub const LeannStore = struct {
             .path = try std.fs.path.join(alloc, &.{ dir_path, file_name }),
         };
         errdefer alloc.free(self.path);
+        if (opts.replicated) {
+            alloc.free(self.path);
+            self.path = try std.fs.path.join(alloc, &.{ dir_path, replicated_mod.file_name });
+            const state = try alloc.create(replicated_mod.ReplicatedState);
+            errdefer alloc.destroy(state);
+            const ropts = replicatedOptions(opts);
+            const existing = std.Io.Dir.cwd().readFileAlloc(io, self.path, alloc, .unlimited) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            defer if (existing) |b| alloc.free(b);
+            state.* = if (existing) |b| try replicated_mod.ReplicatedState.decode(alloc, ropts, b) else try replicated_mod.ReplicatedState.init(alloc, ropts);
+            self.replicated = state;
+            self.durable_raft_index = state.applied_raft_index;
+            return self;
+        }
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, self.path, alloc, .unlimited) catch |err| switch (err) {
             error.FileNotFound => return self,
             else => return err,
@@ -124,7 +148,30 @@ pub const LeannStore = struct {
         return self;
     }
 
+    fn replicatedOptions(opts: Options) replicated_mod.Options {
+        return .{
+            .replica = .{
+                .config = .{
+                    .dims = opts.dims,
+                    .metric = @fromBackingInt(@intCast(@as(u8, @intCast(@backingInt(opts.metric))))),
+                    .quantizer = opts.quantizer,
+                    .max_degree = opts.max_degree,
+                    .seed = opts.seed,
+                },
+                .build_threshold = opts.build_threshold,
+            },
+            .rebuild_deleted_fraction = opts.rebuild_deleted_fraction,
+            .search_ef = opts.search_ef,
+            .bound_scale = opts.bound_scale,
+            .batch_size = opts.batch_size,
+        };
+    }
+
     pub fn deinit(self: *LeannStore) void {
+        if (self.replicated) |state| {
+            state.deinit();
+            self.alloc.destroy(state);
+        }
         self.clearState();
         self.nodes.deinit(self.alloc);
         self.node_of.deinit(self.alloc);
@@ -152,6 +199,50 @@ pub const LeannStore = struct {
 
     pub fn setLoader(self: *LeannStore, loader: VectorLoader) void {
         self.loader = loader;
+        if (self.replicated) |state| state.loader = .{ .ctx = loader.ctx, .load = loader.load };
+    }
+
+    pub fn isReplicated(self: *const LeannStore) bool {
+        return self.replicated != null;
+    }
+
+    /// Replicated mode: where install records fetch chunked generations.
+    pub fn setGenerationFetcher(self: *LeannStore, fetcher: replica_mod.GenerationFetcher) void {
+        if (self.replicated) |state| state.fetcher = fetcher;
+    }
+
+    /// Replicated mode, leader only: plans the next record (see
+    /// `ReplicatedState.plan`).
+    pub fn planRecord(self: *LeannStore, alloc: Allocator) !?replicated_mod.Planned {
+        const state = self.replicated orelse return error.NotReplicated;
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        return try state.plan(alloc);
+    }
+
+    /// Replicated mode: applies the record committed at `raft_index`.
+    pub fn applyRecord(self: *LeannStore, record: []const u8, raft_index: u64) !replica_mod.Outcome {
+        const state = self.replicated orelse return error.NotReplicated;
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        const outcome = try state.applyRecord(record, raft_index);
+        self.dirty = true;
+        return outcome;
+    }
+
+    /// Replicated mode: Raft index of the last applied record (0 if none).
+    pub fn appliedRaftIndex(self: *LeannStore) u64 {
+        const state = self.replicated orelse return 0;
+        self.lock.lockSharedUncancelable(self.io);
+        defer self.lock.unlockShared(self.io);
+        return state.applied_raft_index;
+    }
+
+    /// Replicated mode: Raft index durably persisted by the last `sync`.
+    pub fn durableRaftIndex(self: *LeannStore) u64 {
+        self.lock.lockSharedUncancelable(self.io);
+        defer self.lock.unlockShared(self.io);
+        return self.durable_raft_index;
     }
 
     pub fn stats(self: *LeannStore) Stats {
@@ -161,6 +252,10 @@ pub const LeannStore = struct {
     }
 
     fn statsLocked(self: *const LeannStore) Stats {
+        if (self.replicated) |state| {
+            const st = state.stats();
+            return .{ .live = st.live, .graph_nodes = st.graph_nodes, .deleted_nodes = st.deleted_nodes, .pending = st.dirty };
+        }
         const graph_nodes: u64 = self.nodes.items.len;
         const deleted: u64 = if (self.index) |*index| index.deleted_count else 0;
         return .{
@@ -185,6 +280,11 @@ pub const LeannStore = struct {
     pub fn apply(self: *LeannStore, items: anytype, deletes: []const u64) !void {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
+        if (self.replicated) |state| {
+            try state.noteWrites(items, deletes);
+            if (deletes.len > 0 or items.len > 0) self.dirty = true;
+            return;
+        }
         for (deletes) |vector_id| try self.deleteLocked(vector_id);
         for (items) |item| try self.upsertLocked(item.vector_id, item.vector, item.metadata);
         if (deletes.len > 0 or items.len > 0) self.dirty = true;
@@ -315,6 +415,7 @@ pub const LeannStore = struct {
         if (req.query.len != self.opts.dims) return error.DimensionMismatch;
         self.lock.lockSharedUncancelable(self.io);
         defer self.lock.unlockShared(self.io);
+        if (self.replicated) |state| return try state.search(alloc, req);
 
         var out = search_results.SearchResults.init(alloc, req.k);
         errdefer out.deinit();
@@ -382,6 +483,7 @@ pub const LeannStore = struct {
     pub fn getMetadata(self: *LeannStore, alloc: Allocator, vector_id: u64) !?[]u8 {
         self.lock.lockSharedUncancelable(self.io);
         defer self.lock.unlockShared(self.io);
+        if (self.replicated) |state| return try state.getMetadata(alloc, vector_id);
         if (self.node_of.get(vector_id)) |id| return try alloc.dupe(u8, self.nodes.items[id].metadata);
         if (self.pending_of.get(vector_id)) |slot| return try alloc.dupe(u8, self.pending.items[slot].metadata);
         return null;
@@ -433,6 +535,16 @@ pub const LeannStore = struct {
     pub fn sync(self: *LeannStore) !void {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
+        if (self.replicated) |state| {
+            // Rebuilds are planned by the leader, never done locally.
+            if (!self.dirty) return;
+            const bytes = try state.encode(self.alloc);
+            defer self.alloc.free(bytes);
+            try writeFileAtomicallyDurable(self.alloc, self.io, self.path, bytes);
+            self.durable_raft_index = state.applied_raft_index;
+            self.dirty = false;
+            return;
+        }
         if (self.index) |*index| {
             if (index.deletedFraction() >= self.opts.rebuild_deleted_fraction and self.loader != null) {
                 try self.rebuildLocked();

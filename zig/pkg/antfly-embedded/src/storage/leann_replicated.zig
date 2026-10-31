@@ -42,6 +42,10 @@ pub const file_name = "leann.replica";
 const magic = "LEANNRST";
 const format_version: u32 = 1;
 const delete_digest: u64 = 0;
+/// Dirty marker for "re-index from the stored vector": set after an install
+/// for keys the generation lacks. `vectorDigest` values are odd, so even
+/// sentinels never collide with them.
+const refresh_digest: u64 = 2;
 
 /// Loads a stored vector by local vector id and key (HBC's loader shape).
 pub const VectorLoader = struct {
@@ -55,6 +59,9 @@ pub const Options = struct {
     max_record_keys: usize = 256,
     /// Plan a rebuild once this fraction of graph nodes is deleted.
     rebuild_deleted_fraction: f64 = 0.2,
+    /// Plan a checkpoint generation after this many records, which bounds
+    /// the log history replicas keep for catch-up.
+    checkpoint_records: u64 = 20_000,
     search_ef: u32 = 0,
     bound_scale: f32 = 1.0,
     batch_size: u32 = 0,
@@ -74,6 +81,59 @@ pub const Planned = struct {
         self.* = undefined;
     }
 };
+
+/// Generations larger than the inline limit travel through the log as
+/// chunk records; replicas store them and the digest-only install record
+/// assembles them. Chunk records start with `chunk_magic`, replica records
+/// with a different byte, so one command type carries both.
+pub const chunk_magic: u8 = 0x43; // 'C'
+pub const chunk_bytes: usize = 1 << 20;
+
+pub const Chunk = struct { generation: u64, digest: u64, seq: u32, total: u32, data: []const u8 };
+
+pub fn isChunkRecord(record: []const u8) bool {
+    return record.len > 0 and record[0] == chunk_magic;
+}
+
+/// Splits generation bytes into encoded chunk records, in order.
+pub fn encodeChunkRecords(alloc: Allocator, blob: Planned.Blob) ![][]u8 {
+    const total: usize = @max(1, std.math.divCeil(usize, blob.bytes.len, chunk_bytes) catch unreachable);
+    const out = try alloc.alloc([]u8, total);
+    var made: usize = 0;
+    errdefer {
+        for (out[0..made]) |r| alloc.free(r);
+        alloc.free(out);
+    }
+    for (0..total) |i| {
+        const data = blob.bytes[@min(i * chunk_bytes, blob.bytes.len)..@min((i + 1) * chunk_bytes, blob.bytes.len)];
+        const rec = try alloc.alloc(u8, 1 + 8 + 8 + 4 + 4 + data.len + 4);
+        rec[0] = chunk_magic;
+        std.mem.writeInt(u64, rec[1..9], blob.generation, .little);
+        std.mem.writeInt(u64, rec[9..17], blob.digest, .little);
+        std.mem.writeInt(u32, rec[17..21], @intCast(i), .little);
+        std.mem.writeInt(u32, rec[21..25], @intCast(total), .little);
+        @memcpy(rec[25..][0..data.len], data);
+        std.mem.writeInt(u32, rec[rec.len - 4 ..][0..4], std.hash.Crc32.hash(rec[0 .. rec.len - 4]), .little);
+        out[i] = rec;
+        made += 1;
+    }
+    return out;
+}
+
+/// Decodes a chunk record; `data` borrows from `record`.
+pub fn decodeChunkRecord(record: []const u8) !Chunk {
+    if (record.len < 29 or record[0] != chunk_magic) return error.InvalidRecord;
+    if (std.hash.Crc32.hash(record[0 .. record.len - 4]) != std.mem.readInt(u32, record[record.len - 4 ..][0..4], .little)) return error.InvalidRecord;
+    const c = Chunk{
+        .generation = std.mem.readInt(u64, record[1..9], .little),
+        .digest = std.mem.readInt(u64, record[9..17], .little),
+        .seq = std.mem.readInt(u32, record[17..21], .little),
+        .total = std.mem.readInt(u32, record[21..25], .little),
+        .data = record[25 .. record.len - 4],
+    };
+    if (c.total == 0 or c.seq >= c.total or c.data.len > chunk_bytes) return error.InvalidRecord;
+    return c;
+}
 
 pub const Stats = struct {
     live: u64,
@@ -96,6 +156,13 @@ pub const ReplicatedState = struct {
     dirty: std.StringHashMapUnmanaged(u64) = .empty,
     /// Raft index of the last record applied (or skipped).
     applied_raft_index: u64 = 0,
+    /// Earliest Raft index a replica needs to rebuild this state from the
+    /// log: the current generation's first chunk, or its install record.
+    /// Records before it may be pruned.
+    generation_floor: u64 = 0,
+    /// Lowest chunk Raft index read by the fetcher for the install being
+    /// applied; set by the caller's fetcher.
+    last_fetch_floor: ?u64 = null,
     /// Set while a planned record is uncommitted; cleared when any record
     /// applies or is skipped, so a lost proposal is re-planned.
     inflight: bool = false,
@@ -237,7 +304,8 @@ pub const ReplicatedState = struct {
 
     fn planRebuildIfNeeded(self: *ReplicatedState, alloc: Allocator) !?Planned {
         const index = self.replica.index orelse return null;
-        if (index.deletedFraction() < self.opts.rebuild_deleted_fraction) return null;
+        if (index.deletedFraction() < self.opts.rebuild_deleted_fraction and
+            self.replica.version < self.opts.checkpoint_records) return null;
         const loader = self.loader orelse return error.MissingVectorLoader;
         var ctx = KeyLoader{ .state = self, .loader = loader };
         const planned = try self.replica.planRebuild(alloc, ctx.keyLoader());
@@ -276,19 +344,57 @@ pub const ReplicatedState = struct {
     /// generation cannot be fetched yet.
     pub fn applyRecord(self: *ReplicatedState, record: []const u8, raft_index: u64) !replica_mod.Outcome {
         if (raft_index <= self.applied_raft_index) return .stale;
+        if (isChunkRecord(record)) {
+            // Stored by the caller; consumed by a later install record. The
+            // planner's in-flight rebuild continues.
+            _ = try decodeChunkRecord(record);
+            self.applied_raft_index = raft_index;
+            return .applied;
+        }
+        self.last_fetch_floor = null;
         const outcome = try self.replica.apply(record, self.fetcher);
         if (outcome == .applied) {
             const effects = try replica_mod.Replica.recordEffects(self.alloc, record);
             defer self.alloc.free(effects.effects);
             for (effects.effects) |e| {
                 const local = self.dirty.get(e.key) orelse continue;
-                const covered = if (e.digest) |d| local == d else local == delete_digest;
+                const covered = if (e.digest) |d| local == d or local == refresh_digest else local == delete_digest;
                 if (covered) self.clearDirty(e.key);
+            }
+            if (effects.full_state) {
+                self.generation_floor = @min(raft_index, self.last_fetch_floor orelse raft_index);
+                try self.reconcileAfterInstall();
             }
         }
         self.applied_raft_index = raft_index;
         self.inflight = false;
         return outcome;
+    }
+
+    /// After an install replaced the state: pending keys the generation
+    /// already holds (same digest) are done; bound keys it lacks, and live
+    /// keys deleted locally, are queued so the leader re-plans them. A
+    /// rebuild that raced newer writes therefore loses nothing.
+    fn reconcileAfterInstall(self: *ReplicatedState) !void {
+        var done = std.ArrayListUnmanaged([]const u8).empty;
+        defer done.deinit(self.alloc);
+        var dit = self.dirty.iterator();
+        while (dit.next()) |e| {
+            const live = self.replica.liveDigest(e.key_ptr.*);
+            const covered = if (e.value_ptr.* == delete_digest) live == null else (live != null and live.? == e.value_ptr.*);
+            if (covered) try done.append(self.alloc, e.key_ptr.*);
+        }
+        for (done.items) |k| self.clearDirty(k);
+        var bit = self.bindings.keyIterator();
+        while (bit.next()) |k| {
+            if (self.dirty.contains(k.*) or self.replica.contains(k.*)) continue;
+            try self.markDirty(k.*, refresh_digest);
+        }
+        var lit = self.replica.digest_of.keyIterator();
+        while (lit.next()) |k| {
+            if (self.dirty.contains(k.*) or self.bindings.contains(k.*)) continue;
+            try self.markDirty(k.*, delete_digest);
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -358,6 +464,7 @@ pub const ReplicatedState = struct {
         try wr.writeAll(magic);
         try wr.writeInt(u32, format_version, .little);
         try wr.writeInt(u64, self.applied_raft_index, .little);
+        try wr.writeInt(u64, self.generation_floor, .little);
         const state = try self.replica.encodeState(alloc);
         defer alloc.free(state);
         try writeBytes(wr, state);
@@ -387,7 +494,9 @@ pub const ReplicatedState = struct {
         if (!std.mem.eql(u8, head, magic)) return error.InvalidLeannState;
         if ((r.takeInt(u32, .little) catch return error.InvalidLeannState) != format_version) return error.InvalidLeannState;
         const applied = r.takeInt(u64, .little) catch return error.InvalidLeannState;
+        const floor = r.takeInt(u64, .little) catch return error.InvalidLeannState;
         var self = ReplicatedState{
+            .generation_floor = floor,
             .alloc = alloc,
             .opts = opts,
             .replica = try replica_mod.Replica.decodeState(alloc, opts.replica, try readBytes(&r)),
@@ -586,4 +695,90 @@ test "leann replicated state: a lost proposal is re-planned by the next leader" 
     try testing.expect(!a.inflight);
     try testing.expectEqual(@as(u64, 0), a.stats().dirty);
     try testing.expectEqual(@as(u64, 6), a.stats().live);
+}
+
+test "leann replicated state: generation chunks round-trip" {
+    const alloc = testing.allocator;
+    const bytes = try alloc.alloc(u8, chunk_bytes * 2 + 17);
+    defer alloc.free(bytes);
+    for (bytes, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const records = try encodeChunkRecords(alloc, .{ .generation = 3, .digest = 99, .bytes = bytes });
+    defer {
+        for (records) |r| alloc.free(r);
+        alloc.free(records);
+    }
+    try testing.expectEqual(@as(usize, 3), records.len);
+    var joined = std.ArrayListUnmanaged(u8).empty;
+    defer joined.deinit(alloc);
+    for (records, 0..) |r, i| {
+        try testing.expect(isChunkRecord(r));
+        const c = try decodeChunkRecord(r);
+        try testing.expectEqual(@as(u32, @intCast(i)), c.seq);
+        try testing.expectEqual(@as(u32, 3), c.total);
+        try joined.appendSlice(alloc, c.data);
+    }
+    try testing.expectEqualSlices(u8, bytes, joined.items);
+    const bad = try alloc.dupe(u8, records[1]);
+    defer alloc.free(bad);
+    bad[30] ^= 1;
+    try testing.expectError(error.InvalidRecord, decodeChunkRecord(bad));
+}
+
+test "leann replicated state: a new replica catches up from the latest generation" {
+    const alloc = testing.allocator;
+    const dims = 8;
+    const opts = Options{ .replica = .{ .config = .{ .dims = dims, .max_degree = 8 }, .build_threshold = 20 }, .checkpoint_records = 3 };
+    var leader = try ReplicatedState.init(alloc, opts);
+    defer leader.deinit();
+    var primary = TestPrimary{ .alloc = alloc };
+    defer primary.deinit();
+    leader.loader = primary.loader();
+    var log = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (log.items) |e| alloc.free(e);
+        log.deinit(alloc);
+    }
+    var keys: [80][8]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(5);
+    var install_index: ?usize = null;
+    for (0..80) |i| {
+        var v: [dims]f32 = undefined;
+        for (&v, 0..) |*x, j| x.* = @as(f32, @floatFromInt((i + j) % 3)) + prng.random().floatNorm(f32) * 0.3;
+        try primary.put(i, &v);
+        const key = try std.fmt.bufPrint(&keys[i], "k{d:0>3}", .{i});
+        try leader.noteWrites(&[_]TestItem{.{ .vector_id = i, .vector = &v, .metadata = key }}, &.{});
+        if (i % 8 == 7) while (try leader.plan(alloc)) |planned_value| {
+            var planned = planned_value;
+            defer planned.deinit(alloc);
+            try testing.expect(planned.blob == null);
+            try log.append(alloc, try alloc.dupe(u8, planned.record));
+            _ = try leader.applyRecord(planned.record, log.items.len);
+            if (leader.generation_floor == log.items.len) install_index = log.items.len;
+        };
+    }
+    // Checkpoints were planned; the floor points at the latest install.
+    try testing.expect(install_index != null);
+    try testing.expect(leader.replica.generation >= 2);
+
+    // A new replica sees only the log from the floor on (older records were
+    // pruned), with its own vector ids from its own derived replay.
+    var fresh = try ReplicatedState.init(alloc, opts);
+    defer fresh.deinit();
+    var fresh_primary = TestPrimary{ .alloc = alloc };
+    defer fresh_primary.deinit();
+    fresh.loader = fresh_primary.loader();
+    for (0..80) |i| {
+        const v = primary.vectors.get(i).?;
+        try fresh_primary.put(500 + i, v);
+        try fresh.noteWrites(&[_]TestItem{.{ .vector_id = 500 + i, .vector = v, .metadata = keys[i][0..4] }}, &.{});
+    }
+    for (log.items[leader.generation_floor - 1 ..], leader.generation_floor..) |rec, raft| _ = try fresh.applyRecord(rec, raft);
+
+    const a = try leader.replica.encodeState(alloc);
+    defer alloc.free(a);
+    const b = try fresh.replica.encodeState(alloc);
+    defer alloc.free(b);
+    try testing.expectEqualSlices(u8, a, b);
+    // Everything indexed matches what the new replica saw: nothing pending.
+    try testing.expectEqual(@as(u64, 0), fresh.stats().dirty);
 }

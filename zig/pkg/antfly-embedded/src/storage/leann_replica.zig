@@ -92,7 +92,7 @@ const OpKind = enum(u8) {
 
 const record_magic: u8 = 0x4c; // 'L'
 const generation_magic = "LEANNGEN";
-const generation_format: u32 = 1;
+const generation_format: u32 = 2;
 
 pub const Replica = struct {
     alloc: Allocator,
@@ -110,6 +110,8 @@ pub const Replica = struct {
     /// Exact buffer before the first build, in commit order.
     buffer_keys: std.ArrayListUnmanaged([]u8) = .empty,
     buffer_vectors: std.ArrayListUnmanaged([]f32) = .empty,
+    /// Live key -> `vectorDigest` of its indexed vector. Owns its keys.
+    digest_of: std.StringHashMapUnmanaged(u64) = .empty,
 
     pub fn init(alloc: Allocator, opts: Options) !Replica {
         _ = try opts.config.resolved();
@@ -122,7 +124,31 @@ pub const Replica = struct {
         self.node_of.deinit(self.alloc);
         self.buffer_keys.deinit(self.alloc);
         self.buffer_vectors.deinit(self.alloc);
+        freeDigests(self.alloc, &self.digest_of);
         self.* = undefined;
+    }
+
+    /// Digest of the vector indexed for a live key.
+    pub fn liveDigest(self: *const Replica, key: []const u8) ?u64 {
+        return self.digest_of.get(key);
+    }
+
+    /// Records a digest change in the undo log, then makes it.
+    fn setDigest(self: *Replica, key: []const u8, digest: ?u64, undo: *UndoLog) !void {
+        const prev = self.digest_of.get(key);
+        const undo_key = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(undo_key);
+        try undo.entries.ensureUnusedCapacity(self.alloc, 1);
+        if (digest) |d| {
+            if (self.digest_of.getPtr(key)) |ptr| {
+                ptr.* = d;
+            } else {
+                const owned = try self.alloc.dupe(u8, key);
+                errdefer self.alloc.free(owned);
+                try self.digest_of.put(self.alloc, owned, d);
+            }
+        } else if (self.digest_of.fetchRemove(key)) |kv| self.alloc.free(kv.key);
+        undo.entries.appendAssumeCapacity(.{ .digest = .{ .key = undo_key, .prev = prev } });
     }
 
     fn clear(self: *Replica) void {
@@ -135,6 +161,8 @@ pub const Replica = struct {
         for (self.buffer_vectors.items) |v| self.alloc.free(v);
         self.buffer_keys.clearRetainingCapacity();
         self.buffer_vectors.clearRetainingCapacity();
+        freeDigests(self.alloc, &self.digest_of);
+        self.digest_of = .empty;
     }
 
     pub fn liveCount(self: *const Replica) usize {
@@ -171,6 +199,7 @@ pub const Replica = struct {
                 if (self.node_of.get(w.key)) |node| {
                     var delta = try self.index.?.planDelete(node);
                     try self.applyGraphDelete(w.key, delta, &undo);
+                    try self.setDigest(w.key, null, &undo);
                     try ops.append(alloc, .{ .kind = .graph_delete, .key = w.key, .delta = try delta.encode(alloc) });
                     delta.deinit(alloc);
                 }
@@ -179,14 +208,17 @@ pub const Replica = struct {
                     var delta = try self.index.?.planInsert(alloc, ctx.source(), v);
                     defer delta.deinit(alloc);
                     try self.applyGraphInsert(w.key, delta, &undo);
+                    try self.setDigest(w.key, vectorDigest(v), &undo);
                     try ops.append(alloc, .{ .kind = .graph_insert, .key = w.key, .delta = try delta.encode(alloc), .vector_digest = vectorDigest(v) });
                 }
             } else {
                 if (w.vector) |v| {
                     try self.applyBufferPut(w.key, v, &undo);
+                    try self.setDigest(w.key, vectorDigest(v), &undo);
                     try ops.append(alloc, .{ .kind = .buffer_put, .key = w.key, .vector = v });
                 } else if (self.bufferIndex(w.key) != null) {
                     try self.applyBufferDelete(w.key, &undo);
+                    try self.setDigest(w.key, null, &undo);
                     try ops.append(alloc, .{ .kind = .buffer_delete, .key = w.key });
                 }
             }
@@ -258,6 +290,9 @@ pub const Replica = struct {
             if (v.len != d) return error.DimensionMismatch;
             @memcpy(flat[i * d ..][0..d], v);
         }
+        const digests = try alloc.alloc(u64, keys.len);
+        defer alloc.free(digests);
+        for (keys, 0..) |_, i| digests[i] = vectorDigest(flat[i * d ..][0..d]);
         var index = try leann.Index.build(alloc, self.opts.config, flat);
         defer index.deinit();
         const graph = try index.serialize(alloc);
@@ -268,7 +303,10 @@ pub const Replica = struct {
         try wr.writeAll(generation_magic);
         try wr.writeInt(u32, generation_format, .little);
         try wr.writeInt(u32, @intCast(keys.len), .little);
-        for (keys) |k| try writeBytes(wr, k);
+        for (keys, digests) |k, dg| {
+            try writeBytes(wr, k);
+            try wr.writeInt(u64, dg, .little);
+        }
         try writeBytes(wr, graph);
         return w.toOwnedSlice();
     }
@@ -283,7 +321,14 @@ pub const Replica = struct {
     pub fn apply(self: *Replica, record: []const u8, fetcher: ?GenerationFetcher) !Outcome {
         var decoded = try decodeRecord(self.alloc, record);
         defer decoded.deinit(self.alloc);
-        if (decoded.generation != self.generation or decoded.version != self.version) return .stale;
+        // A record that only installs a newer generation replaces the whole
+        // state, so it applies from any state; that is how a new replica
+        // catches up. Everything else must match the state it was planned
+        // against.
+        const install_only = decoded.ops.len == 1 and decoded.ops[0].kind == .install_generation;
+        if (install_only) {
+            if (decoded.ops[0].generation <= self.generation) return .stale;
+        } else if (decoded.generation != self.generation or decoded.version != self.version) return .stale;
 
         // Fetch any generation first so a fetch failure changes nothing.
         var fetched: ?[]u8 = null;
@@ -320,10 +365,12 @@ pub const Replica = struct {
                 const v = op.vector orelse return error.InvalidRecord;
                 if (v.len != self.opts.config.dims) return error.InvalidRecord;
                 try self.applyBufferPut(op.key, v, undo);
+                try self.setDigest(op.key, vectorDigest(v), undo);
             },
             .buffer_delete => {
                 if (self.index != null or self.bufferIndex(op.key) == null) return error.InvalidRecord;
                 try self.applyBufferDelete(op.key, undo);
+                try self.setDigest(op.key, null, undo);
             },
             .graph_insert, .graph_delete => {
                 if (self.index == null) return error.InvalidRecord;
@@ -332,14 +379,16 @@ pub const Replica = struct {
                 if (op.kind == .graph_insert) {
                     if (delta.kind != .insert or self.node_of.contains(op.key)) return error.InvalidRecord;
                     try self.applyGraphInsert(op.key, delta, undo);
+                    try self.setDigest(op.key, op.vector_digest, undo);
                 } else {
                     const node = self.node_of.get(op.key) orelse return error.InvalidRecord;
                     if (delta.kind != .delete or delta.id != node) return error.InvalidRecord;
                     try self.applyGraphDelete(op.key, delta, undo);
+                    try self.setDigest(op.key, null, undo);
                 }
             },
             .install_generation => {
-                if (op.generation != self.generation + 1) return error.InvalidRecord;
+                if (op.generation <= self.generation) return error.InvalidRecord;
                 const bytes = op.payload orelse fetched orelse return error.InvalidRecord;
                 if (std.hash.Wyhash.hash(0, bytes) != op.digest) return error.InvalidRecord;
                 try self.installGenerationBytes(bytes, op.generation, undo);
@@ -416,10 +465,12 @@ pub const Replica = struct {
             .node_of = self.node_of,
             .buffer_keys = self.buffer_keys,
             .buffer_vectors = self.buffer_vectors,
+            .digest_of = self.digest_of,
         };
         self.index = decoded.index;
         self.keys = decoded.keys;
         self.node_of = decoded.node_of;
+        self.digest_of = decoded.digest_of;
         self.buffer_keys = .empty;
         self.buffer_vectors = .empty;
         self.generation = generation;
@@ -435,6 +486,14 @@ pub const Replica = struct {
                 .buffer_appended => {
                     self.alloc.free(self.buffer_keys.pop().?);
                     self.alloc.free(self.buffer_vectors.pop().?);
+                },
+                .digest => |d| {
+                    if (self.digest_of.fetchRemove(d.key)) |kv| self.alloc.free(kv.key);
+                    if (d.prev) |prev| {
+                        // Re-inserting a key that was present before cannot
+                        // fail for capacity: the map held it.
+                        self.digest_of.putAssumeCapacity(d.key, prev);
+                    } else self.alloc.free(d.key);
                 },
                 .buffer_replaced => |r| {
                     self.alloc.free(self.buffer_vectors.items[r.index]);
@@ -458,6 +517,8 @@ pub const Replica = struct {
                 .installed => |s| {
                     var current = State{ .index = self.index, .keys = self.keys, .node_of = self.node_of };
                     current.deinit(self.alloc);
+                    freeDigests(self.alloc, &self.digest_of);
+                    self.digest_of = s.digest_of;
                     self.generation = s.generation;
                     self.version = s.version;
                     self.index = s.index;
@@ -557,6 +618,22 @@ pub const Replica = struct {
             try writeBytes(wr, k);
             for (v) |f| try wr.writeInt(u32, @bitCast(f), .little);
         }
+        // Sorted, so the bytes do not depend on hash-map history.
+        const sorted = try alloc.alloc([]const u8, self.digest_of.count());
+        defer alloc.free(sorted);
+        var it = self.digest_of.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| : (i += 1) sorted[i] = k.*;
+        std.mem.sortUnstable([]const u8, sorted, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        try wr.writeInt(u32, @intCast(sorted.len), .little);
+        for (sorted) |k| {
+            try writeBytes(wr, k);
+            try wr.writeInt(u64, self.digest_of.get(k).?, .little);
+        }
         return w.toOwnedSlice();
     }
 
@@ -591,6 +668,12 @@ pub const Replica = struct {
             for (v) |*f| f.* = @bitCast(r.takeInt(u32, .little) catch return error.InvalidState);
             try self.buffer_keys.append(alloc, k);
             try self.buffer_vectors.append(alloc, v);
+        }
+        const nd = r.takeInt(u32, .little) catch return error.InvalidState;
+        for (0..nd) |_| {
+            const k = try alloc.dupe(u8, try readBytes(&r));
+            errdefer alloc.free(k);
+            try self.digest_of.put(alloc, k, r.takeInt(u64, .little) catch return error.InvalidState);
         }
         if (r.bufferedLen() != 0) return error.InvalidState;
         return self;
@@ -654,6 +737,7 @@ const State = struct {
 };
 
 const Saved = struct {
+    digest_of: std.StringHashMapUnmanaged(u64),
     generation: u64,
     version: u64,
     index: ?leann.Index,
@@ -669,6 +753,8 @@ const UndoEntry = union(enum) {
     buffer_removed: struct { index: usize, key: []u8, vector: []f32 },
     graph: struct { delta: leann.Delta, undo: leann.Index.Undo },
     installed: Saved,
+    /// `key` is owned; on revert it moves back into the map or is freed.
+    digest: struct { key: []u8, prev: ?u64 },
 };
 
 const UndoLog = struct {
@@ -686,6 +772,7 @@ const UndoLog = struct {
                 alloc.free(r.vector);
             },
             .graph => |*g| g.delta.deinit(alloc),
+            .digest => |d| alloc.free(d.key),
             .installed => |s| {
                 var old = State{ .index = s.index, .keys = s.keys, .node_of = s.node_of };
                 old.deinit(alloc);
@@ -695,6 +782,8 @@ const UndoLog = struct {
                 for (bv.items) |v| alloc.free(v);
                 bk.deinit(alloc);
                 bv.deinit(alloc);
+                var dm = s.digest_of;
+                freeDigests(alloc, &dm);
             },
         };
         self.entries.clearRetainingCapacity();
@@ -862,12 +951,20 @@ const DecodedGeneration = struct {
     index: ?leann.Index,
     keys: std.ArrayListUnmanaged([]u8),
     node_of: std.StringHashMapUnmanaged(u32),
+    digest_of: std.StringHashMapUnmanaged(u64) = .empty,
 
     fn deinit(self: *DecodedGeneration, alloc: Allocator) void {
         var s = State{ .index = self.index, .keys = self.keys, .node_of = self.node_of };
         s.deinit(alloc);
+        freeDigests(alloc, &self.digest_of);
     }
 };
+
+fn freeDigests(alloc: Allocator, map: *std.StringHashMapUnmanaged(u64)) void {
+    var it = map.keyIterator();
+    while (it.next()) |k| alloc.free(k.*);
+    map.deinit(alloc);
+}
 
 fn decodeGeneration(alloc: Allocator, bytes: []const u8, dims: u32) !DecodedGeneration {
     var out = DecodedGeneration{ .index = null, .keys = .empty, .node_of = .empty };
@@ -880,7 +977,13 @@ fn decodeGeneration(alloc: Allocator, bytes: []const u8, dims: u32) !DecodedGene
     for (0..n) |_| {
         const k = try alloc.dupe(u8, try readBytes(&r));
         errdefer alloc.free(k);
+        const digest = r.takeInt(u64, .little) catch return error.InvalidGeneration;
         try out.keys.append(alloc, k);
+        const dk = try alloc.dupe(u8, k);
+        errdefer alloc.free(dk);
+        const gop = try out.digest_of.getOrPut(alloc, dk);
+        if (gop.found_existing) return error.InvalidGeneration;
+        gop.value_ptr.* = digest;
     }
     out.index = try leann.Index.deserialize(alloc, try readBytes(&r));
     if (out.index.?.node_count != n or out.index.?.config.dims != dims) return error.InvalidGeneration;
