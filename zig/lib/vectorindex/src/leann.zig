@@ -634,7 +634,7 @@ pub const Index = struct {
                 }
             }
             if (worst_i == list.len) continue;
-            try edits.append(alloc, .{ .layer = 0, .owner = u, .slot = @intCast(worst_i) });
+            try edits.append(alloc, .{ .layer = 0, .owner = u, .slot = @intCast(worst_i), .old = list[worst_i] });
             try Deg.add(alloc, &overlay, list[worst_i], -1);
             try Deg.add(alloc, &overlay, id, 1);
         }
@@ -660,7 +660,7 @@ pub const Index = struct {
                     }
                 }
                 if (worst_i == list.len) continue;
-                try edits.append(alloc, .{ .layer = @intCast(l), .owner = u, .slot = @intCast(worst_i) });
+                try edits.append(alloc, .{ .layer = @intCast(l), .owner = u, .slot = @intCast(worst_i), .old = list[worst_i] });
             }
         }
         delta.edits = try edits.toOwnedSlice(alloc);
@@ -678,12 +678,31 @@ pub const Index = struct {
     /// (the caller then needs a fresh generation) and malformed deltas with
     /// `error.InvalidDelta`; in both cases the index is unchanged.
     pub fn applyDelta(self: *Index, delta: Delta) !void {
+        _ = try self.applyDeltaUndoable(delta);
+    }
+
+    /// What `revertDelta` needs beyond the delta itself.
+    pub const Undo = struct {
+        prev_entry: u32,
+        prev_max_level: u8,
+        /// Delete deltas only: whether the node was live before.
+        was_live: bool = false,
+    };
+
+    /// `applyDelta`, also returning what is needed to revert it. Planners use
+    /// this to plan a batch (each insert sees the previous ones) and then
+    /// revert, so their state only changes when the batch is committed.
+    pub fn applyDeltaUndoable(self: *Index, delta: Delta) !Undo {
         if (delta.base_version != self.version) return error.DeltaVersionMismatch;
+        const undo = Undo{ .prev_entry = self.entry, .prev_max_level = self.max_level };
         switch (delta.kind) {
             .delete => {
                 if (delta.id >= self.node_count) return error.InvalidDelta;
+                const was_live = !self.isDeleted(delta.id);
                 try self.markDeleted(delta.id);
-                return;
+                var out = undo;
+                out.was_live = was_live;
+                return out;
             },
             .insert => {},
         }
@@ -741,6 +760,55 @@ pub const Index = struct {
             self.entry = id;
         }
         self.version += 1;
+        return undo;
+    }
+
+    /// Reverts the most recently applied delta. Deltas must be reverted in
+    /// reverse order of application.
+    pub fn revertDelta(self: *Index, delta: Delta, undo: Undo) void {
+        std.debug.assert(self.version == delta.base_version + 1);
+        self.version -= 1;
+        switch (delta.kind) {
+            .delete => {
+                if (undo.was_live) {
+                    self.flags.items[delta.id] &= ~flag_deleted;
+                    self.deleted_count -= 1;
+                }
+                return;
+            },
+            .insert => {},
+        }
+        const id = delta.id;
+        std.debug.assert(id + 1 == self.node_count);
+        var i = delta.edits.len;
+        while (i > 0) {
+            i -= 1;
+            const e = delta.edits[i];
+            const list = if (e.layer == 0) &self.adjacency.items[e.owner] else &self.upper.items[e.owner][e.layer - 1];
+            if (e.slot == Delta.append_slot) {
+                std.debug.assert(list.items[list.items.len - 1] == id);
+                list.items.len -= 1;
+            } else {
+                list.items[e.slot] = e.old;
+                if (e.layer == 0) self.indegree.items[e.old] += 1;
+            }
+            if (e.layer == 0) self.indegree.items[id] -= 1;
+        }
+        for (delta.forward) |u| self.indegree.items[u] -= 1;
+        var forward = self.adjacency.pop().?;
+        forward.deinit(self.alloc);
+        freeLists(self.alloc, self.upper.pop().?);
+        self.flags.items.len -= 1;
+        self.indegree.items.len -= 1;
+        self.popCode();
+        self.node_count -= 1;
+        self.entry = undo.prev_entry;
+        self.max_level = undo.prev_max_level;
+    }
+
+    fn popCode(self: *Index) void {
+        if (self.rabitq) |*r| return r.popRow();
+        self.codes.items.len -= self.config.pq_subspaces;
     }
 
     fn validateInsertDelta(self: *const Index, delta: Delta) !void {
@@ -762,9 +830,10 @@ pub const Index = struct {
             if (e.layer > 0 and self.upper.items[e.owner].len < e.layer) return error.InvalidDelta;
             const len = if (e.layer == 0) self.adjacency.items[e.owner].items.len else self.upper.items[e.owner][e.layer - 1].items.len;
             if (e.slot != Delta.append_slot and e.slot >= len) return error.InvalidDelta;
-            if (e.slot != Delta.append_slot and e.layer == 0) {
-                const old = self.adjacency.items[e.owner].items[e.slot];
-                if (self.indegree.items[old] == 0) return error.InvalidDelta;
+            if (e.slot != Delta.append_slot) {
+                const current = if (e.layer == 0) self.adjacency.items[e.owner].items[e.slot] else self.upper.items[e.owner][e.layer - 1].items[e.slot];
+                if (current != e.old) return error.InvalidDelta;
+                if (e.layer == 0 and self.indegree.items[current] == 0) return error.InvalidDelta;
             }
         }
     }
@@ -1349,7 +1418,10 @@ pub const Delta = struct {
 
     pub const Kind = enum(u8) { insert = 1, delete = 2 };
     pub const append_slot: u32 = std.math.maxInt(u32);
-    pub const Edit = struct { layer: u8, owner: u32, slot: u32 };
+    /// `old` is the id being replaced (unused for appends). Applying checks
+    /// it, which catches a replica whose graph has diverged, and reverting
+    /// restores it.
+    pub const Edit = struct { layer: u8, owner: u32, slot: u32, old: u32 = 0 };
 
     pub fn deinit(self: *Delta, alloc: Allocator) void {
         if (self.code.len > 0) alloc.free(self.code);
@@ -1378,6 +1450,7 @@ pub const Delta = struct {
                 try wr.writeByte(e.layer);
                 try wr.writeInt(u32, e.owner, .little);
                 try wr.writeInt(u32, e.slot, .little);
+                try wr.writeInt(u32, e.old, .little);
             }
         }
         return w.toOwnedSlice();
@@ -1416,6 +1489,7 @@ pub const Delta = struct {
                 .layer = r.takeByte() catch return error.InvalidDelta,
                 .owner = r.takeInt(u32, .little) catch return error.InvalidDelta,
                 .slot = r.takeInt(u32, .little) catch return error.InvalidDelta,
+                .old = r.takeInt(u32, .little) catch return error.InvalidDelta,
             };
         }
         if (r.bufferedLen() != 0) return error.InvalidDelta;
@@ -1660,6 +1734,14 @@ pub const RaBitQCodes = struct {
         self.centroid_distances.appendAssumeCapacity(@bitCast(std.mem.readInt(u32, bytes[pos + 4 ..][0..4], .little)));
         self.quantized_dot_products.appendAssumeCapacity(@bitCast(std.mem.readInt(u32, bytes[pos + 8 ..][0..4], .little)));
         if (self.metric != .l2_squared) self.centroid_dot_products.appendAssumeCapacity(@bitCast(std.mem.readInt(u32, bytes[pos + 12 ..][0..4], .little)));
+    }
+
+    fn popRow(self: *RaBitQCodes) void {
+        self.codes.items.len -= self.width;
+        self.code_counts.items.len -= 1;
+        self.centroid_distances.items.len -= 1;
+        self.quantized_dot_products.items.len -= 1;
+        if (self.metric != .l2_squared) self.centroid_dot_products.items.len -= 1;
     }
 
     fn decodeRowBytes(self: *const RaBitQCodes, bytes: []const u8, out: []f32) void {
@@ -2817,4 +2899,60 @@ test "leann: stale and malformed deltas are rejected without changes" {
     defer ok.deinit(alloc);
     try index.applyDelta(ok);
     try testing.expectEqual(@as(u64, 2), index.version);
+}
+
+test "leann: a planned batch reverts exactly, then applies identically" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 600, 1, 32, 8, 53);
+    defer fx.deinit(alloc);
+    for ([_]Quantizer{ .pq, .rabitq }) |quantizer| {
+        var leader = try Index.build(alloc, .{ .dims = 32, .metric = .cosine, .quantizer = quantizer, .max_degree = 12 }, fx.data[0 .. 400 * 32]);
+        defer leader.deinit();
+        const committed = try leader.serialize(alloc);
+        defer alloc.free(committed);
+        var follower = try Index.deserialize(alloc, committed);
+        defer follower.deinit();
+
+        var node_vectors = std.ArrayListUnmanaged(f32).empty;
+        defer node_vectors.deinit(alloc);
+        try node_vectors.appendSlice(alloc, fx.data[0 .. 400 * 32]);
+        var deltas = std.ArrayListUnmanaged(Delta).empty;
+        defer {
+            for (deltas.items) |*d| d.deinit(alloc);
+            deltas.deinit(alloc);
+        }
+        var undos = std.ArrayListUnmanaged(Index.Undo).empty;
+        defer undos.deinit(alloc);
+
+        // Plan a batch of 200 writes, each seeing the previous ones.
+        for (400..600) |i| {
+            var src = SliceEmbeddingSource{ .vectors = node_vectors.items, .dims = 32 };
+            var delta = if (i % 9 == 0) try leader.planDelete(@intCast(i - 300)) else try leader.planInsert(alloc, src.source(), fx.data[i * 32 ..][0..32]);
+            errdefer delta.deinit(alloc);
+            const undo = try leader.applyDeltaUndoable(delta);
+            if (delta.kind == .insert) try node_vectors.appendSlice(alloc, fx.data[i * 32 ..][0..32]);
+            try deltas.append(alloc, delta);
+            try undos.append(alloc, undo);
+        }
+        // Revert the whole batch: the leader is back at its committed state.
+        var i = deltas.items.len;
+        while (i > 0) {
+            i -= 1;
+            leader.revertDelta(deltas.items[i], undos.items[i]);
+        }
+        const reverted = try leader.serialize(alloc);
+        defer alloc.free(reverted);
+        try testing.expectEqualSlices(u8, committed, reverted);
+
+        // "Commit": both replicas apply the batch.
+        for (deltas.items) |d| {
+            try leader.applyDelta(d);
+            try follower.applyDelta(d);
+        }
+        const a = try leader.serialize(alloc);
+        defer alloc.free(a);
+        const b = try follower.serialize(alloc);
+        defer alloc.free(b);
+        try testing.expectEqualSlices(u8, a, b);
+    }
 }
