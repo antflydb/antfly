@@ -155,6 +155,39 @@ pub const PreparedPublication = struct {
         return database;
     }
 
+    /// Storage publication only needs identity/catalog and physical-input
+    /// fences. Opening a named table here reloads every index under the owner
+    /// gate, once per output file, and can strand foreground admission.
+    fn validateStorageCurrent(self: *@This()) !void {
+        if (self.shadow_scopes.len != 0 or self.resolver_dependency != null) {
+            _ = try self.current();
+            return;
+        }
+        const root = try self.owner.refresh();
+        if (Owner.needsOutcomeReconciliation(root)) return error.EnrichmentWaitCanceled;
+        try @import("sql_commit.zig").recover(root);
+        try @import("sql_ddl.zig").recover(root);
+        if (std.mem.eql(u8, self.name, "default")) {
+            if (root.db.root_incarnation != self.incarnation or !std.meta.eql(root.db.core.identity_namespace, self.identity)) return error.EnrichmentSourceChanged;
+        } else {
+            try @import("tables.zig").loadCatalog(root);
+            const id = root.embedded_table_records.get(self.name) orelse return error.EnrichmentSourceChanged;
+            const identity: @TypeOf(self.identity) = .{ .table_id = id, .shard_id = id, .range_id = id };
+            if (!std.meta.eql(identity, self.identity)) return error.EnrichmentSourceChanged;
+            const namespace = try @import("../storage/lite/embedded_catalog.zig").namespaceAlloc(alloc, id);
+            defer alloc.free(namespace);
+            const incarnation = try root.owned_lite_backend.?.existingRootIncarnation(namespace);
+            if (incarnation == null or incarnation.? != self.incarnation) return error.EnrichmentSourceChanged;
+        }
+        try (self.catalog orelse return error.EnrichmentSourceChanged).verify(root);
+        const live_file = &root.owned_lite_backend.?.native_docstore.?.file;
+        try live_file.inheritAllocatorVerification(&self.snapshot_root.owned_lite_backend.?.native_docstore.?.file);
+        if (!live_file.free_pages_verified) {
+            self.owner.publication_stats.allocator_refusals +|= 1;
+            return error.EnrichmentWaitCanceled;
+        }
+    }
+
     fn commit(ptr: *anyopaque, batch: GeneratedBatch, promotions: Promotions, deletes: []const []const u8, guards: SourceGuards, fence: ?WriteFence) !@typeInfo(@typeInfo(std.meta.Child(@FieldType(PublicationPort, "commit"))).@"fn".return_type.?).error_union.payload {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const io = h.handleLockIo();
@@ -1011,7 +1044,7 @@ pub const Owner = struct {
         if (!std.meta.eql(probe.header, file.header)) {
             if (scope == .reclamation) return error.EnrichmentWaitCanceled;
             const publication = root.maintenance_publication orelse return error.EnrichmentWaitCanceled;
-            _ = try publication.current();
+            try publication.validateStorageCurrent();
             // Rebase before opening a primary transaction as well as before
             // publishing immutable index bytes. Lease acquisition and replay
             // checkpoints must not require a quiet interval between capture
@@ -3806,6 +3839,54 @@ test "issue1015 issue1431 warm SQL retains the incremental allocator digest" {
         try std.testing.expect(root.owned_lite_backend.?.native_docstore.?.file.ledger == ledger);
         try std.testing.expect(ledger.digestWork() - before < 1000);
     }
+}
+
+test "capi native allocator proof issue1362 storage publication fences a named table without opening its indexes" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("publication-metadata-only", 1000, .sql);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.sql));
+    const owner = fixture.connection.owner;
+    const root = owner.current.?;
+    const database = try @import("tables.zig").get(root, "numbers");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var catalog = try PublicationCatalog.capture(arena.allocator(), root, database);
+    defer catalog.deinit();
+    var publication: PreparedPublication = .{
+        .owner = owner,
+        .name = "numbers",
+        .identity = database.core.identity_namespace,
+        .incarnation = database.root_incarnation,
+        .catalog = &catalog,
+        .index_prefix = "unused/",
+        .snapshot_root = root,
+        .snapshot_database = database,
+        .source_read = null,
+        .relational_rows = false,
+    };
+    // Keep the detached database alive, but remove it from the serving cache.
+    // The old validation path would reopen it and publish index-reader leases.
+    const removed = root.embedded_tables.fetchRemove("numbers").?;
+    defer root.embedded_tables.put(root.alloc, removed.key, removed.value) catch unreachable;
+    const header = root.owned_lite_backend.?.native_docstore.?.file.header;
+    try publication.validateStorageCurrent();
+    try std.testing.expect(!root.embedded_tables.contains("numbers"));
+    try std.testing.expectEqualDeep(header, root.owned_lite_backend.?.native_docstore.?.file.header);
+    const id = root.embedded_table_records.getPtr("numbers").?;
+    const original_id = id.*;
+    id.* += 1;
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent());
+    id.* = original_id;
+    publication.incarnation +%= 1;
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent());
+    publication.incarnation -%= 1;
+    var txn = try database.core.store.beginWriteTxn();
+    errdefer txn.abort();
+    try txn.put(keys.public_schema_json_key, "{\"changed\":true}");
+    try txn.commit();
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent());
+    try std.testing.expect(!root.embedded_tables.contains("numbers"));
 }
 
 test "capi native allocator proof live commits carry a checked peer certificate" {
