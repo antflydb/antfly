@@ -2610,3 +2610,69 @@ The frozen CLI SHA-256 is
 The observation records native executable identity, commands, source and log
 hashes. Apache boundary (2,338 files), license, formatting and whitespace checks
 pass. Real-provider retention qualification remains deferred.
+
+## Host admission and leased covering ranges
+
+The [retained observation](host-admission-and-leased-ranges-v1-observation.json)
+qualifies runtime `b872ea60c53bc47f6b426a681a5ded366e476123`, with main
+`ebb4bfce947952a7ec2198a4ae3ad13fb7308289` merged cleanly. Runtime ABI **79**
+fences the shared host-budget and residency layouts; reader protocol **97**
+and persisted artifact formats remain unchanged.
+
+The earlier adaptive spill measurement used a standard backing allocator.
+The public SQL factory inserts a ResourceManager host allocator, which previously
+kept production SQL on the conservative cache policy. Direct opt-in host owners
+now participate in shared, round-robin optional reclamation without replacing
+allocation paths or bypassing host and statement admission. Owned reservation
+credit counts as reusable headroom. Busy caches and allocator paths are skipped;
+pins survive eviction, and only refundable frees can reuse held locks. Arena,
+monotonic and unknown paths retain conservative policy. The generic registry
+lives in the platform allocator contract. A single-threaded native probe also
+checks that page-allocator use no longer instantiates the threaded SMP allocator.
+The full WASM bundle was not built.
+
+Covering reads now retain authenticated immutable raw-cache or physical-response
+leases instead of copying each stripe into an intermediate owned buffer.
+Uncached response owners outlive their wave through reference counts and stable
+caller allocators. Cached units still pass through verified admission and retain
+their original persistent-cache identity; decoded cache entries keep their own
+wire framing. Owning range callers retain their adapter. Exhaustive allocation
+failure checks cover cached and uncached partial results.
+
+A 2-MiB fixture of 32 adjacent authenticated units checks every byte. Both
+variants include an identical simulated decoded-owner wire copy. Requested
+caller allocation falls **6,308,312 → 4,212,736 bytes** without caching,
+**4,225,614 → 2,130,995 bytes** on cached cold input, and
+**4,215,070 → 2,119,481 bytes** on raw-cache-warm input: about **33–50% less**.
+Provider work is identical: one 2-MiB filesystem range GET cold, zero GETs on
+cached warm input, and one GET on an uncached repeat. These are caller allocation
+counts, excluding backend cache allocations; no CPU, peak-memory, cloud or
+whole-query throughput gain is inferred from this range kernel. Decoded-cache
+hits already skip this wire path; this improvement serves decoded-cache misses.
+
+The spill comparison now uses the **public `sql_memory_owner` factory and real
+128-MiB ResourceManager host admission**. Both policies retain the same
+33,594,433-byte statement limit and 32 MiB post-finish headroom. In the same
+frozen Debug binary, six alternating Snappy pairs have median full-drain thread
+CPU **978.761 → 122.732 ms (7.97×)**, with no slower candidate. Setup/add and
+Sort.finish are excluded; first page advancement, full drain and independent
+key/value oracles are included. Drain spill reads fall
+**70,618,654 → 5,166,118 bytes**, payload reads **8,192 → 512**, with unchanged
+**12,043,408-byte** writes. Tracked live peak rises
+**403,053 → 13,829,101 bytes** within the identical limit. Both policies check
+all 8,192 sorted keys and eight ordinal-tagged value columns. The raw samples
+also include the uncompressed control. Builds, E2E and cleanup from this task
+did not overlap timing; other host activity was uncontrolled. No RSS, cloud,
+HTTP, archive, whole-query or whole-publication throughput gain is claimed.
+The older bare-allocator 8.68× observation retains its historical identity.
+
+Final qualification passes **351 shared and 87 API checks**, with no failures,
+skips or leaks, plus **50 real Parquet/Iceberg E2E cases in 381.23 seconds**.
+Both threaded host-owner and page-allocator-only single-threaded native probes
+pass. The frozen CLI SHA-256 is
+`3e6927f26cd07fd9a9f530bd9b533808f01e9cdbdaa365abfdd6e5a50ec48389`.
+The observation retains exact commands, native executable identity, source and
+raw-log hashes. Apache boundary (2,345 source files), license, formatting and
+whitespace checks pass. `make gc` skipped cleanup after detecting native build
+activity. Real-provider retention qualification remains deferred; the external
+142,577-row HN fixture remains unavailable on this machine.
