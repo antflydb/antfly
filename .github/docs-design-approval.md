@@ -47,14 +47,29 @@ Keep Antfly's **Allow GitHub Actions to create and approve pull requests** setti
 A separate GitHub App submits approvals using a short-lived installation token,
 scoped to Antfly and revoked by the token action when the job finishes.
 
-Create the organization-owned [`antfly-docs-approver` App](https://github.com/organizations/antflydb/settings/apps/new?name=antfly-docs-approver&description=Scoped+docs+and+design+review+exceptions+for+Antfly+repositories&url=https%3A%2F%2Fgithub.com%2Fantflydb&public=false&webhook_active=false&contents=read&pull_requests=write) with only Contents: read and Pull requests: write
+Create the organization-owned [`antfly-docs-approver` App](https://github.com/organizations/antflydb/settings/apps/new?name=antfly-docs-approver&description=Scoped+docs+and+design+review+exceptions+for+Antfly+repositories&url=https%3A%2F%2Fgithub.com%2Fantflydb&public=false&webhook_active=false&contents=write&pull_requests=write) with Contents: write and Pull requests: write
 (repository Metadata: read is implicit). Disable webhooks; no event subscriptions
 or callback URL are needed. Install the shared App on **only `antflydb/colony` and `antflydb/antfly`**.
 Each workflow must request a token for its own repository only; the Antfly
 workflow enforces its separate docs/design policy. The registration link prefills
 the name and permissions; verify those values before creation. Give it no
-administration, workflow, content-write or branch-bypass permissions. Generate a
+administration, workflow or branch-bypass permissions. Generate a
 private key and note the App ID from its settings page.
+
+GitHub must grant **Contents: write** to both the App installation and the minted
+token for its approvals to count toward required reviews. Contents: read plus
+Pull requests: write can submit an approval, but it leaves `reviewDecision` at
+`REVIEW_REQUIRED`; this was verified on temporary README-only PRs in both
+repositories. For an existing App, change Repository permissions → Contents to
+Read and write, save, and accept the installation permission update for antflydb.
+Changing the workflow request alone is insufficient.
+
+Contents write also permits repository content writes. That is an unavoidable
+capability of this reviewer identity, not a claim that it has an approval-only
+permission. It receives no branch-protection bypass, and this workflow uses its
+token exclusively for metadata reads and the policy approval API. Keep the key
+behind the main-only environment boundary and the installation restricted to the
+two approved repositories. The workflow's default GITHUB_TOKEN stays read-only.
 
 Before storing credentials, configure the `docs-design-approval` GitHub
 **environment** with selected deployment branches/tags: exactly the **branch**

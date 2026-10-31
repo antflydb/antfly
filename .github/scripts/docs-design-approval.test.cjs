@@ -181,7 +181,8 @@ test('privileged workflow uses trusted base checkout and executes no PR commands
   assert.doesNotMatch(workflow, /^\s+pull-requests: write$/m);
   assert.match(workflow, /private-key: \$\{\{ secrets.DOCS_APPROVAL_APP_PRIVATE_KEY \}\}/);
   assert.match(workflow, /repositories: antfly/);
-  assert.match(workflow, /permission-contents: read/);
+  assert.match(workflow, /permission-contents: write/);
+  assert.match(workflow, /^      contents: read$/m);
   assert.match(workflow, /permission-pull-requests: write/);
   assert.match(workflow, /github-token: \$\{\{ steps.approval-app.outputs.token \}\}/);
   for (const [, action] of workflow.matchAll(/uses: (\S+)/g)) {
