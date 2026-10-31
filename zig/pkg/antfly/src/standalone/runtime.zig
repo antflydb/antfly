@@ -3193,12 +3193,6 @@ const LocalStandaloneMetadata = struct {
                 if (!std.mem.eql(u8, sources, "[]")) return error.HACatalogReplicationSourcesUnsupported;
             }
         }
-        // Standalone does not run the CDC snapshot or streaming coordinators,
-        // so a directory-backed table would accept sources and never ingest.
-        // Lite storage keeps accepting them as portable declarations for a
-        // later import into a cluster, where CDC runs.
-        if (self.storage_engine != .lite and replicationSourcesDeclared(req.replication_sources_json))
-            return error.StandaloneReplicationSourcesUnsupported;
         const replicated = (!self.vector_source_storage_allowed and (req.storage orelse antfly.common.table_storage.Settings{}).engine == .local) or
             (if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
         try (req.storage orelse antfly.common.table_storage.Settings{}).validateCreate(req.num_shards, replicated);
@@ -3479,8 +3473,6 @@ const LocalStandaloneMetadata = struct {
             !(system_catalog.isRestoreTarget(table_name) catch false)) return error.InvalidBackupRequest;
         var table = try antfly.public_api.backups.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest);
         defer antfly.metadata.table_manager.freeTable(alloc, table);
-        if (replicationSourcesDeclared(table.replication_sources_json))
-            std.log.warn("restored table={s} declares Postgres CDC replication sources, but standalone does not run CDC", .{table_name});
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, table.indexes_json);
         try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, table.indexes_json);
         const ranges = try antfly.public_api.backups.deriveRestoreRanges(
@@ -5062,24 +5054,6 @@ fn verifyAdoptedLiteIdentity(
     if (!adopted_db.core.identity_namespace.eql(target_identity)) return error.InvalidEmbeddedLiteIdentity;
 }
 
-fn replicationSourcesDeclared(sources: ?[]const u8) bool {
-    const raw = sources orelse return false;
-    return !std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), "[]");
-}
-
-/// Standalone never runs CDC. Tables that already carry sources (catalogs
-/// from Lite declarations or older builds) keep loading, but say so once.
-fn warnUnsupportedReplicationSources(metadata: *LocalStandaloneMetadata) void {
-    var it = metadata.manager.tables.valueIterator();
-    while (it.next()) |table| {
-        if (!replicationSourcesDeclared(table.replication_sources_json)) continue;
-        std.log.warn(
-            "table={s} declares Postgres CDC replication sources, but standalone does not run CDC; run a cluster to ingest them",
-            .{table.name},
-        );
-    }
-}
-
 fn deriveStandaloneTableRecord(
     storage_engine: antfly.common.config.StorageEngine,
     table_name: []const u8,
@@ -5684,7 +5658,6 @@ pub fn runFromIterator(
         return err;
     };
     defer local_metadata.deinit();
-    warnUnsupportedReplicationSources(&local_metadata);
     // An empty instance has a real catalog too. Publish it before readiness so
     // stopped-volume inspection can distinguish empty state from missing state.
     if (local_metadata.manager.tables.count() == 0) {
@@ -9473,7 +9446,7 @@ test "standalone Lite enforces one shard and one replica" {
     try std.testing.expectEqual(@as(u32, 1), local.desired_replica_count);
 }
 
-test "standalone rejects Postgres CDC replication sources it cannot run" {
+test "standalone cdc accepts Postgres replication sources" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9486,25 +9459,16 @@ test "standalone rejects Postgres CDC replication sources it cannot run" {
     const sources = "[{\"type\":\"postgres\",\"dsn\":\"${secret:pg}\",\"postgres_table\":\"public.tickets\"}]";
     const owned_sources = try alloc.dupe(u8, sources);
     defer alloc.free(owned_sources);
-    try std.testing.expectError(
-        error.StandaloneReplicationSourcesUnsupported,
-        LocalStandaloneMetadata.createTable(&metadata, alloc, "tickets", .{ .replication_sources_json = owned_sources }),
-    );
-    try std.testing.expect(metadata.findTableByNameLocked("tickets") == null);
-    // Catalog-scoped creates go through the same derivation.
-    try std.testing.expectError(error.StandaloneReplicationSourcesUnsupported, metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{
-        .mutation = .{ .action = .create, .kind = .table, .name = "scoped_tickets" },
-        .physical_name = "table:scoped-tickets",
-        .create_table_json = "{\"replication_sources\":" ++ sources ++ "}",
-    } }));
+    // Standalone runs the CDC coordinators, so a declared source is stored
+    // and its table replicates once the control loop schedules a round.
+    try LocalStandaloneMetadata.createTable(&metadata, alloc, "tickets", .{ .replication_sources_json = owned_sources });
+    const created = metadata.findTableByNameLocked("tickets") orelse return error.TestExpectedTable;
+    try std.testing.expect(std.mem.indexOf(u8, created.replication_sources_json, "public.tickets") != null);
     // Tables without sources, and an explicit empty list, are unaffected.
     try LocalStandaloneMetadata.createTable(&metadata, alloc, "plain", .{});
     const empty_sources = try alloc.dupe(u8, "[]");
     defer alloc.free(empty_sources);
     try LocalStandaloneMetadata.createTable(&metadata, alloc, "empty_sources", .{ .replication_sources_json = empty_sources });
-    try std.testing.expect(replicationSourcesDeclared(sources));
-    try std.testing.expect(!replicationSourcesDeclared(" [] "));
-    try std.testing.expect(!replicationSourcesDeclared(null));
 }
 
 test "standalone table storage defaults persist without migrating legacy tables" {

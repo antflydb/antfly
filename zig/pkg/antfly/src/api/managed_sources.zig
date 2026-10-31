@@ -41,7 +41,6 @@ pub fn configure(a: A, server: *api.ApiHttpServer, physical: []const u8, bound_i
     if (!std.mem.eql(u8, &hash, parsed.value.expected_sources_hash)) return error.TableGenerationChanged;
     // Managed PostgreSQL currently uses the native CDC executor. Object
     // notifications use lake reconciliation, not a synthetic replication slot.
-    if (server.cfg.deployment_mode == .standalone) return error.StandaloneReplicationSourcesUnsupported;
     if (table.storage.engine == .object) return error.UnsupportedOperation;
     for (parsed.value.replication_sources.array.items) |source| {
         if (source != .object) return error.InvalidCreateTableRequest;
@@ -74,20 +73,15 @@ pub fn status(a: A, server: *api.ApiHttpServer, physical: []const u8, bound_id: 
     var progress: std.ArrayList(@import("../metadata/table_manager.zig").ReplicationSourceStatusRecord) = .empty;
     defer progress.deinit(a);
     for (snapshot.replication_source_statuses) |record| if (record.table_id == table.table_id) try progress.append(a, record);
-    // Standalone stores declared sources but never runs CDC; say so instead
-    // of reporting an empty progress list that looks like a stalled start.
-    const cdc_supported = server.cfg.deployment_mode != .standalone;
+    // Cluster and standalone (directory-backed and Lite) both run CDC.
     return std.json.Stringify.valueAlloc(a, .{
         .table_id = table.table_id,
         .sources_hash = &hash,
         .replication_sources = sources.value,
         .progress = progress.items,
-        .cdc_supported = cdc_supported,
-        .unsupported_reason = if (cdc_supported) null else @as(?[]const u8, standalone_unsupported_message),
-    }, .{ .emit_null_optional_fields = false });
+        .cdc_supported = true,
+    }, .{});
 }
-
-pub const standalone_unsupported_message = "Postgres CDC replication sources require cluster mode; standalone does not run CDC yet";
 
 test "lake SQL managed source replacement checks native definition hash and table incarnation" {
     const a = std.testing.allocator;
@@ -121,16 +115,10 @@ test "lake SQL managed source replacement checks native definition hash and tabl
     const body = try std.fmt.allocPrint(a, "{{\"table_id\":7,\"expected_sources_hash\":\"{s}\",\"replication_sources\":[]}}", .{hash});
     defer a.free(body);
     try std.testing.expectError(error.TableGenerationChanged, configure(a, &server, "hn", 8, null, .{}, body));
-    try std.testing.expectError(error.StandaloneReplicationSourcesUnsupported, configure(a, &server, "hn", 7, null, .{}, body));
     const standalone_status = try status(a, &server, "hn", 7, null, .{});
     defer a.free(standalone_status);
-    try std.testing.expect(std.mem.indexOf(u8, standalone_status, "\"cdc_supported\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, standalone_status, standalone_unsupported_message) != null);
+    try std.testing.expect(std.mem.indexOf(u8, standalone_status, "\"cdc_supported\":true") != null);
     server.cfg.deployment_mode = .distributed;
-    const cluster_status = try status(a, &server, "hn", 7, null, .{});
-    defer a.free(cluster_status);
-    try std.testing.expect(std.mem.indexOf(u8, cluster_status, "\"cdc_supported\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cluster_status, "unsupported_reason") == null);
     const result = try configure(a, &server, "hn", 7, null, .{}, body);
     defer a.free(result);
     try std.testing.expectEqual(@as(usize, 1), source.replacements);
