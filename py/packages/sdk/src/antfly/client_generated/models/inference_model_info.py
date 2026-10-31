@@ -47,6 +47,9 @@ class InferenceModelInfo:
             `incompatible`
             artifacts are rejected before load; a model whose directory cannot
             be read is listed as `incompatible` with `error` set.
+        invocable (bool | Unset): False when this deployment rejects public execution
+            (`public_inference_enabled: false`); the model is installed and
+            listed, but public calls return 403. Omitted when it can be invoked.
         error (InferenceModelInfoError | Unset): Why the model is unusable, set when its directory could not be read.
             Other models still list.
         capabilities (list[str] | Unset): List of capabilities this model supports (omitted when empty). For rerankers,
@@ -60,6 +63,7 @@ class InferenceModelInfo:
     model_revision: str | Unset = UNSET
     qualified_limits: InferenceModelInfoQualifiedLimits | Unset = UNSET
     compatibility: InferenceModelInfoCompatibility | Unset = UNSET
+    invocable: bool | Unset = UNSET
     error: InferenceModelInfoError | Unset = UNSET
     capabilities: list[str] | Unset = UNSET
     inputs: list[str] | Unset = UNSET
@@ -88,6 +92,8 @@ class InferenceModelInfo:
         if not isinstance(self.compatibility, Unset):
             compatibility = self.compatibility.value
 
+        invocable = self.invocable
+
         error: dict[str, Any] | Unset = UNSET
         if not isinstance(self.error, Unset):
             error = self.error.to_dict()
@@ -115,6 +121,8 @@ class InferenceModelInfo:
             field_dict["qualified_limits"] = qualified_limits
         if compatibility is not UNSET:
             field_dict["compatibility"] = compatibility
+        if invocable is not UNSET:
+            field_dict["invocable"] = invocable
         if error is not UNSET:
             field_dict["error"] = error
         if capabilities is not UNSET:
@@ -170,6 +178,8 @@ class InferenceModelInfo:
         else:
             compatibility = InferenceModelInfoCompatibility(_compatibility)
 
+        invocable = d.pop("invocable", UNSET)
+
         _error = d.pop("error", UNSET)
         error: InferenceModelInfoError | Unset
         if isinstance(_error, Unset):
@@ -188,6 +198,7 @@ class InferenceModelInfo:
             model_revision=model_revision,
             qualified_limits=qualified_limits,
             compatibility=compatibility,
+            invocable=invocable,
             error=error,
             capabilities=capabilities,
             inputs=inputs,

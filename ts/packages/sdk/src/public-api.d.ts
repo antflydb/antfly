@@ -24171,6 +24171,12 @@ export interface components {
              * @enum {string}
              */
             compatibility?: "compatible" | "unknown" | "incompatible";
+            /**
+             * @description False when this deployment rejects public execution
+             *     (`public_inference_enabled: false`); the model is installed and
+             *     listed, but public calls return 403. Omitted when it can be invoked.
+             */
+            invocable?: boolean;
             /** @description Why the model is unusable, set when its directory could not be read. Other models still list. */
             error?: {
                 /** @description Error identifier, for example `MissingGlinerSpanEncoderConfig`. */
@@ -24192,7 +24198,7 @@ export interface components {
             usage: components["schemas"]["DecisionUsage"];
         };
         InferenceModelsResponse: {
-            /** @description Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy. */
+            /** @description Whether public inference execution is enabled on this deployment. When false, locally installed models are still listed with `invocable: false` and remote upstreams are not probed. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy. */
             public_inference_enabled?: boolean;
             /**
              * @description OpenAI-compatible response object type.
