@@ -120249,6 +120249,8 @@ test "db text merge producer admission isolates quarantined dimensions" {
 
 test "db manual text producers merge capacity without optional workers" {
     const alloc = std.testing.allocator;
+    text_merge_runtime_mod.test_manual_merge_delay_ms.store(150, .release);
+    defer text_merge_runtime_mod.test_manual_merge_delay_ms.store(0, .release);
     var runtime_owner = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
     defer runtime_owner.deinit();
     var path_tmp = try TestDirectory.init("manual-text-admission");
@@ -120264,6 +120266,7 @@ test "db manual text producers merge capacity without optional workers" {
             .max_pending_segments = 12,
             .resume_pending_segments = 6,
             .max_pending_bytes = 0,
+            .backpressure_max_wait_ms = 100,
         },
     });
     defer db.close();
@@ -120287,6 +120290,14 @@ test "db manual text producers merge capacity without optional workers" {
     try std.testing.expect(runtime.stats().backpressure_events > 0);
     try std.testing.expectEqual(@as(u64, 0), runtime.stats().backpressure_timeouts);
     try std.testing.expect(db.core.index_manager.textMergeStatsSnapshot().completed_merges > 0);
+    {
+        // Work held by a different turn cannot be serviced by this producer.
+        // Assistance must retain the bounded refusal instead of spinning.
+        var held = (try db.core.index_manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+        defer held.deinit(alloc);
+        defer db.core.index_manager.cancelTextMergeTask(&held);
+        try std.testing.expectError(error.TextMergeBackpressureTimeout, runtime.acquireProducerPermit("ft_v1", 6, 0));
+    }
     var result = try db.searchTextKernel(alloc, "ft_v1", .{
         .term = .{ .field = "body", .term = "manual" },
     }, .{ .limit = 40 });
