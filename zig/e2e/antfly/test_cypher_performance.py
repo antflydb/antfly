@@ -1670,12 +1670,13 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
             method="PUT",
         )
         count("D", reader, (16, 8))
-        # Predicates retain the ordinary evaluator and any available index plan.
+        # Predicates retain the ordinary evaluator and its payload budget;
+        # only the eligible count-only statements above use nullness projection.
         residual = call(
             f"/graphs/{prefix}/query",
             {
                 "query": "MATCH (n:D) WHERE n.id='n1' RETURN count(n.body)",
-                "limits": {"memory_bytes": 8 << 20},
+                "limits": {"memory_bytes": 64 << 20},
             },
         )
         assert residual["rows"] == [[{"type": "integer", "value": "1"}]], residual

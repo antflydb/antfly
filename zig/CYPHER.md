@@ -4986,3 +4986,11 @@ while a three-anchor budget returns the correct count. Progress budget and
 authority failures are also checked across independently compiled archives.
 The scan callback ABI fixture uses the contract-only storage profile, allowing
 these checks to run without compiling unrelated storage implementations.
+
+Owner count visitation keeps the statement's total scan budget separate from
+relational session page admission. Session initialization uses a bounded page
+request, while the visitor retains the full statement limit across pages;
+default or explicitly large count budgets must not be rejected as invalid
+relational requests. The portable regression covers a 16,384-anchor allowance
+as well as exact physical-progress enforcement. Explicit query predicates keep
+the existing evaluator and its ordinary payload memory requirements.

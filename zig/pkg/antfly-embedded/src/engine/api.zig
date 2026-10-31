@@ -1531,4 +1531,10 @@ test "embedded api Cypher relational counts account for rejected storage candida
     defer parsed.deinit();
     try std.testing.expectEqualStrings("1", parsed.value.object.get("rows").?.array.items[0].array.items[0].object.get("value").?.string);
     try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("stats").?.object.get("scanned_anchors").?.integer);
+    // A total scan budget larger than the session page bound remains valid.
+    const large_budget = try api.cypherJson(a, "g",
+        \\{"query":"MATCH (n:Keep) RETURN count(n.body)","limits":{"memory_bytes":8388608,"scanned_anchors":16384}}
+    );
+    defer a.free(large_budget);
+    try std.testing.expect(std.mem.indexOf(u8, large_budget, "\"value\":\"1\"") != null);
 }

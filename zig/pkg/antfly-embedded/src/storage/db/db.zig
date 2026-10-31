@@ -28559,7 +28559,11 @@ pub const DB = struct {
     pub fn visitCypherDocuments(self: *DB, alloc: Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("visitCypherDocuments", .{ self, alloc, from, to, opts, visitor });
         if (!opts.isRelational()) return self.scanVisit(alloc, from, to, opts, visitor);
-        const session = try self.openRelationalReadSession(alloc, from, to, opts);
+        // Session admission accepts one bounded page, while visitation may
+        // consume many pages up to the statement's total scan budget.
+        var page_opts = opts;
+        page_opts.limit = @min(opts.limit, 4096);
+        const session = try self.openRelationalReadSession(alloc, from, to, page_opts);
         defer session.deinit();
         try @import("relational_rows.zig").visitCypherRows(&session.reader, alloc, self.backend_runtime.io(), opts.limit, visitor);
         try session.checkpoint();

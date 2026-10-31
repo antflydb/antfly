@@ -124,7 +124,11 @@ pub fn visit(db: anytype, a: A, cut: *Snapshot, from: []const u8, to: []const u8
     var opts = input;
     opts.sql_document_preimage = true;
     var facade: Database(@TypeOf(db.*)) = .{ .source = db, .core = db.core, .cut = cut.* };
-    const session = try facade.openRelationalReadSession(a, from, to, opts);
+    // The session's admission bound describes one page, not the total count
+    // budget. Keep the original limit for the multi-page visitor below.
+    var page_opts = opts;
+    page_opts.limit = @min(opts.limit, 4096);
+    const session = try facade.openRelationalReadSession(a, from, to, page_opts);
     defer session.deinit();
     try @import("relational_rows.zig").visitCypherRows(&session.reader, a, db.backend_runtime.io(), opts.limit, visitor);
     try session.checkpoint();
