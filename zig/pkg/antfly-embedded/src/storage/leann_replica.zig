@@ -179,7 +179,7 @@ pub const Replica = struct {
                     var delta = try self.index.?.planInsert(alloc, ctx.source(), v);
                     defer delta.deinit(alloc);
                     try self.applyGraphInsert(w.key, delta, &undo);
-                    try ops.append(alloc, .{ .kind = .graph_insert, .key = w.key, .delta = try delta.encode(alloc) });
+                    try ops.append(alloc, .{ .kind = .graph_insert, .key = w.key, .delta = try delta.encode(alloc), .vector_digest = vectorDigest(v) });
                 }
             } else {
                 if (w.vector) |v| {
@@ -472,6 +472,27 @@ pub const Replica = struct {
         undo.installed = false;
     }
 
+    /// Final per-key effects of a record, in op order (a key deleted then
+    /// re-inserted reports the insert last). For an install that replaces
+    /// the state, `full_state` is set: every key not listed as live in the
+    /// generation is gone.
+    pub fn recordEffects(alloc: Allocator, record: []const u8) !struct { effects: []Effect, full_state: bool } {
+        var decoded = try decodeRecord(alloc, record);
+        defer decoded.deinit(alloc);
+        var out = std.ArrayListUnmanaged(Effect).empty;
+        errdefer out.deinit(alloc);
+        var full_state = false;
+        for (decoded.ops) |op| switch (op.kind) {
+            .buffer_put => try out.append(alloc, .{ .key = op.key, .digest = vectorDigest(op.vector.?) }),
+            .graph_insert => try out.append(alloc, .{ .key = op.key, .digest = op.vector_digest }),
+            .buffer_delete, .graph_delete => try out.append(alloc, .{ .key = op.key, .digest = null }),
+            .install_generation => full_state = true,
+        };
+        // Keys borrow from `record`, which the caller keeps alive.
+        for (out.items) |*e| e.key = keyInRecord(record, e.key);
+        return .{ .effects = try out.toOwnedSlice(alloc), .full_state = full_state };
+    }
+
     // ---------------------------------------------------------------------
     // Search
     // ---------------------------------------------------------------------
@@ -704,6 +725,22 @@ const Op = struct {
     generation: u64 = 0,
     digest: u64 = 0,
     payload: ?[]const u8 = null,
+    /// graph_insert: digest of the vector the planner used (see
+    /// `vectorDigest`); buffer_put derives it from the vector.
+    vector_digest: u64 = 0,
+};
+
+/// Digest of a vector's bytes. Replicas compare it with their own pending
+/// work to tell whether a committed record covers their latest change.
+pub fn vectorDigest(v: []const f32) u64 {
+    return std.hash.Wyhash.hash(0x6c65616e6e, std.mem.sliceAsBytes(v)) | 1;
+}
+
+/// What a record does to a key, for replicas tracking pending work.
+pub const Effect = struct {
+    key: []const u8,
+    /// `vectorDigest` of the vector now indexed, or null for a delete.
+    digest: ?u64,
 };
 
 const OpList = struct {
@@ -743,6 +780,7 @@ fn encodeRecord(alloc: Allocator, generation: u64, version: u64, ops: []const Op
             .graph_insert, .graph_delete => {
                 try writeBytes(wr, op.key);
                 try writeBytes(wr, op.delta.?);
+                if (op.kind == .graph_insert) try wr.writeInt(u64, op.vector_digest, .little);
             },
             .install_generation => {
                 try wr.writeInt(u64, op.generation, .little);
@@ -806,6 +844,7 @@ fn decodeRecord(alloc: Allocator, bytes: []const u8) !DecodedRecord {
             .graph_insert, .graph_delete => {
                 op.key = try readBytes(&r);
                 op.delta = try readBytes(&r);
+                if (kind == .graph_insert) op.vector_digest = r.takeInt(u64, .little) catch return error.InvalidRecord;
             },
             .install_generation => {
                 op.generation = r.takeInt(u64, .little) catch return error.InvalidRecord;
@@ -852,6 +891,13 @@ fn decodeGeneration(alloc: Allocator, bytes: []const u8, dims: u32) !DecodedGene
     }
     if (r.bufferedLen() != 0) return error.InvalidGeneration;
     return out;
+}
+
+/// `decodeRecord` keys already point into the record bytes; this documents
+/// that and keeps the borrow explicit.
+fn keyInRecord(record: []const u8, key: []const u8) []const u8 {
+    std.debug.assert(@intFromPtr(key.ptr) >= @intFromPtr(record.ptr) and @intFromPtr(key.ptr) + key.len <= @intFromPtr(record.ptr) + record.len);
+    return key;
 }
 
 fn writeBytes(wr: *std.Io.Writer, b: []const u8) !void {

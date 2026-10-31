@@ -7194,6 +7194,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.hbc_adapter.",
             "storage.leann_store.",
             "storage.leann_replica.",
+            "storage.leann_replicated.",
             "storage.hierarchy_navigation.",
             "storage.index_manager_vopr.",
             "storage.internal_keys.",
