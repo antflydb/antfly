@@ -88,6 +88,10 @@ const OpKind = enum(u8) {
     graph_insert = 3,
     graph_delete = 4,
     install_generation = 5,
+    /// Settles a pending delete for a key that is not indexed. Applies only
+    /// while the key is still absent (the record's base version guarantees
+    /// nothing changed since planning), so replicas clear it consistently.
+    forget = 6,
 };
 
 const record_magic: u8 = 0x4c; // 'L'
@@ -203,6 +207,10 @@ pub const Replica = struct {
                     try ops.append(alloc, .{ .kind = .graph_delete, .key = w.key, .delta = try delta.encode(alloc) });
                     delta.deinit(alloc);
                 }
+                if (w.vector == null and !self.node_of.contains(w.key)) {
+                    try ops.append(alloc, .{ .kind = .forget, .key = w.key });
+                    continue;
+                }
                 if (w.vector) |v| {
                     var ctx = PlanSource{ .replica = self, .loader = loader, .far_from = v };
                     var delta = try self.index.?.planInsert(alloc, ctx.source(), v);
@@ -220,6 +228,8 @@ pub const Replica = struct {
                     try self.applyBufferDelete(w.key, &undo);
                     try self.setDigest(w.key, null, &undo);
                     try ops.append(alloc, .{ .kind = .buffer_delete, .key = w.key });
+                } else {
+                    try ops.append(alloc, .{ .kind = .forget, .key = w.key });
                 }
             }
         }
@@ -282,17 +292,28 @@ pub const Replica = struct {
     /// generation bytes.
     fn buildGenerationBytes(self: *Replica, alloc: Allocator, keys: []const []const u8, loader: VectorLoader) ![]u8 {
         const d: usize = self.opts.config.dims;
-        const flat = try alloc.alloc(f32, keys.len * d);
-        defer alloc.free(flat);
-        for (keys, 0..) |k, i| {
-            const v = try loader.load(loader.ctx, alloc, k);
+        var flat_list = std.ArrayListUnmanaged(f32).empty;
+        defer flat_list.deinit(alloc);
+        var kept_list = std.ArrayListUnmanaged([]const u8).empty;
+        defer kept_list.deinit(alloc);
+        for (keys) |k| {
+            // A key whose stored vector is gone was deleted ahead of the log;
+            // leaving it out makes every replica drop it at install.
+            const v = loader.load(loader.ctx, alloc, k) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
             defer alloc.free(v);
             if (v.len != d) return error.DimensionMismatch;
-            @memcpy(flat[i * d ..][0..d], v);
+            try flat_list.appendSlice(alloc, v);
+            try kept_list.append(alloc, k);
         }
-        const digests = try alloc.alloc(u64, keys.len);
+        if (kept_list.items.len == 0) return error.NoLiveVectors;
+        const flat = flat_list.items;
+        const kept = kept_list.items;
+        const digests = try alloc.alloc(u64, kept.len);
         defer alloc.free(digests);
-        for (keys, 0..) |_, i| digests[i] = vectorDigest(flat[i * d ..][0..d]);
+        for (kept, 0..) |_, i| digests[i] = vectorDigest(flat[i * d ..][0..d]);
         var index = try leann.Index.build(alloc, self.opts.config, flat);
         defer index.deinit();
         const graph = try index.serialize(alloc);
@@ -302,8 +323,8 @@ pub const Replica = struct {
         const wr = &w.writer;
         try wr.writeAll(generation_magic);
         try wr.writeInt(u32, generation_format, .little);
-        try wr.writeInt(u32, @intCast(keys.len), .little);
-        for (keys, digests) |k, dg| {
+        try wr.writeInt(u32, @intCast(kept.len), .little);
+        for (kept, digests) |k, dg| {
             try writeBytes(wr, k);
             try wr.writeInt(u64, dg, .little);
         }
@@ -387,6 +408,7 @@ pub const Replica = struct {
                     try self.setDigest(op.key, null, undo);
                 }
             },
+            .forget => if (self.contains(op.key)) return error.InvalidRecord,
             .install_generation => {
                 if (op.generation <= self.generation) return error.InvalidRecord;
                 const bytes = op.payload orelse fetched orelse return error.InvalidRecord;
@@ -546,7 +568,7 @@ pub const Replica = struct {
         for (decoded.ops) |op| switch (op.kind) {
             .buffer_put => try out.append(alloc, .{ .key = op.key, .digest = vectorDigest(op.vector.?) }),
             .graph_insert => try out.append(alloc, .{ .key = op.key, .digest = op.vector_digest }),
-            .buffer_delete, .graph_delete => try out.append(alloc, .{ .key = op.key, .digest = null }),
+            .buffer_delete, .graph_delete, .forget => try out.append(alloc, .{ .key = op.key, .digest = null }),
             .install_generation => full_state = true,
         };
         // Keys borrow from `record`, which the caller keeps alive.
@@ -865,7 +887,7 @@ fn encodeRecord(alloc: Allocator, generation: u64, version: u64, ops: []const Op
                 try wr.writeInt(u32, @intCast(v.len), .little);
                 for (v) |f| try wr.writeInt(u32, @bitCast(f), .little);
             },
-            .buffer_delete => try writeBytes(wr, op.key),
+            .buffer_delete, .forget => try writeBytes(wr, op.key),
             .graph_insert, .graph_delete => {
                 try writeBytes(wr, op.key);
                 try writeBytes(wr, op.delta.?);
@@ -929,7 +951,7 @@ fn decodeRecord(alloc: Allocator, bytes: []const u8) !DecodedRecord {
                 try out.vectors.append(alloc, v);
                 op.vector = v;
             },
-            .buffer_delete => op.key = try readBytes(&r),
+            .buffer_delete, .forget => op.key = try readBytes(&r),
             .graph_insert, .graph_delete => {
                 op.key = try readBytes(&r);
                 op.delta = try readBytes(&r);

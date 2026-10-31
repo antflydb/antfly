@@ -348,10 +348,9 @@ below.
 4. **Filter-aware traversal.** Filters are applied after an over-fetched
    search today; very selective filters would be better served by passing
    them into the graph walk.
-5. **Leader replication wiring.** See
-   [Leader replication](#leader-replication): the state machine is done;
-   the Raft entry, apply path, leader planner job and generation transfer
-   remain.
+5. **Leader replication follow-ups.** See
+   [Leader replication](#leader-replication): splits, a cluster VOPR, and
+   CI verification of the data runtime pieces.
 6. **E2E coverage.** Add a Python e2e test that creates an
    `algorithm: "leann"` index over HTTP and queries it.
 
@@ -396,43 +395,45 @@ plan-then-revert is exact; stale and corrupt deltas are rejected) and
 lagging followers, a deposed leader's late record, inline first build,
 out-of-band rebuild, missing and corrupt generations, restart).
 
-### Wiring into Raft (remaining)
+### Wiring into Raft (done, server side pending CI)
 
-1. **Raft entry.** Add `leann_record: ?{index_name, record}` to
-   `BatchRequest` (`storage/db/types.zig`) and its wire codec, a new
-   `batch_leann_record_protocol_version = 25` in
-   `common/data_raft_protocol.zig`, and a case in
-   `requiredRaftBatchProtocolVersion` (`data/runtime.zig`). Versions are per
-   entry, so only LEANN entries require 25; older replicas reject just
-   those. Exempt it from the timestamp override, like artifact publication.
-2. **Apply path.** Dense indexes are fed asynchronously by each replica's
-   derived replay, which does not follow Raft order. LEANN records instead
-   apply at Raft apply time: `batchInternal` (with `ordered_apply_receipt`)
-   persists the record and the Raft index in the primary transaction, then
-   the index manager hands it to the index's `Replica`. The LEANN state
-   file stores the last applied Raft index; on open, persisted records after
-   it are replayed in order.
-3. **Leader planner.** On the leader, derived replay feeds LEANN work
-   (key + vector, or delete) to a queue instead of mutating the graph; a
-   leader-only job (the enrichment executor's leadership hooks) plans one
-   record per index at a time and proposes it through the artifact
-   publication dispatcher's path (`DataServer.enqueue...` →
-   `proposeRaftBatchGroup`). Work stays queued until its record applies;
-   skipped records re-queue it. Followers' derived replay only updates
-   vector-id bindings.
-4. **Generation transfer.** Raft snapshots deliberately exclude index files
-   (`raft/storage/native_snapshot.zig`), so generations travel out of band:
-   the leader publishes the bytes under `(index, generation, digest)` with
-   the chunked file transfer used for snapshots
-   (`file_snapshot_store.zig`) or object storage, and the install record
-   carries only the digest. New or lagging replicas install the latest
-   generation, then replay records after it.
-5. **Splits.** Each child's leader builds a generation from its key range.
-6. **Simulation.** Extend `DerivedWorkflowScenario`
-   (`vopr/domain_vopr.zig`) with leader-built generations, install at a
-   log position, and leader changes; add a production-cluster VOPR that
-   checks replica graph equality.
+1. **Raft entry.** `BatchRequest.leann_record` (`storage/db/types.zig`)
+   travels as the internal `_leann_record` field of the batch wire
+   (`api/batch.zig`) and must stand alone in its batch. It requires
+   `batch_leann_record_protocol_version = 25`
+   (`common/data_raft_protocol.zig`); versions are per entry, so older
+   replicas reject only LEANN entries. It is exempt from the timestamp
+   override.
+2. **Apply path.** `db.applyLeannRecordBatch` requires an ordered apply
+   receipt, persists the record under `leann_record_prefix` (index name +
+   Raft index) together with the receipt in one transaction, then drains
+   persisted records into the index's replicated state in log order. Records
+   are pruned once the state file covering them is synced. Hot-standby
+   mirrors and DBs opened without `leann_replication` reject the entry.
+3. **Leader planner.** Derived replay on every replica only marks keys dirty
+   (with a vector digest) and updates vector-id bindings; the graph never
+   changes outside Raft apply. The data runtime's control loop runs
+   `runLeannReplicationRound` on shard leaders: a local `leann_plan` lookup
+   plans at most one in-flight record per index, and the leader proposes it
+   with `proposeRaftBatchGroupWithLeaderWait`. Dirty keys clear only when a
+   committed record covers the same digest, so lost proposals, stale
+   records and leader changes all end in a re-plan (after
+   `max_inflight_waits` rounds when a proposal vanishes). Deletes of keys
+   the graph never saw commit a `forget` op so every replica drops them.
+4. **Generation transfer.** Builds and rebuilds produce a generation (keys,
+   per-key vector digests, graph). Small generations ride inline in the
+   install op; larger ones are split into 1 MiB chunk records proposed
+   ahead of the install, so every replica reads them from its own persisted
+   log. Records older than the newest installed generation
+   (`generation_floor`) are pruned; a replica that falls behind replays the
+   chunks it still has. After installing, replicas reconcile keys whose
+   local vector digest differs from the generation's.
+5. **Simulation.** `leann_replicated.zig` runs a seeded randomized
+   simulation (3 replicas, lagging derived replay, lost proposals, leader
+   changes, restarts, chunked generations) and checks that all replicas end
+   with identical state and search results.
 
-Note: the server-side pieces (steps 1, 3, 4) live in the data runtime,
-whose test build declares more memory than the sandbox this was written in,
-so they need CI to compile and run.
+Still to do: splits (each child's leader builds a generation from its key
+range), a production-cluster VOPR that checks replica graph equality, and an
+e2e test. The data runtime pieces (step 3) need CI to compile and run: their
+test build declares more memory than the sandbox this was written in.
