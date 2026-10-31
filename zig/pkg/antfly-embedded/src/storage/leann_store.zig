@@ -238,6 +238,26 @@ pub const LeannStore = struct {
         return state.applied_raft_index;
     }
 
+    pub fn clearGenerationFetcher(self: *LeannStore) void {
+        if (self.replicated) |state| state.fetcher = null;
+    }
+
+    /// Replicated mode: reports the lowest chunk Raft index read while
+    /// fetching a generation (see `ReplicatedState.generation_floor`).
+    pub fn noteFetchFloor(self: *LeannStore, raft_index: u64) void {
+        const state = self.replicated orelse return;
+        state.last_fetch_floor = if (state.last_fetch_floor) |f| @min(f, raft_index) else raft_index;
+    }
+
+    /// Replicated mode: earliest Raft index still needed for catch-up, and
+    /// the current generation.
+    pub fn generationFloor(self: *LeannStore) struct { floor: u64, generation: u64 } {
+        const state = self.replicated orelse return .{ .floor = 0, .generation = 0 };
+        self.lock.lockSharedUncancelable(self.io);
+        defer self.lock.unlockShared(self.io);
+        return .{ .floor = state.generation_floor, .generation = state.replica.generation };
+    }
+
     /// Replicated mode: Raft index durably persisted by the last `sync`.
     pub fn durableRaftIndex(self: *LeannStore) u64 {
         self.lock.lockSharedUncancelable(self.io);

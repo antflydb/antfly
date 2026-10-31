@@ -5464,6 +5464,18 @@ pub const LeannRecordCommand = struct {
     record: []const u8,
 };
 
+/// Leader's planned LEANN records, returned by the `leann_plan` topology
+/// lookup. The caller proposes each proposal's records in order as
+/// `leann_record` commands.
+pub const LeannPlanStatus = struct {
+    proposals: []const Proposal = &.{},
+
+    pub const Proposal = struct {
+        index_name: []const u8,
+        records_base64: []const []const u8,
+    };
+};
+
 /// Upper bound for one record: writes plus an inline generation.
 pub const leann_record_max_bytes: usize = 8 << 20;
 

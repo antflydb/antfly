@@ -61,6 +61,7 @@ const native_read_scratch_pool = @import("../../native_read_scratch_pool.zig");
 const posting_segment_store_mod = @import("../../posting_segment_store.zig");
 const vector_block_mod = @import("antfly_vectorindex").vector_block;
 const leann_store_mod = @import("../../leann_store.zig");
+const leann_replicated_mod = @import("../../leann_replicated.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
@@ -1367,6 +1368,7 @@ pub const IndexManager = struct {
     base_path: []u8,
     byte_range: docstore_mod.ByteRange,
     relaxed_split_durability: bool,
+    leann_replication: bool = false,
     text_main_backend: persistent_mod.MainBackend,
     text_lsm_storage: ?lsm_backend_mod.Storage,
     text_main_lsm_options: lsm_backend_mod.Options,
@@ -3252,6 +3254,7 @@ pub const IndexManager = struct {
             .base_path = try alloc.dupe(u8, base_path),
             .byte_range = .{ .start = "", .end = "" },
             .relaxed_split_durability = false,
+            .leann_replication = opts.leann_replication,
             .text_main_backend = opts.text_main_backend,
             .text_lsm_storage = opts.text_lsm_storage,
             .text_main_lsm_options = text_main_lsm_options,
@@ -8649,6 +8652,10 @@ pub const IndexManager = struct {
         for (self.sparse_indexes.items) |*entry| try entry.index.sync(force);
         for (self.graph_indexes.items) |*entry| try entry.index.sync(force);
         for (self.algebraic_indexes.items) |*entry| try entry.index.sync(force);
+        // LEANN state is durable now; records it no longer needs can go.
+        if (self.leann_replication) if (self.primary_store) |store| self.pruneLeannRecords(store) catch |err| {
+            std.log.warn("leann record prune deferred err={s}", .{@errorName(err)});
+        };
     }
 
     pub fn syncGraphIndexes(self: *IndexManager, force: bool) !void {
@@ -16692,6 +16699,199 @@ pub const IndexManager = struct {
         return handoffs;
     }
 
+    // ---------------------------------------------------------------------
+    // Leader-replicated LEANN (see storage/leann_replicated.zig)
+    // ---------------------------------------------------------------------
+
+    /// Records the leader proposes for one index, in order: generation
+    /// chunks first (if any), then the record.
+    pub const LeannProposal = struct {
+        index_name: []u8,
+        records: [][]u8,
+
+        pub fn deinit(self: *LeannProposal, alloc: Allocator) void {
+            alloc.free(self.index_name);
+            for (self.records) |r| alloc.free(r);
+            alloc.free(self.records);
+            self.* = undefined;
+        }
+    };
+
+    pub fn freeLeannProposals(alloc: Allocator, proposals: []LeannProposal) void {
+        for (proposals) |*p| p.deinit(alloc);
+        alloc.free(proposals);
+    }
+
+    /// Leader only: plans the next record of every replicated LEANN index.
+    /// Each index has at most one record in flight; it is re-planned if the
+    /// proposal is lost or the log skips it.
+    pub fn planLeannRecords(self: *IndexManager, alloc: Allocator) ![]LeannProposal {
+        var out = std.ArrayListUnmanaged(LeannProposal).empty;
+        errdefer {
+            for (out.items) |*p| p.deinit(alloc);
+            out.deinit(alloc);
+        }
+        for (self.dense_indexes.items) |*entry| {
+            const store = entry.index.leann orelse continue;
+            if (!store.isReplicated()) continue;
+            var planned = (try store.planRecord(alloc)) orelse continue;
+            defer planned.deinit(alloc);
+            var records = std.ArrayListUnmanaged([]u8).empty;
+            errdefer {
+                for (records.items) |r| alloc.free(r);
+                records.deinit(alloc);
+            }
+            if (planned.blob) |blob| {
+                const chunks = try leann_replicated_mod.encodeChunkRecords(alloc, blob);
+                defer alloc.free(chunks);
+                try records.appendSlice(alloc, chunks);
+            }
+            try records.append(alloc, try alloc.dupe(u8, planned.record));
+            const name = try alloc.dupe(u8, entry.config.name);
+            errdefer alloc.free(name);
+            try out.append(alloc, .{ .index_name = name, .records = try records.toOwnedSlice(alloc) });
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// Applies persisted LEANN records after each replicated index's last
+    /// applied Raft index, in order. Stops an index (without error) when a
+    /// generation is not fully stored yet; a later drain resumes it.
+    pub fn drainLeannRecords(self: *IndexManager, store: *docstore_mod.DocStore) !void {
+        for (self.dense_indexes.items) |*entry| {
+            const leann_store = entry.index.leann orelse continue;
+            if (!leann_store.isReplicated()) continue;
+            try self.drainLeannRecordsFor(store, entry.config.name, leann_store);
+        }
+    }
+
+    fn drainLeannRecordsFor(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, leann_store: *leann_store_mod.LeannStore) !void {
+        var fetch_ctx = LeannChunkFetch{ .manager = self, .store = store, .index_name = index_name, .leann_store = leann_store };
+        leann_store.setGenerationFetcher(.{ .ctx = &fetch_ctx, .fetch = LeannChunkFetch.fetch });
+        defer leann_store.clearGenerationFetcher();
+        const lower = try internal_keys.leannRecordKeyAlloc(self.alloc, index_name, leann_store.appliedRaftIndex());
+        defer self.alloc.free(lower);
+        const upper = try leannRecordUpperAlloc(self.alloc, index_name);
+        defer self.alloc.free(upper);
+        var cursor = try self.alloc.dupe(u8, lower);
+        defer self.alloc.free(cursor);
+        var txn = try store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer txn.abort();
+        while (true) {
+            var page = try store.scanReadTxnPage(self.alloc, &txn, cursor, true, upper, 64, 64 << 20);
+            defer page.deinit(self.alloc);
+            if (page.items.len == 0) return;
+            for (page.items) |item| {
+                const raft_index = internal_keys.leannRecordRaftIndex(item.key) orelse return error.InvalidLeannRecordKey;
+                const outcome = leann_store.applyRecord(item.value, raft_index) catch |err| switch (err) {
+                    error.GenerationUnavailable => return,
+                    else => return err,
+                };
+                if (outcome == .rejected) std.log.warn("leann record rejected index={s} raft_index={d}", .{ index_name, raft_index });
+            }
+            self.alloc.free(cursor);
+            cursor = try self.alloc.dupe(u8, page.items[page.items.len - 1].key);
+        }
+    }
+
+    /// Deletes persisted LEANN records no replica needs any more: those
+    /// below both the durable applied index and the current generation's
+    /// floor (records from the floor on let a new replica catch up).
+    pub fn pruneLeannRecords(self: *IndexManager, store: *docstore_mod.DocStore) !void {
+        for (self.dense_indexes.items) |*entry| {
+            const leann_store = entry.index.leann orelse continue;
+            if (!leann_store.isReplicated()) continue;
+            const floor = leann_store.generationFloor().floor;
+            const keep_from = @min(floor, leann_store.durableRaftIndex() + 1);
+            if (keep_from <= 1) continue;
+            const lower = try internal_keys.leannRecordKeyAlloc(self.alloc, entry.config.name, 0);
+            defer self.alloc.free(lower);
+            const upper = try internal_keys.leannRecordKeyAlloc(self.alloc, entry.config.name, keep_from);
+            defer self.alloc.free(upper);
+            var doomed = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (doomed.items) |k| self.alloc.free(k);
+                doomed.deinit(self.alloc);
+            }
+            {
+                var txn = try store.beginReadTxnWithBlockCacheAdmission(.transient);
+                defer txn.abort();
+                var page = try store.scanReadTxnPage(self.alloc, &txn, lower, false, upper, 4096, 256 << 20);
+                defer page.deinit(self.alloc);
+                for (page.items) |item| try doomed.append(self.alloc, try self.alloc.dupe(u8, item.key));
+            }
+            if (doomed.items.len == 0) continue;
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            for (doomed.items) |k| try txn.delete(k);
+            try txn.commit();
+        }
+    }
+
+    fn leannRecordUpperAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+        return internal_keys.leannRecordKeyAlloc(alloc, index_name, std.math.maxInt(u64));
+    }
+
+    /// Assembles a generation from its stored chunk records.
+    const LeannChunkFetch = struct {
+        manager: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        leann_store: *leann_store_mod.LeannStore,
+
+        fn fetch(raw: *anyopaque, alloc: Allocator, generation: u64, digest: u64) anyerror![]u8 {
+            const self: *LeannChunkFetch = @ptrCast(@alignCast(raw));
+            const m = self.manager;
+            const lower = try internal_keys.leannRecordKeyAlloc(m.alloc, self.index_name, 0);
+            defer m.alloc.free(lower);
+            const upper = try leannRecordUpperAlloc(m.alloc, self.index_name);
+            defer m.alloc.free(upper);
+            var parts: ?[]?[]u8 = null;
+            defer if (parts) |ps| {
+                for (ps) |p| if (p) |b| alloc.free(b);
+                alloc.free(ps);
+            };
+            var floor: ?u64 = null;
+            var txn = try self.store.beginReadTxnWithBlockCacheAdmission(.transient);
+            defer txn.abort();
+            var cursor = try m.alloc.dupe(u8, lower);
+            defer m.alloc.free(cursor);
+            var first = true;
+            while (true) {
+                var page = try self.store.scanReadTxnPage(m.alloc, &txn, cursor, !first, upper, 64, 64 << 20);
+                defer page.deinit(m.alloc);
+                first = false;
+                if (page.items.len == 0) break;
+                for (page.items) |item| {
+                    if (!leann_replicated_mod.isChunkRecord(item.value)) continue;
+                    const chunk = leann_replicated_mod.decodeChunkRecord(item.value) catch continue;
+                    if (chunk.generation != generation or chunk.digest != digest) continue;
+                    if (parts == null) {
+                        parts = try alloc.alloc(?[]u8, chunk.total);
+                        @memset(parts.?, null);
+                    }
+                    if (chunk.total != parts.?.len) return error.InvalidRecord;
+                    if (parts.?[chunk.seq] == null) parts.?[chunk.seq] = try alloc.dupe(u8, chunk.data);
+                    const raft_index = internal_keys.leannRecordRaftIndex(item.key).?;
+                    floor = if (floor) |f| @min(f, raft_index) else raft_index;
+                }
+                m.alloc.free(cursor);
+                cursor = try m.alloc.dupe(u8, page.items[page.items.len - 1].key);
+            }
+            const ps = parts orelse return error.GenerationUnavailable;
+            var total: usize = 0;
+            for (ps) |p| total += (p orelse return error.GenerationUnavailable).len;
+            const out = try alloc.alloc(u8, total);
+            var pos: usize = 0;
+            for (ps) |p| {
+                @memcpy(out[pos..][0..p.?.len], p.?);
+                pos += p.?.len;
+            }
+            if (floor) |f| self.leann_store.noteFetchFloor(f);
+            return out;
+        }
+    };
+
     /// LEANN indexes cannot be split yet: their graph is not partitioned by
     /// key range. Fail the split before any state moves.
     fn rejectLeannSplit(self: *IndexManager) !void {
@@ -22979,6 +23179,7 @@ pub const IndexManager = struct {
                         .search_ef = leann_opts.search_ef,
                         .bound_scale = leann_opts.bound_scale,
                         .batch_size = leann_opts.batch_size,
+                        .replicated = self.leann_replication,
                     });
                     index.attachLeann(leann_store) catch |err| {
                         leann_store.deinit();
@@ -50971,4 +51172,119 @@ test "leann dense index applies writes, searches, deletes, and reopens" {
         defer if (doc) |d| alloc.free(d);
         try std.testing.expectEqualStrings(keys[7], doc.?);
     }
+}
+
+test "replicated leann indexes converge from leader-planned records" {
+    const alloc = std.testing.allocator;
+    const dims = 8;
+    const n = 300;
+    const config_json = "{\"field\":\"embedding\",\"dims\":8,\"metric\":\"l2_squared\",\"algorithm\":\"leann\",\"leann\":{\"max_degree\":16}}";
+
+    var tmp_leader = std.testing.tmpDir(.{});
+    defer tmp_leader.cleanup();
+    var tmp_follower = std.testing.tmpDir(.{});
+    defer tmp_follower.cleanup();
+    var path_buf_a: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf_b: [std.fs.max_path_bytes]u8 = undefined;
+    const path_a = try std.fmt.bufPrint(&path_buf_a, ".zig-cache/tmp/{s}", .{tmp_leader.sub_path});
+    const path_b = try std.fmt.bufPrint(&path_buf_b, ".zig-cache/tmp/{s}", .{tmp_follower.sub_path});
+    const path_a_z = try alloc.dupeSentinel(u8, path_a, 0);
+    defer alloc.free(path_a_z);
+    const path_b_z = try alloc.dupeSentinel(u8, path_b, 0);
+    defer alloc.free(path_b_z);
+    var store_a = try docstore_mod.DocStore.open(alloc, path_a_z, .{});
+    defer store_a.close();
+    var store_b = try docstore_mod.DocStore.open(alloc, path_b_z, .{});
+    defer store_b.close();
+
+    var prng = std.Random.DefaultPrng.init(23);
+    const rand = prng.random();
+    var vectors: [n][dims]f32 = undefined;
+    for (&vectors, 0..) |*v, i| {
+        const c: f32 = @floatFromInt(i % 5);
+        for (v, 0..) |*x, j| x.* = c * 3 + @as(f32, @floatFromInt(j % 2)) + rand.floatNorm(f32) * 0.3;
+    }
+    var keys: [n][]u8 = undefined;
+    for (&keys, 0..) |*k, i| k.* = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i});
+    defer for (keys) |k| alloc.free(k);
+    for ([_]*docstore_mod.DocStore{ &store_a, &store_b }) |store| {
+        for (keys, vectors) |doc_key, v| {
+            const stored_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+            defer alloc.free(stored_key);
+            var body: std.Io.Writer.Allocating = .init(alloc);
+            defer body.deinit();
+            try body.writer.writeAll("{\"embedding\":[");
+            for (v, 0..) |x, j| {
+                if (j > 0) try body.writer.writeByte(',');
+                try body.writer.print("{d}", .{x});
+            }
+            try body.writer.writeAll("]}");
+            try store.put(stored_key, body.written());
+        }
+    }
+
+    var leader = try IndexManager.initWithOptions(alloc, path_a, .{ .leann_replication = true });
+    defer leader.deinit();
+    var follower = try IndexManager.initWithOptions(alloc, path_b, .{ .leann_replication = true });
+    defer follower.deinit();
+    leader.updateRange(.{ .start = "", .end = "" });
+    follower.updateRange(.{ .start = "", .end = "" });
+    try leader.addAllNoBackfill(&store_a, &.{.{ .name = "leann_idx", .kind = .dense_vector, .config_json = config_json }});
+    try follower.addAllNoBackfill(&store_b, &.{.{ .name = "leann_idx", .kind = .dense_vector, .config_json = config_json }});
+
+    var raft_index: u64 = 0;
+    var start: usize = 0;
+    while (start < n) : (start += 50) {
+        var writes: [50]mapper.DenseEmbeddingWrite = undefined;
+        for (&writes, 0..) |*w, i| w.* = .{ .index_name = @constCast("leann_idx"), .doc_key = keys[start + i], .vector = &vectors[start + i], .artifact_key = null };
+        // Local derived replay on both replicas.
+        try leader.applyDenseEmbeddingWritesByName(&store_a, "leann_idx", &writes);
+        try follower.applyDenseEmbeddingWritesByName(&store_b, "leann_idx", &writes);
+        // Leader plans; "commit" persists each record on both replicas the
+        // way applyLeannRecordBatch does, then both drain in log order.
+        while (true) {
+            const proposals = try leader.planLeannRecords(alloc);
+            defer IndexManager.freeLeannProposals(alloc, proposals);
+            if (proposals.len == 0) break;
+            for (proposals) |p| for (p.records) |record| {
+                raft_index += 1;
+                const key = try internal_keys.leannRecordKeyAlloc(alloc, p.index_name, raft_index);
+                defer alloc.free(key);
+                try store_a.put(key, record);
+                try store_b.put(key, record);
+            };
+            try leader.drainLeannRecords(&store_a);
+            try follower.drainLeannRecords(&store_b);
+        }
+    }
+
+    const entry_a = leader.denseIndex("leann_idx").?;
+    const entry_b = follower.denseIndex("leann_idx").?;
+    const state_a = try entry_a.index.leann.?.replicated.?.replica.encodeState(alloc);
+    defer alloc.free(state_a);
+    const state_b = try entry_b.index.leann.?.replicated.?.replica.encodeState(alloc);
+    defer alloc.free(state_b);
+    try std.testing.expectEqualSlices(u8, state_a, state_b);
+    try std.testing.expectEqual(@as(u64, n), entry_b.index.stats().active_count);
+    try std.testing.expect(entry_b.index.leann.?.replicated.?.replica.generation >= 1);
+
+    // The follower answers queries with its own vector ids and doc keys.
+    for ([_]usize{ 3, 151, 299 }) |i| {
+        var results = try entry_b.index.searchWithRequest(.{ .query = &vectors[i], .k = 3 });
+        defer results.deinit();
+        var best = results.items.items[0];
+        for (results.items.items) |item| if (item.distance < best.distance) {
+            best = item;
+        };
+        const doc = try follower.lookupDenseDocKey(&store_b, "leann_idx", best.vector_id);
+        defer if (doc) |d| alloc.free(d);
+        try std.testing.expectEqualStrings(keys[i], doc.?);
+    }
+
+    // Sync persists state; prune drops records below the generation floor.
+    try follower.syncAll(true);
+    const floor = entry_b.index.leann.?.generationFloor().floor;
+    const pruned_key = try internal_keys.leannRecordKeyAlloc(alloc, "leann_idx", 1);
+    defer alloc.free(pruned_key);
+    if (floor > 1) try std.testing.expectError(error.NotFound, store_b.get(alloc, pruned_key));
 }
