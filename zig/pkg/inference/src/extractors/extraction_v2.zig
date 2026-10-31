@@ -78,6 +78,8 @@ pub const Options = struct {
     threshold: f32 = 0.5,
     word_splitter: processor.WordSplitter = .whitespace,
     overlap: boundary.OverlapPolicy = .flat,
+    /// Omitted overlap preserves artifact-specific decoder defaults.
+    overlap_explicit: bool = false,
     offset_unit: boundary.OffsetUnit = .utf8_bytes,
     include_confidence: bool = false,
     include_spans: bool = false,
@@ -284,6 +286,7 @@ pub fn parseOptions(value: Value) !Options {
     options.include_confidence = try boolValue(object, "include_confidence", false);
     options.include_spans = try boolValue(object, "include_spans", false);
     options.offset_unit = try enumeration(boundary.OffsetUnit, object, "offset_unit", .utf8_bytes);
+    options.overlap_explicit = object.contains("flat_ner") or object.contains("overlap");
     options.overlap = if (try boolValue(object, "flat_ner", true)) .flat else .allow;
     if (object.get("overlap")) |raw| {
         const name = try string(raw);
@@ -455,6 +458,7 @@ pub fn errorDetails(err: anyerror) ?ErrorDetails {
         // UnsupportedGlinerBoundaryRuntime arm below (an unreviewed identity,
         // backend, feature, or malformed table) so the response names the
         // dimension instead of reporting a generic unsupported feature.
+        error.UnsupportedGlinerSpecialtyArtifact => .{ .status = 400, .code = "INVALID_MODEL", .message = "GLiNER specialty artifacts must match the qualified FP32 checkpoint and provenance" },
         error.UnsupportedGlinerDecisionGeometry => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER decision extraction exceeds the qualified item, sequence or token limit" },
         error.GlinerBoundaryRequestItemsLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified request_items (batch size) limit" },
         error.GlinerBoundaryDocumentBytesLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified document_bytes limit" },
@@ -472,6 +476,12 @@ pub fn errorDetails(err: anyerror) ?ErrorDetails {
         error.ExtractionRegexLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "regex validation exceeds its configured compilation or execution limit" },
         else => null,
     };
+}
+
+test "specialty artifact rejection is an invalid model client error" {
+    const details = errorDetails(error.UnsupportedGlinerSpecialtyArtifact) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 400), details.status);
+    try std.testing.expectEqualStrings("INVALID_MODEL", details.code);
 }
 
 test "span v2 feature rejections are client errors" {

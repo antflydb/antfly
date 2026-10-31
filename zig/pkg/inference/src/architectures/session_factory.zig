@@ -64,6 +64,7 @@ const gliner_decision_head = @import("gliner_decision_head.zig");
 const gliner_encoder = @import("../models/gliner_encoder.zig");
 const gliner_boundary_model = @import("../models/gliner_boundary.zig");
 const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
+const gliner_specialty_qualification = @import("../models/gliner_specialty_qualification.zig");
 const gliner_head_graph = @import("gliner_head_graph.zig");
 const kernel_jit = @import("../graph/kernel_jit.zig");
 const graph_runtime = @import("../graph/runtime.zig");
@@ -378,8 +379,19 @@ fn verifyGlinerDecisionSnapshot(bytes: []const u8, expected: ?gliner_decide_qual
         return error.GlinerDecisionArtifactMismatch;
 }
 
+fn validateSpecialtyWeightConfig(mf: *const manifest_mod.ModelManifest, store: tensor_store_mod.TensorStore, identity: ?gliner_decide_qualification.Identity) !void {
+    if (mf.gliner_specialty_artifact_hint == null or mf.gliner_specialty_profile != null) return;
+    // Hash outside discovery/request listing and before any encoder/head runs.
+    // Reuse an already captured identity when a modern declaration supplied it.
+    const weight = if (identity) |captured| captured.weight else blk: {
+        const reader = store.singleSafetensorsReader() orelse return;
+        break :blk gliner_decide_qualification.Digest.ofMapped(reader.file_bytes);
+    };
+    try gliner_specialty_qualification.requireKnownWeightConfig(weight, mf.gliner_span_config_digest);
+}
+
 fn captureGlinerDecisionIdentity(mf: *const manifest_mod.ModelManifest, store: tensor_store_mod.TensorStore) !?gliner_decide_qualification.Identity {
-    if (mf.gliner_architecture != .span or !mf.gliner_span_declared) return null;
+    if (mf.gliner_architecture != .span or (!mf.gliner_span_declared and mf.gliner_specialty_profile == null)) return null;
     const family: gliner_decide_qualification.EncoderFamily = switch (mf.gliner_span_encoder_family) {
         .deberta => .deberta,
         .modern_bert => .modern_bert,
@@ -918,6 +930,11 @@ fn createNativeSessionForCudaUpload(allocator: std.mem.Allocator, model_path: []
     }
     const boundary_identity = if (arch_config == .gliner_boundary) try captureBoundaryIdentity(&mf, store) else null;
     const gliner_decision_identity = try captureGlinerDecisionIdentity(&mf, store);
+    try validateSpecialtyWeightConfig(&mf, store, gliner_decision_identity);
+    if (mf.gliner_specialty_profile != null) {
+        _ = try gliner_specialty_qualification.require(gliner_decision_identity orelse return error.UnsupportedGlinerSpecialtyArtifact);
+        direct_quant_enabled = false;
+    }
     const keep_gliner_q8 = retain_gliner_q8 and requiresModernBertSpanClassifier(mf) and ggufEncoderHasQuantizedTensors(store);
     if (keep_gliner_q8) {
         const identity = gliner_decision_identity orelse return error.UnsupportedGlinerDecisionArtifact;
@@ -1953,7 +1970,11 @@ fn createCudaSessionWithRequiredProfile(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
-    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert;
+    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert or model_manifest.gliner_specialty_profile != null;
+    cuda_compute.qualified_span_fp32 = model_manifest.gliner_specialty_profile != null;
+    if (model_manifest.gliner_specialty_profile) |profile| {
+        std.log.info("gliner_specialty_cuda_policy profile={s} weights=f32 attention=f32 diagnostic_overrides=ignored", .{@tagName(profile)});
+    }
     cuda_compute.gliner_encoder_attention = cuda_profile == .gliner25_modern_bert;
     cuda_compute.gliner_boundary_inference = cuda_profile == .gliner25_boundary;
     cuda_compute.gliner_mixed_attention = cuda_compute.gliner_encoder_attention and (gliner_precision == .fp16 or gliner_precision == .bf16);
@@ -2607,6 +2628,9 @@ fn createGpuHostedSessionWithTaskOverride(
         }
         if (arch_config == .embedding_gemma2) try embedding_gemma2_arch.validateWeights(allocator, tensor_store.?, arch_config.embedding_gemma2);
         gliner_decision_identity = try captureGlinerDecisionIdentity(&mf, tensor_store.?);
+        try validateSpecialtyWeightConfig(&mf, tensor_store.?, gliner_decision_identity);
+        if (mf.gliner_specialty_profile != null)
+            _ = try gliner_specialty_qualification.require(gliner_decision_identity orelse return error.UnsupportedGlinerSpecialtyArtifact);
         const source = (try tensor_store.?.weightSource()) orelse return error.NoDenseWeightSource;
         const all_names = try source.listNames(allocator);
         defer allocator.free(all_names);
@@ -2889,7 +2913,7 @@ fn detectArchitectureWithGgufFile(
         if (try detectModelType(allocator, config_bytes)) |model_type| {
             defer allocator.free(model_type);
             if (std.mem.eql(u8, model_type, "extractor")) {
-                if (mf.gliner_architecture == .span and mf.gliner_span_declared)
+                if (mf.gliner_architecture == .span and (mf.gliner_span_declared or mf.gliner_specialty_profile != null))
                     try verifyGlinerDecisionSnapshot(config_bytes, mf.gliner_span_config_digest);
                 const wrapper = try parseLegacyGlinerWrapper(allocator, config_bytes);
                 if (mf.gliner_span_encoder_family == .modern_bert) {
@@ -3176,6 +3200,10 @@ fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8
         cfg.classification_token_id = mf.gliner_token_c;
     if (mf.gliner_token_e != 0) cfg.entity_token_id = mf.gliner_token_e;
     if (mf.gliner_token_r != 0) cfg.relation_token_id = mf.gliner_token_r;
+
+    // Exact specialty markers come from the authenticated tokenizer snapshot.
+    // Do not reread an unpinned legacy override after capturing that identity.
+    if (mf.gliner_specialty_profile != null) return;
 
     const at_path = try std.fmt.allocPrint(allocator, "{s}/added_tokens.json", .{model_path});
     defer allocator.free(at_path);
@@ -5651,6 +5679,7 @@ fn sessionDirectQuantEnabled(
     manifest: manifest_mod.ModelManifest,
     arch_config: ArchConfig,
 ) bool {
+    if (manifest.gliner_specialty_profile != null) return false;
     if (arch_config == .gliner_boundary) {
         return if (manifest.gliner_boundary_bundle) |receipt| switch (receipt.value.precision) {
             .q8_0, .q4_0, .q4_k => true,
@@ -8448,6 +8477,24 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
         .cuda => self.backend_data.cuda.compute.snapshotStats(),
         else => null,
     };
+}
+
+pub const CudaAllocationStats = struct {
+    limit: usize,
+    live: usize,
+    peak: usize,
+};
+
+/// Physical CUDA buffers owned by the session, including weights and cached
+/// temporaries. Peak spans the context lifetime; driver/library-private memory
+/// is outside this meter. Call while holding the session execution lock.
+pub fn getCudaAllocationStats(session: Session) ?CudaAllocationStats {
+    if (comptime !build_options.enable_cuda) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .cuda) return null;
+    const value = self.backend_data.cuda.compute.allocationStats();
+    return .{ .limit = value.limit, .live = value.live, .peak = value.peak };
 }
 
 /// Drain any buffered non-blocking CUDA op-profile events into the compute's

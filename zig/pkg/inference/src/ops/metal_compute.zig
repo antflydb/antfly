@@ -16870,6 +16870,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             gh_mt,
             request.num_labels,
             request.hidden_size,
+            request.add_residual,
             &out_shape,
         )) |tensor| {
             return self.ctFromOwnedMetalTensor(tensor);
@@ -50063,4 +50064,39 @@ test "LightOnOCR3 row reporting covers sixty-four cohorts without shift overflow
     try std.testing.expectEqual(@as(u64, 0), lightOnReportedRowBit(0));
     try std.testing.expectEqual(@as(u64, 0), lightOnReportedRowBit(65));
     try std.testing.expectEqual(@as(u64, 0), lightOnReportedRowBit(std.math.maxInt(usize)));
+}
+
+test "metal GLiNER GRU residual modes preserve cancellation-sensitive state on device" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const labels = [_]f32{ 16777216, -16777216, 2, -3, 0, 5 };
+    var gates: [18]f32 = @splat(0);
+    for (0..2) |row| for (0..3) |col| {
+        gates[row * 9 + 3 + col] = -100;
+        gates[row * 9 + 6 + col] = 0.25541282;
+    };
+    var label_mt = try compute.deviceTensorFromF32Slice(&labels, &.{ 2, 3 });
+    defer label_mt.deinit();
+    var gi = try compute.deviceTensorFromF32Slice(&gates, &.{ 2, 9 });
+    defer gi.deinit();
+    const zero_gates: [18]f32 = @splat(0);
+    var gh = try compute.deviceTensorFromF32Slice(&zero_gates, &.{ 2, 9 });
+    defer gh.deinit();
+    for ([_]bool{ false, true }) |add_residual| {
+        var out = (try metal_runtime_mod.decoderRuntimeGlinerGruCombineF32Device(compute.provider_impl, label_mt, gi, gh, 2, 3, add_residual, &.{ 2, 3 })) orelse return error.UnsupportedOperation;
+        defer out.deinit();
+        const cb = compute.computeBackend();
+        const out_ct = try compute.ctFromOwnedMetalTensor(try out.retainedCopy());
+        defer cb.free(out_ct);
+        const got = try cb.toFloat32(out_ct, a);
+        defer a.free(got);
+        for (got, labels) |value, label| try std.testing.expectApproxEqAbs(@as(f32, 0.25) + (if (add_residual) label else 0), value, 0.000001);
+    }
 }
