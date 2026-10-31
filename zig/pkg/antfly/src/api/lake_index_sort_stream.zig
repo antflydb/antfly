@@ -417,7 +417,7 @@ test "external lake leased publication wide covering ranges coalesce before deco
 test "external lake leased publication adaptive spill cache reduces wide drain reads within unchanged admission" {
     const Probe = struct {
         fn check(_: *anyopaque) !void {}
-        const Measurement = struct { read: u64, written: u64, drain: u64, payload_reads: usize, cpu: i96 };
+        const Measurement = struct { read: u64, written: u64, drain: u64, payload_reads: usize, cpu: i96, rejected: usize };
         fn now() i96 {
             var stamp: std.c.timespec = undefined;
             if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &stamp) != 0) @panic("CPU clock unavailable");
@@ -501,7 +501,7 @@ test "external lake leased publication adaptive spill cache reduces wide drain r
             try std.testing.expectEqual(@as(usize, count), seen);
             try std.testing.expect(budget.peak <= budget.limit);
             try std.testing.expect(working.quota.peak_bytes <= working.maxBytes());
-            return .{ .read = manager.read_bytes, .written = manager.written_bytes, .drain = manager.read_bytes - reads_before_delivery, .payload_reads = sort.payload_reads, .cpu = cpu };
+            return .{ .read = manager.read_bytes, .written = manager.written_bytes, .drain = manager.read_bytes - reads_before_delivery, .payload_reads = sort.payload_reads, .cpu = cpu, .rejected = reader.cache.admission_rejections };
         }
     };
     for ([_]bool{ false, true }) |publication| for ([_]bool{ false, true }) |compressed| {
@@ -511,6 +511,11 @@ test "external lake leased publication adaptive spill cache reduces wide drain r
         try std.testing.expect(after.drain < before.drain / 2);
         try std.testing.expect(after.payload_reads < before.payload_reads / 2);
     };
+    // Each active phase fits, while the complete dataset does not. Warm each
+    // successor promptly rather than preserving the prior hot set's roots.
+    const fitting = try Probe.runSized(true, false, true, 2048, 1 << 20);
+    try std.testing.expectEqual(@as(usize, 0), fitting.rejected);
+    try std.testing.expect(fitting.payload_reads < 256);
     // The active payload set exceeds this cache. A pure LRU misses every
     // cycle; bounded frequency admission must preserve some reusable roots.
     const scan_before = try Probe.runSized(true, true, true, 2048, 512 << 10);

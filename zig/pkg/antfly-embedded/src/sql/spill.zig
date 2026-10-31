@@ -3881,7 +3881,7 @@ const PayloadCache = struct {
     const Block = Sequential.OwnedBlock;
     const Entry = struct { offset: u64, block: *Block, previous: ?*Entry = null, next: ?*Entry = null };
     const Owner = struct { block: *Block, references: usize = 1, bytes: usize, previous_same: ?*Block = null, next_same: ?*Block = null };
-    // Allocated only when optional residency fills. A fixed-size, aging
+    // Allocated only for sustained cache thrashing. A fixed-size, aging
     // frequency sketch admits a newcomer only when it is more useful than the
     // LRU victim. Ties keep resident roots, making cyclic scans scan-resistant.
     // The sketch is charged with cache metadata and retired with the last root.
@@ -3934,6 +3934,8 @@ const PayloadCache = struct {
     reserve: usize = 0,
     denied: bool = false,
     accesses: usize = 0,
+    consecutive_misses: usize = 0,
+    consecutive_hits: usize = 0,
     frequency: ?*Frequency = null,
     admission_rejections: usize = 0,
     fn lock(self: *PayloadCache) void {
@@ -3990,6 +3992,15 @@ const PayloadCache = struct {
         // Equal-pressure readers converge on a fair share while leaving a
         // comparable amount for required operators and output descriptors.
         return @min(self.max_bytes, (available +| owned) / 2 -| self.reserve);
+    }
+    fn modeThreshold(self: *const PayloadCache) usize {
+        return @max(16, self.entries.count() * 2);
+    }
+    fn clearFrequency(self: *PayloadCache) void {
+        if (self.frequency) |frequency| self.allocator().destroy(frequency);
+        self.frequency = null;
+        self.consecutive_misses = 0;
+        self.consecutive_hits = 0;
     }
     fn refresh(self: *PayloadCache) void {
         var bytes: usize = 0;
@@ -4069,8 +4080,7 @@ const PayloadCache = struct {
         defer if (self.registered) Guard.endReclaim();
         const entry = self.oldest orelse {
             const freed = self.metadata_bytes != 0;
-            if (self.frequency) |frequency| self.allocator().destroy(frequency);
-            self.frequency = null;
+            self.clearFrequency();
             self.entries.deinit(self.allocator());
             self.entries = .empty;
             self.owners.deinit(self.allocator());
@@ -4086,8 +4096,7 @@ const PayloadCache = struct {
         self.allocator().destroy(entry);
         if (self.oldest == null) {
             std.debug.assert(self.owners.count() == 0 and self.bytes == 0);
-            if (self.frequency) |frequency| self.allocator().destroy(frequency);
-            self.frequency = null;
+            self.clearFrequency();
             self.entries.deinit(self.allocator());
             self.entries = .empty;
             self.owners.deinit(self.allocator());
@@ -4176,12 +4185,21 @@ const PayloadCache = struct {
         self.accesses +%= 1;
         if (self.frequency) |frequency| frequency.record(offset);
         const block = if (self.entries.get(offset)) |entry| entry.block else self.addresses.get(offset) orelse {
+            self.consecutive_hits = 0;
+            self.consecutive_misses = @min(2048, self.consecutive_misses + 1);
             if (self.accesses % 64 == 0) {
                 self.refresh();
                 self.trim();
             }
             return null;
         };
+        self.consecutive_misses = 0;
+        if (self.frequency != null) {
+            self.consecutive_hits += 1;
+            // Recover ordinary LRU adaptation after a fitting hot set settles.
+            // Oversized cyclic sets cannot sustain twice-capacity hit runs.
+            if (self.consecutive_hits >= self.modeThreshold()) self.clearFrequency();
+        }
         block.retain();
         if (self.entries.get(offset)) |entry| self.touch(entry);
         if (self.accesses % 64 == 0) self.refresh() else self.refreshBlock(block);
@@ -4203,7 +4221,12 @@ const PayloadCache = struct {
         if (self.max_entries == 0 or self.max_bytes == 0) return;
         const limit = @min(self.max_entries, if (self.registered) @as(usize, 1024) else @as(usize, 4));
         const target_bytes = self.target();
+        // A full cache alone is not evidence of thrashing: fitting phases
+        // routinely replace each other. Require a miss run longer than twice
+        // residency before enabling frequency admission, and leave it again
+        // after a sustained hit run. Both thresholds are bounded by root slots.
         if (self.registered and self.max_bytes > 64 * 1024 and target_bytes >= 64 * 1024 and self.entries.count() > 1 and
+            (self.frequency != null or self.consecutive_misses >= self.modeThreshold()) and
             (self.entries.count() >= limit or block.retainedBytes() > target_bytes -| (self.bytes +| self.metadata_bytes)))
         {
             if (self.frequency == null) {
@@ -10134,6 +10157,20 @@ test "SQL adaptive payload cache resists cyclic scans adapts to hot sets and ref
             }
             const hot = cache.get(31, 0) orelse return error.TestExpectedHotAdmission;
             hot.release();
+            try std.testing.expect(cache.frequency == null);
+            // Successive fitting hot sets must warm on their first pass. A
+            // frequency sketch must not keep the previous phase resident.
+            for (0..3) |phase| {
+                var misses: usize = 0;
+                for (0..16) |_| for (blocks[phase * 8 ..][0..8]) |block| {
+                    if (cache.get(block.physical_offset.?, 0)) |held| held.release() else {
+                        misses += 1;
+                        try cache.insert(block, 0);
+                    }
+                };
+                try std.testing.expect(misses <= 8);
+                try std.testing.expect(cache.frequency == null);
+            }
             // The fault wrapper is opaque to shared reclamation; direct owner
             // teardown still retires all metadata through its original path.
             cache.lock();

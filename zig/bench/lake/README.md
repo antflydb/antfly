@@ -2746,3 +2746,62 @@ raw-log hashes. Apache boundary (2,345 source files), license, Zig formatting,
 Python formatting/lint and whitespace checks pass. `make gc` skipped cleanup
 after detecting native build activity. Real-provider retention qualification
 remains deferred; the external 142,577-row HN fixture remains unavailable.
+
+## Scan-resistant spill admission
+
+The adaptive LRU has a capacity cliff when a cyclic payload working set exceeds
+its residency: every reused root can be evicted before the next cycle. The
+replacement policy uses a lazily allocated, quota-charged frequency sketch to
+reject candidates no more useful than the LRU victim. Admission activates only
+after twice-capacity consecutive misses, and twice-capacity hits restore ordinary
+LRU. Its counters also age so a new hot set can replace an old one. This gate
+preserves rapid adaptation between fitting phases; filling residency alone does
+not prove thrashing. Rejected misses use periodic owner accounting;
+admitted growth still refreshes actual retained sizes before trimming.
+
+The native comparison keeps the same 64-row interleaved input cohorts, eight
+128-byte tagged string columns, Snappy codec, 4-KiB sort workspace and publication
+quota/lock chain. It checks every sorted key and each independent row/column tag.
+A 32,768-row case checks the fitting-cache benefit, and a 65,536-row case exceeds
+the cache's reuse capacity. The 64-KiB/four-root control and candidate use the same
+executable and unchanged quotas. Thread CPU covers drain and its value oracles;
+input construction and original sort finish are outside this interval. Reads,
+writes, peak live allocation and admission rejections are reported separately.
+These are local native drain measurements, not RSS or cloud latency claims.
+
+The normal native test also runs an oversized 2,048-row case with a 512-KiB
+cache. Its assertions cover read reduction, equal writes, complete ordered output
+and unchanged hard admission. Separate shared tests cover cyclic reuse, a new hot
+set, metadata allocation failures, reclamation and complete sketch retirement.
+
+For larger repeated measurements, build the mounted lake API tests with
+`-Dtest-filter='external lake leased publication adaptive spill cache'`, then run
+that executable with `ANTFLY_LAKE_SCAN_CACHE_BENCH=1` and
+`--suite-filter 'external lake leased publication adaptive spill cache'`. The
+`SCAN_CACHE_SAMPLE` records identify six alternating pairs at each size, following
+the ordinary qualification cases. Do not mix these records with the warmups.
+
+Complete real-Parquet publication is measured separately with
+`publication_residency.py LABEL IMMUTABLE_BINARY SOURCE_COMMIT ROWS`. Compare
+independent fresh server directories and alternating immutable binaries at both
+8,192 and 65,536 rows. The timer starts at table creation and stops at the first
+complete, queryable target revision. Startup, fixture creation and complete SQL
+validation stay outside that interval. Retained OS cache and unrelated host
+activity remain uncontrolled; this is not an empty-cache or archive-scale result.
+
+### External permutation experiment
+
+`bounded_payload_permutation.zig` retains the rejected batch-based prototype. It
+sorts compact references by physical offset/index, gathers native column batches,
+then feeds a nonindirect external sort with the original encoded keys and
+ordinals. Both temporary sorts use the original 4-MiB workspace and manager;
+original payloads remain owned until the call completes. Additional reads,
+writes, CPU and output verification are included in its timed interval, under
+the same post-sort quota as ordinary delivery. The helper consumes the original
+reference stream and returns a separately owned sort; it is benchmark-only.
+
+Both scalar and typed-batch prototypes greatly reduced reads but consumed more
+than twice the native CPU of scan-resistant direct delivery in the measured
+65,536-row workload, and added payload writes. Automatic repacking is therefore
+not selected in production. A future cost model must qualify CPU, write
+amplification and actual storage latency together before choosing this strategy.

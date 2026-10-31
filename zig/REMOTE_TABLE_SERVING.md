@@ -2653,8 +2653,11 @@ queryable index revision and verifies the complete ordered result afterward.
 
 ### Scan-resistant spill admission
 
-An adaptive payload cache uses a lazily allocated, fixed-size frequency sketch
-when its optional residency first fills. The four 1024-counter lanes retain no
+An adaptive payload cache enables a lazily allocated, fixed-size frequency sketch
+only after a full cache sees a consecutive miss run at least twice its root
+count (minimum 16 requests, maximum 2048). A full cache with fitting phase changes
+keeps ordinary LRU adaptation. Twice-capacity consecutive hits retire the sketch
+and restore ordinary LRU after a new fitting hot set settles. The four 1024-counter lanes retain no
 row IDs or payload bytes. Counters saturate and age after a bounded number of
 requests proportional to the admitted root count. A candidate replaces the LRU
 root only when its estimated reuse exceeds the victim's; equal-frequency cyclic
