@@ -2650,3 +2650,36 @@ persisted artifact formats remain unchanged. Publication performance is measured
 separately from SQL execution: the drain fixture uses the actual quota/lock
 chain, while the real-Parquet runner measures table creation through the first
 queryable index revision and verifies the complete ordered result afterward.
+
+### Scan-resistant spill admission
+
+An adaptive payload cache uses a lazily allocated, fixed-size frequency sketch
+when its optional residency first fills. The four 1024-counter lanes retain no
+row IDs or payload bytes. Counters saturate and age after a bounded number of
+requests proportional to the admitted root count. A candidate replaces the LRU
+root only when its estimated reuse exceeds the victim's; equal-frequency cyclic
+scans preserve resident roots. Aging lets a new hot set replace an old one.
+Ordinary fitting working sets do not allocate a sketch.
+
+The sketch uses the existing optional metadata allocator and quota, and retires
+with the last root. Required borrowers retain their pins; shared pressure can
+still evict any idle root. Small and opaque allocator paths keep conservative
+admission. All requests advance periodic lazy-growth accounting, including
+misses. Rejected misses avoid walking the entire owner graph; admitted growth
+still refreshes retained owner sizes before trimming and adoption. Genuine
+allocator failures propagate, while optional quota refusals can decline cache
+admission without losing the required row.
+
+Runtime ABI **81** fences the changed in-process cache layout. Reader protocol
+**97** and persisted artifact formats are unchanged. Qualification includes a
+cyclic working set larger than the cache, adaptation to a replacement hot set,
+metadata allocation failures, and complete sorted row/value oracles.
+
+A bounded external-permutation prototype also sorts compact references by
+physical payload address, gathers typed payload batches, then sorts the gathered
+payloads by their original keys and ordinals without further indirection. This
+preserves existing memory, disk and descriptor limits, but adds reference-sort
+and payload-sort passes. It remains benchmark-only: the measured reduction in
+reads did not pay for its additional CPU and writes on local spill storage.
+A future planner must qualify the full cost for the actual storage and workload
+before selecting repacking; reduced read counters alone are insufficient.

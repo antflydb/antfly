@@ -3881,6 +3881,42 @@ const PayloadCache = struct {
     const Block = Sequential.OwnedBlock;
     const Entry = struct { offset: u64, block: *Block, previous: ?*Entry = null, next: ?*Entry = null };
     const Owner = struct { block: *Block, references: usize = 1, bytes: usize, previous_same: ?*Block = null, next_same: ?*Block = null };
+    // Allocated only when optional residency fills. A fixed-size, aging
+    // frequency sketch admits a newcomer only when it is more useful than the
+    // LRU victim. Ties keep resident roots, making cyclic scans scan-resistant.
+    // The sketch is charged with cache metadata and retired with the last root.
+    const Frequency = struct {
+        counters: [4][1024]u8 = @splat(@splat(0)),
+        samples: usize = 0,
+        sample_limit: usize = 10240,
+        fn hash(offset: u64) u64 {
+            return std.hash.Wyhash.hash(0, std.mem.asBytes(&offset));
+        }
+        fn record(self: *@This(), offset: u64) void {
+            if (self.samples == self.sample_limit) {
+                for (&self.counters) |*lane| {
+                    for (lane) |*count| count.* >>= 1;
+                }
+                self.samples /= 2;
+            }
+            self.samples += 1;
+            var bits = hash(offset);
+            for (&self.counters) |*lane| {
+                const count = &lane[@as(usize, @intCast(bits & 1023))];
+                count.* = @min(15, count.* + 1);
+                bits >>= 10;
+            }
+        }
+        fn estimate(self: *const @This(), offset: u64) u8 {
+            var value: u8 = 15;
+            var bits = hash(offset);
+            for (&self.counters) |lane| {
+                value = @min(value, lane[@as(usize, @intCast(bits & 1023))]);
+                bits >>= 10;
+            }
+            return value;
+        }
+    };
     manager: ?*Manager = null,
     metadata_backing: ?Allocator = null,
     registered: bool = false,
@@ -3898,6 +3934,8 @@ const PayloadCache = struct {
     reserve: usize = 0,
     denied: bool = false,
     accesses: usize = 0,
+    frequency: ?*Frequency = null,
+    admission_rejections: usize = 0,
     fn lock(self: *PayloadCache) void {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
     }
@@ -4031,6 +4069,8 @@ const PayloadCache = struct {
         defer if (self.registered) Guard.endReclaim();
         const entry = self.oldest orelse {
             const freed = self.metadata_bytes != 0;
+            if (self.frequency) |frequency| self.allocator().destroy(frequency);
+            self.frequency = null;
             self.entries.deinit(self.allocator());
             self.entries = .empty;
             self.owners.deinit(self.allocator());
@@ -4046,6 +4086,8 @@ const PayloadCache = struct {
         self.allocator().destroy(entry);
         if (self.oldest == null) {
             std.debug.assert(self.owners.count() == 0 and self.bytes == 0);
+            if (self.frequency) |frequency| self.allocator().destroy(frequency);
+            self.frequency = null;
             self.entries.deinit(self.allocator());
             self.entries = .empty;
             self.owners.deinit(self.allocator());
@@ -4131,10 +4173,17 @@ const PayloadCache = struct {
         self.lock();
         defer self.mutex.unlock();
         self.reserve = reserve;
-        const block = if (self.entries.get(offset)) |entry| entry.block else self.addresses.get(offset) orelse return null;
+        self.accesses +%= 1;
+        if (self.frequency) |frequency| frequency.record(offset);
+        const block = if (self.entries.get(offset)) |entry| entry.block else self.addresses.get(offset) orelse {
+            if (self.accesses % 64 == 0) {
+                self.refresh();
+                self.trim();
+            }
+            return null;
+        };
         block.retain();
         if (self.entries.get(offset)) |entry| self.touch(entry);
-        self.accesses +%= 1;
         if (self.accesses % 64 == 0) self.refresh() else self.refreshBlock(block);
         self.trim();
         return block;
@@ -4151,9 +4200,32 @@ const PayloadCache = struct {
         defer self.mutex.unlock();
         self.reserve = reserve;
         self.denied = false;
+        if (self.max_entries == 0 or self.max_bytes == 0) return;
+        const limit = @min(self.max_entries, if (self.registered) @as(usize, 1024) else @as(usize, 4));
+        const target_bytes = self.target();
+        if (self.registered and self.max_bytes > 64 * 1024 and target_bytes >= 64 * 1024 and self.entries.count() > 1 and
+            (self.entries.count() >= limit or block.retainedBytes() > target_bytes -| (self.bytes +| self.metadata_bytes)))
+        {
+            if (self.frequency == null) {
+                const frequency = self.allocator().create(Frequency) catch |err| {
+                    if (err == error.OutOfMemory and self.denied) return;
+                    return err;
+                };
+                frequency.* = .{ .sample_limit = @max(64, self.entries.count() * 10) };
+                var entries = self.entries.keyIterator();
+                while (entries.next()) |offset| frequency.record(offset.*);
+                frequency.record(block.physical_offset.?);
+                self.frequency = frequency;
+            }
+            if (self.frequency.?.estimate(block.physical_offset.?) <= self.frequency.?.estimate(self.oldest.?.offset)) {
+                self.admission_rejections +|= 1;
+                return;
+            }
+        }
+        // Refresh before admitted growth. Rejected misses use the periodic
+        // refresh in get instead of walking every retained owner on every row.
         self.refresh();
         self.trim();
-        if (self.max_entries == 0 or self.max_bytes == 0) return;
         while (self.entries.count() >= @min(self.max_entries, if (self.registered) @as(usize, 1024) else @as(usize, 4))) _ = self.evictLocked();
         self.adopt(block) catch |err| {
             // Optional descriptor admission can decline without poisoning the
@@ -10011,6 +10083,63 @@ test "SQL adaptive payload cache counts shared bodies and aliases and unwinds me
             const remaining = cache.get(9, 0).?;
             remaining.release();
             try std.testing.expect(cache.evict());
+            try std.testing.expectEqual(@as(usize, 0), cache.metadata_bytes);
+            try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+        }
+    };
+    try Harness.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL adaptive payload cache resists cyclic scans adapts to hot sets and refunds its sketch" {
+    const Harness = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(backing: Allocator) !void {
+            var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 4 << 20 };
+            defer std.debug.assert(budget.live == 0);
+            var marker: u8 = 0;
+            var manager: Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = check };
+            defer manager.deinit();
+            const a = manager.allocator();
+            var cache: PayloadCache = .{ .max_bytes = 128 * 1024, .max_entries = 8 };
+            cache.bind(&manager);
+            // Inject metadata failures without turning the required block
+            // allocator into an intentionally opaque (nonadaptive) owner.
+            cache.metadata_backing = backing;
+            defer cache.deinit();
+            var blocks: [32]*Sequential.OwnedBlock = undefined;
+            var count: usize = 0;
+            defer for (blocks[0..count]) |block| block.release();
+            for (&blocks, 0..) |*block, offset| {
+                block.* = try a.create(Sequential.OwnedBlock);
+                block.*.* = .{ .a = a, .arena = .init(a), .physical_offset = offset };
+                count += 1;
+                _ = try block.*.arena.allocator().alloc(u8, 4096);
+            }
+            var hits: usize = 0;
+            for (0..16) |_| for (blocks, 0..) |block, offset| {
+                if (cache.get(offset, 0)) |held| {
+                    hits += 1;
+                    held.release();
+                } else try cache.insert(block, 0);
+            };
+            try std.testing.expect(hits > 64);
+            try std.testing.expect(cache.admission_rejections > 64);
+            try std.testing.expect(cache.frequency != null);
+            try std.testing.expect(cache.entries.count() <= 8);
+            // A new hot block must displace the old working set after aging;
+            // equal-frequency scan resistance must not freeze residency.
+            for (0..256) |_| {
+                if (cache.get(31, 0)) |held| held.release() else try cache.insert(blocks[31], 0);
+            }
+            const hot = cache.get(31, 0) orelse return error.TestExpectedHotAdmission;
+            hot.release();
+            // The fault wrapper is opaque to shared reclamation; direct owner
+            // teardown still retires all metadata through its original path.
+            cache.lock();
+            while (cache.evictLocked()) {}
+            cache.mutex.unlock();
+            try std.testing.expect(cache.frequency == null);
             try std.testing.expectEqual(@as(usize, 0), cache.metadata_bytes);
             try std.testing.expectEqual(@as(usize, 0), cache.bytes);
         }

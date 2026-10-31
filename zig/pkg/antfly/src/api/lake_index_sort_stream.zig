@@ -424,6 +424,9 @@ test "external lake leased publication adaptive spill cache reduces wide drain r
             return @as(i96, stamp.sec) * std.time.ns_per_s + stamp.nsec;
         }
         fn run(compressed: bool, fixed: bool, publication: bool) !Measurement {
+            return runSized(compressed, fixed, publication, 8192, 16 << 20);
+        }
+        fn runSized(compressed: bool, fixed: bool, publication: bool, count: usize, cache_bytes: usize) !Measurement {
             var resources = local.storage_resource_manager.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 << 20 } });
             defer resources.deinit(std.heap.smp_allocator);
             const memory = try @import("sql_memory_owner.zig").create(std.heap.smp_allocator, std.heap.smp_allocator, &resources);
@@ -441,7 +444,6 @@ test "external lake leased publication adaptive spill cache reduces wide drain r
             sort.encoded_bytes = true;
             sort.shared_runs = true;
             sort.parallel_runs = false;
-            const count = 8192;
             var bodies: [64][8][128]u8 = @splat(@splat(@splat('v')));
             var keys: [64][20]u8 = undefined;
             var cells: [64][8]local.sql_scalar.Datum = undefined;
@@ -468,6 +470,7 @@ test "external lake leased publication adaptive spill cache reduces wide drain r
             }
             try sort.finish();
             const reader = try sort.payloadReader();
+            reader.cache.max_bytes = cache_bytes;
             if (fixed) {
                 reader.cache.max_bytes = 64 * 1024;
                 reader.cache.max_entries = 4;
@@ -494,7 +497,7 @@ test "external lake leased publication adaptive spill cache reduces wide drain r
                 }
             }
             const cpu = now() - started;
-            std.debug.print("ADAPTIVE_SPILL publication={} codec={} fixed={} rows={} payload_reads={} drain_read_bytes={} total_read_bytes={} written_bytes={} cpu_ns={} budget_peak={} budget_limit={}\n", .{ publication, manager.compression, fixed, seen, sort.payload_reads, manager.read_bytes - reads_before_delivery, manager.read_bytes, manager.written_bytes, cpu, if (publication) working.quota.peak_bytes else budget.peak, if (publication) working.maxBytes() else budget.limit });
+            std.debug.print("ADAPTIVE_SPILL publication={} codec={} fixed={} rows={} payload_reads={} drain_read_bytes={} total_read_bytes={} written_bytes={} cpu_ns={} budget_peak={} budget_limit={} rejected={}\n", .{ publication, manager.compression, fixed, seen, sort.payload_reads, manager.read_bytes - reads_before_delivery, manager.read_bytes, manager.written_bytes, cpu, if (publication) working.quota.peak_bytes else budget.peak, if (publication) working.maxBytes() else budget.limit, reader.cache.admission_rejections });
             try std.testing.expectEqual(@as(usize, count), seen);
             try std.testing.expect(budget.peak <= budget.limit);
             try std.testing.expect(working.quota.peak_bytes <= working.maxBytes());
@@ -508,6 +511,20 @@ test "external lake leased publication adaptive spill cache reduces wide drain r
         try std.testing.expect(after.drain < before.drain / 2);
         try std.testing.expect(after.payload_reads < before.payload_reads / 2);
     };
+    // The active payload set exceeds this cache. A pure LRU misses every
+    // cycle; bounded frequency admission must preserve some reusable roots.
+    const scan_before = try Probe.runSized(true, true, true, 2048, 512 << 10);
+    const scan_after = try Probe.runSized(true, false, true, 2048, 512 << 10);
+    try std.testing.expectEqual(scan_before.written, scan_after.written);
+    try std.testing.expect(scan_after.payload_reads < scan_before.payload_reads * 3 / 4);
+    try std.testing.expect(scan_after.drain < scan_before.drain * 3 / 4);
+    if (std.c.getenv("ANTFLY_LAKE_SCAN_CACHE_BENCH") != null) {
+        for ([_]usize{ 32768, 65536 }) |count| for (0..6) |sample| {
+            std.debug.print("SCAN_CACHE_SAMPLE rows={} sample={}\n", .{ count, sample });
+            _ = try Probe.runSized(true, sample % 2 == 0, true, count, 16 << 20);
+            _ = try Probe.runSized(true, sample % 2 != 0, true, count, 16 << 20);
+        };
+    }
     if (std.c.getenv("ANTFLY_LAKE_PUBLICATION_CACHE_BENCH") != null) {
         for (0..6) |sample| {
             std.debug.print("PUBLICATION_SAMPLE sample={}\n", .{sample});
